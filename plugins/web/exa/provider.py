@@ -50,12 +50,16 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
     SEARCH_ENDPOINT = "https://api.exa.ai/search"
     SEARCH_TYPE = "auto"
     SEARCH_TYPE_REASON = "default"
-    _stakes = None
+    _prepared = False
 
     def prepare_search(self, query: str, *, stakes: str | None = None) -> ExaWebSearchProvider:
+        from tools.web_tools import _load_web_config
+
         request = copy(self)
-        request._stakes = stakes
-        request.SEARCH_TYPE, request.SEARCH_TYPE_REASON = select_search_policy(query, stakes)
+        request.SEARCH_TYPE, request.SEARCH_TYPE_REASON = select_search_policy(
+            query, stakes, lite_paused=_load_web_config().get("exa_lite_paused", True) is not False,
+        )
+        request._prepared = True
         return request
 
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
@@ -63,7 +67,9 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
             if use_keyless("exa", provider_env("EXA_API_KEY")):
                 return keyless_search("Exa", "exa", query, limit, logger)
             logger.info("Exa search: '%s' (limit=%d)", query, limit)
-            search_type, reason = select_search_policy(query, self._stakes)
+            # Use the same policy snapshot for the cache identity and SDK call.
+            request = self if self._prepared else self.prepare_search(query)
+            search_type, reason = request.SEARCH_TYPE, request.SEARCH_TYPE_REASON
             response = _get_exa_client().search(
                 query, type=search_type, num_results=limit, contents={"highlights": True},
             )

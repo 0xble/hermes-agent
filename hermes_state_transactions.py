@@ -12,7 +12,7 @@ from typing import Any, Callable, TypeVar
 
 from agent.message_metadata import CANONICAL_ROW, DB_ROW_SNAPSHOT
 from hermes_state_write_metrics import WriteMetrics, current_write_metrics
-from hermes_state_publication import record_publication_write
+from hermes_state_publication import publication_is_active, record_publication_write
 from hermes_state_write_stalls import current_observation, observe_safely
 
 
@@ -68,7 +68,9 @@ def settle_write_transaction(
     Either acquisition or transaction hold time can trigger the warning. No payload or SQL is logged.
     """
     started = clock.monotonic()
-    changes_before = conn.total_changes
+    cursors = [] if publication_is_active() else None
+    if cursors is not None:
+        conn.publication_cursors = cursors
     cpu_started = clock.thread_time()
     callback_s = callback_cpu_s = commit_s = commit_cpu_s = rollback_s = 0.0
     observation = current_observation.get()
@@ -112,7 +114,9 @@ def settle_write_transaction(
     finally:
         current_write_metrics.reset(metrics_token)
         held_s = clock.monotonic() - started
-        record_publication_write(hold_s=held_s, rows_written=conn.total_changes - changes_before)
+        if cursors is not None:
+            conn.publication_cursors = None
+        record_publication_write(hold_s=held_s, rows_written=sum(cursor.written_rows() for cursor in cursors or ()))
         if held_s >= warn_s or acquire_s >= warn_s:
             name = getattr(fn, "__qualname__", type(fn).__qualname__)[:160]
             observe_safely(observation.warn, logger,

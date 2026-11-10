@@ -386,6 +386,49 @@ def test_projection_preserves_duplicate_rows_and_rowid_moves(tmp_path, monkeypat
     assert server._session_db_content_sig(path) == after_vacuum
 
 
+def test_canonical_projection_preserves_rowid_moves_and_vacuum(tmp_path, monkeypatch):
+    from hermes_state import SessionDB
+    from hermes_state_session_signature import SessionProjection
+
+    path = tmp_path / "state.db"
+    with SessionDB(path) as db:
+        for sid in ("a", "middle", "z"):
+            db.create_session(sid, source="cli")
+    monkeypatch.setattr(server, "_sessions_db_sig_cache", {})
+    ticks = itertools.count()
+    monkeypatch.setattr(server, "_newest_mtime_ns", lambda paths: next(ticks))
+    original = server._session_db_content_sig(path)
+    projection = server._sessions_db_sig_cache[str(path)][2]
+    assert isinstance(projection, SessionProjection)
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE sessions SET rowid = 99 WHERE id = 'middle'")
+    assert server._session_db_content_sig(path) == original
+    assert server._sessions_db_sig_cache[str(path)][2] is projection
+    assert 99 in projection.hashes and 2 not in projection.hashes
+    with sqlite3.connect(path) as conn:
+        conn.execute("UPDATE sessions SET title = 'moved row' WHERE rowid = 99")
+    changed = server._session_db_content_sig(path)
+    assert changed != original
+    assert server._sessions_db_sig_cache[str(path)][2] is projection
+    server._sessions_db_sig_cache.clear()
+    assert server._session_db_content_sig(path) == changed
+    with sqlite3.connect(path) as conn:
+        conn.execute("VACUUM")
+    # VACUUM changes schema_version. Keep the schema-change rebuild safeguard,
+    # then prove the canonical modular sum resumes indexed incremental updates.
+    assert server._session_db_content_sig(path) == changed
+    projection = server._sessions_db_sig_cache[str(path)][2]
+    assert isinstance(projection, SessionProjection)
+    with sqlite3.connect(path) as conn:
+        rowid = conn.execute("SELECT rowid FROM sessions WHERE id = 'middle'").fetchone()[0]
+        conn.execute("UPDATE sessions SET title = 'after vacuum' WHERE rowid = ?", (rowid,))
+    after_vacuum = server._session_db_content_sig(path)
+    assert after_vacuum != changed
+    assert server._sessions_db_sig_cache[str(path)][2] is projection
+    server._sessions_db_sig_cache.clear()
+    assert server._session_db_content_sig(path) == after_vacuum
+
+
 def test_legacy_signature_detects_swapped_metadata_without_unique_ids(tmp_path, monkeypatch):
     path = tmp_path / "state.db"
     with sqlite3.connect(path) as conn:

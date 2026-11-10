@@ -32,13 +32,23 @@ _TRIM = f"""DELETE FROM session_projection_changes WHERE sequence <=
     (SELECT MAX(sequence) FROM session_projection_changes) - {SESSION_SIGNATURE_HISTORY};"""
 _INSERT = "INSERT INTO session_projection_changes(session_rowid) VALUES (new.rowid);"
 _DELETE = "INSERT INTO session_projection_changes(session_rowid) VALUES (old.rowid);"
+_FIELDS_CHANGED = " OR ".join(
+    f"old.{field} IS NOT new.{field} COLLATE BINARY OR typeof(old.{field}) IS NOT typeof(new.{field})"
+    for field in SESSION_SIGNATURE_FIELDS
+)
 _TRIGGERS = {
     "sessions_projection_insert": f"AFTER INSERT ON sessions BEGIN {_INSERT} {_TRIM} END",
     "sessions_projection_delete": f"AFTER DELETE ON sessions BEGIN {_DELETE} {_TRIM} END",
     "sessions_projection_update": (
-        "AFTER UPDATE ON sessions BEGIN "
-        "INSERT INTO session_projection_changes(session_rowid) SELECT old.rowid WHERE old.rowid <> new.rowid; "
+        f"AFTER UPDATE OF {', '.join(SESSION_SIGNATURE_FIELDS)} ON sessions "
+        f"WHEN old.rowid IS new.rowid AND ({_FIELDS_CHANGED}) BEGIN "
         f"{_INSERT} {_TRIM} END"
+    ),
+    # Pseudo-column aliases are absent from the signature fields. Keep moves
+    # disjoint from metadata updates, including a move and rename in one write.
+    "sessions_projection_rowid_update": (
+        "AFTER UPDATE OF rowid, _rowid_, oid ON sessions WHEN old.rowid IS NOT new.rowid BEGIN "
+        f"{_DELETE} {_INSERT} {_TRIM} END"
     ),
 }
 _TRIGGER_DEFINITIONS = {
@@ -103,7 +113,7 @@ def session_content_signature(conn: sqlite3.Connection, path: Path, previous=Non
     revision = session_signature_revision(conn, path)
     if revision is not None and previous is not None:
         identity, first, last, nonce = revision
-        if (previous.identity == identity and first - 1 <= previous.sequence <= last):
+        if (previous.identity == identity and first <= previous.sequence <= last):
             anchor = conn.execute("SELECT nonce FROM session_projection_changes WHERE sequence = ?",
                                   (previous.sequence,)).fetchone()
             # Sequence numbers alone can repeat in diverged copies restored

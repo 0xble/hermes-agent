@@ -33,6 +33,7 @@ from hermes_state_holders import _read_proc_argv
 from hermes_state_search import _delete_meta, _meta_row
 from hermes_state_errors import is_sqlite_lock_error
 from hermes_state_titles import next_title_in_lineage
+from hermes_state_session_signature import SESSION_SIGNATURE_FIELDS, SESSION_SIGNATURE_TRIGGER_SQL
 
 # Pre-split logger identity so log filtering/capture is unchanged.
 logger = logging.getLogger("hermes_state")
@@ -741,6 +742,10 @@ class SessionSchemaMixin:
                 continue  # PRAGMA table_info returns [] for a missing table; the DDL creates it whole
             # PRAGMA table_info rows: (cid, name, type, notnull, dflt_value, pk)
             live_cols = {row[1] for row in rows}
+            if table_name == "sessions" and set(SESSION_SIGNATURE_FIELDS) - live_cols:
+                # SQLite reparses triggers during ALTER TABLE. A narrowed trigger naming
+                # missing columns blocks catch-up itself; schema setup restores it after ADDs.
+                cursor.execute("DROP TRIGGER IF EXISTS sessions_projection_update")
             for col_name, col_type in declared_cols.items():
                 if col_name in live_cols:
                     continue
@@ -1367,6 +1372,7 @@ def apply_declared_schema(cursor: sqlite3.Cursor) -> None:
     shim._reconcile_columns(cursor)
     SessionSchemaMixin._execute_ddl_script_transactional(cursor, SCHEMA_SQL)
     shim._reconcile_columns(cursor)
+    shim._execute_ddl_skipping_settled_triggers(cursor, SESSION_SIGNATURE_TRIGGER_SQL)
 
 
 def reconcile_state_schema(conn: sqlite3.Connection) -> None:

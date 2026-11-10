@@ -23,7 +23,7 @@ def backend_harness(monkeypatch, tmp_path):
     monkeypatch.setattr(exa, "provider_env", lambda key: "test-key")
     monkeypatch.setattr(exa, "use_keyless", lambda *a: False)
     monkeypatch.setattr("tools.web_tools_rescue._ring_vendor_keyless", lambda name: False)
-    monkeypatch.setattr(wt, "_load_web_config", dict)
+    (tmp_path / "config.yaml").write_text("web:\n  exa_lite_paused: false\n")
     monkeypatch.setattr(wt, "_ensure_web_plugins_loaded", lambda: None)
     monkeypatch.setattr(wt, "_get_search_backend", lambda: "exa")
     monkeypatch.setattr("agent.web_search_registry.get_provider", lambda name: provider)
@@ -35,6 +35,43 @@ def _search(query, **kwargs):
     entry = wt.registry.get_entry("web_search")
     assert entry is not None
     return json.loads(entry.handler({"query": query, **kwargs}))
+
+
+@pytest.mark.parametrize("config", [
+    "{}", "web: null", "web: {exa_lite_paused: true}",
+    "web: {exa_lite_paused: null}", "web: {exa_lite_paused: 'false'}",
+])
+@pytest.mark.parametrize("query", ["FastAPI docs", "tax software reviews", "最新ニュース"])
+@pytest.mark.parametrize("stakes", [None, "standard", "high", "unknown"])
+def test_paused_searches_use_auto_including_cache_hits(backend_harness, tmp_path, config, query, stakes):
+    _, sdk = backend_harness
+    (tmp_path / "config.yaml").write_text(config)
+    for _ in range(2):
+        result = _search(query, **({"stakes": stakes} if stakes is not None else {}))
+        assert result["success"]
+        assert result["data"]["search_type"] == "auto"
+        assert result["data"]["search_type_reason"] == "lite_paused"
+        cache.search_memo = cache.SearchMemo()  # also exercise the persisted Auto lane
+    sdk.search.assert_called_once()
+    assert sdk.search.call_args.kwargs["type"] == "auto"
+
+
+def test_pause_toggle_ignores_old_lite_cache_and_freezes_prepared_request(backend_harness, tmp_path):
+    provider, sdk = backend_harness
+    config = tmp_path / "config.yaml"
+    query = "FastAPI docs"
+    assert _search(query, stakes="standard")["data"]["search_type"] == "lite"
+    config.write_text("web: {exa_lite_paused: true}")
+    prepared = provider.prepare_search(query, stakes="standard")
+    assert provider.search(query)["data"]["search_type_reason"] == "lite_paused"
+    assert _search(query, stakes="standard")["data"]["search_type_reason"] == "lite_paused"
+    assert sdk.search.call_args.kwargs["type"] == "auto"
+    config.write_text("web: {exa_lite_paused: false}")
+    assert prepared.search(query)["data"]["search_type"] == "auto"
+    assert prepared.SEARCH_TYPE == "auto"
+    assert provider.search(query)["data"]["search_type_reason"] == "default"
+    assert _search(query, stakes="standard")["data"]["search_type"] == "lite"
+    assert sdk.search.call_count == 5
 
 
 @pytest.mark.parametrize("query,stakes,expected,expected_reason", [

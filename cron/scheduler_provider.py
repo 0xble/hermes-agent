@@ -73,7 +73,7 @@ def _profile_entry(entry) -> tuple:
     return entry if isinstance(entry, tuple) else (None, entry)
 
 
-def _existing_profile_homes(profile_homes: list) -> list:
+def _existing_profile_homes(profile_homes: list, *, strict=False) -> list:
     """Drop homes no longer on disk: ticking/heartbeating a deleted home would recreate its
     ``cron/`` workspace and silently resurrect the profile.
 
@@ -89,6 +89,8 @@ def _existing_profile_homes(profile_homes: list) -> list:
         try:
             profile_homes = list(profile_homes())
         except Exception:
+            if strict:
+                raise
             logger.warning("cron profile enumeration failed; skipping this cycle", exc_info=True)
             return []
     return [entry for entry in profile_homes if Path(_profile_entry(entry)[1]).is_dir()]
@@ -442,6 +444,22 @@ class InProcessCronScheduler(CronScheduler):
         profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
         profile_bot_platforms=None,
     ):
+        from cron.scheduler_store import ExecutionStoreOwners
+
+        with ExecutionStoreOwners() as stores:
+            self._start(
+                stop_event, adapters=adapters, loop=loop, interval=interval,
+                can_dispatch=can_dispatch, profile_homes=profile_homes,
+                profile_adapters=profile_adapters, default_profile=default_profile,
+                profile_gate=profile_gate, profile_bot_platforms=profile_bot_platforms,
+                stores=stores,
+            )
+
+    def _start(
+        self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None,
+        profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
+        profile_bot_platforms=None, stores,
+    ):
         from cron.scheduler import CronTickYielded
         from cron.scheduler import tick as cron_tick
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
@@ -464,7 +482,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event, profile_homes=profile_homes, adapters=adapters, loop=loop,
                 interval=interval, can_dispatch=can_dispatch, profile_adapters=profile_adapters,
                 default_profile=default_profile, profile_gate=profile_gate,
-                profile_bot_platforms=profile_bot_platforms,
+                profile_bot_platforms=profile_bot_platforms, stores=stores,
             )
             return
 
@@ -477,6 +495,7 @@ class InProcessCronScheduler(CronScheduler):
         try:
             record_ticker_start()
             recovered = self.recover_interrupted()
+            stores.retain(get_process_hermes_home())
             if recovered:
                 logger.warning(
                     "Marked %d interrupted cron execution(s) unknown after restart", recovered
@@ -502,7 +521,7 @@ class InProcessCronScheduler(CronScheduler):
                     note_held()
                 else:
                     note_dispatching()
-                    cron_tick(
+                    stores.run(get_process_hermes_home(), cron_tick,
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
                     )
@@ -552,7 +571,7 @@ class InProcessCronScheduler(CronScheduler):
     def _start_multiplex(
         self, stop_event, *, profile_homes, adapters=None, loop=None, interval=60,
         can_dispatch=None, profile_adapters=None, default_profile=None, profile_gate=None,
-        profile_bot_platforms=None,
+        profile_bot_platforms=None, stores,
     ):
         """Tick every profile's store, each scoped via ``_profile_cron_scope``. ``profile_gate(name,
         home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
@@ -591,12 +610,13 @@ class InProcessCronScheduler(CronScheduler):
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
         # cron workspace via the heartbeat below (#47368).
         for entry in initial_homes:
-            _, home = _profile_entry(entry)
+            profile_name, home = _profile_entry(entry)
             try:
                 with _profile_cron_scope(home):
                     from cron.oneshot_retirement import record_ticker_start
                     record_ticker_start()
                     recovered = self.recover_interrupted()
+                    stores.retain(home, gate=profile_gate, profile_name=profile_name)
                     if recovered:
                         logger.warning(
                             "Marked %d interrupted cron execution(s) for profile at %s",
@@ -625,7 +645,7 @@ class InProcessCronScheduler(CronScheduler):
             # tick the ungated set — the exact stand-down the Desktop gate exists for (#100489).
             cycle_homes: list = []
             try:
-                enumerated = [_profile_entry(e) for e in _existing_profile_homes(profile_homes)]
+                enumerated = [_profile_entry(e) for e in _existing_profile_homes(profile_homes, strict=True)]
                 if profile_gate is not None:
                     enumerated = [(name, home) for name, home in enumerated if profile_gate(name, home)]
                 cycle_homes = enumerated
@@ -633,6 +653,7 @@ class InProcessCronScheduler(CronScheduler):
                 # "do I own cron for this home?" and a profile added or gated out this cycle
                 # must be reflected in that answer, not one cycle late.
                 register_ticked_homes([home for _name, home in cycle_homes])
+                stores.discard_except(home for _name, home in cycle_homes)
             except BaseException as e:
                 logger.error("Cron profile enumeration error: %s", e, exc_info=True)
                 _tick_error = f"{type(e).__name__}: {e}"
@@ -646,7 +667,7 @@ class InProcessCronScheduler(CronScheduler):
                         try:
                             with _profile_cron_scope(home):
                                 note_dispatching()
-                                cron_tick(
+                                stores.run(home, cron_tick,
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,
                                 )

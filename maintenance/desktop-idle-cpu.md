@@ -13,6 +13,23 @@ The bounded session-change journal is installed by writable schema setup, never
 by the read-only watcher. Retain full scans for legacy stores or an untrusted,
 incomplete journal. Incremental and rebuilt digests must agree, including after
 replacement deletes, journal truncation, rowid changes and VACUUM.
+Generate metadata UPDATE scope and value comparisons from the signature field
+constant. Heartbeats, transcript revisions and no-op updates write no journal
+rows. Rowid aliases have a separate, disjoint trigger that records both keys
+when a row moves. Existing stores replace the broad trigger on schema settle,
+while settled definitions avoid acquiring a write lock again.
+Column reconciliation drops an invalid metadata trigger before adding missing
+signature columns. Both writable startup and raw schema catch-up restore the
+narrowed trigger afterwards. Legacy-store fixtures remove column-dependent
+triggers before dropping columns, without changing browse ownership, integrity
+or reconciliation expectations.
+
+Canonical rowid moves stay incremental. VACUUM invalidates the schema identity,
+so the watcher rebuilds once and then resumes changed-row reads. SQLite may
+renumber rowids during VACUUM without firing row triggers. Keep that
+safeguard against writes made while a trigger was absent. Compaction publication
+row counts use direct statement rowcounts, excluding journal and FTS writes,
+and still count completed statements in rolled-back attempts.
 
 Recent session lists must choose their ordered page before transcript preview
 projection. Compression-lineage recency, search filters, pagination and pinned
@@ -33,6 +50,10 @@ Owning surfaces are `tui_gateway/change_watcher.py`,
 and semantic regressions live in `tests/tui_gateway/test_change_watcher_sessions.py`
 and `tests/hermes_cli/test_session_skill_previews.py`; existing lineage, paging,
 archive/pin and sidebar-cache tests cover the surrounding behavior.
+Trigger migration and publication accounting are covered by
+`tests/hermes_state/test_session_signature_triggers.py`,
+`tests/hermes_state/test_publication_rowcounts.py` and
+`tests/hermes_state/test_publication_wait_budget.py`.
 
 Upstream disposition: no upstream PR or submission; this task stops at a draft
 PR in `0xble/hermes-agent`. Fork delivery: this branch only, not installed.

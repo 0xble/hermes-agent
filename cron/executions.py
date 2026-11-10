@@ -3,6 +3,43 @@
 The ledger records what is known about each attempt; it is not a retry queue. Interrupted attempts
 become ``unknown`` only after their owner process is proved gone — a start-time reading that fails
 to match the claim-time fingerprint is not proof of death. Terminal states are immutable.
+
+Read contract (SQLite ``mode=ro``; read metadata and attempts in ONE read transaction):
+``execution_coverage`` has one row (``singleton=1``): ``epoch_id`` is a random database
+incarnation ID, ``started_at`` is the UTC coverage epoch, and ``origin`` is ``fresh`` or
+``migration``. The epoch is never backdated to surviving rows: ALL earlier history is
+unproven, even on migration from a populated ledger. Recreating the DB starts a new ID
+and epoch; readers must not carry a certificate across IDs or a restored older snapshot.
+``execution_prune_watermarks`` has exactly two rows, reasons ``age`` and ``cap``:
+``pruned_count`` is cumulative, ``max_pruned_claimed_jd`` is the greatest SQLite
+``julianday(claimed_at)`` ever deleted for that reason (NULL before any valid deletion),
+``unparseable_claimed_at_count`` counts deleted rows with an unreadable claim time,
+and ``last_pruned_at`` is the UTC time of the latest nonempty prune. All sources count,
+conservatively including never-started misses. Deletion and watermark commit together.
+
+For a valid ISO window start bound as ``:window_start``, the exact proof query is::
+
+    SELECT EXISTS (
+        SELECT 1 FROM execution_coverage
+        WHERE singleton=1 AND julianday(started_at) < julianday(:window_start)
+          AND (SELECT COUNT(*) FROM execution_prune_watermarks) = 2
+          AND NOT EXISTS (
+              SELECT 1 FROM execution_prune_watermarks
+              WHERE unparseable_claimed_at_count > 0
+                 OR max_pruned_claimed_jd >= julianday(:window_start)
+          )
+    ) AS complete
+
+A result of 1 proves no ledger-admitted attempt with claim time >= the window start
+has been pruned since coverage began, for this DB snapshot. Window the attempts using
+``julianday(claimed_at)`` too (numeric instants, not offset-sensitive ISO text). The
+strict epoch comparison and prune comparison conservatively refuse proof on boundary
+collisions at SQLite's millisecond precision.
+Missing tables, a missing epoch, or 0 mean unproven, NOT zero attempts. This certifies
+retention, not scheduler uptime, expected occurrences, terminality, or success. It
+assumes ledger writes use this implementation: older writers, manual SQL, file loss,
+clock rollback and backup restoration are not independently detectable by an in-DB
+certificate and must invalidate external continuity evidence.
 """
 
 from __future__ import annotations
@@ -68,6 +105,9 @@ def _connect() -> sqlite3.Connection:
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_cli.sqlite_util import add_column_if_missing
 
+    existing_ledger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone() is not None
     conn.execute(
         f"""CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
@@ -135,6 +175,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_job_instant "
         "ON executions(job_id, julianday(claimed_at) DESC, claimed_at DESC, id DESC)"
     )
+    _initialize_coverage(conn, existing_ledger=existing_ledger)
 
 
 def _widen_status_check(conn: sqlite3.Connection) -> None:
@@ -163,6 +204,38 @@ def _widen_status_check(conn: sqlite3.Connection) -> None:
     except BaseException:
         conn.rollback()
         raise
+
+
+def _initialize_coverage(conn: sqlite3.Connection, *, existing_ledger: bool) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS execution_coverage (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        epoch_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        origin TEXT NOT NULL CHECK(origin IN ('fresh','migration'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS execution_prune_watermarks (
+        reason TEXT PRIMARY KEY CHECK(reason IN ('age','cap')),
+        pruned_count INTEGER NOT NULL DEFAULT 0 CHECK(pruned_count >= 0),
+        max_pruned_claimed_jd REAL,
+        unparseable_claimed_at_count INTEGER NOT NULL DEFAULT 0
+            CHECK(unparseable_claimed_at_count >= 0),
+        last_pruned_at TEXT
+    )""")
+    if conn.execute("SELECT 1 FROM execution_coverage WHERE singleton=1").fetchone() is not None:
+        return
+    # Separate schema initialization from callers' explicit BEGIN IMMEDIATE. INSERT OR IGNORE
+    # elects one epoch across processes; its empty watermarks must commit with that epoch.
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO execution_coverage (singleton, epoch_id, started_at, origin) "
+            "VALUES (1, ?, ?, ?)",
+            (uuid.uuid4().hex, _hermes_now().astimezone(UTC).isoformat(),
+             "migration" if existing_ledger else "fresh"),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO execution_prune_watermarks (reason) VALUES (?)",
+            (("age",), ("cap",)),
+        )
 
 
 @contextmanager
@@ -333,7 +406,35 @@ def _delete_prunable(
             ids.append((row["id"],))
             if len(ids) == limit:
                 break
+    if ids:
+        _record_prune_watermark(conn, ids, reason="age" if cutoff is not None else "cap")
     return conn.executemany("DELETE FROM executions WHERE id=?", ids).rowcount
+
+
+def _record_prune_watermark(
+    conn: sqlite3.Connection, ids: list[tuple[str]], *, reason: str,
+) -> None:
+    # The selection is already bounded by the shared prune budget; aggregate by primary key,
+    # not by finish time or lexical ISO order. The caller owns the delete's write transaction.
+    stats = conn.execute(
+        "SELECT COUNT(*), MAX(julianday(claimed_at)), "
+        "SUM(julianday(claimed_at) IS NULL) FROM executions WHERE id IN ("
+        + ",".join("?" for _ in ids) + ")",
+        tuple(item[0] for item in ids),
+    ).fetchone()
+    count, maximum, unparseable = stats
+    updated = conn.execute(
+        """UPDATE execution_prune_watermarks
+           SET pruned_count=pruned_count+?,
+               max_pruned_claimed_jd=COALESCE(MAX(max_pruned_claimed_jd, ?),
+                                            max_pruned_claimed_jd, ?),
+               unparseable_claimed_at_count=unparseable_claimed_at_count+?,
+               last_pruned_at=?
+           WHERE reason=?""",
+        (count, maximum, maximum, unparseable, _hermes_now().astimezone(UTC).isoformat(), reason),
+    )
+    if updated.rowcount != 1:
+        raise RuntimeError(f"Missing cron execution prune watermark: {reason}")
 
 
 def _prune_unlocked(conn: sqlite3.Connection, *, keep_ids: Iterable[str] = ()) -> None:

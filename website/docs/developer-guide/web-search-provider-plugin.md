@@ -125,8 +125,14 @@ def register(ctx) -> None:
 
 ## Request-Local Search Quality
 
-`web_search` accepts an optional `stakes` hint (`standard` or `high`). Exa defaults
-to Auto. The agent marks a search `standard` when a somewhat wrong or incomplete
+`web_search` accepts an optional `stakes` hint (`standard` or `high`) for caller
+compatibility. **Exa Lite is paused by default:** `web.exa_lite_paused: true` sends
+every Exa search to full Auto with `search_type_reason="lite_paused"`, including
+`standard` calls and cache hits. Only YAML boolean `false` re-enables guarded Lite:
+`hermes config set web.exa_lite_paused false`. Set it to `true` or unset it to
+pause again. This switch does not change direct fetch, extraction or visible rescue.
+
+With Lite explicitly re-enabled, the agent marks a search `standard` when a somewhat wrong or incomplete
 answer costs little, such as software docs and APIs, product specs and reviews,
 how-tos, recipes, entertainment, navigation, general background, or early broad
 discovery. These searches use Lite unless the protected-topic keyword guard fires.
@@ -140,8 +146,9 @@ override `standard`. The guard is a backstop, not a complete topic classifier:
 known gaps rely on the agent's judgment, and occasional sensitive Lite searches
 are an accepted trade-off. The pilot spot-checks protected topics.
 
-Responses report the request-local `data.search_type_reason`: `default`,
-`hint_standard`, `hint_high`, or `protected_guard`, including cache hits.
+Responses report the request-local `data.search_type_reason`: `lite_paused`,
+or (when Lite is enabled) `default`, `hint_standard`, `hint_high`, or
+`protected_guard`, including cache hits.
 Responses served by the paid Exa SDK also report `data.search_type`. Keyless or
 rescued responses identify their route with `served_by` or `rescued_from`
 instead. Cache identity separates Lite from Auto.

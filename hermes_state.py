@@ -22,7 +22,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import contextmanager, suppress
-from hermes_state_publication import state_lock, measure_write, raise_if_nonretryable_contention
+from hermes_state_publication import PublicationConnection, state_lock, measure_write, raise_if_nonretryable_contention
 from pathlib import Path
 from hermes_dir_acl import make_user_dir
 
@@ -857,7 +857,7 @@ class SessionDB(
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
         conn = _connect_tracked_db(
-            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None, factory=PublicationConnection,
         )
         try:
             conn.row_factory = sqlite3.Row
