@@ -83,7 +83,7 @@ def test_footprint_warning_sizes_the_tree_only_when_the_count_does_not_decide(
     crowded = _git_repo(tmp_path / "crowded")
     for i in range(10):
         (crowded / ".worktrees" / f"lane-{i}").mkdir()
-    sparse = _git_repo(tmp_path / "sparse")
+    sparse = _git_repo(tmp_path / "sparse-sm with space")
     for i in range(2):
         (sparse / ".worktrees" / f"lane-{i}").mkdir()
 
@@ -94,5 +94,5 @@ def test_footprint_warning_sizes_the_tree_only_when_the_count_does_not_decide(
 
         caplog.clear()
         worktree_ops._warn_worktree_footprint(str(sparse))
-    assert du_log.read_text().count("-sm") == 1
+    assert du_log.read_text().splitlines() == [f"-sm {sparse / '.worktrees'}"]
     assert "holds 2 tree(s) (5.9GB)" in caplog.text
