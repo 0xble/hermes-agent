@@ -72,6 +72,41 @@ The fork implementation deliberately uses one time policy and one ceiling for
 all terminal states, with a profile-local age-window setting and no new scheduler owner.
 Upstream state was checked on 2026-10-29. No upstream write is part of this unit.
 
+## Coverage Evidence
+
+Retention alone cannot prove a seven-day denominator: an empty interval can mean
+no admitted claims or lost history. `cron/executions.py` documents the read-only
+SQLite proof query for claim-time windows (the reliability collector uses
+`claimed_at`, not historical `scheduled_instant`). Schema initialization records
+one database-incarnation UUID and a UTC coverage epoch in `execution_coverage`.
+An existing ledger starts at migration time, never at its oldest surviving row;
+all earlier history is explicitly unproven. Recreating the file creates a new
+identity and epoch. Readers must compare identity and read metadata plus attempts
+in the same SQLite read transaction.
+
+The `age` and `cap` rows in `execution_prune_watermarks` retain cumulative counts,
+the greatest parsed claim instant deleted, the count of unparseable deleted
+claim times, and the latest prune time. Updates share the existing lock and the
+same transaction as deletion; rolled-back deletes leave no watermark. The
+bounded row selection, policy order, protected rows, statuses and success
+semantics do not change. These two metadata tables stay constant-sized.
+
+The certificate proves only retention of ledger-admitted attempts, not ticker
+uptime, expected-slot accounting or outcome success. Mixed-version writers,
+manual SQL, restored backups and clock rollback need external continuity checks;
+a certificate inside the database cannot independently prove that the file was
+never restored. An old writer can still use the additive schema, but rolling
+back to it invalidates continuity because it cannot maintain the watermarks.
+
+Independent proposal: extend the ledger's existing schema initializer and
+bounded prune path rather than introduce another scheduler owner. Guidance was
+read at upstream `b3746e35ddd32079697728e2df57a9d78f1e9e32`; upstream PRs
+[#97818](https://github.com/NousResearch/hermes-agent/pull/97818) and
+[#126610](https://github.com/NousResearch/hermes-agent/pull/126610) address
+retention policy/fairness, not coverage epochs or deletion evidence. No proposed
+policy change was adopted. This remains a fork-local reliability consumer
+contract, with no new core tool, setting, telemetry or runtime activation.
+
 ## Verification and Retirement
 
 `tests/cron/test_execution_retention.py` owns the time-window and bounded-cleanup
@@ -81,6 +116,14 @@ in-flight work, current job status, pending delivery, and canonical recovery. Ru
 alongside `test_execution_ledger.py` and
 `test_restart_safe_worker_death_evidence.py` to cover ordinary finishes,
 restart recovery, and dead-worker terminalization.
+
+`tests/cron/test_execution_coverage.py` owns fresh/migrated/recreated epochs,
+read-only proof queries, concurrent initialization and prune calls, per-reason
+counts, parsed-offset maxima, monotone updates, rollback atomicity and refusal
+of proof after an unparseable deletion. Retire the coverage addition only with
+an equivalent read-only completeness contract. Leaving the metadata tables on
+disk is harmless, but running a pruner that does not maintain them invalidates
+their evidence until a new epoch is established.
 
 Retire this divergence only when the selected upstream release passes the same
 window, ceiling, timestamp, and bounded-cleanup contract. Roll back the pruning
