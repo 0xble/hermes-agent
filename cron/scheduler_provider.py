@@ -518,13 +518,10 @@ class InProcessCronScheduler(CronScheduler):
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
                 else:
-                    owner_error = stores.try_retain(get_process_hermes_home())
-                    cron_tick(
+                    stores.run(get_process_hermes_home(), cron_tick,
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
                     )
-                    if owner_error is not None:
-                        raise owner_error
                 ok = True
             except BaseException as e:
                 # BaseException, not Exception: a SystemExit must not silently kill the ticker;
@@ -609,14 +606,13 @@ class InProcessCronScheduler(CronScheduler):
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
         # cron workspace via the heartbeat below (#47368).
         for entry in initial_homes:
-            _, home = _profile_entry(entry)
+            profile_name, home = _profile_entry(entry)
             try:
                 with _profile_cron_scope(home):
                     from cron.oneshot_retirement import record_ticker_start
                     record_ticker_start()
                     recovered = self.recover_interrupted()
-                    if profile_gate is None or profile_gate(*_profile_entry(entry)):
-                        stores.retain(home)
+                    stores.retain(home, gate=profile_gate, profile_name=profile_name)
                     if recovered:
                         logger.warning(
                             "Marked %d interrupted cron execution(s) for profile at %s",
@@ -665,13 +661,10 @@ class InProcessCronScheduler(CronScheduler):
                     for _pname, home in cycle_homes:
                         try:
                             with _profile_cron_scope(home):
-                                owner_error = stores.try_retain(home)
-                                cron_tick(
+                                stores.run(home, cron_tick,
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,
                                 )
-                                if owner_error is not None:
-                                    raise owner_error
                         except CronTickYielded as e:
                             # Yield for THIS profile only; one fresh gateway must not stop others.
                             logger.info("Cron tick yielded for profile at %s: %s", home, e)

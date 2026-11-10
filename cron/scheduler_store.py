@@ -18,11 +18,13 @@ class ExecutionStoreOwners(AbstractContextManager):
     def __init__(self):
         self._connections: dict[Path, sqlite3.Connection] = {}
 
-    def retain(self, home: Path | str) -> None:
+    def retain(self, home: Path | str, *, gate=None, profile_name=None) -> None:
         # The ticker has already bound this home's profile scope. Use the same
         # initializer and WAL fallback as ordinary ledger work, not a second stack.
         from cron.executions import _connect
 
+        if gate is not None and not gate(profile_name, home):
+            return
         key = Path(home).resolve()
         if key not in self._connections:
             conn = _connect()
@@ -35,13 +37,17 @@ class ExecutionStoreOwners(AbstractContextManager):
                 raise
             self._connections[key] = conn
 
-    def try_retain(self, home):
-        """Defer acquisition failure until after the tick's degraded-store cleanup."""
+    def run(self, home, action, **kwargs):
+        """Attempt ownership before work; report failure after degraded-store cleanup."""
+        error = None
         try:
             self.retain(home)
         except BaseException as exc:
-            return exc
-        return None
+            error = exc
+        result = action(**kwargs)
+        if error is not None:
+            raise error
+        return result
 
     def discard_except(self, homes) -> None:
         current = {Path(home).resolve() for home in homes}
