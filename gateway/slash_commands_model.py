@@ -355,8 +355,8 @@ class GatewayModelCommandsMixin:
         if not isinstance(model_cfg, dict):
             model_cfg = {}
         if configured_route is None:
-            from hermes_cli.model_alias_runtime import DefaultRoute
-            configured_route = DefaultRoute()
+            from hermes_cli.model_alias_runtime import AliasRoute
+            configured_route = AliasRoute()
         base_url = result.base_url or ctx.current_base_url or ""
         config_ctx = effective_context_pin(
             config_ctx, result.new_model, result.target_provider, base_url,
@@ -1433,11 +1433,11 @@ class GatewayModelCommandsMixin:
         from gateway.run import _load_gateway_config
         from hermes_cli.codex_runtime_switch import get_current_runtime
         _session_route = ((getattr(self, "_session_model_overrides", {}) or {}).get(session_key) or {})
-        from hermes_cli.model_alias_runtime import DefaultRoute, resolve_default_route
+        from hermes_cli.model_alias_runtime import AliasRoute, resolve_default_route
         _default_route = None
         with contextlib.suppress(Exception):
             _default_route = resolve_default_route(_load_gateway_config(config_path=self.config_path))
-        _default_route = _default_route or DefaultRoute()
+        _default_route = _default_route or AliasRoute()
         _route = (
             _session_route.get("provider") or _default_route.provider,
             _session_model or _default_route.model,

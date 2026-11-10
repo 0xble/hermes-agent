@@ -41,3 +41,5 @@ an explicit parent pick precedence over a model_map route's effort. There is no
 configuration switch to reverse it. Route defaults work when the parent has no
 explicit pick. A parent pick of max can therefore override these non-max routes.
 No core precedence change is included in this migration.
+
+Gateway model confirmation and reasoning status use the same `AliasRoute` value for an empty default route. The retired preset DTO is not retained as a compatibility shim. Existing model-confirmation and reasoning-command tests exercise these consumers.
