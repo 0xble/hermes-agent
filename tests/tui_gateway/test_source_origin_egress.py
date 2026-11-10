@@ -6,6 +6,7 @@ import json
 import logging
 import queue
 import threading
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -57,12 +58,74 @@ def test_stamped_turn_survives_history_and_next_compute_turn(platform, kind, bou
         assert decoded["history"][0]["content"] == "Continue the fictional task."
 
 
-@pytest.mark.parametrize("boundary", [
-    "raw-history", "rpc-stdio", "rpc-fanout", "websocket", "websocket-batch",
-    "event-replay", "event-publisher", "compute-host-output", "worker-journal", "durable-result",
-])
+def _stdio_egress(event, *, fanout=False):
+    output = io.StringIO()
+    transport = StdioTransport(lambda: output, threading.Lock())
+    if fanout:
+        transport = FanoutTransport(transport)
+    assert transport.write(event)
+    if fanout:
+        assert transport.flush(timeout=5)
+    return json.loads(output.getvalue())
+
+
+def _websocket_egress(event, *, batch=False):
+    sent = []
+    async def send_text(line):
+        sent.append(json.loads(line))
+    async def send():
+        transport = WSTransport(SimpleNamespace(send_text=send_text), asyncio.get_running_loop())
+        if batch:
+            assert await transport.write_many_async([event])
+        else:
+            assert await transport.write_async(event)
+    asyncio.run(send())
+    assert len(sent) == 1
+    return sent[0]
+
+
+def _publisher_egress(event):
+    publisher = WsPublisherTransport.__new__(WsPublisherTransport)
+    publisher._dead, publisher._ws, publisher._worker = False, object(), object()
+    publisher._q = queue.Queue()
+    assert publisher.write(event)
+    return json.loads(publisher._q.get_nowait())
+
+
+def _compute_egress(event):
+    host = ComputeHost.__new__(ComputeHost)
+    host._write_lock, host._stdout = threading.Lock(), io.StringIO()
+    host.emit({"type": "rpc", "message": event})
+    return json.loads(host._stdout.getvalue())["message"]
+
+
+def _worker_egress(event):
+    from agent.runtime_session_store import _worker_json_default
+    return json.loads(json.dumps(event, allow_nan=False, default=_worker_json_default))
+
+
+def _durable_egress(event):
+    from gateway.session_results import _redacted
+    return json.loads(json.dumps(_redacted(event)))
+
+
+_HISTORY_EGRESS = {
+    "raw-history": lambda event: json.loads(json.dumps(event)),
+    "rpc-stdio": _stdio_egress,
+    "rpc-fanout": partial(_stdio_egress, fanout=True),
+    "websocket": _websocket_egress,
+    "websocket-batch": partial(_websocket_egress, batch=True),
+    "event-replay": lambda event: json.loads(_freeze_params(event)),
+    "event-publisher": _publisher_egress,
+    "compute-host-output": _compute_egress,
+    "worker-journal": _worker_egress,
+    "durable-result": _durable_egress,
+}
+
+
+@pytest.mark.parametrize("boundary", _HISTORY_EGRESS)
 def test_native_human_and_generated_turns_survive_every_history_json_egress(boundary):
-    """Exercise the JSON sinks found across live history, transport, replay and export.
+    """Exercise each JSON sink found across live history, transport, replay and persistence.
 
     WebSocket single/batch, stdio and fanout share serialize_frame. Compute-host output,
     event replay, the publisher and worker persistence each have their own encoder.
@@ -75,51 +138,8 @@ def test_native_human_and_generated_turns_survive_every_history_json_egress(boun
     generated = _stamped_history()
     history = human["history"] + generated["history"]
     event = {"type": "history", "session_id": "fictional", "messages": history}
-    frame = {"jsonrpc": "2.0", "id": "fixture", "result": event}
-    if boundary in {"rpc-stdio", "rpc-fanout"}:
-        output = io.StringIO()
-        transport = StdioTransport(lambda: output, threading.Lock())
-        if boundary == "rpc-fanout":
-            transport = FanoutTransport(transport)
-        assert transport.write(frame)
-        if boundary == "rpc-fanout":
-            assert transport.flush(timeout=5)
-        decoded = json.loads(output.getvalue())
-        assert "error" not in decoded and decoded["result"]["messages"] == history
-    elif boundary in {"websocket", "websocket-batch"}:
-        sent = []
-        async def send_text(line):
-            sent.append(json.loads(line))
-        async def send():
-            transport = WSTransport(SimpleNamespace(send_text=send_text), asyncio.get_running_loop())
-            if boundary == "websocket-batch":
-                assert await transport.write_many_async([frame])
-            else:
-                assert await transport.write_async(frame)
-        asyncio.run(send())
-        assert len(sent) == 1 and "error" not in sent[0]
-        assert sent[0]["result"]["messages"] == history
-    elif boundary == "event-replay":
-        assert json.loads(_freeze_params(event))["messages"] == history
-    elif boundary == "event-publisher":
-        publisher = WsPublisherTransport.__new__(WsPublisherTransport)
-        publisher._dead, publisher._ws, publisher._worker = False, object(), object()
-        publisher._q = queue.Queue()
-        assert publisher.write(event)
-        assert json.loads(publisher._q.get_nowait())["messages"] == history
-    elif boundary == "compute-host-output":
-        host = ComputeHost.__new__(ComputeHost)
-        host._write_lock, host._stdout = threading.Lock(), io.StringIO()
-        host.emit({"type": "rpc", "message": event})
-        assert json.loads(host._stdout.getvalue())["message"]["messages"] == history
-    elif boundary == "worker-journal":
-        from agent.runtime_session_store import _worker_json_default
-        assert json.loads(json.dumps(event, allow_nan=False, default=_worker_json_default))["messages"] == history
-    elif boundary == "durable-result":
-        from gateway.session_results import _redacted
-        assert json.loads(json.dumps(_redacted(event)))["messages"] == history
-    else:
-        assert json.loads(json.dumps(history)) == history
+    decoded = _HISTORY_EGRESS[boundary](event)
+    assert "error" not in decoded and decoded["messages"] == history
     assert retention_user_text(text, human["history"]) == text
     assert retention_user_text(text, json.loads(json.dumps(human["history"]))) is None
     assert retention_user_text(text, generated["history"]) is None
