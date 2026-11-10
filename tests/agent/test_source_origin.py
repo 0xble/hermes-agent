@@ -102,6 +102,11 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
         assert "3 projects" in clean[0]["content"]
         assert "Help recover my password." in clean[0]["content"]
         assert "482913" not in json.dumps(_redact_for_provider("Recovery code: 482913", "482913"))
+        for material in ("Recovery code: `alpha beta`.", "Recovery codes: 482913, 573024.",
+                         'Password is "fictional phrase".'):
+            safe = _redact_for_provider(material + " Keep notices off. Limit is 12.")
+            assert all(value not in safe for value in ("alpha", "beta", "482913", "573024", "fictional phrase"))
+            assert "Keep notices off." in safe and "12" in safe
         from agent.memory_manager import MemoryManager
         retained = []
         class FictionalArchive:
@@ -129,7 +134,7 @@ def test_native_occurrences_hold_unknown_and_preserve_only_supported_spans(tmp_p
         assert classify_origin(db.get_messages("allowed")[0], session_id="allowed").status == "unknown"
         # The already-merged readiness contract must never return green for an unloadable client.
         from plugins.memory.hindsight import HindsightMemoryProvider
-        import plugins.memory.hindsight as hindsight
+        from plugins.memory import hindsight
         provider = HindsightMemoryProvider()
         monkeypatch.setattr(hindsight, "_load_config", lambda: {"mode": "local_external"})
         monkeypatch.setattr(hindsight, "_ensure_client_dependency", lambda: None)
