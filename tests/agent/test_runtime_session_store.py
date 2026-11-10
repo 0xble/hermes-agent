@@ -151,3 +151,24 @@ def test_worker_store_persists_and_restores_the_tools_prefix_pin(tmp_path):
             store._outbox_owner.close()
     finally:
         db.close()
+
+
+def test_worker_outbox_omits_native_origin_without_losing_transcript(tmp_path):
+    from agent.source_origin import NativeOrigin, ORIGIN_KEY
+
+    seen = []
+    def rpc(method, **params):
+        seen.append(params["payload"])
+        return {"count": 1, "annotations": [{}]}
+
+    text = "fictional worker task"
+    receipt = NativeOrigin.generated(text, producer="subagent", event="worker")
+    message = {"role": "user", "content": text, "display_metadata": {ORIGIN_KEY: receipt}}
+    store = RuntimeSessionStore(rpc, {"session_id": "fixture"}, tmp_path / "private")
+    try:
+        assert store.append_messages_batch("fixture", [message]) == 1
+        assert seen[0]["messages"][0]["content"] == text
+        assert seen[0]["messages"][0]["display_metadata"][ORIGIN_KEY] is None
+        assert message["display_metadata"][ORIGIN_KEY] is receipt
+    finally:
+        store.close()
