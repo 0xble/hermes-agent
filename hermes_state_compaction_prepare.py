@@ -5,12 +5,17 @@ from __future__ import annotations
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
+import hashlib
 import sqlite3
 import time
 from typing import Any
 
 from hermes_state_transactions import execute_transcript_write
 from hermes_state_write_metrics import current_write_metrics
+
+# Below this width the original SQL content matches cost less than building an index
+# and fencing a second read. Held-history/CAS proofs always use the snapshot.
+UNRESOLVED_SNAPSHOT_THRESHOLD = 8
 
 
 class CompactionSnapshotChanged(RuntimeError):
@@ -23,14 +28,19 @@ def _session_freshness(conn: sqlite3.Connection, session_id: str) -> tuple:
     session = conn.execute(
         'SELECT transcript_revision, runtime_revision, runtime_generation FROM sessions WHERE id = ?',
         (session_id,)).fetchone()
-    # The transcript revision trigger does not cover every CAS column (summary/identity markers,
-    # timestamps, etc.). Compare the raw owned values too, without decoding or hashing payloads
-    # under the writer lock. This also catches old writers and edits that preserve count/max-id.
-    columns = ', '.join(dict.fromkeys(('id', 'role', 'timestamp', 'message_uid', 'tool_call_uid', *_OWNED_COLUMNS)))
-    rows = tuple(tuple(row) for row in conn.execute(
+    # messages_transcript_revision_update fences the large transcript bodies, including writes
+    # by old builds. Fence only the remaining CAS/identity columns here. Stream their digest:
+    # sidecars can be large too, and no payload copy may ride across the commit.
+    revision_columns = {'role', 'content', 'api_content', 'tool_calls', 'tool_call_id',
+                        'tool_name', 'reasoning', 'reasoning_content', 'reasoning_details'}
+    columns = ', '.join(dict.fromkeys(('id', 'timestamp', 'message_uid', 'tool_call_uid',
+                                      *(c for c in _OWNED_COLUMNS if c not in revision_columns))))
+    digest = hashlib.blake2b(digest_size=16)
+    for row in conn.execute(
         f'SELECT {columns} FROM messages WHERE session_id = ? AND active = 1 ORDER BY id',
-        (session_id,)).fetchall())
-    return (tuple(session) if session is not None else None, len(rows), rows[-1][0] if rows else 0, rows)
+        (session_id,)):
+        digest.update(repr(tuple(row)).encode('utf-8', 'surrogatepass'))
+    return (tuple(session) if session is not None else None, digest.digest())
 
 
 @dataclass
@@ -86,7 +96,8 @@ def snapshot_compaction(db, session_id, options):
                     options['unresolved_held'], options['watermark'], options['held_messages'], options['held_for_cas'])
             except (StaleHeldHistory, HeldRowRewrittenError) as exc:
                 # Preserve lease error precedence, and revalidate before trusting a rejection.
-                coverage, error = None, exc
+                # A traceback would retain the proof's fetched payload rows across publication.
+                coverage, error = None, exc.with_traceback(None)
         finally:
             conn.rollback()
         return PreparedCompaction(session_id, freshness, coverage, time.monotonic() - started, error)
@@ -100,9 +111,12 @@ def snapshot_compaction(db, session_id, options):
 
 
 def execute_prepared_compaction(db, session_id: str, messages: list[dict[str, Any]], **options):
+    expensive = (options['held_messages'] is not None or options['held_for_cas'] is not None
+                 or (options['covered_ids'] is not None
+                     and len(options['unresolved_held'] or ()) > UNRESOLVED_SNAPSHOT_THRESHOLD))
     for attempt in range(3):
         fold_plan = db._display_fold_plan(session_id)
-        prepared = snapshot_compaction(db, session_id, options) if attempt < 2 else None
+        prepared = snapshot_compaction(db, session_id, options) if expensive and attempt < 2 else None
 
         @wraps(db.archive_and_compact)
         def commit(conn):
