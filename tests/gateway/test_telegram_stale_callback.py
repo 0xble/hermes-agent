@@ -39,7 +39,7 @@ class _RefusingQuery:
     def __init__(self, error: str = STALE, *, thread_id=None, is_topic_message=False):
         self.data = "mc:0"
         self.message = SimpleNamespace(
-            chat_id=12345, text="picker", message_thread_id=thread_id, is_topic_message=is_topic_message)
+            chat_id=12345, message_id=42, text="picker", message_thread_id=thread_id, is_topic_message=is_topic_message)
         self.from_user = SimpleNamespace(id=1, first_name="tester")
         self.edits: list = []
         self._error = error

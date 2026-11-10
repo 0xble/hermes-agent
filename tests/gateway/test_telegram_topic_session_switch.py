@@ -51,7 +51,7 @@ def _bound_topic(tmp_path, *extra_sessions: str):
         get_or_create_session=AsyncMock(return_value=_entry(key, "parent")),
         load_transcript=AsyncMock(return_value=[{"role": "user", "content": "research ozon"},
                                                 {"role": "assistant", "content": "working"}]),
-        switch_session=switch, set_model_override=AsyncMock(),
+        switch_session=switch, set_model_override=AsyncMock(), set_reasoning_override=AsyncMock(),
     )
     runner._clear_conversation_scope = lambda *_a, **_kw: None
     return db, runner
@@ -150,7 +150,7 @@ async def test_older_resume_finishing_last_does_not_undo_newer_switch(tmp_path):
             a_parked.set()
             await release_a.wait()
 
-    runner.async_session_store.set_model_override = AsyncMock(side_effect=park_first_resume)
+    runner.async_session_store.set_reasoning_override = AsyncMock(side_effect=park_first_resume)
     older = asyncio.create_task(runner._handle_resume_command(_make_event("/resume Older Work", thread_id=THREAD)))
     await a_parked.wait()
     runner.async_session_store.get_or_create_session.return_value = _entry(

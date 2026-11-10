@@ -209,7 +209,7 @@ from plugins.platforms.telegram.rich_messages import project_rich_message
 from plugins.platforms.telegram.rich_delivery import is_rich_capability_error, is_rich_fallback_error, rich_message_payload
 from plugins.platforms.telegram.telegram_audio_meta import (
     _coerce_duration_seconds, _probe_voice_duration_seconds, audio_player_fields, fit_thumbnail_jpeg)
-from plugins.platforms.telegram.telegram_dm_topic_send import dead_topic_may_reroute, dead_topic_retry_kwargs, private_chat, topic_gone
+from plugins.platforms.telegram.telegram_dm_topic_send import dead_topic_may_reroute, dead_topic_retry_kwargs, private_chat, text_topic_must_refuse, topic_gone
 from plugins.platforms.telegram.telegram_entities import (
     addressing_sources, addressing_text, expand_link_entities, expand_quote_link_entities, rich_message_text)
 from plugins.platforms.telegram.telegram_held_inbound import TelegramHeldInboundMixin
@@ -228,7 +228,7 @@ from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, build_ptb_requests, discover_fallback_ips, parse_fallback_ip_env,
     proxy_target_hosts)
 from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
-from plugins.platforms.telegram.telegram_send_path_recovery import TelegramSendPathRecoveryMixin, mark_send_path_recovered
+from plugins.platforms.telegram.telegram_send_path_recovery import mark_send_path_recovered
 from plugins.platforms.telegram.telegram_send_errors import LOST, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind
 from plugins.platforms.telegram.telegram_typing_gate import typing_may_fire
 from plugins.platforms.telegram.telegram_group_observe import apply_group_observe_attribution, shared_sender_suffix
@@ -900,7 +900,7 @@ class _PollingStallError(RuntimeError):
 
 class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramContactMixin, TelegramHeldInboundMixin,
                       TelegramReplacementMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, TelegramMediaFloodMixin,
-                      TelegramSendPathRecoveryMixin, BasePlatformAdapter):
+                      BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
     # Immutable defaults also support connectors assembled without __init__ in tests.
@@ -1866,7 +1866,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
     def _send_retry_is_final(self, result: SendResult) -> bool:
         """A send that may already be in the chat is never retried or re-sent as plain text."""
-        return isinstance(result.raw_response, dict) and bool(result.raw_response.get("delivery_uncertain"))
+        return (super()._send_retry_is_final(result)
+                or (isinstance(result.raw_response, dict) and bool(result.raw_response.get("delivery_uncertain"))))
 
     @staticmethod
     async def _record_rich_sent(chat_id: Any, message_id: Any, content: str) -> None:
@@ -4282,7 +4283,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
                 if _BadReq and isinstance(send_err, _BadReq):
                     if topic_gone(chat_id, send_err) and (effective_thread_id or (private_chat(chat_id) and thread_kwargs.get("direct_messages_topic_id"))):
-                        if metadata and metadata.get("telegram_dm_topic_created_for_send"):
+                        if text_topic_must_refuse(chat_id, metadata, retried=retried_thread_not_found, thread_id=effective_thread_id):
                             return SendResult(success=False, error=str(send_err), retryable=False)
                         # A one-off "thread not found" flake retries the same thread_id before any route change.
                         if effective_thread_id and not retried_thread_not_found:
@@ -8027,9 +8028,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     logger.warning("[Telegram] Failed to cache image document: %s", _redact_telegram_error_text(e), exc_info=True)
                     return self._note_instead_of_media(event, f"Image document '{display}' could not be read as an image.")
                 self._set_cached_media(
-                    event, cached_path, doc_mime if doc_mime.startswith(
-                        "image/"
-                    ) else _TELEGRAM_IMAGE_EXT_TO_MIME.get(image_ext, "image/jpeg"),
+                    event, cached_path, _TELEGRAM_IMAGE_EXT_TO_MIME.get(
+                        os.path.splitext(cached_path)[1].lower(), doc_mime or "image/jpeg"),
                     MessageType.PHOTO, "[Telegram] Cached user image-document at %s")
                 await self._route_photo_event(msg, event)
                 return True

@@ -339,6 +339,7 @@ def _secondary_runner(tmp_path, connect):
     from gateway.run import GatewayRunner
 
     runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
     runner.adapters = {}
     runner._failed_platforms = {}
     runner._profile_failed_platforms = {}

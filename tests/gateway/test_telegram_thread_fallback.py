@@ -1095,17 +1095,19 @@ _GONE_META = {"thread_id": "20197", "telegram_dm_topic_reply_fallback": True, "t
 
 
 @pytest.mark.asyncio
-async def test_deleted_anchor_and_dead_topic_text_reply_still_reaches_chat_root():
-    """Route changes (anchor drop, native id, root) must not spend the network retry budget."""
+async def test_deleted_anchor_text_reply_fails_closed_without_proven_dead_topic():
+    """An absent reply anchor alone does not prove that its private topic was deleted."""
     adapter = _make_adapter()
     call_log = []
     adapter._bot = _anchor_and_topic_gone_bot(call_log, "send_message")
 
     result = await adapter.send(chat_id="123", content="the answer", reply_to="462", metadata=dict(_GONE_META))
 
-    assert result.success is True
-    last = call_log[-1]
-    assert (last.get("message_thread_id"), last.get("direct_messages_topic_id"), last.get("reply_to_message_id")) == (None, None, None)
+    assert result.success is False
+    assert "not found" in result.error.lower()
+    assert len(call_log) == 1
+    assert call_log[0]["message_thread_id"] == 20197
+    assert call_log[0]["reply_to_message_id"] == 462
 
 
 @pytest.mark.asyncio
@@ -1181,7 +1183,9 @@ async def test_private_topic_unconfirmed_failure_keeps_binding_and_skips_root(tm
 
     adapter._bot = SimpleNamespace(send_message=mock_send_message)
 
-    with pytest.raises(type(err)):
+    from plugins.platforms.telegram.flood_guard import FloodRefusal
+    expected_error = FloodRefusal if isinstance(err, FakeRetryAfter) else type(err)
+    with pytest.raises(expected_error):
         await adapter._send_control_message("123", "control", parse_mode=None, thread_id="20197", metadata=dict(_GATEWAY_META))
     result = await adapter.send(chat_id="123", content="text", reply_to="462", metadata=dict(_GATEWAY_META))
 

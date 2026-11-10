@@ -129,7 +129,7 @@ async def test_stopping_a_profile_mid_recovery_leaves_no_reply_stranded(tmp_path
     again, not wait 'attempting' for a gateway restart."""
     import threading
     from types import SimpleNamespace
-    from unittest.mock import AsyncMock, MagicMock
+    from unittest.mock import AsyncMock
 
     import gateway.delivery_ledger as ledger
     from gateway.config import Platform
@@ -145,6 +145,7 @@ async def test_stopping_a_profile_mid_recovery_leaves_no_reply_stranded(tmp_path
 
     loop = asyncio.get_running_loop()
     stop_point, stopped, sent = asyncio.Event(), threading.Event(), []
+    release_operation = asyncio.Event()
     real_sweep = ledger.sweep_failed_for_runtime
 
     def _sweep(*args, **kwargs):
@@ -158,33 +159,41 @@ async def test_stopping_a_profile_mid_recovery_leaves_no_reply_stranded(tmp_path
     async def _clear(_session_key):
         if stop_during == "resume_clear" and not stopped.is_set():
             stop_point.set()
-            await asyncio.Event().wait()
+            await release_operation.wait()
+        return True
 
     async def _send(*, chat_id, content, metadata=None):
         if stop_during == "send" and not stopped.is_set():
             stop_point.set()
-            await asyncio.Event().wait()  # the first resend never completes before the stop
+            await release_operation.wait()  # cancellation must settle this same in-flight send
         sent.append(content)
         return SimpleNamespace(success=True, error=None)
 
     runner = object.__new__(GatewayRunner)
     runner.adapters = {}
-    runner._profile_adapters = {"work": {Platform.TELEGRAM: SimpleNamespace(send=_send)}}
+    runner._profile_adapters = {}
     runner.session_store = None
-    runner._async_session_store = MagicMock(_store=None, clear_resume_pending=_clear)
+    runner._async_session_store = SimpleNamespace(
+        _store=None, clear_resume_pending=_clear, get_resume_pending_marker=AsyncMock(return_value=None))
     runner._arm_flood_timers_for_waiting_rows = AsyncMock()
 
     adapter, generation = _degraded_adapter(runner)
+    adapter.send = _send
+    runner._profile_adapters = {"work": {Platform.TELEGRAM: adapter}}
     assert adapter._record_polling_progress(generation)
     await asyncio.wait_for(stop_point.wait(), timeout=5)
     stop = asyncio.ensure_future(adapter.cancel_background_tasks())  # what stopping the profile does
     await asyncio.sleep(0)
     stopped.set()
+    release_operation.set()
     await stop
-    assert sent == []
+    assert len(sent) == (1 if stop_during == "send" else 0)
 
     # The profile starts again and its next sweep runs.
-    assert await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile="work") == 3
+    assert await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile="work") == (
+        2 if stop_during == "send" else 3)
+    assert len(sent) == 3
+    assert all(sum(text.endswith(f"answer {oid}") for text in sent) == 1 for oid in ("ob-1", "ob-2", "ob-3"))
     states = {oid: ledger._connect().execute(
         "SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
         for oid in ("ob-1", "ob-2", "ob-3")}

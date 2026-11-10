@@ -35,6 +35,15 @@ def dead_topic_may_reroute(chat_id: Any, metadata: Any) -> bool:
     return private_chat(chat_id) and not (metadata or {}).get("telegram_dm_topic_created_for_send")
 
 
+def text_topic_must_refuse(chat_id: Any, metadata: Any, *, retried: bool, thread_id: Any) -> bool:
+    """Named-topic routing and final-response recovery retain their owning delivery boundary."""
+    options = metadata or {}
+    return bool(options.get("telegram_dm_topic_created_for_send") or (
+        (retried or thread_id is None) and private_chat(chat_id)
+        and options.get("telegram_dm_topic_reply_fallback")
+        and (options.get("notify") or options.get("_interim_send"))))
+
+
 def dead_topic_retry_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     """A control send's kwargs without the topic route, and without the anchor in a private chat."""
     retry = {k: v for k, v in kwargs.items() if k not in ("message_thread_id", "direct_messages_topic_id")}

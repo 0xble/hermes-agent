@@ -318,7 +318,7 @@ class TestVideoDownloadBlock:
                 super().__init__(name)
 
         fake_filters = SimpleNamespace(
-            **{name: _Names(name) for name in ("TEXT", "COMMAND", "LOCATION", "VENUE", "CONTACT", "PHOTO", "VIDEO",
+            **{name: _Names(name) for name in ("ALL", "TEXT", "COMMAND", "LOCATION", "VENUE", "CONTACT", "PHOTO", "VIDEO",
                                                 "VIDEO_NOTE", "AUDIO", "VOICE")},
             Document=SimpleNamespace(ALL=_Names("DOCUMENT")), Sticker=SimpleNamespace(ALL=_Names("STICKER")),
             StatusUpdate=None, MessageFilter=_Filter)
@@ -353,7 +353,14 @@ class TestVideoDownloadBlock:
 # TestImageDocuments — photos sent "as a file" (uncompressed)
 # ---------------------------------------------------------------------------
 
-_HEIC_BYTES = b"\x00\x00\x00\x18ftypheic\x00\x00\x00\x00mif1heic" + b"\x00" * 64
+def _heic_bytes():
+    from io import BytesIO
+    from PIL import Image
+    import pillow_heif
+
+    encoded = BytesIO()
+    pillow_heif.from_pillow(Image.new("RGB", (4, 4), "red")).save(encoded, format="HEIF")
+    return encoded.getvalue()
 
 
 class TestImageDocuments:
@@ -367,8 +374,9 @@ class TestImageDocuments:
         ("IMG_0002.HEIF", "image/heif", ".heif"),
     ])
     async def test_heic_document_is_cached_as_image(self, adapter, file_name, mime_type, ext):
+        data = _heic_bytes()
         doc = _make_document(file_name=file_name, mime_type=mime_type,
-                             file_size=len(_HEIC_BYTES), file_obj=_make_file_obj(_HEIC_BYTES))
+                             file_size=len(data), file_obj=_make_file_obj(data))
         msg = _make_message(document=doc)
 
         await adapter._handle_media_message(_make_update(msg), MagicMock())
@@ -377,8 +385,11 @@ class TestImageDocuments:
         adapter.handle_message.assert_awaited_once()
         event = adapter.handle_message.await_args.args[0]
         assert event.message_type == MessageType.PHOTO
-        assert len(event.media_urls) == 1 and event.media_urls[0].endswith(ext)
-        assert event.media_types == [mime_type]
+        assert len(event.media_urls) == 1 and event.media_urls[0].endswith(".png")
+        assert event.media_types == ["image/png"]
+        from PIL import Image
+        with Image.open(event.media_urls[0]) as cached:
+            assert cached.format == "PNG" and cached.size == (4, 4)
         assert "could not be read" not in (event.text or "")
 
     @pytest.mark.asyncio

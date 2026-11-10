@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 class GatewayStartupHandoffMixin:
-    async def _handoff_repoint(self, dest, session_key: str, cli_session_id: str) -> None:
+    async def _handoff_repoint(self, dest, session_key: str, cli_session_id: str) -> Any:
         """Point the destination route at the handed-off conversation; ``switch_session`` ends the
         route's prior session and reopens this one. A handoff carries the conversation the user is
         looking at: a local chat's latest ``/new`` segment, then that segment's compression tip
@@ -19,6 +19,7 @@ class GatewayStartupHandoffMixin:
             raise RuntimeError(f"could not switch session key {session_key} → {target}")
         if authority is not None:
             follow_hand_off(authority, dest.source, session_key, authority.logical_owner(target), local_owner)
+        return switched
 
 
     async def _process_handoff(self, row: dict[str, Any], profile_name: Optional[str] = None) -> None:
@@ -32,7 +33,7 @@ class GatewayStartupHandoffMixin:
         cli_session_id = row["id"]
         dest = await self._handoff_resolve_destination(row, profile_name)
         session_key = self._handoff_session_key(dest, profile_name)
-        await self._handoff_repoint(dest, session_key, cli_session_id)
+        await self._handoff_repoint_with_topic_binding(dest, session_key, cli_session_id)
         # Evict the cached AIAgent (rebuild against the CLI session_id, like /resume) and clear stale
         # running-agent state so the synthetic turn isn't queued behind it.
         self._evict_cached_agent(session_key)

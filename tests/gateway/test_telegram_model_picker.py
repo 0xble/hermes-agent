@@ -121,6 +121,7 @@ async def test_group_callback_lists_a_member_written_with_uppercase(plain_keyboa
     query.data = "mpg:kimi"
     query.message = MagicMock()
     query.message.chat_id = 12345
+    query.message.message_id = 42
     query.from_user = MagicMock()
 
     await adapter._handle_model_picker_callback(query, "mpg:kimi", "12345")
@@ -150,6 +151,7 @@ async def test_tapping_a_provider_shows_distinguishable_model_buttons(plain_keyb
     query = AsyncMock()
     query.message = MagicMock()
     query.message.chat_id = 12345
+    query.message.message_id = 42
     query.from_user = MagicMock()
 
     await adapter._handle_model_picker_callback(query, "mp:bedrock", "12345")
@@ -173,6 +175,7 @@ async def _model_labels_for(provider: dict) -> list[str]:
     query = AsyncMock()
     query.message = MagicMock()
     query.message.chat_id = 12345
+    query.message.message_id = 42
     query.from_user = MagicMock()
     await adapter._handle_model_picker_callback(query, f"mp:{provider['slug']}", "12345")
     rows = query.edit_message_text.call_args[1]["reply_markup"].inline_keyboard

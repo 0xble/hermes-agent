@@ -4,17 +4,21 @@ Upstream's accepted-background-delete contract would evict the status owner befo
 the deletion happens. The fork keeps that owner and performs no request or task
 inside the shared flood window.
 """
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from gateway.config import PlatformConfig
+from plugins.platforms.telegram import flood_state
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("wait", [1.0, 240.0])
-async def test_flood_refused_delete_keeps_owner_until_actual_retry(wait):
+async def test_flood_refused_delete_keeps_owner_until_actual_retry(wait, monkeypatch):
+    wall = [1000.0]
+    monkeypatch.setattr(flood_state, "time", SimpleNamespace(time=lambda: wall[0]))
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fixture"))
     adapter._bot = MagicMock()
     adapter._bot.delete_message = AsyncMock(return_value=True)
@@ -26,6 +30,7 @@ async def test_flood_refused_delete_keeps_owner_until_actual_retry(wait):
     adapter._bot.delete_message.assert_not_awaited()
     assert adapter._status_message_ids[key] == "55"
     assert set(adapter._background_tasks) == tasks
+    wall[0] += wait + 1
     adapter.__dict__["_telegram_send_cooldown_until"].clear()
     adapter.__dict__["_telegram_platform_flood_until"].clear()
     assert await adapter.delete_message("4242", "55") is True

@@ -122,7 +122,7 @@ class GatewayTurnPersistenceMixin:
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
-        from gateway.response_filters import is_machinery_display_kind, strip_trailing_silence_marker
+        from gateway.response_filters import is_machinery_display_kind, strip_edge_silence_markers
         from gateway.run_turn import _unexpected_silence_reply
         _silence_kind = agent_result.get("queued_terminal_display_kind", persist_user_display_kind)
         _silence_reply_expected = agent_result.get("queued_terminal_reply_expected", reply_expected)
@@ -177,7 +177,7 @@ class GatewayTurnPersistenceMixin:
         # Normalize empty responses: surface errors, partial failures, and work-without-text.
         # Fix for #18765.
         if not _intentional_silence:
-            response = strip_trailing_silence_marker(response)
+            response = strip_edge_silence_markers(response)
             # A bot peer gets the model's own words only: the runtime's retry hints and "not
             # processed" lines are new inbound messages for its turn loop (#137027).
             if automatic_notices_allowed(source):

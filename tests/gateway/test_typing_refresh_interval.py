@@ -262,7 +262,7 @@ async def test_telegram_lock_busy_tick_returns_sentinel_and_retries_through_real
     adapter._bot.send_chat_action = AsyncMock(side_effect=chat_action)
     adapter.send_typing = typing
     monkeypatch.setattr(adapter, "_chat_budget", lambda: SimpleNamespace(
-        typing_blocked=lambda key: False, try_take=lambda key, kind: True))
+        typing_blocked=lambda key: False, try_take=lambda key, kind: True, remaining=lambda key: 0))
     monkeypatch.setattr(adapter, "_daily_sheds", lambda key, kind: False)
     monkeypatch.setattr(adapter, "_bot_meters_chat_budget", lambda: True)
     monkeypatch.setattr(base_module.asyncio, "get_running_loop", lambda: _Clock())

@@ -171,7 +171,7 @@ def clear_stale_git_locks(repo_root: Path, *, min_age_seconds: Optional[int] = N
     return _sweep_stale(
         git_dir, lambda: [*(git_dir / name for name in (*LOCK_NAMES, *OBJECT_STORE_LOCK_NAMES)),
                           *ref_lock_files(git_dir)],
-        min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
+        repo_root=repo_root, min_age_seconds=min_age_seconds, default_age=STALE_LOCK_MIN_AGE_SECONDS,
         skip_msg="git process running; skipping stale-lock sweep",
         log_removed=lambda p, _size: logger.info("Removed stale git lock %s", p),
     )

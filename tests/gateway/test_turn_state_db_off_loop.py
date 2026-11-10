@@ -420,6 +420,7 @@ async def test_rehydrate_does_not_overwrite_concurrent_choice(change, phase, mon
                 new_model="new-model", target_provider="probe", api_key="new-key",
                 base_url="https://probe.invalid/v1", api_mode="chat_completions",
                 request_overrides={}, runtime_capabilities={}, provider_label="probe",
+                alias_endpoint_applied=False,
             )
             ctx = _ModelSwitchContext(key, source, tmp_path / "config.yaml", False,
                                       current_model="old-model")

@@ -32,7 +32,7 @@ def _delivered(source):
         loop = asyncio.get_running_loop()
         ctx = TurnContext(source=source, user_config={}, _run_still_current=lambda: True, _loop_for_step=loop)
         ctx._status_adapter, ctx._status_chat_id, ctx._status_thread_metadata = Transport(), source.chat_id, None
-        runner = TurnRunner(None, ctx)
+        runner = TurnRunner(SimpleNamespace(_delivery_adapter_for=lambda _source: ctx._status_adapter), ctx)
 
         def emit():
             runner._status_callback_sync("warn", WARNING)

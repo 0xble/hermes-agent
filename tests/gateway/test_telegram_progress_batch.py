@@ -165,7 +165,7 @@ async def test_flood_batch_retries_transient_failures_with_backoff(tmp_path, mon
     times = [at for at, _ in attempts]
     assert len(attempts) == 5  # The isolated batch retries through recovery, without new events.
     assert times[1] >= times[0] + 12
-    assert [b - a for a, b in itertools.pairwise(times)] == [10, 20, 40]
+    assert [b - a for a, b in itertools.pairwise(times)] == [12, 10, 20, 40]
     assert all(text == "first\nsecond\nthird" for _, text in attempts[1:])
     assert adapter._bot.send_message.await_count == 1
 

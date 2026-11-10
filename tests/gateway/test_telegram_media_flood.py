@@ -32,6 +32,8 @@ def flooded(monkeypatch, tmp_path):
     # Shrink the inline cap so a 0.2 s penalty counts as "long": the deferred path runs in real time.
     monkeypatch.setattr(tg_adapter, "_FLOOD_INLINE_WAIT_CAP_SECS", 0.05)
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
+    # Isolate flood deferral from the pacing gap, which also floors the inline wait cap.
+    adapter._telegram_chat_outbound_slot_secs = 0.0
     adapter._bot = SimpleNamespace(send_document=AsyncMock(), send_message=AsyncMock())
     adapter.send = AsyncMock()  # any text notice would land here
     doc = tmp_path / "report.txt"

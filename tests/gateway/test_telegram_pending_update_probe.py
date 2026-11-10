@@ -94,6 +94,8 @@ async def test_first_stuck_pending_probe_requests_prompt_recheck():
     after the short confirm interval instead of a full heartbeat (#139281)."""
     adapter = _make_adapter(pending=9)
     with patch.object(adapter, "_handle_polling_network_error", new=AsyncMock()) as rec:
+        await adapter._probe_pending_updates(adapter._app.bot, 5)  # dispatch baseline only
+        assert adapter._polling_pending_stuck_count == 0
         prompt = await adapter._probe_pending_updates(adapter._app.bot, 5)
     assert prompt is True
     assert adapter._polling_pending_stuck_count == 1
@@ -105,9 +107,12 @@ async def test_second_stuck_pending_probe_escalates_and_ends_recheck():
     """The confirming probe escalates through the recovery ladder and returns
     False so the loop goes back to the full heartbeat interval."""
     adapter = _make_adapter(pending=9)
-    adapter._polling_pending_stuck_count = 1
     recovery = AsyncMock()
     with patch.object(adapter, "_handle_polling_network_error", new=recovery):
+        await adapter._probe_pending_updates(adapter._app.bot, 5)  # dispatch baseline only
+        await adapter._probe_pending_updates(adapter._app.bot, 5)  # first stuck observation
+        assert adapter._polling_pending_stuck_count == 1
+        recovery.assert_not_awaited()
         prompt = await adapter._probe_pending_updates(adapter._app.bot, 5)
         task = adapter._polling_error_task
         assert task is not None
