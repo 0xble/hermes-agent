@@ -995,10 +995,11 @@ _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB = (
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
 _DROPPED_TOOL_ARGUMENTS_LARGE_THRESHOLD_CHARS = 8_000 * CHARS_PER_TOKEN
 def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[list[str]] = None,
-    dropped_tool_argument_chars: int = 0) -> str:
+    dropped_tool_argument_chars: int = 0, dropped_tool_continuation_count: int = 0) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
-        if dropped_tool_argument_chars > _DROPPED_TOOL_ARGUMENTS_LARGE_THRESHOLD_CHARS:
+        if (dropped_tool_argument_chars > _DROPPED_TOOL_ARGUMENTS_LARGE_THRESHOLD_CHARS
+                or dropped_tool_continuation_count >= 2):
             return (f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was too large and the stream "
                 "timed out before it could be delivered. Do NOT retry the same tool call with the same "
                 "large content. Break the content into multiple smaller tool calls under ~8K tokens. "

@@ -2541,12 +2541,13 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
     dropped_tool_names=None, dropped_tool_argument_chars=0, overflow_terminal=False, api_mode=None, clean_eof=False):
-    """Stub for an SSE stream that ended without ``finish_reason`` after
-    delivering content. Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH``
-    so the loop enters its continuation/retry path instead of accepting
-    truncated output as a complete turn (#32086). Overflow is terminal (#106260),
-    Anthropic preserves its Messages shape (#45908), and ``clean_eof`` distinguishes
-    a clean server close from a transport exception (#102766)."""
+    """Stub for an SSE stream that ended without ``finish_reason`` after delivering content.
+    Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH`` so the loop continues instead of accepting
+    truncated output (#32086). ``overflow_terminal`` marks context overflow because seeding recovered text
+    would grow every request into the same overflow (#106260). Anthropic keeps a Messages-shaped stub so validation
+    accepts ``max_tokens``; empty content keeps one text block because an empty list is rejected (#45908). ``clean_eof``
+    marks a server/intermediary close with no exception or finish reason. Only the two clean-EOF sites pass True;
+    transport exceptions keep False for distinct failure wording (#102766)."""
     if api_mode == "anthropic_messages":
         return SimpleNamespace(
             id=PARTIAL_STREAM_STUB_ID,
@@ -4046,7 +4047,9 @@ class _StreamingCall(StreamingWaitMonitor):
         self._stream_stale_timeout = _cloud_stale_timeout_for(self.agent, self.api_kwargs)
 
     def _partial_stream_stub(self, error):
-        """Turn delivered tokens into a safe continuation stub; empty text is not persisted (#112419)."""
+        """Tokens already reached the platform: a length stub fires continuation and ``tool_calls=None`` blocks incomplete calls.
+        Content may be EMPTY (dropped call, overflow), so the loop sends only the nudge rather
+        than persisting placeholder text. Text-only deaths with 0 visible chars are reclassified as undelivered (#112419)."""
         _partial_text = (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip() or None
         _partial_names = list(self.result.get("partial_tool_names") or [])
         # Classify the error before it is swallowed into the stub: the loop reads the
@@ -4072,8 +4075,7 @@ class _StreamingCall(StreamingWaitMonitor):
             _name_str = ", ".join(_partial_names[:3])
             if len(_partial_names) > 3:
                 _name_str += f", +{len(_partial_names) - 3} more"
-            _warn = (f"\n\n⚠ Stream cut mid tool-call ({_name_str}); retrying automatically. "
-                     "The action was not executed.")
+            _warn = f"\n\n⚠ Stream cut mid tool-call ({_name_str}). The action was not executed."
             _partial_text = (_partial_text or "") + _warn
             if self.agent._warning_presentation_enabled():
                 self._quiet(self.agent._fire_stream_delta, _warn)

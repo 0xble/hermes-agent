@@ -1446,7 +1446,7 @@ class TestPartialToolCallWarning:
             f"Stub content is missing the dropped-tool-call warning; users "
             f"get silent failure.  Got content={content!r}"
         )
-        assert "write_file" in content and "retrying automatically" in content and "Ask me to retry" not in content, (
+        assert "write_file" in content and "the action was not executed" in content.lower() and "retrying automatically" not in content and "Ask me to retry" not in content, (
             f"Warning should name the dropped tool. Got: {content!r}"
         )
         assert response.choices[0].message.tool_calls is None
