@@ -12,6 +12,23 @@ The existing idle environment reaper owns child snapshots and preserves environm
 
 Contract tests: `tests/tools/test_local_delegated_shell_isolation.py`, `tests/tools/test_shared_container_task_id.py`.
 
+## Default-profile live home containment
+
+Patch identity: `default-child-live-home`.
+
+The default-profile terminal, PTY, `execute_code` and persistent-shell snapshot children do not
+receive the live default `HERMES_HOME`. Named profiles, cron workers and remote backends keep their
+existing environment. Delegated children keep their Kanban lineage fence through
+`HERMES_KANBAN_HOME` as a fallback, and an explicit child `HERMES_HOME` resolves its own board.
+
+On 2026-11-11 a Codex cleanup ran `rmtree($HERMES_HOME)` after scoping a scratch value to only
+pytest, and wiped the live `~/.hermes`.
+
+This does not cover commands that name `~/.hermes` literally. The shell-guard `home_env_delete` rule
+covers those commands.
+
+Contract tests: `tests/tools/test_default_child_hermes_home.py`, `tests/tools/test_delegate_kanban_isolation.py::test_delegate_child_kanban_cli_cannot_delete_parent_board`, `tests/tools/test_kanban_descendant_scope.py::test_child_shell_can_write_a_kanban_board_outside_its_lineage_root`.
+
 ## Evidence and upstream disposition
 
 Fork base: `9add22c5a5fb54605cc374841721ca9f5c2cc535`. Upstream main inspected: `a212421dbd5070ce70204a88af4b3c3c2aaa2b18`. Upstream root and subsystem guidance require a real reproduction and preserving intentional container sharing. Related open upstream PRs #140434 (cwd-record ownership) and #83430 (opt-in container sandboxing, explicitly not local shells) do not fix default local export snapshot sharing. No competing fork PR was found in the initial shell/child-terminal/environment searches. No upstream submission is part of this change.

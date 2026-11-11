@@ -320,6 +320,25 @@ def _filter_secret_env(
             out[key] = value
 
 
+def _strip_default_profile_home(env: dict) -> dict:
+    """Remove the explicit default home from model-driven local children.
+
+    Hermes code falls back to the same platform default when HERMES_HOME is absent. Keeping the
+    variable for routed/named profiles is required because it is their profile-home route; the
+    caller supplies that route before this helper runs.
+    """
+    from hermes_constants import _expand_hermes_home, _get_platform_default_hermes_home
+    raw_home = str(env.get("HERMES_HOME", "")).strip()
+    if not raw_home:
+        return env
+    try:
+        if _expand_hermes_home(raw_home).resolve() == _get_platform_default_hermes_home().resolve():
+            env.pop("HERMES_HOME", None)
+    except (OSError, RuntimeError, ValueError):
+        pass
+    return env
+
+
 def _finalize_child_env(env: dict) -> dict:
     """Guards shared by every spawn surface: profile-home propagation, session-context
     bridging, Hermes-owned PYTHONPATH + venv-marker strip, MSYS defaults, delegate_task
@@ -828,7 +847,7 @@ def _make_run_env(env: dict) -> dict:
     if published:
         run_env.update(published)
         run_env.pop("WAYLAND_DISPLAY", None)  # X11 desktop; a leaked Wayland socket flips GTK/Chromium backends
-    return run_env
+    return _strip_default_profile_home(run_env)
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---
