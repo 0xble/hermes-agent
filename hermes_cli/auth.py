@@ -1406,7 +1406,7 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
             return ""
         # This hint can reach chat through AuthError. Keep authored diagnostics local.
         return "Config issues detected. Run 'hermes doctor' for local diagnostics."
-    except Exception:
+    except Exception:  # health: allow BLE001 -- provider hint generation is best-effort and must not mask auth errors
         return ""
 
 
