@@ -608,7 +608,9 @@ def display_metadata_for_event(event: Any) -> dict:
     ``title_preview`` (titler-only) a canonical admission committed for this exact event."""
     from gateway.session_display import admission_display
     preview = admission_display(event).get("title_preview")
-    return {**_producer_card(event), **({"title_preview": preview} if preview else {})}
+    from gateway.checkin_delivery import transcript_metadata
+    return {**_producer_card(event), **({"title_preview": preview} if preview else {}),
+            **transcript_metadata(event)}
 
 
 def persisted_user_metadata_for_event(event: Any) -> dict:

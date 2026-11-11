@@ -10,8 +10,12 @@ from __future__ import annotations
 from tests.tui_gateway._thread_fixtures import patch_server_threads
 import subprocess
 
+import pytest
+
 from hermes_state import SessionDB
 from tui_gateway import server
+
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
 
 
 class _ImmediateThread:

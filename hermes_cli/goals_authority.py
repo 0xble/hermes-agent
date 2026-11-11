@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from itertools import pairwise
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("hermes_cli.goals")
@@ -245,6 +246,66 @@ def _removal_instruction_units(source: str, goal: str = "") -> list[tuple[str, s
                 targets = removal.group(2)
                 instructions.append((removal.group(1), targets, quoted_targets))
     return instructions
+
+
+def _bound_removal_instruction_units(source: str, requirements: list[str]) -> list[tuple[str, str, list[str]]]:
+    """Parse removal directives with exact existing requirement names as inert data.
+
+    Binding precedes sentence splitting and authority checks: a name can itself
+    contain negation, conditions or punctuation. Only a name immediately following
+    a removal verb (and optional noun wrapper) can be bound. The remaining entire
+    instruction must still be an unconditional removal, never an example, question,
+    alternative or quoted/code command. Inclusive scope text grants no extra target.
+    """
+    from hermes_cli.session_controls import _message_grants_authority
+
+    source = unicodedata.normalize("NFKC", source).translate(str.maketrans({
+        "\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"})).casefold()
+    marker = "__goal_removal_target_"
+    if marker in source:
+        return []
+    direct = _mask_non_authoritative_spans(source)
+    noun = r"(?:constraint|requirement|criterion|rule)"
+    head = rf"\b{_REMOVAL_VERBS}\s+(?:(?:the\s+)?{noun}\s+)?"
+    spans = {}
+    for value in dict.fromkeys(_normalize_authority_value(item) for item in requirements):
+        if not value:
+            continue
+        name = r"\s+".join(re.escape(part) for part in value.split())
+        target = rf'''(?:"{name}[.!?;]*"|'{name}[.!?;]*'|{name})(?=$|[\s.!;?,])'''
+        for match in re.finditer(rf"{head}(?P<target>{target})", source, re.IGNORECASE):
+            start, end = match.span("target")
+            # Commands in examples/quotes/code never bind names, even if their
+            # target spelling is an exact existing requirement.
+            if direct[match.start():start] == source[match.start():start]:
+                spans[(start, end)] = value
+    ordered = sorted(spans)
+    if not ordered or any(left[1] > right[0] for left, right in pairwise(ordered)):
+        return []  # Overlapping interpretations are ambiguous, not a longest-name guess.
+    bound = {f"{marker}{index}__": spans[span] for index, span in enumerate(ordered)}
+    for index in reversed(range(len(ordered))):
+        start, end = ordered[index]
+        source = source[:start] + f"{marker}{index}__" + source[end:]
+    # Inclusive scope is a closed allowlist: free text after the target could
+    # carry conditional, temporary or future-effective qualifiers a blocklist misses.
+    scope = (r"(?:anywhere\s+(?:(?:that|it)(?:'s|\s+is)\s+)?mentioned|everywhere"
+             r"(?:\s+(?:(?:that|it)(?:'s|\s+is)\s+)?mentioned)?|(?:in\s+)?memory|memories)")
+    grammar = (rf"\s*(?:please\s+)?(?P<verb>{_REMOVAL_VERBS})\s+"
+               rf"(?:(?:the\s+)?{noun}\s+)?(?P<target>{marker}\d+__)"
+               rf"(?:\s+{noun})?(?:,\s*including\s+{scope}(?:\s*,?\s*including\s+{scope})*"
+               rf"(?:\s*\(invalidate\))?)?[.!;\s]*")
+    if _NON_AUTHORITATIVE_SPANS_RE.search(source):
+        return []  # Only bound target data can be quoted/coded, never leftover context.
+    units = []
+    for authority, quoted, _original in _authority_unit_records(source):
+        match = re.fullmatch(grammar, authority, re.IGNORECASE)
+        if (not match or quoted or _unit_is_non_directive(authority) or not _message_grants_authority(authority)
+                or re.search(r"\b(?:and|or|but|except|excluding|keep|retain|preserve|leave|nothing|none|contingent|conditional|"
+                             r"example|actually|instead|rather|cancel|disregard|ignore|scratch)\b"
+                             r"|\b(?:subject to|as long as|in case|on condition)\b", authority, re.IGNORECASE)):
+            return []
+        units.append((match["verb"], bound[match["target"]], []))
+    return units
 
 
 def _explicit_restriction_removals(source: str, goal: str) -> tuple[bool, bool]:

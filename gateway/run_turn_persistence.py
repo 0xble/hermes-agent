@@ -719,12 +719,21 @@ class GatewayTurnPersistenceMixin:
         from agent.plan_limits import chat_refusal_wording
         return chat_refusal_wording(response, agent_result.get("failure_resets_at"))
 
+    def _event_thread_metadata(self, event, source):
+        """Thread metadata for a send that replies to ``event`` on ``source``."""
+        from gateway.checkin_delivery import delivery_metadata
+        return delivery_metadata(event, self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)))
+
     async def _deliver_turn_response_then_limit_offer(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, footer_line, intentional_silence,
     ):
         """``_hmwa_deliver_turn_response``, then, for a usage-window refusal, the limit offer: the limit
         sentence is the reply, and the button follows it once it lands."""
+        from gateway.checkin_delivery import delivery_metadata, permits_metadata, suppress_result
+        if not await permits_metadata(self, delivery_metadata(event, {})):
+            suppress_result(agent_result)
+            return ""
         delivered = await self._hmwa_deliver_turn_response(
             event, source, session_entry, session_key, run_generation,
             agent_result, agent_messages, response, footer_line, intentional_silence,

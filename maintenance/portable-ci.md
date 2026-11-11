@@ -97,7 +97,11 @@ venv or personal pytest plugin. Setup and checks reject a symlinked checkout
 chained and dangling links. Remove the symlink explicitly and run `bin/ci setup`
 to create a checkout-owned environment; the gate never removes it for you.
 This isolation guard extends `fork-ci-reliability`; focused regressions live in
-`scripts/ci/tests/test_portable.py`. Credential and test-selection environment
+`scripts/ci/tests/test_portable.py`. `git()`, `run()`, `git_environment()`, and
+`source_files()` resolve an omitted checkout against the current module `ROOT`
+when called, so a fixture that patches `ROOT` runs Git in that checkout rather
+than the checkout captured at import. Explicit `git_environment(root=None)` still
+trusts no checkout. Credential and test-selection environment
 variables are absent from the child environment. Installed rustup users share
 only the resolved toolchain executable directory. Cargo configuration/cache is
 checkout-owned. Setup/check detect any edits to pre-existing source files and

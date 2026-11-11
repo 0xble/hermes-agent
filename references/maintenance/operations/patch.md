@@ -6,8 +6,8 @@
   ContextVars, execution journal and pytest suite; no dependency, transport,
   persistent field, configuration or external scheduler.
 - **Boundary:** A separate serial per-profile lane only for explicitly declared
-  one-shot `no_agent`, `deliver=local` person-send wrappers. Exact bounded first-line
-  marker `# hermes: person-send` inside the profile scripts root. Existing ordinary
+  one-shot `no_agent`, `deliver=local` person-send wrappers. Exact bounded marker on
+  line 1, or line 2 after a `#!` shebang, inside the profile scripts root. Existing ordinary
   script FIFO and agent/reserved capacities are unchanged. Revalidate persisted
   classification under the fire-claim lock and demote edits without releasing the
   original execution/dedup owner or taking an early lease.

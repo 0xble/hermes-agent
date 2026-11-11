@@ -49,3 +49,24 @@ def _join_leaked_turn_workers(monkeypatch):
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
         if time.monotonic() >= deadline and (still := own_workers()):
             pytest.fail(f"turn workers still running at teardown: {[t.name for t in still]}")
+
+
+@pytest.fixture
+def without_write_stall_sampler(monkeypatch):
+    """Keep synchronous gateway thread doubles out of the native sampler.
+
+    Patching ``server.threading.Thread`` changes the shared stdlib module. On
+    macOS a state write can then run the watchdog's long-lived helper inline.
+    These tests exercise TUI behavior, not sampling; keep real observations and
+    writes, but don't launch a helper. Native lifecycle/sampling tests opt out
+    simply by not requesting this fixture.
+    """
+    import hermes_state_write_stalls as stalls
+
+    monkeypatch.setattr(stalls, "_watchdog", None)
+    monkeypatch.setattr(stalls.WriteStallWatchdog, "start", lambda self: None)
+    try:
+        yield
+    finally:
+        if stalls._watchdog is not None:
+            stalls._watchdog.close()

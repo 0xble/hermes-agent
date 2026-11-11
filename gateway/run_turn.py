@@ -872,10 +872,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
 
 
 
-    def _event_thread_metadata(self, event, source):
-        """Thread metadata for a send that replies to ``event`` on ``source``."""
-        return self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-
     @staticmethod
     def _pop_post_delivery_callback(adapter, key, generation):
         """Pop the adapter's deferred post-delivery callback for ``key`` (legacy dict fallback)."""

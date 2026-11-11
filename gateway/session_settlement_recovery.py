@@ -258,6 +258,8 @@ async def settle_with_retry(authority, live, ref, row, response, outcome, captur
     read back by ``finish_result``, and a failure after the commit (``settled`` set) never retries.
     A fence refusal (``RuntimeStoreError``) is not transient and is raised at once."""
     from gateway.session_runtime_workers import track_mutation
+    from gateway.checkin_delivery import fence_local_settlement
+    response = await fence_local_settlement(authority, live, row, response, captured)
     for delay in (*_SETTLE_RETRY_DELAYS_S, None):
         try:
             return await asyncio.shield(track_mutation(authority, asyncio.to_thread(

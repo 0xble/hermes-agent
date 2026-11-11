@@ -483,6 +483,7 @@ class GatewayNotificationsMixin(
         Returns True when at least one upload was confirmed delivered.
         """
         from urllib.parse import quote as _quote
+        from gateway.checkin_delivery import delivery_metadata
         delivered_any = False
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
@@ -503,11 +504,9 @@ class GatewayNotificationsMixin(
             # extraction left a streamed reply that showed the tag as text and never sent the image
             # (#141806).
             url_images, _ = adapter.extract_images(cleaned)
-            _thread_meta = (
-                dict(thread_metadata)
-                if thread_metadata is not None
-                else self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
-            )
+            _thread_meta = dict(thread_metadata) if thread_metadata is not None else self._thread_metadata_for_source(
+                event.source, self._reply_anchor_for_event(event))
+            _thread_meta = delivery_metadata(event, _thread_meta)
             chat_id = event.source.chat_id
             # Images go out as one batch (e.g. Signal's multi-attachment RPC) unless [[as_document]].
             def _is_photo(media_path: str, is_voice: bool) -> bool:

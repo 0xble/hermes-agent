@@ -13,8 +13,12 @@ from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 import types
 
+import pytest
+
 from tui_gateway import server
 from tui_gateway.user_messages import AGENT_BUILD_ABANDONED
+
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
 
 
 class _InlineThread:

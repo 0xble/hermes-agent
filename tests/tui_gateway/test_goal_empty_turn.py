@@ -4,6 +4,8 @@ import pytest
 
 from tui_gateway.prompt_turn import _is_successful_goal_turn
 
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
+
 
 @pytest.mark.parametrize("text", ["", "   ", "[SILENT]", "failure notice"])
 @pytest.mark.parametrize("outcome", ["success", "failed", "interrupted", "incomplete", "handoff"])

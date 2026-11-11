@@ -35,6 +35,7 @@ class ScriptAdmissionRequired(AgentAdmissionRequired):
 
 
 PERSON_SEND_MARKER = b"# hermes: person-send"
+_SHEBANG_LINE_LIMIT = 256
 
 
 def is_person_send(job: dict) -> bool:
@@ -42,7 +43,8 @@ def is_person_send(job: dict) -> bool:
 
     This scheduling declaration is not authorization or a sandbox. Existing
     script timeout, lifecycle guard and provider-side send checks still apply.
-    Read only a bounded first line inside this profile's validated scripts root.
+    The marker is line 1, or line 2 when line 1 is a `#!` shebang. Read at most two
+    bounded lines inside this profile's validated scripts root.
     """
     schedule = job.get("schedule")
     if (not job.get("no_agent") or job.get("deliver") != "local"
@@ -59,6 +61,12 @@ def is_person_send(job: dict) -> bool:
         if not path.is_relative_to(root) or _on_cloud_path(path) or not path.is_file():
             return False
         with path.open("rb") as script:
+            first = script.readline(_SHEBANG_LINE_LIMIT)
+            if first.rstrip(b"\r\n") == PERSON_SEND_MARKER:
+                return True
+            # A complete shebang line may precede the marker; nothing else may.
+            if not (first.startswith(b"#!") and first.endswith(b"\n")):
+                return False
             return script.readline(len(PERSON_SEND_MARKER) + 2).rstrip(b"\r\n") == PERSON_SEND_MARKER
     except (OSError, ValueError, TypeError, RuntimeError):
         return False
