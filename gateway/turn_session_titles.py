@@ -38,11 +38,6 @@ class TurnSessionTitlesMixin:
                 from gateway.session_store_async import run_store_lookup
                 return await run_store_lookup(runner.session_store, "peek_session_id", session_key) == session_id
 
-            def session_current() -> bool:
-                # Synchronous title adapters cannot safely consult the store on the loop. They
-                # schedule their async callback through the adapter's loop boundary instead.
-                return False
-
             # A platform adapter may own its session-title lane (Slack DM thread upgrades).
             adapter = getattr(ctx, "_status_adapter", None)
             configure = getattr(type(adapter), "configure_session_titles", None)

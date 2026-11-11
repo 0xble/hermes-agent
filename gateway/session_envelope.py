@@ -408,9 +408,9 @@ async def _snapshot_native_async(runner, event, provenance, fresh_roles=False,
     payload = _native_payload(runner, event, provenance, fresh_roles, encoded_source, media)
     if provenance is None or getattr(runner.config, 'multiplex_profiles', False):
         return payload
-    from gateway.session_store_async import run_store_lookup
+    from gateway.session_store_async import run_store_call, run_store_lookup
     entry = await run_store_lookup(runner.session_store, 'lookup_by_session_key', payload['native_text_v1']['route'])
-    return _legacy_retry_payload(runner, event, payload, entry)
+    return await run_store_call(_legacy_retry_payload, runner, event, payload, entry)
 
 
 def restore_native_source(payload, runner=None):

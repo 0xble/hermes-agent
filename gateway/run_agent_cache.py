@@ -321,9 +321,6 @@ class GatewayAgentCacheMixin:
         if store is None:
             return None, "session"
         try:
-            from gateway.session_store_async import session_store_executor
-            # This helper is normally called by the async hydration path. Keep the sync helper
-            # worker-safe for the remaining legacy callers; they must not call it on the loop.
             persisted = store.get_model_override(session_key)
             scope = store.get_model_override_scope(session_key)
         except Exception:
