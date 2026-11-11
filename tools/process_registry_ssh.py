@@ -71,7 +71,8 @@ token = request["token"]
 def identity(pid):
     try:
         result = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+                                capture_output=True, text=True,
+                                env={"PATH": os.defpath, "LC_ALL": "C", "TZ": "UTC"})
     except OSError:
         return None
     fields = result.stdout.split(None, 1)
@@ -131,7 +132,8 @@ os.umask(0o077)
 def identity(pid):
     try:
         result = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], stdin=subprocess.DEVNULL,
-                                capture_output=True, text=True, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+                                capture_output=True, text=True,
+                                env={"PATH": os.defpath, "LC_ALL": "C", "TZ": "UTC"})
     except OSError:
         return None
     fields = result.stdout.split(None, 1)

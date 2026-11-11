@@ -345,7 +345,7 @@ def test_remote_protocol_executes_and_stops_real_child_on_mock_transport(registr
 def _remote_identity(pid):
     # Mirrors the target program's (stat, start-time) process identity.
     result = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], text=True, capture_output=True,
-                            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+                            env={"PATH": os.defpath, "LC_ALL": "C", "TZ": "UTC"})
     fields = result.stdout.split(None, 1)
     return fields[1].strip() if len(fields) == 2 and not fields[0].startswith("Z") else None
 
