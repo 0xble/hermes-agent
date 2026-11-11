@@ -33,11 +33,11 @@ wake an agent, cannot enter this lane. This adds 1 script worker, not agent
 capacity: the general cap and the single protected reservation are unchanged.
 Script jobs can still wait behind another ordinary script, bounded by the existing
 script timeout. Frozen person-send wrappers can opt into a separate serial per-profile
-`person-send` lane with the exact first line `# hermes: person-send`, but only for
+`person-send` lane with the marker on line 1, or line 2 after a `#!` shebang, but only for
 `no_agent` jobs with a one-shot schedule and `deliver=local`. This is an author
 scheduling declaration, not send authorization or a sandbox. Do not infer eligibility
-from job names, IDs, script names, or message content. Read at most the marker-sized
-first line, within the owning profile's scripts root; malformed/missing/escaped
+from job names, IDs, script names, or message content. Read at most a 256-byte shebang
+line plus the marker-sized line, within the owning profile's scripts root; malformed/missing/escaped
 paths retain ordinary script admission. New prepared wrappers opt in; existing
 scripts and cron records are never rewritten by the scheduler.
 

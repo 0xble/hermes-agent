@@ -23,7 +23,7 @@ def declared_send(path, now, name="send"):
 
 
 @pytest.mark.parametrize("change", ["agent", "recurring", "delivery", "missing", "outside",
-                                     "prefix", "late_marker", "invalid_path"])
+                                     "prefix", "late_marker", "line3", "shebang_prefix", "invalid_path"])
 def test_only_explicit_local_oneshot_scripts_qualify(home, tmp_path, change):
     path, now = home
     job = declared_send(path, now)
@@ -48,8 +48,41 @@ def test_only_explicit_local_oneshot_scripts_qualify(home, tmp_path, change):
         script = path / "scripts" / "late.py"
         script.write_bytes(b"# ordinary\n" + admission.PERSON_SEND_MARKER + b"\npass\n")
         job["script"] = str(script)
+    elif change == "shebang_prefix":
+        script = path / "scripts" / "shebang-prefix.py"
+        script.write_bytes(b"#!/usr/bin/env python3\n" + admission.PERSON_SEND_MARKER + b"x\npass\n")
+        job["script"] = str(script)
+    elif change == "line3":
+        script = path / "scripts" / "line3.py"
+        script.write_bytes(b"#!/usr/bin/env python3\n# ordinary\n" + admission.PERSON_SEND_MARKER + b"\npass\n")
+        job["script"] = str(script)
     elif change == "invalid_path":
         job["script"] = "\0"
+    assert not admission.is_person_send(job)
+
+
+def test_marker_after_shebang_uses_person_send_lane(request, monkeypatch):
+    path, now = request.getfixturevalue("home")
+    job = declared_send(path, now, "shebang")
+    script = path / "scripts" / "shebang.py"
+    script.write_bytes(b"#!/usr/bin/env python3\n" + admission.PERSON_SEND_MARKER + b"\npass\n")
+    job["script"] = str(script)
+    assert admission.is_person_send(job)
+    lanes = []
+
+    def record(item, target, process_job, dispatch_lane=None):
+        lanes.append(dispatch_lane)
+
+    monkeypatch.setattr(scheduler, "_submit_with_guard", record)
+    admission.submit_due_jobs([job], scheduler._get_parallel_pool(1), lambda item: True)
+    assert lanes == ["person-send"]
+
+
+def test_overlong_shebang_line_is_rejected_without_unbounded_read(request):
+    path, now = request.getfixturevalue("home")
+    job = declared_send(path, now, "long")
+    script = path / "scripts" / "long.py"
+    script.write_bytes(b"#!" + b"x" * 4096 + b"\n" + admission.PERSON_SEND_MARKER + b"\npass\n")
     assert not admission.is_person_send(job)
 
 
