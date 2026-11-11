@@ -106,3 +106,76 @@ def test_atomic_collision_rejection_never_blocks_a_manual_title(tmp_path):
         db.set_session_title("b", "q3 billing")
         assert db.get_session_title("b") == "q3 billing"
         assert db.get_session_title_source("b") == "user"
+
+
+def test_auto_title_reclaims_an_ended_empty_visible_ghost(tmp_path):
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("ghost", source="telegram")
+        db.set_session_title("ghost", "Billing Review")
+        db.end_session("ghost", "abandoned")
+        db.create_session("active", source="telegram")
+
+        assert db.set_auto_title("active", "Billing Review", source="llm", reject_collision=True)
+        assert db.get_session_title("active") == "Billing Review"
+        assert db.get_session_title("ghost") is None
+
+
+def test_auto_title_reclaims_a_hidden_compression_ancestor(tmp_path):
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("ancestor", source="telegram")
+        db.set_session_title("ancestor", "Billing Review")
+        db.end_session("ancestor", "compression")
+        db.set_session_hidden("ancestor", True)
+        db.create_session("continuation", source="telegram", parent_session_id="ancestor")
+
+        assert db.set_auto_title("continuation", "Billing Review", source="llm", reject_collision=True)
+        assert db.get_session_title("continuation") == "Billing Review"
+        assert db.get_session_title("ancestor") is None
+
+
+def test_auto_title_reclaims_a_retired_hidden_bot_chat(tmp_path):
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("retired", source="telegram")
+        db.set_session_title("retired", SessionDB.CANONICAL_BOT_CHAT_TITLE)
+        db.set_session_hidden("retired", True)
+        db.set_session_archived("retired", True)
+        db.create_session("replacement", source="telegram")
+
+        assert db.set_auto_title(
+            "replacement", SessionDB.CANONICAL_BOT_CHAT_TITLE, source="llm", reject_collision=True,
+        )
+        assert db.get_session_title("replacement") == SessionDB.CANONICAL_BOT_CHAT_TITLE
+        assert db.get_session_title("retired") is None
+
+
+def test_auto_title_rejects_a_visible_legitimate_holder(tmp_path):
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("holder", source="telegram")
+        db.set_session_title("holder", "Billing Review #2")
+        db.create_session("active", source="telegram")
+
+        assert not db.set_auto_title("active", "Billing Review", source="llm", reject_collision=True)
+        assert db.get_session_title("holder") == "Billing Review #2"
+        assert db.get_session_title("active") is None
+
+
+def test_auto_title_worker_reclaims_a_ghost_after_advisory_collision(tmp_path):
+    from unittest.mock import patch
+    from agent.title_generator import auto_title_session
+
+    with SessionDB(tmp_path / "state.db") as db:
+        db.create_session("ghost", source="telegram")
+        db.set_session_title("ghost", "Billing Review")
+        db.end_session("ghost", "abandoned")
+        db.create_session("active", source="telegram")
+
+        with patch("agent.title_generator.generate_title", return_value="Billing Review"), \
+             patch("agent.title_generator._hold_until_reply_enabled", return_value=True):
+            auto_title_session(
+                db, "active", "Review billing", conversation_history=[
+                    {"role": "user", "content": "Review billing"},
+                ],
+            )
+
+        assert db.get_session_title("active") == "Billing Review"
+        assert db.get_session_title("ghost") is None

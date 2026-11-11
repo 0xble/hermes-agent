@@ -106,7 +106,10 @@ authorized for this change.
   literal subject without more model calls or link fetches. An entirely untitled
   session retains its existing model retry eligibility. A manual `/title` still wins, and a stored `llm` or `user`
   title is never replaced. `auxiliary.title_generation.hold_until_reply: false` restores
-  the previous opening-message-only upgrade. Patch identity: `title-hold-until-reply`.
+  the previous opening-message-only upgrade. A candidate is colliding only when a legitimate
+  holder keeps its name: the atomic title write reclaims a hidden compression ancestor, a
+  retired Bot Chat or an ended empty visible ghost (`_title_conflict_kind`) before the
+  advisory collision read can hold the candidate. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
   turn's empty or attachment-only opener is the exception: `auxiliary.title_generation.hold_until_reply`
@@ -201,4 +204,4 @@ rolled-back code; never edit the operator's live config as part of source rollba
 `title-concurrent-endpoint` rolls back alone by reverting its commit: an unread
 `concurrent_requests` capability is ignored, so titles on that endpoint simply defer again.
 
-Contract tests: `tests/gateway/test_telegram_topic_owner_routing.py`, `tests/cron/test_cron_live_delivery_confirmation.py`, `tests/hermes_state/test_telegram_icon_migration.py`, `tests/agent/test_title_preview_eligibility.py`, `tests/agent/test_title_completion_retry.py`.
+Contract tests: `tests/gateway/test_telegram_topic_owner_routing.py`, `tests/cron/test_cron_live_delivery_confirmation.py`, `tests/hermes_state/test_telegram_icon_migration.py`, `tests/agent/test_title_preview_eligibility.py`, `tests/agent/test_title_completion_retry.py`, `tests/hermes_state/test_auto_title_collisions.py`.
