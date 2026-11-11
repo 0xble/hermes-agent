@@ -2,6 +2,7 @@
 
 Fork patch identity: `kanban-submit-registration`.
 Contract tests: `tests/e2e/core/kanban/test_kanban_dispatch_registration.py`.
+Contract tests: `tests/hermes_cli/test_kanban_submit_registration.py`.
 
 ## Required behavior
 
