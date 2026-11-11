@@ -5,6 +5,7 @@ executes the same terminal command twice, independently of provider-call account
 FIFO barriers control the kill windows, and expiring the scratch claim replaces
 waiting for the TTL. The randomized restart E2E remains unchanged.
 """
+from contextlib import closing
 import os
 import shlex
 import signal
@@ -44,7 +45,7 @@ def _release(root, name):
 
 
 @pytest.mark.platforms('linux')
-@pytest.mark.live_system_guard_bypass
+@pytest.mark.live_system_guard_bypass  # Board.env() pins every home/DB to tmp_path.
 @pytest.mark.parametrize('window', [
     'claimed', 'spawned_unregistered', 'spawned_registered',
     'recorded_unregistered', 'recorded_registered',
@@ -79,9 +80,14 @@ def test_sigkill_registration_windows_execute_user_work_once(tmp_path, window):
                 assert work.entered.wait(90), board.diag(tid)
             dispatcher.send_signal(signal.SIGKILL)
             dispatcher.wait(timeout=30)
-            with sqlite3.connect(board.db_path) as conn:
+            with closing(sqlite3.connect(board.db_path)) as conn, conn:
                 conn.execute('UPDATE tasks SET claim_expires=0 WHERE id=?', (tid,))
             board.dispatch()
+            if window in ('claimed', 'spawned_unregistered'):
+                assert board.runs(tid)[0]['outcome'] == 'reclaimed', board.diag(tid)
+            else:
+                assert board.task(tid)['current_run_id'] == old_run, board.diag(tid)
+                assert board.events(tid, 'claim_extended'), board.diag(tid)
             if window.endswith('_unregistered'):
                 _release(control, 'worker')
             work.release.set()
@@ -110,4 +116,6 @@ def test_sigkill_registration_windows_execute_user_work_once(tmp_path, window):
             if dispatcher.poll() is None:
                 dispatcher.kill()
                 dispatcher.wait(timeout=30)
+            if (control / 'worker.pid').exists():
+                board.spawned_pids.add(int((control / 'worker.pid').read_text(encoding='utf-8')))
             board.kill_workers()
