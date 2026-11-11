@@ -361,7 +361,11 @@ class GatewayBusySessionMixin:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
         accepted = _call_with_steer_delivery(running_agent.steer, text, on_delivered)
-        return bool(self._steer_active_subagents(running_agent, text)) or accepted
+        child_accepted = bool(self._steer_active_subagents(running_agent, text))
+        if child_accepted and not accepted and on_delivered is not None:
+            # Child-only acceptance: the parent never owns the text, so its callback will not fire.
+            on_delivered()
+        return child_accepted or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """True when a compression lock is held for this session's id (callers demote interrupt →

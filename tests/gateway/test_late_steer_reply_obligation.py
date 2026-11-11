@@ -138,3 +138,17 @@ def test_withdrawn_ticket_never_reports_delivery():
     apply_pending_steer_to_tool_results(agent, messages, 1)
     assert len(messages) == 1
     delivered.assert_not_called()
+
+
+def test_child_only_steer_acceptance_reports_delivery_once():
+    from unittest.mock import Mock
+
+    runner, agent, _, _, _ = _running()
+    child = Mock()
+    child.steer = Mock(return_value=True)
+    agent._active_children.append(child)
+    agent.steer = Mock(return_value=False)
+    delivered = Mock()
+    assert runner._steer_running_agent(agent, "to child", on_delivered=delivered)
+    child.steer.assert_called_once_with("to child")
+    delivered.assert_called_once_with()
