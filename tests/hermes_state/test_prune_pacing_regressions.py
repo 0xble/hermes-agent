@@ -58,10 +58,31 @@ def test_three_thousand_message_delete_uses_operation_pacing(tmp_path, monkeypat
         else:
             assert db.prune_sessions() == 1
         retention = operation == "prune"
-        assert {limit for limit, _ in pages} == {16 if retention else 64}
-        assert sum(count > 0 for count in reclaimed) == (188 if retention else 47)
+        limits = {limit for limit, _ in pages}
+        if retention:
+            # Retention starts at the explicit 16-row cap, then PrunePacer may
+            # shrink it when a writer transaction exceeds its target hold time.
+            assert 16 in limits
+            assert limits <= {1, 2, 4, 8, 16}
+        else:
+            assert limits == {64}
+        if retention:
+            # The 16-row value is a cap, not a promise that every transaction
+            # reaches it: PrunePacer shrinks slow writer transactions and may
+            # later grow them again.
+            assert sum(count > 0 for count in reclaimed) >= 188
+        else:
+            assert sum(count > 0 for count in reclaimed) == 47
         assert max(steps) == (1 if retention else 8)
-        assert pauses and set(pauses) == {0.05 if retention else 0.01}
+        assert pauses
+        if retention:
+            # Writer fairness pauses track measured hold time, with a 50 ms
+            # floor and 2 s ceiling. Slow pages therefore produce longer
+            # pauses than the floor.
+            assert 0.05 in pauses
+            assert all(0.05 <= pause <= 2.0 for pause in pauses)
+        else:
+            assert set(pauses) == {0.01}
         assert db._read_one("SELECT count(*) FROM messages")[0] == 0
         assert db.get_session("large") is None
 
