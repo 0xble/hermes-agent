@@ -36,7 +36,7 @@ def test_learned_credentials_require_token_boundaries():
     assert messages[0]["display_metadata"]["_hermes_source_origin"] is receipt
 
 
-@pytest.mark.parametrize("secret", ["hunter2zz9", "AbCdEfGhJkLmNpQrStUvWxYz", "7xQ2aZ", "12345678"])
+@pytest.mark.parametrize("secret", ["hunter2zz9", "AbCdEfGhJkLmNpQrStUvWxYz", "7xQ2aZ9q", "12345678"])
 def test_learned_secrets_preserve_other_tokens(secret):
     safe = _redact_for_provider("Password: " + secret,
                                {"content": f"token_{secret} {secret}abc https://fictional.test/{secret}/end {secret}"})
@@ -52,7 +52,6 @@ def test_learned_secrets_preserve_other_tokens(secret):
     "The OTP is delivered by SMS.",
     "The password is surprisingly complicated.",
     "The OTP is delivered!",
-    "The OTP is 482913.",
 ])
 def test_benign_prose_neither_holds_nor_teaches_values(text):
     from agent.authentication_material import authentication_values, exclude_authentication_material
@@ -60,6 +59,33 @@ def test_benign_prose_neither_holds_nor_teaches_values(text):
     assert authentication_values(text) == ()
     assert exclude_authentication_material(text) == text
     assert _redact_for_provider(text, {"content": text}) == (text, {"content": text})
+
+
+@pytest.mark.parametrize(("text", "repeat"), [
+    ("password: str", "Use str(x) and str(y)."),
+    ("Password: is stored", "It is stored and is available."),
+    ("API key: see the docs", "Please see the docs and see examples."),
+    ("OTP: 6 digits", "Use 6 digits, with 6 places."),
+    ("Reset password: done", "Work done, all done."),
+    ('def login(password: str, otp: int)', "Use str(x) and int(x)."),
+    ('class Cfg: password: str = ""', "Use str(x)."),
+    *[(f"password: {value}", f"Use {value} here.") for value in (
+        "str", "int", "bool", "float", "bytes", "None", "Optional[str]", "Any", "dict", "list",
+        "Optional[bytes]", "dict[str, int]", "(", ")", ",",
+        "(Hunter2!x9)", ")Hunter2!x9", ",Hunter2!x9",
+    )],
+    ("Password=7xQ2aZ", "Use 7xQ2aZ here."),
+    *[(f"OTP{separator}{value}", f"Use {value} here.")
+      for separator in (": ", " = ", " is ", " are ") for value in ("6", "12", "123")],
+])
+def test_unshaped_assigned_values_neither_hold_nor_teach(text, repeat):
+    from agent.authentication_material import authentication_values, exclude_authentication_material
+
+    assert authentication_values(text) == ()
+    assert exclude_authentication_material(text) == text
+    cleaned, neighbor = _redact_for_provider(text, {"content": repeat})
+    assert "[authentication span held]" not in cleaned
+    assert neighbor == {"content": repeat}
 
 
 def test_held_sentence_does_not_teach_unrelated_tokens():
@@ -72,15 +98,23 @@ def test_held_sentence_does_not_teach_unrelated_tokens():
 @pytest.mark.parametrize(("text", "value"), [
     ('Password is "fictional phrase".', "fictional phrase"),
     ("Password: hunter2zz9", "hunter2zz9"),
-    ("Password=7xQ2aZ", "7xQ2aZ"),
+    ('Password="7xQ2aZ"', "7xQ2aZ"),
     ("My password is P@ssw0rd!", "P@ssw0rd!"),
     ("Password is AbCdEfGhJkLmNpQrStUvWxYz", "AbCdEfGhJkLmNpQrStUvWxYz"),
     ("Recovery code is 12345678", "12345678"),
+    ("password: Hunter2!x9", "Hunter2!x9"),
+    ("api_key=sk-fictionalAbC123", "sk-fictionalAbC123"),
+    ("The OTP is 482913.", "482913"),
+    *[(f"{label}{separator}{value}", value)
+      for label in ("OTP", "Recovery code") for separator in (": ", "=", " is ", " are ", " ")
+      for value in ("482913", "4829137", "48291375")],
+    ('Password: "str"', "str"),
 ])
 def test_credential_shapes_still_hide_standalone_repeats(text, value):
-    from agent.authentication_material import authentication_values
+    from agent.authentication_material import authentication_values, exclude_authentication_material
 
     assert value in authentication_values(text)
+    assert value not in exclude_authentication_material(text)
     assert value not in json.dumps(_redact_for_provider(text, "Repeat " + value))
 
 

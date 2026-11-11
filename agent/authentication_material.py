@@ -9,20 +9,20 @@ _VALUE = re.compile(
     r"(?P<label>\b" + _LABEL + r"(?:[ \t]*(?:is|are)[ \t]+|[ \t]*[:=][ \t]*|[ \t]+(?=[`'\"]?\d{4,})))"
     r"(?P<value>`[^`\n]+`|\"[^\"\n]+\"|'[^'\n]+'|\S+(?:(?<=[,;])\s+\d{4,}[.,;]?)*)", re.IGNORECASE)
 _SENTENCE = re.compile(r".+?(?:[.!?](?=\s|$)|\n|$)")
-_STATUS_WORDS = frozenset({"wrong", "required", "none", "missing", "needed", "unset", "unavailable",
-                           "incorrect", "invalid", "expired", "enabled", "disabled", "optional",
-                           "correct", "set", "stored", "configured", "available", "secure", "insecure",
-                           "safe", "unsafe", "strong", "weak", "long", "short",
-                           "a", "an", "the", "not", "in", "on", "to", "i", "we", "you", "it",
-                           "my", "your", "this", "that", "same", "still", "there"})
+_NON_VALUE = re.compile(r"(?:str|int|bool|float|bytes|None|Optional|Any|dict|list)\b|[(),]", re.IGNORECASE)
+_CODE_LABEL = re.compile(r"\b(?:codes?|otp)\b", re.IGNORECASE)
 
 
-def credential_shaped(value: str) -> bool:
-    """Unassigned prose needs a long, mixed-case/type token or a long numeric code."""
+def credential_shaped(value: str, *, label: str = "") -> bool:
+    """Require a long mixed token or numeric value, allowing 6+ digits for code labels."""
     value = value.rstrip(".!?")
+    if _NON_VALUE.match(value):
+        return False
+    if value.isdecimal():
+        return len(value) >= 8 or (len(value) >= 6 and _CODE_LABEL.search(label) is not None)
     classes = (any(c.islower() for c in value), any(c.isupper() for c in value),
                any(c.isdigit() for c in value), any(not c.isalnum() for c in value))
-    return len(value) >= 8 and (sum(classes) >= 2 or value.isdecimal())
+    return len(value) >= 8 and sum(classes) >= 2
 
 
 def _values(text):
@@ -33,11 +33,7 @@ def _values(text):
         for item in items:
             value = item.strip().strip("`'\"")
             quoted = raw[:1] in "`'\""
-            # Label-adjacent numeric codes ("OTP 482913") are an existing explicit
-            # code form. Natural-language is/are needs stronger value evidence.
-            assigned = re.search(r"(?:is|are)[ \t]+$", match.group("label"), re.IGNORECASE) is None
-            if (value and (quoted or value.lower().rstrip(".!?") not in _STATUS_WORDS)
-                    and (quoted or assigned or credential_shaped(value))):
+            if value and (quoted or credential_shaped(value, label=match.group("label"))):
                 yield match, value
 
 
