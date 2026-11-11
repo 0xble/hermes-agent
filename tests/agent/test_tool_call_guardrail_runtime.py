@@ -208,6 +208,63 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
 
     content = messages[0]["content"]
     assert "same_tool_failure_warning" in content
+    assert "Try different arguments" not in content
+    assert "change strategy" in content
+
+
+def test_unattended_guardrail_block_returns_to_model_instead_of_false_halt():
+    """A background turn must keep working after a guardrail blocks one endpoint."""
+    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config(), platform="telegram")
+    same_args = {"query": "same"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
+        )
+        for i in range(1, 4)
+    ]
+    responses.append(_mock_response(content="done", finish_reason="stop", tool_calls=None))
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("model_tools.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly", turn_origin="goal_loop")
+
+    assert mock_hfc.call_count == 2
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "done"
+    assert "continue" not in result["final_response"].lower()
+
+
+def test_unattended_guardrail_still_hard_stops_dead_endpoint_without_asking_user():
+    agent = _make_agent("web_search", max_iterations=20, config=_hard_stop_config())
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps({"query": "same"}), f"c{i}")],
+        )
+        for i in range(1, 20)
+    ]
+    agent._disable_streaming = True
+    with (
+        patch("model_tools.handle_function_call", return_value=json.dumps({"error": "boom"})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly", turn_origin="cron")
+
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["api_calls"] < 10
+    final = result["final_response"].lower()
+    assert "continue" not in final and "tell me" not in final
+    assert "web_search" in final
 
 
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
