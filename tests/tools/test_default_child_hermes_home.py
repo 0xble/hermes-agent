@@ -13,8 +13,7 @@ import pytest
 
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tools.code_execution_env import _build_child_env
-from tools.environments.base import BaseEnvironment
-from tools.environments.local import _make_run_env
+from tools.environments.local import LocalEnvironment, _make_run_env
 from tools.process_registry import ProcessRegistry
 
 
@@ -34,7 +33,7 @@ def _cron_worker_env(monkeypatch, home: Path) -> dict[str, str]:
     ))
 
 
-class _SnapshotEnv(BaseEnvironment):
+class _SnapshotEnv(LocalEnvironment):
     def cleanup(self) -> None:
         return None
 

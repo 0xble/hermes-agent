@@ -324,8 +324,7 @@ def _strip_default_profile_home(env: dict) -> dict:
     """Remove the explicit default home from model-driven local children.
 
     Hermes code falls back to the same platform default when HERMES_HOME is absent. Keeping the
-    variable for routed/named profiles is required because it is their profile-home route; the
-    caller supplies that route before this helper runs.
+    variable for routed or custom homes is required because it is their home route.
     """
     from hermes_constants import _expand_hermes_home, _get_platform_default_hermes_home
     raw_home = str(env.get("HERMES_HOME", "")).strip()
@@ -1075,6 +1074,17 @@ class LocalEnvironment(BaseEnvironment):
     is_local = True
     # A subclass that confines its commands (a sandbox) sets this False: see BaseEnvironment.
     uses_host_filesystem = True
+
+    def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
+        names = set(super()._snapshot_excluded_passthrough_names())
+        env = served_profile_child_env(dict(os.environ))
+        env.update(getattr(self, "env", {}) or {})
+        from hermes_constants import get_hermes_home_override
+        if override := get_hermes_home_override():
+            env["HERMES_HOME"] = override
+        if "HERMES_HOME" not in _strip_default_profile_home(env):
+            names.add("HERMES_HOME")
+        return tuple(sorted(names))
 
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
         """First-party ``BUZZ_*`` names present in the env, excluded from the shared

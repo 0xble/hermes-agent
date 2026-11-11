@@ -189,7 +189,10 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     if cleaned.get("HERMES_SESSION_SOURCE") == "kanban":
         del cleaned["HERMES_SESSION_SOURCE"]
     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
-    cleaned[DELEGATED_CHILD_ENV_MARKER] = inherited if inherited and inherited != "1" else _fenced_kanban_root()
+    fenced_root = inherited if inherited and inherited != "1" else _fenced_kanban_root()
+    cleaned[DELEGATED_CHILD_ENV_MARKER] = fenced_root
+    if fenced_root != "1" and (inherited or _DELEGATED_CHILD_CONTEXT.get()):
+        cleaned.setdefault("HERMES_KANBAN_HOME", fenced_root)
     parent_session_id = delegated_child_parent_session_id()
     if parent_session_id:
         cleaned[DELEGATED_PARENT_SESSION_ENV] = parent_session_id
