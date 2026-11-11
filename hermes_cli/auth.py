@@ -362,7 +362,7 @@ def _model_level_key_env(provider_id: str) -> str:
     try:
         from hermes_cli.config import load_config
         model_cfg = (load_config() or {}).get("model")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- provider hint generation is best-effort and must not mask auth errors
         return ""
     if not isinstance(model_cfg, dict):
         return ""
