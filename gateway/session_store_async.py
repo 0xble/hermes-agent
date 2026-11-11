@@ -19,4 +19,10 @@ async def run_store_lookup(store: Any, method: str, *args: Any, **kwargs: Any) -
     return await loop.run_in_executor(_EXECUTOR, partial(getattr(store, method), *args, **kwargs))
 
 
-__all__ = ["run_store_lookup", "session_store_executor"]
+async def run_store_call(function: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run a synchronous store-related callable outside the gateway loop."""
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(_EXECUTOR, partial(function, *args, **kwargs))
+
+
+__all__ = ["run_store_call", "run_store_lookup", "session_store_executor"]

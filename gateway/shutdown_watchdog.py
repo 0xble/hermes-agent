@@ -85,6 +85,30 @@ def _arm_loop_floor_timer(
     return _LoopFloorTimerHandle(loop, iv if iv > 0 else DEFAULT_LOOP_FLOOR_TIMER_INTERVAL_S)
 
 
+def session_store_lock_snapshot(runner) -> dict:
+    """Sample every active profile store's lock owner without acquiring any store lock."""
+    stores = {getattr(runner, "_primary_profile_name", None) or "default": runner.session_store}
+    for authority in getattr(runner, "session_authorities", ()):
+        store = getattr(getattr(authority, "runner", None), "session_store", None) or runner.session_store
+        stores[getattr(authority, "profile_id", "default")] = store
+    locks = {}
+    for name, store in stores.items():
+        lock = getattr(store, "_lock", None)
+        if lock is None or not callable(getattr(lock, "owner_snapshot", None)):
+            continue
+        count, owner = lock.owner_snapshot()
+        detail = {"acquisition_count": count, "owner": None}
+        if owner is not None:
+            detail["owner"] = {
+                "thread_name": owner.thread_name,
+                "thread_ident": owner.thread_ident,
+                "held_age_s": max(0.0, time.monotonic() - owner.acquired_at),
+                "callsites": [f"{code.co_filename}:{line}" for code, line in owner.callsite],
+            }
+        locks[str(name)] = detail
+    return {"session_store_locks": locks}
+
+
 def start_loop_liveness_watchdog(
     loop: asyncio.AbstractEventLoop, *, probe_interval: float = DEFAULT_LOOP_WATCHDOG_INTERVAL_S,
     probe_timeout: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,

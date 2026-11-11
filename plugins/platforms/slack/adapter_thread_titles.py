@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import inspect
 import logging
 import re
 from typing import Any, Optional
@@ -192,7 +193,12 @@ class SlackThreadTitlesMixin:
 
     async def _reserve_title_upgrade(self, source, title: str, current) -> Optional[str]:
         """Reserve before I/O: an ambiguous API failure must not retry over a manual rename."""
-        if not self._app or not self._thread_titles_enabled(source) or not await current():
+        if not self._app or not self._thread_titles_enabled(source):
+            return None
+        current_result = current()
+        if inspect.isawaitable(current_result):
+            current_result = await current_result
+        if not current_result:
             return None
         key = self._workspace_thread_key(source.scope_id or "", source.chat_id, source.thread_id)
         if not key or key in self._upgraded_assistant_threads:

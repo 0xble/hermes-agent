@@ -4204,10 +4204,6 @@ class GatewayRunner(
             self._async_session_store = facade
         return facade
 
-    def _automation_route_owner(self, event, authority):
-        from gateway.session_automation import _owner
-        return _owner(self, event, authority)
-
     def _get_cached_session_source(self, session_key: str):
         cached_sources = getattr(self, "_session_sources", None) if session_key else None
         if not cached_sources:

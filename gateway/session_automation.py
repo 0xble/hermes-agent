@@ -537,9 +537,9 @@ async def check_automation_route_async(runner, payload, session_id, available_so
     authority = active_authority(runner)
     if authority is None:
         raise RuntimeStoreError('not_found')
-    from gateway.session_store_async import run_store_lookup
+    from gateway.session_store_async import run_store_call
     event = restore_native(payload, runner)
-    entry = await run_store_lookup(runner, '_automation_route_owner', event, authority)
+    entry = await run_store_call(_owner, runner, event, authority)
     return _check_automation_route(runner, payload, session_id, available_source, adapter, entry)
 
 

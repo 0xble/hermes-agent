@@ -3,7 +3,6 @@ from __future__ import annotations
 
 import asyncio
 import threading
-import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -35,34 +34,37 @@ async def test_store_lookup_does_not_block_loop_when_lock_is_held():
     task = asyncio.create_task(run_store_lookup(store, "lookup_by_session_key", "head"))
     await asyncio.to_thread(store.started.wait, 1)
     ticks = 0
-    deadline = time.monotonic() + .12
-    while time.monotonic() < deadline:
-        await asyncio.sleep(.01)
+    for _ in range(50):
+        await asyncio.sleep(0)  # a loop blocked on the held lock never reaches the next tick
         ticks += 1
+    assert not task.done()
     store.release.set()
     store.lock.release()
     result = await task
-    assert ticks >= 5
+    assert ticks == 50
     assert result.session_key == "head"
 
 
 @pytest.mark.asyncio
 async def test_cancelled_store_lookup_never_publishes_late_result():
-    done = asyncio.Event()
+    entered, release, finished = threading.Event(), threading.Event(), threading.Event()
     published = []
 
     class Store:
         def read(self):
-            done.wait(2)
+            entered.set()
+            release.wait(2)
+            finished.set()
             return "stale"
 
     task = asyncio.create_task(run_store_lookup(Store(), "read"))
-    await asyncio.sleep(0)
+    await asyncio.to_thread(entered.wait, 2)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
-    done.set()
-    await asyncio.sleep(.05)
+    release.set()
+    await asyncio.to_thread(finished.wait, 2)
+    assert finished.is_set()
     assert published == []
 
 

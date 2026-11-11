@@ -320,7 +320,7 @@ async def prepare_native(runner, event):
     return await _snapshot_native_async(runner, frozen, provenance, fresh_roles, encoded_source, media)
 
 
-def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
+def _native_payload(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
     if encoded_source is None:
         encoded_source = _validate_native(runner, event, provenance, fresh_roles)
     envelope = {'source': encoded_source,
@@ -368,29 +368,21 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                                  media_text_inlined=list(event.media_text_inlined))
     # Keep the private dispatch key so previously committed text-only rows recover
     # under the same authority; optional media/context fields extend that envelope.
-    payload = {'text': event.text, 'native_text_v1': envelope}
+    return {'text': event.text, 'native_text_v1': envelope}
+
+
+def _legacy_retry_payload(runner, event, payload, entry):
     # Only an exact persisted legacy retry retains its old fingerprint. New
     # ordinary admissions must bind homes too, including execution after restart.
-    return payload
-
-
-async def _snapshot_native_async(runner, event, provenance, fresh_roles=False,
-                                 encoded_source=None, media=None):
-    """Build an ingress snapshot without acquiring SessionStore._lock on the loop."""
-    payload = _snapshot_native(runner, event, provenance, fresh_roles, encoded_source, media)
-    if provenance is None or getattr(runner.config, 'multiplex_profiles', False):
-        return payload
     from hermes_state_runtime import list_session_admissions
     from gateway.session_authorities import active_authority
-    from gateway.session_store_async import run_store_lookup
-    authority = active_authority(runner)
-    entry = await run_store_lookup(runner.session_store, 'lookup_by_session_key', payload['native_text_v1']['route'])
     if entry is None:
         return payload
     legacy = deepcopy(payload)
     legacy['native_text_v1'].pop('provenance')
     legacy['native_text_v1'].pop('attended_activity', None)
     legacy['native_text_v1'].pop('absorbed_synthetic', None)
+    authority = active_authority(runner)
     for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
         prior = deepcopy(row['payload'])
         if isinstance(prior.get('native_text_v1'), dict):
@@ -399,6 +391,26 @@ async def _snapshot_native_async(runner, event, provenance, fresh_roles=False,
         if row['request_id'] == event.message_id and prior == legacy:
             return row['payload']
     return payload
+
+
+def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
+    """Build a sync snapshot; sync callers may acquire the SessionStore lock."""
+    payload = _native_payload(runner, event, provenance, fresh_roles, encoded_source, media)
+    if provenance is not None and not getattr(runner.config, 'multiplex_profiles', False):
+        entry = runner.session_store.lookup_by_session_key(payload['native_text_v1']['route'])
+        return _legacy_retry_payload(runner, event, payload, entry)
+    return payload
+
+
+async def _snapshot_native_async(runner, event, provenance, fresh_roles=False,
+                                 encoded_source=None, media=None):
+    """Build an ingress snapshot without acquiring SessionStore._lock on the loop."""
+    payload = _native_payload(runner, event, provenance, fresh_roles, encoded_source, media)
+    if provenance is None or getattr(runner.config, 'multiplex_profiles', False):
+        return payload
+    from gateway.session_store_async import run_store_lookup
+    entry = await run_store_lookup(runner.session_store, 'lookup_by_session_key', payload['native_text_v1']['route'])
+    return _legacy_retry_payload(runner, event, payload, entry)
 
 
 def restore_native_source(payload, runner=None):
