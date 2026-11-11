@@ -2,8 +2,11 @@
 
 Only a run's own remote supervisor signals its unreaped child. Controllers send
 an incarnation-scoped stop request over existing SSH, never a remote PID to
-``kill``. The UUID is a run identity, not a separate service credential. A missing
-supervisor or unreachable host leaves the handle retryable, not exited.
+``kill``. The UUID is a run identity, not a separate service credential. If the
+supervisor is lost, a stop request may signal the child's process group only
+when that PID still leads its group with the start time the supervisor
+recorded. Otherwise, and when the host is unreachable, the handle stays
+retryable, not exited.
 """
 from __future__ import annotations
 
@@ -65,6 +68,14 @@ import fcntl, json, os, pathlib, signal, subprocess, sys, time
 request = json.loads(sys.argv[1])
 run = pathlib.Path(request["run"])
 token = request["token"]
+def identity(pid):
+    try:
+        result = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    except OSError:
+        return None
+    fields = result.stdout.split(None, 1)
+    return fields[1].strip() if len(fields) == 2 and not fields[0].startswith("Z") else None
 def publish(record):
     record["token"] = token
     temporary = run / "receipt.tmp"
@@ -79,7 +90,9 @@ with (run / "lock").open("a") as lock:
                 cwd=os.path.expanduser(request["cwd"]) if request["cwd"] else None,
                 stdin=subprocess.DEVNULL, stdout=output, stderr=subprocess.STDOUT,
                 start_new_session=True)
-            publish({"state": "running", "pid": child.pid})
+            # The start time lets a later request recognize this exact child if
+            # the supervisor is lost, without trusting a bare (reusable) PID.
+            publish({"state": "running", "pid": child.pid, "started": identity(child.pid)})
             killed = False
             source = ""
             while True:
@@ -110,11 +123,19 @@ with (run / "lock").open("a") as lock:
 '''
 
 _REMOTE_REQUEST = r'''
-import base64, fcntl, json, os, pathlib, subprocess, sys, time
+import base64, fcntl, json, os, pathlib, signal, subprocess, sys, time
 request = json.loads(sys.argv[1])
 token = request["token"]
 run = pathlib.Path.home() / ".cache" / "hermes" / "processes" / token
 os.umask(0o077)
+def identity(pid):
+    try:
+        result = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], stdin=subprocess.DEVNULL,
+                                capture_output=True, text=True, env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    except OSError:
+        return None
+    fields = result.stdout.split(None, 1)
+    return fields[1].strip() if len(fields) == 2 and not fields[0].startswith("Z") else None
 def receipt():
     try:
         result = json.loads((run / "receipt.json").read_text(encoding="utf-8"))
@@ -130,6 +151,39 @@ def supervised():
             return False
         except BlockingIOError:
             return True
+def stop_orphan(result):
+    # The supervisor is gone but its child may still run in its own process
+    # group. Signal it only when the receipt's PID still names that same group
+    # leader, started at the recorded time. Otherwise the outcome stays unknown.
+    pid, started = result.get("pid"), result.get("started")
+    if not isinstance(pid, int) or not started:
+        return result
+    with (run / "lock").open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return result
+        current = receipt()
+        if current.get("state") != "running" or current.get("started") != started:
+            return current
+        try:
+            if identity(pid) != started or os.getpgid(pid) != pid:
+                return result
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            return result
+        deadline = time.monotonic() + request.get("wait", 3)
+        while identity(pid) is not None and time.monotonic() < deadline:
+            time.sleep(0.02)
+        if identity(pid) is not None:
+            return result
+        record = {"token": token, "state": "exited", "pid": pid, "exit_code": -signal.SIGKILL,
+                  "reason": "killed", "source": request.get("source", "process.kill"),
+                  "error": "Supervisor was lost; stopped its verified process group"}
+        temporary = run / ("receipt." + str(os.getpid()) + ".tmp")
+        temporary.write_text(json.dumps(record), encoding="utf-8")
+        os.replace(temporary, run / "receipt.json")
+        return record
 if request["action"] == "launch":
     run.parent.mkdir(parents=True, exist_ok=True)
     # Exclusive creation also refuses accidental transport-level launch retries.
@@ -143,7 +197,10 @@ if request["action"] == "launch":
         time.sleep(0.02)
 result = receipt()
 if result["state"] == "running" and not supervised():
-    result["state"] = "unavailable"
+    if request["action"] == "stop":
+        result = stop_orphan(result)
+    if result["state"] == "running":
+        result["state"] = "unavailable"
 if request["action"] == "stop":
     if result["state"] == "running":
         # The token-scoped request is consumed by the original supervisor. A stale

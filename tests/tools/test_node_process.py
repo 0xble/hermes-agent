@@ -328,6 +328,7 @@ def test_remote_protocol_executes_and_stops_real_child_on_mock_transport(registr
     try:
         assert record["state"] == "running"
         assert record["token"] == token
+        assert record["started"]
         def ready():
             return b"peer-ready" in base64.b64decode(request("inspect").get("output", ""))
         assert wait_until(ready, timeout=10)
@@ -341,16 +342,67 @@ def test_remote_protocol_executes_and_stops_real_child_on_mock_transport(registr
         request("stop", wait=3)
 
 
+def _remote_identity(pid):
+    # Mirrors the target program's (stat, start-time) process identity.
+    result = subprocess.run(["ps", "-o", "stat=,lstart=", "-p", str(pid)], text=True, capture_output=True,
+                            env={**os.environ, "LC_ALL": "C", "TZ": "UTC"})
+    fields = result.stdout.split(None, 1)
+    return fields[1].strip() if len(fields) == 2 and not fields[0].startswith("Z") else None
+
+
 @pytest.mark.platforms("posix")
-def test_stale_remote_pid_receipt_cannot_kill_a_reused_pid(tmp_path):
+def test_stop_after_supervisor_loss_kills_the_verified_orphan_group(tmp_path):
+    """A lost supervisor must not leave its still-running command uncontrollable."""
+    from tools.process_registry_ssh import _REMOTE_REQUEST
+    import sys
+    token = "d" * 32
+    run = tmp_path / ".cache" / "hermes" / "processes" / token
+    run.mkdir(parents=True)
+    # The state a killed supervisor leaves: its own-session child still runs,
+    # its receipt says running, and nobody holds the run lock.
+    child = subprocess.Popen(["sleep", "60"], stdin=subprocess.DEVNULL, start_new_session=True)
+
+    def request(action, **extra):
+        result = subprocess.run([sys.executable, "-c", _REMOTE_REQUEST,
+                                 json.dumps({"action": action, "token": token, **extra})],
+                                env={"HOME": str(tmp_path), "PATH": os.defpath},
+                                text=True, capture_output=True, timeout=15, check=True)
+        return json.loads(result.stdout)
+
+    try:
+        started = _remote_identity(child.pid)
+        assert started
+        (run / "receipt.json").write_text(json.dumps(
+            {"token": token, "state": "running", "pid": child.pid, "started": started}))
+        # Inspection alone never signals; the outcome stays unknown.
+        assert request("inspect")["state"] == "unavailable"
+        assert child.poll() is None
+        result = request("stop", wait=3, source="operator")
+        assert result["state"] == "exited" and result["reason"] == "killed"
+        assert result["exit_code"] == -9 and result["source"] == "operator"
+        assert child.wait(timeout=10) == -9
+        assert request("inspect")["state"] == "exited"
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait(timeout=10)
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("started", [None, "Thu Jan  1 00:00:00 1970"])
+def test_stale_remote_pid_receipt_cannot_kill_a_reused_pid(tmp_path, started):
     from tools.process_registry_ssh import _REMOTE_REQUEST
     import sys
     token = "c" * 32
     run = tmp_path / ".cache" / "hermes" / "processes" / token
     run.mkdir(parents=True)
-    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL)
+    child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], stdin=subprocess.DEVNULL,
+                             start_new_session=True)
     try:
-        (run / "receipt.json").write_text(json.dumps({"token": token, "state": "running", "pid": child.pid}))
+        receipt = {"token": token, "state": "running", "pid": child.pid}
+        if started is not None:
+            receipt["started"] = started
+        (run / "receipt.json").write_text(json.dumps(receipt))
         result = subprocess.run([sys.executable, "-c", _REMOTE_REQUEST,
                                  json.dumps({"action": "stop", "token": token, "wait": 0})],
                                 env={"HOME": str(tmp_path), "PATH": os.defpath},

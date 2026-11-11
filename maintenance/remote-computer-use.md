@@ -55,7 +55,9 @@ identity, not a new service credential. Profile-filtered list and release sweeps
 must filter before probing remote handles. `tools/process_registry_ssh.py` uses a per-command POSIX
 supervisor holding its unreaped child's identity and a token-scoped receipt. It
 is not a resident service. Stop requests go to that supervisor, never to a bare
-remote PID or local kill helper. Persist the binding before launch, never replay
+remote PID or local kill helper. If the supervisor is lost, a stop request may
+kill the child's process group only after proving the PID still leads that group
+with the start time the supervisor recorded. Persist the binding before launch, never replay
 on lost acknowledgement, and retain unknown/unavailable state when proof is
 missing. Old SSH checkpoints without the binding remain unverified and cannot
 be turned into local process identities.
