@@ -19,7 +19,7 @@ def test_status_labels_do_not_poison_neighboring_payload(label, neighbor):
     assert cleaned[1]["content"] == neighbor
 
 
-def test_only_short_numeric_codes_require_word_boundaries():
+def test_learned_credentials_require_token_boundaries():
     # A short numeric code must match a whole token, not part of an unrelated identifier.
     safe = _redact_for_provider("Recovery code: 482913.", "482913 and x482913y.",
                                 "API key: AbCdEfGhJkLmNpQrStUvWxYz", "AbCdEfGhJkLmNpQrStUvWxYz")
@@ -37,11 +37,51 @@ def test_only_short_numeric_codes_require_word_boundaries():
 
 
 @pytest.mark.parametrize("secret", ["hunter2zz9", "AbCdEfGhJkLmNpQrStUvWxYz", "7xQ2aZ", "12345678"])
-def test_learned_secrets_are_removed_inside_other_tokens(secret):
+def test_learned_secrets_preserve_other_tokens(secret):
     safe = _redact_for_provider("Password: " + secret,
-                               {"content": f"token_{secret} {secret}abc https://fictional.test/{secret}/end"})
-    assert secret not in json.dumps(safe)
-    assert safe[1]["content"] == "token_[redacted] [redacted]abc https://fictional.test/[redacted]/end"
+                               {"content": f"token_{secret} {secret}abc https://fictional.test/{secret}/end {secret}"})
+    assert secret not in safe[0]
+    assert safe[1]["content"] == f"token_{secret} {secret}abc https://fictional.test/[redacted]/end [redacted]"
+
+
+@pytest.mark.parametrize("text", [
+    "I know; nothing is known yet. Snow is falling now.",
+    "The OTP is 6 digits.",
+    "The password is too short.",
+    "Your login code is valid for 10 minutes.",
+    "The OTP is delivered by SMS.",
+    "The password is surprisingly complicated.",
+    "The OTP is delivered!",
+    "The OTP is 482913.",
+])
+def test_benign_prose_neither_holds_nor_teaches_values(text):
+    from agent.authentication_material import authentication_values, exclude_authentication_material
+
+    assert authentication_values(text) == ()
+    assert exclude_authentication_material(text) == text
+    assert _redact_for_provider(text, {"content": text}) == (text, {"content": text})
+
+
+def test_held_sentence_does_not_teach_unrelated_tokens():
+    safe = _redact_for_provider("Password: hunter2zz9 NeighboringLongIdentifier.",
+                               "hunter2zz9 NeighboringLongIdentifier")
+    assert "hunter2zz9" not in json.dumps(safe)
+    assert safe[1] == "[redacted] NeighboringLongIdentifier"
+
+
+@pytest.mark.parametrize(("text", "value"), [
+    ('Password is "fictional phrase".', "fictional phrase"),
+    ("Password: hunter2zz9", "hunter2zz9"),
+    ("Password=7xQ2aZ", "7xQ2aZ"),
+    ("My password is P@ssw0rd!", "P@ssw0rd!"),
+    ("Password is AbCdEfGhJkLmNpQrStUvWxYz", "AbCdEfGhJkLmNpQrStUvWxYz"),
+    ("Recovery code is 12345678", "12345678"),
+])
+def test_credential_shapes_still_hide_standalone_repeats(text, value):
+    from agent.authentication_material import authentication_values
+
+    assert value in authentication_values(text)
+    assert value not in json.dumps(_redact_for_provider(text, "Repeat " + value))
 
 
 def test_native_origin_cannot_silently_serialize_as_empty_metadata():

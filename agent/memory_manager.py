@@ -133,7 +133,7 @@ def _redact_for_provider(*values: Any) -> Any:
     model repeats it bare in prose. Never mutates the caller's objects: unchanged values come back as-is,
     changed containers as shallow copies. One value in → one value out; several → a tuple.
     """
-    from agent.authentication_material import authentication_values, exclude_authentication_material
+    from agent.authentication_material import authentication_values, credential_shaped, exclude_authentication_material
     from agent.source_origin import NativeOrigin, ORIGIN_KEY
     learned: set = set()
 
@@ -154,18 +154,17 @@ def _redact_for_provider(*values: Any) -> Any:
 
     def scrub(text: str) -> str:
         learned.update(authentication_values(text))
-        out = _scrub(exclude_authentication_material(text))
-        if out != text:
-            learned.update(set(_TOKEN_RE.findall(text)) - set(_TOKEN_RE.findall(out)))
+        held = exclude_authentication_material(text)
+        out = _scrub(held)
+        if out != held:
+            learned.update(t for t in set(_TOKEN_RE.findall(held)) - set(_TOKEN_RE.findall(out))
+                           if credential_shaped(t))
         return out
 
     scrubbed = [walk(v, scrub) for v in values]
     if learned:
-        # Only short numeric codes need token boundaries. Learned passwords/keys must
-        # still be removed when repeated inside an identifier, prefix or URL.
-        pattern = re.compile("|".join(
-            r"(?<!\w)" + re.escape(t) + r"(?!\w)" if t.isdecimal() and len(t) < 8 else re.escape(t)
-            for t in sorted(learned, key=len, reverse=True)))
+        pattern = re.compile(r"(?<!\w)(?:" + "|".join(
+            re.escape(t) for t in sorted(learned, key=len, reverse=True)) + r")(?!\w)")
         scrubbed = [walk(v, lambda t: pattern.sub("[redacted]", t) if pattern.search(t) else t) for v in scrubbed]
     return scrubbed[0] if len(scrubbed) == 1 else tuple(scrubbed)
 

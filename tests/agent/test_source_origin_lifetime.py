@@ -40,3 +40,26 @@ def test_origin_authority_is_live_only_and_released_with_its_last_anchor(tmp_pat
     del receipt, metadata, message
     gc.collect()
     assert receipt_ref() is None
+
+
+def test_gateway_scale_receipts_track_live_anchors_and_return_to_baseline():
+    from agent.source_origin import _origin_receipts
+
+    gc.collect()
+    baseline = len(_origin_receipts)
+    anchors = [origin_metadata(NativeOrigin.person(
+        f"Fictional message {index}", platform="telegram", principal="fictional", event=str(index)))
+        for index in range(10_000)]
+    assert len(_origin_receipts) == baseline + len(anchors)
+    # Repeated shallow handoffs resolve the same anchor without growing the registry.
+    for metadata in anchors:
+        for _ in range(3):
+            assert native_origin(dict(metadata)) is native_origin(metadata)
+    del metadata
+    assert len(_origin_receipts) == baseline + len(anchors)
+    del anchors[:5_000]
+    gc.collect()
+    assert len(_origin_receipts) == baseline + len(anchors)
+    anchors.clear()
+    gc.collect()
+    assert len(_origin_receipts) == baseline

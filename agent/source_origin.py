@@ -92,6 +92,9 @@ def origin_metadata(receipt, metadata=None):
 
     Shallow history/metadata copies retain the anchor. JSON and deep copies cannot mint
     evidence, and releasing the last live anchor releases its process-local receipt.
+    The registry holds exactly 1 entry per live anchor, not per shallow copy or lookup.
+    Retaining more messages/anchors grows it linearly with their receipts and text bytes;
+    there is no fixed process-wide bound while those anchors remain live.
     """
     anchor = _OriginReference()
     key = id(anchor)

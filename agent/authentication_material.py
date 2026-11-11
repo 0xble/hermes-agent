@@ -17,6 +17,14 @@ _STATUS_WORDS = frozenset({"wrong", "required", "none", "missing", "needed", "un
                            "my", "your", "this", "that", "same", "still", "there"})
 
 
+def credential_shaped(value: str) -> bool:
+    """Unassigned prose needs a long, mixed-case/type token or a long numeric code."""
+    value = value.rstrip(".!?")
+    classes = (any(c.islower() for c in value), any(c.isupper() for c in value),
+               any(c.isdigit() for c in value), any(not c.isalnum() for c in value))
+    return len(value) >= 8 and (sum(classes) >= 2 or value.isdecimal())
+
+
 def _values(text):
     """The same value grammar decides what is held and what later repeats must hide."""
     for match in _VALUE.finditer(text or ""):
@@ -24,7 +32,12 @@ def _values(text):
         items = re.split(r"[,;]\s*", raw) if re.fullmatch(r"\d{4,}(?:[,;]\s*\d{4,})+", raw) else [raw]
         for item in items:
             value = item.strip().strip("`'\"")
-            if value and (raw[:1] in "`'\"" or value.lower().rstrip(".!?") not in _STATUS_WORDS):
+            quoted = raw[:1] in "`'\""
+            # Label-adjacent numeric codes ("OTP 482913") are an existing explicit
+            # code form. Natural-language is/are needs stronger value evidence.
+            assigned = re.search(r"(?:is|are)[ \t]+$", match.group("label"), re.IGNORECASE) is None
+            if (value and (quoted or value.lower().rstrip(".!?") not in _STATUS_WORDS)
+                    and (quoted or assigned or credential_shaped(value))):
                 yield match, value
 
 
