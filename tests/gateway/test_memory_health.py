@@ -134,7 +134,7 @@ async def test_readiness_failure_is_logged_once_and_startup_checks_other_profile
     other = tmp_path / "other"
     other.mkdir()
     (other / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
-    monkeypatch.setattr("gateway.runtime_health._health_scopes", lambda _: [("broken", home), ("healthy", other)])
+    monkeypatch.setattr("gateway.run._resolve_handoff_watch_scopes", AsyncMock(return_value=[("broken", home), ("healthy", other)]))
     checked = []
 
     def selection(selected_home):
@@ -294,7 +294,7 @@ async def test_muted_profile_is_log_only_without_a_delivery_marker(tmp_path, mon
     (other / "config.yaml").write_text("memory: {provider: hindsight}\n", encoding="utf-8")
     (other / "hindsight").mkdir()
     (other / "hindsight/config.json").write_text(json.dumps({"mode": "local_external"}), encoding="utf-8")
-    monkeypatch.setattr("gateway.runtime_health._health_scopes", lambda _: [(None, home), ("other", other)])
+    monkeypatch.setattr("gateway.run._resolve_handoff_watch_scopes", AsyncMock(return_value=[(None, home), ("other", other)]))
     gateway = runner()
     gateway._served_home_channel_transports = lambda: [
         (None, "fixture", None, "muted", object()),

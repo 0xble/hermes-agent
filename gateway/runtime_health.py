@@ -51,18 +51,6 @@ def _marker(home: Path) -> Path:
     return home / "state" / "memory-client-health" / key
 
 
-def _health_scopes(runner) -> list[tuple[str | None, Path]]:
-    from gateway.run import _multiplex_profile_homes
-    from hermes_constants import get_hermes_home
-
-    config = getattr(runner, "config", None)
-    if config is not None and getattr(config, "multiplex_profiles", False):
-        # Adapter ownership uses None for the served default home, not the launch home.
-        return [(None if name == "default" else name, Path(home))
-                for name, home in _multiplex_profile_homes(config)]
-    return [(None, get_hermes_home())]
-
-
 def _failure_key(home: Path) -> str:
     try:
         return str(_marker(home))
@@ -71,7 +59,8 @@ def _failure_key(home: Path) -> str:
 
 
 async def check_memory_health(runner) -> None:
-    from gateway.run import _async_profile_runtime_scope
+    from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
+    from hermes_constants import get_default_hermes_root
 
     lock = getattr(runner, "_memory_health_lock", None)
     if lock is None:
@@ -79,8 +68,9 @@ async def check_memory_health(runner) -> None:
     if lock.locked():
         return
     async with lock:
-        for profile, home in await asyncio.to_thread(_health_scopes, runner):
+        for profile, home in await _resolve_handoff_watch_scopes(runner):
             try:
+                home = Path(home or get_default_hermes_root())
                 async with _async_profile_runtime_scope(home):
                     await _check_profile_health(runner, profile, home)
             except Exception:
