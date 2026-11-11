@@ -1,5 +1,182 @@
 # Fork CI reliability
 
+## Reset cleanup fixture scope
+
+The reset resource-cleanup probe has a cached agent but no persisted old
+conversation. Its mock route index stays empty so cold goal/loop retirement
+cannot consume the close-start window before resource cleanup begins. Keep the
+real reset handler, off-loop close, heartbeat and survivor assertions unchanged.
+The fixture correction reuses owner commit `42a358abfdd1183332132a178c19e6130b01318a`
+and changes no production behavior or wait bounds.
+
+The shared-metrics worker join retains its 10-second bound and assertion. On
+failure it dumps all thread stacks to distinguish a native flush wait from
+SQLite contention. The hosted database-locked warnings alone do not establish
+the worker's blocking point, and inserting another join between sessions would
+only split the time budget without diagnosing the stall.
+
+## Historical git-install download isolation
+
+The dispatcher-restart E2E also covers the gateway submitter's spawn/publication gap. The
+submitter adopts its PID on the live run before contacting the owner, using the same registration
+as the former CLI worker. A killed dispatcher therefore leaves a live handle for TTL extension,
+and a reclaimed submitter exits before admission. Native CLI PTY coverage keeps its private tmux
+server alive across empty-session gaps and destroys it in teardown, avoiding last-session shutdown
+racing the next client launch.
+
+The shallow/partial clone suites retain smart HTTP, complete subject ancestry, historical
+N-1 installer bytes, all clone-shape/transfer assertions and the 900-second nightly file bound.
+Their three simultaneous real installs share only explicit runner content caches (uv, managed
+Python, npm and SHA256-keyed PM archives). Each native store, checkout, PM install identity,
+venv, active selection record and Hermes user home remains distinct. PM's machine uv cache is
+linked to the explicit content cache because PM intentionally does not use `UV_CACHE_DIR`.
+The shell runner carries explicit `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, and `npm_config_cache`
+inputs across its `env -i` boundary under private names. The file runner restores them only for
+files inside `tests/e2e/core/upgrade` and removes the private names from every worker. Ordinary
+tests and their subprocesses receive none of these caches, even in a mixed invocation. The runner
+regression also proves installed/runtime/user state and credentials remain scrubbed.
+Only absolute explicit cache paths are eligible. Resolve symlinks and refuse descendants of
+`.hermes`, `.cache/uv`, `.npm` and `.local/share/uv` under the OS password-database home, even
+when `HOME` names a sandbox. Failure to resolve that account also drops these inputs.
+N-1 receives a private copy of the runner's actual uv, avoiding repeated Astral bootstrap.
+The Git worlds pass the existing `--skip-browser` option to both real installer versions.
+Their contract is clone shape, transfer, hydration and update behavior, not optional browser
+provisioning. In the local Linux reproduction on failing commit `80718d41`, partial/shallow
+installers spent time in `npx playwright install --with-deps chromium` (a separate 600-second
+optional step), then completed in 566/586 seconds. Only `test_upgrade_path.py` reproduced the
+900-second kill, during its sixth scenario. These observations do not establish the exact
+subprocess responsible for either historical partial/shallow kill.
+Skipping that unrelated step does not replace the installer or bypass Git/dependency assertions.
+Cold real installer download coverage remains in
+`test_install_fresh.py::test_fresh_install_serves_head_and_runs_a_turn`: its `installed` fixture
+starts with an empty machine home, does not use `InstallCache` or copy uv/runtime artifacts,
+and runs the real installer against its pinned download sources. This PR does not preseed that
+separate cold path; all three git worlds retain the download-sharing optimization.
+
+`make_leg(root, template_home)` remains supported for other upgrade suites. Omitting the optional
+cache creates download storage under that leg's own root; only explicit fixture-cache callers share
+content and opt into the shared fixture deadline and PM archive preparation. Keep caller audits and a two-argument regression when extending shared test helpers.
+
+`test_upgrade_path` uses the same download-only fixture for its repeated N-1/update legs. Its
+bare origin advertises only the subject branch, like `_install_helpers.make_origin`, rather than
+all branches of a developer's partial clone (whose unrelated missing blobs could trigger network
+fetches during a local fixture clone). No source clone is redirected to external GitHub. The
+small local-repository regression proves the unrelated branch stays unadvertised; cache
+regressions prove user state and installed environments are not shared.
+
+## Bounded archive acquisition and diagnostics
+
+`InstallCache.artifact` retains only bytes matching a lockfile SHA256. A complete cache hit
+performs no HTTP request. A cold request uses curl's 10-second connection and 30-second total
+bounds, no retries, and atomic publication. Status, URL and checksum failures surface immediately.
+Preparation tries each lock URL first, then the maintained pinned mirror on download or checksum
+failure, checking the same SHA256 for either source. If both fail, diagnostics name both URLs.
+Each sandbox receives
+private copies of PM's `fetch-<sha256>` entries. PM may delete those copies after publication
+without losing the retained archive. Retained archives are stored beside the explicit uv cache
+(in `<uv-cache-name>-pm-archives`), outside uv-owned buckets, so `uv cache prune` cannot
+discard them. Only shell-installer worlds extract bootstrap uv from the exact pinned archive
+into the slot the unmodified historical shell installer already checks. Legacy handoff legs seed
+archives without pre-extracting that slot: the staged-uv bootstrap assumes the launching Python
+is suitable, while N-1 may run Python 3.13 and HEAD requires 3.14. PM must acquire its complete
+pinned toolchain on that path before preparing the new runtime.
+
+The previous shared `HERMES_RUNTIME_DIR` was a mutable native store. Its `.install.lock`
+serialized the nominally parallel installs across downloads. It was not an immutable download
+cache, and its archive entries disappeared after successful publication. PM runtime preparation
+and venv selection are separately scoped to each install, so this does not establish a runtime
+preparation deadlock.
+
+The three target files share a per-file fixture deadline of 840 seconds, leaving room for
+process-tree cleanup and pytest diagnostics before the unchanged 900-second file watchdog.
+Installer, update, passive checks, version probes, dependency staging and freeze-point waits
+use the remaining budget. Raw Git helper operations are bounded too. uv and npm HTTP requests
+receive explicit shorter transport limits. No assertion, clone shape, update scenario or outer
+watchdog is relaxed. A slow or failed setup produces an ordinary failure with subprocess output
+instead of losing every result to SIGKILL.
+
+Contract tests: `tests/e2e/core/upgrade/test_install_downloads.py` `tests/e2e/core/upgrade/test_install_cache.py`
+
+## Worker deadline exit observation
+
+The deadline probe keeps its 2-second request bound and immediate worker-reaped
+assertion. A killed non-child can close its inherited stdout pipe before the
+kernel marks it a zombie. The caller has already read EOF, so the sleeper cannot
+still retain that pipe, but an immediate liveness probe can still see it exiting.
+Observe descendant exit within the existing 5-second cleanup bound, matching the
+sibling worker lifetime tests, and kill any owned survivor on failure. Keep the
+no-survivor assertion and production cleanup unchanged. Hosted run
+https://github.com/0xble/hermes-agent/actions/runs/42753302737 recorded this race in
+`test_worker_deadline_reaps_the_worker_and_its_child[True]`.
+
+Contract tests: `tests/pm/test_worker_deadline.py`, `tests/pm/test_worker_lifetime.py`.
+
+Retire this fixture correction when upstream observes asynchronous descendant exit
+without assuming zero signal-delivery latency. Rollback changes no product state.
+
+## Upgrade scenario scheduling
+
+The historical N-1 migration file previously ran 7 cases serially. On failing
+commit `80718d41`, its real Linux reproduction reached the sixth case at 14:39
+and was killed at 900 seconds. With bounded downloads on `56ff43da`, the first
+3 cases passed, the lock-only recovery exhausted the 840-second diagnostic
+budget, and the remaining 3 cases reported that budget exhaustion. The active
+subprocess reached HEAD runtime preparation, not a perpetual Git freeze seam.
+
+Schedule clean/long-scalar, autostash, interrupted-pull, interrupted-dependencies
+and offline cases in separate files, following the existing hostile-commit layout.
+All 6 complete test-function ASTs (7 parametrized cases), assertions, guards and
+historical base selection remain identical. Each file owns its provider, seed,
+installed environments and user state. Only explicit download caches are shared.
+This adds 4 seed builds while removing serial aggregation under 1 file watchdog.
+The nightly command discovers the whole directory with retries disabled. Both the
+840-second diagnostic deadline and 900-second watchdog remain unchanged.
+
+Retire this scheduling adaptation when the upstream harness schedules the same
+fresh-install scenarios within the existing finite budget. Rollback restores the
+original file grouping without changing product code or stored user state.
+
+## Fork upgrade release contract
+
+Git-world N-1 means the newest `origin` `deploy/nightly-*` promotion that is a strict
+ancestor of the candidate, not the nearest upstream CalVer tag. Discover refs using a bounded
+`ls-remote` and fetch a missing promotion object without changing `nightly.yml`. When those refs
+are unavailable, use the immutable `deploy/nightly-20261103` floor
+`002f8807dbdef3b9aa450980baa501c6e9920f58`; fail loudly if neither resolves. Ignore promotions
+before that floor. Both it and subsequent promotions contain upstream #126150's shallow healing
+fix (#123254), while upstream `v2026.9.24` performs an unfiltered `git fetch origin main` before
+swapping updater code. A depth-1 *install* does not make that later fetch depth-limited: the real
+smart-HTTP backend correctly sends hundreds of MB of historical blobs. This is a historical
+product defect, not a cache, browser, dumb-HTTP or fixed-pack fixture defect.
+
+Provision the genuine promoted runtime first, then seed its retained depth-1 Git metadata with a
+fresh real depth-1 smart-HTTP clone of the same commit. Modern bootstrap heals shallow clones at
+install time, so seeding before bootstrap cannot model retained legacy user state. Replace only
+the sandbox checkout's `.git`; never its source or installed dependencies. Record the real clone's
+shape and transfer baseline. Use this shared `World.seed_clone_shape` for partial cells too,
+asserting exact tree:0/blob:none/full input shapes so bootstrap cannot silently erase updater
+coverage. Keep the original shape, transfer, ancestry and two-update
+assertions. Passive checks advance through 3 synthetic releases on the real origin after HEAD,
+so a recent promotion cannot collapse their 3 distinct shallow grafts. Current shallow-healer
+real-Git regressions remain independent of release selection;
+never truncate history, patch the historical updater or raise either timeout to make this pass.
+
+Local prerequisite: run historical upstream-tag suites from a tag-pinned object store rather than
+sharing mutable refs with other worktrees. A global `fetch.pruneTags=true` (with prune enabled)
+lets another fetch against the fork delete a just-hydrated upstream tag the fork does not publish,
+silently selecting August again. Verify the selected tag/SHA at execution time. This is separate
+from immutable object hydration needed for a partial developer checkout; hosted full-history,
+fresh-tag checkout is the arbiter for unchanged `test_upgrade_path.py`.
+
+Contract tests: `tests/e2e/core/upgrade/git/test_release_selection.py` `tests/hermes_cli/test_update_shallow_heal.py`
+
+Historical baseline: nightly 41454766643 completed shallow/partial/upgrade_path in 659.5/677.8/816.0
+seconds; 41834945580 timed out all three at 900 seconds. That establishes expensive successful
+runs, not a proven deadlock. Local process snapshots show installer dependency/runtime downloads
+and N-1's npm workspace install after the loopback Git clone has completed. Network is still
+required on a cold dependency cache; do not describe this fixture as offline or claim complete
+nightly coverage from a focused run.
+
 ## Required behavior
 
 The current CI interface is owned by [repository-ci-contract.md](repository-ci-contract.md);
