@@ -107,6 +107,7 @@ def _submit():
         # before contacting the owner, so TTL recovery sees its live handle during admission.
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli.kanban_db_dispatch import adopt_worker_pid
+        # Lock contention deliberately counts against the card.
         with connect_closing(Path(board_db).resolve(strict=True)) as conn:
             if not adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid()):
                 print('Kanban owner refused: stale dispatcher claim', file=sys.stderr)
@@ -119,7 +120,6 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
-    # Lock contention deliberately counts against the card's failure budget.
     except (KeyError, ValueError, OSError, sqlite3.Error) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1

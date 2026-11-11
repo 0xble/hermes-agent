@@ -15,7 +15,7 @@ import threading
 
 import pytest
 
-from tests.e2e.core.kanban._helpers import PY, REPO, Board, wait_until
+from tests.e2e.core.kanban._helpers import PY, REPO, Board, pid_alive, wait_until
 from tests.e2e.core.kanban.test_kanban_dispatcher_restart import _TASK_RE
 from tests.fakes.fake_llm_provider import FakeLLMServer, Text, ToolCall
 
@@ -102,7 +102,6 @@ def test_sigkill_registration_windows_execute_user_work_once(tmp_path, window):
             # A stale original submitter must have finished refusing its old claim before the
             # effect count is observed, or a late duplicate could evade the assertion.
             if worker_pid:
-                from tests.e2e.core.kanban._helpers import pid_alive
                 wait_until(lambda: not pid_alive(worker_pid), 60, 'original submitter exits')
             assert work.output.read_text(encoding='utf-8').splitlines() == ['work'], board.diag(tid)
             runs = board.runs(tid)

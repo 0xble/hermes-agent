@@ -26,8 +26,8 @@ The regression uses FIFO barriers around the actual dispatcher's claim, spawn,
 and PID recording. It covers registration both before and after recording, kills
 the dispatcher with SIGKILL, expires only the isolated test claim, and holds the
 first provider response across a recovery tick. A real terminal command appends
-to a file. Base executes that command twice in the spawn/record gap, independently
-of the existing E2E's provider counter. The original restart E2E is unchanged.
+to a file. On base, the `spawned_registered` case fails at the reclaim assertion
+before the effect count can be evaluated. The original restart E2E is unchanged.
 
 ## Scope and retirement
 
