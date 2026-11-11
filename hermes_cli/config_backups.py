@@ -82,7 +82,7 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
         for stale in [dest, *existing][keep:]:
             stale.unlink(missing_ok=True)
         return dest
-    except OSError as exc:
+    except (OSError, ValueError, TypeError) as exc:
         logger.warning("Could not back up %s (%s): %s", config_path, reason, exc)
         return None
 
@@ -98,7 +98,7 @@ def load_newest_good_backup(config_path: Path) -> Optional[dict]:
                 loaded = fast_safe_load(f)
             data = {} if loaded is None else loaded
             validate_candidate(data)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- invalid backup copies are skipped without blocking recovery
             logger.warning("Skipping invalid last-known-good backup %s: %s", candidate, exc)
             continue
         return data

@@ -4,6 +4,7 @@
 internals are imported lazily inside method bodies (import cycle), so ``patch("gateway.run.X")``
 keeps intercepting them at call time.
 """
+# health: allow FILE_LINES -- config-error handling stays at this established callback facade.
 
 from __future__ import annotations
 
@@ -1877,7 +1878,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
                 )
             return result
 
-    def _run_sync_scoped(self):
+    def _run_sync_scoped(self):  # health: allow CC -- scoped runner preserves cancellation and profile fences
         """Executor-thread body of the turn; returns the gateway result dict.
 
         The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees

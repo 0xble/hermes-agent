@@ -425,7 +425,7 @@ def _register_lazy_from_cache(new_servers: dict[str, dict]) -> tuple[dict[str, d
             _core._server_connecting.discard(_server_key(name))
         try:
             names = _registration._register_from_cache_sync(name, cfg, entry)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- one server's invalid config must not prevent other discovery
             logger.warning("Failed lazy MCP registration for '%s': %s", name, exc)
             with _core._lock:
                 _core._server_connecting.add(_server_key(name))

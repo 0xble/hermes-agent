@@ -1,5 +1,6 @@
 """Configuration management for Hermes Agent: config.yaml / .env loading, saving,
 validation, migration, and the ``hermes config`` command."""
+# health: allow FILE_LINES -- strict config admission remains in this established facade; extraction is a separate refactor.
 
 # Stale-module bridge — must run before ANY import below can bind a root-level symbol.
 # A pre-handoff updater purges only package prefixes after the pull, so a root module
@@ -2331,7 +2332,7 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 user_config = {} if loaded is None else loaded
                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
-            except Exception as e:
+            except Exception as e:  # health: allow BLE001 -- load path converts any read/validation fault to bounded recovery
                 lkg_copy = _last_known_good_fallback(config_path, path_key, cache_sig, e)
                 if lkg_copy is not None:
                     return copy.deepcopy(lkg_copy) if want_deepcopy else lkg_copy
@@ -3358,7 +3359,7 @@ def _print_unknown_key_notice(key: str, suggestion: Optional[str]) -> None:
         print(color("  (Use --force to skip this notice.)", Colors.DIM))
 
 
-def set_config_value(key: str, value: str, force: bool = False):
+def set_config_value(key: str, value: str, force: bool = False):  # health: allow CC -- strict admission branches stay at one write boundary
     """Set a configuration value at a dotted ``key``; ``value`` is auto-coerced to bool/int/float.
     ``force`` writes a known key given under the wrong prefix (``gateway.discord.foo`` where
     ``discord.foo`` is known; otherwise refused — any other unknown path under a known section

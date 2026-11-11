@@ -7,7 +7,8 @@
 - ``resolve_provider()`` picks the active provider via the documented priority chain.
 - ``OAUTH_PROVIDER_FLOWS`` maps each OAuth provider to its resolver/status builder; the flows live in
   ``auth_nous``/``auth_codex``/``auth_xai``/``auth_qwen``/``auth_minimax``/``auth_openrouter`` and are
-  re-imported here so ``hermes_cli.auth.<name>`` stays the public/patchable surface."""
+ re-imported here so ``hermes_cli.auth.<name>`` stays the public/patchable surface."""
+# health: allow FILE_LINES -- config diagnostic redaction is coupled to the auth hint boundary.
 
 from __future__ import annotations
 
@@ -117,7 +118,7 @@ def is_actual_local_base_url(base_url: str) -> bool:
     """Return True for Actual's loopback local API endpoint."""
     try:
         host = (urlparse(base_url or "").hostname or "").lower().rstrip(".")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- provider hint generation is best-effort and must not mask auth errors
         return False
     return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 

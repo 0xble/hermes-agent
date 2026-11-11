@@ -2,8 +2,9 @@
 
 Each concern lives in ``update_cmd_<concern>.py`` and is re-imported here so
 ``hermes_cli.update_cmd.<name>`` keeps resolving (and stays monkeypatchable). Imports are one-way:
-main -> update_cmd -> update_cmd_*; ``_m()`` resolves ``hermes_cli.main`` at call time.
+ main -> update_cmd -> update_cmd_*; ``_m()`` resolves ``hermes_cli.main`` at call time.
 """
+# health: allow FILE_LINES -- receipt-consent compatibility stays on this frozen updater facade.
 
 import logging
 import json

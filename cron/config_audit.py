@@ -30,7 +30,7 @@ def _changed_config_warning(job: dict, path: Path, before: tuple, *, failed: boo
         if not path.exists():
             raise ValueError("config.yaml was removed")
         validate_config_for_write(require_readable_config_before_write(path))
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- audit must report any parser/validator failure as invalid config
         invalid = str(exc)
     if not failed and invalid is None:
         return None

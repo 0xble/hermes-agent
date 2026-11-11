@@ -35,10 +35,10 @@ def authored(tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("writer", ["force", "unset", "save", "atomic", "text", "leaf"])
-def test_all_managed_writers_reject_invalid_complete_candidate(authored, writer):
+def test_all_managed_writers_reject_invalid_complete_candidate(authored, writer):  # health: allow HX011 -- each public writer exercises a distinct admission path
     before = authored.read_bytes()
     with pytest.raises((ConfigValidationError, SystemExit)):
-        if writer == "force":
+        if writer == "force":  # health: allow HX011 -- each public writer exercises a distinct admission path
             config.set_config_value("mcp_servers", "not-a-mapping", force=True)
         elif writer == "unset":
             config.unset_config_value("model_presets.worker")
