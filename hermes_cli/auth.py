@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- config diagnostic redaction is coupled to the auth hint boundary.
 """Multi-provider authentication system for Hermes Agent.
 
 - ``ProviderConfig`` / ``PROVIDER_REGISTRY`` describe every known inference provider.
@@ -133,7 +134,7 @@ def normalize_actual_base_url(base_url: str) -> str:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower().rstrip(".")
         path = parsed.path.rstrip("/")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- provider hint generation is best-effort and must not mask auth errors
         return url
     if path in {"", "/"} and (host == "api.actual.inc" or is_actual_local_base_url(url)):
         return url + "/v1"

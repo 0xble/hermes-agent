@@ -674,7 +674,7 @@ def reconcile_mcp_servers_with_config() -> dict[str, list[str]]:
     with _owner_secret_scope():
         try:
             servers = _config._load_mcp_config(strict=True)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- reconcile failure retains live servers and retries later
             from hermes_cli.config_errors import log_config_error_once
             log_config_error_once(logger, str(exc), context="MCP reconcile skipped, retaining current servers")
             return {"removed": [], "added": [], "pending": []}

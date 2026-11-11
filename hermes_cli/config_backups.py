@@ -58,7 +58,7 @@ def backup_config(config_path: Path, reason: str, *, keep: int = DEFAULT_KEEP) -
             try:
                 loaded = fast_safe_load(good_bytes.decode("utf-8-sig"))
                 validate_candidate({} if loaded is None else loaded)
-            except Exception as exc:
+            except Exception as exc:  # health: allow BLE001 -- invalid serialized config is skipped before backup
                 logger.warning("Not backing up invalid config as good: %s", exc)
                 return None
         root = backups_dir(config_path)

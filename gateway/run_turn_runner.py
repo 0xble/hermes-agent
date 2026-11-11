@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- config-error handling stays at this established callback facade.
 """Per-turn callback runner (progress/status/voice/run_sync) for the gateway agent turn.
 
 ``TurnRunner`` owns the per-turn callbacks ``GatewayRunner._run_agent_inner`` binds. ``gateway.run``
