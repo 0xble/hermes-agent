@@ -1,4 +1,5 @@
 """Advisory memory health must stay bounded and preserve actionable diagnostics."""
+import asyncio
 import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -34,6 +35,7 @@ async def test_scope_discovery_is_off_loop_and_uses_served_primary_home(tmp_path
     async def check(runner, profile, home):
         checked.append((profile, home))
 
+    monkeypatch.setattr("gateway.run._handoff_watch_scopes", Mock(side_effect=AssertionError("sync resolver used")))
     monkeypatch.setattr("gateway.run._resolve_handoff_watch_scopes", AsyncMock(return_value=[(None, None), ("launch", launch)]))
     monkeypatch.setattr(health, "_check_profile_health", check)
     monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: primary)
@@ -45,7 +47,7 @@ async def test_scope_discovery_is_off_loop_and_uses_served_primary_home(tmp_path
 
 @pytest.mark.asyncio
 async def test_startup_does_not_await_blocked_advisory_health(monkeypatch):
-    entered, release = __import__("asyncio").Event(), __import__("asyncio").Event()
+    entered, release = asyncio.Event(), asyncio.Event()
 
     async def blocked(runner):
         entered.set()
@@ -54,12 +56,12 @@ async def test_startup_does_not_await_blocked_advisory_health(monkeypatch):
     monkeypatch.setattr(health, "check_memory_health", blocked)
     monkeypatch.setattr("gateway.cron_store_notices.install_cron_store_notices", Mock())
     gateway = SimpleNamespace()
-    setup = __import__("asyncio").create_task(health.install_health_notices(gateway))
-    await __import__("asyncio").wait_for(entered.wait(), 2)
+    setup = asyncio.create_task(health.install_health_notices(gateway))
+    await asyncio.wait_for(entered.wait(), 2)
     assert setup.done()
     release.set()
     await setup
-    await __import__("asyncio").wrap_future(gateway._memory_health_future)
+    await asyncio.wrap_future(gateway._memory_health_future)
 
 
 @pytest.mark.asyncio
