@@ -357,6 +357,31 @@ def test_project_skill_diagnosis_persists_nothing_under_home(tmp_path, monkeypat
     assert sorted(p.relative_to(home) for p in home.rglob("*")) == before
 
 
+def test_plugin_skill_lookup_failure_keeps_traceback(monkeypatch, caplog):
+    from cron.tool_requirements import _plugin_skill_path
+    from hermes_cli import plugins
+
+    def broken_manager():
+        raise RuntimeError("plugin discovery failed")
+
+    monkeypatch.setattr(plugins, "get_plugin_manager", broken_manager)
+    assert _plugin_skill_path("audit") is None
+    assert any(r.exc_info and "Unable to resolve plugin skill" in r.message for r in caplog.records)
+
+
+def test_readonly_project_scan_failure_is_quarantined_with_traceback(tmp_path, monkeypatch, caplog):
+    from agent import skill_utils
+    from tools import skills_guard
+
+    def broken_scan(*_args, **_kwargs):
+        raise RuntimeError("scanner failed")
+
+    monkeypatch.setattr(skills_guard, "scan_skill", broken_scan)
+    with skill_utils.project_skill_scans_read_only():
+        assert skill_utils.is_quarantined_project_skill(tmp_path / "SKILL.md")
+    assert any(r.exc_info and "Read-only project skill scan failed" in r.message for r in caplog.records)
+
+
 def test_execute_code_without_terminal_call_needs_no_shell():
     job = {"enabled_toolsets": ["file", "code_execution"],
            "prompt": "Use execute_code(...) to batch read_file calls."}

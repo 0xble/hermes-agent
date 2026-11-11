@@ -8,8 +8,12 @@ perform one of its required steps.
 
 from __future__ import annotations
 
+import logging
 import re
 from typing import Any, Callable, Iterable, Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 # These are intentionally capability-oriented, not a list of every CLI in the
@@ -43,6 +47,7 @@ def _plugin_skill_path(name: str):
         from hermes_cli.plugins import get_plugin_manager
         path = get_plugin_manager().find_plugin_skill(name)
     except Exception:
+        logger.warning("Unable to resolve plugin skill %s for cron diagnostics", name, exc_info=True)
         return None
     return path if path is not None and path.exists() else None
 
@@ -84,6 +89,7 @@ def _attached_skill_content(name: str) -> str:
         from agent.skill_utils import get_disabled_skill_names
         disabled = get_disabled_skill_names()
     except Exception:
+        logger.warning("Unable to read disabled skills for cron diagnostics", exc_info=True)
         disabled = set()
     members = [m for m in info.get("skills", []) if m not in disabled]
     loaded_members = [_single_skill_loaded(member) for member in members]
@@ -250,6 +256,7 @@ def job_tool_requirement_issues(
             from hermes_cli.config import load_config_readonly
             cfg = load_config_readonly()
         except Exception:
+            logger.warning("Unable to load configuration for cron tool diagnostics", exc_info=True)
             cfg = {}
     names = _effective_toolsets(stored, cfg)
 

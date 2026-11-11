@@ -2,6 +2,7 @@
 
 import contextlib
 import json
+import logging
 import re
 import sys
 from datetime import timezone, UTC
@@ -12,6 +13,8 @@ PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli.colors import Colors, color
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_skills(single_skill=None, skills: Optional[Iterable[str]] = None) -> Optional[list[str]]:
@@ -763,6 +766,7 @@ def cron_doctor() -> int:
         expanded_cfg = _expand_env_vars(raw_cfg) if isinstance(raw_cfg, dict) else {}
         cfg, _ = _merge_managed_overlay(cast(Dict[str, Any], expanded_cfg))
     except Exception:
+        logger.warning("Unable to read effective configuration for cron doctor", exc_info=True)
         cfg = {}
     jobs = [job for job in list_jobs(include_disabled=True)
             if job.get("enabled", True) or job.get("state") == "missed"]

@@ -671,6 +671,8 @@ def is_quarantined_project_skill(skill_md) -> bool:
             from tools.skills_guard import scan_skill
             return scan_skill(skill_dir, source=_PROJECT_SCAN_SOURCE).verdict == "dangerous"
         except Exception:
+            logger.warning("Read-only project skill scan failed — quarantining (fail closed): %s",
+                           skill_dir, exc_info=True)
             return True
     try:
         from tools.skills_guard import scan_skill_cached
