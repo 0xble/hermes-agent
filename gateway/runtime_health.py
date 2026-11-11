@@ -165,9 +165,12 @@ async def install_health_notices(runner) -> None:
     try:
         from gateway.cron_store_notices import install_cron_store_notices
         install_cron_store_notices(runner, asyncio.get_running_loop())
-        schedule_memory_health(runner, asyncio.get_running_loop())
     except Exception:
         logger.error("Cron store health notice setup failed", exc_info=True)
+    try:
+        schedule_memory_health(runner, asyncio.get_running_loop())
+    except Exception:
+        logger.error("Memory health notice setup failed", exc_info=True)
 
 
 def health_notice_chores(runner, loop) -> list:
