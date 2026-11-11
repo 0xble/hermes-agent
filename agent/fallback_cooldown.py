@@ -75,13 +75,30 @@ def _arm_rate_limit_cooldown(
     """
     if reason not in _SHARED_COOLDOWN_REASONS:
         return None
+    if getattr(agent, "_shared_primary_probe_failed", False) and not getattr(agent, "_fallback_activated", False):
+        record = getattr(agent, "_shared_primary_cooldown_record", None)
+        if isinstance(record, dict):
+            return max(0, math.ceil(float(record.get("reset_at", 0) or 0) - time.time()))
+    backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     if getattr(agent, "_fallback_activated", False):
         # Compare the whole route: a same-provider fallback (another model or endpoint) failing
         # says nothing about the primary and must not arm the primary's shared window.
-        from agent.shared_primary_cooldown import live_route_from_agent, route_from_agent
-        if live_route_from_agent(agent) != route_from_agent(agent):
+        from agent.shared_primary_cooldown import canonical_route, live_route_from_agent, route_from_agent
+        live_route = canonical_route(live_route_from_agent(agent))
+        primary_route = canonical_route(route_from_agent(agent))
+        if live_route != primary_route:
+            # Fallback routes have their own breaker. A fallback failure is never evidence that
+            # the primary recovered, and the reason is deliberately rate_limit-only.
+            from agent.shared_primary_cooldown import arm_cooldown
+            fallback_record = arm_cooldown(
+                live_route, reason=FailoverReason.rate_limit, reset_at=reset_at,
+                backoff_count=backoff_count, request_id=str(getattr(agent, "session_id", "") or ""),
+                short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
+                              and (live_route[0] == "custom" or live_route[0].startswith("custom:"))),
+            )
+            if fallback_record:
+                agent._shared_fallback_cooldown_record = fallback_record
             return None
-    backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     agent._rate_limit_backoff_count = backoff_count + 1
     provider_delay = _provider_reset_delay(reset_at)
     if provider_delay is not None:
@@ -96,11 +113,21 @@ def _arm_rate_limit_cooldown(
     # across gateway agent eviction, delegated children, cron workers and restarts.
     agent._shared_primary_cooldown_record = None
     try:
-        from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+        from agent.shared_primary_cooldown import arm_cooldown, read_cooldown, route_from_agent
+        primary_route = route_from_agent(agent)
+        existing = read_cooldown(primary_route)
+        owner = str(existing.get("probe_owner") or "") if isinstance(existing, dict) else ""
+        token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
+        if owner and owner != token:
+            logger.info("Ignoring stale primary failure while another probe owns the lease")
+            return None
         record = arm_cooldown(
-            route_from_agent(agent), reason=reason,
+            primary_route, reason=reason,
             reset_at=_provider_reset_epoch(reset_at),
             backoff_count=backoff_count,
+            request_id=str(getattr(agent, "session_id", "") or "") or None,
+            short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
+                          and (primary_route[0] == "custom" or primary_route[0].startswith("custom:"))),
         )
     except Exception:
         record = None

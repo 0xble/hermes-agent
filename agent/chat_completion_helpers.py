@@ -70,12 +70,10 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own longer cooldown.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
-
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
     context = contextvars.copy_context()
     return lambda: context.run(callback)
-
 
 def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
     """Bounded worker join before raising InterruptedError (#81521).
@@ -96,12 +94,10 @@ def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
         logger.warning("%s worker still alive after interrupt abort (2.0s join "
             "timeout); Relay teardown will best-effort drain orphaned scopes (#81521).", label)
 
-
 def _ra():
     """Lazy ``run_agent`` reference so ``patch("run_agent.cleanup_vm")`` etc. intercept."""
     import run_agent
     return run_agent
-
 
 class ProviderStreamError(Exception):
     """Provider encoded an API error as streaming content instead of an SDK error."""
@@ -127,7 +123,6 @@ class ProviderStreamError(Exception):
             text += f": {error_obj['message']}"
         return text
 
-
 def _status_code_from_value(value: Any) -> Optional[int]:
     if isinstance(value, int) and 100 <= value < 600:
         return value
@@ -135,7 +130,6 @@ def _status_code_from_value(value: Any) -> Optional[int]:
         return None
     match = re.search(r"(?:HTTP_STATUS/)?\b([1-5]\d\d)\b", value, re.IGNORECASE)
     return int(match.group(1)) if match else None
-
 
 def _status_code_from_payload(payload: Any) -> Optional[int]:
     if not isinstance(payload, dict):
@@ -151,7 +145,6 @@ def _status_code_from_payload(payload: Any) -> Optional[int]:
         if status_code is not None:
             return status_code
     return None
-
 
 def _json_object_from_text(text: str) -> Optional[dict]:
     stripped = (text or "").strip()
@@ -2055,6 +2048,10 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     if _candidate_pool_exhausted(agent, fb_provider, fb_model):
         logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)
+        return True
+    from agent.shared_primary_probe_runtime import fallback_route_is_active
+    if fallback_route_is_active(fb_provider, fb.get("base_url"), fb_model):
+        logger.info("Fallback skip: %s/%s has an active shared cooldown", fb_provider, fb_model)
         return True
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
