@@ -179,7 +179,8 @@ def test_primary_success_after_reset_clears_outage_with_one_recovery_notice(tmp_
     assert result["final_response"] == "OK from primary-model"
     assert result["model"] == "primary-model"
     assert [r["status"] for r in primary] == [429, 200]
-    assert not _record_path(home).exists(), "a real primary success must clear the outage"
+    state = json.loads(_record_path(home).read_text(encoding="utf-8-sig"))
+    assert any(entry.get("state") == "tombstone" for entry in state["routes"].values())
     assert len([n for n in result["notices"] if "restored" in n]) == 1, result["notices"]
 
 

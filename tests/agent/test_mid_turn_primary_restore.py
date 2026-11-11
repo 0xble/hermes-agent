@@ -151,7 +151,8 @@ def test_long_turn_uses_shared_recovery_and_preserves_tool_pairs(tmp_path, monke
                 base_url="https://primary.invalid/v1", _emit_diagnostic_status=Mock(),
             )
             assert complete_primary_recovery(peer)
-            assert not path.exists()
+            state = json.loads(path.read_text(encoding="utf-8-sig"))
+            assert any(record.get("state") == "tombstone" for record in state["routes"].values())
         tool_finished.append(True)
         return "tool result"
 

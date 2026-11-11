@@ -663,7 +663,8 @@ class TestRateLimitCooldown:
             agent._try_activate_fallback(reason=FailoverReason.rate_limit)
 
         assert hasattr(agent, "_rate_limited_until")
-        assert agent._rate_limited_until > before + 50  # ~60s from now
+        # Design-v2 arms the first transient custom-route outage for a short window.
+        assert 14 <= agent._rate_limited_until - before <= 20
 
     def test_cooldown_not_set_when_already_on_fallback(self):
         """Chain-switching while already on fallback must not reset cooldown."""

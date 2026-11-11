@@ -443,7 +443,7 @@ def claim_outage_notice(
         return False
 
 
-def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool:
+def clear_if_current(route: tuple[str, str, str], outage_id: str | None, *, tombstone: bool = False) -> bool:
     """Clear only the outage this agent observed; return true for the recovery-notice owner."""
     route = canonical_route(route)
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
@@ -455,7 +455,17 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool
                 return False
             if outage_id is not None and str(entry.get("outage_id")) != str(outage_id):
                 return False
-            del state["routes"][key]
+            if tombstone:
+                now = time.time()
+                entry.pop("probe_owner", None)
+                entry.pop("probe_until", None)
+                entry["state"] = "tombstone"
+                entry["reset_at"] = now
+                entry["recorded_at"] = now
+                entry["tombstone_until"] = now + _RECOVERY_TOMBSTONE_SECONDS
+                state["routes"][key] = entry
+            else:
+                del state["routes"][key]
             _write_state(path, state)
             return True
     except OSError as exc:
@@ -694,7 +704,9 @@ def complete_primary_recovery(agent) -> bool:
     probe_token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
     if not outage_id:
         return False
-    cleared = _settle_probe(route, outage_id, probe_token, success=True) if probe_token else clear_if_current(route, outage_id)
+    cleared = _settle_probe(route, outage_id, probe_token, success=True) if probe_token else clear_if_current(
+        route, outage_id, tombstone=True
+    )
     if not cleared:
         return False
     agent._shared_primary_cooldown_record = None

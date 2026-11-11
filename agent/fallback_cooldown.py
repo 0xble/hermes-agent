@@ -75,6 +75,11 @@ def _arm_rate_limit_cooldown(
     """
     if reason not in _SHARED_COOLDOWN_REASONS:
         return None
+    request_id = str(getattr(agent, "_current_api_request_id", "") or "").strip()
+    if not request_id:
+        sequence = int(getattr(agent, "_cooldown_failure_sequence", 0) or 0) + 1
+        agent._cooldown_failure_sequence = sequence
+        request_id = f"fallback:{id(agent)}:{sequence}"
     if getattr(agent, "_shared_primary_probe_failed", False) and not getattr(agent, "_fallback_activated", False):
         record = getattr(agent, "_shared_primary_cooldown_record", None)
         if isinstance(record, dict):
@@ -92,7 +97,7 @@ def _arm_rate_limit_cooldown(
             from agent.shared_primary_cooldown import arm_cooldown
             fallback_record = arm_cooldown(
                 live_route, reason=FailoverReason.rate_limit, reset_at=reset_at,
-                backoff_count=backoff_count, request_id=str(getattr(agent, "session_id", "") or ""),
+                backoff_count=backoff_count, request_id=request_id,
                 short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
                               and (live_route[0] == "custom" or live_route[0].startswith("custom:"))),
             )
@@ -125,7 +130,7 @@ def _arm_rate_limit_cooldown(
             primary_route, reason=reason,
             reset_at=_provider_reset_epoch(reset_at),
             backoff_count=backoff_count,
-            request_id=str(getattr(agent, "session_id", "") or "") or None,
+            request_id=request_id,
             short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
                           and (primary_route[0] == "custom" or primary_route[0].startswith("custom:"))),
         )
