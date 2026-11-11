@@ -8,6 +8,7 @@ import time
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -814,3 +815,122 @@ def test_fallback_route_gets_independent_breaker_without_clearing_primary():
     assert spc.read_cooldown(spc.route_from_agent(agent))["outage_id"] == primary["outage_id"]
     fallback = getattr(agent, "_shared_fallback_cooldown_record", None)
     assert fallback and fallback["reason"] == "rate_limit"
+
+
+def test_fresh_adopters_share_one_primary_probe_lease():
+    """Fresh agents claim an expired outage before either is allowed to probe primary."""
+    from agent import shared_primary_cooldown_runtime as shared_runtime
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+
+    def fresh():
+        return SimpleNamespace(
+            _fallback_chain=[{"provider": "openai", "model": "fallback"}],
+            provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2], _primary_runtime=None,
+        )
+
+    first, second = fresh(), fresh()
+    with patch("agent.chat_completion_helpers.try_activate_fallback", return_value=True) as activate:
+        assert shared_runtime._adopt_shared_primary_cooldown(first) is False
+        assert shared_runtime._adopt_shared_primary_cooldown(second) is True
+    assert getattr(first, "_shared_primary_probe_token", None)
+    activate.assert_called_once()
+    assert activate.call_args.kwargs["_shared_cooldown_record"]["outage_id"] == entry["outage_id"]
+
+
+def test_probe_failure_flag_is_scoped_to_its_outage():
+    """A later outage on the same agent must arm after an earlier probe failure."""
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(
+        provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2], _primary_runtime=None,
+        _shared_primary_cooldown_record=entry, _shared_primary_probe_token=token,
+        _fallback_activated=False, _rate_limit_backoff_count=0, _fallback_episode_cooled=False,
+    )
+    assert spc._fail_agent_probe(agent)
+    first = _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit)
+    assert first is not None
+    old_outage = agent._shared_primary_cooldown_record["outage_id"]
+    spc.clear_if_current(_ROUTE, old_outage)
+    agent._shared_primary_cooldown_record = None
+    second = _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit)
+    assert second is not None
+    assert agent._shared_primary_cooldown_record["outage_id"] != old_outage
+
+
+def test_fallback_breaker_does_not_inherit_primary_backoff_count():
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)
+    agent._fallback_activated = True
+    agent._provider_fallback_active = True
+    agent._rate_limit_backoff_count = 7
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) is None
+    assert agent._shared_fallback_cooldown_record["backoff_count"] == 1
+
+
+def test_fallback_cooldown_lookup_uses_resolved_base_url():
+    from agent.shared_primary_probe_runtime import fallback_route_is_active
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+               return_value={"base_url": "https://resolved.invalid/v1"}) as resolve:
+        spc.arm_cooldown(("custom:resolved", "https://resolved.invalid/v1", "model"), reason="rate_limit")
+        assert fallback_route_is_active("custom:resolved", None, "model")
+    resolve.assert_called_once()
+
+
+def test_local_probe_release_does_not_escalate_backoff():
+    from agent.shared_primary_probe_runtime import release_primary_probe
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(_shared_primary_cooldown_record=entry, _shared_primary_probe_token=token)
+    release_primary_probe(agent, token)
+    released = spc.read_cooldown(_ROUTE)
+    assert released["state"] == "expired"
+    assert released["backoff_count"] == entry["backoff_count"]
+
+
+def test_fresh_recovery_tombstone_rejects_late_failure():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert spc._settle_probe(_ROUTE, entry["outage_id"], token, success=True)
+    assert spc.arm_cooldown(_ROUTE, reason="rate_limit", request_started_at=entry["recorded_at"]) is None
+
+
+def test_stream_first_delta_does_not_announce_recovery():
+    from agent.turn_api_call import perform_api_call
+    with patch("agent.turn_api_call._should_stream", return_value=True), \
+         patch("agent.shared_primary_cooldown.complete_primary_recovery") as recovered:
+        agent = SimpleNamespace(
+            _interruptible_streaming_api_call=lambda _kwargs, on_first_delta: (
+                on_first_delta(), (_ for _ in ()).throw(RuntimeError("late stream failure"))
+            ),
+            _interruptible_api_call=None, _get_transport=lambda: None, _is_codex_backend=lambda: False,
+            _has_stream_consumers=lambda: True, api_mode="chat_completions", base_url="https://primary.invalid/v1",
+            provider="custom", model="primary", session_id="s", platform="cli", _model_request_active=None,
+            thinking_callback=None,
+            _pending_redirect_lock=None, _pending_redirect=False, _has_pending_redirect=lambda: False,
+        )
+        with pytest.raises(RuntimeError, match="late stream failure"):
+            perform_api_call(
+                agent, api_kwargs={}, _original_api_kwargs={}, _llm_middleware_trace=[],
+                _moa_prepared_request=None, _retry=SimpleNamespace(), thinking_spinner=None,
+                retry_count=0, api_call_count=1, api_request_id="r", effective_task_id="t",
+                turn_id="turn", interrupted=False,
+            )
+    recovered.assert_not_called()

@@ -24,11 +24,28 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
         # refuse the turn if no fallback can be bound, rather than use the primary.
         raise
     try:
-        if not is_active(record):
-            # Keep an expired record as a recovery probe: the first successful primary request
-            # clears it atomically and owns the sole recovery notice. None drops a record that
-            # was cleared elsewhere (another process recovered, or `hermes fallback cooldowns clear`).
+        if (isinstance(record, dict)
+                and str(record.get("probe_owner") or "")
+                and str(record.get("probe_owner") or "") == str(getattr(agent, "_shared_primary_probe_token", "") or "")):
             agent._shared_primary_cooldown_record = record
+            return False
+        if record is None:
+            return False
+        if not is_active(record):
+            agent._shared_primary_cooldown_record = record
+            from agent.shared_primary_cooldown import claim_probe, route_from_record
+            probe = claim_probe(route_from_record(record), str(record.get("outage_id") or ""))
+            if probe:
+                agent._shared_primary_probe_token = probe
+                return False
+            if probe is False:
+                from agent.error_classifier import FailoverReason
+                from agent.chat_completion_helpers import try_activate_fallback
+                try:
+                    reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))
+                except ValueError:
+                    reason = FailoverReason.rate_limit
+                return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=record))
             return False
         from agent.error_classifier import FailoverReason
         try:

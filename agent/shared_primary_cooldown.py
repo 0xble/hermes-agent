@@ -40,6 +40,7 @@ _MAX_PROVIDER_RESET_SECONDS = 31 * 86_400
 _FIRST_BACKOFF_SECONDS = 15
 _PROBE_LEASE_SECONDS = 120
 _RECOVERY_TOMBSTONE_SECONDS = 5 * 60
+_RECOVERY_TOMBSTONE_GRACE_SECONDS = 2
 
 
 def _state_path() -> Path:
@@ -338,7 +339,8 @@ def active_cooldown(route: tuple[str, str, str]) -> dict[str, Any] | None:
 
 def arm_cooldown(
     route: tuple[str, str, str], *, reason: Any, reset_at: Any = None,
-    backoff_count: int | None = None, request_id: str | None = None, short_window: bool = False,
+    backoff_count: int | None = None, request_id: str | None = None,
+    request_started_at: Any = None, short_window: bool = False,
 ) -> dict[str, Any] | None:
     """Create or re-arm a route outage and return its durable record."""
     now = time.time()
@@ -352,6 +354,16 @@ def arm_cooldown(
             changed = _merge_duplicate_routes(state)
             changed = _prune_stale(state, now) or changed
             old = state["routes"].get(key)
+            if isinstance(old, dict) and old.get("state") == "tombstone":
+                tombstone_until = _finite_float(old.get("tombstone_until")) or 0.0
+                recovered_at = _finite_float(old.get("recorded_at"))
+                started_at = _finite_float(request_started_at)
+                late_request = started_at is not None and recovered_at is not None and started_at <= recovered_at
+                within_grace = bool(request_id) and started_at is None and recovered_at is not None and now - recovered_at < _RECOVERY_TOMBSTONE_GRACE_SECONDS
+                if tombstone_until > now and (late_request or within_grace):
+                    if changed:
+                        _write_state(path, state)
+                    return None
             # Only a successful primary response clears the record, so an active or recently
             # expired entry is the same outage: escalate shared backoff, keep notice state. A
             # stale entry was pruned above, so a 429 long after expiry starts a new outage.
@@ -473,7 +485,7 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None, *, tomb
         return False
 
 
-def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> str | None:
+def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> str | bool | None:
     """Atomically claim the single half-open probe for an expired outage."""
     now = time.time()
     route = canonical_route(route)
@@ -494,7 +506,7 @@ def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> str | Non
             if probe_until > now:
                 if changed:
                     _write_state(path, state)
-                return None
+                return False
             reset_at = _plausible_reset(entry.get("reset_at", 0), now)
             if reset_at is not None and reset_at > now:
                 if changed:
@@ -590,7 +602,7 @@ def _fail_agent_probe(agent) -> bool:
     settled = _settle_probe(route, str(record.get("outage_id") or ""), token, success=False)
     if settled:
         agent._shared_primary_probe_token = None
-        agent._shared_primary_probe_failed = True
+        agent._shared_primary_probe_failed_outage_id = str(record.get("outage_id") or "")
         current = get_cooldown(route)
         if isinstance(current, dict):
             agent._shared_primary_cooldown_record = current
@@ -704,13 +716,22 @@ def complete_primary_recovery(agent) -> bool:
     probe_token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
     if not outage_id:
         return False
-    cleared = _settle_probe(route, outage_id, probe_token, success=True) if probe_token else clear_if_current(
-        route, outage_id, tombstone=True
-    )
+    if probe_token:
+        cleared = _settle_probe(route, outage_id, probe_token, success=True)
+        if not cleared:
+            # The lease may have been released or replaced before this successful primary
+            # response arrived. A success on the live primary still proves the current outage
+            # recovered, but never clear a lease another process currently owns.
+            current = get_cooldown(route)
+            if isinstance(current, dict) and not current.get("probe_owner"):
+                cleared = clear_if_current(route, outage_id, tombstone=True)
+    else:
+        cleared = clear_if_current(route, outage_id, tombstone=True)
     if not cleared:
         return False
     agent._shared_primary_cooldown_record = None
     agent._shared_primary_probe_token = None
+    agent._shared_primary_probe_failed_outage_id = None
     agent._rate_limited_until = 0
     agent._fallback_episode_cooled = False
     silent_retry = bool(record.get("_silent_retry", getattr(agent, "_provider_fallback_silent_retry", False)))
@@ -724,8 +745,8 @@ def complete_primary_recovery(agent) -> bool:
 
 
 __all__ = [
-    "active_cooldown", "announced_fallback", "arm_cooldown", "claim_outage_notice", "clear_cooldowns",
-    "clear_if_current", "complete_primary_recovery", "get_cooldown", "is_active", "list_cooldowns",
-    "canonical_route", "claim_probe", "live_route_from_agent", "read_cooldown", "route_from_agent",
+    "active_cooldown", "announced_fallback", "arm_cooldown", "canonical_route", "claim_outage_notice",
+    "claim_probe", "clear_cooldowns", "clear_if_current", "complete_primary_recovery", "get_cooldown",
+    "is_active", "list_cooldowns", "live_route_from_agent", "read_cooldown", "route_from_agent",
     "route_from_record", "route_key",
 ]

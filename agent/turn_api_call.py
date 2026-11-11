@@ -86,8 +86,6 @@ def perform_api_call(
 
     def _stop_spinner():
         nonlocal thinking_spinner
-        from agent.shared_primary_cooldown import complete_primary_recovery
-        complete_primary_recovery(agent)
         thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
 
     _use_streaming = _should_stream(agent)
