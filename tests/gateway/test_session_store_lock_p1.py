@@ -96,11 +96,6 @@ def test_liveness_dump_includes_session_store_owner_snapshot(tmp_path):
             return None
 
     loop = _FrozenLoop()
-    lock = SimpleNamespace(owner_snapshot=lambda: (
-        7, SimpleNamespace(thread_name="store-writer", thread_ident=44,
-                           acquired_at=time.monotonic() - 3.0,
-                           callsite=(("session.py", 123),)),
-    ))
     with patch("gateway.shutdown_watchdog._write_watchdog_dump") as dump, \
             patch("gateway.shutdown_watchdog._hard_exit"), \
             patch("gateway.shutdown_watchdog._mark_exited_quietly"):
