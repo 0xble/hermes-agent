@@ -140,7 +140,7 @@ class TestCommandCodeFetchModelsPickerContract:
     """
 
 
-    def test_resolve_provider_full(self):
+    def test_resolve_provider_full(self, monkeypatch):
         """Both profiles must resolve through the model-switch path.
 
         Regression: ``resolve_provider_full`` only knew models.dev + overlay
@@ -150,6 +150,8 @@ class TestCommandCodeFetchModelsPickerContract:
         """
         from hermes_cli.providers import resolve_provider_full
 
+        # Exercise plugin-only resolution, not the changing models.dev catalog.
+        monkeypatch.setattr("hermes_cli.providers._models_dev_info", lambda *args, **kwargs: None)
         chat = resolve_provider_full("commandcode", {}, [])
         assert chat is not None and chat.id == "commandcode"
         assert chat.transport == "openai_chat"
