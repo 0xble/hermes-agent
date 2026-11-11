@@ -40,6 +40,16 @@ authorization settles the obligation without delivery.
 - Dispatch is the enforced-notice mechanism. The gateway's async-delegation watcher
   calls `_drive_delegation_retries` on the orphan-sweep cadence. `sweep_retries`
   claims due rows atomically (`retry_claim` CAS) and returns actions:
+  - Idle discovery is read-only, including dropped-success classification. Only
+    selected due ids enter writer admission, where eligibility is rechecked before
+    claims change. A busy transaction rolls back, leaving work owed for the next
+    sweep on the 30-second orphan cadence (plus watcher work and contention).
+    Classification already committed before a later busy claim remains durable.
+    No retry attempt or notice is spent by a failed claim transaction.
+  - Busy ticks log INFO as deferred, separately for each served profile. After
+    `ceil(RETRY_CLAIM_TTL_S / ORPHAN_SWEEP_INTERVAL_S)` consecutive busy ticks
+    (currently 10), every subsequent busy tick logs WARNING. Success resets the
+    counter and logs recovery. Non-busy failures remain WARNING immediately.
   - A notice is injected as a parent turn telling it to call
     `delegate_task(action='resume')` and spawn with `recovery_context`. If the parent
     has not dispatched after `NOTICE_GRACE_S` (15 min), it is re-prompted once. If it
@@ -132,3 +142,18 @@ Fork patch identity: `delegation-durable-retry`.
 `tests/gateway/test_delegation_auto_resume.py`.
 
 Contract tests: `tests/tools/test_delegation_retry.py`, `tests/tools/test_delegation_retry_controls.py`, `tests/gateway/test_delegation_retry_delivery.py`, `tests/tools/test_delegate_control_actions.py`, `tests/gateway/test_delegation_auto_resume.py`.
+
+## Sweep contention regression
+
+`tests/tools/test_delegation_sweep_contention.py` holds a real temporary WAL
+writer while an empty sweep reads. `tests/gateway/test_delegation_sweep_contention.py`
+holds a writer past a shortened test-only busy timeout, verifies unchanged
+durable claims and other-profile progress, then releases it and verifies the
+next sweep claims exactly once. Both primary and secondary profile failures
+exercise escalation and recovery. Production timeouts and retry budgets are
+unchanged. Existing retry and gateway-delivery suites cover claim races, stop,
+seals, pending completion/outbox delivery and bounded lineage behavior.
+
+Retire this fork adjustment when upstream provides equivalent read-before-write
+discovery and profile-local busy deferral. Roll back by reverting its commit as
+a unit. There is no schema or persisted-state migration.
