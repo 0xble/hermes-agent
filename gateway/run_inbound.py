@@ -2187,7 +2187,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # See #17916.
             if source.platform == Platform.SLACK and source.user_id:
                 _safe_user_name = f"{_safe_user_name} | Slack user <@{source.user_id}>"
-            message_text = f"[{_safe_user_name}] {message_text}"
+            from gateway.source_origin import insert_event_context
+            message_text = insert_event_context(event, message_text, 0, f"[{_safe_user_name}] ")
         return message_text
 
     @staticmethod
@@ -2340,7 +2341,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             # paragraph breaks to collide with the pointer's closing delimiter.
             reply_text = json.dumps(event.reply_to_text, ensure_ascii=False)
             _who = " your previous message" if getattr(event, "reply_to_is_own_message", False) else ""
-            message_text = f'[Replying to{_who}: {reply_text}]\n\n{message_text}'
+            from gateway.source_origin import insert_event_context
+            message_text = insert_event_context(event, message_text, 0, f'[Replying to{_who}: {reply_text}]\n\n')
 
         # Discord: the triggering message id goes on the per-turn user message, never the cached
         # system prompt — it changes every turn and would bust the agent-cache signature. It is
@@ -2455,7 +2457,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # Keep current media after the recall boundary, not among discarded backfill.
         # The sender prefix stays on the caption, after the media notes.
         if channel_context := getattr(event, "channel_context", None):
-            message_text = channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY + message_text
+            from gateway.source_origin import insert_event_context
+            message_text = insert_event_context(
+                event, message_text, 0, channel_context + "\n" + CHANNEL_MESSAGE_BOUNDARY)
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
         message_text = self._prepend_inbound_document_notes(event, message_text)
         from gateway.session_context_refs import turn_references

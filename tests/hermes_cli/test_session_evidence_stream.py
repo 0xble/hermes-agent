@@ -22,6 +22,15 @@ def _args(*argv):
     return parser.parse_args(["sessions", "state", *argv])
 
 
+def test_acquisition_without_manifest_names_flag_and_docs_before_store_read(capsys, monkeypatch):
+    from hermes_cli.session_evidence import cmd_session_evidence
+    args = _args("transcript", "--session-id", "fictional")
+    monkeypatch.setattr("hermes_cli.session_evidence._capture", lambda *a, **kw: pytest.fail("store opened"))
+    assert cmd_session_evidence(args) == 1
+    error = capsys.readouterr().err
+    assert "--control-roots-file" in error and "#session-graph-and-audit-streams" in error
+
+
 @pytest.fixture
 def store(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -156,6 +165,18 @@ class _StreamSink:
 
 def _capture(capsys, monkeypatch, operation, *, sid="root", callback=None, short=False, measure=False):
     argv = (operation,) if operation == "inventory" else (operation, "--session-id", sid)
+    if operation == "transcript":
+        policy_path = Path(os.environ["HERMES_HOME"]) / "control-roots.json"
+        from hermes_state_evidence import evidence_snapshot, inventory_rows
+        from hermes_state_acquisition import graph_identity
+        try:
+            with evidence_snapshot(policy_path.parent / "state.db") as conn:
+                identity = graph_identity(list(inventory_rows(conn)))
+        except (ValueError, sqlite3.Error):
+            identity = "unavailable"
+        policy_path.write_text(json.dumps({"version": 1, "owner": "fictional-maintenance",
+            "roots": ["dangling"], "coverage_complete": True, "inventory_sha256": identity}))
+        argv += ("--control-roots-file", str(policy_path))
     args = _args(*argv)
     if measure:
         # Warm the real import/redaction path, excluding imports from stream working memory.
@@ -225,10 +246,10 @@ _AUDIT_CHANGES = {
     "invalid-utf8": ("UPDATE messages SET content = CAST(x'80' AS TEXT) WHERE id = 3", ()),
 }
 _AUDIT_ERRORS = {
-    "prefix": "exact session ID", "alias": "exact session ID", "title": "exact session ID",
-    "absent": "exact session ID", "oversize-content": "source bytes", "blob-content": "unsupported",
-    "oversize-metadata": "source bytes", "huge-blob": "exceeds 262144 source bytes",
-    "huge-text": "exceeds 262144 source bytes", "invalid-utf8": "UnicodeDecodeError",
+    "prefix": "control component or unresolved session; acquisition held",
+    "alias": "control component or unresolved session; acquisition held",
+    "title": "control component or unresolved session; acquisition held",
+    "absent": "control component or unresolved session; acquisition held",
     "record-budget": "encoded bytes", "interrupt": "stream interrupted",
 }
 
@@ -330,7 +351,8 @@ def _selected_entrypoint(store, tmp_path, explicit_profile):
     command = [sys.executable, "-m", "hermes_cli.main"]
     if explicit_profile:
         command += ["-p", "fictional"]
-    command += ["sessions", "state", "transcript", "--session-id", "root"]
+    command += ["sessions", "state", "transcript", "--session-id", "root",
+                "--control-roots-file", str(tmp_path / "control-roots.json")]
     return command, env, selected
 
 
@@ -360,12 +382,12 @@ def audit_case(store, scenario):
     "origin-drift", "oversize-content", "blob-content", "oversize-metadata", "large", "interrupt", "wal",
     "huge-blob", "huge-text", "home", "profile", "invalid-utf8", "record-budget",
 ])
-def test_transcript_is_exact_bounded_audit_evidence_or_fails_closed(audit_case, scenario, monkeypatch, capsys, tmp_path):
-    """Completion certifies one exact audit segment, not origin, lineage or a repaired source."""
+def test_transcript_holds_unknown_bodies_without_losing_occurrence_identity(audit_case, scenario, monkeypatch, capsys, tmp_path):
+    """Unknown historical authorship cannot trigger a content query, including malformed bodies."""
     store = audit_case
     sizes = []
     forbidden = {"messages_fts": None, "system_prompts": None,
-                 "sessions": _PRIVATE_SESSION, "messages": _PRIVATE_MESSAGE}
+                 "sessions": _PRIVATE_SESSION | {"origin_json"}, "messages": _PRIVATE_MESSAGE | {"content"}}
     reads, writes = _read_guard(monkeypatch, forbidden, sizes)
     _, baseline, error, _ = _capture(capsys, monkeypatch, "transcript", measure=scenario == "large")
     assert not error
@@ -386,54 +408,35 @@ def test_transcript_is_exact_bounded_audit_evidence_or_fails_closed(audit_case, 
     else:
         code, sink, error, peak = _capture(capsys, monkeypatch, "transcript", sid=sid, callback=callback,
                                           measure=scenario == "large")
-    assert reads and not writes
+    assert reads and not writes and ("messages", "content") not in reads
+    assert "x" * 1000 not in json.dumps(sink.rows)
+    assert max(sizes) < 262144
     if scenario in _AUDIT_ERRORS:
         assert code == (130 if scenario == "interrupt" else 1)
         assert _AUDIT_ERRORS[scenario] in error and sink.footer is None
-        assert "x" * 1000 not in json.dumps(sink.rows)
-        assert max(sizes) < 262144
-        if scenario in {"prefix", "alias", "title", "absent", "record-budget"}:
-            assert sink.header is None
         assert (tmp_path / "state.db").read_bytes() == before_bytes
         return
-
     assert code == 0 and not error
     _verify(sink, "session_transcript", 1505 if scenario == "large" else 5)
-    assert sink.header is not None and sink.footer is not None and baseline.footer is not None
     rows = sink.rows[:5]
     assert [r["message"]["id"] for r in rows] == [2, 3, 5, 6, 7]
-    assert [r["audit_state"] for r in rows] == [
-        "rewind_excluded" if scenario == "state-drift" else "active",
-        "compaction_archive", "rewind_excluded", "active", "active",
-    ]
-    assert sink.header["human_origin"] == "unknown" and all(r["human_origin"] == "unknown" for r in rows)
     assert [r["message"]["role"] for r in rows] == ["user", "assistant", "user", "assistant", "user"]
-    assert all(r["message"]["session_id"] == "root" and r["message"]["timestamp"] == 2 for r in rows)
+    assert all(r["human_origin"] == "unknown" and r["message"]["disposition"] == "unresolved" for r in rows)
+    assert all("content" not in r["message"] for r in rows)
     assert all(r["message"]["message_uid"] for r in rows)
-    assert rows[0]["message"]["content"] == ("same-count edit" if scenario == "content-drift" else "架空の文 🌿")
-    assert rows[1]["message"]["content"] == '[{"type":"text","text":"fictional structured reply"}]'
-    assert rows[2]["message"]["display_metadata"] == '{"recovery_identity":"fictional"}'
-    assert rows[4]["message"]["display_metadata"] == '{"author":"Human"}'
     serialized = json.dumps([sink.header, *sink.rows])
-    assert "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789" not in serialized
-    assert "forbidden" not in serialized and "descendant must not appear" not in serialized
-    assert all(not _PRIVATE_MESSAGE & row["message"].keys() for row in rows)
+    assert "private title" not in serialized and "forbidden" not in serialized
     assert sink.footer["count"] == baseline.footer["count"]
     if selection is not None:
         command, env, selected = selection
         assert sink.header["scope"] == {"home": str(selected), "profile": "fictional"}
-        assert "wrong default home" not in serialized
         (selected / "state.db").unlink()
         missing_code, missing_sink, missing_error, _ = _entrypoint_capture(command, env)
-        assert missing_code != 0 and missing_error and missing_sink.header is None and missing_sink.footer is None
+        assert missing_code != 0 and missing_error and missing_sink.footer is None
         assert not (selected / "state.db").exists()
     else:
-        assert (sink.footer["sha256"] != baseline.footer["sha256"]) == scenario.endswith("-drift")
-    if scenario == "wal":
-        _, after, _, _ = _capture(capsys, monkeypatch, "transcript")
-        assert after.footer is not None
-        assert after.footer["sha256"] != baseline.footer["sha256"]
-    else:
+        assert (sink.footer["sha256"] != baseline.footer["sha256"]) == (scenario == "state-drift")
+    if scenario != "wal":
         assert (tmp_path / "state.db").read_bytes() == before_bytes
     if scenario == "large":
         assert peak is not None and peak < 5 * 1024 * 1024
@@ -463,7 +466,8 @@ def test_routing_identity_is_refused_rather_than_masked(store, field, operation,
 
 
 def test_closed_output_pipe_has_no_shutdown_flush_noise(store, tmp_path):
-    command, env, _ = _selected_entrypoint(store, tmp_path, False)
+    _, env, _ = _selected_entrypoint(store, tmp_path, False)
+    command = [sys.executable, "-m", "hermes_cli.main", "sessions", "state", "inventory"]
     read_fd, write_fd = os.pipe()
     os.close(read_fd)
     try:
@@ -473,3 +477,43 @@ def test_closed_output_pipe_has_no_shutdown_flush_noise(store, tmp_path):
         os.close(write_fd)
     assert result.returncode == 1
     assert result.stderr == b""
+
+
+def test_native_person_turn_reaches_cli_with_bounded_authored_content(tmp_path, monkeypatch, capsys):
+    from types import SimpleNamespace
+    from agent.turn_context import _stage_turn_user_message
+    from agent.session_persistence import _db_flush_row
+    from gateway.platforms.event import MessageEvent
+    from gateway.response_filters import display_metadata_for_event
+    from gateway.source_origin import stamp_telegram_person
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(tmp_path / "state.db")
+    db.create_session("dangling", source="audit_control")
+    directive = "Keep project progress notices off."
+    try:
+        for sid, text in (("allowed", directive), ("oversize", "x" * (300 * 1024))):
+            db.create_session(sid, source="telegram")
+            raw = SimpleNamespace(from_user=SimpleNamespace(id=1, is_bot=False), text=text,
+                                  forward_origin=None, via_bot=None, sender_chat=None)
+            event = stamp_telegram_person(MessageEvent(text=text, message_id=sid), raw)
+            agent = SimpleNamespace(platform="telegram")
+            message, _ = _stage_turn_user_message(agent, text, None, 1.0, event.message_id,
+                                                  None, display_metadata_for_event(event))
+            db.append_messages_batch(sid, [_db_flush_row(agent, message, True)])
+    finally:
+        db.close()
+    code, sink, error, _ = _capture(capsys, monkeypatch, "transcript", sid="allowed")
+    assert code == 0 and not error
+    _verify(sink, "session_transcript", 1)
+    row = sink.rows[0]["message"]
+    assert row["origin"] == "verified_human" and row["content"] == directive
+    assert row["platform_message_id"] == row["event"] == "allowed"
+    assert row["principal"] == "1" and row["authored_spans"] == [[0, len(directive)]]
+    code, sink, error, _ = _capture(capsys, monkeypatch, "transcript", sid="oversize")
+    assert code == 1 and error and sink.footer is None
+    with sqlite3.connect(tmp_path / "state.db") as writer:
+        writer.execute("ALTER TABLE messages DROP COLUMN absorbed_message_uids")
+    code, sink, error, _ = _capture(capsys, monkeypatch, "transcript", sid="allowed")
+    assert code == 1 and error and sink.header is None and sink.footer is None

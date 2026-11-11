@@ -114,6 +114,7 @@ def _adapter_event(event, **changes):
     Any other non-list still reaches ``_validate_native`` and refuses."""
     changes.update({name: [] for name in _MEDIA_FIELDS if getattr(event, name) is None})
     projected = replace(event, **changes) if changes else event
+    projected._native_origin = event._native_origin
     # Each absorbed input owns its stamp task. Do not replace the head's live clock: a task
     # already persisting that clock could then mark a newer, unpersisted receipt as complete.
     # Only the durable projection represents the newest receipt still needing a retry.
@@ -327,6 +328,9 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                 'route': runner.session_store._generate_session_key(event.source),
                 'event': deepcopy({name: getattr(event, name) for name in _EVENT_FIELDS}),
                 'timestamp': event.timestamp.isoformat()}
+    from agent.source_origin_worker import pack_origin
+    if origin := pack_origin(getattr(event, '_native_origin', None)):
+        envelope['source_origin'] = origin
     if (received_at := getattr(event, '_attended_activity_received_at', None)) is not None:
         # Arrival survives FIFO restoration, including a restart.
         envelope['attended_activity'] = {
@@ -419,6 +423,10 @@ def restore_native(payload, runner=None):
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),
                         **deepcopy(envelope['event']))
+    from agent.source_origin_worker import unpack_origin
+    receipt = unpack_origin(envelope.get('source_origin'))
+    if receipt is not None and receipt.text == event.text and receipt.event == str(event.message_id):
+        event._native_origin = receipt
     if activity := envelope.get('attended_activity'):
         event._attended_activity_received_at = activity['received_at']
         event._attended_activity_marked = activity['marked']

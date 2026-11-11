@@ -1069,7 +1069,8 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         # posts lacking bot_id/bot_message markers; DM channel IDs are per-user, hence bounded).
         self._user_name_cache: dict[tuple[str, str], str] = {}
         self._channel_name_cache: dict[tuple[str, str], str] = {}
-        self._user_is_bot_cache: dict[tuple[str, str], bool] = {}
+        self._user_is_bot_cache: dict[tuple[str, str], bool | None] = {}
+        self._user_info_retry_after: dict[tuple[str, str], float] = {}
         # channel_id → owning team_id (bounded; re-learned on the next event, _get_client falls
         # back to primary). Kept only while exactly one workspace claims the id — _channel_teams
         # holds all claimants; an ambiguous id is dropped, not last-writer-wins.
@@ -3358,10 +3359,11 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         try:
             payload = await self._users_info_payload(user_id, chat_id, team_id)
             if not payload:
-                self._user_is_bot_cache[cache_key] = False
+                self._user_is_bot_cache[cache_key] = None
                 self._user_name_cache[cache_key] = user_id
                 return user_id
-            name, self._user_is_bot_cache[cache_key] = self._parse_users_info(payload, user_id)
+            name, is_bot = self._parse_users_info(payload, user_id)
+            self._user_is_bot_cache[cache_key] = (is_bot if type((payload.get("user") or {}).get("is_bot")) is bool else None)
         except Exception as e:
             logger.debug("[Slack] users.info failed for %s: %s", user_id, e)
             name = user_id
@@ -3444,19 +3446,19 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
             return False
         team_id = str(team_id or self._channel_team.get(chat_id, ""))
         cache_key = (team_id, str(user_id))
-        if cache_key in self._user_is_bot_cache:
-            return self._user_is_bot_cache[cache_key]
+        if self._user_is_bot_cache.get(cache_key) is not None:
+            return bool(self._user_is_bot_cache[cache_key])
         if not self._app:
-            self._user_is_bot_cache[cache_key] = False
+            self._user_is_bot_cache[cache_key] = None
             return False
         try:
             payload = await self._users_info_payload(user_id, chat_id, team_id)
             if not payload:
-                self._user_is_bot_cache[cache_key] = False
+                self._user_is_bot_cache[cache_key] = None
                 self._user_name_cache.setdefault(cache_key, user_id)
                 return False
             name, is_bot = self._parse_users_info(payload, user_id)
-            self._user_is_bot_cache[cache_key] = is_bot
+            self._user_is_bot_cache[cache_key] = (is_bot if type((payload.get("user") or {}).get("is_bot")) is bool else None)
             self._trim_oldest_dict_entries(self._user_is_bot_cache, self._USER_NAME_CACHE_MAX)
             # Populate the name cache from the same users.info response so the
             # later source construction does not need a second API lookup.
@@ -3464,21 +3466,36 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
             return is_bot
         except Exception as e:
             logger.debug("[Slack] users.info bot check failed for %s: %s", user_id, e)
-            self._user_is_bot_cache[cache_key] = False
+            self._user_is_bot_cache[cache_key] = None
             return False
 
     async def _users_info_payload(self, user_id: str, chat_id: str, team_id: str) -> dict:
         """``users.info`` payload for ``user_id`` via the channel's (or default) client."""
-        client = self._get_client(chat_id, team_id=team_id or None) if chat_id else self._app.client
-        return _slack_response_payload(await client.users_info(user=user_id))
+        team_id = str(team_id or self._channel_team.get(chat_id, ""))
+        key, now = (team_id, str(user_id)), time.monotonic()
+        if now < self._user_info_retry_after.get(key, 0):
+            return {}
+        payload = {}
+        try:
+            client = self._get_client(chat_id, team_id=team_id or None) if chat_id else self._app.client
+            payload = _slack_response_payload(await client.users_info(user=user_id))
+            return payload
+        finally:
+            if payload.get("user") and payload.get("ok") is not False:
+                self._user_info_retry_after.pop(key, None)
+            else:
+                self._user_info_retry_after[key] = now + 60
+                self._trim_oldest_dict_entries(self._user_info_retry_after, self._USER_NAME_CACHE_MAX)
 
     @staticmethod
     def _parse_users_info(payload: dict, user_id: str) -> tuple[str, bool]:
         """``(display name, is_bot)`` from a users.info payload; name prefers display → real → id."""
         user = payload.get("user", {})
         profile = user.get("profile", {}) if isinstance(user, dict) else {}
+        from gateway.source_origin import SLACK_SYSTEM_USERS
         is_bot = bool(
-            user.get("is_bot")
+            user_id in SLACK_SYSTEM_USERS
+            or user.get("is_bot")
             or user.get("is_workflow_bot")
             or (isinstance(profile, dict) and profile.get("bot_id")))
         name = (
@@ -4548,6 +4565,8 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         if command_text.startswith("/"):
             original_text = text = command_probe_text = command_text
             is_command_text = True
+        else:
+            original_text = mention_stripped
         # Remember the thread so follow-ups auto-trigger (skipped under strict_mention /
         # thread_require_mention, which it would defeat). Session-scoped ``thread_ts`` because a
         # top-level @mention STARTS a thread whose replies must trigger too.
@@ -4667,9 +4686,10 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         # the agent per view switch and leak stale context). Inert label, never a channel body.
         context_channel_id = agent_context.get("context_channel_id", "")
         if context_channel_id and context_channel_id != channel_id and not is_command_text:
-            msg_event.text = (
-                f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
-                f"{msg_event.text}")
+            from gateway.source_origin import insert_event_context
+            msg_event.text = insert_event_context(
+                msg_event, msg_event.text, 0,
+                f"[Slack app context: user is viewing channel {context_channel_id}]\n\n")
         if ts:
             self._remember_processed_message_ts(ts)
         await self.handle_message(msg_event)
@@ -4685,6 +4705,7 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         if is_command_text:
             text = command_probe_text
         msg_type = MessageType.COMMAND if is_command_text else self._media_message_type(media_types)
+        team_id = str(team_id or self._channel_team.get(channel_id, ""))
         user_name = await self._resolve_user_name(user_id, chat_id=channel_id, team_id=team_id)
         channel_name = await self._resolve_channel_name(channel_id, team_id=team_id)
         # Best-effort: title the DM thread from the prompt for Slack's AI Agent Messages tab.
@@ -4706,8 +4727,9 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
         from gateway.platforms.base import resolve_channel_skills
         # Remaining ``<@UID>`` are OTHER participants (own mention stripped
         # above); render as ``@DisplayName`` so the agent knows who is addressed.
+        authored_text = await self._humanize_user_mentions(original_text, chat_id=channel_id, team_id=team_id)
         text = await self._humanize_user_mentions(text, chat_id=channel_id, team_id=team_id)
-        return MessageEvent(
+        msg_event = MessageEvent(
             text=(command_probe_text if is_command_text else text),
             message_type=msg_type,
             source=source,
@@ -4722,6 +4744,11 @@ class SlackAdapter(SlackThreadTitlesMixin, BasePlatformAdapter):
             reply_expected=reply_expected,
             reply_to_text=None,
             auto_skill=resolve_channel_skills(self.config.extra, channel_id, None))
+        from gateway.source_origin import stamp_slack_person
+        if self._user_is_bot_cache.get((str(team_id), str(user_id))) is None:
+            await self._resolve_user_is_bot(user_id, chat_id=channel_id, team_id=team_id)
+        return stamp_slack_person(msg_event, event, authored_text,
+                                  verified_person=self._user_is_bot_cache.get((str(team_id), str(user_id))) is False)
 
     def _note_attachment_failure(
         self, notices: list[str], detail: Optional[str], fallback_msg: str, *fallback_args: Any,

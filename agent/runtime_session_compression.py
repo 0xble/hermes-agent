@@ -60,9 +60,12 @@ class RuntimeSessionCompressionMixin:
         if resident_only:
             # A worker has no resident writer connection; fail like an unavailable local one.
             raise RuntimeError("Resident session read unavailable")
-        return self._apply('compression.history', dict(target=session_id, include_ancestors=include_ancestors,
+        result = self._apply('compression.history', dict(target=session_id, include_ancestors=include_ancestors,
             include_inactive=include_inactive, repair_alternation=repair_alternation,
-            include_row_ids=include_row_ids, include_compacted=include_compacted))['messages']
+            include_row_ids=include_row_ids, include_compacted=include_compacted))
+        from agent.source_origin_worker import unpack_worker_payload
+        unpack_worker_payload(result, result['messages'])
+        return result['messages']
 
     def get_active_message_watermark(self, session_id):
         self._session(session_id)

@@ -220,6 +220,7 @@ class MessageEvent:
 
     # Process-local admission receipt, never routing metadata or execution acknowledgement.
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
+    _native_origin: Any = field(default=None, init=False, repr=False, compare=False)
     # The local inbox placeholder belongs to this event until native admission succeeds.
     _owned_local_pending: Optional[int] = field(default=None, init=False, repr=False, compare=False)
     # Set when ``admit_internal_event`` hands its producer a receipt before any drain began. The
@@ -233,6 +234,8 @@ class MessageEvent:
 
     def absorb_reply_expected(self, other: "MessageEvent") -> None:
         """One turn now answers *other*: addressed human input wins over autonomous unknown input."""
+        from gateway.source_origin import merge_event_origins
+        merge_event_origins(self, other)
         self_goal = bool((self.metadata or {}).get(GOAL_CONTINUATION_METADATA_KEY))
         other_goal = bool((other.metadata or {}).get(GOAL_CONTINUATION_METADATA_KEY))
         if self_goal:

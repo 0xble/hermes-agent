@@ -192,6 +192,7 @@ def ingress_fingerprint(payload, raw=None):
     envelope.pop('ingress_sha256', None)
     envelope.pop('attended_activity', None)
     envelope.pop('absorbed_synthetic', None)
+    envelope.pop('source_origin', None)  # derived receipt coverage does not change transport retry identity
     if 'media' in envelope:
         envelope['media'] = [[media['sha256'], media['size']] for media in envelope['media']]
     received = {**payload, 'native_text_v1': envelope}

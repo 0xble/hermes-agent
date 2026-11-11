@@ -190,11 +190,12 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         return content
 
     @staticmethod
-    def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
+    def _encode_display_metadata(display_metadata: Any, *, stored_metadata=None) -> Optional[str]:
         """Serialize ``display_metadata`` for its TEXT column; an already-serialized JSON string
         (import/replace paths) is not double-encoded."""
-        if not display_metadata:
+        if not display_metadata and not stored_metadata:
             return None
+        display_metadata = display_metadata or {}
         if isinstance(display_metadata, str):
             display_metadata = _json_or(display_metadata, _INVALID, "Ignoring non-JSON display metadata on write")
             if display_metadata is _INVALID:
@@ -205,7 +206,9 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         elif not isinstance(display_metadata, dict):
             logger.warning("Ignoring unexpected display metadata type on write: %s", type(display_metadata).__name__)
             return None
-        return json.dumps(display_metadata)
+        from agent.source_origin import reserve_metadata
+        metadata = reserve_metadata(display_metadata, stored_metadata)
+        return json.dumps(metadata) if metadata else None
 
     @staticmethod
     def _decode_display_metadata(raw: Any) -> Optional[dict[str, Any]]:
@@ -222,7 +225,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         if not isinstance(meta, dict):
             logger.warning("Ignoring non-object display metadata on message row")
             return None
-        return meta
+        from agent.source_origin import stored_origin_metadata
+        return stored_origin_metadata(meta)
 
     @staticmethod
     def _reasoning_json_text(value: Any) -> Optional[str]:
@@ -305,7 +309,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         if msg.get(DATA_USE) and isinstance(display_metadata, (dict, type(None))):
             # Writers that copy a fixed field list (/branch) carry the key, not display_metadata.
             display_metadata = {**(display_metadata or {}), DATA_USE: list(msg[DATA_USE])}
-        display_metadata = self._encode_display_metadata(display_metadata)
+        from agent.source_origin import persistence_metadata
+        display_metadata = self._encode_display_metadata(persistence_metadata(display_metadata, msg, session_id, encoded_content))
         identity_row = {
             "role": role, "content": encoded_content, "timestamp": message_timestamp,
             "tool_call_id": msg.get("tool_call_id"), "tool_calls": encoded_tool_calls,
@@ -392,7 +397,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         if row["display_metadata"] is not None:
             metadata = self._decode_display_metadata(row["display_metadata"])
             if metadata is not None:
-                msg["display_metadata"] = metadata
+                from agent.source_origin import stored_origin_metadata
+                msg["display_metadata"] = stored_origin_metadata(metadata, row)
         if row["role"] == "assistant":
             for column in ("reasoning", "reasoning_content"):
                 if row[column] is not None:
@@ -514,7 +520,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
                 meta[self.REACTIONS_METADATA_KEY] = reactions
             else:
                 meta.pop(self.REACTIONS_METADATA_KEY, None)
-            conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta) if meta else None, message_row_id))
+            conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta, stored_metadata=row[0]), message_row_id))
             return reactions
         return self._execute_write(_do, session_ids=(session_id,), skip_result=[])
 
@@ -563,7 +569,7 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
                         "row_id": row["id"], "role": row["role"], "emoji": reaction.get("emoji") or "",
                         "text": content if isinstance(content, str) else ""})
                 if changed:
-                    conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta), row["id"]))
+                    conn.execute(_SET_DISPLAY_META_SQL, (self._encode_display_metadata(meta, stored_metadata=row["display_metadata"]), row["id"]))
             return pending
         return self._execute_write(_do, session_ids=(session_id,), skip_result=[])
 
@@ -1136,7 +1142,9 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             msg["tool_calls"] = _json_or(
                 msg["tool_calls"], [], f"Failed to deserialize tool_calls in {warn_context}, falling back to []")
         if msg.get("display_metadata") is not None:
-            msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
+            from agent.source_origin import stored_origin_metadata
+            msg["display_metadata"] = stored_origin_metadata(
+                self._decode_display_metadata(msg["display_metadata"]), row)
         # A `SELECT *` picks up every column, including any BLOB added to the schema later; the
         # JSON encoder that serves these dicts over HTTP fails outright on raw bytes. Drop them
         # here, once, rather than needing a new named pop for each future binary column. Known
@@ -1586,7 +1594,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             _restore_identity_columns(row, msg)
             msg.update((col, row[col]) for col in ("api_content", "display_kind") if row[col])
             if row["display_metadata"] and (decoded := self._decode_display_metadata(row["display_metadata"])) is not None:
-                msg["display_metadata"] = decoded
+                from agent.source_origin import stored_origin_metadata
+                msg["display_metadata"] = stored_origin_metadata(decoded, row, session_id=session_id)
                 lift_data_use(msg)
             if include_summary_markers and row["_compressed_summary"]:
                 msg["_compressed_summary"] = True

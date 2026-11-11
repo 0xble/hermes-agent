@@ -133,14 +133,18 @@ def _redact_for_provider(*values: Any) -> Any:
     model repeats it bare in prose. Never mutates the caller's objects: unchanged values come back as-is,
     changed containers as shallow copies. One value in → one value out; several → a tuple.
     """
+    from agent.authentication_material import authentication_values, credential_shaped, exclude_authentication_material
+    from agent.source_origin import NativeOrigin, ORIGIN_KEY
     learned: set = set()
 
     def walk(value: Any, fix) -> Any:
+        if isinstance(value, NativeOrigin):
+            return None  # The receipt holds original text and belongs only to the native origin gate.
         if isinstance(value, str):
             return value if not value or value.startswith("data:") else fix(value)
         if isinstance(value, dict):
-            out = {k: walk(v, fix) for k, v in value.items()}
-            return value if all(out[k] is value[k] for k in value) else out
+            out = {k: walk(v, fix) for k, v in value.items() if k != ORIGIN_KEY}
+            return value if out.keys() == value.keys() and all(out[k] is value[k] for k in value) else out
         if isinstance(value, (list, tuple)):
             items = [walk(v, fix) for v in value]
             if all(new is old for new, old in zip(items, value)):
@@ -149,14 +153,18 @@ def _redact_for_provider(*values: Any) -> Any:
         return value
 
     def scrub(text: str) -> str:
-        out = _scrub(text)
-        if out != text:
-            learned.update(set(_TOKEN_RE.findall(text)) - set(_TOKEN_RE.findall(out)))
+        learned.update(authentication_values(text))
+        held = exclude_authentication_material(text)
+        out = _scrub(held)
+        if out != held:
+            learned.update(t for t in set(_TOKEN_RE.findall(held)) - set(_TOKEN_RE.findall(out))
+                           if credential_shaped(t))
         return out
 
     scrubbed = [walk(v, scrub) for v in values]
     if learned:
-        pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
+        pattern = re.compile(r"(?<!\w)(?:" + "|".join(
+            re.escape(t) for t in sorted(learned, key=len, reverse=True)) + r")(?!\w)")
         scrubbed = [walk(v, lambda t: pattern.sub("[redacted]", t) if pattern.search(t) else t) for v in scrubbed]
     return scrubbed[0] if len(scrubbed) == 1 else tuple(scrubbed)
 
@@ -258,6 +266,7 @@ class MemoryManager:
                  read_only: bool = False) -> None:
         self.read_only = bool(read_only)
         self._providers: list[MemoryProvider] = []
+        self._retention_origin_skips: dict[str, int] = {}
         # Host policy (memory.recall_synthetic_turns): whether Hermes-generated turns may key
         # automatic recall. Read by the turn-start and post-turn prefetch gates.
         self.recall_synthetic_turns = recall_synthetic_turns
@@ -607,18 +616,36 @@ class MemoryManager:
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
         if not clean_user_content or not self._owner_allows("sync_turn"):
             return
-        clean_user_content, assistant_content, redacted_messages = _redact_for_provider(
-            clean_user_content, assistant_content, messages)
+        from agent.source_origin import retention_user_text
+        # Select against native text before redaction changes span offsets. The selected
+        # text must share the complete exchange's learned secret set at the egress boundary.
+        origin_user = retention_user_text(clean_user_content, messages)
+        clean_user_content, origin_user, assistant_content, redacted_messages = _redact_for_provider(
+            clean_user_content, origin_user, assistant_content, messages)
         optional_kwargs = {"messages": redacted_messages, "turn_author": turn_author,
                            "display_kind": display_kind, "platform": platform}
 
         def _sync(provider: MemoryProvider) -> None:
+            requires_origin = getattr(provider, "requires_verified_origin", False) is True
+            retained_user = origin_user if requires_origin else clean_user_content
+            if not retained_user:
+                if requires_origin:
+                    from agent.session_source import session_source_for
+                    surface = session_source_for(platform) if platform else "unknown"
+                    count = self._retention_origin_skips.get(surface, 0) + 1
+                    self._retention_origin_skips[surface] = count
+                    logger.info("Skipping automatic retention for %s: missing verified origin surface=%s count=%d",
+                                provider.name, surface, count)
+                return
             kwargs: dict[str, Any] = {"session_id": session_id}
             for keyword, value in optional_kwargs.items():
+                # A full transcript could reintroduce generated or unknown spans withheld above.
+                if requires_origin and keyword == "messages":
+                    continue
                 if value is not None and self._provider_sync_accepts(provider, keyword):
                     kwargs[keyword] = value
             self._call_unless_stalled(
-                provider, lambda: provider.sync_turn(clean_user_content, assistant_content, **kwargs))
+                provider, lambda: provider.sync_turn(retained_user, assistant_content, **kwargs))
 
         self._submit_background(
             lambda: self._each_provider("sync_turn failed", _sync, level=logging.WARNING, providers=providers)

@@ -909,6 +909,7 @@ def _worker_append(db, conn, session_id, payload):
                 'SELECT 1 FROM messages WHERE id=? AND session_id=?',
                 (msg['_row_id'], session_id)).fetchone():
             raise RuntimeStoreError('permission_denied')
+    messages = [dict(message) for message in messages]
     holder = payload.get('turn_lease_holder')
     if holder is not None:
         _text(holder)
@@ -1075,7 +1076,8 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             raise RuntimeStoreError('invalid_params')
         # Each SQLite retry gets fresh rows; rolled-back annotations must not escape.
         changes = conn.total_changes
-        result = handlers[operation](db, conn, session_id, json.loads(encoded))
+        from agent.source_origin_worker import decode_worker_payload
+        result = handlers[operation](db, conn, session_id, decode_worker_payload(operation, json.loads(encoded)))
         # The CAS fence moves only when the handler changed durable state (or the execution
         # closes): a read-only receipt (context, history, lineage, lifecycle) must not make a
         # client's mutation built on the pre-read revision fail revision_conflict.

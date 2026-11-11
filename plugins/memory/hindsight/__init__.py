@@ -447,6 +447,8 @@ class HindsightMemoryProvider(MemoryProvider):
     def name(self) -> str:
         return "hindsight"
 
+    requires_verified_origin = True
+
     def is_available(self) -> bool:
         try:
             _ensure_client_dependency()

@@ -93,7 +93,8 @@ class ComputeHost:
 
     def emit(self, frame: dict[str, Any]) -> None:
         frame.setdefault("host_ns", now_ns())
-        data = json.dumps(frame, separators=(",", ":"), ensure_ascii=False)
+        from agent.source_origin import public_origin_projection
+        data = json.dumps(public_origin_projection(frame), separators=(",", ":"), ensure_ascii=False)
         with self._write_lock:
             print(data, file=self._stdout, flush=True)
 
@@ -232,6 +233,15 @@ class ComputeHost:
             self._reply("respond.ack", sid, request_id, response=response)
         self._guarded(frame, "respond.error", body)
 
+    @staticmethod
+    def _native_input_metadata(frame):
+        from agent.source_origin import origin_metadata
+        from agent.source_origin_worker import unpack_origin
+        metadata = frame.get("display_metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        receipt = unpack_origin(frame.get("native_input_origin"))
+        return origin_metadata(receipt, metadata) if receipt is not None and receipt.text == frame.get("text") else metadata
+
     def _run_real_turn(self, frame: dict[str, Any]) -> None:
         sid = str(frame.get("sid") or "")
         request_id = str(frame.get("request_id") or uuid.uuid4().hex)
@@ -284,8 +294,7 @@ class ComputeHost:
             server._run_prompt_submit(
                 request_id, sid, session, text, display_kind=frame.get("display_kind") or None,
                 user_turn=bool(frame.get("user_turn")),
-                display_metadata=(frame.get("display_metadata")
-                                  if isinstance(frame.get("display_metadata"), dict) else None),
+                display_metadata=self._native_input_metadata(frame),
                 queue_token=frame.get("queue_token") or None)
             run_thread = session.get("_run_thread")
             if run_thread is not None and hasattr(run_thread, "join"):

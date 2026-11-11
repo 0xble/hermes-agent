@@ -8911,13 +8911,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         return reply_to_id, reply_to_text
 
     def _build_message_event(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> MessageEvent:
-        """Build a MessageEvent from a Telegram message. ``update_id`` lets ``/restart`` record the
-        triggering offset so the new gateway process advances past it."""
+        """Build an event bound to the transport occurrence and its restart offset."""
         chat = message.chat
         user = message.from_user
         telegram_chat_type = self._chat_type_str(chat)  # str() so PTB enums and plain-string mocks both work
         chat_type = "group" if telegram_chat_type in {"group", "supergroup"} else ("channel" if telegram_chat_type == "channel" else "dm")
-        # Shared normalizer so gating and session routing agree (reply-UI anchors dropped, General → "1").
         # Resolve routable thread id for DM topics and forum group topics via the shared normalizer, so
         # gating and session routing agree on one value. Only real topic/forum messages keep a thread id;
         # ordinary reply-UI anchors are dropped (they are not durable session threads and sends against them
@@ -8947,12 +8945,16 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         from plugins.platforms.telegram.telegram_context import group_identity_prompt
         _chat_id_str = str(chat.id)
         channel_prompt = resolve_channel_prompt(self.config.extra, thread_id_str or _chat_id_str, _chat_id_str if thread_id_str else None)
-        return MessageEvent(
-            text=expand_link_entities(message), message_type=msg_type, source=source, raw_message=message,
+        event = MessageEvent(
+            text=message.text or message.caption or "", message_type=msg_type, source=source, raw_message=message,
             message_id=str(message.message_id), platform_update_id=update_id,
             reply_to_message_id=reply_to_id, reply_to_text=reply_to_text, auto_skill=topic_skill,
             channel_prompt=group_identity_prompt(self, message, channel_prompt),
             edit_revision=self._edit_revision(message, update_id), timestamp=message.date)
+        from gateway.source_origin import stamp_telegram_person
+        stamp_telegram_person(event, message)
+        event.text = expand_link_entities(message, origin_event=event)
+        return event
 
     @staticmethod
     def _edit_revision(message, update_id: Optional[int]) -> Optional[str]:

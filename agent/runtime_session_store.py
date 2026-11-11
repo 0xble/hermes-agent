@@ -48,6 +48,15 @@ def apply_row_annotations(messages, annotations):
             else:
                 message[key] = value
 
+
+def _worker_json_default(value):
+    from agent.source_origin import NativeOrigin
+    if isinstance(value, NativeOrigin):
+        # A process-local receipt cannot certify a person across the worker JSON boundary.
+        return None
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 class WorkerPersistenceError(RuntimeError):
     pass
 
@@ -374,6 +383,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('permission_denied')
 
     def _apply(self, operation, payload, *, best_effort=False):
+        from agent.source_origin_worker import pack_worker_payload
+        payload = pack_worker_payload(operation, payload)
         with self.lock:
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
@@ -381,7 +392,7 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                 raise WorkerPersistenceError('pending_receipt')
             entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
             candidate = json.loads(json.dumps(self.journal))
-            candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
+            candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False, default=_worker_json_default)))
             candidate['next_sequence'] += 1
             from agent.runtime_session_journal import OutboxCapacityError, check_worker_frame
             try:

@@ -9,9 +9,7 @@ import sqlite3
 import sys
 
 from hermes_state_evidence import (
-    AUDIT_COLUMNS, GRAPH_COLUMNS, MAX_SOURCE_ROW_BYTES, SESSION_ORIGIN_COLUMNS,
-    EvidenceUnavailable, audit_rows, audit_state, evidence_snapshot, exact_session,
-    inventory_rows, validate_projection,
+    GRAPH_COLUMNS, MAX_SOURCE_ROW_BYTES, EvidenceUnavailable, evidence_snapshot, inventory_rows, validate_projection,
 )
 
 # JSON escaping can expand a source byte sixfold. Keep a separate hard output ceiling too.
@@ -45,6 +43,7 @@ def _encoded(record: dict) -> bytes:
 class _Stream:
     def __init__(self):
         self.digest = hashlib.sha256()
+        self.inventory_digest = None
         self.hashed_bytes = 0
         self.count = 0
 
@@ -57,7 +56,9 @@ class _Stream:
     def finish(self) -> None:
         _write(_encoded({"type": "footer", "complete": True, "exhausted": True,
                          "count": self.count, "sha256": self.digest.hexdigest(),
-                         "hashed_bytes": self.hashed_bytes}))
+                         "hashed_bytes": self.hashed_bytes,
+                         **({"inventory_sha256": self.inventory_digest.hexdigest()}
+                            if self.inventory_digest is not None else {})}))
 
 
 def _write(data: bytes) -> None:
@@ -72,30 +73,41 @@ def _write(data: bytes) -> None:
     sys.stdout.flush()
 
 
-def _capture(stream: _Stream, *, home, profile: str, session_id: str | None) -> None:
+def _capture(stream: _Stream, *, home, profile: str, session_id: str | None, policy=None) -> None:
     transcript = session_id is not None
     with evidence_snapshot(home / "state.db") as conn:
-        validate_projection(conn, transcript)
-        origin = _redact_row(exact_session(conn, session_id)) if transcript else None
+        from hermes_state_acquisition import ACQUISITION_COLUMNS, acquire_rows, acquisition_preflight
+        validate_projection(conn)
+        if transcript:
+            for routing in acquisition_preflight(conn, session_id, policy):
+                _redact_row(routing)
+        origin = {"id": session_id} if transcript else None
         header = {
             "type": "header", "version": 1,
             "stream": "session_transcript" if transcript else "session_inventory",
             "scope": _redact_row({"home": str(home), "profile": profile}),
             "snapshot": "sqlite_read_transaction", "order": "messages.id" if transcript else "sessions.id_binary",
-            "projection": list(AUDIT_COLUMNS if transcript else GRAPH_COLUMNS),
+            "projection": list(GRAPH_COLUMNS),
             "max_source_row_bytes": MAX_SOURCE_ROW_BYTES, "max_record_bytes": MAX_RECORD_BYTES,
             "redaction": "agent.redact.redact_sensitive_text(force=True)",
             "hash": "sha256 of exact UTF-8 JSONL bytes before footer, including header and LF",
         }
         if transcript:
-            header.update(session=origin, session_projection=list(SESSION_ORIGIN_COLUMNS), human_origin="unknown")
+            header.update(session=origin, human_origin="per_event_preflight", version=2,
+                          projection=list(ACQUISITION_COLUMNS))
         stream.emit(header)
-        rows = audit_rows(conn, session_id) if transcript else inventory_rows(conn)
+        rows = acquire_rows(conn, session_id, policy) if transcript else inventory_rows(conn)
+        if not transcript:
+            stream.inventory_digest = hashlib.sha256()
         try:
             for row in rows:
                 evidence = _redact_row(row)
-                record = ({"type": "message", "message": evidence, "audit_state": audit_state(row),
-                           "human_origin": "unknown"} if transcript else {"type": "session", "session": evidence})
+                if not transcript:
+                    stream.inventory_digest.update(json.dumps(
+                        {key: row[key] for key in ("id", "parent_session_id", "source", "created_source")},
+                        sort_keys=True, separators=(",", ":"), allow_nan=False).encode() + b"\n")
+                record = ({"type": "message", "message": evidence, "human_origin": row["origin"]}
+                          if transcript else {"type": "session", "session": evidence})
                 stream.emit(record)
                 stream.count += 1
         finally:
@@ -111,7 +123,8 @@ def cmd_session_evidence(args) -> int:
         if session_id is not None and (not session_id or len(session_id.encode("utf-8")) > 4096):
             raise EvidenceUnavailable("one nonempty exact session ID of at most 4096 bytes is required")
         stream = _Stream()
-        _capture(stream, home=home, profile=profile, session_id=session_id)
+        policy = _load_policy(args.control_roots_file) if session_id is not None else None
+        _capture(stream, home=home, profile=profile, session_id=session_id, policy=policy)
         stream.finish()
         return 0
     except BrokenPipeError:
@@ -127,3 +140,22 @@ def cmd_session_evidence(args) -> int:
         reason = str(exc) if isinstance(exc, EvidenceUnavailable) else type(exc).__name__
         print(json.dumps({"type": "error", "error": reason}), file=sys.stderr)
         return 1
+
+
+def _load_policy(path):
+    from pathlib import Path
+    from hermes_state_acquisition import AcquisitionPolicy
+    if not path:
+        raise EvidenceUnavailable(
+            "acquisition requires --control-roots-file; see website/docs/reference/cli-commands.md "
+            "#session-graph-and-audit-streams (Session Graph And Audit Streams)")
+    with Path(path).open("rb") as source:
+        raw = source.read(65537)
+    if len(raw) > 65536:
+        raise EvidenceUnavailable("control coverage manifest exceeds 64 KiB")
+    data = json.loads(raw)
+    if (not isinstance(data, dict) or data.get("version") != 1 or not data.get("owner")
+            or not isinstance(data.get("roots"), list)
+            or not all(isinstance(root, str) and root for root in data["roots"])):
+        raise EvidenceUnavailable("invalid owner control coverage manifest")
+    return AcquisitionPolicy(tuple(data["roots"]), data.get("inventory_sha256"), data.get("coverage_complete") is True)

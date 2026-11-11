@@ -32,6 +32,7 @@ export interface QueueItem {
   controlMethod?: 'session.steer' | 'session.redirect'
   executionGeneration?: number
   preparedText?: string
+  nativeOrigin?: object
   legacyAttempted?: boolean
   settle?: (accepted: boolean) => void
 }

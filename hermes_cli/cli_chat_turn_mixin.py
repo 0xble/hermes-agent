@@ -265,6 +265,10 @@ class CLIChatTurnMixin:
             agent._persist_user_message_override = None
             agent._persist_user_message_timestamp = None
             staged_user_message = stamp_message_timestamp({"role": "user", "content": message})
+            typed = getattr(self, "_typed_input_message", None)
+            self._typed_input_message = None
+            if isinstance(typed, dict) and typed.get("content") == message:
+                staged_user_message.update(typed)
             from tools.process_registry_notifications import TimelineNotification
             if isinstance(message, TimelineNotification):
                 staged_user_message.update(content=str(message), display_kind=message.display_kind,

@@ -101,6 +101,7 @@ class CLITuiRuntimeMixin:
         from tools.process_registry_notifications import TimelineNotification
         self._tui_dock_drop_dequeued()
         user_input, is_voice_input, is_seeded_query = self._tui_unwrap_input(user_input)
+        typed_text = user_input if isinstance(user_input, str) and not user_input.startswith("/") else None
         if not user_input:
             return
         notification_preview = user_input if isinstance(user_input, TimelineNotification) else None
@@ -165,8 +166,14 @@ class CLITuiRuntimeMixin:
         self._turn_summary_begin()
         self._app.invalidate()
         try:
+            from agent.source_origin import typed_input_message
+            from hermes_cli.cli_loops_mixin import _is_self_injected_turn
+            if (notification_preview is None and not is_seeded_query and not is_voice_input
+                    and not _is_self_injected_turn(user_input) and user_input == typed_text):
+                self._typed_input_message = typed_input_message(user_input, "cli")
             self.chat(notification_preview or user_input, images=submit_images or None, voice_input=is_voice_input)
         finally:
+            self._typed_input_message = None
             self._tui_after_turn()
 
     def _tui_run_slash_input(self, user_input: str):

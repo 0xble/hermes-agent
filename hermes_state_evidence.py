@@ -20,15 +20,6 @@ GRAPH_COLUMNS = (
     "message_count", "tool_call_count", "rewind_count", "runtime_revision", "runtime_generation",
     "transcript_revision",
 )
-SESSION_ORIGIN_COLUMNS = (
-    "id", "parent_session_id", "source", "created_source", "profile_name", "transport_profile",
-    "user_id", "session_key", "chat_id", "chat_type", "thread_id", "origin_json",
-)
-AUDIT_COLUMNS = (
-    "id", "session_id", "message_uid", "absorbed_message_uids", "role", "timestamp", "content",
-    "active", "compacted", "_compressed_summary", "platform_message_id", "display_order",
-    "display_kind", "display_metadata",
-)
 
 
 class EvidenceUnavailable(ValueError):
@@ -100,40 +91,7 @@ def inventory_rows(conn: sqlite3.Connection) -> Generator[dict, None, None]:
     return _rows(conn, "sessions", GRAPH_COLUMNS, " ORDER BY sessions.id COLLATE BINARY")
 
 
-def exact_session(conn: sqlite3.Connection, session_id: str) -> dict:
-    rows = _rows(conn, "sessions", SESSION_ORIGIN_COLUMNS,
-                 " WHERE sessions.id = ? COLLATE BINARY", (session_id,))
-    try:
-        row = next(rows, None)
-        if row is None:
-            raise EvidenceUnavailable("exact session ID not found in the selected home")
-        return row
-    finally:
-        rows.close()
 
-
-def audit_rows(conn: sqlite3.Connection, session_id: str) -> Generator[dict, None, None]:
-    """Read one physical segment, not display lineage or model replay, in native row-ID order."""
-    return _rows(conn, "messages", AUDIT_COLUMNS,
-                 " WHERE messages.session_id = ? COLLATE BINARY AND messages.role IN ('user', 'assistant')"
-                 " ORDER BY messages.id", (session_id,))
-
-
-def validate_projection(conn: sqlite3.Connection, transcript: bool) -> None:
-    """Fail before emitting the header on stale schemas or SQLite without octet_length."""
-    projections: list[tuple[str, tuple[str, ...]]] = [
-        ("sessions", SESSION_ORIGIN_COLUMNS if transcript else GRAPH_COLUMNS)]
-    if transcript:
-        projections.append(("messages", AUDIT_COLUMNS))
-    for table, columns in projections:
-        conn.execute(_bounded_projection(table, columns) + " LIMIT 0").close()
-
-
-def audit_state(row: dict) -> str:
-    if row["active"] == 1:
-        return "active"
-    if row["active"] == 0 and row["compacted"] == 1:
-        return "compaction_archive"
-    if row["active"] == 0 and row["compacted"] == 0:
-        return "rewind_excluded"
-    return "unknown"
+def validate_projection(conn: sqlite3.Connection) -> None:
+    """Validate structural columns without preparing any body-column expression."""
+    conn.execute(_bounded_projection("sessions", GRAPH_COLUMNS) + " LIMIT 0").close()

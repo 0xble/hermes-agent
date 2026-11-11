@@ -112,6 +112,7 @@ def _make_adapter():
     adapter._app = MagicMock()
     adapter._user_name_cache = {}
     adapter._user_is_bot_cache = {}
+    adapter._user_info_retry_after = {}
     adapter._channel_name_cache = {}
     adapter._channel_team = {}
     adapter._USER_NAME_CACHE_MAX = 5000
@@ -157,6 +158,14 @@ class TestIdentityResolution:
         )
         name = asyncio.run(adapter._resolve_user_name("U_HUMAN"))
         assert name == "Nikita"
+
+    @response_shape
+    def test_authorized_app_user_is_still_a_human(self, make_response):
+        adapter = _make_adapter()
+        adapter._app.client.users_info = AsyncMock(return_value=make_response(
+            {"ok": True, "user": {"is_bot": False, "is_app_user": True, "profile": {}}}))
+        assert asyncio.run(adapter._resolve_user_is_bot("U_AUTHORIZED_PERSON")) is False
+        assert adapter._user_is_bot_cache[("", "U_AUTHORIZED_PERSON")] is False
 
     @response_shape
     def test_user_is_bot_resolves(self, make_response):

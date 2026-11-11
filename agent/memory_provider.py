@@ -195,6 +195,8 @@ class MemoryProvider(ABC):
     # Providers that durably checkpoint every successful on_pre_compress() set this to
     # PRE_COMPRESS_CHECKPOINT_API_VERSION; 1 = best-effort legacy.
     pre_compress_checkpoint_api_version = 1
+    # Opt-in occurrence gate shared by retention and read-only recovery evidence.
+    requires_verified_origin = False
 
     @property
     @abstractmethod

@@ -21,7 +21,7 @@ def _code_point_index(text: str, utf16_offset: int) -> int | None:
         return None
 
 
-def expand_link_entities(message: Any) -> str:
+def expand_link_entities(message: Any, *, origin_event=None) -> str:
     """Message text (or caption) with every hidden ``text_link`` URL inlined after its anchor.
 
     Entity offsets are UTF-16 code units (emoji before the anchor count twice), so they are mapped
@@ -64,5 +64,9 @@ def expand_link_entities(message: Any) -> str:
         inline = f" ({url})"
         if expanded[end:].startswith(inline):
             continue
-        expanded = f"{expanded[:end]}{inline}{expanded[end:]}"
+        if origin_event is not None:
+            from gateway.source_origin import insert_event_context
+            expanded = insert_event_context(origin_event, expanded, end, inline)
+        else:
+            expanded = f"{expanded[:end]}{inline}{expanded[end:]}"
     return expanded

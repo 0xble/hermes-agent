@@ -17,7 +17,6 @@ def prepare_single_message(db, session_id, message):
     """Share single-occurrence encoding without adopting an existing transcript row."""
     from hermes_state_messages import _coerce_timestamp, _parse_tool_calls, _tool_calls_count
 
-    message['display_metadata'] = db._encode_display_metadata(message.get('display_metadata'))
     tool_calls = _parse_tool_calls(message.get('tool_calls'))
     timestamp = _coerce_timestamp(message.get('timestamp'), time.time())
     stamp_message_uid(message)

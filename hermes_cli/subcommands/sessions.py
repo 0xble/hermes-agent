@@ -61,6 +61,8 @@ def _build_state_parser(sessions_subparsers):
     transcript_parser = state_subs.add_parser(
         "transcript", help="Stream user/assistant audit rows from one exact segment as read-only JSONL")
     transcript_parser.add_argument("--session-id", required=True, help="Exact stored session ID, never a prefix or lineage")
+    transcript_parser.add_argument("--control-roots-file",
+                                   help="Owner-approved structural inventory digest and complete control-root coverage")
     transcript_parser.set_defaults(func=cmd_session_evidence_lazy)
 
 

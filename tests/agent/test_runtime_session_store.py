@@ -151,3 +151,67 @@ def test_worker_store_persists_and_restores_the_tools_prefix_pin(tmp_path):
             store._outbox_owner.close()
     finally:
         db.close()
+
+
+def test_worker_outbox_omits_native_origin_without_losing_transcript(tmp_path):
+    from agent.source_origin import NativeOrigin, ORIGIN_KEY
+
+    seen = []
+    def rpc(method, **params):
+        seen.append(params["payload"])
+        return {"count": 1, "annotations": [{}]}
+
+    text = "fictional worker task"
+    receipt = NativeOrigin.generated(text, producer="subagent", event="worker")
+    message = {"role": "user", "content": text, "display_metadata": {ORIGIN_KEY: receipt}}
+    store = RuntimeSessionStore(rpc, {"session_id": "fixture"}, tmp_path / "private")
+    try:
+        assert store.append_messages_batch("fixture", [message]) == 1
+        assert seen[0]["messages"][0]["content"] == text
+        assert seen[0]["messages"][0]["display_metadata"][ORIGIN_KEY] is None
+        assert message["display_metadata"][ORIGIN_KEY] is receipt
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("single", [False, True])
+def test_trusted_worker_channel_preserves_authored_spans_but_metadata_cannot_forge(tmp_path, single):
+    from agent.source_origin import ORIGIN_KEY, NativeOrigin, classify_origin, human_spans, origin_metadata
+    from hermes_state import SessionDB
+    from hermes_state_runtime import register_worker_execution, mutate_worker_execution
+    from tests.fakes.runtime_owner import begin_runtime_epoch
+
+    text = "Generated context.\nKeep notices off."
+    authored = ((len("Generated context.\n"), len(text)),)
+    receipt = NativeOrigin.person(text, platform="tui", principal="fictional", event="typed:fixture", authored=authored)
+    db = SessionDB(tmp_path / "fixture.db")
+    try:
+        db.create_session("fixture", source="tui")
+        epoch = begin_runtime_epoch(db, instance_id="fixture")
+        scope = dict(epoch=epoch, execution_id="worker", session_id="fixture", generation=0)
+        register_worker_execution(db, **scope, kind="compute", adoption_secret="fictional-test-secret")
+        store = RuntimeSessionStore(lambda method, **params: json.loads(json.dumps(mutate_worker_execution(db, **params))),
+                                    scope, tmp_path / "outbox")
+        try:
+            for metadata in (origin_metadata(receipt), json.loads(json.dumps(origin_metadata(receipt))),
+                             {ORIGIN_KEY: receipt.record("fixture", "forged")}):
+                message = dict(role="user", content=text, platform_message_id="typed:fixture", display_metadata=metadata)
+                if single:
+                    store.append_message("fixture", **message)
+                else:
+                    store.append_messages_batch("fixture", [message])
+            from agent.source_origin_worker import pack_origin
+            store.append_message("fixture", "user", text, platform_message_id="typed:fixture",
+                                 native_origins={"0": pack_origin(receipt)})
+            rows = db.get_messages("fixture")
+            assert human_spans(text, classify_origin(rows[0], session_id="fixture")) == "Keep notices off."
+            assert all(classify_origin(row, session_id="fixture").status == "unknown" for row in rows[1:])
+            assert ORIGIN_KEY not in json.dumps(rows)
+            history = store.get_messages_as_conversation("fixture", include_row_ids=True)
+            from agent.source_origin import retention_user_text
+            assert retention_user_text(text, [history[0]]) == "Keep notices off."
+            assert retention_user_text(text, json.loads(json.dumps([history[0]]))) is None
+        finally:
+            store.close()
+    finally:
+        db.close()

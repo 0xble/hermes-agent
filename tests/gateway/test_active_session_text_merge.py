@@ -246,3 +246,37 @@ async def test_control_and_clarify_messages_bypass_text_debounce():
     adapter._message_handler.assert_awaited_once_with(answer)
     assert session_key not in adapter._text_debounce
     assert session_key not in adapter._pending_messages
+
+
+@pytest.mark.asyncio
+async def test_debounced_origin_binds_latest_event_and_keeps_chunk_references(tmp_path):
+    from agent.source_origin import NativeOrigin, classify_origin, native_origin
+    from gateway.source_origin import source_origin_metadata
+    from hermes_state import SessionDB
+
+    adapter = _make_adapter()
+    first, second = _make_event("Keep notices off."), _make_event("Also keep receipts.")
+    for event in (first, second):
+        event._native_origin = NativeOrigin.person(event.text, platform="telegram", principal="person",
+                                                   event=event.message_id)
+    first_id, second_id = first.message_id, second.message_id
+    key = build_session_key(first.source)
+    try:
+        await adapter._queue_text_debounce(key, first)
+        await adapter._queue_text_debounce(key, second)
+        merged = _debounced_event(adapter, key)
+        assert merged.message_id == second_id
+        metadata = source_origin_metadata(merged, merged.text)
+        receipt = native_origin(metadata)
+        assert receipt.event == second_id
+        assert {ref[2] for ref in receipt.references} == {first_id, second_id}
+        db = SessionDB(tmp_path / "fictional.db")
+        try:
+            db.create_session("fixture", source="telegram")
+            db.append_message("fixture", "user", merged.text, message_uid="occurrence",
+                              platform_message_id=merged.message_id, display_metadata=metadata)
+            assert classify_origin(db.get_messages("fixture")[0], session_id="fixture").status == "verified_human"
+        finally:
+            db.close()
+    finally:
+        await adapter._flush_text_debounce_now(key)
