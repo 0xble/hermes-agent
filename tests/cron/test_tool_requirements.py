@@ -151,6 +151,28 @@ def test_explicit_other_mcp_server_does_not_merge_relay():
     assert job_tool_requirement_issues(job, cfg=cfg)
 
 
+def test_effective_toolsets_matches_prefixed_mcp_selection():
+    from cron.tool_requirements import _effective_toolsets
+    cfg = {"mcp_servers": {"relay": {"command": "relay"}, "github": {"command": "gh-mcp"}}}
+    assert _effective_toolsets(["file", "mcp-github"], cfg) == ["file", "mcp-github"]
+
+
+def test_effective_toolsets_matches_configured_disabled_selection():
+    from cron.tool_requirements import _effective_toolsets
+    cfg = {"mcp_servers": {"relay": {"command": "relay"}, "github": {"command": "gh-mcp", "enabled": False}}}
+    assert _effective_toolsets(["file", "github"], cfg) == ["file", "github"]
+
+
+@pytest.mark.parametrize("named", ["mcp-github", "github"])
+@pytest.mark.parametrize("github_cfg", [{"command": "gh-mcp"}, {"command": "gh-mcp", "enabled": False}])
+def test_named_mcp_server_blocks_relay_merge_like_the_scheduler(named, github_cfg):
+    from cron.scheduler import _resolve_cron_enabled_toolsets
+    cfg = {"mcp_servers": {**_RELAY_MCP_CFG["mcp_servers"], "github": github_cfg}}
+    job = {"enabled_toolsets": ["file", named], "prompt": "If needed, use Pick the Destination."}
+    assert "relay" not in _resolve_cron_enabled_toolsets(job, cfg)
+    assert job_tool_requirement_issues(job, cfg=cfg)
+
+
 def test_relay_mcp_server_does_not_satisfy_shell_step():
     job = {"enabled_toolsets": ["file"], "prompt": "Add it with `loops finding add --job x`."}
     issues = job_tool_requirement_issues(job, cfg=_RELAY_MCP_CFG)
@@ -365,7 +387,7 @@ def test_plugin_skill_lookup_failure_keeps_traceback(monkeypatch, caplog):
         raise RuntimeError("plugin discovery failed")
 
     monkeypatch.setattr(plugins, "get_plugin_manager", broken_manager)
-    assert _plugin_skill_path("audit") is None
+    assert _plugin_skill_path("acme:audit") is None
     assert any(r.exc_info and "Unable to resolve plugin skill" in r.message for r in caplog.records)
 
 

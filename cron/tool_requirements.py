@@ -111,22 +111,9 @@ def _toolset_names(job: dict[str, Any]) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()] if isinstance(value, list) else []
 
 
-_LEGACY_TOOLSET_MAP = {
-    "web_tools": ["web_search", "web_extract"],
-    "terminal_tools": ["terminal"],
-    "vision_tools": ["vision_analyze"],
-    "image_tools": ["image_generate"],
-    "skills_tools": ["skills_list", "skill_view", "skill_manage"],
-    "browser_tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_scroll",
-                      "browser_back", "browser_press", "browser_get_images", "browser_vision", "browser_console"],
-    "cronjob_tools": ["cronjob_manage"],
-    "file_tools": ["read_file", "write_file", "patch", "search_files"],
-    "tts_tools": ["text_to_speech"],
-}
-
-
 def _static_tool_names(names: list[str]) -> set[str]:
     """Resolve built-in and legacy toolsets without importing runtime/plugin discovery."""
+    from toolset_compat import _LEGACY_TOOLSET_MAP
     from toolsets import TOOLSETS, TOOLSET_SESSION_PLATFORMS
 
     def resolve(name: str, visited: set[str] | None = None) -> set[str]:
@@ -159,18 +146,18 @@ def _static_tool_names(names: list[str]) -> set[str]:
 
 
 def _static_disabled_tool_names(names: list[str]) -> set[str]:
-    """Resolve the scheduler denylist without importing ``model_tools`` or plugin code."""
-    from toolsets import TOOLSETS, _HERMES_CORE_TOOLS
+    """Resolve the scheduler denylist like ``model_tools._apply_toolset_selection`` without importing it."""
+    from toolset_compat import _LEGACY_TOOLSET_MAP
+    from toolsets import bundle_non_core_tools, get_toolset
     tools: set[str] = set()
     for name in names:
         if name in _LEGACY_TOOLSET_MAP:
-            resolved = set(_LEGACY_TOOLSET_MAP[name])
+            tools.update(_LEGACY_TOOLSET_MAP[name])
+        elif name.startswith("hermes-") or (get_toolset(name) or {}).get("posture"):
+            # Bundles/postures re-list the core tools without owning them: remove only the non-core delta.
+            tools.update(bundle_non_core_tools(name))
         else:
-            resolved = _static_tool_names([name])
-        definition = TOOLSETS.get(name) or {}
-        if name.startswith("hermes-") or definition.get("posture"):
-            resolved -= set(_HERMES_CORE_TOOLS)
-        tools.update(resolved)
+            tools.update(_static_tool_names([name]))
     return tools
 
 
@@ -227,14 +214,17 @@ def _allows_relay(names: list[str], cfg: Optional[dict]) -> bool:
 
 
 def _effective_toolsets(names: list[str], cfg: Optional[dict]) -> list[str]:
-    """Mirror cron's MCP merge using only the native config declarations."""
+    """Mirror ``cron.scheduler._merge_mcp_into_per_job_toolsets`` using only native config declarations."""
     result = [name for name in names if name != "no_mcp"]
     if "no_mcp" in names:
         return result
     enabled_mcp = _configured_enabled_mcp_server_names(cfg)
-    if set(result) & enabled_mcp:
+    servers = (cfg or {}).get("mcp_servers")
+    # Configured-but-disabled servers still count as named (the user's selection); match bare or ``mcp-`` names.
+    known = enabled_mcp | {str(name) for name in (servers if isinstance(servers, dict) else {})}
+    if set(result) & (known | {f"mcp-{name}" for name in known}):
         return result
-    return result + sorted(enabled_mcp - set(result))
+    return result + sorted(name for name in enabled_mcp if name not in result)
 
 
 def job_tool_requirement_issues(
