@@ -61,6 +61,14 @@ def test_benign_prose_neither_holds_nor_teaches_values(text):
     assert _redact_for_provider(text, {"content": text}) == (text, {"content": text})
 
 
+def test_credential_shape_boundary_fails_closed_for_non_text_startup_values():
+    from agent.authentication_material import credential_shaped
+
+    assert credential_shaped(None) is False
+    assert credential_shaped(12345678) is False
+    assert credential_shaped(482913, label=None) is False
+
+
 @pytest.mark.parametrize(("text", "repeat"), [
     ("password: str", "Use str(x) and str(y)."),
     ("Password: is stored", "It is stored and is available."),

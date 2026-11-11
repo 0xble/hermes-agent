@@ -15,6 +15,10 @@ _CODE_LABEL = re.compile(r"\b(?:codes?|otp)\b", re.IGNORECASE)
 
 def credential_shaped(value: str, *, label: str = "") -> bool:
     """Require a long mixed token or numeric value, allowing 6+ digits for code labels."""
+    if not isinstance(value, str):
+        return False
+    if not isinstance(label, str):
+        label = ""
     value = value.rstrip(".!?")
     if _NON_VALUE.match(value):
         return False
