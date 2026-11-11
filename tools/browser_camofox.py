@@ -314,6 +314,7 @@ _sessions: Dict[str, Dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id
 _sessions_lock = threading.RLock()
 # Cleanup epochs invalidate identity lookups that started before a task was released.
 _task_release_epochs: Dict[str, int] = {}
+_active_identity_lookups: Dict[str, int] = {}
 # Only successful POST /tabs creates ownership. Bindings may be replaced or carried;
 # keep the exact identity and profile separately until close is confirmed.
 _owned_tabs: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
@@ -631,63 +632,74 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
     with _sessions_lock:
         prior = _sessions.get(task_id)
         release_epoch = _task_release_epochs.get(task_id, 0)
+        _active_identity_lookups[task_id] = _active_identity_lookups.get(task_id, 0) + 1
         bound_account = prior.get("account") if prior is not None else None
         bound_user_id = prior.get("user_id") if prior is not None else None
-    # Registry HTTP must not serialize unrelated tasks or their cleanup. Resolve before
-    # dropping even a carried binding so a registry failure leaves it intact.
-    identity_account = account if account is not None else bound_account
-    identity = get_camofox_account_identity(identity_account, task_id) if identity_account is not None else None
-    with _sessions_lock:
-        if (_sessions.get(task_id) is not prior
-                or _task_release_epochs.get(task_id, 0) != release_epoch
-                or (prior is not None and (prior.get("account") != bound_account
-                                           or prior.get("user_id") != bound_user_id))):
-            raise ValueError("Camofox task binding changed while resolving its identity; retry the browser operation")
-        if task_id in _sessions:
-            session = _sessions[task_id]
-            bound_account = session.get("account")
-            if account is not None and bound_account != account:
-                # The account is fixed within a turn. A binding carried over from an earlier turn,
-                # or an empty one from a read-only preflight, yields to the requested account.
-                if not session.get("carried") and (session.get("tab_id") or bound_account is not None):
-                    raise ValueError(
-                        f"Camofox account is already bound to {bound_account or 'the default identity'} "
-                        f"for this task; cannot switch to {account!r}. Start a new task instead."
-                    )
-                if session.get("tab_id"):
-                    _drop_session_locked(task_id)  # quarantines the old tab if it holds protected data
+    try:
+        # Registry HTTP must not serialize unrelated tasks or their cleanup. Resolve before
+        # dropping even a carried binding so a registry failure leaves it intact.
+        identity_account = account if account is not None else bound_account
+        identity = get_camofox_account_identity(identity_account, task_id) if identity_account is not None else None
+        with _sessions_lock:
+            if (_sessions.get(task_id) is not prior
+                    or _task_release_epochs.get(task_id, 0) != release_epoch
+                    or (prior is not None and (prior.get("account") != bound_account
+                                               or prior.get("user_id") != bound_user_id))):
+                raise ValueError("Camofox task binding changed while resolving its identity; retry the browser operation")
+            if task_id in _sessions:
+                session = _sessions[task_id]
+                bound_account = session.get("account")
+                if account is not None and bound_account != account:
+                    # The account is fixed within a turn. A binding carried over from an earlier turn,
+                    # or an empty one from a read-only preflight, yields to the requested account.
+                    if not session.get("carried") and (session.get("tab_id") or bound_account is not None):
+                        raise ValueError(
+                            f"Camofox account is already bound to {bound_account or 'the default identity'} "
+                            f"for this task; cannot switch to {account!r}. Start a new task instead."
+                        )
+                    if session.get("tab_id"):
+                        _drop_session_locked(task_id)  # quarantines the old tab if it holds protected data
+                    else:
+                        _sessions.pop(task_id, None)
                 else:
-                    _sessions.pop(task_id, None)
+                    if identity is not None and identity["user_id"] != session["user_id"]:
+                        raise ValueError(f"Camofox account {bound_account!r} persistent mapping changed; start a new task")
+                    session.pop("carried", None)
+                    session.pop("carried_from", None)  # in use now: its own agent releases it
+                    _release_protected_tab_binding(task_id, session)
+                    return session
+            camofox_cfg = _get_camofox_config()
+            # Positive provenance only: external userIds and their groups may belong to another app.
+            hermes_identity = identity is not None
+            managed, adopt, adopt_any = True, True, False  # Hermes-derived identities own their tabs
+            if identity is None:
+                identity = _camofox_identity_override(task_id, camofox_cfg)
+                if identity is not None:  # another app's userId: adopting its tabs stays opt-in
+                    adopt = adopt_any = _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
+            if identity is None and _managed_persistence_enabled(camofox_cfg):
+                identity = get_camofox_identity(task_id)
+                hermes_identity = True
+            if identity is None:
+                identity = {"user_id": f"hermes_{uuid.uuid4().hex[:10]}", "session_key": f"task_{task_id[:16]}"}
+                hermes_identity = True
+                managed, adopt = False, False
+            # ``fresh``: never bound in this process (new task or gateway restart), so a page action
+            # may adopt its tab. A binding cleared later (stale tab, quarantine, release, another
+            # task's handoff) is rebound only by navigation, never silently replaced.
+            session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
+                       "task_id": task_id or "default", "managed": managed, "adopt_existing_tab": adopt,
+                       "adopt_any": adopt_any, "hermes_identity": hermes_identity, "account": account, "fresh": True}
+            _sessions[task_id] = session
+            return session
+    finally:
+        with _sessions_lock:
+            remaining = _active_identity_lookups.get(task_id, 0) - 1
+            if remaining > 0:
+                _active_identity_lookups[task_id] = remaining
             else:
-                if identity is not None and identity["user_id"] != session["user_id"]:
-                    raise ValueError(f"Camofox account {bound_account!r} persistent mapping changed; start a new task")
-                session.pop("carried", None)
-                session.pop("carried_from", None)  # in use now: its own agent releases it
-                _release_protected_tab_binding(task_id, session)
-                return session
-        camofox_cfg = _get_camofox_config()
-        # Positive provenance only: external userIds and their groups may belong to another app.
-        hermes_identity = identity is not None
-        managed, adopt, adopt_any = True, True, False  # Hermes-derived identities own their tabs
-        if identity is None:
-            identity = _camofox_identity_override(task_id, camofox_cfg)
-            if identity is not None:  # another app's userId: adopting its tabs stays opt-in
-                adopt = adopt_any = _flag("CAMOFOX_ADOPT_EXISTING_TAB", camofox_cfg, "adopt_existing_tab")
-        if identity is None and _managed_persistence_enabled(camofox_cfg):
-            identity = get_camofox_identity(task_id)
-            hermes_identity = True
-        if identity is None:
-            identity = {"user_id": f"hermes_{uuid.uuid4().hex[:10]}", "session_key": f"task_{task_id[:16]}"}
-            hermes_identity = True
-            managed, adopt = False, False
-        # ``fresh``: never bound in this process (new task or gateway restart), so a page action
-        # may adopt its tab. A binding cleared later (stale tab, quarantine, release, another
-        # task's handoff) is rebound only by navigation, never silently replaced.
-        session = {"user_id": identity["user_id"], "tab_id": None, "session_key": identity["session_key"],
-                   "task_id": task_id or "default", "managed": managed, "adopt_existing_tab": adopt,
-                   "adopt_any": adopt_any, "hermes_identity": hermes_identity, "account": account, "fresh": True}
-        _sessions[task_id] = session
-        return session
+                _active_identity_lookups.pop(task_id, None)
+                if task_id not in _sessions:
+                    _task_release_epochs.pop(task_id, None)
 
 
 def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Optional[str] = None,
@@ -852,7 +864,8 @@ def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool =
                           and session.get("carried_from") in keys}:
             keys |= carried
         for key in keys:
-            _task_release_epochs[key] = _task_release_epochs.get(key, 0) + 1
+            if key in _active_identity_lookups:
+                _task_release_epochs[key] = _task_release_epochs.get(key, 0) + 1
         for key in keys:
             _drop_session_locked(key)  # quarantine before destroying tabs
     # The DELETE calls must not run while the process-wide session lock is held.

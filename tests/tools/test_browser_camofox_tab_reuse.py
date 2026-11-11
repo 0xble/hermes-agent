@@ -155,6 +155,7 @@ def camofox(tmp_path, monkeypatch):
         with cf._sessions_lock:
             cf._sessions.clear()
             cf._task_release_epochs.clear()
+            cf._active_identity_lookups.clear()
             getattr(cf, "_stale_tab_ids", {}).clear()
             getattr(cf, "_owned_tabs", {}).clear()
             cf._closing_tabs.clear()
@@ -1275,6 +1276,14 @@ def test_cleanup_during_initial_identity_lookup_invalidates_the_lookup(camofox):
     # The next operation is a fresh lookup and binds normally.
     assert _dispatch("browser_navigate", {"url": "https://fresh.test/", "account": "brianle"}, "target")["success"]
     assert cf._sessions["target"]["tab_id"]
+
+
+def test_cleanup_without_an_inflight_lookup_does_not_retain_release_epochs(camofox):
+    cf = camofox.cf
+    for index in range(1000):
+        cf.release_task_bindings({f"unused-{index}"}, close_created_tabs=True)
+    assert not cf._task_release_epochs
+    assert not cf._active_identity_lookups
 
 
 def test_slow_owned_tab_delete_does_not_block_sibling_tool(camofox):
