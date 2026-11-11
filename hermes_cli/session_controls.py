@@ -212,6 +212,50 @@ def _message_grants_authority(source: str) -> bool:
     return not any(w in _NEGATION_TOKENS or w in _QUALIFIER_TOKENS for w in words)
 
 
+class UserQuote(tuple):
+    """Keep tuple compatibility while carrying authenticated relay provenance."""
+    relay_receipt: str
+    source_session_id: str
+
+    def __new__(cls, quote, message, *, relay_receipt="", source_session_id=""):
+        value = super().__new__(cls, (quote, message))
+        value.relay_receipt = relay_receipt
+        value.source_session_id = source_session_id
+        return value
+
+
+def _current_quote_source(db, session_id, rows, quote, *, cursor=None):
+    from hermes_cli.lifecycle_authority import authenticated_relay_sender
+    from hermes_cli.goals import (
+        _active_profile_name, _relay_ledger_receipts,
+        _relay_receipt_id, _relay_sender, _unwrap_steer,
+    )
+
+    for row in rows:
+        text = str(row.get("content") or "")
+        if _is_user_typed(row):
+            return text, "", session_id
+        receipt_id = _relay_receipt_id(text)
+        if not receipt_id:
+            continue
+        sender = authenticated_relay_sender(
+            db, row, session_id, _active_profile_name(), _relay_ledger_receipts([receipt_id]), cursor=cursor)
+        if not sender:
+            continue
+        # The transport authenticates delivery, not an agent's paraphrase of Brian.
+        # Bind the body to the latest CURRENT typed source, also predating delivery.
+        body = "\n".join(line for line in _unwrap_steer(text).splitlines()
+                         if _relay_sender(line) is None)
+        sources = db.messages_by_role(sender, "user", since=0.0, limit=500,
+                                      current_only=True, cursor=cursor)
+        source = next((item for item in sources if _is_user_typed(item)), None)
+        if (source and float(source.get("timestamp") or 0) <= float(row.get("timestamp") or 0)
+                and quote in _normalize(body) and quote in _normalize(source.get("content") or "")):
+            return str(source["content"]), receipt_id, sender
+        return "", "", ""
+    return "", "", ""
+
+
 def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> tuple[str, str] | str:
     """Bind a verbatim quote to current typed input before applying action-specific authority."""
     normalized = _normalize(quote)
@@ -227,10 +271,10 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
     except Exception:
         logger.debug("current user quote lookup failed", exc_info=True)
         return "user_quote_not_found"
-    latest = next((row for row in rows if _is_user_typed(row)), None)
-    if latest is None:
+    source_raw, relay_receipt, source_sid = _current_quote_source(
+        db, requester_session_id, rows, normalized, cursor=cursor)
+    if not source_raw:
         return "user_quote_not_found"
-    source_raw = str(latest.get("content") or "")
     try:
         from gateway.response_filters import is_agent_origin_text
         if is_agent_origin_text(source_raw):
@@ -252,32 +296,61 @@ def _read_current_user_quote(requester_session_id: str, quote: str, *, cursor=No
         return "user_message_too_long"
     if normalized not in source:
         return "user_quote_not_found"
-    return normalized, stripped
+    return UserQuote(normalized, stripped, relay_receipt=relay_receipt, source_session_id=source_sid)
 
 
-def check_user_quote(requester_session_id: str, quote: str, *, cursor=None) -> Tuple[str, str] | str:
-    """Validate a quote against only the requester's latest typed user message."""
+def quote_authorizes(source: UserQuote, controlled_session_id: str, *, cursor=None) -> bool:
+    """Deictic words belong to where the user typed them, never to a relay receiver."""
+    origin = source.source_session_id
+    return bool(origin) and (origin == controlled_session_id or _quote_names_target(
+        _governing_sentence(_normalize(source[0]), _normalize(source[1])), controlled_session_id, cursor=cursor))
+
+
+def check_user_quote(requester_session_id: str, quote: str, *, cursor=None,
+                     controlled_session_id: Optional[str] = None,
+                     quoted_targets: bool = False, stop_condition: str = "") -> Tuple[str, str] | str:
+    """Validate a current authenticated quote against its typed origin and controlled session."""
     checked = _read_current_user_quote(requester_session_id, quote, cursor=cursor)
     if isinstance(checked, str):
         return checked
     normalized, stripped = checked
     source = _normalize(stripped)
-    if _is_negated(normalized, source):
+    instruction, instruction_quote = stripped, normalized
+    if quoted_targets:
+        # Removal syntax may quote an exact requirement name. Its words are data
+        # (e.g. "Never restart"), not a refusal; code spans and block quotes still refuse.
+        from hermes_cli.goals_authority import _NON_AUTHORITATIVE_QUOTE_RE
+        instruction = _NON_AUTHORITATIVE_QUOTE_RE.sub("", instruction)
+        instruction_quote = _NON_AUTHORITATIVE_QUOTE_RE.sub("", instruction_quote)
+    scoped = UserQuote(instruction_quote, instruction, source_session_id=checked.source_session_id)
+    if stop_condition:
+        # In a new stop specification, "when/until" binds the supplied condition,
+        # not the timing of a removal. Never relax guards for an empty condition.
+        condition = _normalize(stop_condition).rstrip(".!;").casefold()
+        declaration = _normalize(instruction).rstrip(".!;").casefold()
+        if (declaration in {f"stop when {condition}", f"keep checking until {condition}",
+                            f"keep checking until the {condition}"}
+                or (declaration == condition and re.match(r"^(?:stop when|keep checking until)\b", declaration))):
+            instruction = re.sub(r"\b(?:when|until)\b", "", instruction, count=1, flags=re.IGNORECASE)
+    if _is_negated(instruction_quote, _normalize(instruction)):
         return "user_quote_negated"
     # Authority comes from the user's instruction in its full context, never a trimmed substring:
     # any refusal, question or condition anywhere in the message ("Clear the X goal? Not now")
     # refuses. Callers match the control against the quote's whole sentence (_governing_sentence).
     # Quoted-data provenance (block quotes, fences) is line-based: judge it on the raw message,
     # before normalization collapsed the newlines that mark it.
-    if not _message_grants_authority(source) or _QUOTED_DATA_RE.search(stripped):
+    if not _message_grants_authority(instruction) or _QUOTED_DATA_RE.search(instruction):
         return "user_quote_qualified"
     # The whole message must be the one instruction. Any other sentence can revoke, correct or
     # reframe it ("Disregard the next sentence. Clear ...", "Clear ... Actually, keep it"), and no
     # word list can read that reliably, so a multi-sentence message falls back to Approve/Deny.
     # Judge the raw message: normalization collapses the newlines that separate sentences.
-    if len([part for part in _CLAUSE_BREAK.split(stripped) if part.strip()]) != 1:
+    if len([part for part in _CLAUSE_BREAK.split(instruction) if part.strip()]) != 1:
         return "user_quote_multi_sentence"
-    return normalized, source
+    if not quote_authorizes(scoped, controlled_session_id or requester_session_id, cursor=cursor):
+        return "user_quote_mismatch"
+    return UserQuote(normalized, source, relay_receipt=checked.relay_receipt,
+                     source_session_id=checked.source_session_id)
 
 
 # A quote authorizes only the control it states. Each control has disjoint verb sets within its
@@ -483,8 +556,21 @@ def _save_record(record: Dict[str, Any], *, cursor=None) -> None:
 def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                    payload: Optional[Dict[str, Any]] = None,
                    authority: Optional[Dict[str, Any]] = None, cursor=None) -> Dict[str, Any]:
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
     payload = dict(payload or {})
     handler = CONTROLS.get((kind, action))
+    from hermes_cli.lifecycle_policy import decision, A
+    from hermes_cli.goals import load_goal
+    from hermes_cli.loops import load_loop
+    policy_state = (load_goal if kind == "goal" else load_loop)(target_sid, cursor=cursor)
+    permission = decision(kind, action, policy_state, actor=caller.actor,
+                          autonomous=caller is LifecycleAuthority.AUTONOMY)
+    if permission != A:
+        user_pause = (policy_state is not None and policy_state.status == "paused"
+                      and policy_state.paused_by != "agent" and action in {"resume", "stop"})
+        code = "user_paused" if user_pause else "user_only"
+        return {"result": {"ok": False, "error_code": code}}
     if action == "replace" and kind == "goal":
         from hermes_cli.goals import GoalManager
         manager = GoalManager(target_sid, cursor=cursor)
@@ -494,7 +580,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
                 goal=str(payload.get("goal") or ""),
                 max_turns=payload.get("max_turns"),
                 contract=payload.get("contract"),
-                actor="agent" if (authority or {}).get("via") == "autonomy" else "user",
+                actor=caller.actor,
                 user_quote=str((authority or {}).get("quote") or ""),
             )
         continuation_prompt = manager.next_continuation_prompt() if result.get("ok") else None
@@ -508,10 +594,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
             code = f"nothing_to_{action}"
             return {"result": {"ok": False, "error_code": code, "error": code},
                     "state": manager.state}
-        autonomous = (authority or {}).get("via") == "autonomy"
-        if autonomous and manager.state.paused_by != "agent":
-            # A /goal pause, /stop, Ctrl+C, quoted or system pause is the user's to lift.
-            return {"result": _user_paused(manager.state, "goal"), "state": manager.state}
+        autonomous = caller.actor == "agent"
         result = manager.resume(reset_budget=not autonomous, user_override=not autonomous,
                                 by="agent" if autonomous else "user")
         if result is None:
@@ -548,7 +631,7 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
         code = f"nothing_to_{action}"
         return {"result": {"ok": False, "error_code": code, "error": code}, "state": state}
     receipt = {"result": result, "state": state}
-    if (kind, action) == ("goal", "pause") and (authority or {}).get("via") == "autonomy":
+    if (kind, action) == ("goal", "pause") and caller is LifecycleAuthority.AUTONOMY:
         seconds = state.waiting_seconds
         duration = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} sec"
         receipt.update(
@@ -943,13 +1026,18 @@ def _bind_control_result(record: Dict[str, Any], result: Dict[str, Any], cursor)
 def _new_record(kind: str, action: str, target_sid: str, requester_sid: str, *,
                 reason: str, payload: Optional[Dict[str, Any]], authority: Dict[str, Any],
                 status: str, now: float, expires_at: Optional[float], affected_text: str, cursor=None) -> Dict[str, Any]:
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
     return {
         "id": uuid.uuid4().hex[:12], "kind": kind, "action": action,
         "target_session_id": target_sid, "requester_session_id": requester_sid,
         "requester_title": _session_title(requester_sid, cursor=cursor), "target_title": _session_title(target_sid, cursor=cursor),
         "reason": reason or "session-control", "payload": dict(payload or {}),
         "affected_text": affected_text,
-        "authority": dict(authority), "status": status, "created_at": now,
+        "authority": {key: value for key, value in authority.items() if key != "quote_source_session_id"},
+        **({"quote_source_session_id": authority["quote_source_session_id"]}
+           if authority.get("quote_source_session_id") else {}),
+        "status": status, "created_at": now,
+        "lifecycle_authority": LifecycleAuthority.from_control(authority).value,
         "expires_at": expires_at, "resolved_at": None, "error": None,
         "request_posted": status != "pending", "request_skipped": False,
         "target_notice_sent": False, "target_notice_skipped": False,
@@ -1032,7 +1120,16 @@ def request_control(kind: str, action: str, target_sid: str, *, requester_sid: s
                              reason=reason, payload=payload)
     if (kind, action) not in CONTROLS:
         raise ValueError("unsupported_control")
+    from hermes_cli.lifecycle_authority import owned_control_state
     from hermes_cli.goal_notices import lifecycle_cards_hidden
+    # Ownership discovery cannot throw ahead of the stable hidden-card refusal.
+    try:
+        owned_target = resolve_target(target_sid)
+    except ValueError:
+        owned_target = None
+    if owned_target and owned_control_state(kind, action, owned_target, requester_sid) is not None:
+        return apply_control(kind, action, owned_target, requester_sid=requester_sid,
+                             reason=reason, payload=payload)
     if lifecycle_cards_hidden(kind):
         # Nobody would see the card, so a pending request could only expire. Refuse now so the
         # requester learns at once and asks in conversation instead.
@@ -1083,8 +1180,9 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     if (kind, action) not in CONTROLS:
         return {"ok": False, "error_code": "unsupported_control"}
     autonomous = _lifecycle_autonomy(kind)
-    if autonomous and action == "clear":
-        return {"ok": False, "error_code": "user_only", "error": "Only the user can clear a goal with /goal clear"}
+    from hermes_cli.lifecycle_policy import decision, D
+    if decision(kind, action, None, autonomous=autonomous) == D:
+        return {"ok": False, "error_code": "user_only", "error": "Clearing is user-only"}
     try:
         payload = _check_payload(kind, action, payload)
         target_sid = resolve_target(target_sid)
@@ -1102,10 +1200,10 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
     quote_check = None
     quote_matches = False
     if user_quote:
-        quote_check = check_user_quote(requester_sid, user_quote)
+        quote_check = check_user_quote(requester_sid, user_quote, controlled_session_id=target_sid)
         if not isinstance(quote_check, str):
             quote_matches = _quote_matches_control(
-                kind, action, target_sid, requester_sid,
+                kind, action, target_sid, quote_check.source_session_id,
                 _governing_sentence(*quote_check), payload,
             )
 
@@ -1132,10 +1230,18 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                              expires_at=None, affected_text=affected_before, cursor=conn)
         record["resolved_at"], record["error"] = now, code or None
         record["current_max_turns"] = _current_max_turns(kind, raw)
+        record["before"] = json.loads(raw) if raw else None
+        after_raw = _meta_value(conn, _definition_key(kind, target_sid))
+        record["after"] = json.loads(after_raw) if after_raw else None
         _bind_control_result(record, result, conn)
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,
                 **({"error_code": code, "error": code} if code else {}), **result}
+
+    from hermes_cli.lifecycle_authority import apply_owned_control
+    owned_result = apply_owned_control(kind, action, target_sid, requester_sid, reason, user_quote, commit)
+    if owned_result is not None:
+        return owned_result
 
     if autonomous:
         # No route/approval requirement: goal and loop writes use the same transaction and wake
@@ -1145,13 +1251,15 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
             if action in {"pause", "resume", "stop"} and user_quote:
                 # Only a still-current user instruction may suspend automatic waking, lift a user
                 # pause, or stop (clear) a loop. Anything else stays the agent's own act.
-                checked = check_user_quote(requester_sid, user_quote, cursor=conn)
+                checked = check_user_quote(requester_sid, user_quote, cursor=conn, controlled_session_id=target_sid)
                 if not isinstance(checked, str) and _quote_matches_control(
-                    kind, action, target_sid, requester_sid,
+                    kind, action, target_sid, checked.source_session_id,
                     _governing_sentence(*checked), payload, cursor=conn,
                 ):
                     quote, message = checked
-                    authority = {"via": "quote", "quote": quote, "message": message}
+                    authority = {"via": "quote", "quote": quote, "message": message,
+                                 "quote_source_session_id": checked.source_session_id,
+                                 **({"relay_receipt": checked.relay_receipt} if checked.relay_receipt else {})}
             return commit(conn, authority, "session_control_autonomy")
 
         try:
@@ -1196,15 +1304,18 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
 
     def apply(conn):
         # Recheck after acquiring the write lock: a newer message must not inherit an older quote.
-        checked = check_user_quote(requester_sid, user_quote, cursor=conn)
+        checked = check_user_quote(requester_sid, user_quote, cursor=conn, controlled_session_id=target_sid)
         if isinstance(checked, str):
             return {_REFUSED: checked}
-        if not _quote_matches_control(kind, action, target_sid, requester_sid,
+        if not _quote_matches_control(kind, action, target_sid, checked.source_session_id,
                                       _governing_sentence(*checked), payload,
                                       cursor=conn):
             return {_REFUSED: "user_quote_mismatch"}
         quote, message = checked
-        return commit(conn, {"via": "quote", "quote": quote, "message": message},
+        return commit(conn, {"via": "quote", "quote": quote, "message": message,
+                             "quote_source_session_id": checked.source_session_id,
+                             **({"relay_receipt": checked.relay_receipt}
+                                if getattr(checked, "relay_receipt", "") else {})},
                       "session_control_quote")
 
     try:
@@ -1242,6 +1353,7 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[Di
             _save_record(record, cursor=conn)
             return record
         record["authority"] = {"via": "button", "user_id": str(user_id)}
+        record["lifecycle_authority"] = "user"
         record["resolved_at"] = now
         if decision == "deny":
             record["status"] = "denied"
@@ -1411,34 +1523,37 @@ def mark_outbox(request_id: str, flag: str, value: Any = True) -> Optional[Dict[
 def _pause_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
 
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
     manager = GoalManager(sid, cursor=cursor)
-    if authority.get("via") == "autonomy":
+    if caller is LifecycleAuthority.AUTONOMY:
         if not manager.is_active():
             return None
         return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
                                         reason=reason or "session-control")
-    return manager.pause(reason=reason or "session-control")
+    if caller.actor == "agent" and not manager.is_active():
+        return None
+    return manager.pause(reason=reason or "session-control", by=caller.actor)
 
 
 def _pause_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.loops import LoopManager
 
-    autonomous = (authority or {}).get("via") == "autonomy"
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
     # An agent pause applies only to an active loop and records the agent as its owner.
     return LoopManager(sid, cursor=cursor).pause(
-        reason=reason or "session-control", by="agent" if autonomous else "user")
+        reason=reason or "session-control", by=caller.actor)
 
 
 def _resume_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.loops import LoopManager
 
     manager = LoopManager(sid, cursor=cursor)
-    if (authority or {}).get("via") != "autonomy":
-        return manager.resume()
-    state = manager.state
-    if state is not None and state.status == "paused" and state.paused_by != "agent":
-        # A user, Ctrl+C or tick-budget pause is the user's to lift.
-        return _user_paused(state, "loop")
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
+    if caller.actor == "user":
+        return manager.resume(by=caller.actor)
     return manager.resume(by="agent")  # None unless this is the agent's own pause
 
 
@@ -1446,11 +1561,10 @@ def _stop_loop(sid, reason, payload, authority, cursor=None):
     from hermes_cli.loops import LoopManager
 
     manager = LoopManager(sid, cursor=cursor)
-    if (authority or {}).get("via") != "autonomy":
+    from hermes_cli.lifecycle_authority import LifecycleAuthority
+    caller = LifecycleAuthority.from_control(authority)
+    if caller.actor == "user":
         return manager.clear()
-    state = manager.state
-    if state is not None and state.status == "paused" and state.paused_by != "agent":
-        return _user_paused(state, "loop")
     # The agent finishes its loop; clearing it stays a user control.
     return manager.finish(reason or "agent finished the loop")
 

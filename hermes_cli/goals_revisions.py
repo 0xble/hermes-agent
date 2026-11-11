@@ -75,7 +75,8 @@ def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
         # under the same writer lock as the contract delta.
         from hermes_cli.goals_autonomy import validate_removal_quote
         def precondition(cursor):
-            validate_removal_quote(staged.state, expected, cursor)
+            validate_removal_quote(staged.state, expected, cursor,
+                                   controlled_session_id=manager.session_id)
         # No-op and validation returns must also observe conflicting command writes.
         commit_and_publish_snapshot(
             manager, staged.state,
@@ -222,9 +223,22 @@ class GoalRevisionsMixin:
                 evidence: str = "", user_quote: str = "") -> Dict[str, Any]:
         """Validate and apply an additive revision to this manager's (staged) state."""
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
-        if goal_autonomy_enabled() and actor == "agent":
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
+        caller = LifecycleAuthority.for_edit(actor, autonomous=goal_autonomy_enabled())
+        if caller is None:
+            return {"ok": False, "error_code": "invalid_actor",
+                    "error": "actor must be agent or user"}
+        actor = caller.actor
+        from hermes_cli.lifecycle_policy import decision, A
+        if decision("goal", "revise", self._state, actor=actor,
+                    autonomous=caller is LifecycleAuthority.AUTONOMY) != A:
+            return {"ok": False, "error_code": "user_authority_required"}
+        # Individual removed fields are checked by autonomous_edit's table.
+        permitted = decision("goal", "objective", self._state, actor=actor,
+                             autonomous=caller is LifecycleAuthority.AUTONOMY) == A
+        if actor == "agent" and permitted:
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
-                                   subgoals=subgoals, user_quote=user_quote)
+                                   subgoals=subgoals, user_quote=user_quote, authority=caller.value)
         state = self._require_goal()
         reason = (reason or "").strip()
         if not reason:
@@ -235,6 +249,9 @@ class GoalRevisionsMixin:
         result = self._revise_state(state, reason=reason, actor=actor, goal=goal, contract=contract,
                                     subgoals=subgoals, evidence=evidence, evidence_error=evidence_error)
         if result.get("ok"):
+            result["revision"]["lifecycle_authority"] = caller.value
+            if actor == "user" and contract and "stop_when" in contract:
+                state.stop_condition_owner = "user"
             self._save()
         return result
 
@@ -252,9 +269,18 @@ class GoalRevisionsMixin:
         )
 
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
-        if goal_autonomy_enabled() and actor == "agent":
+        from hermes_cli.lifecycle_authority import LifecycleAuthority
+        caller = LifecycleAuthority.for_edit(actor, autonomous=goal_autonomy_enabled())
+        if caller is None:
+            return {"ok": False, "error_code": "invalid_actor",
+                    "error": "actor must be agent or user"}
+        actor = caller.actor
+        from hermes_cli.lifecycle_policy import decision, A
+        permission = decision("goal", "replace", self._state, actor=actor,
+                              autonomous=caller is LifecycleAuthority.AUTONOMY)
+        if actor == "agent" and permission == A:
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
-                                   max_turns=max_turns, user_quote=user_quote, kind="replace")
+                                   max_turns=max_turns, user_quote=user_quote, kind="replace", authority=caller.value)
         if actor != "user":
             return {"ok": False, "error_code": "destructive_change_requires_command",
                     "error": f"Use goal_set action=replace through session controls with a current user instruction "
@@ -292,6 +318,8 @@ class GoalRevisionsMixin:
             # GoalContract values are complete contracts, mappings patch only named fields.
             state.contract = (contract if isinstance(contract, GoalContract)
                               else GoalContract.from_dict({**state.contract.to_dict(), **contract}))
+            if state.contract.stop_when != previous["contract"]["stop_when"]:
+                state.stop_condition_owner = "user"
         # Replacing an objective does not remove independent additive criteria. Their
         # existing explicit user removal controls remain the only removal path.
         if max_turns is not None:
@@ -312,9 +340,14 @@ class GoalRevisionsMixin:
         state.last_reason = None
         revision = {"at": time.time(), "actor": "user", "kind": "replace", "reason": reason,
                     "authority": authority.get("via") if approved else "explicit_command",
+                    "lifecycle_authority": caller.value,
                     "user_quote": user_quote if approved else "",
                     "user_message": str(authority.get("message") or "") if approved else "",
                     "before": previous, "after": snapshot()}
+        if authority.get("quote_source_session_id"):
+            revision["quote_source_session_id"] = authority["quote_source_session_id"]
+        if authority.get("relay_receipt"):
+            revision["relay_receipt"] = authority["relay_receipt"]
         if authority.get("via") == "button":
             revision["approved_by"] = str(authority.get("user_id") or "")
             revision["user_message"] = f'Approved in Telegram: replace goal with "{goal}"'

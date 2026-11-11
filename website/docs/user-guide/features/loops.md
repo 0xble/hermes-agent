@@ -95,6 +95,12 @@ Works on the CLI, the TUI (`hermes --tui`), the web dashboard chat, the desktop 
 
 In the desktop app and dashboard chat, the backend keeps firing an active loop after you close the window or the app disconnects: a session with an active `/loop` (or `/heartbeat`) is exempt from the disconnected-session reaper, so the wakeups and their results are waiting when you reopen it. The exemption ends when the loop stops, pauses, or reaches its tick budget, and the session is then collected normally. The backend process itself must keep running: if it exits with the app, nothing fires until it is back. For unattended loops, run the session on a long-lived backend (a remote `hermes serve`, or the dashboard).
 
+## Agent Edits
+
+With the `loop-lifecycle` plugin installed, an agent can adjust its own loop's prompt wording, cadence in either direction, and run count, or replace/pause/resume/stop it with a reason while preserving the same intent. Creation callers record ownership: commands create user-owned loops, while agent tools pass `actor="agent"` to the core creation API. Missing legacy ownership is not assumed to be agent ownership.
+
+Changing or removing a user-set stop condition, or removing a user-created loop, still requires user authority. A verbatim quote may arrive directly or through a relay whose ledger authenticates the exact delivery and whose quote matches the sender's latest current typed user message. Paraphrases and unverified relay headers never qualify. Revisions and controls retain the reason and before/after values, plus the relay receipt when used.
+
 ## Mixing with `/goal`
 
 Both features inject synthetic turns at idle boundaries, so **only an active, non-waiting goal defers loop wakeups.** While a `/goal` is actively driving (judge saying "continue"), loop wakeups defer. Parked/waiting, paused, and done goals do not block loop ticks. The loop resumes using idle time as soon as the goal finishes, pauses, or parks itself on a wait barrier (`/goal wait`, or the judge's automatic WAIT verdict). The overlap warning appears only when the goal currently blocks loop ticks, not merely because a goal exists. A parked goal plus a `/loop` is a natural combo: the goal waits on the big async thing while the loop keeps a heartbeat on something else.

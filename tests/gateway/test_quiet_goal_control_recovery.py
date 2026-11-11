@@ -54,6 +54,7 @@ async def test_quiet_online_autonomy_settles_notices_and_keeps_progress(state, a
     assert result["status"] == "applied"
     record = controls._load_record(result["record"]["id"])
     assert record["authority"] == {"via": "autonomy", "session_id": "requester", "quote": user_quote}
+    assert record["lifecycle_authority"] == "autonomy"
     runner = _runner(state)
     with patch("gateway.wake.admit_internal_event", new=AsyncMock(side_effect=_accept)):
         await runner._drain_session_controls()
