@@ -19,6 +19,7 @@ arrived. This suite pins the two-record contract that fixes that:
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import logging
 import threading
 import types
@@ -78,7 +79,7 @@ def turn_stubs(monkeypatch, tmp_path):
 @pytest.fixture()
 def turn_env(turn_stubs, monkeypatch):
     """``turn_stubs`` with the turn run inline on the caller's thread."""
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
 
 def _records(caplog, needle):
     return [r for r in caplog.records if needle in r.getMessage()]

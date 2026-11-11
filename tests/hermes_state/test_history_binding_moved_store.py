@@ -8,6 +8,7 @@ import json
 
 import hermes_state_runtime as rt
 from hermes_state import SessionDB
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from hermes_state_mutation_binding import BINDING_PREFIX, bindings_agree, binding_names, import_history_control
 
 
@@ -36,7 +37,7 @@ def test_import_links_a_parent_its_owner_imported_before_the_home_moved(tmp_path
         db.create_session('parent', source='cli')
         db.set_meta(BINDING_PREFIX + 'parent', _bound(tmp_path / 'mac' / 'home'))
         actor = SessionActor('owner', str(tmp_path / 'cloud'), frozenset(), 'peer')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = begin_runtime_epoch(db, instance_id='owner')
         result = rt.mutate_runtime_session(
             db, epoch=epoch, principal_id='owner', session_id='child', request_id='import', expected_revision=0,
             operation='import', payload={'sessions': [

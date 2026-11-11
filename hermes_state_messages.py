@@ -1189,10 +1189,10 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
             # (display_order is per-segment and not comparable across segments, so the per-segment
             # display_order paging below does not apply across a lineage.)
             display = include_compacted and not include_inactive  # removed rows too: see drop_removed
-            rows = self._read_all(f"SELECT * FROM messages WHERE {_VISIBLE_MESSAGE_SQL} AND session_id IN ({_placeholders(session_ids)})"
-                                  + active_clause + " ORDER BY id ASC", session_ids)
-            rows = self._dedupe_display_generations(
-                self._with_removed_identities(rows, session_ids) if display else rows, drop_removed=display)
+            sql = (f"SELECT * FROM messages WHERE {_VISIBLE_MESSAGE_SQL} AND session_id IN ({_placeholders(session_ids)})"
+                   + active_clause + " ORDER BY id ASC")
+            rows = self._display_set(sql, session_ids) if display else self._read_all(sql, session_ids)
+            rows = self._dedupe_display_generations(rows, drop_removed=display)
             rows = rows[::-1][offset:][:limit][::-1] if latest else rows[offset:][:limit]
         elif include_compacted and not include_inactive and self._ensure_display_order(session_id):
             # _read_retrying_ioerr: mode=ro pooled readers see a transient IOERR mid-checkpoint (#100871).
@@ -1426,12 +1426,14 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         """``_CONVERSATION_ROW_COLUMNS`` rows for *session_ids* ORDER BY id (timestamps are not monotonic
         and would break tool-call adjacency). ``with_compacted``: the display set (``active_clause`` is
         ignored) with the ``compacted`` column, plus the removed rows' identities for ``drop_removed``."""
-        rows = self._read_conversation_all(
+        sql = (
             f"SELECT {'session_id, ' if with_session_id or with_compacted else ''}{'compacted, display_order, ' if with_compacted else ''}"
             f"{self._CONVERSATION_ROW_COLUMNS} "
             f"FROM messages WHERE session_id IN ({_placeholders(session_ids)}) AND {_VISIBLE_MESSAGE_SQL}"
-            f"{_DISPLAY_ACTIVE_CLAUSE if with_compacted else active_clause} ORDER BY {'+id' if active_clause == ' AND active = 1' and not with_compacted else 'id'}", tuple(session_ids), resident_only=resident_only)
-        return self._with_removed_identities(rows, session_ids, resident_only=resident_only) if with_compacted else rows
+            f"{_DISPLAY_ACTIVE_CLAUSE if with_compacted else active_clause} ORDER BY {'+id' if active_clause == ' AND active = 1' and not with_compacted else 'id'}")
+        if with_compacted:
+            return self._display_set(sql, session_ids, resident_only=resident_only)
+        return self._read_conversation_all(sql, tuple(session_ids), resident_only=resident_only)
 
     def _read_conversation_all(self, sql, params, *, resident_only=False):
         if not resident_only:
@@ -1439,16 +1441,19 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         with self._read_ctx(resident_only=True) as conn:
             return conn.execute(sql, params).fetchall()
 
-    def _with_removed_identities(self, rows, session_ids: list[str], *, resident_only=False) -> list[Any]:
+    def _with_removed_identities(self, rows, session_ids: list[str], conn=None, *, resident_only=False) -> list[Any]:
         """*rows* (ordered by id) merged with the identities of the lineage's removed rows (``active=0,
         compacted=0``), which ``_dedupe_display_generations(drop_removed=True)`` needs only to hide a copy, never
         to show: no body (a legacy row without a stored display identity keeps its content for the key)."""
-        removed = SessionMessagesMixin._read_conversation_all(self,
+        sql = (
             "SELECT session_id, id, role, timestamp, tool_call_id, tool_calls, tool_name, display_kind, display_metadata, "
             "message_uid, absorbed_message_uids, display_identity, active, compacted, "
             "CASE WHEN display_identity IS NULL THEN content END AS content "
             f"FROM messages WHERE {_VISIBLE_MESSAGE_SQL} AND session_id IN ({_placeholders(session_ids)}) AND active = 0 AND compacted = 0 "
-            "ORDER BY id", tuple(session_ids), resident_only=resident_only)
+            "ORDER BY id")
+        params = tuple(session_ids)
+        removed = (conn.execute(sql, params).fetchall() if conn is not None else
+                   SessionMessagesMixin._read_conversation_all(self, sql, params, resident_only=resident_only))
         return sorted([*rows, *removed], key=lambda row: row["id"]) if removed else list(rows)
 
     def get_messages_as_conversation(self, session_id: str, include_ancestors: bool = False,

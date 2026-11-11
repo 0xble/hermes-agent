@@ -42,3 +42,6 @@ def checkout_venvs_are_not_an_install(monkeypatch):
     real = extras._pre_pm_site_packages
     monkeypatch.setattr(extras, "_pre_pm_site_packages",
                         lambda root: [] if Path(root).resolve() == checkout else real(root))
+    real_installed = extras.installed_selection
+    monkeypatch.setattr(extras, "installed_selection",
+                        lambda root: [] if Path(root).resolve() == checkout else real_installed(root))

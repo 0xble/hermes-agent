@@ -23,6 +23,12 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   (retained results open state.db), the startup-restore drain's session-key resolution (Telegram
   topic recovery), the boot resume-candidate snapshot, and the first open of each served secondary
   profile's handles (primed off the loop at startup and on hot-add).
+- Detached process-result routing (`gateway/session_detached.py::follow_detached_pin`) resolves
+  store entries, logical owners, session rows and cold mounts through `asyncio.to_thread`.
+  The live route is checked after the worker returns. This preserves completion delivery after
+  a chat moves to another conversation without blocking the gateway loop or bypassing its guard.
+  The real headless completion contract is in `tests/tools/test_completed_process_results.py`,
+  with detached-conversation lifecycle and result coverage in `tests/gateway/`.
 - 2026-10-25 sweep of the sites the guard named on the live gateway (about 120 active agents,
   writer-lock holds of 3-13 s, two exit-75 kills): attended route resolution takes the durable
   activity stamp and `get_attended_route_active` from the off-loop resolution snapshot; turn

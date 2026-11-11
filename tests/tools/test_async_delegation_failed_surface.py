@@ -16,12 +16,25 @@ from tools import async_delegation as ad
 
 
 @pytest.fixture(autouse=True)
-def home(tmp_path):
+def home(tmp_path, monkeypatch):
+    from queue import Queue
+    from tools.process_registry import process_registry
+
     ad._reset_for_tests()
+    monkeypatch.setattr(process_registry, "completion_queue", Queue())
     token = set_hermes_home_override(str(tmp_path))
-    yield tmp_path
-    reset_hermes_home_override(token)
-    ad._reset_for_tests()
+    try:
+        yield tmp_path
+    finally:
+        try:
+            # A force-finalized outcome may precede the actual runner's shutdown.
+            with ad._records_lock:
+                futures = [r["_future"] for r in ad._records.values() if r.get("_future") is not None]
+            for future in futures:
+                future.result(timeout=10)
+        finally:
+            reset_hermes_home_override(token)
+            ad._reset_for_tests()
 
 
 def _delegation(delegation_id, *, status, result, ui="ui-1", parent="agent-1", completed_at=None, **task):
@@ -83,8 +96,8 @@ def test_a_split_unit_that_failed_before_any_task_reported_lists_its_own_tasks(s
 
 
 def test_a_split_unit_that_stalls_after_one_task_finished_lists_only_the_stalled_task(monkeypatch):
-    """Task 1 finishes (recorded on the unit's row), then task 2 stalls: the forced finalization keeps task 1's
-    result, so only task 2 surfaces as failed."""
+    """Task 1's durable success survives a stalled aggregator. The unfinished task's outcome
+    remains unknown, and only that task surfaces as failed."""
     from tools.process_registry import process_registry
     monkeypatch.setattr(ad, "_STALE_IDLE_SECONDS", 0.3)
     monkeypatch.setattr(ad, "_STALE_IN_TOOL_SECONDS", 0.3)
@@ -104,7 +117,7 @@ def test_a_split_unit_that_stalls_after_one_task_finished_lists_only_the_stalled
             max_async_children=2, runner=runner, progress_fn=lambda: ((0, None), False))
         assert res["status"] == "dispatched"
         failed = wait_until(lambda: ad.failed_delegations_for_session("ui-1"), timeout=5)
-        assert [(r["task_index"], r["goal"], r["status"]) for r in failed] == [(2, "C goal", "stalled")]
+        assert [(r["task_index"], r["goal"], r["status"]) for r in failed] == [(2, "C goal", "unknown")]
     finally:
         gate.set()
         while not process_registry.completion_queue.empty():
@@ -127,7 +140,7 @@ def test_a_unit_whose_runner_raises_after_one_task_finished_lists_only_the_unfin
     evt = process_registry.completion_queue.get(timeout=10)
 
     assert [(r["task_index"], r["status"]) for r in evt["results"]] == sorted(
-        [(1, "completed")] + [(i, "error") for i in unfinished])
+        [(1, "completed")] + [(i, "unknown") for i in unfinished])
     assert [(r["task_index"], r["goal"]) for r in ad.failed_delegations_for_session("ui-1")] == [
         (i, goals[i]) for i in unfinished]
 

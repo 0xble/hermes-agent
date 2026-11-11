@@ -208,6 +208,11 @@ class SessionCoverageMixin:
             return True
         if not self._copy_of_current_row(row, held):
             return False
+        if role == "tool":
+            # Tool-result pruning replaces the payload rather than wrapping it.
+            # Keep replay-sidecar checks above: the ownership digest deliberately
+            # excludes API-content and Codex reasoning backfills.
+            return True
         stored_text = _text_of(stored)
         return bool(stored_text.strip()) and _holds_as_block(stored_text, _text_of(content))
 

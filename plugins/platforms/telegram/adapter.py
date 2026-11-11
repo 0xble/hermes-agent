@@ -22,7 +22,7 @@ from weakref import WeakValueDictionary
 from typing import Any, Awaitable, Callable, Dict, Iterator, List, Optional, Set, cast
 from hermes_cli import setup_platforms
 
-from gateway.platforms.reaction_lifecycle import reaction_operation
+from gateway.platforms.base import reaction_operation
 
 logger = logging.getLogger(__name__)
 
@@ -391,9 +391,7 @@ def check_telegram_requirements() -> bool:
     return True
 
 
-# A one-line CommonMark code span delimited by two or more backticks. The MarkdownV2 fenced-block
-# pass shares its boundaries with the inline pass so code inside a block is never rewritten.
-_MULTI_TICK_CODE_SPAN_RE = re.compile(r'(?<![`\\])(?P<ticks>`{2,})(?!`)(?P<body>[^\n]+?)(?<!`)(?P=ticks)(?!`)')
+# Fence extraction runs before the shared matching-width inline-code scanner.
 _MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
 # MarkdownV2 escaping and the bare-bracket safety net live once, in telegram_markdown.py.
 from plugins.platforms.telegram.telegram_markdown import _EXPANDABLE_QUOTE, _escape_bare_bracket, _escape_mdv2
@@ -401,7 +399,8 @@ from plugins.platforms.telegram.telegram_markdown import _EXPANDABLE_QUOTE, _esc
 
 def _strip_mdv2(text: str) -> str:
     """Strip MarkdownV2 escapes and formatting markers for the plain-text fallback."""
-    from gateway.copy_blocks import protect_inline_copy_bodies, restore_inline_copy_bodies
+    from gateway.copy_blocks import protect_inline_copy_bodies
+    from gateway.platforms.base import restore_inline_copy_bodies
     text, bodies = protect_inline_copy_bodies(text)
     from .copy_quotes import protect_quote_fallback
     text, quote_bodies = protect_quote_fallback(text)
@@ -679,7 +678,10 @@ _LINK_SCRUB_PROTECT_RE = re.compile(
 
 def _tg_link_target_supported(target: str) -> bool:
     """True if Telegram can render *target* as a clickable link target."""
-    return bool(_SUPPORTED_LINK_TARGET_RE.match(target.strip()))
+    from .telegram_markdown import link_target_renders
+    target = target.strip()
+    return (bool(_SUPPORTED_LINK_TARGET_RE.match(target))
+            or (not re.match(r"[a-z][a-z0-9+.-]*:", target, re.IGNORECASE) and link_target_renders(target)))
 
 
 def _markdown_link_target(destination: str) -> str:
@@ -6839,21 +6841,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         #    before the normal MarkdownV2 conversions run.
         from .copy_quotes import protect_copy_quotes
         text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
-        # 1a) CommonMark multi-backtick inline code (``a `b` c``, as format_progress_literal emits). MarkdownV2
-        # has only single-backtick code, so re-emit the content as one with ` and \ escaped. Runs before the
-        # fenced pass; spans inside a real fence stay that fence's content. Lead-in prose remains outside
-        # the protected span so multi-backtick inline code there still renders as code.
-        fences = [(m.start(2), m.end()) for m in _MDV2_FENCE_RE.finditer(text)]
-
-        def _protect_multi_tick(m):
-            if any(start <= m.start() < end for start, end in fences):
-                return m.group(0)
-            body = m.group('body')
-            if body.startswith(' ') and body.endswith(' ') and body.strip():
-                body = body[1:-1]  # CommonMark strips one padding space from each side
-            return _ph('`' + body.replace('\\', '\\\\').replace('`', '\\`') + '`')
-
-        text = _MULTI_TICK_CODE_SPAN_RE.sub(_protect_multi_tick, text)
         # 1) Protect fenced code blocks (``` ... ```)
         #    Per MarkdownV2 spec, \ and ` inside pre/code must be escaped.
         #    A fence still opens on its own line — the opening ``` must be the
@@ -6879,8 +6866,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             return prefix + _ph(opening + body + closing)
 
         text = _MDV2_FENCE_RE.sub(_protect_fenced, text)
-        # 2) Protect inline code; escape \ inside it per MarkdownV2 spec.
-        text = re.sub(r'(`[^`\r\n]+`)', lambda m: _ph(m.group(0).replace('\\', '\\\\')), text)
+        # Match the outer run first, so inner runs remain literal code content.
+        from .telegram_markdown import _stash_inline_code
+        text = _stash_inline_code(text, _ph)
         # 3) Links: escape display text; inside the URL only ')' and '\' need escaping.
         text = _degrade_unsupported_markdown_links(text, preserve_citation_brackets=False)
 
@@ -8559,21 +8547,6 @@ def _is_connected(config) -> bool:
     return bool(str(token).strip())
 
 
-async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False):
-    """Out-of-process delivery (standalone_sender_fn) so deliver=telegram cron jobs succeed without the
-    gateway; delegates to the REST ``_send_telegram`` sender."""
-    token = getattr(pconfig, "token", None)
-    if not token:
-        from agent.secret_scope import get_secret  # profile-scoped: never borrow another profile's token
-        token = get_secret("TELEGRAM_BOT_TOKEN", "") or ""
-    extra = getattr(pconfig, "extra", None) or {}
-    from tools.send_message_senders import _send_telegram
-    return await _send_telegram(
-        token, chat_id, message, media_files=media_files, thread_id=thread_id,
-        disable_link_previews=bool(extra.get("disable_link_previews")), force_document=force_document,
-        rich_messages=extra.get("rich_messages"), allow_cjk_rich_messages=extra.get("allow_cjk_rich_messages", False))
-
-
 def interactive_setup() -> None:
     """Configure Telegram credentials and allowlist via the CLI setup wizard (lazy import)."""
     setup_platforms._setup_telegram()
@@ -8659,6 +8632,7 @@ def _apply_yaml_config(yaml_cfg: dict, telegram_cfg: dict) -> dict | None:
 def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system."""
     from .adapter_hint import PLATFORM_HINT, PLATFORM_HINT_TOOL_NOTES
+    from .standalone import standalone_send
     from .dashboard_card import DASHBOARD_CARD
     from . import gateway_env  # env -> GatewayConfig bridge (gateway.config_env)
     ctx.register_platform(
@@ -8666,7 +8640,7 @@ def register(ctx) -> None:
         **DASHBOARD_CARD,
         ensure_deps_fn=check_telegram_requirements, is_connected=_is_connected, required_env=["TELEGRAM_BOT_TOKEN"],
         install_hint=t("platform.telegram.install_hint"), setup_fn=interactive_setup, apply_yaml_config_fn=_apply_yaml_config, cron_deliver_env_var="TELEGRAM_HOME_CHANNEL",
-        standalone_sender_fn=_standalone_send, max_message_length=4096, emoji="✈️", allow_update_command=True,
+        standalone_sender_fn=standalone_send, max_message_length=4096, emoji="✈️", allow_update_command=True,
         platform_hint=PLATFORM_HINT, platform_hint_tool_notes=PLATFORM_HINT_TOOL_NOTES,
         display_tier="high",
         # Mobile inbox: quiet tool_progress / busy-ack, but keep interim commentary and heartbeats.

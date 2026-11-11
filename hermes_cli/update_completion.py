@@ -64,6 +64,7 @@ def _owner_death_watch():
         watcher = subprocess.Popen(
             [sys.executable, "-I", "-S", "-c", _OWNER_DEATH_WATCH],
             stdin=read_end, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # detached-spawn: ok — pipe EOF on parent death must let this stdlib watcher kill the completion session
             start_new_session=True)
     except OSError:
         os.close(write_end)
@@ -165,6 +166,7 @@ def run_completion(request: dict) -> dict:
         # start_new_session would otherwise outlive a SIGKILL of this parent; the death
         # watch kills that session when we die, matching the Windows job.
         watch = _owner_death_watch() if os.name == "posix" else None
+        # detached-spawn: ok — the announced child session is killed by the pipe owner-death watcher above
         popen_kwargs = ({"start_new_session": True, "pass_fds": checkout_lock_fds(root)}
                         if os.name == "posix" else
                         {"creationflags": subprocess.CREATE_NO_WINDOW | CREATE_SUSPENDED})
@@ -173,7 +175,6 @@ def run_completion(request: dict) -> dict:
         try:
             proc = subprocess.Popen(
                 command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                # detached-spawn: ok — awaited; holds the checkout lock fd so an update finishes atomically even if this parent dies
                 **popen_kwargs)
         except BaseException:
             if watch is not None:

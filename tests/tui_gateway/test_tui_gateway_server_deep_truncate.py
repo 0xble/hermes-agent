@@ -2,6 +2,7 @@
 ``confirm_deep_truncate`` (#133716: a cut that archives more than one user turn — a valid
 anchor can still name the wrong, stale row)."""
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 import types
 
@@ -38,7 +39,7 @@ def test_prompt_submit_refuses_deep_truncation_without_confirm(monkeypatch):
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     # The confirmed submit starts a turn; never run it on a real thread (it would leak).
-    monkeypatch.setattr(server.threading, "Thread", lambda *a, **k: types.SimpleNamespace(start=lambda: None))
+    patch_server_threads(monkeypatch, server, lambda *a, **k: types.SimpleNamespace(start=lambda: None))
 
     def _submit(**extra):
         return server.handle_request({"id": "1", "method": "prompt.submit", "params": {
@@ -90,7 +91,7 @@ def test_deep_truncate_counts_every_durable_row_a_merged_carrier_holds(monkeypat
     server._sessions["deep-carrier-sid"] = sess
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server.threading, "Thread", lambda *a, **k: types.SimpleNamespace(start=lambda: None))
+    patch_server_threads(monkeypatch, server, lambda *a, **k: types.SimpleNamespace(start=lambda: None))
     try:
         refused = server.handle_request({"id": "1", "method": "prompt.submit", "params": {
             "session_id": "deep-carrier-sid", "text": "a", "truncate_before_row_id": 101,
@@ -153,7 +154,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
     )
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
@@ -220,7 +221,7 @@ def test_unconfirmed_deep_truncation_is_warn_only_this_release(monkeypatch, capl
     server._sessions["warn-only-sid"] = _session(history=list(history))
     monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
-    monkeypatch.setattr(server.threading, "Thread", lambda *a, **k: types.SimpleNamespace(start=lambda: None))
+    patch_server_threads(monkeypatch, server, lambda *a, **k: types.SimpleNamespace(start=lambda: None))
     try:
         with caplog.at_level(logging.WARNING):
             result = server.handle_request({"id": "1", "method": "prompt.submit", "params": {

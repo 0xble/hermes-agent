@@ -19,6 +19,7 @@ from websockets.asyncio.server import serve
 from tools import browser_cdp_tool
 import requests
 from tools import browser_tool_eval_policy as bt_eval_policy
+from tools import browser_url_policy
 from tools import browser_tool_install as bt_install
 from tools import browser_tool_cdp as bt_cdp
 
@@ -455,8 +456,8 @@ def test_runtime_evaluate_blocked_when_current_page_is_private(monkeypatch):
     )
 
 
-    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
-    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda task_id: PRIVATE_URL)
+    monkeypatch.setattr(browser_url_policy, "eval_ssrf_guard_active", lambda: True)
+    monkeypatch.setattr(browser_cdp_tool, "_current_page_private_url", lambda endpoint, target_id: PRIVATE_URL)
 
     async def fake_call(*args, **kwargs):
         calls.append((args, kwargs))
@@ -484,7 +485,7 @@ def test_frame_id_route_blocked_when_current_page_is_private(monkeypatch):
     supervisor_calls = []
 
 
-    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(browser_url_policy, "eval_ssrf_guard_active", lambda: True)
     monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda task_id: PRIVATE_URL)
 
     def fake_supervisor_route(**kwargs):
@@ -516,7 +517,7 @@ def test_frame_id_route_allowed_when_page_is_not_private(monkeypatch):
     supervisor_calls = []
 
 
-    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(browser_url_policy, "eval_ssrf_guard_active", lambda: True)
     monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", lambda task_id: None)
 
     def fake_supervisor_route(**kwargs):
@@ -550,7 +551,7 @@ def test_page_navigate_to_private_url_blocked_before_cdp(monkeypatch):
     )
 
 
-    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: True)
+    monkeypatch.setattr(browser_url_policy, "eval_ssrf_guard_active", lambda: True)
 
     async def fake_call(*args, **kwargs):
         calls.append((args, kwargs))
@@ -575,12 +576,12 @@ def test_private_guard_inactive_does_not_probe(monkeypatch, cdp_server):
     cdp_server.on("Runtime.evaluate", lambda params, sid: {"result": {"value": "ok"}})
 
 
-    monkeypatch.setattr(bt_eval_policy, "_eval_ssrf_guard_active", lambda task_id: False)
+    monkeypatch.setattr(browser_url_policy, "eval_ssrf_guard_active", lambda: False)
 
-    def fail_probe(task_id):
+    def fail_probe(endpoint, target_id):
         raise AssertionError("_current_page_private_url must not be probed")
 
-    monkeypatch.setattr(bt_eval_policy, "_current_page_private_url", fail_probe)
+    monkeypatch.setattr(browser_cdp_tool, "_current_page_private_url", fail_probe)
 
     result = json.loads(
         browser_cdp_tool.browser_cdp(

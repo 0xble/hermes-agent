@@ -78,7 +78,7 @@ def keyless_adapter(monkeypatch, vendor, shape):
     elif vendor == "firecrawl":
         from plugins.web.firecrawl import provider as fc
         monkeypatch.setattr(fc, "_KeylessFirecrawlClient", lambda: NS(scrape=lambda *, url, **kw: {
-            "data": {"markdown": page(url)["content"], "metadata": {"sourceURL": FINAL}}
+            "data": {"markdown": page(url)["content"], "metadata": {"url": url, "sourceURL": url}}
         }))
     else:
         monkeypatch.setattr(keyless, "_keenable_request", lambda *args, params: {"url": FINAL, "content": page(params["url"])["content"]})
@@ -158,8 +158,8 @@ def adapter(monkeypatch, name, shape):
             if url == A and shape == "error":
                 raise RuntimeError("Scrape unavailable")
             final = FINAL if url == A else B
-            # Exercise typed metadata as well as the final-URL sourceURL shape.
-            return {"data": {"markdown": page(url)["content"], "metadata": NS(model_dump=lambda: {"sourceURL": final})}}
+            # SDK metadata keeps the requested source_url separate from the final url.
+            return {"data": {"markdown": page(url)["content"], "metadata": NS(model_dump=lambda: {"url": final, "source_url": url})}}
 
         monkeypatch.setattr(module, "_get_firecrawl_client", lambda *args: NS(scrape=scrape))
         return module.FirecrawlWebSearchProvider()

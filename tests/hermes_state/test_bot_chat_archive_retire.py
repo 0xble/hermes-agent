@@ -6,13 +6,14 @@ import pytest
 
 import hermes_state_runtime as rt
 from hermes_state import SessionDB
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.mark.parametrize('reaped', [False, True])
 def test_sidebar_archive_mutation_retires_canonical_bot_chat(tmp_path, reaped):
     db = SessionDB(db_path=tmp_path / 'state.db')
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = begin_runtime_epoch(db, instance_id='owner')
         db.create_session('canon', source='desktop')
         assert db.set_session_title('canon', SessionDB.CANONICAL_BOT_CHAT_TITLE)
         assert db.set_session_hidden('canon', True)
@@ -77,7 +78,7 @@ def test_archive_of_visible_reaped_bot_chat_retires_the_name(tmp_path, writer):
     poll and clicks keep landing in it."""
     db = SessionDB(db_path=tmp_path / 'state.db')
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = begin_runtime_epoch(db, instance_id='owner')
         db.create_session('canon', source='gateway_botmode')
         assert db.set_session_title('canon', SessionDB.CANONICAL_BOT_CHAT_TITLE)
         db.end_session('canon', 'ws_orphan_reap')

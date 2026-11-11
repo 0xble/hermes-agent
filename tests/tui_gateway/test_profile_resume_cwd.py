@@ -8,6 +8,7 @@ default profile's files. A resume with no stored cwd fell to ``_default_session_
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import pytest
 
 from tui_gateway import server
@@ -48,7 +49,7 @@ def resume(profile, monkeypatch):
         "_child_run_active": lambda _key, _home=None: False,
     }.items():
         monkeypatch.setattr(server, name, value)
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server.git_probe, "branch", lambda _cwd: None)
     monkeypatch.setattr(server.git_probe, "common_repo_root", lambda _cwd: None)
     db = SessionDB(db_path=profile / "state.db")

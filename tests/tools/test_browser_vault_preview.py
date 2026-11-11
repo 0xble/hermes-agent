@@ -38,7 +38,7 @@ class PreviewWindow:
         expression = request["expression"]
         if "location.href" in expression:
             result = self.origin + "/login"
-        elif "data-hermes-vault-slot\", nonce" in expression:
+        elif 'element.setAttribute("data-hermes-vault-slot", stamp)' in expression:
             result = json.dumps(CONTROLS)
         else:
             result = json.dumps({"filled": 1})

@@ -36,25 +36,25 @@ def _next_selection(recorded, requested=None):
 
 
 def test_without_drops_a_recorded_extra_from_every_later_selection(synced, tmp_path):
-    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False, without=["matrix"])) == 0
+    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False, without=["telegram"])) == 0
 
     # The update's sync carries recorded extras forward; the dropped one stays out, others stay.
-    assert _next_selection(["all", "fal", "matrix"]) == ["all", "fal"]
+    assert _next_selection(["all", "fal", "telegram"]) == ["all", "fal"]
     # A data root without facts re-scans the main-era venv, which is never deleted.
-    main_era_venv(tmp_path, *extras._anchors("matrix"), "fal_client")
-    assert extras.legacy_selection(tmp_path) == ["all", "fal", "matrix"]
-    extras.record_declined_extras(add=["matrix"], project_root=tmp_path)
+    main_era_venv(tmp_path, *extras._anchors("telegram"), "fal_client")
+    assert extras.legacy_selection(tmp_path) == ["all", "fal", "telegram"]
+    extras.record_declined_extras(add=["telegram"], project_root=tmp_path)
     assert extras.legacy_selection(tmp_path) == ["all", "fal"]
     # A lazy first use refuses instead of silently reinstalling it.
     package = SimpleNamespace(project_root=repo_root)
-    with pytest.raises(InstallError, match="pm install --extra matrix"):
-        install._refuse_declined(package, ["matrix"], explicit=False)
+    with pytest.raises(InstallError, match="pm install --extra telegram"):
+        install._refuse_declined(package, ["telegram"], explicit=False)
 
 
 def test_extra_opts_a_dropped_extra_back_in():
-    extras.record_declined_extras(add=["matrix"])
-    assert _next_selection(["all"], requested=["matrix"]) == ["all", "matrix"]
-    install._refuse_declined(SimpleNamespace(project_root=repo_root), ["matrix"], explicit=True)
+    extras.record_declined_extras(add=["telegram"])
+    assert _next_selection(["all"], requested=["telegram"]) == ["all", "telegram"]
+    install._refuse_declined(SimpleNamespace(project_root=repo_root), ["telegram"], explicit=True)
 
 
 def test_without_refuses_an_extra_the_default_sync_selects_anyway(synced, capsys):
@@ -112,15 +112,15 @@ def _watch_lock(monkeypatch, asked=None):
 
 
 def test_a_sync_queued_behind_an_opt_in_keeps_the_extra(monkeypatch):
-    """`--extra matrix` clears the decline while it still owns the dependency lock, so a bare
-    update sync queued behind it never reads the stale decline and publishes without matrix."""
+    """`--extra telegram` clears the decline while it still owns the dependency lock, so a bare
+    update sync queued behind it never reads the stale decline and publishes without telegram."""
     import threading
 
     monkeypatch.setattr(install, "_feature_policy", lambda extras, *, repair: (None, None))
     package = _BlockingVenv()
     monkeypatch.setattr(install, "get_package", lambda name: package)
     install.sync_venv(["all"], explicit=True)
-    extras.record_declined_extras(add=["matrix"])
+    extras.record_declined_extras(add=["telegram"])
 
     holders, _ = _watch_lock(monkeypatch)
     queued_sync_selected = threading.Event()
@@ -147,21 +147,21 @@ def test_a_sync_queued_behind_an_opt_in_keeps_the_extra(monkeypatch):
             queued_errors.append(exc)
 
     queued = threading.Thread(target=queued_sync)
-    package.hold[("all", "matrix")] = queued.start
+    package.hold[("all", "telegram")] = queued.start
     monkeypatch.setattr(install, "_target_selection", target)
     monkeypatch.setattr(extras, "record_declined_extras", clear_decline)
 
-    install.sync_venv(["matrix"], explicit=True)
+    install.sync_venv(["telegram"], explicit=True)
     queued.join(30)
 
     assert not queued.is_alive() and queued_errors == []
-    assert package.built[-1] == ["all", "matrix"]
-    assert _recorded() == ["all", "matrix"]
+    assert package.built[-1] == ["all", "telegram"]
+    assert _recorded() == ["all", "telegram"]
     assert extras.declined_extras() == frozenset()
 
 
 def test_without_during_an_opt_in_sync_stays_recorded(monkeypatch):
-    """`--without matrix` landing while `--extra matrix` builds waits for it, so the opt-in's
+    """`--without telegram` landing while `--extra telegram` builds waits for it, so the opt-in's
     decline clear cannot erase the newer opt-out."""
     import threading
 
@@ -176,25 +176,25 @@ def test_without_during_an_opt_in_sync_stays_recorded(monkeypatch):
         return result
 
     def mid_build():
-        threading.Thread(target=install.decline_extras, args=(["matrix"],), name="opt-out").start()
+        threading.Thread(target=install.decline_extras, args=(["telegram"],), name="opt-out").start()
         # Set once the opt-out queues on the lock or, unlocked, has written its decline.
         assert settled.wait(30)
 
-    package = _BlockingVenv({("all", "matrix"): mid_build})
+    package = _BlockingVenv({("all", "telegram"): mid_build})
     monkeypatch.setattr(install, "get_package", lambda name: package)
     monkeypatch.setattr(extras, "record_declined_extras", record)
 
-    install.sync_venv(["all", "matrix"], explicit=True)
+    install.sync_venv(["all", "telegram"], explicit=True)
     for thread in threading.enumerate():
         if thread.name == "opt-out":
             thread.join(30)
 
-    assert extras.declined_extras() == frozenset({"matrix"})
+    assert extras.declined_extras() == frozenset({"telegram"})
 
 
 def test_without_after_a_failed_first_migration_keeps_the_other_legacy_extras(monkeypatch):
     """A first PM sync that died before writing facts leaves the main-era venv as the only record of
-    what was installed: `--without matrix` seeds its sync from that scan and drops only matrix."""
+    what was installed: `--without telegram` seeds its sync from that scan and drops only telegram."""
     from pm.environments import runtime_facts_path
     from pm.lock import Facts
 
@@ -210,19 +210,19 @@ def test_without_after_a_failed_first_migration_keeps_the_other_legacy_extras(mo
     monkeypatch.setattr(pm.cli, "repo_root", lambda: root)
     (root / "pyproject.toml").parent.mkdir(parents=True)
     (root / "pyproject.toml").write_bytes((repo_root() / "pyproject.toml").read_bytes())
-    main_era_venv(root, *extras._anchors("matrix"), "fal_client")
+    main_era_venv(root, *extras._anchors("telegram"), "fal_client")
     monkeypatch.setattr(importlib.import_module("pm.paths"), "repo_root", lambda: root)
 
-    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False, without=["matrix"])) == 0
+    assert pm.cli.cmd_install(argparse.Namespace(names=None, tools_only=False, without=["telegram"])) == 0
 
     assert (Facts(runtime_facts_path(root)).get("venv") or {}).get("extras") == ["all", "fal"]
-    assert extras.declined_extras(root) == frozenset({"matrix"})
+    assert extras.declined_extras(root) == frozenset({"telegram"})
 
 
 def test_automatic_repair_never_undoes_a_without_that_landed_after_its_read(monkeypatch):
     """Configured-platform repair reads the declines, then asks PM for the configured extra. A
-    `--without matrix` completing between that read and PM's lock wins: repair's request was
-    Hermes's choice, not the user's, so it neither re-adds matrix nor clears the new decline."""
+    `--without telegram` completing between that read and PM's lock wins: repair's request was
+    Hermes's choice, not the user's, so it neither re-adds telegram nor clears the new decline."""
     import pm.client
     from hermes_cli import main_install_repair
 
@@ -231,7 +231,7 @@ def test_automatic_repair_never_undoes_a_without_that_landed_after_its_read(monk
     monkeypatch.setattr(install, "get_package", lambda name: package)
     monkeypatch.setattr(pm.client, "is_runtime", lambda: True)
     monkeypatch.setattr(main_install_repair, "_configured_features_missing_deps",
-                        lambda: [("Matrix", "Run `hermes setup`.", "matrix")])
+                        lambda: [("Telegram", "Run `hermes setup`.", "telegram")])
     install.sync_venv(["all"], explicit=True)
 
     real_lock, opted_out = install._venv_install_lock, []
@@ -240,7 +240,7 @@ def test_automatic_repair_never_undoes_a_without_that_landed_after_its_read(monk
         if not opted_out:
             # Repair has read the declines and is about to take the lock: the opt-out lands first.
             opted_out.append(True)
-            install.decline_extras(["matrix"])
+            install.decline_extras(["telegram"])
             install.sync_venv(["all"], explicit=True)
         return real_lock(**kwargs)
 
@@ -248,6 +248,6 @@ def test_automatic_repair_never_undoes_a_without_that_landed_after_its_read(monk
     main_install_repair._install_configured_features_missing_deps(repo_root())
 
     assert opted_out
-    assert extras.declined_extras() == frozenset({"matrix"})
+    assert extras.declined_extras() == frozenset({"telegram"})
     assert _recorded() == ["all"]
-    assert all("matrix" not in built for built in package.built)
+    assert all("telegram" not in built for built in package.built)

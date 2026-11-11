@@ -7,6 +7,7 @@ on the frame that reaches the client, so the turn's ``_emit`` calls are the same
 off and on (test_prompt_submit_golden_transcript_matches_flag_off_and_on).
 """
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 import types
 
@@ -25,7 +26,7 @@ def _submit_turns(monkeypatch, run_conversation, turns):
     """Client frames (``write_json``) of ``turns`` in-process prompt.submit turns, and the session."""
     frames = []
     monkeypatch.setattr(srv, "write_json", lambda obj: frames.append(obj["params"]) or True)
-    monkeypatch.setattr(srv.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, srv, _ImmediateThread)
     monkeypatch.setattr(srv, "_load_cfg", lambda: {"dashboard": {"turn_isolation": False}})
     monkeypatch.setattr(srv, "_load_interim_assistant_messages", lambda: True)
     monkeypatch.setattr(srv, "_ensure_session_db_row", lambda _session: None)

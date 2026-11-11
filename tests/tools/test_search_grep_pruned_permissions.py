@@ -91,14 +91,16 @@ def test_count_mode_partial_results_name_unreadable_subtree(
 
 
 @live
-def test_no_match_beside_unreadable_subtree_still_warns(
+def test_no_payload_beside_unreadable_subtree_surfaces_traversal_failure(
         hidden_root, locked_dir, monkeypatch):
     result = _grep_only_ops(hidden_root, monkeypatch).search(
         "absent-token", path=str(hidden_root), target="content")
 
-    assert result.error is None
+    assert result.error is not None
+    assert "Permission denied" in result.error
     assert result.total_count == 0
-    assert str(locked_dir) in (result.warning or "")
+    assert str(locked_dir) in result.error
+    assert not result.matches and not result.files and not result.counts
 
 
 @live

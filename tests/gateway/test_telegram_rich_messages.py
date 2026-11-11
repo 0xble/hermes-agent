@@ -1156,10 +1156,10 @@ async def test_rich_prose_currency_pair_is_protected_in_always_mode():
 
 
 @pytest.mark.asyncio
-async def test_rich_single_currency_amount_left_alone():
+async def test_rich_single_currency_amount_stays_literal():
     adapter = _make_adapter(extra={"rich_messages": "always"})
     assert (await adapter.send("12345", "Total was $18,500 this month.")).success
-    assert "Total was $18,500 this month." in _rich_api_kwargs(adapter)["rich_message"]["markdown"]
+    assert r"Total was \$18,500 this month." in _rich_api_kwargs(adapter)["rich_message"]["markdown"]
 
 
 @pytest.mark.asyncio

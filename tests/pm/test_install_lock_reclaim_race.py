@@ -12,16 +12,39 @@ import pm.environments
 import pm.install_states
 import pytest
 from hermes_cli.runtime_state import runtime_lock
-from pm.environments import install_key
+from pm.environments import install_key, install_state_lock_path
 from pm.install_states import collect_orphan_install_states
+from pm.filesystem import lock_path
+
+
+def _lock_file(checkout, lock_kind):
+    state = pm.environments.install_state_dir(checkout)
+    return install_state_lock_path(state) if lock_kind == "stable" else state / ".install.lock"
+
+
+@contextlib.contextmanager
+def _launcher_lock(checkout, lock_kind, *, timeout):
+    if lock_kind == "stable":
+        with runtime_lock(checkout, timeout=timeout) as held:
+            yield held
+        return
+    # Legacy launchers still use the collector's deletable lock. Keep the real
+    # inode-validation retry path under the same adversarial interleaving.
+    fd = lock_path(_lock_file(checkout, lock_kind), timeout=timeout, create_dir=True)
+    try:
+        yield fd is not None
+    finally:
+        if fd is not None:
+            os.close(fd)
 
 
 @pytest.mark.platforms("posix")
-def test_launcher_waiting_on_a_reclaimed_state_lock_excludes_later_launchers(tmp_path, monkeypatch):
+@pytest.mark.parametrize("lock_kind", ["stable", "legacy"])
+def test_launcher_waiting_on_a_reclaimed_state_lock_excludes_later_launchers(tmp_path, monkeypatch, lock_kind):
     """A launcher from a checkout re-created at the recorded path opens the lock while the
-    collector holds it, then gets it when the collector lets go. The lock file it waited on
-    is the one the collector removes; whatever it ends up holding must still exclude the
-    next launcher, or two installers write one state."""
+    collector holds it, then gets it when the collector lets go. The stable lock survives
+    reclamation; a legacy waiter retries on the replacement inode. Either holder must
+    still exclude the next launcher, or two installers write one state."""
     installs = tmp_path / "home" / "installs"
     checkout = tmp_path / "home" / "cache" / "scratch" / "clone"  # provably deleted: reclaimed
     state = installs / install_key(checkout)
@@ -29,18 +52,19 @@ def test_launcher_waiting_on_a_reclaimed_state_lock_excludes_later_launchers(tmp
     (state / "inputs" / ".project-root").write_text(str(checkout), encoding="utf-8")
     (state / "environments" / "gen" / "venv").mkdir(parents=True)
     monkeypatch.setattr(pm.environments, "installs_root", lambda: installs)
+    lock = _lock_file(checkout, lock_kind)
 
     opened, held, done = threading.Event(), threading.Event(), threading.Event()
     real_open = os.open
 
     def observed_open(path, *args, **kwargs):
         fd = real_open(path, *args, **kwargs)
-        if threading.current_thread().name == "launcher-a" and os.fspath(path).endswith(".install.lock"):
+        if threading.current_thread().name == "launcher-a" and os.fspath(path) == os.fspath(lock):
             opened.set()
         return fd
 
     def launcher_a():
-        with runtime_lock(checkout, timeout=None) as got:
+        with _launcher_lock(checkout, lock_kind, timeout=None) as got:
             if got:
                 held.set()
             done.wait(30)
@@ -60,7 +84,7 @@ def test_launcher_waiting_on_a_reclaimed_state_lock_excludes_later_launchers(tmp
     try:
         collect_orphan_install_states(installs)
         assert held.wait(30)
-        with runtime_lock(checkout, timeout=0) as launcher_b:
+        with _launcher_lock(checkout, lock_kind, timeout=0) as launcher_b:
             assert launcher_b is False, "two launchers hold the same state's install lock"
     finally:
         done.set()
@@ -68,7 +92,8 @@ def test_launcher_waiting_on_a_reclaimed_state_lock_excludes_later_launchers(tmp
 
 
 @pytest.mark.platforms("posix")
-def test_lock_file_removal_never_lands_after_a_waiting_launcher_got_the_lock(tmp_path, monkeypatch):
+@pytest.mark.parametrize("lock_kind", ["stable", "legacy"])
+def test_lock_file_removal_never_lands_after_a_waiting_launcher_got_the_lock(tmp_path, monkeypatch, lock_kind):
     """Worst interleaving for the collector's lock-file removal: if it happens once the
     collector has let go, a launcher already waiting on that file gets the lock first, and the
     removal then hands the next launcher a fresh, unheld file. Removal has to happen while
@@ -80,14 +105,17 @@ def test_lock_file_removal_never_lands_after_a_waiting_launcher_got_the_lock(tmp
     (state / "inputs" / ".project-root").write_text(str(checkout), encoding="utf-8")
     (state / "environments" / "gen" / "venv").mkdir(parents=True)
     monkeypatch.setattr(pm.environments, "installs_root", lambda: installs)
+    lock = _lock_file(checkout, lock_kind)
 
     opened, held, released, done = (threading.Event() for _ in range(4))
     collector = threading.current_thread()
-    real_open, real_unlink, real_install_lock = os.open, Path.unlink, pm.install_states._install_lock
+    fence_name = "_install_fence" if lock_kind == "stable" else "_install_lock"
+    real_open, real_unlink = os.open, Path.unlink
+    real_install_lock = getattr(pm.install_states, fence_name)
 
     def observed_open(path, *args, **kwargs):
         fd = real_open(path, *args, **kwargs)
-        if threading.current_thread().name == "launcher-a" and os.fspath(path).endswith(".install.lock"):
+        if threading.current_thread().name == "launcher-a" and os.fspath(path) == os.fspath(lock):
             opened.set()
         return fd
 
@@ -98,12 +126,12 @@ def test_lock_file_removal_never_lands_after_a_waiting_launcher_got_the_lock(tmp
         released.set()
 
     def unlink_late(self, *args, **kwargs):
-        if threading.current_thread() is collector and self.name == ".install.lock" and released.is_set():
+        if threading.current_thread() is collector and self == lock and released.is_set():
             assert held.wait(30)  # the lock is free: the waiting launcher takes it first
         return real_unlink(self, *args, **kwargs)
 
     def launcher_a():
-        with runtime_lock(checkout, timeout=None) as got:
+        with _launcher_lock(checkout, lock_kind, timeout=None) as got:
             if got:
                 held.set()
             done.wait(30)
@@ -119,12 +147,12 @@ def test_lock_file_removal_never_lands_after_a_waiting_launcher_got_the_lock(tmp
 
     monkeypatch.setattr(os, "open", observed_open)
     monkeypatch.setattr(Path, "unlink", unlink_late)
-    monkeypatch.setattr(pm.install_states, "_install_lock", observed_install_lock)
+    monkeypatch.setattr(pm.install_states, fence_name, observed_install_lock)
     monkeypatch.setattr(pm.install_states, "_leased", checkout_recreated_mid_reclaim)
     try:
         collect_orphan_install_states(installs)
         assert held.wait(30)
-        with runtime_lock(checkout, timeout=0) as launcher_b:
+        with _launcher_lock(checkout, lock_kind, timeout=0) as launcher_b:
             assert launcher_b is False, "two launchers hold the same state's install lock"
     finally:
         done.set()
@@ -132,20 +160,21 @@ def test_lock_file_removal_never_lands_after_a_waiting_launcher_got_the_lock(tmp
 
 
 @pytest.mark.platforms("posix")
-def test_unopenable_lock_path_fails_instead_of_retrying(tmp_path, monkeypatch):
+@pytest.mark.parametrize("lock_kind", ["stable", "legacy"])
+def test_unopenable_lock_path_fails_instead_of_retrying(tmp_path, monkeypatch, lock_kind):
     """A lock path that can never be opened (a dangling symlink) raises at once; only a parent
     directory removed mid-open is worth retrying, and never past the timeout."""
     installs = tmp_path / "installs"
     checkout = tmp_path / "clone"
     monkeypatch.setattr(pm.environments, "installs_root", lambda: installs)
-    lock = installs / install_key(checkout) / ".install.lock"
+    lock = _lock_file(checkout, lock_kind)
     lock.parent.mkdir(parents=True)
     lock.symlink_to(tmp_path / "gone" / "target")
     outcome: list[BaseException] = []
 
     def launcher():
         try:
-            with runtime_lock(checkout, timeout=0):
+            with _launcher_lock(checkout, lock_kind, timeout=0):
                 pass
         except BaseException as exc:
             outcome.append(exc)

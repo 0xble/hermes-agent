@@ -21,6 +21,7 @@ time is positive proof the turn never finished. Contract pinned here:
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import multiprocessing
 import os
 import subprocess
@@ -113,7 +114,7 @@ def marker_home(monkeypatch, tmp_path):
 @pytest.fixture()
 def turn_env(monkeypatch, tmp_path, marker_home):
     """Neutralize the turn pipeline's environment-heavy side paths."""
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
     monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
@@ -409,7 +410,7 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
 
 @pytest.fixture()
 def schedule_env(monkeypatch, marker_home):
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
     monkeypatch.setattr(server, "_wait_agent", lambda session, rid, timeout=30.0: None)
     monkeypatch.setattr(server, "_load_cfg", dict)

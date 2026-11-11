@@ -139,12 +139,14 @@ _LOADED_MODULES = """
 import importlib, json, sys
 from pathlib import Path
 root = Path.cwd().resolve()
+interpreter = Path(sys.base_prefix).resolve()
 sys.path.insert(0, str(root))
 for entry in sys.argv[1:]:
     importlib.import_module(entry)
 files = (Path(getattr(module, "__file__", None) or "").resolve() for module in list(sys.modules.values()))
 print(json.dumps(sorted(path.relative_to(root).as_posix() for path in files
-                        if path.is_file() and path.is_relative_to(root) and "site-packages" not in path.parts)))
+                        if path.is_file() and path.is_relative_to(root) and not path.is_relative_to(interpreter)
+                        and "site-packages" not in path.parts)))
 """
 
 

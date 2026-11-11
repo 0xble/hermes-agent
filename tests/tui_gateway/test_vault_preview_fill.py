@@ -51,7 +51,7 @@ def window(monkeypatch):
         expr = req["expression"]
         if "location.href" in expr:
             result = state["origin"] + "/signin"
-        elif "data-hermes-vault-slot\", nonce" in expr:
+        elif 'element.setAttribute("data-hermes-vault-slot", stamp)' in expr:
             result = json.dumps(CONTROLS)
         else:
             state["fill"] = expr

@@ -24,7 +24,8 @@ def test_rerun_child_timeout_falls_back_and_kills_tree(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     child = Mock(communicate=Mock(side_effect=subprocess.TimeoutExpired("rerun", 20)),
                  poll=Mock(return_value=None))
-    monkeypatch.setattr(subprocess, "Popen", Mock(return_value=child))
+    monkeypatch.setattr("hermes_cli.process_identity.spawn_owned", Mock(return_value=child))
+    monkeypatch.setattr("hermes_cli.process_identity.release_process_group_once_empty", Mock())
     kill, drain = Mock(), Mock()
     monkeypatch.setattr("cron.scheduler_script._terminate_cron_script_tree", kill)
     monkeypatch.setattr("cron.scheduler_script._drain_script_pipes", drain)
@@ -43,7 +44,8 @@ def test_abandoned_review_thread_kills_its_rerun(tmp_path, monkeypatch):
     monkeypatch.setattr(review, "_shutdown", threading.Event())
     child = Mock(communicate=Mock(side_effect=review.ReviewAbandoned("review abandoned")),
                  poll=Mock(return_value=None))
-    monkeypatch.setattr(subprocess, "Popen", Mock(return_value=child))
+    monkeypatch.setattr("hermes_cli.process_identity.spawn_owned", Mock(return_value=child))
+    monkeypatch.setattr("hermes_cli.process_identity.release_process_group_once_empty", Mock())
     kill, drain = Mock(), Mock()
     monkeypatch.setattr("cron.scheduler_script._terminate_cron_script_tree", kill)
     monkeypatch.setattr("cron.scheduler_script._drain_script_pipes", drain)
@@ -64,7 +66,8 @@ def test_gateway_shutdown_kills_live_rerun_process_group(tmp_path, monkeypatch):
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setattr(review, "_shutdown", threading.Event())
-    real_popen = subprocess.Popen
+    from hermes_cli.process_identity import spawn_owned
+    real_spawn_owned = spawn_owned
     children = []
     ready = tmp_path / "child.pid"
     script = (
@@ -75,12 +78,12 @@ def test_gateway_shutdown_kills_live_rerun_process_group(tmp_path, monkeypatch):
         f"Path({str(ready)!r}).write_text(str(child.pid))\n"
         "time.sleep(120)\n"
     )
-    def launch(argv, **kwargs):
-        assert kwargs["start_new_session"] is True
-        child = real_popen([sys.executable, "-c", script], **kwargs)
+    def launch(argv, *, purpose, **kwargs):
+        assert purpose == "cron-review-rerun"
+        child = real_spawn_owned([sys.executable, "-c", script], purpose=purpose, **kwargs)
         children.append(child)
         return child
-    monkeypatch.setattr(review.subprocess, "Popen", launch)
+    monkeypatch.setattr("hermes_cli.process_identity.spawn_owned", launch)
     errors = []
     def rerun():
         try:

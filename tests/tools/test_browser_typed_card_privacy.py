@@ -182,7 +182,9 @@ if os.fork()==0:
     try:
         print('daemon alive '+value,flush=True)
         print(value,file=sys.stderr,flush=True)
-        ack.write_text('survived')
+        pending=ack.with_suffix('.tmp')
+        pending.write_text('survived')
+        os.replace(pending,ack)
     finally:
         os._exit(0)
 if sys.argv[3]=='timeout':

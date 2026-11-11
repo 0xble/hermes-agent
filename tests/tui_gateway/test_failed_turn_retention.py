@@ -21,6 +21,7 @@ Contract pinned here:
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 import types
 
@@ -81,7 +82,7 @@ def emits(monkeypatch):
 @pytest.fixture()
 def turn_env(monkeypatch, tmp_path):
     """Neutralize the turn pipeline's environment-heavy side paths."""
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
     monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))

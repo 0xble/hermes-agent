@@ -139,7 +139,9 @@ def _edit_reinserted_with_its_uid(db: SessionDB) -> tuple:
     uid = db.get_messages_as_conversation(SID)[-1]["message_uid"]
     db.append_messages_batch(SID, [{"role": "assistant", "content": "v2 edited", "message_uid": uid}])
     held = {"role": "assistant", "content": "v2 edited", "message_uid": uid}
-    return [_summary(), held], [SUMMARY_TEXT, "v2 edited", "v1 draft"]
+    # A reused UID names one logical occurrence. The handoff owns the active
+    # edit, while the original payload remains visible in compacted history.
+    return [_summary(), held], [SUMMARY_TEXT, "v2 edited"]
 
 
 def _summary_merged_into_named_row(db: SessionDB) -> tuple:

@@ -4,11 +4,13 @@ The background ``cronjob(action='run')`` completion used to render ``Model: ?`` 
 whatever the job did: the runner hard-coded ``api_calls: 0`` and the dispatch only knew the job's
 model pin (None for a job on the default model). The run's own session in state.db is the record.
 """
+from contextlib import ExitStack
+from queue import Queue
 from unittest.mock import patch
 
 import pytest
 
-from cron import jobs
+from cron import executions, jobs
 from tests.fakes.cron_owner import admit_fire, cron_owner
 from tools.cronjob_tools import _try_dispatch_background_run
 from tools.process_registry_notifications import format_process_notification
@@ -16,21 +18,47 @@ from tools.process_registry_notifications import format_process_notification
 
 @pytest.fixture()
 def owner(tmp_path, monkeypatch):
+    from tools import async_delegation as ad
+    from tools.process_registry import process_registry
+
+    ad._reset_for_tests()
+    monkeypatch.setattr(process_registry, "completion_queue", Queue())
     authority = cron_owner(tmp_path / "home", monkeypatch)
-    yield authority
-    authority.db.close()
+    try:
+        yield authority
+    finally:
+        try:
+            with ad._records_lock:
+                futures = [r["_future"] for r in ad._records.values() if r.get("_future") is not None]
+            for future in futures:
+                future.result(timeout=10)
+        finally:
+            ad._reset_for_tests()
+            authority.db.close()
 
 
-def _completion(job, run_one_job):
+def _completion(job, run_one_job, *, execution_id=None):
     """Dispatch ``job`` through the real background path and return its completion event."""
     from tools.approval_context import _approval_session_key
     from tools.process_registry import process_registry
 
     token = _approval_session_key.set("agent:main:telegram:dm:4242")
     others = []
+    def run_and_settle(claimed, **kwargs):
+        fire = claimed["execution_id"]
+        success = run_one_job(claimed, **kwargs)
+        assert claimed["execution_id"] == fire
+        assert executions.finish_execution(
+            fire, success=bool(success), error=None if success else "fixture refusal") is not None
+        return success
+
     try:
-        with patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: dict(job)), \
-             patch("cron.scheduler.run_one_job", side_effect=run_one_job):
+        with ExitStack() as stack:
+            stack.enter_context(patch("tools.cronjob_tools.claim_job_for_fire", side_effect=lambda jid, **kw: dict(job)))
+            stack.enter_context(patch("cron.scheduler.run_one_job", side_effect=run_and_settle))
+            if execution_id is not None:
+                # The usage fixture already admitted this exact fire on the owner loop.
+                stack.enter_context(patch("cron.executions.create_execution", return_value={"id": execution_id}))
             res = _try_dispatch_background_run(dict(job))
             assert res["dispatched"] is True
             while True:  # a blocking get is the signal; Empty after the deadline fails the test
@@ -53,11 +81,11 @@ async def test_notice_carries_the_run_sessions_model_and_api_calls(owner):
     owner.db._conn.commit()
 
     def run_one_job(claimed, **kw):
-        claimed["execution_id"] = fire  # what the real run_one_job stamps on the claimed snapshot
+        assert claimed["execution_id"] == fire
         jobs.mark_job_run(claimed["id"], True)
         return True
 
-    evt = _completion(job, run_one_job)
+    evt = _completion(job, run_one_job, execution_id=fire)
     assert (evt.get("model"), evt.get("api_calls")) == ("vendor/run-model", 3)
     text = format_process_notification(evt)
     assert "Role: cron_run   Model: vendor/run-model" in text

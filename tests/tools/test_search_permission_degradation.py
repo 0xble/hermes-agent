@@ -19,6 +19,7 @@ Contract after the fix:
 """
 
 import os
+import re
 import shutil
 
 import pytest
@@ -112,6 +113,14 @@ class RecordingEnvironment:
         if "--version" in command:
             return {"output": self.rg_version, "returncode": 0}
         if "--files" in command:
+            # Filename transport frames stderr separately from head-bounded paths.
+            marker = re.search(r"__HERMES_RG_STDERR_[0-9a-f]+__", command)
+            if marker:
+                diagnostics, paths = [], []
+                for line in self.rg_output.splitlines():
+                    (diagnostics if line.startswith(("rg: ", "grep: ", "find: ", "bash: ")) else paths).append(line)
+                framed = "\n".join(paths) + "\n" + marker.group(0) + "\n".join(diagnostics)
+                return {"output": framed, "returncode": self.rg_code}
             return {"output": self.rg_output, "returncode": self.rg_code}
         if "--line-number" in command:
             # rg content-search invocation (goes through the same canned output).
@@ -309,7 +318,7 @@ def test_content_search_fully_unreadable_degrades_to_actionable_empty():
     assert "fix permissions" in (result.warning or "")
 
 
-def test_content_search_hard_error_regex_still_surfaced():
+def test_content_search_hard_error_after_literal_retry_still_surfaced():
     env = RecordingEnvironment(
         rg_output="rg: regex parse error:\n    (?:[\n       ^\nerror: unclosed character class\n",
         rg_code=2)
@@ -319,7 +328,11 @@ def test_content_search_hard_error_regex_still_surfaced():
     assert result.error is not None
     assert result.error.startswith("Search failed: rg: regex parse error:")
     assert "unclosed character class" in result.error
-    assert result.warning is None
+    searches = [command for command in env.commands if "--line-number" in command]
+    assert len(searches) == 2
+    assert "--fixed-strings" not in searches[0]
+    assert "--fixed-strings" in searches[1]
+    assert result.warning == "Invalid regex; retried once as a fixed-string (literal) search."
 
 
 @pytest.mark.parametrize("code", [126, 2])

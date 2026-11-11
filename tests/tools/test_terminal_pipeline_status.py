@@ -40,6 +40,15 @@ def test_plain_command_reports_one_status():
     assert f"{PIPE_MARKER}1{PIPE_MARKER}" in output
 
 
+@pytest.fixture(scope="module")
+def bash_major() -> int:
+    result = subprocess.run(
+        ["bash", "-c", 'printf "%s" "${BASH_VERSINFO[0]}"'],
+        capture_output=True, text=True, check=True, timeout=10,
+    )
+    return int(result.stdout)
+
+
 def _seen(result: subprocess.CompletedProcess) -> tuple[int, str, str]:
     """Exit code and output as the model sees them, markers stripped like production does."""
     stdout = result.stdout
@@ -66,8 +75,14 @@ def _seen(result: subprocess.CompletedProcess) -> tuple[int, str, str]:
         ("trap 'echo T' ERR; false", 1, "T\n"),
     ],
 )
-def test_capturing_pipestatus_changes_nothing_the_model_sees(command, exit_code, stdout):
+def test_capturing_pipestatus_changes_nothing_the_model_sees(command, exit_code, stdout, bash_major):
     """The capture is side data: the shell's own ``$?`` and output, no wrapper text."""
+    # Native Bash 3.2 has different eval syntax status and trailing-backslash output.
+    if bash_major < 4:
+        if exit_code == 2:
+            exit_code = 1
+        if command == "echo hi " + chr(92):
+            stdout = "hi\n"
     seen_code, seen_stdout, seen_stderr = _seen(_run_result(command))
     baseline_code, baseline_stdout, _baseline_stderr = _seen(_run_result(command, pipe_marker=""))
 

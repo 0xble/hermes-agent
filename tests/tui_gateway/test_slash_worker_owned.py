@@ -148,9 +148,13 @@ def test_a_worker_that_already_died_is_never_group_signalled(monkeypatch):
     """A dead leader no longer proves the pgid is ours: leave the group to the supervisor."""
     released, signalled = [], []
     monkeypatch.setattr(process_identity, "release_process_groups", lambda pgids: released.append(list(pgids)))
-    leader = _group_leader("sleep 120 & exit 0")
+    # Keep the surviving member a direct test child so teardown can still
+    # prove ownership after the leader exits and its process number is gone.
+    leader = subprocess.Popen(["sh", "-c", "read release"], stdin=subprocess.PIPE,
+                              process_group=0)
+    survivor = subprocess.Popen(["sleep", "120"], process_group=leader.pid)
     try:
-        leader.wait(timeout=10)
+        leader.communicate(b"release\n", timeout=10)
         survivors = wait_until(lambda: _group(leader.pid), what="the leaderless member")
         real_killpg = os.killpg
         monkeypatch.setattr(server.os, "killpg",
@@ -162,8 +166,11 @@ def test_a_worker_that_already_died_is_never_group_signalled(monkeypatch):
         assert released == [], "a group with a live member was released from the supervisor"
         assert all(p.is_running() for p in survivors)
     finally:
-        with contextlib.suppress(ProcessLookupError):
-            os.killpg(leader.pid, signal.SIGKILL)  # windows-footgun: ok — posix-marked test
+        if leader.poll() is None:
+            leader.kill()
+        leader.wait(timeout=10)
+        survivor.kill()
+        survivor.wait(timeout=10)
 
 
 def test_main_arms_the_legacy_watchdog_then_imports_cli_before_runtime_prep(monkeypatch):

@@ -10,6 +10,7 @@ uses to render a system line and fire the kickoff prompt.
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import importlib
 import threading
 import types
@@ -120,7 +121,7 @@ class _InlineThread:
 def turn_env(server, monkeypatch, tmp_path):
     """Neutralize side paths unrelated to post-turn goal continuation."""
     emitted = []
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(
         server,
         "_emit",
@@ -740,7 +741,7 @@ def test_prompt_submit_rpc_marks_turn_as_user_turn(server, session, monkeypatch)
         _session["running"] = False  # the real one releases the turn in its finally
         return True
 
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_run_prompt_submit", fake_run)

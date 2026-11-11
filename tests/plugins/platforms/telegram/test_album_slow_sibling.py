@@ -37,7 +37,7 @@ def _adapter() -> TelegramAdapter:
 def _slow_photo(release: asyncio.Event):
     file_obj = _make_file_obj(b"second")
 
-    async def download():
+    async def download(**_timeouts):
         await release.wait()
         return bytearray(b"second")
     file_obj.download_as_bytearray = AsyncMock(side_effect=download)

@@ -133,7 +133,7 @@ def test_oversized_copy_block_is_sent_whole_as_document(monkeypatch):
     bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=9))
     _install_telegram_mock(monkeypatch, MagicMock(return_value=bot))
     _no_proxy(monkeypatch)
-    from tools.send_message_senders import _send_telegram
+    from plugins.platforms.telegram.standalone import _send_telegram
 
     body = "line (1/2) *x*\n" * 400
     result = asyncio.run(_send_telegram("tok", "123", body, copy_block=True))

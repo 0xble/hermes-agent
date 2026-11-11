@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 from tui_gateway import server
 from hermes_state import SessionDB
 
@@ -31,7 +32,7 @@ def test_cwd_claim_precedes_probe_and_generation_reaches_publish(monkeypatch):
             return True
 
     monkeypatch.setattr(server, "_get_db", lambda: DB())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(
         server.git_probe,
         "branch",
@@ -95,7 +96,7 @@ def test_persisted_row_missing_git_metadata_is_enriched_on_hydration(monkeypatch
     sid = "live-desktop-session"
 
     monkeypatch.setattr(server, "_get_db", lambda: db)
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server.git_probe, "branch", lambda _cwd: "feature/session-metadata")
     monkeypatch.setattr(server.git_probe, "common_repo_root", lambda _cwd: str(repo))
     server._sessions[sid] = session

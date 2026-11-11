@@ -708,21 +708,19 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     """Route to the platform sender, chunking long text with the adapters' splitter. Order matters:
     Weixin first (its native helper must not be blocked by unrelated optional imports such as
     lark-oapi), Telegram (chunks itself), plugin standalone media, native chunked, generic text."""
-    from gateway.config import Platform
     platform_name = platform.value if hasattr(platform, "value") else str(platform)
     media_files = media_files or []
     if platform_name == "weixin":  # plugin standalone sender only: no other plugin's import can block it
         return await _send_plugin_standalone(platform_name, pconfig, chat_id, message, [message], media_files,
                                              thread_id=thread_id, max_len=None, force_document=force_document)
     # Telegram's plugin sender chunks internally on the *formatted* text (escaping inflates length).
-    if platform == Platform.TELEGRAM:
-        from tools.send_message_senders import _send_telegram
-        return await _send_telegram(
-            pconfig.token, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
-            copy_block=bool(args and args.get("copy_block")),
-            disable_link_previews=bool(getattr(pconfig, "extra", {}) and pconfig.extra.get("disable_link_previews")),
-            rich_messages=(getattr(pconfig, "extra", {}) or {}).get("rich_messages"),
-            allow_cjk_rich_messages=(getattr(pconfig, "extra", {}) or {}).get("allow_cjk_rich_messages", False))
+    if platform_name == "telegram":
+        sender, error = _plugin_standalone_sender(platform_name)
+        if error:
+            return error
+        return await sender(
+            pconfig, chat_id, message, media_files=media_files, thread_id=thread_id, force_document=force_document,
+            **_optional_sender_kwargs(sender, notify=notify, copy_block=bool(args and args.get("copy_block"))))
     from gateway.platforms.base import BasePlatformAdapter
     max_len = _platform_max_length(platform)
     chunks = BasePlatformAdapter.truncate_message(message, max_len) if max_len else [message]

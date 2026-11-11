@@ -272,7 +272,8 @@ def test_album_on_telegrams_json_5xx_resends_the_same_album(standalone, monkeypa
     not posted: the same sendMediaGroup goes again after the text lane's backoff, never photo by
     photo, and the files are re-read from the start."""
     sleep = AsyncMock()
-    monkeypatch.setattr("asyncio.sleep", sleep)
+    # Count the album's backoff, leaving the real per-chat budget wait intact.
+    monkeypatch.setattr("plugins.platforms.telegram.telegram_album.asyncio", SimpleNamespace(sleep=sleep))
     uploads = []
 
     async def send_media_group(**kwargs):

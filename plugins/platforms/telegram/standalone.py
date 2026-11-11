@@ -71,7 +71,10 @@ def _telegram_retry_delay(exc: Exception, attempt: int) -> float | None:
     kind = kinds.send_error_kind(exc)
     if kind == kinds.FLOOD:
         try:
-            return max(float(exc.retry_after), 0.0)
+            from plugins.platforms.telegram.adapter import _FLOOD_INLINE_WAIT_CAP_SECS
+            value = exc.retry_after
+            wait = value.total_seconds() if hasattr(value, "total_seconds") else float(value)
+            return max(wait, 0.0) if wait <= _FLOOD_INLINE_WAIT_CAP_SECS else None
         except (TypeError, ValueError):
             return 1.0
     return kinds.same_request_backoff(attempt) if kind in (kinds.UNSENT, kinds.SERVER_ERROR) else None
@@ -113,6 +116,34 @@ def _telegram_fallback_ips(extra):
     return parse_fallback_ip_env(configured) or list(SEED_FALLBACK_IPS)
 
 
+def _standalone_telegram_rate_limiter():
+    """Per-chat budget for the standalone lane, tied to the profile's durable flood store: a chat
+    under a known server penalty is refused locally and a new ``retry_after`` is persisted, so this
+    lane (cron fallback, out-of-gateway sends) cannot extend a ban the gateway is waiting out."""
+    from hermes_constants import get_hermes_home
+    from plugins.platforms.telegram import flood_state
+    from plugins.platforms.telegram.chat_budget import ChatBudgetRateLimiter, ChatOutboundBudget
+    profile_dir = get_hermes_home()
+
+    def penalty_remaining(key: str) -> float | None:
+        try:
+            remaining = max(flood_state.remaining_seconds(profile_dir, key),
+                            flood_state.fallback_remaining_seconds(profile_dir, key))
+        except Exception:
+            logger.warning("send_message: could not read Telegram flood deadline for chat %s", key, exc_info=True)
+            return 60.0  # an unreadable deadline is not evidence the penalty expired
+        return remaining if remaining > 0 else None
+
+    def on_retry_after(key: str, wait: float) -> None:
+        flood_state.record_deadline(profile_dir, key, wait)
+
+    from plugins.platforms.telegram.daily_quota import DailyQuota
+    # One-shot lane: persist every call so the gateway's daily ledger sees this lane's volume.
+    daily = DailyQuota(soft_ceiling=None, call_soft_ceiling=None, profile_dir=profile_dir, flush_interval=0.0)
+    return ChatBudgetRateLimiter(ChatOutboundBudget(), penalty_remaining=penalty_remaining,
+                                 on_retry_after=on_retry_after, daily=daily)
+
+
 def _telegram_bot(token, extra=None):
     """Bot built by the gateway adapter's request builder (``telegram_network.build_ptb_requests``:
     pool size, keepalive limits, timeouts, TLS verify): ``extra.base_url``/``base_file_url``
@@ -120,6 +151,8 @@ def _telegram_bot(token, extra=None):
     server actually reached, else the fallback-IP transport on api.telegram.org. Falls back to PTB
     defaults (same URLs) on failure."""
     from telegram import Bot
+    from plugins.platforms.telegram.chat_budget import MeteredBot
+    limiter = _standalone_telegram_rate_limiter()
     from gateway.platforms.base import describe_proxy_error, resolve_proxy_url, safe_proxy_url_for_log
     proxy = None
     extra = extra or {}
@@ -134,12 +167,12 @@ def _telegram_bot(token, extra=None):
         if proxy:
             logger.info("send_message: standalone Telegram send routed through proxy %s", safe_proxy_url_for_log(proxy))
         request, updates_request = build_ptb_requests(HTTPXRequest, fallback_ips=fallback_ips, proxy_url=proxy)
-        return Bot(token=token, request=request, get_updates_request=updates_request, **urls)
+        return MeteredBot(Bot(token=token, request=request, get_updates_request=updates_request, **urls), limiter)
     except Exception as request_err:
         logger.warning("send_message: failed to build the Telegram request (%s), using PTB defaults",
                        describe_proxy_error(request_err, proxy) or _sanitize_error_text(request_err),
                        exc_info=describe_proxy_error(request_err, proxy) is None)
-    return Bot(token=token, **urls)
+    return MeteredBot(Bot(token=token, **urls), limiter)
 
 
 def _telegram_thread_kwargs(thread_id):
@@ -325,8 +358,52 @@ def _telegram_mdv2(text, *, max_units=None):
     return None if max_units is not None and utf16_len(formatted) > max_units else formatted
 
 
+def _telegram_text_chunks(formatted, has_html, copy_block):
+    """Split formatted text without breaking HTML, copy blocks or Markdown fences."""
+    from gateway.platforms.base import BasePlatformAdapter, utf16_len
+    chunks = BasePlatformAdapter.truncate_message(
+        formatted, 4096, len_fn=utf16_len,
+        indicator_overhead=0 if has_html or copy_block else 3) if formatted.strip() else []
+    if len(chunks) > 1 and not has_html and not copy_block:
+        # truncate_message appends a raw " (1/2)" suffix after format_message escaped the text;
+        # escape the MarkdownV2-special parentheses, as the live adapter does (#74004).
+        from plugins.platforms.telegram.adapter import _separate_chunk_indicator_from_fence
+        chunks = [
+            _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
+            for chunk in chunks
+        ]
+    return chunks
+
+
+async def _telegram_send_media_files(bot, int_chat_id, media_files, *, _tg_caption, send_parse_mode,
+                                     _has_html, thread_kwargs, text_kwargs, force_document, last_msg, warnings):
+    """Deliver remaining attachments, retaining a caption when its file disappeared."""
+    for media_path, is_voice in media_files:
+        if not await asyncio.to_thread(os.path.exists, media_path):
+            warnings.append(f"Media file not found, skipping: {media_path}")
+            logger.warning(warnings[-1])
+            # Caption mode suppressed the text send; the file is gone, so deliver the words alone.
+            if _tg_caption is not None and last_msg is None:
+                try:
+                    last_msg = await _send_telegram_message_with_retry(
+                        bot, chat_id=int_chat_id, text=_tg_caption, parse_mode=send_parse_mode, **text_kwargs)
+                    _tg_caption = None  # delivered — don't re-caption a later file
+                except Exception as _cap_err:  # health: allow BLE001 -- sanitized warning returned to the caller; raw provider exceptions can contain tokens
+                    logger.warning("Telegram caption-fallback send failed for missing media: %s",
+                                   _sanitize_error_text(_cap_err))
+            continue
+        try:
+            last_msg = await _telegram_send_one_media(
+                bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
+                has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
+        except Exception as e:  # health: allow BLE001 -- sanitized failure returned to the caller without logging credential-bearing traceback
+            warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
+            logger.error(warnings[-1])
+    return last_msg
+
+
 async def _send_telegram(token, chat_id, message, media_files=None, thread_id=None, disable_link_previews=False,
-                         force_document=False, extra=None, notify=None):
+                         force_document=False, extra=None, notify=None, copy_block=False):
     """One-shot Telegram Bot API send over the platform's ``extra`` (base_url, proxy, fallback IPs,
     ``rich_messages``), under the adapter's push-notification mode (``notify`` rings regardless);
     parse failures fall back to plain text."""
@@ -342,44 +419,49 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             send_rich_standalone)
         if is_visually_empty(message):
             message = ""  # invisible-only text would land as an empty bubble
-        formatted, send_parse_mode, _has_html = _telegram_format(message)
         bot = _telegram_bot(token, extra)
         from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
-        from gateway.platforms.base import BasePlatformAdapter, utf16_len
+        from gateway.platforms.base import utf16_len
         # Telegram accepts a numeric chat_id OR an @username string; never force-int.
         # See #13206.
         int_chat_id = normalize_telegram_chat_id(chat_id)
         media_files = media_files or []
         thread_kwargs = {**_telegram_thread_kwargs(thread_id),
                          **notification_kwargs(resolve_notifications_mode(), notify)}
-        # disable_web_page_preview is only valid for send_message, not media sends.
+        if copy_block and utf16_len(message) > 4096 and not media_files:
+            # A paste-ready body remains intact, with the same proxy, budget and notify policy.
+            import io
+            document = io.BytesIO(message.encode("utf-8"))
+            document.name = "copy.txt"
+            sent = await bot.send_document(chat_id=int_chat_id, document=document, filename="copy.txt", **thread_kwargs)
+            return _success(chat_id, message_id=str(getattr(sent, "message_id", "")))
+        # Accepted rich text is never repeated as a caption, including failed attachments.
+        rich = None
+        if message and not copy_block:
+            rich = await send_rich_standalone(
+                bot, {**(extra or {}), "disable_link_previews": disable_link_previews}, chat_id, message,
+                thread_id=thread_id, notify=notify, thread_kwargs=thread_kwargs)
+            if rich is not None:
+                if not rich.success:
+                    return _error(f"Telegram send failed: {rich.error}")
+                if not media_files:
+                    return _success(chat_id, message_id=rich.message_id)
+                message = ""
+        formatted, send_parse_mode, _has_html = ((message, None, False) if copy_block else _telegram_format(message))
+        # Build after rich routing: a refused stale topic must stay dropped during legacy fallback.
         text_kwargs = {**thread_kwargs, **({"disable_web_page_preview": True} if disable_link_previews else {})}
         last_msg, warnings, _tg_caption = None, [], None
-        if message and not media_files:
-            rich = await send_rich_standalone(bot, {**(extra or {}), "disable_link_previews": disable_link_previews},
-                                              chat_id, message, thread_id=thread_id, notify=notify)
-            if rich is not None:
-                return (_success(chat_id, message_id=rich.message_id) if rich.success
-                        else _error(f"Telegram send failed: {rich.error}"))
         # MEDIA caption rides on the bubble as its *formatted* caption; formatting can inflate a
         # raw <1024 string past Telegram's cap, so re-check in UTF-16 units.
         _cap, _ = _media_caption_split(message, media_files)
         if _cap is not None and utf16_len(formatted) <= _TELEGRAM_CAPTION_LIMIT:
             _tg_caption, formatted = formatted, ""  # suppress the separate text send below
-        # Chunk *after* formatting, in UTF-16 units: escaping can push a raw-<4096 message over.
-        chunks = BasePlatformAdapter.truncate_message(formatted, 4096, len_fn=utf16_len) if formatted.strip() else []
-        if len(chunks) > 1 and not _has_html:
-            # truncate_message appends a raw " (1/2)" suffix after format_message escaped the text;
-            # escape the MarkdownV2-special parentheses, as the live adapter does (#74004).
-            from plugins.platforms.telegram.adapter import _separate_chunk_indicator_from_fence
-            chunks = [
-                _separate_chunk_indicator_from_fence(re.sub(r" \((\d+)/(\d+)\)$", r" \\(\1/\2\\)", chunk))
-                for chunk in chunks
-            ]
+        chunks = _telegram_text_chunks(formatted, _has_html, copy_block)
         for chunk in chunks:
             last_msg = await _telegram_send_text_chunk(bot, int_chat_id, chunk, send_parse_mode, _has_html, text_kwargs)
         if album := _telegram_album_paths(media_files, force_document, _tg_caption):
-            result = await send_album_standalone(bot, extra or {}, chat_id, album, thread_id=thread_id, notify=notify)
+            result = await send_album_standalone(
+                bot, extra or {}, chat_id, album, thread_id=thread_kwargs.get("message_thread_id"), notify=notify)
             detail = result.raw_response or {}
             warnings += [_sanitize_error_text(f"Failed to send Telegram photo {path}: {err}")
                          for path, err in detail.get("failed", ())]
@@ -390,27 +472,12 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
             # A refused album goes photo by photo below (topic fallback, a warning per failure).
             media_files = [(path, False) for path in detail.get("refused", ())]
             last_msg = last_msg or (SimpleNamespace(message_id=None) if result.success else None)
-        for media_path, is_voice in media_files:
-            if not await asyncio.to_thread(os.path.exists, media_path):
-                warnings.append(f"Media file not found, skipping: {media_path}")
-                logger.warning(warnings[-1])
-                # Caption mode suppressed the text send; the file is gone, so deliver the words alone.
-                if _tg_caption is not None and last_msg is None:
-                    try:
-                        last_msg = await _send_telegram_message_with_retry(
-                            bot, chat_id=int_chat_id, text=_tg_caption, parse_mode=send_parse_mode, **text_kwargs)
-                        _tg_caption = None  # delivered — don't re-caption a later file
-                    except Exception as _cap_err:  # health: allow BLE001 -- sanitized warning returned to the caller; raw provider exceptions can contain tokens
-                        logger.warning("Telegram caption-fallback send failed for missing media: %s",
-                                       _sanitize_error_text(_cap_err))
-                continue
-            try:
-                last_msg = await _telegram_send_one_media(
-                    bot, int_chat_id, media_path, is_voice, caption=_tg_caption, parse_mode=send_parse_mode,
-                    has_html=_has_html, thread_kwargs=thread_kwargs, force_document=force_document)
-            except Exception as e:  # health: allow BLE001 -- sanitized failure returned to the caller without logging credential-bearing traceback
-                warnings.append(_sanitize_error_text(f"Failed to send media {media_path}: {e}"))
-                logger.error(warnings[-1])
+        last_msg = await _telegram_send_media_files(
+            bot, int_chat_id, media_files, _tg_caption=_tg_caption, send_parse_mode=send_parse_mode,
+            _has_html=_has_html, thread_kwargs=thread_kwargs, text_kwargs=text_kwargs,
+            force_document=force_document, last_msg=last_msg, warnings=warnings)
+        if last_msg is None and rich is not None:
+            return _success(chat_id, warnings, message_id=rich.message_id)
         if last_msg is None:
             return {"error": _NO_DELIVERABLE, **({"warnings": warnings} if warnings else {})}
         return _success(chat_id, warnings, **({"message_id": str(last_msg.message_id)}
@@ -423,7 +490,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
 
 
 async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False,
-                          notify=None, **_ignored):
+                          notify=None, copy_block=False, **_ignored):
     """``standalone_sender_fn``: the target profile's token (``pconfig.token``, else its scoped
     ``TELEGRAM_BOT_TOKEN``) and ``extra`` (base_url, proxy, fallback IPs, rich_messages, link
     previews); ``notify`` rings under the ``important`` notification mode (cron.delivery.notify)."""
@@ -435,4 +502,4 @@ async def standalone_send(pconfig, chat_id, message, *, thread_id=None, media_fi
     return await _send_telegram(
         token, chat_id, message, media_files=media_files, thread_id=thread_id,
         disable_link_previews=bool(extra.get("disable_link_previews")), force_document=force_document,
-        extra=extra, notify=notify)
+        extra=extra, notify=notify, copy_block=copy_block)

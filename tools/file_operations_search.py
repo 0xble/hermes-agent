@@ -439,7 +439,10 @@ def _parse_search_output(result, output_mode: str, limit: int, offset: int,
     # BSD find -exec ... + reports a grep hard error as exit 1, not 2.
     # A normal grep no-match is also 1, but has no diagnostics.
     hard_error = result.exit_code == 2 or (result.exit_code == 1 and bool(diagnostics.strip()))
-    if hard_error and not payload.strip() and not _is_permission_only_error(diagnostics):
+    # A failed find traversal with no readable payload cannot establish an empty
+    # search. Direct rg/grep permission skips retain their actionable empty result.
+    traversal_failed = any(line.lstrip().startswith("find: ") for line in diagnostics.splitlines())
+    if hard_error and not payload.strip() and (traversal_failed or not _is_permission_only_error(diagnostics)):
         error_msg = diagnostics.strip() or result.stdout.strip() or "Search error"
         return SearchResult(error=f"Search failed: {error_msg}", total_count=0)
     skip = _skipped_fields(diagnostics)

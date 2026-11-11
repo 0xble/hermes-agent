@@ -90,6 +90,7 @@ class ProcessSurvivalMixin:
                     stdin=subprocess.DEVNULL,
                     stdout=subprocess.DEVNULL,
                     stderr=outer_stderr,
+                    # detached-spawn: ok — opt-in restart/persist jobs use durable logs and successor adoption after owner exit
                     start_new_session=True,
                 )
         except Exception:

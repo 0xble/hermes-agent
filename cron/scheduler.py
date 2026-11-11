@@ -31,11 +31,6 @@ except ImportError:
         msvcrt = None
 from pathlib import Path
 from typing import Any, Callable, Optional
-from cron.scheduler_worker_exit import (
-    ExternalWorkerExitTimeout as _ExternalWorkerExitTimeout,
-    TERMINAL_EXIT_GRACE_SECONDS as _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
-    wait_external_worker_body as _wait_for_external_cron_worker_body,
-)
 
 # Freeze the physical code root at module import. Resolving `__file__` during a
 # later dispatch would follow a moved `current` symlink into the next release.
@@ -47,6 +42,12 @@ _checkout_root = _LOADED_CODE_ROOT
 # Append the physically loaded release without shadowing installed packages.
 if str(_checkout_root) not in sys.path:
     sys.path.append(str(_checkout_root))
+
+from cron.scheduler_worker_exit import (
+    ExternalWorkerExitTimeout as _ExternalWorkerExitTimeout,
+    TERMINAL_EXIT_GRACE_SECONDS as _EXTERNAL_WORKER_TERMINAL_EXIT_GRACE_SECONDS,
+    wait_external_worker_body as _wait_for_external_cron_worker_body,
+)
 
 from hermes_cli import immutable_releases
 from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot

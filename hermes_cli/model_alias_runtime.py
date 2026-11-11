@@ -74,6 +74,6 @@ def resolve_default_route(config: Mapping[str, Any] | None) -> AliasRoute:
     route = resolve_model_alias(raw, cfg)
     if route.name:
         return route
-    return AliasRoute(provider=str(model.get("provider") or ""), model=str(raw),
+    return AliasRoute(provider=str(model.get("provider") or ""), model=route.model,
                       reasoning_effort=normalize_route_reasoning_effort(model.get("reasoning_effort")),
                       base_url=str(model.get("base_url") or ""))

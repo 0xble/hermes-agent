@@ -174,7 +174,7 @@ class SessionStoredReadsMixin:
         removed = conn.execute(sql, tuple(session_ids)).fetchall() if conn is not None else self._read_all(sql, tuple(session_ids))
         return sorted([*rows, *removed], key=lambda row: row["id"]) if removed else list(rows)
 
-    def _display_set(self, sql: str, session_ids: list[str]) -> list[Any]:
+    def _display_set(self, sql: str, session_ids: list[str], *, resident_only: bool = False) -> list[Any]:
         """*sql*'s rows (bound to *session_ids*) with the removed rows' identities, in ONE read transaction:
         a compaction committing between the two reads marks a row removed after it was read live, so the
         removed read would hide the message while the live read never saw its new copy.
@@ -189,6 +189,9 @@ class SessionStoredReadsMixin:
             finally:
                 if began and conn.in_transaction:
                     conn.execute("ROLLBACK")
+        if resident_only:
+            with self._read_ctx(resident_only=True) as conn:
+                return read(conn)
         return self._read_retrying_ioerr(read)
 
     # -- session.transcript --------------------------------------------------------------------------

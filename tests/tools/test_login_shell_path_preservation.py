@@ -125,7 +125,9 @@ def test_dropped_spawn_path_dirs_return_after_the_login_path(tmp_path, monkeypat
                    profile_body=f'PATH="/usr/local/bin:/usr/bin:/bin"\nPATH="{user_bin}:$PATH"\n')
     # A relative entry resolves against the terminal's cwd, not this process's.
     monkeypatch.chdir(user_bin)
-    env = LocalEnvironment(cwd=str(tmp_path), env={"PATH": f"{extra_a}:{extra_b}:rel-bin:/usr/bin:/bin"})
+    # Inherited spawn PATH is unbound. An explicit env PATH pins the selected client toolchain.
+    monkeypatch.setenv("PATH", f"{extra_a}:{extra_b}:rel-bin:/usr/bin:/bin")
+    env = LocalEnvironment(cwd=str(tmp_path))
     try:
         entries = _snapshot_path_value(env)
         assert entries.index(str(user_bin)) < entries.index("/usr/bin") < entries.index(str(extra_a)) \

@@ -366,7 +366,7 @@ batched cleanup and its flood retention, and the standalone lane. The 30-session
 fails on the pre-patch base (30 chat actions instead of 1).
 
 **Rollback:** Revert the `fix(telegram): one outbound budget per chat` commit. It removes
-`chat_budget.py`, the builder `rate_limiter`, `MeteredBot` in `tools/send_message_senders.py`,
+`chat_budget.py`, the builder `rate_limiter`, `MeteredBot` in `plugins/platforms/telegram/standalone.py`,
 `delete_messages` (base, Telegram, cleanup grouping), the inline-cap helper and the 3.0s
 producer interval, and restores the 1.0s slot helpers. No state, schema or configuration
 migration is involved.
@@ -435,10 +435,11 @@ The adopted fix is upstream salvage PR
 [#74004](https://github.com/NousResearch/hermes-agent/issues/74004). It is
 cherry-picked with original authorship. It escapes the indicator and separates
 it from a closing code fence, reusing `_separate_chunk_indicator_from_fence`.
-Source: `tools/send_message_senders.py`. Proof:
+Source: `plugins/platforms/telegram/standalone.py` after v0.23.1 adoption. Proof:
 `tests/tools/test_telegram_send_message_chunk_mdv2.py`, which fails on the
-unpatched sender. The standalone lane still sends MarkdownV2, never Rich
-Messages. That gap is unchanged.
+unpatched sender. v0.23.1 contains the indicator escaping and fence separation, so
+that part is retired against upstream. The fork retains the UTF-16 indicator reserve
+under `telegram-rendering`; eligible standalone text now follows the shared rich policy.
 
 Retire after an accepted upstream release contains #126100, or an equivalent,
 and the proof test passes without this patch. Roll back by reverting the two

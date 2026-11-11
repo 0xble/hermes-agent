@@ -455,7 +455,9 @@ class TestStdioPgroupReaping:
                             ("_orphan_stdio_pids", set()), ("_orphan_stdio_pid_servers", {})):
             monkeypatch.setattr(_mcp_lifecycle, name, value)
             monkeypatch.setattr(transport, name, value)
-        monkeypatch.setattr(core, "_update_death_supervisor", lambda *args: None)
+        monkeypatch.setattr(transport, "own_process_groups", lambda *args: None)
+        monkeypatch.setattr(transport, "release_process_groups", lambda *args: None)
+        monkeypatch.setattr(_mcp_lifecycle, "release_process_groups", lambda *args: None)
         monkeypatch.setattr("hermes_cli.process_identity.register_child", lambda *args: None)
         monkeypatch.setattr("hermes_cli.process_identity.attach_self_to_kill_on_close_job", lambda: False)
         monkeypatch.setattr(core, "_ensure_mcp_sdk", lambda: True)
