@@ -402,7 +402,7 @@ def kanban_home() -> Path:
     profiles BY DESIGN: resolving through the active profile's HERMES_HOME would
     fork the board per profile and break the dispatcher/worker handoff."""
     override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-    if override:
+    if override and not (os.environ.get("HERMES_HOME", "").strip() and os.environ.get("HERMES_DELEGATED_CHILD_CONTEXT", "").strip()):
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
     return get_default_hermes_root()
