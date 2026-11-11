@@ -25,6 +25,22 @@ def configure(monkeypatch, **settings):
 
 
 @pytest.mark.asyncio
+async def test_visible_anchor_reuses_loaded_config(fixture, monkeypatch):
+    f = fixture
+    seen = []
+
+    def manager(runner, entry, config=None):
+        seen.append(config)
+        assert config is not None
+        return f.manager
+
+    monkeypatch.setattr(run_checkins, "_manager", manager)
+    await run_checkins.record_visible(f.runner, f.adapter, "42", "3")
+
+    assert seen and seen[0].enabled
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("scope", [None, [], ["owner"], ["other"], "owner", {}, [""], ["owner", 7], "invalid-yaml", "invalid-section"])
 async def test_scope_admission_execution_and_hot_idle_rearm(fixture, tmp_path, monkeypatch, scope):
     f = fixture
@@ -108,8 +124,10 @@ async def test_inflight_disarm_fences_pending_delivery_and_replay(fixture, monke
     event._gateway_active_turn_token = "exact-turn"
     assert await run_checkins.prepare_checkin(f.runner, event, f.entry, start=True)
     from gateway.response_filters import display_metadata_for_event
+    metadata = display_metadata_for_event(event)
+    assert metadata["checkin_turn_id"] != event._gateway_active_turn_token
     f.db.append_message("owner", role="user", content=event.text, timestamp=1300,
-                        display_kind="supervisor_checkin", display_metadata=display_metadata_for_event(event))
+                        display_kind="supervisor_checkin", display_metadata=metadata)
     f.db.end_session("owner", "compression")
     f.db.create_session("compressed", source="telegram", parent_session_id="owner")
     f.entry.session_id = "compressed"
