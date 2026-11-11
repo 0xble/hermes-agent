@@ -341,7 +341,7 @@ async def test_fired_loop_wakeup_asks_for_silence_and_its_silent_reply_is_not_de
     assert await _deliver(event, "[SILENT]", monkeypatch) == ""
     combo = "[SILENT]" + chr(10) + "LOOP_COMPLETE"
     assert await _deliver(event, combo, monkeypatch) == ""
-    assert event._raw_final_response == combo
+    assert event._agent_final_response == combo
     assert await _deliver(event, "Queue depth changed to 2.", monkeypatch) == "Queue depth changed to 2."
 
 
