@@ -68,13 +68,6 @@ def _health_scopes(runner) -> list[tuple[str | None, Path]]:
     return [(None, get_hermes_home())]
 
 
-def _failure_key(home: Path) -> str:
-    try:
-        return str(_marker(home))
-    except Exception:
-        return f"{__file__}:{home}"
-
-
 async def check_memory_health(runner) -> None:
     from gateway.run import _async_profile_runtime_scope
 
