@@ -692,12 +692,12 @@ class TestEmptyPartialStreamStubNotPersisted:
         )
 
         # The continuation nudge is still appended as a user message, and
-        # it's the chunking variant (dropped tool call), not the length lie.
+        # it's the transport variant (dropped tool call), not the length lie.
         last_user = next(
             (m for m in reversed(msgs) if m.get("role") == "user"), None,
         )
         assert last_user is not None
-        assert "too large" in (last_user.get("content") or "")
+        assert "transport interruption" in (last_user.get("content") or "") and "re-issue the same tool call unchanged" in (last_user.get("content") or "").lower()
         assert "output length limit" not in (last_user.get("content") or "")
 
         assert result["completed"] is True
