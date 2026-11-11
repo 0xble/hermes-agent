@@ -18,11 +18,11 @@ rather than releasing it through the ordinary disconnect timeout path.
 
 External drain is engaged before stopping cron reviews or polling. Keep that order:
 `gateway/run.py`'s cron `can_dispatch` closure reads `_external_drain_active`.
-This is best-effort early cron quiescence, not a persistent handover-owned fence:
-`gateway/run_shutdown.py`'s dashboard marker watcher clears the shared flag when
-no marker exists. The early flag still closes the cron gate when observed, and
-`stop_reviews()` separately stops review admission. While this existing handover
-owns the old Telegram transport, its live received events remain admissible through
+The accepted handover owns the shared quiescence until its completion enters the
+real shutdown drain or its failure path restores transport ownership. The dashboard
+marker watcher may still release an ordinary drain, but it cannot clear an active,
+non-failed handover. The flag closes the cron gate when observed, and `stop_reviews()`
+separately stops review admission. While this existing handover owns the old Telegram transport, its live received events remain admissible through
 the normal auth and session admission path. The allowance requires a registered
 receiving Telegram adapter via `_transport_owner`, not a restored source, relay
 event or profile-name guess. Failed-handover recovery keeps that allowance until
@@ -139,9 +139,9 @@ external drain, Telegram batch shutdown and held input. Related, not equivalent:
 No equivalent solution was found within those bounded searches. Upstream guidance
 supports joining existing task owners and preserving the ordered admission path.
 The intentional fork divergence is the existing opt-in handover state granting its
-registered old Telegram transport an admission allowance. The early shared drain
-flag gates cron when observed, but the dashboard watcher can clear it as described
-above. This extension does not add a persistent handover-owned cron fence.
+registered old Telegram transport an admission allowance and owning the shared cron
+quiescence through settlement. This extension does not add a second registry, queue,
+or marker.
 Retire this extension with the handover owner, or when upstream provides equivalent
 lossless cooperative transfer and these regressions pass without the fork patch.
 Rollback is the source repair commit with `Fork-Patch: zero-cut-handover`, not a

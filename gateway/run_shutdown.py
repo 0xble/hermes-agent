@@ -763,6 +763,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
         if not self._external_drain_active:
             return
+        handover = getattr(self, "_zero_cut_handover_state", None)
+        if handover is not None and not handover.get("failed") and not self._draining:
+            # The handover owns this shared quiescence until it either fails and restores
+            # transport ownership or hands control to the real shutdown drain.
+            return
         self._external_drain_active = False
         if self._draining or not self._running:
             logger.info(

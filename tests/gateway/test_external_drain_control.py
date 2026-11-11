@@ -17,9 +17,11 @@ import json
 import pytest
 
 import gateway.drain_control as dc
+import gateway.zero_cut_handover_drain as handover_drain
 from gateway.run import GatewayRunner
 from gateway.platforms.event import MessageEvent, MessageType
 from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+from tests.waiting import async_wait_until
 from datetime import UTC
 
 
@@ -273,6 +275,30 @@ class TestDrainStateMachine:
 class TestDrainWatcher:
 
     @pytest.mark.asyncio
+    async def test_watcher_does_not_release_accepted_handover_without_marker(self, home, monkeypatch):
+        runner, _ = _drain_runner()
+        runner._zero_cut_handover_state = {
+            "accepted": True, "updates_settled": False,
+            "token_lock_released": False, "failed": None,
+        }
+        runner._external_drain_active = True
+        can_dispatch = lambda: not (runner._draining or runner._external_drain_active)
+        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
+            runner, GatewayRunner
+        )
+        ticks = []
+        monkeypatch.setattr(dc, "drain_requested", lambda: ticks.append(True) or False)
+
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.01))
+        await async_wait_until(lambda: ticks, what="the handover drain watcher tick")
+        assert runner._external_drain_active is True
+        assert can_dispatch() is False
+
+        runner._running = False
+        await task
+
+
+    @pytest.mark.asyncio
     async def test_watcher_enters_then_exits_with_marker(self, home):
         runner, _ = _drain_runner()
         runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
@@ -293,6 +319,43 @@ class TestDrainWatcher:
             await task
         except asyncio.CancelledError:
             pass
+
+    @pytest.mark.asyncio
+    async def test_failed_handover_releases_drain_and_reopens_dispatch(self, home):
+        runner, _ = _drain_runner()
+        runner._zero_cut_handover_state = {
+            "accepted": True, "updates_settled": False,
+            "token_lock_released": False, "failed": None,
+        }
+        runner._external_drain_active = True
+        recovery = handover_drain._fail(runner, "transport did not settle", [])
+        await recovery
+        assert runner._external_drain_active is False
+        assert not (runner._draining or runner._external_drain_active)
+
+    @pytest.mark.asyncio
+    async def test_completed_handover_leaves_shutdown_drain_in_control(self, home):
+        runner, _ = _drain_runner()
+        runner._zero_cut_handover_state = {
+            "accepted": True, "updates_settled": True,
+            "token_lock_released": True, "failed": None,
+        }
+        runner._draining = True
+        runner._external_drain_active = True
+        runner._drain_control_watcher = GatewayRunner._drain_control_watcher.__get__(
+            runner, GatewayRunner
+        )
+        exits = []
+        real_exit = runner._exit_external_drain
+        runner._exit_external_drain = lambda: (exits.append(True), real_exit())[1]
+
+        task = asyncio.create_task(runner._drain_control_watcher(interval=0.01))
+        await async_wait_until(lambda: exits, what="the completed handover watcher tick")
+        assert runner._draining is True
+        assert runner._external_drain_active is False
+
+        runner._running = False
+        await task
 
 
 # ---------------------------------------------------------------------------

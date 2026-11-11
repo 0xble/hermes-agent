@@ -110,6 +110,42 @@ def test_handover_waits_for_buffered_text_batches_before_settling():
     asyncio.run(scenario())
 
 
+def test_cancelled_handover_releases_owned_drain(monkeypatch):
+    from gateway import zero_cut_handover_drain as drain
+
+    async def scenario():
+        runner = _Runner()
+        runner._external_drain_active = True
+        runner._zero_cut_handover_state = {
+            "accepted": True, "updates_settled": False,
+            "token_lock_released": False, "active_turns": 0,
+            "idle": False, "failed": None,
+        }
+        adapter = SimpleNamespace(platform=SimpleNamespace(value="telegram"))
+        runner.adapters = {"telegram": adapter}
+        started = asyncio.Event()
+
+        async def stop_polling(_adapter):
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.disconnect_handover.handover_stop_polling",
+            stop_polling,
+        )
+        task = asyncio.create_task(drain._handover(runner))
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await runner._zero_cut_recovery_task
+        assert runner._zero_cut_handover_state["failed"] == "handover cancelled"
+        assert runner._external_drain_active is False
+        assert not runner._draining
+
+    asyncio.run(scenario())
+
+
 def test_idle_handover_stops_outside_background_tasks_and_exits_cleanly(monkeypatch):
     from gateway import zero_cut_handover_drain as drain
 
