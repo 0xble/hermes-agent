@@ -9,6 +9,9 @@ Ordinary attached local jobs use the base Popen/PTY path unchanged: no shell
 wrapper, exit marker, `process-runs` directory, or checkpoint `exit_path`.
 Popen's wait status is authoritative, including explicit exits 129–192 and
 negative signal statuses. Kill uses the base local process-tree path.
+Kanban reaps only the worker Popen handles it spawned. Reaping every child with
+`waitpid(-1)` can steal an ordinary terminal child's failure status, making Popen
+report success and holding its completion in the gateway's success batch window.
 
 Only `persist_on_release`, `survive_restart`, and the pre-existing detached
 managed-worker handoff publish file-backed exit status. A recorded marker is

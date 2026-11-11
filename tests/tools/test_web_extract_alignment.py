@@ -6,8 +6,10 @@ from unittest.mock import AsyncMock
 import pytest
 
 from tests.tools.test_web_extract_accounting import A, B, C, FINAL, page, run
-from tests.tools.test_web_extract_accounting import offline as offline
+from tests.tools.test_web_extract_accounting import offline as _offline
 from tools import web_result_cache as cache
+
+offline = _offline
 
 
 @pytest.mark.parametrize("requested, returned", [
@@ -71,3 +73,102 @@ def test_duplicate_identity_prefers_success_over_error(offline, success_first, e
     assert first[0]["content"] == page(A)["content"]
     assert run(provider, [A, B])[0]["cached"]
     assert provider.extract.await_count == 1
+
+
+_AMBIGUOUS = "provider returned results that could not be matched to this URL; retry it alone"
+_MISSING = "Extract backend returned no result for this URL"
+
+
+def _uncached(*urls):
+    assert all(cache.extract_cache_get(url, provider="exa") is None for url in urls)
+
+
+def test_unique_www_apex_batch_is_recovered_and_cached(offline):
+    """example.com/a and /b redirecting to www.example.com/a and /b stay paid-once."""
+    requested = ["https://example.com/a", "https://example.com/b"]
+    returned = ["https://www.example.com/a", "https://www.example.com/b"]
+    rows = [page(url, content=f"Paid page {url}. " * 40) for url in reversed(returned)]
+    provider = SimpleNamespace(name="exa", extract=AsyncMock(return_value=rows))
+    first = run(provider, requested)
+    assert [result["url"] for result in first] == returned
+    assert [result["requested_url"] for result in first] == requested
+    assert [result["content"] for result in first] == [f"Paid page {url}. " * 40 for url in returned]
+    assert not any(result.get("error") for result in first)
+    second = run(provider, requested)
+    assert all(result["cached"] for result in second)
+    assert [result["url"] for result in second] == returned
+    assert provider.extract.await_count == 1
+    for requested_url, final in zip(requested, returned):
+        cached = cache.extract_cache_get(requested_url, provider="exa")
+        assert cached is not None and cached["url"] == final
+        assert cache.extract_cache_get(final, provider="exa") is None
+
+
+def test_scheme_and_www_batch_pairs_only_unique_paths(offline):
+    requested = ["http://example.com/a", "http://example.com/b?q=1"]
+    returned = ["https://www.example.com/a", "https://www.example.com/b?q=1"]
+    provider = SimpleNamespace(name="exa", extract=AsyncMock(return_value=[page(url) for url in returned]))
+    results = run(provider, requested)
+    assert [result["url"] for result in results] == returned
+    assert [result["requested_url"] for result in results] == requested
+    assert not any(result.get("error") for result in results)
+
+
+def test_ambiguous_batch_errors_without_caching(offline):
+    """Same paths on non-alias hosts are not guessed, and the paid pages are not stored."""
+    requested = ["https://example.com/a", "https://other.test/a"]
+    returned = ["https://cdn.example.net/a", "https://static.other.test/a"]
+    provider = SimpleNamespace(name="exa", extract=AsyncMock(return_value=[page(url) for url in returned]))
+    results = run(provider, requested)
+    assert [result["url"] for result in results] == requested
+    assert [result["error"] for result in results] == [_AMBIGUOUS, _AMBIGUOUS]
+    assert not any(result.get("content") for result in results)
+    _uncached(*requested, *returned)
+
+
+def test_duplicate_www_alias_is_not_attributed(offline):
+    requested = ["https://example.com/a", "https://example.com/b"]
+    returned = ["https://www.example.com/a", "https://WWW.example.com/a"]
+    provider = SimpleNamespace(name="exa", extract=AsyncMock(return_value=[page(url) for url in returned]))
+    results = run(provider, requested)
+    assert [result["error"] for result in results] == [_AMBIGUOUS, _AMBIGUOUS]
+    assert not any(result.get("content") for result in results)
+    _uncached(*requested, *returned)
+
+
+def test_partial_www_pair_does_not_claim_the_unrelated_page(offline):
+    requested = ["https://example.com/a", "https://example.com/b"]
+    paired = "https://www.example.com/a"
+    unrelated = "https://evil.test/stolen"
+    provider = SimpleNamespace(name="exa", extract=AsyncMock(return_value=[page(unrelated), page(paired)]))
+    results = run(provider, requested)
+    assert results[0]["url"] == paired and results[0]["requested_url"] == requested[0]
+    assert results[0]["content"] == page(paired)["content"] and not results[0].get("error")
+    assert results[1]["url"] == requested[1] and results[1]["error"] == _AMBIGUOUS
+    assert not results[1].get("content")
+    cached = cache.extract_cache_get(requested[0], provider="exa")
+    assert cached is not None and cached["url"] == paired
+    _uncached(requested[1], paired, unrelated)
+
+
+def test_conflicting_source_blocks_www_pair(offline):
+    requested = ["https://example.com/a", "https://example.com/b"]
+    blocked = "https://www.example.com/a"
+    paired = "https://www.example.com/b"
+    provider = SimpleNamespace(name="exa", extract=AsyncMock(return_value=[
+        page(blocked, metadata={"sourceURL": "https://evil.test/a"}),
+        page(paired),
+    ]))
+    results = run(provider, requested)
+    assert results[0]["url"] == requested[0] and results[0]["error"] == _AMBIGUOUS
+    assert not results[0].get("content")
+    assert results[1]["url"] == paired and results[1]["requested_url"] == requested[1]
+    _uncached(requested[0], blocked)
+
+
+def test_omitted_page_keeps_no_result_error(offline):
+    provider = SimpleNamespace(name="exa", extract=AsyncMock(return_value=[page(B)]))
+    results = run(provider, [A, B])
+    assert results[0]["url"] == A and results[0]["error"] == _MISSING
+    assert not results[0].get("content")
+    assert results[1]["url"] == B and not results[1].get("error")

@@ -3,10 +3,10 @@
 ``World`` is one sandboxed machine (``_install_helpers.new_sandbox``: bwrap, empty fake HOME, the
 git wrapper that reports the official remote URL) whose ``~/.gitconfig`` rewrites the official
 GitHub URL to a loopback ``git http-backend`` origin (``_smart_http``). The install itself comes
-from a real ``scripts/install.sh``: N-1's own copy for an N-1 install (it makes the depth-1
-single-branch clone N-1 users have), HEAD's for a HEAD install (a ``--filter=blob:none`` clone).
-``preclone`` seeds a checkout the installer then adopts, for the clone shapes users got another
-way (a manual full clone, a ``blob:none`` fallback clone).
+from a real ``scripts/install.sh``: the previous fork promotion's own copy for N-1, HEAD's for
+HEAD. ``seed_clone_shape`` uses real clones over the same complete smart-HTTP origin to restore
+retained user Git state after bootstrap, so install-time shallow/treeless healing cannot mask
+the updater's behavior.
 
 Everything a cell asserts is user-visible: the exit code and transcript of ``hermes update``, the
 checkout's HEAD / branch / working tree / refs, the update receipt, and whether ``hermes
@@ -21,8 +21,10 @@ import json
 import os
 import shutil
 import subprocess
+import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterator
 
@@ -30,6 +32,7 @@ import pytest
 
 from tests.e2e.core.upgrade import _helpers as H
 from tests.e2e.core.upgrade import _install_helpers as I
+from tests.e2e.core.upgrade._install_cache import InstallCache
 from tests.e2e.core.upgrade.git._smart_http import GitHTTPServer, serve_bare
 
 REPO = "hermes-agent.git"
@@ -54,12 +57,64 @@ def reported_success(cp: subprocess.CompletedProcess) -> bool:
     return cp.returncode == 0 or SUCCESS in output(cp)
 
 
+# deploy/nightly-20261103: previous promoted fork release. Both this floor and the
+# later promotions contain #126150's fix for #123254; upstream v2026.9.24 does not.
+# Never silently substitute upstream CalVer tags for releases fork users ran.
+FORK_RELEASE_FLOOR = "002f8807dbdef3b9aa450980baa501c6e9920f58"
+
+
+@lru_cache(maxsize=1)
 def n1_tag(generation: str | None = None) -> str:
-    """The start version's ref (``_install_helpers.upgrade_base``): N-1, or ``generation``'s newest release."""
-    base = I.upgrade_base(generation)
-    if base is None:
-        pytest.skip("no release tag reachable before HEAD (fetch tags)")
-    return base.ref
+    """Newest promoted fork release strictly before HEAD; offline, the verified floor.
+
+    Keep the historical name for callers; the result is an immutable commit, not
+    an upstream tag. Listing/fetching promotions here keeps nightly.yml unchanged.
+    """
+    if generation or os.environ.get("HERMES_E2E_UPGRADE_BASE") or os.environ.get("HERMES_E2E_N1_REF"):
+        base = I.upgrade_base(generation)
+        if base is None:
+            pytest.skip("no release tag reachable before HEAD (fetch tags)")
+        return base.ref
+    deadline = time.monotonic() + 30
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(["git", *args], 30)
+        return subprocess.run(
+            ["git", *args], cwd=H.WORKTREE, capture_output=True, text=True,
+            env={**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_NO_LAZY_FETCH": "1"},
+            timeout=remaining, check=False,
+        )
+
+    head = git("rev-parse", "HEAD").stdout.strip()
+
+    def eligible(sha: str) -> bool:
+        return (sha != head and git("merge-base", "--is-ancestor", sha, head).returncode == 0
+                and (sha == FORK_RELEASE_FLOOR
+                     or git("merge-base", "--is-ancestor", FORK_RELEASE_FLOOR, sha).returncode == 0))
+
+    try:
+        refs = git("ls-remote", "--heads", "origin", "refs/heads/deploy/nightly-*")
+        if refs.returncode == 0:
+            for sha, ref in sorted((line.split() for line in refs.stdout.splitlines()),
+                                   key=lambda row: row[1], reverse=True):
+                try:
+                    if git("cat-file", "-e", f"{sha}^{{commit}}").returncode != 0:
+                        git("fetch", "--no-tags", "origin", sha)
+                    if eligible(sha):
+                        print(f"Fork N-1: {ref} ({sha})", flush=True)
+                        return sha
+                except (OSError, subprocess.TimeoutExpired) as exc:
+                    print(f"Fork promotion unavailable ({ref}): {exc}", flush=True)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        print(f"Fork promotions unavailable: {exc}", flush=True)
+    # The offline floor needs only local objects, independently of a spent remote budget.
+    deadline = time.monotonic() + 5
+    if eligible(FORK_RELEASE_FLOOR):
+        print(f"Fork N-1: pinned promotion floor ({FORK_RELEASE_FLOOR})", flush=True)
+        return FORK_RELEASE_FLOOR
+    raise RuntimeError("Cannot resolve a promoted fork N-1 strict ancestor or its release floor")
 
 
 def n1_base(generation: str | None = None) -> str:
@@ -74,7 +129,7 @@ def commit_of(ref: str) -> str:
 def installer_script(ref: str | None) -> str:
     """``scripts/install.sh`` as of ``ref`` (None: this worktree's copy)."""
     if ref is None:
-        return (H.WORKTREE / "scripts" / "install.sh").read_text(encoding="utf-8")
+        return (H.WORKTREE / "scripts" / "install.sh").read_text(encoding="utf-8-sig")
     return I.git("show", f"{ref}:scripts/install.sh", cwd=H.WORKTREE) + "\n"
 
 
@@ -84,6 +139,7 @@ class World:
     srv: GitHTTPServer
     bare: Path
     sb: I.Sandbox
+    cache: InstallCache | None = None
     transcripts: list[str] = field(default_factory=list)
     install_bytes: int = 0
     install_shape: dict[str, str] = field(default_factory=dict)
@@ -126,6 +182,31 @@ class World:
                 "filter": self.config("remote.origin.partialclonefilter") or "-",
                 "shallow": self.git("rev-parse", "--is-shallow-repository")}
 
+    def seed_clone_shape(self, args: list[str]) -> None:
+        """Restore retained user Git state after genuine bootstrap (which heals old shapes).
+
+        A fresh real clone of the same release supplies only .git. Installed source,
+        dependencies and updater stay untouched; origin still exposes complete history.
+        """
+        seed = self.root / "retained-clone"
+        mark = self.srv.mark()
+        cp = subprocess.run(
+            ["git", "clone", "-q", *args, "--branch", "main", I.OFFICIAL_HTTPS, str(seed)],
+            env=self.git_env(), capture_output=True, text=True,
+            timeout=self.cache.remaining(120) if self.cache is not None else 120, check=False,
+        )
+        assert cp.returncode == 0, f"retained clone {args} failed: {cp.stderr}"
+        assert I.git("rev-parse", "HEAD", cwd=seed, env=self.git_env()) == self.head()
+        branch, upstream = self.branch(), self.git("rev-parse", "--abbrev-ref", "@{upstream}")
+        status = self.status()
+        shutil.rmtree(self.checkout / ".git")
+        (seed / ".git").rename(self.checkout / ".git")
+        assert self.branch() == branch == "main"
+        assert self.git("rev-parse", "--abbrev-ref", "@{upstream}") == upstream
+        assert self.status() == status, "retained clone changed installed working-tree status"
+        self.install_bytes = self.bytes_since(mark)
+        self.install_shape = self.shape()
+
     def status(self) -> str:
         return self.git("status", "--porcelain=v1", "--untracked-files=all")
 
@@ -157,6 +238,9 @@ class World:
         return sum(r.body_bytes for r in self.srv.since(mark) if r.method == "POST")
 
     def update(self, *extra: str, timeout: float = 1200) -> subprocess.CompletedProcess:
+        if self.cache is not None:
+            self.cache.prepare(self.sb.env)
+            timeout = self.cache.remaining(timeout)
         cp = self.sb.cli("update", "--yes", "--branch", "main", *extra, timeout=timeout)
         self.transcripts.append(f"$ hermes update --yes --branch main {' '.join(extra)} -> rc={cp.returncode}\n"
                                 f"{(cp.stdout or '')[-8000:]}\n{(cp.stderr or '')[-4000:]}")
@@ -170,7 +254,7 @@ class World:
         if not path.is_file():
             return {}
         try:
-            return json.loads(path.read_text(encoding="utf-8"))
+            return json.loads(path.read_text(encoding="utf-8-sig"))
         except (OSError, ValueError):
             return {"unreadable": str(path)}
 
@@ -192,21 +276,14 @@ class World:
         for name in ("update.log", "errors.log"):
             p = logs / name
             if p.is_file():
-                out.append(f"--- {p} (tail)\n" + p.read_text(encoding="utf-8", errors="replace")[-3000:])
+                out.append(f"--- {p} (tail)\n" + p.read_text(encoding="utf-8-sig", errors="replace")[-3000:])
         out.append("http requests:\n" + self.srv.describe(mark))
         return "\n".join(out)
 
 
-def _preclone(sb: I.Sandbox, args: list[str], env: dict[str, str]) -> None:
-    sb.hermes_home.mkdir(parents=True, exist_ok=True)
-    cp = subprocess.run(["git", "clone", "-q", *args, "--branch", "main", I.OFFICIAL_HTTPS, str(sb.checkout)],
-                        capture_output=True, text=True, env=env, timeout=900, check=False)
-    assert cp.returncode == 0, f"pre-clone {args} failed: {cp.stderr[-2000:]}"
-
-
 @contextlib.contextmanager
 def world(root: Path, *, base: str, installer_ref: str | None = None,
-          preclone: list[str] | None = None) -> Iterator[World]:
+          cache: InstallCache | None = None) -> Iterator[World]:
     """Serve origin ``main`` at ``base`` over smart HTTP and install from it with the installer
     of ``installer_ref`` (None: HEAD's). Yields the live ``World``; the server stops on exit."""
     root.mkdir(parents=True, exist_ok=True)
@@ -215,18 +292,24 @@ def world(root: Path, *, base: str, installer_ref: str | None = None,
     bare = serve_bare(srv_root, REPO, H.WORKTREE, base)
     with GitHTTPServer(srv_root) as srv:
         sb = I.new_sandbox(root / "sb")
+        if cache is not None:
+            sb.deadline = cache.deadline
+            sb.env = cache.environment(sb.env, managed_uv=I.real_uv())
+            cache.prepare(sb.env, installer_ref, bootstrap_uv=True)
+            cache.prepare(sb.env)
         url = srv.url(REPO)
         (sb.home / ".gitconfig").write_text(
             f'[url "{url}"]\n  insteadOf = {I.OFFICIAL_HTTPS}\n  insteadOf = {I.OFFICIAL_SSH}\n'
             '[user]\n  name = user\n  email = user@example.invalid\n', encoding="utf-8")
-        w = World(root=root, srv=srv, bare=bare, sb=sb)
-        if preclone is not None:
-            _preclone(sb, preclone, w.git_env())
+        w = World(root=root, srv=srv, bare=bare, sb=sb, cache=cache)
         script = sb.root / "install.sh"
         script.write_text(installer_script(installer_ref), encoding="utf-8")
         # The served repo publishes commits on main and no release tags: install main (N-1's
         # installer ignores the variable and installs main anyway).
-        cp = sb.run(["bash", str(script), "--non-interactive"], timeout=1800, input="",
+        # These worlds assert Git install/update behavior, not optional browser provisioning.
+        # Use the real installers' supported seam; the independent fresh-install test stays cold.
+        cp = sb.run(["bash", str(script), "--non-interactive", "--skip-browser"],
+                    timeout=cache.remaining(600) if cache is not None else 1800, input="",
                     env={**sb.env, "HERMES_INSTALL_CHANNEL": "main"})
         assert cp.returncode == 0, f"install ({installer_ref or 'HEAD'} installer, base {base[:12]}) failed:\n{w.diag(cp)}"
         head = w.head()

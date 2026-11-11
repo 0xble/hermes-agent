@@ -125,6 +125,9 @@ finally:
                 tmux("send-keys", "-t", "chat", "Enter")
 
             launch("--cli", "chat")
+            # Keep this test's server through empty-session gaps between client launches.
+            kept = tmux("set-option", "-s", "exit-empty", "off")
+            assert kept.returncode == 0, kept.stderr
             first = until("Welcome to Hermes Agent")
             until("❯ ")  # the banner prints before the prompt accepts input
             type_line("WS_SHARED")

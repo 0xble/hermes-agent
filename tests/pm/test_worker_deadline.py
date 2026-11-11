@@ -7,7 +7,7 @@ import sys
 import pytest
 
 from pm.package import InstallError
-from tests.waiting import process_alive
+from tests.waiting import kill_if_alive, process_alive, wait_until
 
 
 @pytest.mark.parametrize("partial_reply", [False, True])
@@ -32,5 +32,10 @@ def test_worker_deadline_reaps_the_worker_and_its_child(tmp_path, monkeypatch, p
     with pytest.raises(InstallError, match="worker prune_cache timed out after 2s"):
         client._request("prune_cache", {"cache": str(tmp_path)})
 
-    for pid in json.loads(pids.read_text()):
-        assert not process_alive(pid)
+    worker, child = json.loads(pids.read_text())
+    try:
+        assert not process_alive(worker)
+        # The caller reaps its worker; the non-child may still be completing SIGKILL exit.
+        wait_until(lambda: not process_alive(child), timeout=5, what="worker child to exit")
+    finally:
+        kill_if_alive(child)

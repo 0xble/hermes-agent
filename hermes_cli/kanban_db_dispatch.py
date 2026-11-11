@@ -212,14 +212,15 @@ _RECENT_WORKER_EXIT_TTL_SECONDS = 600
 _RECENT_WORKER_EXITS_MAX = 4096
 _recent_worker_exits: dict[int, tuple[int, float]] = {}
 
-# Windows has no ``waitpid(-1)``: a child's exit code is only recoverable
-# through a live handle, so ``_default_spawn`` parks each worker's ``Popen``
-# here (Windows only) and ``reap_worker_zombies`` polls it. Entry: ``pid -> Popen``.
+# Retain the Popen on every host: a process-wide waitpid(-1) steals terminal/provider
+# children from their owners, making Popen report their nonzero exits as zero.
 _live_worker_procs: dict[int, subprocess.Popen] = {}
 
 
 def _wait_status_from_returncode(returncode: int) -> int:
     """Encode a ``Popen.returncode`` in the wait-status layout the registry stores."""
+    if returncode < 0:
+        return -returncode  # POSIX signal deaths occupy the low 7 bits.
     return (int(returncode) & 0xFF) << 8
 
 
@@ -306,32 +307,15 @@ def _worker_log_exit_code(
 
 
 def reap_worker_zombies() -> list[int]:
-    """Reap exited workers without blocking; returns reaped PIDs. POSIX reaps
-    every child via ``waitpid(-1)``; Windows polls the ``Popen`` handles
-    parked by ``_default_spawn`` (the only way to learn a child's exit code
-    there), so the rate-limit sentinel exit is classified on both hosts."""
+    """Collect only our spawned workers, preserving every other child's wait status."""
     reaped: list[int] = []
-    if _kb._IS_WINDOWS:
-        for pid, proc in list(_live_worker_procs.items()):
-            returncode = proc.poll()
-            if returncode is None:
-                continue
-            _record_worker_exit(pid, _wait_status_from_returncode(returncode))
-            _live_worker_procs.pop(pid, None)
-            reaped.append(pid)
-        return reaped
-    try:
-        while True:
-            try:
-                pid, status = os.waitpid(-1, os.WNOHANG)
-            except ChildProcessError:
-                break
-            if pid == 0:
-                break
-            _record_worker_exit(pid, status)
-            reaped.append(pid)
-    except Exception:
-        pass
+    for pid, proc in list(_live_worker_procs.items()):
+        returncode = proc.poll()
+        if returncode is None:
+            continue
+        _record_worker_exit(pid, _wait_status_from_returncode(returncode))
+        _live_worker_procs.pop(pid, None)
+        reaped.append(pid)
     return reaped
 
 
@@ -2938,8 +2922,7 @@ def _default_spawn(task: Task, workspace: str, *, board: Optional[str] = None) -
         )
     # Intentionally NOT closing log_f: the child keeps writing after return;
     # the OS-level FD stays open in the child until it exits.
-    if _kb._IS_WINDOWS:
-        _live_worker_procs[proc.pid] = proc
+    _live_worker_procs[proc.pid] = proc
     return proc.pid
 
 

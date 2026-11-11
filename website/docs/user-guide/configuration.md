@@ -3086,6 +3086,10 @@ web:
   # call attempts the chosen backend again (never sticky).
   keyless_rescue: true
 
+  # Exa Lite pause (default: true). Every Exa search uses full Auto.
+  # `hermes config set web.exa_lite_paused false` restores guarded Lite.
+  exa_lite_paused: true
+
   # Pin Exa/Parallel to a tier (set by the hermes tools Free/Paid rows).
   # free = always the anonymous endpoint; paid = always the keyed SDK path;
   # unset = auto (key present -> paid, otherwise free).
@@ -3113,7 +3117,7 @@ web:
 
 **Parallel search modes:** Set `PARALLEL_SEARCH_MODE` to control search behavior — `fast`, `one-shot`, or `agentic` (default: `agentic`).
 
-**Exa:** Set `EXA_API_KEY` in `~/.hermes/.env`. Supports `category` filtering (`company`, `research paper`, `news`, `people`, `personal site`, `pdf`) and domain/date filters.
+**Exa:** Set `EXA_API_KEY` in `~/.hermes/.env`. Supports `category` filtering (`company`, `research paper`, `news`, `people`, `personal site`, `pdf`) and domain/date filters. `web.exa_lite_paused` defaults to `true` and sends every Exa search to Auto. `hermes config set web.exa_lite_paused false` restores guarded Lite.
 
 ## Browser
 

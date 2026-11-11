@@ -657,6 +657,12 @@ def _run_one_file_once(
     # One root for each subprocess removes the shared directory that the race
     # needs. The parent deletes the root after the attempt.
     env = os.environ.copy()
+    upgrade = file.resolve().is_relative_to((repo_root / "tests/e2e/core/upgrade").resolve())
+    for key in ("UV_CACHE_DIR", "UV_PYTHON_INSTALL_DIR", "npm_config_cache"):
+        value = env.pop(f"_HERMES_UPGRADE_{key}", None)
+        env.pop(key, None)
+        if upgrade and value:
+            env[key] = value
     temproot = tempfile.mkdtemp(prefix="r-", dir=_runner_scratch_root())
     env["PYTEST_DEBUG_TEMPROOT"] = temproot
     # Every tempfile.* call inside the test process lands in the same per-run root, so the

@@ -16,6 +16,7 @@ from hermes_cli import lifecycle, plugins
 from agent import relay_runtime
 from hermes_cli.observability import relay_shared_metrics
 from hermes_cli.plugins import PluginManager
+from tests.hermes_cli._relay_shared_metrics_helpers import join_export_workers as _join_export_workers
 
 
 class _Request:
@@ -213,17 +214,6 @@ class _Relay:
 
     def _flush(self) -> None:
         self.events.append(("subscribers.flush",))
-
-
-_EXPORT_WORKER = "hermes-shared-metrics-flush"
-
-
-def _join_export_workers() -> None:
-    """Task/session exports run on a background worker; wait for it before reading the store."""
-    while workers := [t for t in threading.enumerate() if t.name == _EXPORT_WORKER]:
-        for worker in workers:
-            worker.join(timeout=10)
-            assert not worker.is_alive()
 
 
 @pytest.fixture

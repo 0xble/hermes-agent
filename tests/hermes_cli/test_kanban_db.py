@@ -1139,6 +1139,7 @@ class TestSharedBoardPaths:
                 self.pid = 4242
 
         monkeypatch.setattr("subprocess.Popen", _FakePopen)
+        monkeypatch.setattr(kbd, "_live_worker_procs", {})
 
         task = kb.Task(
             id="t_dispatch_env",
@@ -1655,6 +1656,7 @@ def test_default_spawn_pins_repo_root_on_module_worker_pythonpath(tmp_path, monk
             self.pid = 4242
 
     monkeypatch.setattr("subprocess.Popen", _FakePopen)
+    monkeypatch.setattr(kbd, "_live_worker_procs", {})
 
     task = kb.Task(
         id="t_import_root", title="x", body=None, assignee="coder", status="ready",
@@ -2005,8 +2007,6 @@ def test_write_txn_check_reads_correct_header_fields(tmp_path):
 # ---------------------------------------------------------------------------
 # reap_worker_zombies() tests
 # ---------------------------------------------------------------------------
-
-
 
 
 

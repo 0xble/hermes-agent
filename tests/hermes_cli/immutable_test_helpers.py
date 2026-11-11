@@ -2,9 +2,46 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import sysconfig
+import time
+import tomllib
 import venv
+from contextlib import contextmanager
 from pathlib import Path
+
+
+@contextmanager
+def launchd_phase(request, name):
+    """Expose phase boundaries through pytest capture to the parent runner."""
+    # fd capture keeps even flushed stderr in pytest's private temp file until
+    # the test ends. Suspend it only for markers so the runner's pipe retains
+    # the last phase when it SIGKILLs a worker at the unchanged file deadline.
+    capture = request.config.pluginmanager.getplugin("capturemanager")
+
+    def mark(edge):
+        with capture.global_and_fixture_disabled():
+            print(f"[launchd-real] {name} {edge} {time.monotonic():.6f}",
+                  file=sys.stderr, flush=True)
+
+    mark("begin")
+    try:
+        yield
+    finally:
+        mark("end")
+
+
+def clone_packaged_runtime(repo: Path, source: Path) -> None:
+    """Seed the source index with the declared runtime before probe revisions."""
+    subprocess.run(["git", "clone", "--quiet", "--shared", "--no-checkout",
+                    str(repo), str(source)], check=True, timeout=60)
+    metadata = tomllib.loads((repo / "pyproject.toml").read_text(encoding="utf-8"))
+    packages = sorted({name.split(".")[0] for name in
+                       metadata["tool"]["setuptools"]["packages"]["find"]["include"]})
+    subprocess.run(["git", "-C", str(source), "read-tree", "--empty"], check=True)
+    subprocess.run(["git", "-C", str(source), "restore", "--source=HEAD", "--staged", "--worktree", "--",
+                    ":(top,glob)*.py", "pyproject.toml", "uv.lock", *packages], check=True)
 
 
 def _fake_release_generation(release: Path, extras: list[str]) -> Path:

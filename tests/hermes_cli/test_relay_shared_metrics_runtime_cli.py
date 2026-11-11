@@ -2,8 +2,12 @@
 
 from hermes_cli import lifecycle
 from hermes_cli.observability import relay_shared_metrics
-from tests.hermes_cli.test_relay_shared_metrics_runtime import direct_runtime as _direct_runtime_fixture, _finish_desktop_task, _join_export_workers, _stored_values
-direct_runtime = _direct_runtime_fixture
+from tests.hermes_cli.test_relay_shared_metrics_runtime import (
+    direct_runtime as direct_runtime,  # noqa: PLC0414 -- pytest fixture registration
+    _finish_desktop_task,
+    _stored_values,
+)
+from tests.hermes_cli._relay_shared_metrics_helpers import join_export_workers as _join_export_workers
 
 
 def _cli_turn(session_id: str, parent_session_id: str = "") -> None:

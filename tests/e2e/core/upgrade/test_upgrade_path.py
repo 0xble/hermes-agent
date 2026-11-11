@@ -17,9 +17,10 @@ Class C6 (bricked installs, stale code, lost state after `hermes update`). Each 
    without depending on the separately published R2 channel record.
 
 Legs: ``clean``; ``autostash`` (local edits + an orphan update autostash from an earlier run);
-``kill_mid_pull`` (SIGKILL while the fast-forward holds ``index.lock``, then the user retries
-later; ``torn-tree`` variant: half the changed files already swapped, merge-order-safe xfail for the
-live gap fixed by #120339); ``kill_before_deps``
+``kill_mid_pull`` (in ``test_upgrade_path_interrupted_pull.py``, SIGKILL while the fast-forward
+holds ``index.lock``, then the user retries later; ``torn-tree`` variant: half the changed files already swapped, merge-order-safe xfail for the
+live gap fixed by #120339); ``kill_before_deps`` (in
+``test_upgrade_path_interrupted_deps.py``)
 (SIGKILL after the code swap, when the dependency sync starts: new code on the old venv);
 ``offline`` (origin unreachable: must fail loudly and leave N-1 working).
 
@@ -66,6 +67,7 @@ import hermes_yaml as yaml
 from tests.e2e.core._pending_fixes import known_failure
 from tests.e2e.core.upgrade import _helpers as H
 from tests.e2e.core.upgrade import _install_helpers as I
+from tests.e2e.core.upgrade._install_cache import InstallCache
 from tests.fakes.fake_llm_provider import FakeLLMServer
 
 pytestmark = [
@@ -84,7 +86,7 @@ CLI_TIMEOUT = 600
 
 def _git(*args: str, cwd: Path, check: bool = True) -> str:
     cp = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, check=False)
+                        env={**os.environ, "GIT_TERMINAL_PROMPT": "0"}, check=False, timeout=120)
     if check and cp.returncode != 0:
         raise AssertionError(f"git {args} failed in {cwd}: {cp.stderr}")
     return cp.stdout.strip()
@@ -259,6 +261,7 @@ class Leg:
     env: dict[str, str]
     hermes_home: Path
     wrap_dir: Path
+    cache: InstallCache | None
     snapshot: dict = field(default_factory=dict)
 
     @property
@@ -279,7 +282,7 @@ class Leg:
     def run(self, *args: str, timeout: float = CLI_TIMEOUT, argv0: str | None = None,
             cwd: Path | None = None) -> subprocess.CompletedProcess:
         return H.run([argv0 or self.hermes, *args], env=self.env, cwd=cwd or self.install,
-                     writable=[self.root], timeout=timeout)
+                     writable=[self.root], timeout=self.cache.remaining(timeout) if self.cache else timeout)
 
     def popen(self, *args: str) -> subprocess.Popen:
         log = open(self.root / f"popen-{int(time.monotonic() * 1000)}.log", "w")
@@ -300,9 +303,10 @@ _KILLED_RUN_PREFIX = ["/bin/sh", "-c", '"$0" "$@"; exit $?']
 _RETRY_PREFIX = ["/bin/sh", "-c", 'true; exec "$0" "$@"']
 
 
-def _make_origin(root: Path, base: str) -> Path:
+def _make_origin(root: Path, base: str | None = None) -> Path:
+    base = base or _refs().base
     origin = root / "origin.git"
-    _git("clone", "-q", "--bare", "--shared", "--no-tags", str(H.WORKTREE), str(origin), cwd=root)
+    _git("clone", "-q", "--bare", "--shared", "--no-tags", "--single-branch", str(H.WORKTREE), str(origin), cwd=root)
     _git("update-ref", "refs/heads/main", base, cwd=origin)
     _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=origin)
     _git("tag", "-f", "e2e-upgrade-base", base, cwd=origin)
@@ -358,10 +362,14 @@ def _sockets(directory: str, names: list[str]) -> list[str]:
     return [n for n in names if stat.S_ISSOCK(os.lstat(os.path.join(directory, n)).st_mode)]
 
 
-def make_leg(root: Path, template_home: Path | None, base: str | None = None) -> Leg:
+def make_leg(root: Path, template_home: Path | None, cache: InstallCache | None = None, *,
+             base: str | None = None) -> Leg:
     """An install of ``base`` (default: the suite's start version) with its own venv and origin."""
     base = base or _refs().base
     root.mkdir(parents=True, exist_ok=True)
+    # Other upgrade suites use the original two-argument helper. Keep their downloads
+    # private to this leg; only callers explicitly supplying a fixture cache share content.
+    downloads = cache or InstallCache(root / "downloads")
     origin = _make_origin(root, base)
     install = root / "install"
     _git("clone", "-q", "--shared", "-b", "main", str(origin), str(install), cwd=root)
@@ -379,11 +387,11 @@ def make_leg(root: Path, template_home: Path | None, base: str | None = None) ->
     # the updater must cross that interpreter boundary during the retry.
     no_cfg = root / "uv-config"
     no_cfg.mkdir()
-    uv_env = {k: v for k, v in os.environ.items() if k not in ("VIRTUAL_ENV", "UV_NO_CONFIG", "UV_CONFIG_FILE")}
+    uv_env = downloads.environment(H.isolated_env(root))
     uv_env.update(UV_PROJECT_ENVIRONMENT=str(install / "venv"), XDG_CONFIG_HOME=str(no_cfg), XDG_CONFIG_DIRS=str(no_cfg))
     cp = subprocess.run([uv, "sync", "-q", "--locked", "--extra", "all", "--managed-python",
                          "--python", base_python], cwd=str(install),
-                        env=uv_env, capture_output=True, text=True, timeout=1800, check=False)
+                        env=uv_env, capture_output=True, text=True, timeout=cache.remaining(300) if cache else 1800, check=False)
     assert cp.returncode == 0, f"N-1 venv install from its uv.lock failed:\n{cp.stderr[-4000:]}"
     env_probe = H.isolated_env(root)
     hermes_home = Path(env_probe["HERMES_HOME"])
@@ -391,8 +399,10 @@ def make_leg(root: Path, template_home: Path | None, base: str | None = None) ->
         shutil.rmtree(hermes_home)
         shutil.copytree(template_home, hermes_home, symlinks=True, ignore=_sockets)
     wrap = _write_wrappers(root, install, hermes_home)
-    env = H.isolated_env(root, extra_path=[wrap])
-    return Leg(root=root, origin=origin, install=install, env=env, hermes_home=hermes_home, wrap_dir=wrap)
+    env = downloads.environment(H.isolated_env(root, extra_path=[wrap]))
+    if cache is not None:
+        cache.prepare(env)
+    return Leg(root=root, origin=origin, install=install, env=env, hermes_home=hermes_home, wrap_dir=wrap, cache=cache)
 
 
 # ---------------------------------------------------------------------------
@@ -563,9 +573,14 @@ def provider():
 
 
 @pytest.fixture(scope="module")
-def template_home(tmp_path_factory, provider) -> Path:
+def install_cache(tmp_path_factory):
+    return InstallCache(tmp_path_factory.mktemp("upgrade-downloads"), os.environ)
+
+
+@pytest.fixture(scope="module")
+def template_home(tmp_path_factory, provider, install_cache) -> Path:
     """HERMES_HOME populated by the N-1 CLI itself (sessions, profile, cron, config)."""
-    seed = make_leg(tmp_path_factory.mktemp("seed"), None)
+    seed = make_leg(tmp_path_factory.mktemp("seed"), None, install_cache)
     # A user's config may predate the release binary. v45 is the last schema before
     # the MCP editor's disabled → enabled migration, so even a v46+ base must exercise it.
     version = min(_base_config_version(seed), 45)
@@ -593,13 +608,16 @@ def template_home(tmp_path_factory, provider) -> Path:
         with contextlib.closing(sqlite3.connect(db)) as con:
             assert con.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0] == 0
     template = seed.root / "template-home"
-    shutil.copytree(seed.hermes_home, template, symlinks=True, ignore=_sockets)
+    # Native archives and tools belong to each leg, not to the user's state snapshot.
+    shutil.copytree(seed.hermes_home, template, symlinks=True,
+                    ignore=lambda directory, names: _sockets(directory, names) +
+                    (["tools"] if Path(directory) == seed.hermes_home else []))
     return template
 
 
 @pytest.fixture
-def leg(tmp_path, template_home) -> Leg:
-    lg = make_leg(tmp_path / "leg", template_home)
+def leg(tmp_path, template_home, install_cache) -> Leg:
+    lg = make_leg(tmp_path / "leg", template_home, install_cache)
     lg.snapshot = snapshot_state(lg)
     assert lg.snapshot["default"]["db"]["integrity"] == [("ok",)]
     assert len(lg.snapshot["default"]["db"]["sessions"]) >= 2 and len(lg.snapshot["work"]["db"]["sessions"]) >= 1
@@ -611,6 +629,8 @@ def _publish_head(leg: Leg) -> None:
 
 
 def _update(leg: Leg) -> subprocess.CompletedProcess:
+    if leg.cache is not None:
+        leg.cache.prepare(leg.env)
     return leg.run(*_RETRY_PREFIX[1:], leg.hermes, "update", "--yes", "--branch", "main",
                    argv0=_RETRY_PREFIX[0], timeout=UPDATE_TIMEOUT)
 
@@ -619,7 +639,7 @@ def _freeze_update_at(leg: Leg, marker: str) -> None:
     proc = leg.popen("update", "--yes", "--branch", "main")
     try:
         H.wait_for(lambda: (leg.root / marker).exists() or proc.poll() is not None,
-                   timeout=UPDATE_TIMEOUT, interval=0.5, what=marker)
+                   timeout=leg.cache.remaining(UPDATE_TIMEOUT) if leg.cache else UPDATE_TIMEOUT, interval=0.5, what=marker)
         assert (leg.root / marker).exists(), (
             f"update finished (rc={proc.returncode}) without reaching the {marker} point")
     finally:
@@ -639,8 +659,8 @@ def _age_git_locks(install: Path, seconds: float = 3600) -> None:
 
 
 @pytest.fixture(scope="module")
-def clean_leg(tmp_path_factory, template_home):
-    lg = make_leg(tmp_path_factory.mktemp("clean") / "leg", template_home)
+def clean_leg(tmp_path_factory, template_home, install_cache):
+    lg = make_leg(tmp_path_factory.mktemp("clean") / "leg", template_home, install_cache)
     lg.snapshot = snapshot_state(lg)
     _publish_head(lg)
     return lg, _update(lg)
@@ -660,93 +680,3 @@ def test_clean_update_keeps_long_scalar_lines_verbatim(clean_leg):
         for line in leg.snapshot[name]["config"].decode("utf-8").splitlines():
             if LONG_VALUE in line or "deploy: step one" in line:
                 assert line in after_lines, f"{name}: long user value re-folded: {line!r}"
-
-
-def test_update_with_local_edits_and_orphan_autostash(leg, provider):
-    # A file that does not change N-1 -> HEAD, so restoring the user's edit is conflict-free.
-    unchanged = next(p for p in ("README.md", "LICENSE", "AGENTS.md")
-                     if (leg.install / p).exists()
-                     and not _git("diff", "--name-only", _refs().base, _refs().head, "--", p, cwd=H.WORKTREE))
-    # An orphan autostash from an earlier update that never restored it (#63717).
-    (leg.install / unchanged).write_text((leg.install / unchanged).read_text() + "\norphan edit\n")
-    _git("stash", "push", "-m", "hermes-update-autostash-20260101-000000", cwd=leg.install)
-    orphan = _git("rev-parse", "refs/stash", cwd=leg.install)
-    # The user's current local work: a tracked edit and an untracked file.
-    user_line = "\nuser's local note that must survive the update\n"
-    (leg.install / unchanged).write_text((leg.install / unchanged).read_text() + user_line)
-    (leg.install / "my_notes.txt").write_text("untracked user file\n")
-    _publish_head(leg)
-    final = _update(leg)
-    stash_commits = _git("log", "-g", "--format=%H", "refs/stash", cwd=leg.install, check=False).split()
-    assert orphan in stash_commits, "the pre-existing autostash (maybe the only copy of user work) was dropped"
-    # The user's work is either restored in the tree or parked in a stash entry: never lost.
-    restored = user_line.strip() in (leg.install / unchanged).read_text()
-    parked = any(user_line.strip() in _git("stash", "show", "-p", "--include-untracked", c, cwd=leg.install, check=False)
-                 for c in stash_commits if c != orphan)
-    assert restored or parked, "local tracked edit lost by the update"
-    untracked_ok = (leg.install / "my_notes.txt").exists() or any(
-        "my_notes.txt" in _git("show", "--name-only", "--format=", f"{c}^3", cwd=leg.install, check=False)
-        for c in stash_commits if c != orphan)
-    assert untracked_ok, "untracked user file lost by the update"
-    assert_healthy_at_head(leg, provider, final)
-
-
-@pytest.mark.parametrize("torn", [
-    pytest.param(False, id="lock-only"),
-    pytest.param(True, id="torn-tree"),
-])
-def test_kill_mid_pull_then_retry_heals(leg, provider, torn):
-    changed = sorted(_git("diff", "--name-only", "--no-renames", "--diff-filter=AM", _refs().base, _refs().head,
-                          cwd=H.WORKTREE).splitlines())
-    assert changed, "N-1 and HEAD have no file differences"
-    torn_paths = changed[: max(1, len(changed) // 2)] if torn else []
-    (leg.root / "torn-paths").write_text("".join(p + "\n" for p in torn_paths))
-    (leg.root / "arm-pull").touch()
-    _publish_head(leg)
-    _freeze_update_at(leg, "frozen-pull")
-    assert _git("rev-parse", "HEAD", cwd=leg.install) == _refs().base, "kill point was not mid-pull"
-    assert (leg.install / ".git" / "index.lock").exists()
-    _age_git_locks(leg.install)
-    final = _update(leg)
-    # Merge-order safe (see _pending_fixes.known_failure): only the import-time death excuses torn-tree.
-    gate = known_failure(
-        r"(?s)^final `hermes update` failed:.*(cannot import name|No module named)",
-        "#120339 (merged; passes once N-1 is a release carrying it): a fast-forward killed half-way leaves a prefix of the changed files at HEAD while "
-        "HEAD still names N-1; every entry point, including `hermes update`, then dies at import (cannot import "
-        "name ... from 'utils'), so nothing can heal the install without manual git") if torn else contextlib.nullcontext()
-    with gate:
-        assert_healthy_at_head(leg, provider, final)
-
-
-def test_kill_before_deps_then_retry_heals(leg, provider):
-    (leg.root / "arm-deps").touch()
-    _publish_head(leg)
-    _freeze_update_at(leg, "frozen-deps")
-    assert _git("rev-parse", "HEAD", cwd=leg.install) == _refs().head, "kill point was not after the code swap"
-    _age_git_locks(leg.install)
-    final = _update(leg)
-    assert_healthy_at_head(leg, provider, final)
-
-
-def test_offline_update_fails_loudly_and_changes_nothing(leg, provider):
-    _publish_head(leg)
-    # Origin goes unreachable (network down / repo moved). The install borrows its objects from
-    # the origin store (--shared), so the store moves and the install's alternates follow it.
-    store = leg.root / "offline-store.git"
-    leg.origin.rename(store)
-    (leg.install / ".git" / "objects" / "info" / "alternates").write_text(f"{store / 'objects'}\n")
-    cp = _update(leg)
-    assert cp.returncode != 0, "update against an unreachable origin reported success:\n" + H.describe(cp)
-    assert TRACEBACK not in cp.stdout + cp.stderr, H.describe(cp)
-    assert _git("rev-parse", "HEAD", cwd=leg.install) == _refs().base
-    assert _git("status", "--porcelain", "--untracked-files=no", cwd=leg.install) == ""
-    after = snapshot_state(leg)
-    for name in ("default", "work"):
-        assert after[name]["config"] == leg.snapshot[name]["config"], f"{name} config touched by a failed update"
-        assert after[name]["db"] == leg.snapshot[name]["db"], f"{name} state.db touched by a failed update"
-    ver = leg.run("--version")
-    assert ver.returncode == 0, H.describe(ver)
-    n = len(provider.main_requests())
-    turn = leg.run("-z", "turn after a failed update")
-    assert turn.returncode == 0 and provider.default_text in turn.stdout, H.describe(turn)
-    assert len(provider.main_requests()) == n + 1
