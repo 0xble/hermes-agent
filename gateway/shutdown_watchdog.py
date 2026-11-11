@@ -90,6 +90,7 @@ def start_loop_liveness_watchdog(
     probe_timeout: float = DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
     max_strikes: int = DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     exit_code: int = GATEWAY_SERVICE_RESTART_EXIT_CODE,
+    store_snapshot_fn: Optional[Callable[[], dict[str, Any]]] = None,
 ) -> Optional[_LoopLivenessWatchdogHandle]:
     """Start an out-of-loop watchdog that hard-exits after missed probes. The caller
     (``GatewayRunner._start_loop_liveness_guards``) enforces the ``gateway.loop_watchdog: false``
@@ -131,9 +132,13 @@ def start_loop_liveness_watchdog(
                     strikes, exit_code)
             # File + stderr: a console-less launcher (Windows .vbs login item) discards stderr, so a
             # liveness death used to leave no stack anywhere (#120356, #91097).
+            snapshot = {"strikes": strikes, "probe_interval_s": probe_interval}
+            if store_snapshot_fn is not None:
+                with contextlib.suppress(Exception):
+                    snapshot.update(store_snapshot_fn())
             _write_watchdog_dump(
                 get_shutdown_watchdog_dump_path(), delay_s=probe_timeout * strikes,
-                snapshot={"strikes": strikes, "probe_interval_s": probe_interval},
+                snapshot=snapshot,
                 event="loop_liveness_watchdog_fired")
             if stop_event.is_set():
                 return

@@ -190,9 +190,9 @@ class SlackThreadTitlesMixin:
         agent._on_session_title = on_title
         return True
 
-    def _reserve_title_upgrade(self, source, title: str, current) -> Optional[str]:
+    async def _reserve_title_upgrade(self, source, title: str, current) -> Optional[str]:
         """Reserve before I/O: an ambiguous API failure must not retry over a manual rename."""
-        if not self._app or not self._thread_titles_enabled(source) or not current():
+        if not self._app or not self._thread_titles_enabled(source) or not await current():
             return None
         key = self._workspace_thread_key(source.scope_id or "", source.chat_id, source.thread_id)
         if not key or key in self._upgraded_assistant_threads:
@@ -207,7 +207,7 @@ class SlackThreadTitlesMixin:
 
     async def _upgrade_assistant_thread_title(self, source, title: str, current) -> None:
         try:
-            title = self._reserve_title_upgrade(source, title, current)
+            title = await self._reserve_title_upgrade(source, title, current)
             if title:
                 await self._rename_thread(source.chat_id, source.thread_id, title, source.scope_id or "")
         except Exception:
@@ -221,7 +221,7 @@ class SlackThreadTitlesMixin:
         """
         try:
             from slack_sdk.errors import SlackApiError
-            title = self._reserve_title_upgrade(source, title, current)
+            title = await self._reserve_title_upgrade(source, title, current)
             if not title:
                 return
             team_id = source.scope_id or ""

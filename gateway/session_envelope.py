@@ -317,7 +317,7 @@ async def prepare_native(runner, event):
         except BaseException:
             await abandon_capture(scope)
             raise
-    return _snapshot_native(runner, frozen, provenance, fresh_roles, encoded_source, media)
+    return await _snapshot_native_async(runner, frozen, provenance, fresh_roles, encoded_source, media)
 
 
 def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
@@ -371,23 +371,33 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
     payload = {'text': event.text, 'native_text_v1': envelope}
     # Only an exact persisted legacy retry retains its old fingerprint. New
     # ordinary admissions must bind homes too, including execution after restart.
-    if provenance is not None and not getattr(runner.config, 'multiplex_profiles', False):
-        from hermes_state_runtime import list_session_admissions
-        from gateway.session_authorities import active_authority
-        authority = active_authority(runner)
-        entry = runner.session_store.lookup_by_session_key(envelope['route'])
-        if entry is not None:
-            legacy = deepcopy(payload)
-            legacy['native_text_v1'].pop('provenance')
-            legacy['native_text_v1'].pop('attended_activity', None)
-            legacy['native_text_v1'].pop('absorbed_synthetic', None)
-            for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
-                prior = deepcopy(row['payload'])
-                if isinstance(prior.get('native_text_v1'), dict):
-                    prior['native_text_v1'].pop('attended_activity', None)
-                    prior['native_text_v1'].pop('absorbed_synthetic', None)
-                if row['request_id'] == event.message_id and prior == legacy:
-                    return row['payload']  # Preserve the original durable recovery evidence.
+    return payload
+
+
+async def _snapshot_native_async(runner, event, provenance, fresh_roles=False,
+                                 encoded_source=None, media=None):
+    """Build an ingress snapshot without acquiring SessionStore._lock on the loop."""
+    payload = _snapshot_native(runner, event, provenance, fresh_roles, encoded_source, media)
+    if provenance is None or getattr(runner.config, 'multiplex_profiles', False):
+        return payload
+    from hermes_state_runtime import list_session_admissions
+    from gateway.session_authorities import active_authority
+    from gateway.session_store_async import run_store_lookup
+    authority = active_authority(runner)
+    entry = await run_store_lookup(runner.session_store, 'lookup_by_session_key', payload['native_text_v1']['route'])
+    if entry is None:
+        return payload
+    legacy = deepcopy(payload)
+    legacy['native_text_v1'].pop('provenance')
+    legacy['native_text_v1'].pop('attended_activity', None)
+    legacy['native_text_v1'].pop('absorbed_synthetic', None)
+    for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
+        prior = deepcopy(row['payload'])
+        if isinstance(prior.get('native_text_v1'), dict):
+            prior['native_text_v1'].pop('attended_activity', None)
+            prior['native_text_v1'].pop('absorbed_synthetic', None)
+        if row['request_id'] == event.message_id and prior == legacy:
+            return row['payload']
     return payload
 
 
@@ -448,8 +458,8 @@ def restore_native(payload, runner=None):
 async def check_native_route(runner, payload, session_id, available_source, adapter):
     """Read-only preflight: route/auth rejection must never consume a queued row."""
     if 'automation' in payload['native_text_v1']:
-        from gateway.session_automation import check_automation_route
-        return check_automation_route(runner, payload, session_id, available_source, adapter)
+        from gateway.session_automation import check_automation_route_async
+        return await check_automation_route_async(runner, payload, session_id, available_source, adapter)
     event = restore_native(payload, runner)
     # Validate the stored sender without recapturing files or trusting the binding caller.
     from gateway.session_ingress_context import reauthorize_roles
@@ -461,7 +471,8 @@ async def check_native_route(runner, payload, session_id, available_source, adap
     if (store._generate_session_key(event.source) != route
             or store._generate_session_key(available_source) != route):
         raise RuntimeStoreError('admission_conflict')
-    entry = store.lookup_by_session_key(route)
+    from gateway.session_store_async import run_store_lookup
+    entry = await run_store_lookup(store, 'lookup_by_session_key', route)
     if entry is None or entry.session_id != session_id:
         raise RuntimeStoreError('admission_conflict')
     if adapter is None or runner._adapter_for_source(event.source) is not adapter:

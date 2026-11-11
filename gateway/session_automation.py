@@ -129,9 +129,10 @@ async def prepare_heartbeat(runner, event):
     queues behind it. A retry of a tick already admitted is dropped."""
     import asyncio
     from gateway.session_authorities import active_authority
+    from gateway.session_store_async import run_store_lookup
     authority = active_authority(runner)
-    entry = await asyncio.to_thread(
-            runner.session_store.lookup_by_session_key, str(event.get('session_key') or '')) if authority else None
+    entry = await run_store_lookup(
+            runner.session_store, 'lookup_by_session_key', str(event.get('session_key') or '')) if authority else None
     if entry is None:
         return event
     owner = await asyncio.to_thread(_route_owner, authority, entry)
@@ -190,9 +191,10 @@ async def withdraw_process_ticks(runner, event):
     import asyncio
     from gateway.session_authorities import active_authority
     try:
+        from gateway.session_store_async import run_store_lookup
         authority = active_authority(runner)
-        entry = await asyncio.to_thread(
-            runner.session_store.lookup_by_session_key, str(event.get('session_key') or '')) if authority else None
+        entry = await run_store_lookup(
+            runner.session_store, 'lookup_by_session_key', str(event.get('session_key') or '')) if authority else None
         if entry is None:
             return
         finished = {identity[1] for identity in _identities(
@@ -502,21 +504,43 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     return {'text': event.text, 'native_text_v1': envelope}, entry
 
 
-def check_automation_route(runner, payload, session_id, available_source, adapter):
+def _check_automation_route(runner, payload, session_id, available_source, adapter, entry):
     from gateway.session_envelope import restore_native
     event = restore_native(payload, runner)
     envelope = payload['native_text_v1']
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
-    if authority is None:  # a late preflight for a profile this runtime no longer serves
+    if authority is None:
         raise RuntimeStoreError('not_found')
-    entry = _owner(runner, event, authority)
     if (entry.session_id != session_id
             or envelope['automation']['owner'] != authority.logical_owner(session_id)
             or runner.session_store._generate_session_key(available_source) != entry.session_key
             or adapter is None or runner._adapter_for_source(event.source) is not adapter):
         raise RuntimeStoreError('admission_conflict')
     return event.source, entry.session_key
+
+
+def check_automation_route(runner, payload, session_id, available_source, adapter):
+    """Synchronous compatibility API for worker-only callers."""
+    from gateway.session_envelope import restore_native
+    from gateway.session_authorities import active_authority
+    authority = active_authority(runner)
+    if authority is None:
+        raise RuntimeStoreError('not_found')
+    return _check_automation_route(runner, payload, session_id, available_source, adapter,
+                                    _owner(runner, restore_native(payload, runner), authority))
+
+
+async def check_automation_route_async(runner, payload, session_id, available_source, adapter):
+    from gateway.session_envelope import restore_native
+    from gateway.session_authorities import active_authority
+    authority = active_authority(runner)
+    if authority is None:
+        raise RuntimeStoreError('not_found')
+    from gateway.session_store_async import run_store_lookup
+    event = restore_native(payload, runner)
+    entry = await run_store_lookup(runner, '_automation_route_owner', event, authority)
+    return _check_automation_route(runner, payload, session_id, available_source, adapter, entry)
 
 
 def snapshot_local_automation(authority, adapter, event, identity, entry, *, ref=None):

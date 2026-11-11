@@ -42,9 +42,9 @@ async def _admit_local_delivery(authority, chat_id, text, metadata):
     from gateway.config import Platform
     from gateway.session_authorities import owner_scope
     from gateway.session_automation import admit_route_wake
-    from gateway.session_local_recovery import local_adapter_map, restore_local_session
+    from gateway.session_local_recovery import local_adapter_map, restore_local_session_async
     with owner_scope(authority):
-        restore_local_session(authority, chat_id)  # a chat closed before this fire, as for completions
+        await restore_local_session_async(authority, chat_id)  # a chat closed before this fire
         source = authority.sessions[chat_id].source
         return await admit_route_wake(authority.runner, local_adapter_map(authority)[Platform.LOCAL], source,
                                       text, 'cron', metadata)
@@ -170,8 +170,8 @@ async def operation(authority, name, params, actor=None):
         if row is None:
             return {'status': 'missing', 'result': None}
         state = await operation(authority, 'status', {'session_id': sid, 'admission_id': row['admission_id']}, actor)
-        from gateway.session_local_recovery import restore_local_session
-        restore_local_session(authority, sid)
+        from gateway.session_local_recovery import restore_local_session_async
+        await restore_local_session_async(authority, sid)
         from gateway.config import Platform
         from gateway.session_local_recovery import local_adapter_map
         policy = local_adapter_map(authority)[Platform.LOCAL].policies[sid]

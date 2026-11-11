@@ -276,10 +276,11 @@ class GatewayAgentCacheMixin:
 
     async def _rehydrate_session_model_override_async(self, session_key: str) -> None:
         """Serialize restart hydration with route edits, publishing only on the loop."""
+        from gateway.session_store_async import run_store_lookup
         async with self._session_model_override_lock(session_key):
             if self._session_model_override(session_key) is None:
                 epoch = self._session_model_override_epoch(session_key)
-                loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
+                loaded = await run_store_lookup(self, "_load_session_model_override", session_key)
                 self._commit_session_model_override(session_key, loaded, epoch)
 
     def _rehydrate_session_model_override(self, session_key: str) -> None:
@@ -303,14 +304,14 @@ class GatewayAgentCacheMixin:
         store = getattr(self, "session_store", None)
         if store is None:
             return
+        from gateway.session_store_async import run_store_lookup
         async with self._session_model_override_lock(session_key):
             state = self._session_state(session_key)
             if state.conversation.model_role is None:
-                state.conversation.model_role = await asyncio.to_thread(
-                    store.get_model_role, session_key)
+                state.conversation.model_role = await run_store_lookup(store, "get_model_role", session_key)
             if self._session_model_override(session_key) is None:
                 epoch = self._session_model_override_epoch(session_key)
-                loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
+                loaded = await run_store_lookup(self, "_load_session_model_override", session_key)
                 self._commit_session_model_override(session_key, loaded, epoch)
 
     def _load_session_model_override(self, session_key: str) -> tuple[Optional[dict], str]:
@@ -320,6 +321,9 @@ class GatewayAgentCacheMixin:
         if store is None:
             return None, "session"
         try:
+            from gateway.session_store_async import session_store_executor
+            # This helper is normally called by the async hydration path. Keep the sync helper
+            # worker-safe for the remaining legacy callers; they must not call it on the loop.
             persisted = store.get_model_override(session_key)
             scope = store.get_model_override_scope(session_key)
         except Exception:

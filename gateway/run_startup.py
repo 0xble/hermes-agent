@@ -858,9 +858,35 @@ class GatewayStartupMixin(GatewayStartupSecretsMixin, RestartRecoveryMixin, Runt
                     max_strikes=int(getattr(
                         config, "loop_watchdog_max_strikes", DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
                     )),
+                    store_snapshot_fn=self._session_store_lock_snapshot,
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)
+
+    def _session_store_lock_snapshot(self) -> dict:
+        """Sample every active profile store without acquiring any store lock."""
+        stores = {}
+        stores[getattr(self, "_primary_profile_name", None) or "default"] = self.session_store
+        for authority in getattr(self, "session_authorities", ()):
+            store = getattr(getattr(authority, "runner", None), "session_store", None) or getattr(self, "session_store", None)
+            if store is not None:
+                stores[getattr(authority, "profile_id", "default")] = store
+        locks = {}
+        for name, store in stores.items():
+            lock = getattr(store, "_lock", None)
+            if lock is None or not callable(getattr(lock, "owner_snapshot", None)):
+                continue
+            count, owner = lock.owner_snapshot()
+            detail = {"acquisition_count": count, "owner": None}
+            if owner is not None:
+                detail["owner"] = {
+                    "thread_name": owner.thread_name,
+                    "thread_ident": owner.thread_ident,
+                    "held_age_s": max(0.0, time.monotonic() - owner.acquired_at),
+                    "callsites": [f"{code.co_filename}:{line}" for code, line in owner.callsite],
+                }
+            locks[str(name)] = detail
+        return {"session_store_locks": locks}
 
     def _stop_loop_liveness_guards(self) -> None:
         """Disarm lifetime liveness guards before shutdown can load the loop — including the

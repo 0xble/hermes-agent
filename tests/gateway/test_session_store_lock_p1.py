@@ -91,17 +91,25 @@ def test_loop_store_paths_are_guarded_by_async_boundary(site):
 
 
 def test_liveness_dump_includes_session_store_owner_snapshot(tmp_path):
-    loop = MagicMock()
+    class _FrozenLoop:
+        def call_soon_threadsafe(self, _callback):
+            return None
+
+    loop = _FrozenLoop()
     lock = SimpleNamespace(owner_snapshot=lambda: (
         7, SimpleNamespace(thread_name="store-writer", thread_ident=44,
                            acquired_at=time.monotonic() - 3.0,
                            callsite=(("session.py", 123),)),
     ))
     with patch("gateway.shutdown_watchdog._write_watchdog_dump") as dump, \
-            patch("gateway.shutdown_watchdog._hard_exit"):
+            patch("gateway.shutdown_watchdog._hard_exit"), \
+            patch("gateway.shutdown_watchdog._mark_exited_quietly"):
         handle = start_loop_liveness_watchdog(
             loop, probe_interval=.001, probe_timeout=.001, max_strikes=1,
-            store_snapshot_fn=lambda: {"default": lock},
+            store_snapshot_fn=lambda: {"session_store_locks": {"default": {
+                "acquisition_count": 7,
+                "owner": {"thread_name": "store-writer"},
+            }}},
         )
         handle.join(1)
         handle.stop()
