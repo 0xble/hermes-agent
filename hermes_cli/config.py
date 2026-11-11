@@ -2031,7 +2031,6 @@ def _write_config_state(
                     "deletion by omission is deliberate.",
                 ) from exc
         validate_config_for_write(data)
-        validate_config_for_write(data)
         write_config_document(config_path, data, extra_content_on_create=extra_content_on_create)
 
 
