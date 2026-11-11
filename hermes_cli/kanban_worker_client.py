@@ -108,10 +108,15 @@ def _submit():
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli.kanban_db_dispatch import adopt_worker_pid
         # Lock contention deliberately counts against the card.
-        with connect_closing(Path(board_db).resolve(strict=True)) as conn:
-            if not adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid()):
-                print('Kanban owner refused: stale dispatcher claim', file=sys.stderr)
-                return 1
+        try:
+            with connect_closing(Path(board_db).resolve(strict=True)) as conn:
+                if not adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid()):
+                    print('Kanban owner refused: stale dispatcher claim', file=sys.stderr)
+                    return 1
+        except sqlite3.Error as exc:
+            print(f'Kanban owner refused: {exc}', file=sys.stderr)
+            return 1
+
         # Owner startup must never inherit this worker's task/tool/goal identity.
         for key in list(os.environ):
             # The busy timeout is a host tuning knob, not task identity: the answer budget reads it.
@@ -120,7 +125,7 @@ def _submit():
         for key in ('HERMES_SESSION_SOURCE', 'HERMES_TENANT', 'TERMINAL_CWD'):
             os.environ.pop(key, None)
         return asyncio.run(run(params, board_db))
-    except (KeyError, ValueError, OSError, sqlite3.Error) as exc:
+    except (KeyError, ValueError, OSError) as exc:
         print(f'Kanban owner refused: {exc}', file=sys.stderr)
         return 1
 
