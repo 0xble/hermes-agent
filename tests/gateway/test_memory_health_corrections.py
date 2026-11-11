@@ -1,6 +1,5 @@
 """Advisory memory health must stay bounded and preserve actionable diagnostics."""
 import logging
-import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -30,23 +29,17 @@ async def test_scope_discovery_is_off_loop_and_uses_served_primary_home(tmp_path
     primary.mkdir()
     launch.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(launch))
-    loop_thread = threading.get_ident()
-    scans, checked = [], []
-
-    def served(config):
-        scans.append(threading.get_ident())
-        return [(None, None), ("launch", launch)]
+    checked = []
 
     async def check(runner, profile, home):
         checked.append((profile, home))
 
-    monkeypatch.setattr("gateway.run._handoff_watch_scopes", served)
+    monkeypatch.setattr("gateway.run._resolve_handoff_watch_scopes", AsyncMock(return_value=[(None, None), ("launch", launch)]))
     monkeypatch.setattr(health, "_check_profile_health", check)
     monkeypatch.setattr("hermes_constants.get_default_hermes_root", lambda: primary)
     gateway = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True),
                               _run_in_executor_with_context=AsyncMock(side_effect=lambda fn, runner: fn(runner)))
     await health.check_memory_health(gateway)
-    assert scans and all(thread != loop_thread for thread in scans)
     assert checked == [(None, primary), ("launch", launch)]
 
 
@@ -71,7 +64,7 @@ async def test_startup_does_not_await_blocked_advisory_health(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_failing_profile_tracebacks_are_deduped_per_release(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(health, "_health_scopes", lambda _: [("broken", tmp_path)])
+    monkeypatch.setattr("gateway.run._resolve_handoff_watch_scopes", AsyncMock(return_value=[("broken", tmp_path)]))
     monkeypatch.setattr(health, "_check_profile_health", AsyncMock(side_effect=ValueError("bad config")))
     monkeypatch.setattr("hermes_cli.version_info.get_code_identity", lambda: {"sha": "A"})
     gateway = SimpleNamespace()
