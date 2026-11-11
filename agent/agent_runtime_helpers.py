@@ -1,8 +1,10 @@
+# health: allow FILE_LINES -- shared cooldown restore must stay at the existing facade seam
 """Assorted AIAgent runtime helpers (message repair/sanitization, credential recovery, primary
 runtime restore, prompt-cache policy, client construction, model switching, tool invocation).
 Each function takes the parent ``AIAgent`` as ``agent`` except the stateless message helpers.
 ``_ra()`` resolves ``run_agent`` lazily so tests patching ``run_agent.X`` keep intercepting.
 """
+
 
 from __future__ import annotations
 import contextlib
@@ -82,10 +84,12 @@ _UNTERMINATED_TOOL_CALL_PATTERN = re.compile(
     re.DOTALL | re.IGNORECASE,
 )
 
+
 def _ra():
     """Lazy ``run_agent`` reference for test-patch routing."""
     import run_agent
     return run_agent
+
 
 AGENT_RUNTIME_POST_HOOK_TOOL_NAMES = frozenset({
     "todo_list", "session_search", "memory", "clarify", "read_terminal", "desktop_preview",
@@ -108,15 +112,18 @@ _TRAJECTORY_SYSTEM_PROMPT = (
     "Example:\n<tool_call>\n{{'name': <function-name>,'arguments': <args-dict>}}\n</tool_call>"
 )
 
+
 def _trajectory_gpt_prefix(msg: dict[str, Any]) -> str:
     """Leading ``<think>`` block from native reasoning tokens, if any."""
     if msg.get("reasoning") and msg["reasoning"].strip():
         return f"<think>\n{msg['reasoning']}\n</think>\n"
     return ""
 
+
 def _with_think_block(content: str) -> str:
     """Every gpt turn gets a <think> block (empty if none) for a consistent training format."""
     return content if "<think>" in content else "<think>\n</think>\n" + content
+
 
 def _trajectory_tool_call_turn(msg: dict[str, Any]) -> str:
     content = _trajectory_gpt_prefix(msg)
@@ -1517,7 +1524,8 @@ def restore_primary_runtime(agent) -> bool:
     if not (isinstance(fallback_route, (list, tuple)) and len(fallback_route) == 2):
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
     previous_model, previous_provider = (str(v or "unknown") for v in fallback_route)
-    provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False)); from agent.shared_primary_probe_runtime import claim_primary_probe, settle_failed_primary_probe
+    provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
+    from agent.shared_primary_probe_runtime import claim_primary_probe, release_primary_probe
     probe_token = claim_primary_probe(agent, shared_state)
     if probe_token is False:
         return False
@@ -1531,7 +1539,10 @@ def restore_primary_runtime(agent) -> bool:
         finish_fallback_restore(agent, provider_fallback_active, held_shared_record,
                                 previous_model, previous_provider)
         return True
-    except Exception as e: settle_failed_primary_probe(agent, probe_token); logger.warning("Failed to restore primary runtime: %s", e, exc_info=True); return False
+    except Exception as e:
+        release_primary_probe(agent, probe_token)
+        logger.warning("Failed to restore primary runtime: %s", e, exc_info=True)
+        return False
 
 
 # Transient transport failures worth one more attempt with a rebuilt client / connection pool.

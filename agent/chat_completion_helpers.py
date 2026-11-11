@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- shared cooldown fallback lookup must stay at the existing helper seam
 """API-call helpers extracted from :class:`AIAgent`: non-streaming and streaming
 request drivers, request kwargs builder, assistant-message materializer,
 provider-fallback activator, max-iterations handler, per-turn resource cleanup.
@@ -6,6 +7,7 @@ Each function takes the parent ``AIAgent`` as ``agent``; AIAgent keeps thin
 forwarders. Symbols tests patch on ``run_agent`` (``cleanup_vm`` /
 ``cleanup_browser``) are resolved through :func:`_ra` at call time.
 """
+
 
 from __future__ import annotations
 
@@ -70,10 +72,12 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own longer cooldown.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
+
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
     context = contextvars.copy_context()
     return lambda: context.run(callback)
+
 
 def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
     """Bounded worker join before raising InterruptedError (#81521).
@@ -94,10 +98,12 @@ def _join_worker_for_relay_teardown(worker, *, label: str) -> None:
         logger.warning("%s worker still alive after interrupt abort (2.0s join "
             "timeout); Relay teardown will best-effort drain orphaned scopes (#81521).", label)
 
+
 def _ra():
     """Lazy ``run_agent`` reference so ``patch("run_agent.cleanup_vm")`` etc. intercept."""
     import run_agent
     return run_agent
+
 
 class ProviderStreamError(Exception):
     """Provider encoded an API error as streaming content instead of an SDK error."""
@@ -123,6 +129,7 @@ class ProviderStreamError(Exception):
             text += f": {error_obj['message']}"
         return text
 
+
 def _status_code_from_value(value: Any) -> Optional[int]:
     if isinstance(value, int) and 100 <= value < 600:
         return value
@@ -130,6 +137,7 @@ def _status_code_from_value(value: Any) -> Optional[int]:
         return None
     match = re.search(r"(?:HTTP_STATUS/)?\b([1-5]\d\d)\b", value, re.IGNORECASE)
     return int(match.group(1)) if match else None
+
 
 def _status_code_from_payload(payload: Any) -> Optional[int]:
     if not isinstance(payload, dict):
@@ -145,6 +153,7 @@ def _status_code_from_payload(payload: Any) -> Optional[int]:
         if status_code is not None:
             return status_code
     return None
+
 
 def _json_object_from_text(text: str) -> Optional[dict]:
     stripped = (text or "").strip()
@@ -2004,7 +2013,7 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
     )
 
 
-def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_armed: bool = False) -> bool:
+def _fallback_chain_exhausted(agent, reason: FailoverReason | None, cooldown_armed: bool = False) -> bool:
     """Always False; briefly cool an exhausted chain if the primary has no cooldown.
     Gate next-turn restore even when a rate limit or overload came from an active fallback."""
     if agent._fallback_chain and not cooldown_armed:
@@ -2218,7 +2227,7 @@ def _finalize_fallback_route(agent, provider: str) -> None:
     agent._provider_fallback_route = (str(agent.model), str(provider))
 
 def try_activate_fallback(
-    agent, reason: "FailoverReason | None" = None, reset_at=None, *,
+    agent, reason: FailoverReason | None = None, reset_at=None, *,
     _shared_cooldown_record=None,
 ) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,

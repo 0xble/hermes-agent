@@ -80,10 +80,12 @@ def _arm_rate_limit_cooldown(
         sequence = int(getattr(agent, "_cooldown_failure_sequence", 0) or 0) + 1
         agent._cooldown_failure_sequence = sequence
         request_id = f"fallback:{id(agent)}:{sequence}"
-    if getattr(agent, "_shared_primary_probe_failed", False) and not getattr(agent, "_fallback_activated", False):
-        record = getattr(agent, "_shared_primary_cooldown_record", None)
-        if isinstance(record, dict):
-            return max(0, math.ceil(float(record.get("reset_at", 0) or 0) - time.time()))
+    failed_outage_id = str(getattr(agent, "_shared_primary_probe_failed_outage_id", "") or "")
+    record = getattr(agent, "_shared_primary_cooldown_record", None)
+    if (failed_outage_id and isinstance(record, dict)
+            and str(record.get("outage_id") or "") == failed_outage_id
+            and not getattr(agent, "_fallback_activated", False)):
+        return max(0, math.ceil(float(record.get("reset_at", 0) or 0) - time.time()))
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     if getattr(agent, "_fallback_activated", False):
         # Compare the whole route: a same-provider fallback (another model or endpoint) failing
@@ -97,8 +99,9 @@ def _arm_rate_limit_cooldown(
             from agent.shared_primary_cooldown import arm_cooldown
             fallback_record = arm_cooldown(
                 live_route, reason=FailoverReason.rate_limit, reset_at=reset_at,
-                backoff_count=backoff_count, request_id=request_id,
-                short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
+                backoff_count=0, request_id=request_id,
+                request_started_at=getattr(agent, "_current_api_request_started_at", None),
+                short_window=(reset_at is None and reason != FailoverReason.overloaded
                               and (live_route[0] == "custom" or live_route[0].startswith("custom:"))),
             )
             if fallback_record:
@@ -121,6 +124,10 @@ def _arm_rate_limit_cooldown(
         from agent.shared_primary_cooldown import arm_cooldown, read_cooldown, route_from_agent
         primary_route = route_from_agent(agent)
         existing = read_cooldown(primary_route)
+        if (getattr(agent, "_shared_primary_probe_failed_outage_id", None)
+                and (not isinstance(existing, dict)
+                     or str(existing.get("outage_id") or "") != str(agent._shared_primary_probe_failed_outage_id))):
+            agent._shared_primary_probe_failed_outage_id = None
         owner = str(existing.get("probe_owner") or "") if isinstance(existing, dict) else ""
         token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
         if owner and owner != token:
@@ -131,6 +138,7 @@ def _arm_rate_limit_cooldown(
             reset_at=_provider_reset_epoch(reset_at),
             backoff_count=backoff_count,
             request_id=request_id,
+            request_started_at=getattr(agent, "_current_api_request_started_at", None),
             short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
                           and (primary_route[0] == "custom" or primary_route[0].startswith("custom:"))),
         )

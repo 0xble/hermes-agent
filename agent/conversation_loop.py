@@ -1,9 +1,11 @@
+# health: allow FILE_LINES -- request start timestamp belongs at the existing turn-loop seam
 """The agent conversation loop — extracted from ``run_agent.AIAgent``.
 
 ``run_conversation(agent, ...)`` drives one user turn (model call, tool dispatch,
 retries, fallbacks, compression, post-turn hooks). Symbols that callers patch on
 ``run_agent`` (``handle_function_call``, ``_set_interrupt``, ``OpenAI``) resolve via
 ``_ra`` so those patches keep working."""
+
 
 from __future__ import annotations
 
@@ -1788,7 +1790,9 @@ def _run_conversation_turn(
                     continue
         _run_phase(announce_api_call, agent, s)
 
-        s.api_start_time, s.retry_count, s.max_retries = time.time(), 0, agent._api_max_retries
+        s.api_start_time = time.time()
+        agent._current_api_request_started_at = s.api_start_time
+        s.retry_count, s.max_retries = 0, agent._api_max_retries
         s._retry, s.finish_reason, s.response, s.api_kwargs = TurnRetryState(), "stop", None, None
         s.api_request_id = agent._current_api_request_id = f"{s.turn_id}:api:{s.api_call_count}"
 
