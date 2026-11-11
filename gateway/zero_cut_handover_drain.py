@@ -64,6 +64,12 @@ def _telegram_adapters(runner):
             yield adapter
 
 
+def running_cron_job_count() -> int:
+    """Count scheduler jobs for fail-awake scale-to-zero accounting."""
+    from cron.scheduler import get_running_job_ids
+    return len(get_running_job_ids())
+
+
 async def _handover(runner) -> None:
     from plugins.platforms.telegram.disconnect_handover import handover_stop_polling, release_handover_lock
 
@@ -187,6 +193,12 @@ def handover_runs_followups(runner) -> bool:
     state = getattr(runner, "_zero_cut_handover_state", None) or {}
     stopping = getattr(runner, "_zero_cut_stop_task", None) is not None  # the real stop spools as today
     return bool(state.get("token_lock_released") and not state.get("failed") and not stopping)
+
+
+def handover_owns_external_drain(runner) -> bool:
+    """True while an accepted handover owns external quiescence before shutdown takes over."""
+    state = getattr(runner, "_zero_cut_handover_state", None)
+    return bool(state is not None and not state.get("failed") and not getattr(runner, "_draining", False))
 
 
 def handover_accepts_received(runner, source) -> bool:

@@ -36,6 +36,7 @@ from agent.async_utils import cancel_task_with_grace
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
+from gateway.zero_cut_handover_drain import handover_owns_external_drain, running_cron_job_count
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -222,18 +223,6 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
             # bare runner double lacks the hook (upstream drain tests call this unbound).
             + getattr(self, "_active_async_delegation_count", GatewayShutdownMixin._active_async_delegation_count)()
         )
-
-    @staticmethod
-    def _running_cron_job_count() -> int:
-        # The FULL work aggregate, not _running_agent_count(): cron jobs run on the scheduler's own thread
-        # pool and API-server runs live on the adapter — both outside _running_agents (the #60432 blind
-        # spot), so counting agents alone let a suspend land mid-cron-job. Fail-AWAKE accounting: the shared
-        # shutdown-drain counters (_active_cron_job_count/_active_api_run_count) swallow exceptions to 0,
-        # which is fine for a drain but unsafe for a suspend predicate — a transient read failure would make
-        # live work look idle and reopen the mid-job freeze. Here an unreadable source counts as work
-        # (sentinel 1) so the machine stays awake until the source is readable again.
-        from cron.scheduler import get_running_job_ids
-        return len(get_running_job_ids())
 
     def _active_cron_job_count(self) -> int:
         """Cron jobs currently executing — they run outside ``_running_agents``; 0 if cron can't import.
@@ -511,7 +500,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
                 logger.debug("scale-to-zero: %s unreadable — staying awake", label, exc_info=True)
                 return busy_sentinel
 
-        cron_count = _read_or_awake("cron work count", self._running_cron_job_count, 1)
+        cron_count = _read_or_awake("cron work count", running_cron_job_count, 1)
         api_count = _read_or_awake("api work count", lambda: self._api_server_hook("active_agent_work_count"), 1)
         # An attached dashboard/desktop/TUI client (heartbeat mtime) is inbound activity — folded into
         # the inbound clock, not a conjunct, so a lingering marker cannot pin the box.
@@ -763,8 +752,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
         """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
         if not self._external_drain_active:
             return
-        handover = getattr(self, "_zero_cut_handover_state", None)
-        if handover is not None and not handover.get("failed") and not self._draining:
+        if handover_owns_external_drain(self):
             # The handover owns this shared quiescence until it either fails and restores
             # transport ownership or hands control to the real shutdown drain.
             return
