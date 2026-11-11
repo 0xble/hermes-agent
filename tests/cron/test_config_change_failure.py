@@ -23,7 +23,10 @@ def test_config_mutating_run_keeps_result_and_warns_once(tmp_path, monkeypatch, 
     assert result[0] is success
     assert result[1].startswith("real output")
     assert result[2] == "real response"
-    assert result[3] == ("real error" if not success else "")
+    if success:
+        assert result[3] == ""
+    else:
+        assert result[3].startswith("real error\nconfig.yaml changed while cron job")
     warnings = [r.message for r in caplog.records if "config.yaml changed while cron job" in r.message]
     assert len(warnings) == 1
     assert "quota-burn-fixture" in warnings[0]
