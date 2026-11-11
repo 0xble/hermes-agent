@@ -411,8 +411,15 @@ def _prune_unlocked(conn: sqlite3.Connection, *, keep_ids: Iterable[str] = ()) -
     """
     from hermes_cli.config import load_config_readonly
 
-    value = (load_config_readonly().get("cron") or {}).get(
-        "execution_retention_days", TERMINAL_RETENTION_DAYS)
+    try:
+        value = (load_config_readonly().get("cron") or {}).get(
+            "execution_retention_days", TERMINAL_RETENTION_DAYS)
+    except Exception as exc:  # health: allow BLE001 -- terminal bookkeeping must survive invalid config
+        from hermes_cli.config_errors import ConfigValidationError
+        if not isinstance(exc, ConfigValidationError):
+            raise
+        logger.warning("Invalid config while pruning cron execution history, using default retention: %s", exc)
+        value = TERMINAL_RETENTION_DAYS
     try:
         days = float(value)
         if not math.isfinite(days) or days < 0:

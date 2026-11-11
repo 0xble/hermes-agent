@@ -979,19 +979,6 @@ _VALID_CUSTOM_PROVIDER_FIELDS = {
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
 
 
-@dataclass
-class ConfigIssue:
-    """A config problem. ``local_detail`` is for operator diagnostics, never transport replies."""
-    severity: str  # "error", "warning"
-    message: str
-    hint: str
-    local_detail: str = ""
-
-
-def _issue(issues: list[ConfigIssue], severity: str, message: str, hint: str) -> None:
-    issues.append(ConfigIssue(severity, message, hint))
-
-
 def _require_fields(
     issues: list[ConfigIssue], entry: dict[str, Any], label: str,
     fields: tuple[tuple[str, str], ...], suffix: str = "") -> None:
@@ -1900,7 +1887,8 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
         try:
-            data = read_config_doc(config_path) or {}
+            loaded = read_config_doc(config_path)
+            data = {} if loaded is None else loaded
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return FailedConfigRead(error=e)
@@ -2339,7 +2327,8 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
 
         if user_sig is not None:
             try:
-                user_config = read_config_doc(config_path) or {}
+                loaded = read_config_doc(config_path)
+                user_config = {} if loaded is None else loaded
                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
             except Exception as e:
