@@ -52,7 +52,7 @@ def test_attached_skill_is_read_without_running_preprocessing(tmp_path, monkeypa
     skill = tmp_path / "skill" / "SKILL.md"
     skill.parent.mkdir()
     skill.write_text("---\nname: skill\ndeps: [never-install-me]\n---\nRun `custom-check --json`.\n")
-    monkeypatch.setattr(skills_tool, "_skill_search_dirs", lambda: ([(TIER_LOCAL, tmp_path)], tmp_path))
+    monkeypatch.setattr(skills_tool, "skill_search_dirs", lambda: ([(TIER_LOCAL, tmp_path)], tmp_path))
     issues = job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["skill"]})
     assert len(issues) == 1 and "terminal" in issues[0]
 
@@ -291,7 +291,7 @@ def test_attached_bundle_members_and_instruction_are_scanned(tmp_path, monkeypat
     bundles.mkdir()
     (bundles / "daily.yaml").write_text("name: daily\nskills: [audit]\ninstruction: Use Pick the Destination.\n")
     monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles))
-    monkeypatch.setattr(skills_tool, "_skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
+    monkeypatch.setattr(skills_tool, "skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
     issues = job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["daily"]}, cfg={})
     assert len(issues) == 2
     assert "terminal access" in issues[0] and "relay" in issues[1]
@@ -314,7 +314,7 @@ def test_empty_loaded_bundle_member_activates_bundle_instruction(tmp_path, monke
     bundles.mkdir()
     (bundles / "daily.yaml").write_text("name: daily\nskills: [empty]\ninstruction: Use Pick the Destination.\n")
     monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles))
-    monkeypatch.setattr(skills_tool, "_skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
+    monkeypatch.setattr(skills_tool, "skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
     issues = job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["daily"]}, cfg={})
     assert len(issues) == 1 and "relay" in issues[0]
 
@@ -329,7 +329,7 @@ def test_missing_bundle_members_do_not_activate_bundle_instruction(tmp_path, mon
     bundles.mkdir()
     (bundles / "daily.yaml").write_text("name: daily\nskills: [missing]\ninstruction: Use Pick the Destination.\n")
     monkeypatch.setenv("HERMES_BUNDLES_DIR", str(bundles))
-    monkeypatch.setattr(skills_tool, "_skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
+    monkeypatch.setattr(skills_tool, "skill_search_dirs", lambda: ([(TIER_LOCAL, skills)], skills))
     assert job_tool_requirement_issues({"enabled_toolsets": ["file"], "skills": ["daily"]}, cfg={}) == []
 
 
