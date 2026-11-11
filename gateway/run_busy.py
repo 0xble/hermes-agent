@@ -21,7 +21,8 @@ import inspect
 import json
 import os
 import time
-from agent.i18n import DEFAULT_LANGUAGE, t
+from agent.i18n import t
+from gateway.run_busy_approval import approval_input_words
 from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
@@ -48,22 +49,6 @@ def _call_with_steer_delivery(method, text: str, on_delivered=None) -> bool:
     if accepted and on_delivered is not None:
         on_delivered()
     return accepted
-
-
-def approval_input_words(input_key: str) -> tuple[str, ...]:
-    """Typed-reply synonyms for ``approval.inputs.<input_key>`` (comma-lists): the English words
-    ALWAYS match, plus the active language's list, so a Polish pack can add "tak" without losing
-    "yes". Lower-cased, de-duplicated, order preserved (English first)."""
-    seen: dict[str, None] = {}
-    key = f"approval.inputs.{input_key}"
-    for raw in (t(key, lang=DEFAULT_LANGUAGE), t(key)):
-        if raw == key:  # catalog miss: t() echoes the key
-            continue
-        for word in raw.split(","):
-            word = word.strip().lower()
-            if word:
-                seen.setdefault(word, None)
-    return tuple(seen)
 
 
 # Log-record parity with the origin module.

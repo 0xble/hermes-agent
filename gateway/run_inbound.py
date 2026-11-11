@@ -30,7 +30,7 @@ from gateway.cron_review import is_review_event
 from gateway.platforms.base import EphemeralReply, as_command_reply
 from gateway.platforms.event import MessageEvent, MessageType, clean_attachment_filename, turn_origin_for_event
 from gateway.platforms.typing_state import resume_typing_after_prompt
-from gateway.run_busy import approval_input_words
+from gateway.run_busy_approval import approval_input_words
 from gateway.run_common import _UNSET
 from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
