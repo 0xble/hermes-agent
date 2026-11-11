@@ -66,7 +66,7 @@ def test_credential_shape_boundary_fails_closed_for_non_text_startup_values():
 
     assert credential_shaped(None) is False
     assert credential_shaped(12345678) is False
-    assert credential_shaped(482913, label=None) is False
+    assert credential_shaped("482913", label=None) is False
 
 
 @pytest.mark.parametrize(("text", "repeat"), [
