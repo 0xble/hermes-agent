@@ -73,10 +73,15 @@ Completion notifications remain the fast path. The supervisor automatically disa
 ```yaml
 checkins:
   enabled: true
+  only_roots: []
   first_after_seconds: 1200
   interval_seconds: 1800
 ```
 
 Both durations have a **300-second minimum**. Invalid durations use the defaults. Set `enabled: false` to disable automatic supervision. Changes are read by the gateway scheduler, no separate service or cron job is required.
+
+To supervise only selected conversations, set `only_roots` to a list of their exact compression-root session IDs. An absent or empty list preserves profile-wide supervision. A physical session created by compression retains its original root. A reset or fork has its own root. Invalid root lists and unreadable configuration fail closed instead of expanding supervision.
+
+The owning profile's current configuration is checked at scheduling, execution and final delivery, including delayed or recovered delivery. Disabling check-ins or removing a root drops a pending supervisor status even if its inspection already started. An addressed human takeover and a successful result that verifies the last dependency retain their normal delivery. Allowing a previously scanned idle conversation re-arms it on the next scheduler poll without a new user message or restart.
 
 Check-ins do not consume the session's [`/loop`](./loops) or [`/heartbeat`](./heartbeat) slot. An active goal does not defer them, and existing quiet goal and heartbeat behavior remains unchanged when no background work is outstanding.

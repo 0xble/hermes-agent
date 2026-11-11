@@ -997,10 +997,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)
 
-    def _event_thread_metadata(self, event, source):
-        """Thread metadata for a send that replies to ``event`` on ``source``."""
-        return self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
-
     @staticmethod
     def _pop_post_delivery_callback(adapter, key, generation):
         """Pop the adapter's deferred post-delivery callback for ``key`` (legacy dict fallback)."""
