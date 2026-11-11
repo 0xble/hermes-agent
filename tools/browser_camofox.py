@@ -312,6 +312,8 @@ def _rewrite_loopback_url_for_camofox(url: str) -> tuple[str, Optional[dict[str,
 SHARED_IDENTITY_GROUP = "__shared_identity__"
 _sessions: Dict[str, Dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
 _sessions_lock = threading.RLock()
+# Cleanup epochs invalidate identity lookups that started before a task was released.
+_task_release_epochs: Dict[str, int] = {}
 # Only successful POST /tabs creates ownership. Bindings may be replaced or carried;
 # keep the exact identity and profile separately until close is confirmed.
 _owned_tabs: Dict[tuple[str, str, str, str], Dict[str, Any]] = {}
@@ -628,6 +630,7 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
     account = _resolve_account(account)
     with _sessions_lock:
         prior = _sessions.get(task_id)
+        release_epoch = _task_release_epochs.get(task_id, 0)
         bound_account = prior.get("account") if prior is not None else None
         bound_user_id = prior.get("user_id") if prior is not None else None
     # Registry HTTP must not serialize unrelated tasks or their cleanup. Resolve before
@@ -636,6 +639,7 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
     identity = get_camofox_account_identity(identity_account, task_id) if identity_account is not None else None
     with _sessions_lock:
         if (_sessions.get(task_id) is not prior
+                or _task_release_epochs.get(task_id, 0) != release_epoch
                 or (prior is not None and (prior.get("account") != bound_account
                                            or prior.get("user_id") != bound_user_id))):
             raise ValueError("Camofox task binding changed while resolving its identity; retry the browser operation")
@@ -847,6 +851,8 @@ def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool =
                           if key not in keys and session.get("carried")
                           and session.get("carried_from") in keys}:
             keys |= carried
+        for key in keys:
+            _task_release_epochs[key] = _task_release_epochs.get(key, 0) + 1
         for key in keys:
             _drop_session_locked(key)  # quarantine before destroying tabs
     # The DELETE calls must not run while the process-wide session lock is held.
