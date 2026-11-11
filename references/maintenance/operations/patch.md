@@ -2,10 +2,11 @@
 
 ## kanban-submit-registration (candidate; activation held)
 
-Register the spawned submitter atomically before owner admission so a dispatcher
-SIGKILL in the spawn/record gap cannot release its card beside live user work.
-Source-only draft candidate, activation held by the request. Contract, diagnosis,
-rollback and retirement: `maintenance/kanban-submit-registration.md`.
+Harden the existing submitter registration before owner admission: resolve
+`HERMES_KANBAN_DB` strictly, fail closed on registration SQLite errors, and let
+owner startup/admission tracebacks surface. Source-only draft candidate, activation
+held by the request. Contract, diagnosis, rollback and retirement:
+`maintenance/kanban-submit-registration.md`.
 
 ## cron-person-send-admission (candidate; activation held)
 
