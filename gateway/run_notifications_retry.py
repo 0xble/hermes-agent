@@ -27,7 +27,7 @@ class GatewayDelegationRetrySweepMixin:
             # errors are failures, not an expected competing-writer deferral.
             if getattr(exc, "sqlite_errorcode", 0) & 0xFF != sqlite3.SQLITE_BUSY:
                 failures.pop(key, None)
-                logger.warning("Delegation retry sweep failed for profile %s: %s", profile, exc)
+                logger.warning("Delegation retry sweep failed for profile %s", profile, exc_info=True)
                 return []
             count = failures[key] = failures.get(key, 0) + 1
             threshold = max(1, math.ceil(RETRY_CLAIM_TTL_S / ORPHAN_SWEEP_INTERVAL_S))
@@ -36,9 +36,9 @@ class GatewayDelegationRetrySweepMixin:
                 "Delegation retry sweep deferred: database busy; retrying next sweep "
                 "(profile=%s consecutive=%d warning_after=%d)", profile, count, threshold)
             return []
-        except (sqlite3.DatabaseError, OSError) as exc:
+        except Exception:
             failures.pop(key, None)
-            logger.warning("Delegation retry sweep failed for profile %s: %s", profile, exc)
+            logger.warning("Delegation retry sweep failed for profile %s", profile, exc_info=True)
             return []
         if count := failures.pop(key, 0):
             logger.info("Delegation retry sweep recovered for profile %s after %d busy sweeps", profile, count)
@@ -50,13 +50,19 @@ class GatewayDelegationRetrySweepMixin:
         from hermes_cli.profiles import get_active_profile_name
 
         primary = get_active_profile_name() or "default"
-        actions = self._collect_profile_retry_actions(primary)
+        def _collect(profile: str, home=None) -> list:
+            try:
+                if home is None:
+                    return self._collect_profile_retry_actions(profile)
+                with _profile_runtime_scope(Path(home), {}):
+                    return self._collect_profile_retry_actions(profile)
+            except Exception:
+                logger.warning("Delegation retry sweep failed for profile %s", profile, exc_info=True)
+                return []
+
+        actions = _collect(primary)
         for profile, home in (getattr(self, "_served_profile_homes", None) or {}).items():
             if profile in {primary, getattr(self, "_primary_profile_name", None)}:
                 continue
-            try:
-                with _profile_runtime_scope(Path(home), {}):
-                    actions.extend(self._collect_profile_retry_actions(profile))
-            except (OSError, TypeError, ValueError, RuntimeError) as exc:
-                logger.warning("Delegation retry sweep failed for profile %s: %s", profile, exc)
+            actions.extend(_collect(profile, home))
         return actions

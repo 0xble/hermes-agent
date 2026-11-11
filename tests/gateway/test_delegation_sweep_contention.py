@@ -3,6 +3,7 @@
 import logging
 import math
 import sqlite3
+import time
 
 import pytest
 
@@ -19,8 +20,7 @@ def test_busy_sweep_retains_claims_recovers_and_escalates(tmp_path, monkeypatch,
     homes = {name: tmp_path / name for name in ("default", "secondary")}
     monkeypatch.setenv("HERMES_HOME", str(homes["default"]))
     monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
-    now = 1_800_000_000.0
-    monkeypatch.setattr(dr.time, "time", lambda: now)
+    now = time.time()
     for name, home in homes.items():
         with _profile_runtime_scope(home, {}), ad._transaction() as conn:
             conn.execute("PRAGMA journal_mode=WAL")
@@ -74,4 +74,72 @@ def test_busy_sweep_retains_claims_recovers_and_escalates(tmp_path, monkeypatch,
     runner._served_profile_homes["secondary"] = object()
     caplog.clear()
     assert runner._collect_delegation_retry_actions() == []
-    assert all(r.levelno == logging.WARNING and "failed" in r.message for r in caplog.records)
+    records = [r for r in caplog.records if "Delegation retry sweep failed" in r.message]
+    assert len(records) == 2
+    assert all(r.levelno == logging.WARNING and r.exc_info for r in records)
+
+
+def test_primary_sweep_failure_does_not_skip_secondary(tmp_path, monkeypatch, caplog):
+    from gateway.run import _profile_runtime_scope
+    from hermes_constants import get_hermes_home
+
+    homes = {name: tmp_path / name for name in ("default", "secondary")}
+    monkeypatch.setenv("HERMES_HOME", str(homes["default"]))
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    for home in homes.values():
+        home.mkdir()
+    with _profile_runtime_scope(homes["default"], {}):
+        runner = object.__new__(GatewayRunner)
+        runner._served_profile_homes = homes
+        runner._primary_profile_name = "default"
+
+        calls = []
+
+        def sweep():
+            profile = get_hermes_home().name
+            calls.append(profile)
+            if profile == "default":
+                raise ValueError("primary sweep failed")
+            return [{"delegation_id": "secondary-action"}]
+
+        monkeypatch.setattr(dr, "sweep_retries", sweep)
+        caplog.set_level(logging.WARNING, logger="gateway.run")
+        actions = runner._collect_delegation_retry_actions()
+
+    assert calls == ["default", "secondary"]
+    assert [action["delegation_id"] for action in actions] == ["secondary-action"]
+    records = [r for r in caplog.records if "Delegation retry sweep failed" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info
+
+
+def test_secondary_sweep_failure_preserves_actions_and_later_profiles(tmp_path, monkeypatch, caplog):
+    from gateway.run import _profile_runtime_scope
+    from hermes_constants import get_hermes_home
+
+    homes = {name: tmp_path / name for name in ("default", "broken", "later")}
+    monkeypatch.setenv("HERMES_HOME", str(homes["default"]))
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "default")
+    for home in homes.values():
+        home.mkdir()
+    with _profile_runtime_scope(homes["default"], {}):
+        runner = object.__new__(GatewayRunner)
+        runner._served_profile_homes = homes
+        runner._primary_profile_name = "default"
+
+        def sweep():
+            profile = get_hermes_home().name
+            if profile == "broken":
+                raise KeyError(profile)
+            return [{"delegation_id": f"{profile}-action"}]
+
+        monkeypatch.setattr(dr, "sweep_retries", sweep)
+        caplog.set_level(logging.WARNING, logger="gateway.run")
+        actions = runner._collect_delegation_retry_actions()
+
+    assert [action["delegation_id"] for action in actions] == ["default-action", "later-action"]
+    records = [r for r in caplog.records if "Delegation retry sweep failed" in r.message]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    assert records[0].exc_info
