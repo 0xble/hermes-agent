@@ -320,9 +320,14 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
 
     for base in _hermes_dirs():
         for sub in _HERMES_PROTECTED_SUBPATHS:
-            with suppress(Exception):
-                if _is_under(resolved, _realpath(os.path.join(str(base), sub))):
+            anchor = os.path.join(str(base), sub)
+            if _named_remote():
+                if _is_under(resolved, _realpath(anchor)):
                     return "credential"
+            else:
+                with suppress(Exception):
+                    if _is_under(resolved, _realpath(anchor)):
+                        return "credential"
 
     safe_roots = get_safe_write_roots()
     if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):

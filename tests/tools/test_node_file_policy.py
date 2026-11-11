@@ -59,6 +59,27 @@ def test_unavailable_policy_anchor_refuses_without_writing(peers, monkeypatch):
     assert not (roots["macstudio"] / "untouched.txt").exists()
 
 
+@pytest.mark.parametrize("anchor", ["vault", "state.db"])
+def test_unavailable_protected_write_anchor_refuses_without_writing(peers, monkeypatch, anchor):
+    from tools import file_backend_state
+
+    roots, path, *_ = peers
+    hermes = roots["macstudio"] / "home/.hermes"
+    target = hermes / anchor / "evil.txt"
+    remote_path = file_backend_state.remote_path
+
+    def unavailable(candidate, **kwargs):
+        if str(candidate) == str(hermes / anchor):
+            raise RuntimeError("fixture selected-node write policy unavailable")
+        return remote_path(candidate, **kwargs)
+
+    monkeypatch.setattr(file_backend_state, "remote_path", unavailable)
+    result = call("write_file", {"node": "macstudio", "path": path + f"/home/.hermes/{anchor}/evil.txt",
+                                 "content": "refused"})
+    assert "write policy unavailable" in result.get("error", ""), result
+    assert not target.exists()
+
+
 @pytest.mark.parametrize("anchor", ["auth.json", "vault"])
 def test_unavailable_read_anchor_refuses_symlinked_credential(peers, monkeypatch, anchor):
     from tools import file_backend_state
