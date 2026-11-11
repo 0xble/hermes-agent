@@ -36,7 +36,7 @@ class GatewayDelegationRetrySweepMixin:
                 "Delegation retry sweep deferred: database busy; retrying next sweep "
                 "(profile=%s consecutive=%d warning_after=%d)", profile, count, threshold)
             return []
-        except Exception as exc:
+        except (sqlite3.DatabaseError, OSError) as exc:
             failures.pop(key, None)
             logger.warning("Delegation retry sweep failed for profile %s: %s", profile, exc)
             return []
@@ -57,6 +57,6 @@ class GatewayDelegationRetrySweepMixin:
             try:
                 with _profile_runtime_scope(Path(home), {}):
                     actions.extend(self._collect_profile_retry_actions(profile))
-            except Exception as exc:
+            except (OSError, TypeError, ValueError, RuntimeError) as exc:
                 logger.warning("Delegation retry sweep failed for profile %s: %s", profile, exc)
         return actions
