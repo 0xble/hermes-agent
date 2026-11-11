@@ -2540,29 +2540,13 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
-    dropped_tool_names=None, overflow_terminal=False, api_mode=None, clean_eof=False):
+    dropped_tool_names=None, dropped_tool_argument_chars=0, overflow_terminal=False, api_mode=None, clean_eof=False):
     """Stub for an SSE stream that ended without ``finish_reason`` after
     delivering content. Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH``
     so the loop enters its continuation/retry path instead of accepting
-    truncated output as a complete turn (#32086).
-
-    ``overflow_terminal`` (``full_content=None``): the stream died on a
-    context-overflow error. Seeding the recovered text as a continuation stub
-    would grow every later request into the same overflow (#106260); the loop
-    treats the marker as terminal and ends the turn via the recovery contract.
-
-    ``api_mode="anthropic_messages"`` returns a Messages-shaped stub (``content``
-    block list + ``stop_reason="max_tokens"``) so AnthropicTransport validates it
-    and the loop continues instead of entering the invalid-response retry ladder
-    (#45908). Empty content keeps one empty text block: validate_response rejects
-    an empty list for ``max_tokens``.
-
-    ``clean_eof``: the stream ended with no transport exception and no
-    ``finish_reason`` (server/intermediary closed cleanly). Only the two
-    clean-EOF sites in ``_finish_chat_stream`` pass True; the stub built after a
-    real transport exception keeps False so the loop can word the two failure
-    modes differently (#102766).
-    """
+    truncated output as a complete turn (#32086). Overflow is terminal (#106260),
+    Anthropic preserves its Messages shape (#45908), and ``clean_eof`` distinguishes
+    a clean server close from a transport exception (#102766)."""
     if api_mode == "anthropic_messages":
         return SimpleNamespace(
             id=PARTIAL_STREAM_STUB_ID,
@@ -2574,6 +2558,7 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
             stop_sequence=None,
             usage=usage_obj,
             _dropped_tool_names=dropped_tool_names or None,
+            _dropped_tool_argument_chars=dropped_tool_argument_chars,
             _overflow_terminal=overflow_terminal,
             _clean_eof=clean_eof,
         )
@@ -2588,6 +2573,7 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
         )],
         usage=usage_obj,
         _dropped_tool_names=dropped_tool_names or None,
+        _dropped_tool_argument_chars=dropped_tool_argument_chars,
         _overflow_terminal=overflow_terminal,
         _clean_eof=clean_eof,
     )
@@ -2891,6 +2877,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.on_first_delta = on_first_delta
         self.worker = None  # request thread; None in inline mode
         self.result = {"response": None, "error": None, "partial_tool_names": []}
+        self._partial_tool_accumulator = None
         self.clients = _RequestClientRegistry(agent)
         # Request-local cancel flag: the worker recognizes its own interrupt
         # force-close (RemoteProtocolError) and exits instead of retrying (#6600).
@@ -2962,6 +2949,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # its tool name (died before any text) must not label a later partial stub or retry.
         self.provider_tool_in_flight["yes"], self.prompt_progress["progress"] = False, None
         self.result["partial_tool_names"] = []
+        self._partial_tool_accumulator = None
         return attempt_id
 
     def _cancel_current_stream_attempt(self, reason: str) -> None:
@@ -3219,6 +3207,7 @@ class _StreamingCall(StreamingWaitMonitor):
         pending_text_parts: list[str] = []
         from agent.chat_completion_helpers_tool_calls import _ToolCallAccumulator
         tool_calls = _ToolCallAccumulator()
+        self._partial_tool_accumulator = tool_calls
         tool_calls_acc = tool_calls.acc
         from agent.reasoning_carriers import StreamCarriers
         carriers = StreamCarriers()
@@ -3501,13 +3490,17 @@ class _StreamingCall(StreamingWaitMonitor):
             # Partial args WITH finish_reason="length" is a real output cap; with NONE the
             # upstream dropped mid tool-call, and stamping "length" burns 3 useless retries.
             _dropped_names = [(tool_calls_acc[idx]["function"]["name"] or "?") for idx in sorted(tool_calls_acc)]
+            _arg_chars = sum(len(tool_calls_acc[idx]["function"]["arguments"]) for idx in sorted(tool_calls_acc))
             logger.warning(
                 "Clean EOF, no finish_reason: server ended the stream (no transport exception) while a tool "
                 "call's arguments were still incomplete (tools=%s). The server or a proxy closed the stream "
-                "cleanly; not an output-length truncation.",
-                _dropped_names)
+                "cleanly; not an output-length truncation. model=%s provider=%s base_url_host=%s stale_timeout=%s "
+                "arg_chars=%s error_class=%s", _dropped_names, getattr(self.agent, "model", "unknown"),
+                getattr(self.agent, "provider", "") or "unknown", base_url_hostname(getattr(self.agent, "base_url", "") or "") or "unknown",
+                self._stream_stale_timeout, _arg_chars, "CleanEOF")
             return _build_partial_stream_stub(
                 role, full_content, full_reasoning, model_name, usage_obj, dropped_tool_names=_dropped_names or None,
+                dropped_tool_argument_chars=_arg_chars,
                 clean_eof=True)
         if finish_reason is None and (content_parts or reasoning_parts) and not tool_calls_acc and usage_obj is None:
             # Text-only (or reasoning-only) drop: otherwise the partial text is stamped "stop"
@@ -3582,6 +3575,7 @@ class _StreamingCall(StreamingWaitMonitor):
         from agent import relay_llm
         from agent.anthropic_adapter import normalize_stream_usage, sanitize_anthropic_kwargs
         accumulator = relay_llm.AnthropicStreamAccumulator()
+        self._partial_tool_accumulator = accumulator
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
@@ -4052,27 +4046,9 @@ class _StreamingCall(StreamingWaitMonitor):
         self._stream_stale_timeout = _cloud_stale_timeout_for(self.agent, self.api_kwargs)
 
     def _partial_stream_stub(self, error):
-        """Tokens already reached the platform: a finish_reason="length" stub fires the
-        continuation machinery; tool_calls=None blocks executing incomplete calls.
-        Content may be EMPTY (dropped tool call, overflow) — the loop skips appending an
-        empty stub and only sends the nudge (placeholder text leaked into the stitched
-        response). A text-only death with 0 visible chars never gets here: the error
-        handler reclassifies it as undelivered (#112419)."""
+        """Turn delivered tokens into a safe continuation stub; empty text is not persisted (#112419)."""
         _partial_text = (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip() or None
         _partial_names = list(self.result.get("partial_tool_names") or [])
-        if _partial_names:
-            # User-visible warning so the user and model both know what was attempted.
-            _name_str = ", ".join(_partial_names[:3])
-            if len(_partial_names) > 3:
-                _name_str += f", +{len(_partial_names) - 3} more"
-            _warn = (f"\n\n⚠ Stream stalled mid tool-call ({_name_str}); the action was not executed. "
-                     f"Ask me to retry if you want to continue.")
-            _partial_text = (_partial_text or "") + _warn  # model/result bookkeeping, never gated
-            if self.agent._warning_presentation_enabled():
-                self._quiet(self.agent._fire_stream_delta, _warn)  # visible immediately
-            logger.warning(
-                "Partial stream dropped tool call(s) %s after %s chars of text; surfaced warning to user: %s",
-                _partial_names, len(_partial_text or ""), error)
         # Classify the error before it is swallowed into the stub: the loop reads the
         # content-filter tag and falls back; a context overflow must not be continued at all.
         _cls = None
@@ -4080,12 +4056,33 @@ class _StreamingCall(StreamingWaitMonitor):
             from agent.error_classifier import classify_api_error
             _cls = classify_api_error(
                 error, provider=str(getattr(self.agent, "provider", "") or ""), model=str(getattr(self.agent, "model", "") or ""))
+        _arg_chars = 0
+        if self._partial_tool_accumulator is not None:
+            with contextlib.suppress(Exception):
+                _arg_chars = self._partial_tool_accumulator.argument_chars()
+        _overflow_terminal = _cls is not None and _cls.reason == FailoverReason.context_overflow
+        if _partial_names:
+            logger.warning(
+                "Partial stream dropped tool call(s) %s after %s chars of text; model=%s provider=%s base_url_host=%s "
+                "stale_timeout=%s arg_chars=%s error_class=%s error=%s", _partial_names, len(_partial_text or ""),
+                getattr(self.agent, "model", "unknown"), getattr(self.agent, "provider", "") or "unknown",
+                base_url_hostname(getattr(self.agent, "base_url", "") or "") or "unknown", self._stream_stale_timeout,
+                _arg_chars, type(error).__name__, error)
+        if _partial_names and not _overflow_terminal:
+            _name_str = ", ".join(_partial_names[:3])
+            if len(_partial_names) > 3:
+                _name_str += f", +{len(_partial_names) - 3} more"
+            _warn = (f"\n\n⚠ Stream cut mid tool-call ({_name_str}); retrying automatically. "
+                     "The action was not executed.")
+            _partial_text = (_partial_text or "") + _warn
+            if self.agent._warning_presentation_enabled():
+                self._quiet(self.agent._fire_stream_delta, _warn)
         _reset_stale_streak(self.agent)  # deltas fired => provider responsive: clear the breaker
         # #106260: continuing after a context-overflow error re-sends a larger request into the
         # same overflow. Return an EMPTY stub marked terminal so the loop ends the turn instead.
         # Scope is context_overflow ONLY: payload_too_large (413) has its own byte-scored recovery
         # owner (turn_overflow._recover_payload_too_large, #88960/#47339) that must not be bypassed.
-        if _cls is not None and _cls.reason == FailoverReason.context_overflow:
+        if _overflow_terminal:
             logger.warning(
                 "Partial stream ended on a context-overflow error after %s chars; "
                 "NOT seeding a continuation stub (transcript is already over budget): %s",
@@ -4093,7 +4090,7 @@ class _StreamingCall(StreamingWaitMonitor):
             )
             return _build_partial_stream_stub(
                 "assistant", None, None, getattr(self.agent, "model", "unknown"), None,
-                dropped_tool_names=_partial_names, overflow_terminal=True,
+                dropped_tool_names=_partial_names, dropped_tool_argument_chars=_arg_chars, overflow_terminal=True,
                 api_mode=getattr(self.agent, "api_mode", None),
             )
         if not _partial_names:
@@ -4103,6 +4100,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 len(_partial_text or ""), error)
         _stub = _build_partial_stream_stub("assistant", _partial_text, None,
             getattr(self.agent, "model", "unknown"), None, dropped_tool_names=_partial_names,
+            dropped_tool_argument_chars=_arg_chars,
             api_mode=getattr(self.agent, "api_mode", None))
         if _cls is not None and _cls.reason == FailoverReason.content_policy_blocked:
             _stub._content_filter_terminated = True
