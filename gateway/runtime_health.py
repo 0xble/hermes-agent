@@ -36,7 +36,7 @@ def _readiness_issue() -> str:
         manifest, _inputs = memory_provider_dependency_inputs(name.strip())
         packages = [Requirement(raw).name for raw in
                     (manifest.get("python_dependencies") or manifest.get("pip_dependencies") or ())]
-    except Exception:
+    except Exception:  # health: allow BLE001 -- marker identity fallback must never break readiness checks
         # Optional package names enrich the warning, never gate its delivery.
         logger.debug("Could not read memory client package hints for %s", name, exc_info=True)
     detail = f" Client packages: {', '.join(packages)}." if packages else ""
@@ -54,7 +54,7 @@ def _marker(home: Path) -> Path:
 def _failure_key(home: Path) -> str:
     try:
         return str(_marker(home))
-    except Exception:
+    except Exception:  # health: allow BLE001 -- marker identity fallback must never break readiness checks
         return f"{__file__}:{home}"
 
 
@@ -73,7 +73,7 @@ async def check_memory_health(runner) -> None:
                 home = Path(home or get_default_hermes_root())
                 async with _async_profile_runtime_scope(home):
                     await _check_profile_health(runner, profile, home)
-            except Exception:
+            except Exception:  # health: allow BLE001 -- advisory profile probes must isolate failures
                 # Advisory probes must not block startup or the remaining profiles.
                 failures = getattr(runner, "_memory_health_failures", None)
                 if failures is None:
