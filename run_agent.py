@@ -1277,11 +1277,11 @@ class AIAgent(
         # Shown to the user as the reply, so no decision codes; the code stays in result["guardrail"].
         tool = decision.tool_name or "the same tool"
         if unattended:
-            # Nobody is waiting on this turn: state what failed, never ask anyone to reply.
+            # Nobody is waiting on this turn: state the bounded outcome, never ask anyone to reply.
             return (
-                f"Stopped: {tool} was blocked by the tool-loop guardrail after repeated failures "
+                f"Stopped: {tool} was blocked by the tool-loop guardrail after repeated no-progress calls "
                 f"(count {decision.count}); no further progress was possible through it this turn. "
-                "The last tool result shows the failure."
+                "The last tool result shows the guardrail details."
             )
         return (
             f"I stopped retrying because I kept running {tool} "

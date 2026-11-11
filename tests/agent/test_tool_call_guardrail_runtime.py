@@ -267,6 +267,40 @@ def test_unattended_guardrail_still_hard_stops_dead_endpoint_without_asking_user
     assert "web_search" in final
 
 
+def test_unattended_streak_halt_can_recover_by_switching_tools():
+    agent = _make_agent("terminal", "read_file", max_iterations=12, config=_hard_stop_config(), platform="telegram")
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("terminal", json.dumps({"command": "printf stable"}), f"terminal-{i}")],
+        )
+        for i in range(1, 6)
+    ]
+    responses.extend([
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("read_file", json.dumps({"path": "/tmp/recovery"}), "read-1")],
+        ),
+        _mock_response(content="recovered", finish_reason="stop", tool_calls=None),
+    ])
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("model_tools.handle_function_call", side_effect=[
+            json.dumps({"stdout": "stable"}),
+        ] * 5 + ["recovered contents"]),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("check and recover", turn_origin="goal_loop")
+
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "recovered"
+
+
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
     agent = _make_agent("web_search", config=_hard_stop_config())
     blocked_args = {"query": "blocked"}

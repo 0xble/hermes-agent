@@ -1,6 +1,6 @@
-"""Token-shape helpers for goal authoring findings (stale-identifier exemptions).
+"""Token-shape helpers for goal authoring findings.
 
-Split from ``hermes_cli.goals`` to keep that module from growing; behavior is unchanged."""
+Split from ``hermes_cli.goals`` to keep that module from growing."""
 
 from __future__ import annotations
 

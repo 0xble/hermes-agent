@@ -65,6 +65,9 @@ def _end_turn_on_guardrail_halt(agent: Any, messages: Any) -> Optional[str]:
         agent._unattended_guardrail_halts = getattr(agent, "_unattended_guardrail_halts", 0) + 1
         if agent._unattended_guardrail_halts < _UNATTENDED_HALT_LIMIT:
             agent._tool_guardrail_halt_decision = None
+            clear_halt = getattr(agent._tool_guardrails, "clear_halt_decision", None)
+            if clear_halt is not None:
+                clear_halt(decision)
             agent._emit_diagnostic_status(
                 f"⚠️ Tool guardrail blocked {decision.tool_name}: {decision.code}; continuing turn"
             )

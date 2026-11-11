@@ -377,6 +377,11 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
+    def clear_halt_decision(self, decision: ToolGuardrailDecision | None = None) -> None:
+        """Acknowledge a handled halt without resetting the other per-turn detectors."""
+        if decision is None or self._halt_decision is decision:
+            self._halt_decision = None
+
     def _decide(
         self, action: str, code: str, tool_name: str, count: int, signature: ToolCallSignature,
         *, message: str | None = None, **fmt: Any,
