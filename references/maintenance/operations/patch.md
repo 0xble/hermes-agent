@@ -1,6 +1,6 @@
 # Maintained fork patch register
 
-## kanban-submit-registration
+## kanban-submit-registration (candidate; activation held)
 
 Register the spawned submitter atomically before owner admission so a dispatcher
 SIGKILL in the spawn/record gap cannot release its card beside live user work.
