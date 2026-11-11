@@ -9,6 +9,7 @@ fallback → terminal result) and the interruptible backoff. Nothing here import
 from __future__ import annotations
 
 from dataclasses import dataclass
+import contextlib
 import json
 import logging
 import ssl
@@ -129,6 +130,9 @@ def handle_api_error(
         base_url=str(getattr(agent, "base_url", "") or ""),
         api_key=getattr(agent, "api_key", None),
     )
+    with contextlib.suppress(Exception):
+        from agent.shared_primary_cooldown import _fail_agent_probe
+        _fail_agent_probe(agent)
     logger.debug(
         "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
         classified.reason.value, classified.status_code,
