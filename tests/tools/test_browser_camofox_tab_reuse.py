@@ -1276,6 +1276,8 @@ def test_cleanup_during_initial_identity_lookup_invalidates_the_lookup(camofox):
     # The next operation is a fresh lookup and binds normally.
     assert _dispatch("browser_navigate", {"url": "https://fresh.test/", "account": "brianle"}, "target")["success"]
     assert cf._sessions["target"]["tab_id"]
+    cf.release_task_bindings({"target"}, close_created_tabs=True)
+    assert "target" not in cf._task_release_epochs
 
 
 def test_cleanup_without_an_inflight_lookup_does_not_retain_release_epochs(camofox):

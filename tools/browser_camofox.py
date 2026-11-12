@@ -866,6 +866,8 @@ def release_task_bindings(task_ids: Iterable[str], *, close_created_tabs: bool =
         for key in keys:
             if key in _active_identity_lookups:
                 _task_release_epochs[key] = _task_release_epochs.get(key, 0) + 1
+            else:
+                _task_release_epochs.pop(key, None)
         for key in keys:
             _drop_session_locked(key)  # quarantine before destroying tabs
     # The DELETE calls must not run while the process-wide session lock is held.
