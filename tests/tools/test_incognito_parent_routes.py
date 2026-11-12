@@ -1,11 +1,13 @@
 """Live-parent routes protect real private construction without disabling public logging."""
 from contextlib import nullcontext
 import json
+import os
 from typing import Any
 from unittest.mock import Mock, patch
 
 import pytest
 
+from agent import incognito_private_dir as private_dirs
 from agent import prompt_builder
 from agent.incognito import incognito_scope, is_incognito, register_session
 from agent.subagent_lifecycle import SubagentLaunchRequest, SubagentLifecycleService
@@ -48,6 +50,7 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
     parent._cached_system_prompt = "public frozen prompt"
     parent.set_incognito(private_parent)
     created = []
+    private_root = None
 
     def collect(batch, background):
         assert is_incognito() is private_parent
@@ -109,6 +112,11 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
         assert any("Context file AGENTS.md TRUNCATED" in str(call.args[0]) for call in warning.call_args_list)
         after = _files(tmp_path)
         if private_parent:
+            private_root = private_dirs.private_dir_for_session(parent.session_id, create=False)
+            assert private_root is not None
+            assert private_root.parent == private_dirs._configured_root()
+            assert not private_root.is_relative_to(tmp_path)
+            assert (private_root / ".owner").read_text(encoding="ascii").strip() == str(os.getpid())
             assert after == before
         else:
             assert b"Context file AGENTS.md TRUNCATED" in after["logs/agent.log"]
@@ -117,7 +125,11 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
             register_session(agent.session_id, False)
             agent.close()
         parent.set_incognito(False)
+        # Direct AIAgent callers own interval cleanup; the gateway normally does this.
+        private_dirs.discard_private_dir(parent.session_id)
         parent.close()
         register_session(parent.session_id, False)
         db.close()
         hermes_logging._reset_queued_handlers()
+    if private_parent:
+        assert private_root is not None and not private_root.exists()

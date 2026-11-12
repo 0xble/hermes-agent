@@ -349,10 +349,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
-    # Incognito interval directories default to the account's cache root, outside HERMES_HOME by
-    # design. Any test entering a private scope would otherwise create them in the real home.
+    # Incognito intervals live outside HERMES_HOME. Use a sibling sandbox even when a
+    # test selects tmp_path itself as its home and snapshots every file beneath it.
     from agent import incognito_private_dir as _incognito_private_dir
-    monkeypatch.setattr(_incognito_private_dir, "_configured_root", lambda: tmp_path / "incognito-private")
+    private_root = tmp_path_factory.mktemp("incognito-private")
+    monkeypatch.setattr(_incognito_private_dir, "_configured_root", lambda: private_root)
     # A test that pins the process home (hermes_constants.pin_process_hermes_home) must not
     # leak that module-global into the next test's routed-profile decisions.
     try:
