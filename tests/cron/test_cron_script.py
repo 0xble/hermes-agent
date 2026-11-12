@@ -451,6 +451,91 @@ class TestRunJobScript:
         assert pickled == "pickled True"  # __main__ outlives the body, as in a plain run
 
     @pytest.mark.platforms("posix")
+    @pytest.mark.parametrize("missing_interpreter", [False, True])
+    def test_posix_snapshot_uses_its_own_generation_environment(
+        self, cron_env, tmp_path, monkeypatch, missing_interpreter
+    ):
+        """Snapshot code belongs to the sibling venv, not workspace/venv or a newer selection.
+
+        Exercise real path resolution and a real child process. Only the unrelated managed-store
+        discovery is stubbed; mocking selected_venv would hide the original workspace/venv defect.
+        """
+        from cron import scheduler_script
+        from pm.environments import site_packages
+
+        generation = tmp_path / "installs" / "owner" / "environments" / "generation"
+        snapshot = generation / "workspace"
+        (snapshot / "cron").mkdir(parents=True)
+        (generation / ".lease-managed").touch()
+        monkeypatch.setattr(scheduler_script, "__file__", str(snapshot / "cron" / "scheduler_script.py"))
+        monkeypatch.setattr(
+            "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
+        )
+        monkeypatch.delenv("PYTHONPATH", raising=False)
+
+        venv = generation / "venv"
+        (venv / "bin").mkdir(parents=True)
+        base_executable = getattr(sys, "_base_executable", sys.executable)
+        if not missing_interpreter:
+            (venv / "bin" / "python").symlink_to(base_executable)
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {Path(sys.base_prefix) / 'bin'}\ninclude-system-site-packages = false\n",
+            encoding="utf-8",
+        )
+        deps = site_packages(venv)
+        deps.mkdir(parents=True)
+        (deps / "generation_probe.py").write_text("VALUE = 'generation dependency'\n", encoding="utf-8")
+        script = cron_env / "scripts" / "generation-probe.py"
+        script.write_text(
+            "import os, sys, generation_probe\n"
+            "print(sys.prefix)\nprint(generation_probe.VALUE)\n"
+            "print(os.environ.get('HERMES_DISABLE_LAZY_INSTALLS'))\n"
+            "print('PYTHONPATH=' + (os.environ.get('PYTHONPATH') or ''))\n",
+            encoding="utf-8",
+        )
+        if missing_interpreter:
+            # Even a tempting workspace-local interpreter cannot hide a damaged generation.
+            fallback = snapshot / "venv" / "bin" / "python"
+            fallback.parent.mkdir(parents=True)
+            fallback.symlink_to(base_executable)
+
+        success, output = scheduler_script._run_job_script("generation-probe.py")
+
+        if missing_interpreter:
+            assert success is False
+            assert f"dependency environment interpreter is missing: {venv / 'bin' / 'python'}" in output
+        else:
+            assert success is True, output
+            prefix, dependency, lazy, pythonpath = output.splitlines()
+            assert Path(prefix).resolve() == venv.resolve()
+            assert dependency == "generation dependency"
+            assert lazy == "1"
+            assert pythonpath == "PYTHONPATH="
+
+    @pytest.mark.platforms("posix")
+    @pytest.mark.parametrize("managed_layout", [False, True])
+    def test_posix_workspace_name_alone_does_not_select_a_sibling_venv(
+        self, tmp_path, monkeypatch, managed_layout
+    ):
+        from cron import scheduler_script
+
+        parent = tmp_path / ("environments" if managed_layout else "ordinary") / "generation"
+        repo = parent / "workspace"
+        (repo / "cron").mkdir(parents=True)
+        if not managed_layout:
+            (parent / ".lease-managed").touch()
+        # Neither the generation marker alone nor the directory layout alone proves ownership.
+        python = repo / "venv" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        monkeypatch.setattr(scheduler_script, "__file__", str(repo / "cron" / "scheduler_script.py"))
+        monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda root: Path(sys.executable))
+
+        argv, _ = scheduler_script._posix_cron_script_argv(tmp_path / "probe.py")
+
+        assert argv[0] == str(python)
+
+    @pytest.mark.platforms("posix")
     @pytest.mark.parametrize("broken", ["selection_raises", "interpreter_missing"])
     def test_posix_unusable_store_selection_fails_the_run_not_the_tick(
         self, cron_env, tmp_path, monkeypatch, broken
