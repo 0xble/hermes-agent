@@ -128,8 +128,7 @@ def locked_scan():
                 continue
             if store._evaluate_due_job(job, scan, run_claim_ttl):
                 due.append(job)
-        except (AttributeError, IndexError, KeyError, OSError, OverflowError, TypeError, ValueError,
-                RuntimeError):
+        except Exception:  # health: allow BLE001 -- per-job containment: any failure skips only this job (traceback logged below)
             store.logger.exception(
                 "Skipping malformed cron job %r during due scan",
                 job.get("name") or job.get("id") or "?")

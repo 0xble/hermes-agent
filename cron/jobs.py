@@ -313,9 +313,13 @@ def _jobs_lock_holder_hint(lock_path: Path) -> str:
         return ""
     if pid <= 0 or pid == os.getpid():
         return ""
-    import psutil
+    try:
+        import psutil
 
-    if not psutil.pid_exists(pid):
+        alive = psutil.pid_exists(pid)
+    except Exception:  # health: allow BLE001 -- diagnostic-only hint must never break the lock-timeout path
+        return ""
+    if not alive:
         return ""
     return f"; holder pid={pid}"
 

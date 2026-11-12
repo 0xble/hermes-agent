@@ -135,6 +135,24 @@ def test_jobs_lock_timeout_omits_dead_holder_pid(store, monkeypatch, caplog):
     assert "holder pid=" not in caplog.text
 
 
+def test_jobs_lock_timeout_survives_broken_psutil(store, monkeypatch, caplog):
+    holder_pid = os.getpid() + 1
+    lock_path = jobs._jobs_lock_file()
+    lock_path.write_text(f"{holder_pid}\n", encoding="utf-8")
+    import psutil
+
+    def boom(_pid):
+        raise ImportError("psutil unavailable")
+
+    monkeypatch.setattr(psutil, "pid_exists", boom)
+    monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(jobs, "_acquire_flock", lambda _fd, _timeout: False)
+    with caplog.at_level("ERROR", logger=jobs.logger.name):
+        with jobs._jobs_lock():
+            pass
+    assert "holder pid=" not in caplog.text
+
+
 def test_unrelated_edit_does_not_starve_due_job(store, monkeypatch):
     job, now = store
     sibling = dict(job, id="sibling", name="sibling", next_run_at=(now + timedelta(hours=1)).isoformat())
