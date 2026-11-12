@@ -52,8 +52,30 @@ class IncognitoPluginTests(unittest.TestCase):
         self.assertEqual(self.manager.invoke_hook("pre_tool_call", content="normal"), ["unsafe", "safe"])
         self.assertEqual([name for name, _ in self.seen], ["unsafe", "safe"])
 
-    def test_plugin_tools_default_to_private_dispatch_and_storage(self):
-        from agent.incognito_private_dir import bind_private_session, discard_private_dir, private_dir_for_session
+    def test_undeclared_plugin_tool_is_refused_and_writes_nothing(self):
+        from tools.registry import registry
+
+        register_session(self.sid, True)
+        callback = mock.Mock(return_value='{"ok": true}')
+        handle = self.unsafe.register_tool(
+            name="incognito_probe_undeclared", toolset="incognito-probe",
+            schema={"name": "incognito_probe_undeclared", "parameters": {"type": "object"}},
+            handler=lambda args, **kwargs: callback(args, **kwargs),
+        )
+        assert handle is not None
+        self.addCleanup(handle.dispose)
+        try:
+            result = registry.dispatch("incognito_probe_undeclared", {"content": CANARY}, session_id=self.sid)
+            self.assertEqual(result, '{"error": "This plugin tool is unavailable in incognito mode."}')
+            callback.assert_not_called()
+            self.assertFalse((self.home / "plugin-data").exists())
+            self.assertFalse((self.home / "memories").exists())
+        finally:
+            register_session(self.sid, False)
+
+    def test_declared_safe_plugin_state_and_storage_stay_private(self):
+        from agent.incognito_private_dir import bind_private_session, discard_private_dir
+        from hermes_cli.plugins_state import PluginState
         from plugins.plugin_storage import plugin_data_dir
         from tools.registry import registry
 
@@ -61,37 +83,28 @@ class IncognitoPluginTests(unittest.TestCase):
         interval = self.home / "private-interval"
         interval.mkdir()
         bind_private_session(self.sid, interval)
-        def callback_fn(_args, **_context):
-            # Public handlers may receive optional context (session_id, task_id, ...).
-            # Storage stays private through the dispatch scope, not through those keywords.
-            plugin_data_dir("unsafe").joinpath("state.txt").write_text(CANARY, encoding="utf-8")
+        state = PluginState("safe", "safe-state")
+
+        def handler(args, **kwargs):
+            plugin_data_dir("safe").joinpath("state.txt").write_text(args["content"], encoding="utf-8")
+            state.set("secret", args["content"])
+            assert state.path.is_relative_to(interval)
             return '{"ok": true}'
-        callback = mock.Mock(side_effect=callback_fn)
-        handle = self.unsafe.register_tool(
-            name="incognito_probe_default", toolset="incognito-probe",
-            schema={"name": "incognito_probe_default", "parameters": {"type": "object"}},
-            handler=callback,
+
+        handle = self.safe.register_tool(
+            name="incognito_probe_safe", toolset="incognito-probe",
+            schema={"name": "incognito_probe_safe", "parameters": {"type": "object"}},
+            handler=handler,
         )
         assert handle is not None
         self.addCleanup(handle.dispose)
         try:
-            result = registry.dispatch("incognito_probe_default", {"content": CANARY}, session_id=self.sid)
-            self.assertEqual(result, '{"ok": true}')
-            callback.assert_called_once()
-            private_file = interval / "plugin-data" / "unsafe" / "state.txt"
-            self.assertEqual(private_file.read_text(encoding="utf-8"), CANARY)
-            self.assertFalse((self.home / "plugin-data").exists())
-            narrow = self.unsafe.register_tool(
-                name="incognito_probe_narrow", toolset="incognito-probe",
-                schema={"name": "incognito_probe_narrow", "parameters": {"type": "object"}},
-                handler=lambda _args: '{"ok": true}',
-            )
-            assert narrow is not None
-            self.addCleanup(narrow.dispose)
             self.assertEqual(
-                registry.dispatch("incognito_probe_narrow", {"content": CANARY}, session_id=self.sid),
+                registry.dispatch("incognito_probe_safe", {"content": CANARY}, session_id=self.sid),
                 '{"ok": true}',
             )
+            self.assertEqual((interval / "plugin-data" / "safe" / "state.txt").read_text(encoding="utf-8"), CANARY)
+            self.assertFalse((self.home / "plugin-data").exists())
         finally:
             register_session(self.sid, False)
             discard_private_dir(self.sid)

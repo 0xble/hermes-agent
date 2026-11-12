@@ -399,9 +399,8 @@ class PluginManifest:
     # automatically (no Python needed). ``locale_metadata`` carries the optional per-id
     # ``{endonym, rtl}`` from the mapping form of a ``provides_locales`` entry.
     # Conversation content reaches callbacks only with an explicit YAML boolean opt-in.
+    # An omitted declaration is fail-closed, including plugin tools.
     incognito_safe: bool = False
-    # Distinguish an omitted declaration (tool callbacks are private-safe by default) from
-    # an explicit false declaration, which remains fail-closed.
     incognito_safe_declared: bool = False
     provides_locales: list[str] = field(default_factory=list)
     locale_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)

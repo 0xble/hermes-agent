@@ -138,6 +138,34 @@ def test_private_delegated_child_uses_parent_interval():
         assert private_dirs.disposable_path_for_current_session() is None
 
 
+def test_discard_shuts_down_kernels_for_session_and_aliases_before_removal(monkeypatch):
+    calls = []
+    removed = []
+
+    def shutdown(owner):
+        calls.append(owner)
+        assert removed == []
+
+    monkeypatch.setattr("tools.code_kernel.shutdown_kernels_for_owner", shutdown, raising=False)
+    register_session("session-id")
+    with incognito_scope(True, "session-id"):
+        interval = private_dirs.private_path_for_current_session()
+    assert interval is not None
+    private_dirs.bind_private_session("topic-key", interval)
+    real_remove = private_dirs._remove
+
+    def observe(path):
+        removed.append(path)
+        real_remove(path)
+
+    monkeypatch.setattr(private_dirs, "_remove", observe)
+    register_session("session-id", False)
+    private_dirs.discard_private_dir("session-id")
+    assert calls == ["session-id", "topic-key"]
+    assert removed
+    register_session("topic-key", False)
+
+
 def test_cleanup_failure_is_logged_without_raising(caplog, monkeypatch):
     register_session("private-a")
     with incognito_scope(True, "private-a"):

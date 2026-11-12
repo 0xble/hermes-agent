@@ -119,9 +119,9 @@ async def promote(runner) -> dict[str, Any]:
     if not _ready:
         return {"promoted": False, "refused": "not_ready"}
 
-    # The standby opened no shared store; take ownership before any adapter can deliver a turn.
-    from agent.incognito_private_dir import sweep_private_dirs
-    sweep_private_dirs()
+    # The old slot still serves in-flight private turns until it exits after promotion
+    # (gateway_handover waits for that exit only after this promote returns). The
+    # startup sweep in run_client_owned runs after that process is confirmed gone.
     _promoted = True
     try:
         return await _promote(runner)

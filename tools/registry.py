@@ -1114,25 +1114,22 @@ def _context_signature_target(handler: Callable) -> Callable:
 
 
 def _invoke_tool_handler(handler: Callable, args: dict, kwargs: dict, *, is_async: bool):
-    """Call *handler* with only context kwargs it accepts.
+    """Call *handler* once, with only context kwargs its signature binds.
 
-    A wrapper can still reject a keyword its signature claimed to accept. Drop the
-    injected context and retry once; do not retry any other ``TypeError``.
+    A wrapper can reject a keyword its visible signature claimed to accept. Choose
+    the accepted set before entering the handler; never retry after it has run.
     """
-    accepted = _kwargs_accepted_by(_context_signature_target(handler), kwargs)
-
-    def _call(passed: dict):
-        if is_async:
-            from model_tools import _run_async
-            return _run_async(handler(args, **passed))
-        return handler(args, **passed)
-
+    target = _context_signature_target(handler)
+    accepted = _kwargs_accepted_by(target, kwargs)
     try:
-        return _call(accepted)
-    except TypeError as exc:
-        if not accepted or "unexpected keyword argument" not in str(exc):
-            raise
-        return _call({})
+        inspect.signature(target).bind(args, **accepted)
+    except (TypeError, ValueError):
+        accepted = {}
+
+    if is_async:
+        from model_tools import _run_async
+        return _run_async(handler(args, **accepted))
+    return handler(args, **accepted)
 
 
 def _kwargs_accepted_by(handler: Callable, kwargs: dict) -> dict:

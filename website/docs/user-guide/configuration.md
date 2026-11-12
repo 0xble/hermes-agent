@@ -28,8 +28,11 @@ private history and starts a normal session.
 Incognito starts off in every topic. Prior saved history remains readable, including
 session search and Hindsight recall. Hermes does not save new private conversation
 content, automatic memory writes, explicit memory writes, hook payloads, or durable
-restart/outbox payloads. Plugin tools are denied unless their manifest or tool
-registration declares them incognito-safe. Incognito does not change the visible
+restart/outbox payloads. A plugin tool runs in a private turn only when its
+manifest explicitly declares `incognito_safe: true`; an omitted declaration is
+refused. A declared-safe tool's `plugin_data_dir` and `PluginState` writes land
+in the private interval and are deleted with it. Direct `HERMES_HOME` writes by
+that plugin remain the plugin author's responsibility. Incognito does not change the visible
 tool schema or the frozen system prompt. It is not anonymity: the messaging platform,
 model provider and any deliberately contacted external service still receive content.
 

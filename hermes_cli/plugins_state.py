@@ -139,8 +139,12 @@ class PluginState:
 
     @property
     def data_dir(self) -> Path:
-        """Profile-scoped directory matching portable plugins' PLUGIN_DATA."""
-        return get_hermes_home() / "plugin-data" / self._data_namespace
+        """Profile-scoped ``<hermes home>/plugin-data/<data_namespace>/``."""
+        from agent.incognito_private_dir import private_path_for_current_session
+
+        private_root = private_path_for_current_session()
+        root = private_root if private_root is not None else get_hermes_home()
+        return root / "plugin-data" / self._data_namespace
 
     @property
     def path(self) -> Path:

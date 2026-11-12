@@ -185,12 +185,17 @@ def discard_private_dir(session_id: str | None) -> None:
         for key in aliases:
             _session_dirs.pop(key, None)
     from agent.incognito import any_incognito_sessions, register_session
-    # Dispose private execute_code kernels before removing their staging/RPC directory.
+    # A topic key and its restored session id can own different kernels for the same interval.
     try:
         from tools.code_kernel import shutdown_kernels_for_owner
-        shutdown_kernels_for_owner(session_id)
     except Exception:
         logger.debug("Could not dispose private kernels during interval cleanup", exc_info=True)
+    else:
+        for owner in dict.fromkeys((session_id, *aliases)):
+            try:
+                shutdown_kernels_for_owner(owner)
+            except Exception:
+                logger.debug("Could not dispose private kernels during interval cleanup", exc_info=True)
     for key in aliases:
         register_session(key, False)
     root = path.parent if path is not None else _configured_root()

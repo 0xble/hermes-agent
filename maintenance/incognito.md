@@ -43,8 +43,11 @@ not only the command reply.
 - The content-free sidecar preserves privacy routing across restart. Model
   overrides pass through the existing sanitizer. Do not persist a private model
   selection or credentials as recovery metadata.
-- Plugin content observation is opt-in through `incognito_safe`, including tools,
-  hooks, middleware and event subscribers. New execution paths need the same
+- Plugin content observation is opt-in through an explicit `incognito_safe: true`,
+  including tools, hooks, middleware and event subscribers. An omitted declaration
+  refuses the plugin tool. A declared-safe tool runs with `plugin_data_dir` and
+  `PluginState` redirected into the private interval; direct `HERMES_HOME` writes
+  remain the plugin author's responsibility. New execution paths need the same
   admission owner, not an independently maintained exception list. Hindsight read
   operations remain available. A queued recall keeps the route it was queued
   under, and pending recall is discarded at every boundary. A refused private
