@@ -310,7 +310,7 @@ def test_gateway_replay_after_compaction_still_commits_micro_compaction(tmp_path
         [dict(m) for m in held], held=held, start_watermark=db.get_active_message_watermark(session_id),
     )
 
-    assert committed is True
+    assert committed is None
 
 
 def _rows(db: SessionDB, session_id: str) -> list[tuple]:

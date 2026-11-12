@@ -163,8 +163,10 @@ def planned_stop(home, proc, desc):
 
 @contextmanager
 def daemon(home, env, log_name, *, fixture=None, expect_ready=True):
+    from tests.socket_paths import short_socket_dir
     command = [sys.executable, str(ROOT / 'tests/gateway/fixtures' / fixture)] if fixture else [sys.executable, '-m', 'gateway.run']
-    with (home.parent / log_name).open('w+', encoding='utf-8', errors='replace') as log:
+    with short_socket_dir('hermes-gw-' + 'x' * 16 + '.sock') as runtime, (home.parent / log_name).open('w+', encoding='utf-8', errors='replace') as log:
+        env = {**env, 'TMPDIR': str(runtime), 'XDG_RUNTIME_DIR': str(runtime)}
         proc = subprocess.Popen(command, cwd=ROOT, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         try:
             desc = {}

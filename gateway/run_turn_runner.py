@@ -31,8 +31,10 @@ from gateway.platforms.typing_state import pause_typing_for_prompt, resume_typin
 from gateway.platforms.base_exec_approval import ea_default_reason_text
 from gateway.run_task_card_progress import TaskCardProgressMixin
 from gateway.run_turn_runner_progress import _ToolProgressLine, send_progress_text
+from gateway.run_turn_runner_receipts import _persisted_turn
 from gateway.turn_context import TurnContext, silence_retry_prompt
 from hermes_cli.config import cfg_get
+from hermes_cli.plugins_dispatch import stream_held
 from utils import is_truthy_value
 from gateway.run_turn_progress import GatewayTurnProgressMixin, _viewer_status_kind, local_viewer_turn
 from gateway.session_execution import GatewaySessionAgentMixin
@@ -56,6 +58,11 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     from hermes_state_runtime import RuntimeStoreError
     auth_permanent = FailoverReason.auth_permanent.value
+    if isinstance(exc, RuntimeStoreError) and exc.reason == 'launch_credentials_unavailable':
+        # The session's launch key is gone (a restart revoked a CLI --api-key, a route key changed):
+        # the shared refusal copy names /new, never a resend.
+        from agent.turn_failure_copy import launch_credentials_copy
+        return launch_credentials_copy(exc), 'launch_credentials_unavailable', False
     if isinstance(exc, RuntimeStoreError):
         return (f"⚠️ This session's launch credentials are no longer available ({exc.reason}), so this "
                 "message wasn't processed. Start a new session from the CLI to bind them again.", auth_permanent, False)
@@ -110,24 +117,6 @@ def _finite_viewer_turn() -> bool:
     return finite_turn_required() is True
 
 
-def _persisted_turn(agent, agent_history, result, compressions) -> dict | None:
-    """``message.complete.persisted_turn`` for this turn, the receipt the TUI gateway's own turns
-    publish: clients bind the streamed reply to its stored row instead of comparing words. The
-    agent copies ``conversation_history`` into its message list, so an untouched pre-turn prefix
-    is the same dicts (transcript rows here carry no ``_row_id`` to compare)."""
-    from agent.persisted_turn_receipt import persisted_turn_receipt
-    if not isinstance(result, dict):
-        return None
-    status = ("interrupted" if result.get("interrupted")
-              else "error" if result.get("failed") or result.get("error") else "complete")
-    return persisted_turn_receipt(
-        result.get("messages"), getattr(agent, "_persist_user_message_idx", None), agent_history,
-        result.get("final_response"), status,
-        compression_unchanged=type(compressions) is int and compressions == getattr(
-            getattr(agent, "context_compressor", None), "compression_count", None),
-        prefix_row_matches=lambda before, after: before is after)
-
-
 class _NoStreamConsumer(RuntimeError):
     """Raised by the delta callback when nothing consumed the text; ``_call_quietly`` turns it into
     'not delivered' so the agent's partial-delivery accounting matches what the user saw."""
@@ -153,6 +142,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
     def __init__(self, runner: GatewayRunner, ctx: TurnContext, *, model_assignment: Optional[dict] = None) -> None:
         self._runner = runner
         self._ctx = ctx
+        from gateway.reply_latency import current_receipt
+        ctx._reply_latency_receipt = current_receipt()
         self._model_assignment = model_assignment
         from gateway.status_delivery import StatusDelivery
         self._status_delivery = StatusDelivery(ctx, lambda: runner._delivery_adapter_for(ctx.source))
@@ -285,8 +276,12 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         reanchored: bool = False
         # Buffer until the monotonic flood deadline, without editing, splitting or sending.
         defer_until: float = 0.0
+        retry_wait: float = 0.0
         # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
         tool_progress_sent: bool = False
+        skipped_edits: int = 0
+        progress_pause_logged: bool = False
+        dirty: bool = False
 
     # Default minimum seconds between progress edits. An adapter may raise it with
     # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
@@ -326,17 +321,6 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             _edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
         )
 
-    async def _edit_progress_message(self, st, message_id: str, content: str):
-        ctx = self._ctx
-        kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
-        if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
-            kwargs["finalize"] = True
-        if st._edit_accepts_metadata:
-            kwargs["metadata"] = ctx._progress_metadata
-        from gateway.platforms.base import OUTBOUND_PROGRESS, outbound_class
-        with outbound_class(OUTBOUND_PROGRESS):
-            return await st.adapter.edit_message(**kwargs)
-
     @staticmethod
     def _progress_text(lines: list) -> str:
         text = "\n".join(str(line) for line in lines)
@@ -360,24 +344,6 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
     def _is_flood_refusal(result) -> bool:
         error = (getattr(result, "error", "") or "").lower()
         return getattr(result, "retry_after", None) is not None or any(w in error for w in ("flood", "retry after"))
-
-    @classmethod
-    def _edit_failure_is_deferrable(cls, st, result) -> bool:
-        """Transient and rate-limit edit failures leave the bubble editable for a later tick.
-
-        A flood refusal says "not now", not "never": disabling edits on it turns every later tool
-        line into its own message for the rest of the turn, and sending one now spends the budget
-        the platform just said is exhausted.
-        """
-        if cls._is_flood_refusal(result):
-            wait = max(float(getattr(result, "retry_after", None) or 0.0), cls._progress_edit_interval(st.adapter))
-            st.defer_until = time.monotonic() + wait
-            logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
-            return True
-        if getattr(result, "retryable", False):
-            logger.debug("[%s] Transient progress edit failure, retrying next tick", st.adapter.name)
-            return True
-        return False
 
     @staticmethod
     def _progress_deferred(st) -> bool:
@@ -403,28 +369,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
         st.progress_msg_id, st.progress_lines = None, []
+        st.dirty = False
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
-
-
-
-    async def _drain_progress_on_cancel(self, st) -> None:
-        ctx = self._ctx
-        with suppress(Exception):
-            while not ctx.progress_queue.empty():
-                raw = ctx.progress_queue.get_nowait()
-                if self._is_reset_marker(raw):
-                    # Content-bubble marker during drain: close the current progress bubble
-                    # and start a fresh one for tool lines that arrived after.
-                    await self._roll_progress_overflow_if_needed(st)
-                    await self._flush_progress_edit(st)
-                    self._reset_progress_bubble(st)
-                else:
-                    self._progress_absorb(st, raw)
-                    await self._roll_progress_overflow_if_needed(st)
-        # Final edit with all remaining tools (only if editing works)
-        if st.can_edit and st.progress_lines and st.progress_msg_id:
-            await self._roll_progress_overflow_if_needed(st)
-        await self._flush_progress_edit(st)
 
     async def _progress_restore_typing(self, st) -> None:
         ctx = self._ctx
@@ -523,10 +469,6 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         except Exception as e:
             logger.debug("event_callback hook error: %s", e)
 
-    def _status_live(self) -> bool:
-        """Status adapter present and this run is still the current generation."""
-        return bool(self._ctx._status_adapter) and self._ctx._run_still_current()
-
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
         ctx = self._ctx
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
@@ -581,7 +523,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
     def _setup_stream_consumer(self, platform_key):
         from gateway.stream_recovery import preview_recorder, restore_preview
         ctx = self._ctx
-        if ctx.mute_notification_reply:
+        if ctx.mute_notification_reply or ctx.persist_user_display_kind == "supervisor_checkin":
             return None, None, None, False
         stream_consumer = None
         # The streaming-TTS consumer is created on the outer loop thread before run_sync launches;
@@ -593,8 +535,12 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             scfg = StreamingConfig()
         # display.platforms.<plat>.streaming may disable streaming per platform; None = follow global.
         plat_streaming = ctx.resolve_display_setting(ctx.user_config, platform_key, "streaming")
-        want_stream_deltas = not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
-        want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat
+        # A loaded ``hold_stream`` transform rewrites this session's reply before the user may see it:
+        # no drafts, edits, native stream or commentary bubbles; the rewrite goes out as one plain
+        # final while the typing indicator runs (the agent also withholds every delta).
+        held = stream_held()
+        want_stream_deltas = not held and not ctx.scheduled_heartbeat and scfg.enabled_for(plat_streaming)
+        want_interim_messages = bool(ctx.interim_assistant_messages_enabled) and not ctx.scheduled_heartbeat and not held
         if want_stream_deltas or want_interim_messages:
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
@@ -1901,7 +1847,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
 
     def run_sync(self):
         from contextlib import ExitStack
-        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, workspace_unavailable_result
+        from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, refused_turn_result
         from gateway.session_api_turn import api_policy_scope
         from gateway.session_authorities import active_authority
         from hermes_state_runtime import RuntimeStoreError
@@ -1910,9 +1856,9 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             try:
                 scope.enter_context(policy_scope(policy, authority=active_authority(self._runner)))
             except RuntimeStoreError as exc:
-                if exc.reason != 'workspace_unavailable':
+                result = refused_turn_result(policy, exc)
+                if result is None:
                     raise
-                result = workspace_unavailable_result(policy)
             else:
                 scope.enter_context(api_policy_scope())
                 bind_turn_workspace(policy, self._ctx.session_id)
@@ -2057,7 +2003,8 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
             from gateway.session_cli_turn import run_classic_cli_turn
             from gateway.session_secret_prompt import secret_prompt_scope
             from gateway.session_sudo_prompt import sudo_prompt_scope
-            with sudo_prompt_scope(self, agent), secret_prompt_scope(self, agent):
+            from gateway.session_vault_prompt import vault_prompt_scope
+            with sudo_prompt_scope(self, agent), secret_prompt_scope(self, agent), vault_prompt_scope(self, agent):
                 result = run_classic_cli_turn(self, lambda: self._run_conversation_with_approval(
                     agent, agent_history, observed_group_context, persist_msg, persist_ts))
         finally:

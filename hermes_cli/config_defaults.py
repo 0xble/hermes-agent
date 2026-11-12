@@ -4,6 +4,8 @@ Pure-data leaf module — must not import from hermes_cli.config. Comments are t
 docs of config.yaml.
 """
 
+from hermes_cli.config_defaults_vault import DEFAULT_VAULT_CONFIG
+
 
 #: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
 #: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
@@ -408,9 +410,9 @@ DEFAULT_CONFIG = {
         "extract_backend": "",   # per-capability override for web_extract (e.g. "native")
         # per-page char budget for web_extract; larger pages truncate, full text kept in cache/web
         "extract_char_limit": 15000,
-        # Keyless free-tier ring: with NO web backend configured or keyed, web_search/web_extract
-        # rotate round-robin across exa, parallel, firecrawl, keenable public free tiers, failing
-        # over on rate limits. Never pre-empts a configured/keyed backend. false = disable.
+        "exa_lite_paused": True,  # false restores guarded stakes-based Lite routing
+        # With no configured/keyed backend, the keyless ring rotates free exa, parallel, firecrawl,
+        # keenable tiers and fails over on rate limits. Never pre-empts keyed backends; false disables.
         "keyless_fallback": True,
         # One-shot rescue: when the chosen/keyed backend fails a call, THAT call retries once on the
         # keyless ring; the next call tries the chosen backend again (no sticky failover). Off when
@@ -434,24 +436,29 @@ DEFAULT_CONFIG = {
     },
 
     "browser": {
-        # "" = Browser Use mode when the browser-use CLI (or uvx) is available, else built-in tools
-        # (Camofox setups always keep built-in tools: no CDP surface); "browser-use" = force one
-        # browser_exec tool driving the Browser Use CLI over any CDP backend (local Chrome, cloud);
-        # "off" = force the built-in browser_navigate/browser_click/... tools.
         "backend": "",
+        "snapshot_threshold": 15000,
+        "record_sessions": False,
+        "allow_unsafe_evaluate": False,
+        "restrict_evaluate": False,
         "inactivity_timeout": 120,
-        "command_timeout": 30,  # seconds per browser command (screenshot, navigate, etc.)
-        "snapshot_threshold": 15000,  # max chars before snapshot truncate-and-store (min 1000)
-        "record_sessions": False,  # auto-record browser sessions as WebM videos
+        # Seconds a local Chromium launch may take to open its DevTools port; a launch always waits
+        # at least 120 s (a cold first start unpacks the profile).
+        "command_timeout": 30,
         # headed: visible Chromium window (local); skips per-turn cleanup, idle reaper still applies
         "headed": False,
         "allow_private_urls": False,  # allow private/internal IPs (localhost, 192.168.x.x, ...)
-        # Local browser engine for both drivers. "auto" = Chrome; "lightpanda" = faster navigation,
-        # no screenshots (Browser Use mode spawns `lightpanda serve` per session; built-in tools
-        # pass `--engine <value>` to agent-browser with Chrome fallback); "chrome" = explicit.
-        # Ignored while a cloud provider, Camofox, cdp_url or use_real_profile is active. Also
-        # settable via AGENT_BROWSER_ENGINE.
+        # Local browser engine. "auto" = Chromium; "lightpanda" = `lightpanda serve` per session
+        # (faster navigation, no screenshots); "chrome" is read as "auto". Ignored while a cloud
+        # provider, cdp_url or use_real_profile is active.
         "engine": "auto",
+        # Chromium binary for local sessions. "" = pm's chromium (`hermes pm install chromium`), the
+        # Docker image's build, else a system chromium where pm builds none (Termux).
+        "executable_path": "",
+        # Persistent Chromium profile directory shared by local sessions; "" = a fresh throwaway
+        # profile per session.
+        "user_data_dir": "",
+        "chromium_args": [],  # extra Chromium flags for local sessions, e.g. ["--lang=de"]
         # With a cloud provider, auto-spawn local Chromium for LAN/localhost URLs instead
         "auto_local_for_private_urls": True,
         "cdp_url": "",  # persistent CDP endpoint for attaching to an existing Chromium/Chrome
@@ -475,11 +482,6 @@ DEFAULT_CONFIG = {
         # agent the wrong identity. A pin naming a missing directory never falls back to another
         # profile: the session gets a fresh browser without the user's logins.
         "real_profile_pin": "",
-        # restrict_evaluate: opt-in denylist blocking sensitive JS primitives (cookies/storage/
-        # clipboard/network/form values) in browser_console(expression=...); allow_unsafe_evaluate
-        # is the legacy override that bypasses that denylist entirely.
-        "allow_unsafe_evaluate": False,
-        "restrict_evaluate": False,
         # CDP supervisor: dialog + frame detection over a persistent WebSocket; active only with a
         # CDP-capable backend (Browserbase, or local Chrome via /browser connect). See
         # website/docs/developer-guide/browser-supervisor.md.
@@ -699,7 +701,7 @@ DEFAULT_CONFIG = {
         # (Historical key name.) When True, gpt-5.4/5.5/5.6 and gpt-6 Astra (any slug containing
         # "astra" without "900k") on the ChatGPT Codex OAuth route raise their compaction trigger to
         # 85%: Codex hard-caps them at a 272K window, so the global 50% would compact at ~136K. False = global `threshold`. Only that route; the same models via
-        # OpenAI direct, OpenRouter or Copilot keep the global value.
+        # OpenAI direct, OpenRouter or another relay keep the global value.
         "codex_gpt55_autoraise": True,
         # Show the one-time autoraise banner; False keeps the autoraise, hides the notice.
         "codex_gpt55_autoraise_notice": True,
@@ -714,21 +716,21 @@ DEFAULT_CONFIG = {
         # safety margin; explicit values only clamp downward so the server goes first.
         "codex_responses_compact_threshold": None,
         # in_place: compaction rewrites the message list and system prompt WITHOUT rotating the
-        # session id (no parent_session_id chain, no `name #N` renumbering), avoiding the
-        # session-rotation bug cluster. Pre-compaction turns are soft-archived under the same id
-        # (active=0, compacted=1) — still session_search-able. False = legacy rotating-compaction
-        # path.
+        # session id (no parent_session_id chain, no `name #N` renumbering), avoiding the session-rotation
+        # bug cluster. Pre-compaction turns are soft-archived under the same id (active=0, compacted=1) —
+        # still session_search-able. False = legacy rotating-compaction path.
         "in_place": True,
         # Per-model threshold overrides: keys substring-match the model name (longest wins), values
         # replace the global `threshold`, e.g. {"glm-5.2": 0.40}. Prefix a key with "<provider>:" to
         # scope it to one route ({"openai-codex:astra": 0.85} leaves Astra on OpenRouter/Nous at the
         # global value). The <512K floor (0.75) still applies raise-only on top.
         "model_thresholds": {},
-        # Opt-in idle compaction (0 = off): a session resuming after this many idle seconds compacts
-        # up front, before the first reply. Time-based complement to `threshold`; skipped when
-        # already at/below threshold × target_ratio; honors the same cooldown/ anti-thrash/lock
-        # guards. Example: 1800 = 30 min.
+        # Opt-in idle compaction (0 = off): a session resuming after this many idle seconds compacts up
+        # front, before the first reply. Time-based complement to `threshold`; skipped when already at/below
+        # threshold × target_ratio; honors the same cooldown/anti-thrash/lock guards. Example: 1800 = 30 min.
         "idle_compact_after_seconds": 0,
+        # Opt-in: write the next summary in the background near the trigger; compaction uses (or waits for) it if it still covers the same messages.
+        "prepare_ahead": False,
     },
     # Anthropic prompt caching (Claude via OpenRouter or native API). cache_ttl: "5m" | "1h" | "auto"
     # (auto = 1h for human-paced sessions — cli/tui/desktop/messaging — and 5m for subagent, cron,
@@ -784,7 +786,7 @@ DEFAULT_CONFIG = {
         # WARNING is logged whenever a non-":free" model is engaged.
         "openrouter_model": "",
         # Endpoints that reject NON-streaming chat (HTTP 400): aux calls are sent with stream=True
-        # and aggregated. Case-insensitive URL substrings; copilot.tencent.com is always
+        # and aggregated. Case-insensitive URL substrings; some vendor endpoints are always
         # stream-only.
         "stream_only_base_urls": [],
         # Per-task blocks share one shape (_aux): provider "auto" = inherit the main model; base_url
@@ -1045,7 +1047,7 @@ DEFAULT_CONFIG = {
             "unicode_cols": 0,  # Hard override for terminal column width; 0 = derive from scale.
         },
     },
-
+    "webapp": {"enabled": False, "host": "127.0.0.1", "port": 9120, "public_url": ""},  # gateway/webapp_listener.py
     "dashboard": {
         # Visual theme: "default" | "midnight" | "ember" | "mono" | "cyberpunk" | "rose"
         "theme": "default",
@@ -1473,7 +1475,9 @@ DEFAULT_CONFIG = {
     # goal is satisfied, else a continuation prompt re-enters the session until done, budget
     # exhausted, or paused. Judge failures fail OPEN; the budget is the backstop.
     "goals": {
-        "notices": True,  # False hides automatic lifecycle output, not queries, errors or approvals.
+        # True shows every goal card. False hides automatic lifecycle output, not queries or
+        # approvals. "hidden" also hides approval cards and control receipts (hermes_cli/goal_notices.py).
+        "notices": True,
         "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
         # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
@@ -1484,9 +1488,9 @@ DEFAULT_CONFIG = {
         # Fork patch: committed agent goal_set receipts surface as notices; /goal replies don't.
         "auto_notices": True,
     },
-    # Supervisor check-ins, automatic reassurance while gateway-owned work remains.
     "checkins": {
         "enabled": True,
+        "only_roots": [],  # Exact compression-root session ids. Empty preserves profile-wide supervision.
         "first_after_seconds": 1200,  # Both durations have a 300-second floor.
         "interval_seconds": 1800,
     },
@@ -1497,6 +1501,13 @@ DEFAULT_CONFIG = {
         "min_interval_seconds": 30,  # smallest fixed interval; tighter cadences raised to it
         "max_ticks": 100,  # auto-pause after this many wakeups unless --times set; 0 = unlimited
         "auto_notices": True,  # show agent loop_set receipts (set/revise/replace) to the user
+        # True shows loop outcome cards; False hides them and loop_set receipts; "hidden" also hides
+        # loop approval cards and control receipts (hermes_cli/goal_notices.py).
+        "notices": True,
+        # Agent sets, revises, replaces, pauses, resumes its own pauses, and finishes loops without
+        # a user quote. Clear and resuming a user pause stay user-only; interval floors and
+        # max_ticks still apply.
+        "autonomy": False,
         "self_paced_floor_seconds": 60,  # Self-paced cadence bounds (seconds).
         "self_paced_ceiling_seconds": 24 * 60 * 60,
     },
@@ -1795,8 +1806,8 @@ DEFAULT_CONFIG = {
     # substitutes it; a bare string is shorthand for append. `replace` wins over `append` if both
     # are given.
     "platform_hints": {},
-    # Plugin system. `enabled`/`disabled` lists are written by `hermes plugins enable|disable` and
-    # deliberately omitted here so an empty default never clobbers a user allow-list.
+    # Plugin system. `enabled`/`disabled` (`hermes plugins enable|disable`) and `disabled_by_update` (pm.plugin_eviction:
+    # plugins an update turned off, retried by later updates) are omitted so an empty default never clobbers a user's lists.
     "plugins": {
         # Deadline (seconds) for one plugin Git clone, fetch or checkout. Slow repositories may
         # need more time; each network operation is capped at one hour.
@@ -1950,6 +1961,9 @@ DEFAULT_CONFIG = {
         # save_job_output keeps the N most recent .md files per job; 0 or negative disables pruning
         # (for externally managed cleanup).
         "output_retention": 50,
+        # Elapsed days of terminal execution history. 0 disables age expiration;
+        # the row backstop still applies. Latest attempts and unsettled work stay.
+        "execution_retention_days": 8,
         # Timeout (seconds) for a no-agent cron script. Env: HERMES_CRON_SCRIPT_TIMEOUT. Keep in
         # sync with cron.scheduler._DEFAULT_SCRIPT_TIMEOUT.
         "script_timeout_seconds": 3600,
@@ -2387,11 +2401,8 @@ DEFAULT_CONFIG = {
         # List delegate_task subagent runs in session lists (desktop sidebar, dashboard, session.list),
         # nested under their parent. Off by default: they are machinery, not conversations.
         "show_subagents": False,
-        # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE). VACUUM
-        # blocks writes (~seconds per 100MB), so it runs only at startup, only when ≥1 session was
-        # deleted AND freelist/page_count > 25%.
-        # SQLite does not reclaim disk space on DELETE — freed pages are just reused on subsequent INSERTs —
-        # so without VACUUM the file stays bloated even after pruning. See #54189.
+        # VACUUM after a prune that deleted rows (SQLite never reclaims disk on DELETE, #54189). It blocks
+        # writes (~seconds per 100MB): only at startup, only when ≥1 session went AND freelist/page_count > 25%.
         "vacuum_after_prune": True,
         # Minimum days between VACUUM rewrites; pruning keeps its normal cadence.
         "min_vacuum_interval_days": 30,
@@ -2421,6 +2432,9 @@ DEFAULT_CONFIG = {
         # Max active messages per session for in-memory export (`hermes sessions export`); checked
         # per session, so full-DB backups of small sessions work.
         "max_export_messages": 20000,
+        # Seconds before a local session with no viewer is ended (resumable) once its turn settles; 0 = never; after a
+        # restart also >= 6h idle. Unset: dashboard.ws_orphan_reap_grace_s: 0 / startup_orphan_sweep: false opt out.
+        "orphan_end_grace_s": 300.0,
     },
     # First-touch onboarding hints (agent/onboarding.py), each latched under `seen` once shown.
     "onboarding": {
@@ -2560,32 +2574,7 @@ DEFAULT_CONFIG = {
     # encrypted vault (`hermes vault add`, Desktop → Settings → Credential Vault) is always on.
     # External password managers are unlocked per session with a masked master-password prompt;
     # headless sessions (cron, webhook, API) never prompt and see them as locked.
-    "vault": {
-        # Map an existing login handle or 1Password item ID to extra exact HTTPS origins.
-        # Aliases extend fill authorization without editing the password-manager item; malformed,
-        # HTTP, and wildcard origins are ignored. Example: {"item-id": ["https://signin.example.com"]}.
-        "origin_aliases": {},
-        # Alias-only login fills ask for confirmation unless this is false.
-        "confirm_alias_fills": True,
-        "onepassword": {
-            # Detected managers are login sources unless the user opts out (vault.<name>.enabled: false).
-            "enabled": True,        # `op` CLI: Login items with a website URL become fillable handles.
-            "account": "",          # account shorthand for `op --account`; empty = default account.
-            "binary_path": "",      # absolute path to op; empty = PATH.
-            # Env var holding a service-account token (headless auth, no unlock prompt). Unset = prompt.
-            "service_account_token_env": "OP_SERVICE_ACCOUNT_TOKEN",
-            # Optional model-blind fields. Each entry binds one op:// reference to a supported semantic and
-            # exact HTTPS origins; the model sees only an opaque handle and can fill only that field there.
-            "protected_fields": [],
-            # Additional accounts: [{alias, account, service_account_token_env, browser_account?}].
-            # Each uses only its own service-account token; handles are op@<alias>:<item-id>.
-            "accounts": [],
-        },
-        "bitwarden": {
-            "enabled": True,        # `bw` CLI (Password Manager, not Secrets Manager); run `bw login` once first.
-            "binary_path": "",      # absolute path to bw; empty = PATH.
-        },
-    },
+    "vault": DEFAULT_VAULT_CONFIG,
     "secrets": {
         # Optional ordering of enabled sources (e.g. [onepassword, bitwarden]); default registration
         # order. Mapped sources (explicit VAR→ref) always beat bulk sources (BSM project dumps);
@@ -2841,7 +2830,7 @@ DEFAULT_CONFIG = {
         # Extra ports detection probes for an external llama-server (besides 8080).
         "detect_ports": [],
     },
-    "_config_version": 51,  # Config schema version - bump this when adding new required fields
+    "_config_version": 52,  # Config schema version - bump this when adding new required fields
 }
 
 
@@ -3015,33 +3004,19 @@ OPTIONAL_ENV_VARS = {
     "BROWSERBASE_API_KEY": _tool(
         "Browserbase API key for cloud browser (optional — local browser works without this)",
         "Browserbase API key", "https://browserbase.com/",
-        tools=["browser_navigate", "browser_click"]),
+        tools=["browser_exec"]),
     "BROWSERBASE_PROJECT_ID": _tool(
         "Browserbase project ID (optional — only needed for cloud browser)",
         "Browserbase project ID", "https://browserbase.com/",
-        tools=["browser_navigate", "browser_click"], password=False),
+        tools=["browser_exec"], password=False),
     "BROWSER_USE_API_KEY": _tool(
         "Browser Use API key for cloud browser (optional — local browser works without this)",
         "Browser Use API key", "https://browser-use.com/",
-        tools=["browser_navigate", "browser_click"]),
+        tools=["browser_exec"]),
     "FIRECRAWL_BROWSER_TTL": _tool(
         "Firecrawl browser session TTL in seconds (optional, default 300)",
-        "Browser session TTL (seconds)", tools=["browser_navigate", "browser_click"],
+        "Browser session TTL (seconds)", tools=["browser_exec"],
         password=False),
-    "AGENT_BROWSER_ENGINE": _env(
-        "Local browser engine: auto (default Chrome), lightpanda (faster, no screenshots; Browser Use mode "
-        "spawns lightpanda serve), chrome", "Browser engine (auto/lightpanda/chrome)",
-        url="https://lightpanda.io/docs/run-locally/installation/one-liner",
-        tools=["browser_exec", "browser_navigate", "browser_snapshot", "browser_click", "browser_vision"],
-        password=False, category="tool", advanced=True),
-    "CAMOFOX_URL": _tool(
-        "Camofox browser server URL for local anti-detection browsing (e.g. http://localhost:9377)",
-        "Camofox server URL", "https://github.com/jo-inc/camofox-browser",
-        tools=["browser_navigate", "browser_click"], password=False),
-    "CAMOFOX_API_KEY": _tool(
-        "Optional bearer token sent as Authorization header to a remote/authenticated Camofox "
-        "server", "Camofox API key", "https://github.com/jo-inc/camofox-browser",
-        tools=["browser_navigate", "browser_click"], advanced=True),
     "FAL_KEY": _tool("FAL API key for image and video generation", "FAL API key", "https://fal.ai/",
         tools=["image_generate", "video_generate"]),
     "KREA_API_KEY": _tool("Krea API key for Krea 3 and Krea 2 image generation",

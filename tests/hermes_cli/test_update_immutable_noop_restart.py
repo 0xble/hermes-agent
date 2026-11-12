@@ -31,8 +31,7 @@ def _latest_receipt(home, fleet_sha):
 
 
 def _frozen_source_head(monkeypatch):
-    monkeypatch.setattr("hermes_cli.version_info.get_code_identity",
-                        lambda refresh=False: {"sha": SOURCE, "source": "git"})
+    monkeypatch.setattr("hermes_cli.version_info.read_checkout_sha", lambda *_a, **_kw: SOURCE)
 
 
 def test_expected_sha_is_the_active_release(monkeypatch):

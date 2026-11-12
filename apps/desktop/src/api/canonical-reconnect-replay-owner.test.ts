@@ -36,6 +36,7 @@ test('a canonical reconnect replays the retained window to the epoch owner\'s pr
       const { method, params } = request
 
       // The owner only answers its own profile; an unrouted replay is a different session.
+      if (method === 'session.resume') { peer.attached = true }
       const result = method === 'session.events.since'
         ? (params.profile === 'alpha' && params.replay_epoch === epoch
             ? { events: ring.filter(event => event.seq > params.last_seen && event.seq <= 5), latest_seq: 5, replay_epoch: epoch, snapshot_required: false }
@@ -65,7 +66,9 @@ test('a canonical reconnect replays the retained window to the epoch owner\'s pr
 
     await client.connect(url)
     await vi.waitFor(() => expect(seen.map(event => event.seq)).toEqual([1, 2, 3, 4, 5]))
-    push(peers[1], ring[5])
+    // Authority subscriptions belong to the socket. Replay reads the ring,
+    // but only resume subscribes this replacement socket to future frames.
+    if (peers[1].attached) { push(peers[1], ring[5]) }
     await vi.waitFor(() => expect(seen.map(event => event.seq)).toEqual([1, 2, 3, 4, 5, 6]))
 
     const replays = calls.filter(call => call.method === 'session.events.since')

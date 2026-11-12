@@ -5,6 +5,7 @@ row, so later instructions and answers the user meant to leave behind rode into 
 boundary is a physical row id (``through_message_id``), validated against the parent's active
 transcript inside the receipt transaction and part of the retry identity.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from types import SimpleNamespace
 
 import pytest
@@ -28,7 +29,7 @@ async def test_branch_through_a_middle_message_excludes_later_and_concurrent_row
                              _evict_cached_agent=lambda route: None, _cached_agent_for=lambda route: None,
                              _adapter_for_source=lambda source: None)
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
+                                 epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
     owner = AuthorityConnection(authority, object(), {'user_id': 'human'})
     ref = create_local_session(authority, owner.actor, dict(request_id='branch-boundary', source='cli',
                                                               cwd=str(tmp_path), model='m', toolsets=[]))

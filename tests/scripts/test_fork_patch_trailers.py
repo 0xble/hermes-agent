@@ -313,3 +313,44 @@ def test_release_merge_excludes_upstream_but_keeps_all_fork_commits_after_floor(
     git("merge", "--no-ff", "-m", "adopt release", release)
     failures = checker.check_trailers(release, floor)
     assert len(failures) == 1 and "forgotten fork trailer" in failures[0]
+
+
+def test_pinned_contract_tests_must_still_exist(tmp_path, monkeypatch):
+    """A sync that deletes or renames a unit's pinned behavioural test fails the check."""
+    _units(tmp_path, "fixture", prose=(
+        "Contract tests: `tests/test_kept.py::test_behaviour`,\n"
+        "  `tests/test_kept.py::Suite::test_method`, `tests/test_dropped.py`\n"
+        "Other prose naming `tests/test_unpinned.py` pins nothing.\n"
+    ))
+    tests = tmp_path / "tests"
+    tests.mkdir()
+    (tests / "test_kept.py").write_text(
+        "def test_behaviour():\n    pass\n\nclass Suite:\n    def test_method(self):\n        pass\n",
+        encoding="utf-8")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.contract_tests() == {"maintenance/unit.md": [
+        "tests/test_kept.py::test_behaviour", "tests/test_kept.py::Suite::test_method", "tests/test_dropped.py"]}
+    failures = checker.check_contract_tests()
+    assert len(failures) == 1 and "tests/test_dropped.py is missing" in failures[0]
+    (tests / "test_dropped.py").write_text("", encoding="utf-8")
+    (tests / "test_kept.py").write_text("def test_renamed():\n    pass\n", encoding="utf-8")
+    failures = checker.check_contract_tests()
+    assert len(failures) == 2 and all("no longer defines" in f for f in failures)
+
+
+def test_units_owning_identities_without_contract_tests_are_listed_uncovered(tmp_path, monkeypatch):
+    _units(tmp_path, "fixture")
+    (tmp_path / "maintenance" / "pinned.md").write_text(
+        "- Fork patch identity: `pinned`\n\nContract tests: `tests/test_x.py`\n", encoding="utf-8")
+    (tmp_path / "maintenance" / "notes.md").write_text("No identity here.\n", encoding="utf-8")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.uncovered_units() == ["maintenance/unit.md"]
+
+
+def test_this_checkout_pins_queued_voice_and_every_pinned_test_exists(monkeypatch):
+    """The real contract: every pinned fork-behaviour test is present in this checkout."""
+    root = Path(__file__).resolve().parents[2]
+    checker = _checker(root, monkeypatch)
+    assert checker.check_contract_tests() == []
+    assert any("test_queued_voice_durable_fifo.py::" in target
+               for target in checker.contract_tests()["maintenance/queued-voice-stt.md"])

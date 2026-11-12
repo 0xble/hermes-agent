@@ -35,7 +35,8 @@ async def test_restart_recovery_keeps_every_profiles_held_images_and_collects_ea
     from gateway.session_authorities import SessionAuthorities
     from gateway.session_authority import SessionAuthority
     from hermes_state import SessionDB
-    from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input, settle_session_input
+    from hermes_state_runtime import admit_session_input, claim_session_input, settle_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     launch = tmp_path / '.hermes'
     beta = launch / 'profiles' / 'beta'

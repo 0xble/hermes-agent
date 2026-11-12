@@ -31,9 +31,23 @@ EXECUTIONS_FILE: Optional[Path] = None
 # and wants it silent. Only ``closed`` is terminal; a repeat of a resolved error re-opens it.
 INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 _FAILURE_TYPE_ORDER = (
+    # Local argument rejection wins over incidental auth/delivery context in a report.
+    ("config", (
+        r"\b(?:invalid_key|invalid_title|invalid_brief|intent_required|self_relay)\b",
+        r"\busage\s*:",
+        r"\b(?:argument|input) validation\b",
+        r"\bvalidation(?:error|_error| failed| error)\b",
+    )),
     ("rate_limit", (r"\b429\b", "rate limit", "usage limit", "quota")),
     ("timeout", ("timeout", "timed out")),
-    ("auth", (r"\b401\b", "unauthorized", "authentication", "auth")),
+    ("auth", (
+        r"\b(?:401|403|unauthorized|not_authed|invalid_auth|auth_unavailable)\b",
+        r"\b(?:authentication[ _-]?|auth[ _-])(?:error|failed|failure|required)\b",
+        r"\b(?:invalid|incorrect)[ _-]+(?:api[ _-]+key|x-api-key|credentials?)\b",
+        r"\bcredentials? (?:are |is )?invalid\b",
+        r"\btoken(?:[ _-](?:has[ _-])?(?:expired|revoked))\b",
+        r"\bexpired[ _-]token\b",
+    )),
     ("delivery", ("delivery", "deliver", "delivering")),
     ("config", ("config", "configuration", "validation")),
     ("script", ("script", "no_agent")),
@@ -128,10 +142,15 @@ def _redact_error(error: str) -> str:
     return text[:MAX_ERROR_CHARS]
 
 
-def _error_signature(job_id: str, error: str) -> str:
-    """Dedup key: stable for same job + same normalized error prefix."""
-    normalized = _DURATION_RE.sub("#s", _normalize_error(error))[:_MAX_SIGNATURE_ERROR_CHARS]
-    return hashlib.sha256(job_id.encode() + normalized.encode()).hexdigest()[:12]
+def _error_signature(job_id: str, error: str, *, failure_type: Optional[str] = None) -> str:
+    """Dedup key: stable for same job + cause. Durations and scheduled instants vary per occurrence."""
+    normalized = _DURATION_RE.sub("#s", _normalize_error(error))
+    normalized = re.sub(
+        r"\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})\b",
+        "<scheduled>", normalized,
+    )[:_MAX_SIGNATURE_ERROR_CHARS]
+    namespace = b"script\0" if failure_type == "script" else b""
+    return hashlib.sha256(namespace + job_id.encode() + normalized.encode()).hexdigest()[:12]
 
 
 def _incident_id(job_id: str, error_sig: str) -> str:
@@ -139,17 +158,13 @@ def _incident_id(job_id: str, error_sig: str) -> str:
 
 
 def _classify_failure_type(error: str) -> str:
-    """Classify a failure from error-text keywords; ``unknown`` is the default."""
+    """Classify specific failure signals before broad context; default to ``unknown``."""
     text = _normalize_error(error)
     if not text:
         return "unknown"
     for kind, patterns in _FAILURE_TYPE_ORDER:
-        for pattern in patterns:
-            if pattern.startswith("\\b") and pattern.endswith("\\b"):
-                if re.search(pattern, text):
-                    return kind
-            elif pattern in text:
-                return kind
+        if any(re.search(pattern, text) for pattern in patterns):
+            return kind
     return "unknown"
 
 
@@ -163,7 +178,7 @@ def upsert_incident(
     closed, while a ``resolved`` one (job recovered, then broke the same way again) re-opens as
     ``detected`` so the operator is alerted once more. A changed error text mints a new incident."""
     job_id = str(job_id or "")
-    sig = _error_signature(job_id, error)
+    sig = _error_signature(job_id, error, failure_type=failure_type)
     stored_error = _redact_error(error)
     incident_id = _incident_id(job_id, sig)
     now = _hermes_now().isoformat()

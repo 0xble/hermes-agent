@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.immutable_releases import promote, stage_release
-from tests.hermes_cli.immutable_test_helpers import _build_test_venv
+from tests.hermes_cli.immutable_test_helpers import _build_test_venv, clone_packaged_runtime
 
 # scripts/run_tests_parallel.py kills a file after 300s with no attribution. Fail
 # inside the test first, naming the phase that ran out of budget, while leaving
@@ -67,7 +67,10 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
     home.mkdir()
     repo = Path(__file__).resolve().parents[2]
     source = tmp_path / "source"
-    subprocess.run(["git", "clone", "--quiet", "--shared", str(repo), str(source)], check=True)
+    # Stage the packaged Python runtime, not thousands of unrelated tests,
+    # contributor records and frontend files. Keep real Git archives and venvs:
+    # the contract is physical cron/code/interpreter identity across the flip.
+    clone_packaged_runtime(repo, source)
     probe = source / "cron" / "s2_release_probe.py"
     revisions = []
     for name in ("A", "B"):
@@ -96,6 +99,7 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
         # Exercise the candidate's scheduler and its job/deadline dependencies
         # together; copying only the facade mixes it with the cloned base API.
         for relative in ("cron/scheduler.py", "cron/scheduler_detached_worker.py", "cron/jobs.py",
+                         "cron/missed_windows.py", "cron/owner_alerts.py",
                          "cron/scheduler_session_store.py", "cron/job_run_retry.py",
                          "hermes_cli/immutable_releases.py"):
             shutil.copy2(repo / relative, release / relative)

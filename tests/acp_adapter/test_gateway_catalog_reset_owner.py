@@ -1,4 +1,5 @@
 """An explicit canonical reset on an ACP session is offered and reopened by its retained owner."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from contextlib import closing
 from dataclasses import asdict
 
@@ -28,7 +29,7 @@ def _acp_local_session(db, epoch, cwd):
 def test_reset_child_maps_to_its_owner_while_legacy_reset_histories_stay_independent(tmp_path):
     path = tmp_path / 'state.db'
     with closing(SessionDB(path)) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         sid = _acp_local_session(db, epoch, tmp_path)
         db.append_message(sid, 'user', 'before reset')
         row = db.get_session(sid)

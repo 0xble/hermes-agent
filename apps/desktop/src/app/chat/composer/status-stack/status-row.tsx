@@ -65,7 +65,14 @@ function leadingGlyph(item: ComposerStatusItem, s: Translations['statusStack'], 
   return (
     <span
       aria-hidden
-      className={cn('size-1.5 rounded-full', item.state === 'failed' ? 'bg-destructive/80' : 'bg-emerald-500/70')}
+      className={cn(
+        'size-1.5 rounded-full',
+        item.state === 'unknown'
+          ? 'bg-amber-500/80'
+          : item.state === 'failed'
+            ? 'bg-destructive/80'
+            : 'bg-emerald-500/70'
+      )}
     />
   )
 }

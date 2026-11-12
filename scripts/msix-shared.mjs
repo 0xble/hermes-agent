@@ -8,6 +8,63 @@ import { createRequire } from 'node:module'
 
 const require = createRequire(import.meta.url)
 
+/** @type {Set<string> | null} */
+let admittedChannelRequests = null
+
+const channelValidator = [
+  'import sys',
+  'sys.path.insert(0, sys.argv[1])',
+  'from hermes_cli.release_channels import decode_json',
+  'from scripts.bundles.desktop_prepare import validate_channel_request',
+]
+
+/** @param {string[]} raws @param {NodeJS.ProcessEnv} env */
+function validateChannelRequests(raws, env) {
+  const validator = [...channelValidator,
+    'import json',
+    '[validate_channel_request(decode_json(raw.encode())) for raw in json.loads(sys.stdin.buffer.read())]',
+  ].join('; ')
+  execFileSync(env.HERMES_PYTHON || 'python', ['-I', '-S', '-c', validator, path.resolve(import.meta.dirname, '..')], {
+    env, input: JSON.stringify(raws), encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30_000,
+  })
+}
+
+/** @param {NodeJS.ProcessEnv} env */
+function channelAdmissionKey(env) {
+  return JSON.stringify([env.HERMES_PYTHON || 'python', env._HERMES_CHANNEL_REQUEST_JSON])
+}
+
+/** Validate exact request bytes together, then reuse them only within a
+ * synchronous callback. Every caller still performs its packaging guards,
+ * JSON decoding and version checks; no verdict survives the scope.
+ * @template T
+ * @param {NodeJS.ProcessEnv[]} environments
+ * @param {() => T} action
+ * @returns {T}
+ */
+export function withChannelBuildRequestBatch(environments, action) {
+  if (!environments.length) throw new Error('Channel request batch must not be empty')
+  const env = environments[0]
+  if (environments.some(value => (value.HERMES_PYTHON || 'python') !== (env.HERMES_PYTHON || 'python'))) {
+    throw new Error('Channel request batch requires one validator interpreter')
+  }
+  const raws = environments.map(value => {
+    if (!value._HERMES_CHANNEL_REQUEST_JSON) throw new Error('Channel request batch requires request JSON')
+    return value._HERMES_CHANNEL_REQUEST_JSON
+  })
+  validateChannelRequests(raws, env)
+  const previous = admittedChannelRequests
+  admittedChannelRequests = new Set(environments.map(channelAdmissionKey))
+  try {
+    for (const value of environments) channelBuildRequest(value)
+    const result = action()
+    if (result && typeof Object(result).then === 'function') throw new Error('Channel request batch callback must be synchronous')
+    return result
+  } finally {
+    admittedChannelRequests = previous
+  }
+}
+
 /** Build-only structured bridge; never read by the installed runtime.
  * @param {NodeJS.ProcessEnv} [env]
  * @returns {import('../apps/desktop/electron/install-stamp.js').ChannelBuildRequest | null}
@@ -19,16 +76,14 @@ export function channelBuildRequest(env = process.env) {
   if (env.HERMES_BUILD_COMMIT || env.HERMES_PAYLOAD_TAG) throw new Error('Channel request conflicts with commit or tag identity')
   // The bundled toolchain already supplies Python. Reuse the authoritative
   // validator rather than maintaining a third protocol decoder for packaging.
-  const validator = [
-    'import sys',
-    'sys.path.insert(0, sys.argv[1])',
-    'from hermes_cli.release_channels import decode_json',
-    'from scripts.bundles.desktop_prepare import validate_channel_request',
-    'validate_channel_request(decode_json(sys.stdin.buffer.read()))'
-  ].join('; ')
-  execFileSync(env.HERMES_PYTHON || 'python', ['-I', '-S', '-c', validator, path.resolve(import.meta.dirname, '..')], {
-    env, input: env._HERMES_CHANNEL_REQUEST_JSON, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30_000
-  })
+  if (!admittedChannelRequests?.has(channelAdmissionKey(env))) {
+    const validator = [...channelValidator,
+      'validate_channel_request(decode_json(sys.stdin.buffer.read()))'
+    ].join('; ')
+    execFileSync(env.HERMES_PYTHON || 'python', ['-I', '-S', '-c', validator, path.resolve(import.meta.dirname, '..')], {
+      env, input: env._HERMES_CHANNEL_REQUEST_JSON, encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'], timeout: 30_000
+    })
+  }
   if (env.HERMES_PAYLOAD_VERSION && env.HERMES_PAYLOAD_VERSION !== value.version) throw new Error('Channel package version conflicts with prepared request')
   Object.freeze(value.identity)
   Object.freeze(value.bundleEnv)

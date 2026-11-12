@@ -11,7 +11,7 @@ def _probe(tmp_path, *, advanced=False, runs=False):
     home, state = tmp_path / 'home', tmp_path / 'state'
     home.mkdir()
     state.mkdir()
-    env = {key: os.environ[key] for key in ('PATH', 'LANG', 'TZ', 'SYSTEMROOT') if key in os.environ}
+    env = {key: os.environ[key] for key in ('HERMES_TEST_ISOLATION', 'PATH', 'LANG', 'TZ', 'SYSTEMROOT') if key in os.environ}
     env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state), PYTHONPATH=str(repo))
     if advanced:
         env['API_ADVANCED'] = '1'

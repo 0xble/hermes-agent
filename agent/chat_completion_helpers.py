@@ -70,11 +70,6 @@ _PROVIDER_STREAM_ERROR_TEXT_LIMIT = 4096
 # billing reasons keep their own longer cooldown.
 _FALLBACK_EXHAUSTED_COOLDOWN_S = 5.0
 
-# Streaming 5xx unmask probe: one non-streaming re-issue per this window. Covers the
-# outer retry loop (up to ~3 attempts x backoff, well under 60s) so an outage doesn't
-# double traffic every attempt, while later turns re-arm automatically.
-_STREAM_5XX_PROBE_WINDOW_S = 60.0
-
 
 def _context_thread_target(callback):
     """Bind a no-argument thread target to the caller's ContextVars."""
@@ -1501,11 +1496,11 @@ def _build_bedrock_kwargs(agent, api_messages, tools_for_api, reasoning_config):
 def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, request_overrides, cache_scope_id):
     from agent.codex_responses_adapter import classify_responses_route
     from agent.native_compaction import native_compaction_context_management
-    is_codex_backend, is_xai_responses, is_github_responses = classify_responses_route(agent)
+    is_codex_backend, is_xai_responses, endpoint = classify_responses_route(agent)
     # Native server-side compaction (gpt-5.6 on direct OpenAI / ChatGPT Codex routes
     # only) — None on every other route/model, leaving the request unchanged.
     context_management = native_compaction_context_management(agent, is_codex_backend=is_codex_backend,
-        is_xai_responses=is_xai_responses, is_github_responses=is_github_responses)
+        is_xai_responses=is_xai_responses, endpoint=endpoint)
     # xAI's /responses endpoint 400s on ``pattern``/``format`` schema keywords and on
     # ``enum`` values containing ``/`` — strip them (#27197). Deep-copy first: the
     # sanitizers mutate in place and tools_for_api aliases agent.tools (#27907).
@@ -1528,9 +1523,9 @@ def _build_codex_kwargs(agent, api_messages, tools_for_api, reasoning_config, re
         cache_scope_id=cache_scope_id, base_url=agent.base_url,
         max_tokens=output_cap,
         timeout=agent._resolved_api_call_timeout(), request_overrides=request_overrides,
-        provider=getattr(agent, "provider", None), is_github_responses=is_github_responses,
+        provider=getattr(agent, "provider", None),
         is_codex_backend=is_codex_backend, is_xai_responses=is_xai_responses,
-        github_reasoning_extra=agent._github_models_reasoning_extra_body() if is_github_responses else None,
+        profile_reasoning=agent._endpoint_reasoning_payload() if endpoint.profile_reasoning else None,
         replay_encrypted_reasoning=bool(getattr(agent, "_codex_reasoning_replay_enabled", True)),
         context_management=context_management, text_verbosity=getattr(agent, "text_verbosity", None))
 
@@ -1543,8 +1538,8 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     _is_qwen = agent._is_qwen_portal()
     _is_or = agent._is_openrouter_url()
     _host = agent._base_url_lower
-    _is_gh = base_url_host_matches(_host, "models.github.ai") or base_url_host_matches(_host, "githubcopilot.com")
     _is_lmstudio = (agent.provider or "").strip().lower() == "lmstudio"
+    _profile_endpoint = agent._reasoning_endpoint_profile() is not None
 
     # _fixed_temperature_for_model may return the OMIT_TEMPERATURE sentinel
     # (temperature omitted entirely), a numeric override, or None.
@@ -1567,7 +1562,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     output_cap = selected_max_output_tokens(agent)
     _ephemeral_out = _consume_ephemeral_max_output(agent)
     from agent.reasoning_carriers import shape_wire_carriers
-    api_messages = shape_wire_carriers(api_messages, model=agent.model, base_url=agent.base_url)
+    api_messages = shape_wire_carriers(api_messages, model=agent.model, base_url=agent.base_url, scope=agent)
     # Strip image parts for non-vision models on BOTH paths (registered
     # providers with profiles used to bypass it).
     _common = dict(model=agent.model, messages=agent._prepare_messages_for_non_vision_model(api_messages),
@@ -1592,7 +1587,6 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         is_openrouter=_is_or,
         is_nous=base_url_host_matches(_host, "nousresearch.com"),
         is_qwen_portal=_is_qwen,
-        is_github_models=_is_gh,
         is_nvidia_nim=base_url_host_matches(_host, "integrate.api.nvidia.com"),
         is_kimi=any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
         is_tokenhub=base_url_host_matches(_host, "tokenhub.tencentmaas.com"),
@@ -1601,7 +1595,7 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
         fixed_temperature=_fixed_temp,
         omit_temperature=_omit_temp,
-        github_reasoning_extra=agent._github_models_reasoning_extra_body() if _is_gh else None,
+        profile_endpoint=_profile_endpoint, endpoint_reasoning=agent._endpoint_reasoning_payload() if _profile_endpoint else None,
         provider_name=agent.provider,
     )
 
@@ -1733,7 +1727,7 @@ def _assistant_tool_call_dict(agent, tool_call, index: int) -> dict:
     extra = getattr(tool_call, "extra_content", None)
     if extra is not None:
         tc_dict["extra_content"] = _dump_if_model(extra)
-    # Copilot's Gemini 3 variant signs the call inside ``function`` (replayed only to Copilot).
+    # Some gateways sign Gemini 3 calls inside ``function`` (replayed only where the endpoint profile asks).
     from agent.reasoning_carriers import field
     fn_sig = field(tool_call, "thought_signature") or getattr(tool_call.function, "thought_signature", None)
     if isinstance(fn_sig, str) and fn_sig:
@@ -1836,7 +1830,7 @@ def build_assistant_message(agent, assistant_message, finish_reason: str) -> dic
 
     from agent.reasoning_carriers import carrier_record
     if record := carrier_record(assistant_message):
-        # Gemini text-turn signature / Copilot reasoning_opaque+text: top-level for the live
+        # Gemini text-turn signature / profile-declared reasoning carriers: top-level for the live
         # history, a private reasoning_details record for persistence (reasoning_carriers.py).
         msg.update({k: v for k, v in record.items() if k != "type"})
         msg["reasoning_details"] = [*msg.get("reasoning_details", ()), record]
@@ -1969,7 +1963,7 @@ def _fallback_api_mode_resolved(agent, fb_provider: str, fb_model: str, fb_base_
         return "anthropic_messages"
     if agent._is_azure_openai_url(fb_base_url):
         return "chat_completions"  # Azure serves gpt-5.x on /chat/completions — no Responses API.
-    # Provider exceptions (Copilot gpt-5-mini) stay inside the requires-responses predicate.
+    # Per-model provider exceptions stay inside the requires-responses predicate.
     if agent._is_direct_openai_url(fb_base_url) or agent._provider_model_requires_responses_api(fb_model, provider=fb_provider):
         return "codex_responses"
     host = base_url_hostname(fb_base_url)
@@ -2018,14 +2012,15 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
 
 
 def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_armed: bool = False) -> bool:
-    """Chain exhausted (always False). A non-empty chain walked without an armed primary cooldown
-    arms a short one so next turn's restore_primary_runtime stays gated instead of replaying the
-    whole context across every provider again. A rate limit or overload from an active fallback
-    arms nothing shared, so it still gets this short window."""
+    """Always False; briefly cool an exhausted chain if the primary has no cooldown.
+    Gate next-turn restore even when a rate limit or overload came from an active fallback."""
     if agent._fallback_chain and not cooldown_armed:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
         agent._fallback_episode_cooled = True
+    # Exhaustion is not restoration: an active alias still owns its silent provenance.
+    if not getattr(agent, "_provider_fallback_active", False):
+        agent._provider_fallback_silent_retry = False
     return False
 
 
@@ -2068,13 +2063,14 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
-    # Skip entries that resolve to the same backend that just failed — falling back to it loops the failure.
-    # See #22548, #62984, #70893.
+    # Skip same-label entries on the failed backend; different labels retain their bounded retry.
     from agent.backend_identity import BackendIdentity, should_skip_candidate
     current_ident = BackendIdentity.build(provider=getattr(agent, "provider", ""),
         model=getattr(agent, "model", ""), base_url=str(getattr(agent, "base_url", "") or ""))
     fb_ident = BackendIdentity.build(provider=fb_provider, model=fb_model, base_url=(fb.get("base_url") or ""))
-    if should_skip_candidate(fb_ident, current_ident):
+    # This preserves alias retry eligibility for all existing failover reasons, not only 5xx.
+    # Keep earlier unavailability/connection-domain skips authoritative.
+    if should_skip_candidate(fb_ident, current_ident) and fb_provider == current_ident.provider:
         logger.warning(
             "Fallback skip: chain entry %s/%s resolves to the same backend as the current one (%s)",
             fb_provider, fb_model, current_ident.base_url or current_ident.provider)
@@ -2236,6 +2232,7 @@ def try_activate_fallback(
     another process already armed; it must not re-arm the record or emit a duplicate notice.
     """
     from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    from agent.fallback_notice import buffer_fallback_route_notice, resolved_route
     shared_adoption = isinstance(_shared_cooldown_record, dict)
     new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
     if new_fallback_episode and not shared_adoption:
@@ -2269,6 +2266,7 @@ def try_activate_fallback(
 
         try:
             from agent.route_binding import bind_route_entry
+            old_route = resolved_route(agent)
             bound = bind_route_entry(agent, fb, fb_provider, fb_model)
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
@@ -2276,18 +2274,8 @@ def try_activate_fallback(
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
-            use_generic_notice, notice = _rate_limit_fallback_notice(
-                agent, reason, shared_adoption, old_model, fb_model, fb_provider)
-            if use_generic_notice:
-                notice = (
-                    f"⚠️ Model fallback: {old_model} via {old_provider} unavailable "
-                    f"({_fallback_reason_text(reason)}); using {fb_model} via {fb_provider}."
-                )
-                if cooldown_seconds is not None:
-                    remaining = max(0, math.ceil(agent._rate_limited_until - time.monotonic()))
-                    notice += f" Primary retry eligible in ~{remaining} s; recovery is not guaranteed."
-            if notice:
-                _buffer_fallback_notice(agent, notice)
+            buffer_fallback_route_notice(
+                agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds)
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
@@ -2552,29 +2540,14 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
-    dropped_tool_names=None, overflow_terminal=False, api_mode=None, clean_eof=False):
-    """Stub for an SSE stream that ended without ``finish_reason`` after
-    delivering content. Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH``
-    so the loop enters its continuation/retry path instead of accepting
-    truncated output as a complete turn (#32086).
-
-    ``overflow_terminal`` (``full_content=None``): the stream died on a
-    context-overflow error. Seeding the recovered text as a continuation stub
-    would grow every later request into the same overflow (#106260); the loop
-    treats the marker as terminal and ends the turn via the recovery contract.
-
-    ``api_mode="anthropic_messages"`` returns a Messages-shaped stub (``content``
-    block list + ``stop_reason="max_tokens"``) so AnthropicTransport validates it
-    and the loop continues instead of entering the invalid-response retry ladder
-    (#45908). Empty content keeps one empty text block: validate_response rejects
-    an empty list for ``max_tokens``.
-
-    ``clean_eof``: the stream ended with no transport exception and no
-    ``finish_reason`` (server/intermediary closed cleanly). Only the two
-    clean-EOF sites in ``_finish_chat_stream`` pass True; the stub built after a
-    real transport exception keeps False so the loop can word the two failure
-    modes differently (#102766).
-    """
+    dropped_tool_names=None, dropped_tool_argument_chars=0, overflow_terminal=False, api_mode=None, clean_eof=False):
+    """Stub for an SSE stream that ended without ``finish_reason`` after delivering content.
+    Tagged ``PARTIAL_STREAM_STUB_ID`` + ``FINISH_REASON_LENGTH`` so the loop continues instead of accepting
+    truncated output (#32086). ``overflow_terminal`` marks context overflow because seeding recovered text
+    would grow every request into the same overflow (#106260). Anthropic keeps a Messages-shaped stub so validation
+    accepts ``max_tokens``; empty content keeps one text block because an empty list is rejected (#45908). ``clean_eof``
+    marks a server/intermediary close with no exception or finish reason. Only the two clean-EOF sites pass True;
+    transport exceptions keep False for distinct failure wording (#102766)."""
     if api_mode == "anthropic_messages":
         return SimpleNamespace(
             id=PARTIAL_STREAM_STUB_ID,
@@ -2586,6 +2559,7 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
             stop_sequence=None,
             usage=usage_obj,
             _dropped_tool_names=dropped_tool_names or None,
+            _dropped_tool_argument_chars=dropped_tool_argument_chars,
             _overflow_terminal=overflow_terminal,
             _clean_eof=clean_eof,
         )
@@ -2600,6 +2574,7 @@ def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, u
         )],
         usage=usage_obj,
         _dropped_tool_names=dropped_tool_names or None,
+        _dropped_tool_argument_chars=dropped_tool_argument_chars,
         _overflow_terminal=overflow_terminal,
         _clean_eof=clean_eof,
     )
@@ -2903,6 +2878,7 @@ class _StreamingCall(StreamingWaitMonitor):
         self.on_first_delta = on_first_delta
         self.worker = None  # request thread; None in inline mode
         self.result = {"response": None, "error": None, "partial_tool_names": []}
+        self._partial_tool_accumulator = None
         self.clients = _RequestClientRegistry(agent)
         # Request-local cancel flag: the worker recognizes its own interrupt
         # force-close (RemoteProtocolError) and exits instead of retrying (#6600).
@@ -2974,6 +2950,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # its tool name (died before any text) must not label a later partial stub or retry.
         self.provider_tool_in_flight["yes"], self.prompt_progress["progress"] = False, None
         self.result["partial_tool_names"] = []
+        self._partial_tool_accumulator = None
         return attempt_id
 
     def _cancel_current_stream_attempt(self, reason: str) -> None:
@@ -3039,7 +3016,7 @@ class _StreamingCall(StreamingWaitMonitor):
         reasoning tags inside it must still reach the display: route through
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
-        if self.agent.stream_delta_callback:
+        if self.agent.stream_delta_callback and not getattr(self.agent, "_hold_stream", False):
             self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
 
     def _new_diag(self) -> dict:
@@ -3231,6 +3208,7 @@ class _StreamingCall(StreamingWaitMonitor):
         pending_text_parts: list[str] = []
         from agent.chat_completion_helpers_tool_calls import _ToolCallAccumulator
         tool_calls = _ToolCallAccumulator()
+        self._partial_tool_accumulator = tool_calls
         tool_calls_acc = tool_calls.acc
         from agent.reasoning_carriers import StreamCarriers
         carriers = StreamCarriers()
@@ -3318,7 +3296,7 @@ class _StreamingCall(StreamingWaitMonitor):
             # whose deltas carry only this field otherwise trips the empty-stream guard (#56516).
             if reasoning_text is None and isinstance(getattr(delta, "model_extra", None), dict):
                 reasoning_text = delta.model_extra.get("reasoning_content") or delta.model_extra.get("reasoning")
-            # Copilot /chat/completions names its readable reasoning ``reasoning_text``.
+            # A profile-declared text carrier doubles as the readable reasoning.
             reasoning_text = carriers.feed(delta, reasoning_text)
             if reasoning_text:
                 # Summary-part models omit the separator between markdown blocks; re-insert it.
@@ -3513,13 +3491,17 @@ class _StreamingCall(StreamingWaitMonitor):
             # Partial args WITH finish_reason="length" is a real output cap; with NONE the
             # upstream dropped mid tool-call, and stamping "length" burns 3 useless retries.
             _dropped_names = [(tool_calls_acc[idx]["function"]["name"] or "?") for idx in sorted(tool_calls_acc)]
+            _arg_chars = sum(len(tool_calls_acc[idx]["function"]["arguments"]) for idx in sorted(tool_calls_acc))
             logger.warning(
                 "Clean EOF, no finish_reason: server ended the stream (no transport exception) while a tool "
                 "call's arguments were still incomplete (tools=%s). The server or a proxy closed the stream "
-                "cleanly; not an output-length truncation.",
-                _dropped_names)
+                "cleanly; not an output-length truncation. model=%s provider=%s base_url_host=%s stale_timeout=%s "
+                "arg_chars=%s error_class=%s", _dropped_names, getattr(self.agent, "model", "unknown"),
+                getattr(self.agent, "provider", "") or "unknown", base_url_hostname(getattr(self.agent, "base_url", "") or "") or "unknown",
+                self._stream_stale_timeout, _arg_chars, "CleanEOF")
             return _build_partial_stream_stub(
                 role, full_content, full_reasoning, model_name, usage_obj, dropped_tool_names=_dropped_names or None,
+                dropped_tool_argument_chars=_arg_chars,
                 clean_eof=True)
         if finish_reason is None and (content_parts or reasoning_parts) and not tool_calls_acc and usage_obj is None:
             # Text-only (or reasoning-only) drop: otherwise the partial text is stamped "stop"
@@ -3594,6 +3576,7 @@ class _StreamingCall(StreamingWaitMonitor):
         from agent import relay_llm
         from agent.anthropic_adapter import normalize_stream_usage, sanitize_anthropic_kwargs
         accumulator = relay_llm.AnthropicStreamAccumulator()
+        self._partial_tool_accumulator = accumulator
 
         def _open_anthropic_stream(next_api_kwargs: dict[str, Any]):
             final_kwargs = dict(next_api_kwargs)
@@ -3792,22 +3775,7 @@ class _StreamingCall(StreamingWaitMonitor):
             self.clients.close_once("stream_options_rejected_retry")
             return True
 
-        if self.deltas_were_sent["yes"]:
-            _partial_tool_in_flight = bool(self.result.get("partial_tool_names")) or self.provider_tool_in_flight["yes"]
-            if not _partial_tool_in_flight and not self._visible_text_delivered():
-                # Deltas fired but nothing visible reached a consumer (whitespace/think-only
-                # deltas, or no display consumer at all) and no tool call is in flight: from
-                # the user's and the model's point of view NOTHING was delivered. The
-                # "partial delivery" stub would be EMPTY and the loop would ask the model to
-                # continue from nowhere, so it repeats the lost step (#112419). Classify as an
-                # undelivered failure instead: same-prefix retry, then the main loop's
-                # fallback/backoff — there is no text to duplicate.
-                logger.warning(
-                    "Stream died after deltas but before any visible text was delivered (0 chars, "
-                    "no tool call in flight); treating as an undelivered stream failure: %s", e)
-                self._quiet(self.agent._reset_stream_delivery_tracking)
-                self.deltas_were_sent["yes"] = False
-                self.first_delta_fired["done"] = False
+        _partial_tool_in_flight = self._forget_invisible_deltas(e)
         if self.deltas_were_sent["yes"]:
             # Died AFTER tokens were delivered: normally no retry (would duplicate
             # text). Exception: a tool call in flight — aborting discards it, so
@@ -3873,16 +3841,9 @@ class _StreamingCall(StreamingWaitMonitor):
         that decision, so a pending stop must not buy one more request.
         True = handled (caller must not overwrite result); False = propagate ``e``.
         """
-        if getattr(self.agent, "_interrupt_requested", False):
+        from agent.chat_completion_stream_probe import _STREAM_5XX_PROBE_WINDOW_S, stream_error_allows_unmask
+        if not stream_error_allows_unmask(self.agent, e, self.deltas_were_sent["yes"]):
             return False
-        if _streams_llamacpp(self.agent):
-            # Same error either way, and the router can't cancel this probe once its watchdog gives up.
-            return False
-        status = _extract_status_code(e)
-        if status is None or status < 500 or self.deltas_were_sent["yes"]:
-            return False
-        if getattr(self.agent, "api_mode", "") not in ("", "chat_completions"):
-            return False  # replay handles chat-completions shapes only
         now = time.monotonic()
         last_probe = self.agent._stream_5xx_probe_ts
         if last_probe is not None and now - last_probe < _STREAM_5XX_PROBE_WINDOW_S:
@@ -4041,10 +4002,7 @@ class _StreamingCall(StreamingWaitMonitor):
             self.clients.close_once("stale_stream_kill")
         self._shutdown_stale_attempt_socket(_killed_response)
         self._count_stale_attempt()
-        # Reset the timer so we don't kill repeatedly while the worker unwinds.
-        self.last_chunk_time["t"] = time.time()
-        self.agent._emit_diagnostic_wait(f"⚠ no output from provider for {int(elapsed)}s — reconnecting...")
-        self.agent._touch_activity(f"stale stream detected after {int(elapsed)}s, reconnecting")
+        self._rearm_or_abandon_after_kill(elapsed)
 
     def _abort_for_interrupt(self, stale_elapsed: float) -> None:
         """/stop seen by the monitor: mark cancelled, abort the request-local
@@ -4088,29 +4046,12 @@ class _StreamingCall(StreamingWaitMonitor):
             return
         self._stream_stale_timeout = _cloud_stale_timeout_for(self.agent, self.api_kwargs)
 
-    def _partial_stream_stub(self):
-        """Tokens already reached the platform: a finish_reason="length" stub fires the
-        continuation machinery; tool_calls=None blocks executing incomplete calls.
-        Content may be EMPTY (dropped tool call, overflow) — the loop skips appending an
-        empty stub and only sends the nudge (placeholder text leaked into the stitched
-        response). A text-only death with 0 visible chars never gets here: the error
-        handler reclassifies it as undelivered (#112419)."""
-        error = self.result["error"]
+    def _partial_stream_stub(self, error):
+        """Tokens already reached the platform: a length stub fires continuation and ``tool_calls=None`` blocks incomplete calls.
+        Content may be EMPTY (dropped call, overflow), so the loop sends only the nudge rather
+        than persisting placeholder text. Text-only deaths with 0 visible chars are reclassified as undelivered (#112419)."""
         _partial_text = (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip() or None
         _partial_names = list(self.result.get("partial_tool_names") or [])
-        if _partial_names:
-            # User-visible warning so the user and model both know what was attempted.
-            _name_str = ", ".join(_partial_names[:3])
-            if len(_partial_names) > 3:
-                _name_str += f", +{len(_partial_names) - 3} more"
-            _warn = (f"\n\n⚠ Stream stalled mid tool-call ({_name_str}); the action was not executed. "
-                     f"Ask me to retry if you want to continue.")
-            _partial_text = (_partial_text or "") + _warn  # model/result bookkeeping, never gated
-            if self.agent._warning_presentation_enabled():
-                self._quiet(self.agent._fire_stream_delta, _warn)  # visible immediately
-            logger.warning(
-                "Partial stream dropped tool call(s) %s after %s chars of text; surfaced warning to user: %s",
-                _partial_names, len(_partial_text or ""), error)
         # Classify the error before it is swallowed into the stub: the loop reads the
         # content-filter tag and falls back; a context overflow must not be continued at all.
         _cls = None
@@ -4118,12 +4059,32 @@ class _StreamingCall(StreamingWaitMonitor):
             from agent.error_classifier import classify_api_error
             _cls = classify_api_error(
                 error, provider=str(getattr(self.agent, "provider", "") or ""), model=str(getattr(self.agent, "model", "") or ""))
+        _arg_chars = 0
+        if self._partial_tool_accumulator is not None:
+            with contextlib.suppress(Exception):
+                _arg_chars = self._partial_tool_accumulator.argument_chars()
+        _overflow_terminal = _cls is not None and _cls.reason == FailoverReason.context_overflow
+        if _partial_names:
+            logger.warning(
+                "Partial stream dropped tool call(s) %s after %s chars of text; model=%s provider=%s base_url_host=%s "
+                "stale_timeout=%s arg_chars=%s error_class=%s error=%s", _partial_names, len(_partial_text or ""),
+                getattr(self.agent, "model", "unknown"), getattr(self.agent, "provider", "") or "unknown",
+                base_url_hostname(getattr(self.agent, "base_url", "") or "") or "unknown", self._stream_stale_timeout,
+                _arg_chars, type(error).__name__, error)
+        if _partial_names and not _overflow_terminal:
+            _name_str = ", ".join(_partial_names[:3])
+            if len(_partial_names) > 3:
+                _name_str += f", +{len(_partial_names) - 3} more"
+            _warn = f"\n\n⚠ Stream cut mid tool-call ({_name_str}). The action was not executed."
+            _partial_text = (_partial_text or "") + _warn
+            if self.agent._warning_presentation_enabled():
+                self._quiet(self.agent._fire_stream_delta, _warn)
         _reset_stale_streak(self.agent)  # deltas fired => provider responsive: clear the breaker
         # #106260: continuing after a context-overflow error re-sends a larger request into the
         # same overflow. Return an EMPTY stub marked terminal so the loop ends the turn instead.
         # Scope is context_overflow ONLY: payload_too_large (413) has its own byte-scored recovery
         # owner (turn_overflow._recover_payload_too_large, #88960/#47339) that must not be bypassed.
-        if _cls is not None and _cls.reason == FailoverReason.context_overflow:
+        if _overflow_terminal:
             logger.warning(
                 "Partial stream ended on a context-overflow error after %s chars; "
                 "NOT seeding a continuation stub (transcript is already over budget): %s",
@@ -4131,7 +4092,7 @@ class _StreamingCall(StreamingWaitMonitor):
             )
             return _build_partial_stream_stub(
                 "assistant", None, None, getattr(self.agent, "model", "unknown"), None,
-                dropped_tool_names=_partial_names, overflow_terminal=True,
+                dropped_tool_names=_partial_names, dropped_tool_argument_chars=_arg_chars, overflow_terminal=True,
                 api_mode=getattr(self.agent, "api_mode", None),
             )
         if not _partial_names:
@@ -4141,6 +4102,7 @@ class _StreamingCall(StreamingWaitMonitor):
                 len(_partial_text or ""), error)
         _stub = _build_partial_stream_stub("assistant", _partial_text, None,
             getattr(self.agent, "model", "unknown"), None, dropped_tool_names=_partial_names,
+            dropped_tool_argument_chars=_arg_chars,
             api_mode=getattr(self.agent, "api_mode", None))
         if _cls is not None and _cls.reason == FailoverReason.content_policy_blocked:
             _stub._content_filter_terminated = True
@@ -4173,11 +4135,18 @@ class _StreamingCall(StreamingWaitMonitor):
             raise InterruptedError("Agent interrupted during streaming API call")
         if self.agent._interrupt_requested:  # worker returned early before the monitor saw the flag
             raise InterruptedError("Agent interrupted during streaming API call (post-worker)")
-        if self.result["error"] is not None:
+        # Read the outcome once: an abandoned worker can still write into ``self.result`` later.
+        error, response = self.result["error"], self.result["response"]
+        if self._abandon_error is not None:
+            # Same bounded Relay join as /stop (#81521), before the retry opens a new scope.
+            _join_worker_for_relay_teardown(self.worker, label="Abandoned streaming")
+            error, response = self._abandon_error, None
+            self._forget_invisible_deltas(error)  # nothing visible: retry, not a stub
+        if error is not None:
             if self.deltas_were_sent["yes"]:
-                return self._partial_stream_stub()
-            raise self.result["error"]
-        if self.result["response"] is not None:
+                return self._partial_stream_stub(error)
+            raise error
+        if response is not None:
             _reset_stale_streak(self.agent)  # provider proved responsive: clear the breaker
             with contextlib.suppress(Exception):
                 from agent.shared_primary_cooldown import complete_primary_recovery
@@ -4185,7 +4154,7 @@ class _StreamingCall(StreamingWaitMonitor):
         # Propagate first-chunk timing for the ``post_api_request`` hook.
         if isinstance(self.clients.diag, dict) and self.clients.diag.get("first_chunk_at"):
             self.agent._last_api_first_chunk_at = float(self.clients.diag["first_chunk_at"])
-        return self.result["response"]
+        return response
 
 
 def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):

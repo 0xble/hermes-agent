@@ -12,6 +12,17 @@ Every other field still has to match, including `user_name`, which
 `test_native_completion_wake_refuses_other_source_drift` pins. The admitted payload
 carries the committed envelope's own source and provenance.
 
+Trusted process notices first validate the recovered route, session pin and
+per-user owner, then restore that route's committed native source before ordinary
+admission. This accepts stale origin display or speaker data only at the process
+notice boundary. Direct automation still compares every source field other than
+`chat_topic` and `message_id`. Rebound and legacy routes keep their current-origin
+validation, and local/API paths do not borrow native provenance.
+
+Contract tests: `tests/gateway/test_process_notice_committed_source.py`,
+`tests/gateway/test_automation_route_display_labels.py`,
+`tests/gateway/test_automation_wake_route.py`.
+
 ## Source
 
 Fork patch identity: `automation-route-display-labels`.

@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from cron import jobs, executions, scheduler_authority
+from cron import jobs, executions, incidents, scheduler_authority
 from hermes_cli import gateway_client
 
 
@@ -117,7 +117,10 @@ def test_direct_retry_reuses_generated_fire_identity(monkeypatch, initial):
     assert requests[0] == requests[1]
 
 
-@pytest.mark.parametrize('answer', ['  \n', '[CRON_FAILURE]\nchild task failed'], ids=['blank', 'declared'])
+@pytest.mark.parametrize('answer', [
+    '  \n', '[CRON_FAILURE]\nchild task failed',
+    '[CRON_FAILURE]\n\n```text\nchild task failed\n```',
+], ids=['blank', 'declared', 'fenced-declared'])
 def test_recovered_receipt_books_the_same_failure_verdicts_as_the_firer(tmp_path, monkeypatch, answer):
     """A blank answer and an agent-declared [CRON_FAILURE] fail the run on the ordinary tail;
     receipt recovery must not book the same result green (ok / delivery_queued -> ok)."""
@@ -138,3 +141,7 @@ def test_recovered_receipt_books_the_same_failure_verdicts_as_the_firer(tmp_path
         saved = jobs.get_job(job['id'])
         assert (saved['last_status'], saved['failure_streak']) == ('error', 1)
         assert executions.get_execution(execution['id'])['status'] == 'failed'
+        if answer.startswith('[CRON_FAILURE]'):
+            incident, = incidents.list_incidents()
+            assert incident['failure_type'] == 'agent'
+            assert incident['error'].splitlines()[0] == 'child task failed'

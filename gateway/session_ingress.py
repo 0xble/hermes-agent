@@ -21,6 +21,9 @@ busy_acceptance = ContextVar('busy_acceptance', default=None)
 # commit task, which command barriers and /restart wait on): ``busy_acceptance`` may already resolve
 # once the input's FIFO position is fixed behind an earlier input of its chat still capturing.
 busy_commit = ContextVar('busy_commit', default=None)
+# Set by a messaging caller to run synchronously once its committed row is still ``queued`` (not yet
+# claimed by a drain), so work it starts is visible before the turn's own preprocessing can run.
+admitted_queued = ContextVar('admitted_queued', default=None)
 # ``_validate_native`` clauses about the message's own content, safe to name to the sender's chat.
 _CONTENT_CLAUSES = frozenset({
     'text', 'auto_skill', 'channel_prompt', 'channel_context', 'reply_expected',
@@ -35,12 +38,15 @@ QUEUE_FULL_REPLY = ('⏳ Too many messages are already waiting in this conversat
 async def admit_message(authority, event):
     from gateway.session_refusals import internal_input, log_internal_refusal, user_notice_due
     from gateway.session_authority import messaging_admission
-    accepted, committed = busy_acceptance.get(), busy_commit.get()
+    accepted, committed, on_queued = busy_acceptance.get(), busy_commit.get(), admitted_queued.get()
     busy_acceptance.set(None)  # the drain task this schedules must not inherit the busy caller's future
     busy_commit.set(None)
+    admitted_queued.set(None)
     ingress = messaging_admission.set(True if accepted is None else accepted)
     try:
         receipt = await authority.admit_native(event)
+        from gateway.reply_latency import record_admitted
+        record_admitted(event)
         if committed is not None and not committed.done():
             committed.set_result(None)  # the row is durable (any status): a barrier may go on
     except RuntimeStoreError as exc:
@@ -87,6 +93,8 @@ async def admit_message(authority, event):
             del adopters[receipt.admission_id]
         return (None if status == 'terminal' or internal_input(event)
                 else pause_notice(authority, receipt.ref, 'unknown_execution'))
+    if on_queued is not None and status == 'queued':
+        on_queued()
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
@@ -95,10 +103,47 @@ async def admit_message(authority, event):
         if internal_input(event):
             log_internal_refusal(authority.runner, event.source, exc.reason, exc.field)
             return None
+        row = get_session_admission(authority.db, admission_id=receipt.admission_id)
+        if row is not None and row['status'] == 'terminal':
+            # The drain refused this head (``_refuse_head``): cancelled, not saved behind a pause.
+            return (f'⚠️ Hermes did not answer this message ({exc.reason}): the conversation it was '
+                    'queued for moved, so it was dropped. Send it again to continue.')
         return pause_notice(authority, receipt.ref, exc.reason)
     finally:
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
+        _claim_post_delivery(authority, receipt.admission_id, event, waiter)
+
+
+def _claim_post_delivery(authority, admission_id, event, waiter):
+    """Hand the drained turn's post-delivery cleanup to this waiter's sender, which fires it once
+    the reply is sent (``fire_turn_post_delivery``). A caller that stopped waiting sends nothing, so
+    the cleanup then fires when the turn settles."""
+    if waiter.done():
+        post_delivery = _registry(authority, 'waiter_post_deliveries').pop(admission_id, None)
+        if post_delivery is not None:
+            event._turn_post_delivery = post_delivery
+        return
+
+    def abandoned(_):
+        post_delivery = _registry(authority, 'waiter_post_deliveries').pop(admission_id, None)
+        if post_delivery is not None:
+            _fire_post_delivery(post_delivery)
+    waiter.add_done_callback(abandoned)
+
+
+async def fire_turn_post_delivery(event):
+    """Fire, once, the post-delivery cleanup (temporary progress bubbles) of the turn whose reply
+    ``event``'s sender just delivered. False when the drain handed this event none."""
+    post_delivery = getattr(event, '_turn_post_delivery', None)
+    if post_delivery is None:
+        return False
+    event._turn_post_delivery = None
+    owner, session_key, generation = post_delivery
+    fire = getattr(owner, '_fire_post_delivery_callback', None)
+    if fire is not None:
+        await fire(session_key, generation)
+    return True
 
 
 def _marker_adopters(authority):
@@ -130,6 +175,9 @@ async def _hand_over_turn_marker(authority, admission_id, event):
 
 
 def _move_marker(source, target):
+    for name in ('_reply_latency_receipt', '_terminal_reply_latency_receipt'):
+        if hasattr(source, name):
+            setattr(target, name, getattr(source, name))
     for name in _MARKER_FIELDS:
         if hasattr(source, name):
             setattr(target, name, getattr(source, name))
@@ -174,6 +222,10 @@ def retain_unsettled_delivery(authority, admission_id):
         delivery = authority.pending_deliveries.pop(admission_id, None)
     if delivery is not None:
         _registry(authority, 'unsettled_deliveries')[admission_id] = delivery
+    # The turn is over either way: a reply a later Discard sends carries no cards of its own.
+    post_delivery = _registry(authority, 'post_deliveries').pop(admission_id, None)
+    if post_delivery is not None:
+        _fire_post_delivery(post_delivery)
 
 
 async def deliver_resolved(authority, admission_id, *, owed):
@@ -233,6 +285,50 @@ def row_turn_author(policy, row):
     return forward_author(policy)
 
 
+async def _handle_compression_deferred_admission(authority, ref, row, event, captured):
+    """Keep an unexecuted native claim started, ahead of the durable FIFO.
+
+    A handler can defer at entry OR after its own hygiene turn-hold expires.
+    Re-enter that same handler only after compression publishes, so it reloads
+    current history. Never re-submit or enqueue the restored event in adapter RAM.
+    """
+    runner = authority.runner
+    live = authority.sessions[ref.session_id]
+    original_text = event.text
+    while True:
+        # Preparation can enrich event.text (auto skills). Replaying an unexecuted
+        # attempt must not stack that enrichment or suppress the eventual hooks.
+        event.text = original_text
+        event._gateway_compression_deferred = False
+        response = await runner._handle_message(event)
+        session_key = captured.pop('compression_deferred', None)
+        if session_key is None:
+            return response
+        while True:
+            held = await runner._session_has_compression_in_flight(session_key)
+            if not held:
+                from gateway.session_results import validate_unexecuted_claim
+                await asyncio.to_thread(validate_unexecuted_claim, authority.db, authority.epoch, row)
+            # Both the lock read and ownership validation yield: a Stop or drain
+            # accepted during either await must win before handler re-entry.
+            stopped = authority.pending_stops.get(ref.session_id) == row['generation']
+            draining = runner._draining or authority.retiring
+            replaced = authority.sessions.get(ref.session_id) is not live or live.superseded
+            if stopped or draining or replaced:
+                result = {'final_response': '', 'messages': [], 'interrupted': True, 'api_calls': 0}
+                if draining and not stopped:
+                    # Existing shutdown settlement requeues a zero-model native
+                    # claim, preserving its admission id for restart recovery.
+                    result['interrupt_message'] = runner._shutdown_interrupt_reason()
+                captured['result'] = result
+                return None
+            if not held:
+                break
+            # Lock lookup runs off-loop. Controls remain live while this claim
+            # holds the FIFO; the lease also bounds waits on a lost compressor.
+            await asyncio.sleep(0.1)
+
+
 async def execute_admission(authority, ref, row):
     # An admission explicitly claimed by the restore executor owns the corresponding queued
     # inbound event. Remove it before dispatch so replay cannot run it a second time.
@@ -273,7 +369,9 @@ async def execute_admission(authority, ref, row):
     # The committed FIFO claim owns execution, not the transport envelope that ingress
     # already admitted. Rehydration creates a new event, so its local outbox scope cannot
     # survive. Give the claim a durable identity without weakening transport redelivery dedup.
-    setattr(event, '_outbox_admission_id', f"admission:{row['admission_id']}")
+    # The claim's generation is part of it: a claim a shutdown requeued unrun
+    # (``requeue_unstarted_claim``) runs again under the next generation, not as a duplicate.
+    event._outbox_admission_id = f"admission:{row['admission_id']}:{row['generation']}"
     if event.internal and 'gateway_session_id' in event.metadata:
         # Main's ownership proof (802fd5782f3): the session the pre-claim check just validated, so the
         # turn's resolver never re-reads (and on a transient failure drops) an admitted completion.
@@ -315,7 +413,7 @@ async def execute_admission(authority, ref, row):
                     event.text = '\n'.join(part['text'] for part in prepared['content'] if part.get('type') == 'text')
                 event.allow_gateway_control = False
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
-            response = await authority.runner._handle_message(event)
+            response = await _handle_compression_deferred_admission(authority, ref, row, event, captured)
             result = captured.get('terminal_result', captured.get('result'))
             if result is None:
                 # No TurnRunner result means the handler answered without executing the turn.
@@ -359,12 +457,23 @@ async def execute_admission(authority, ref, row):
             return response
     finally:
         post_delivery = captured.get('post_delivery')
-        if post_delivery is not None and not native:
+        waiter = authority.waiters.get(row['admission_id'])
+        if post_delivery is not None and native and waiter is not None and not waiter.done():
+            # The live waiter sends this reply, so its sender fires the cleanup after that send.
+            # Every waiter does, not only the first message's adapter lifecycle: a busy follow-up's
+            # observer (``dispatch_shared_busy``) never unwinds one (2026-10-31, stale tool cards).
+            _registry(authority, 'waiter_post_deliveries')[row['admission_id']] = post_delivery
+            _claim(post_delivery)
+        elif post_delivery is not None and native:
+            # The waiter was already released (a pause, /stop) and claims nothing now.
+            _fire_post_delivery(post_delivery)
+        elif post_delivery is not None:
             # No live adapter handler unwinds this turn, so nothing else fires its post-delivery
             # cleanup: a recovered or internal turn's progress bubbles would stay forever. A turn
             # that raised or was cancelled is over too.
             if row['admission_id'] in authority.pending_deliveries:
                 _registry(authority, 'post_deliveries')[row['admission_id']] = post_delivery
+                _claim(post_delivery)
             else:
                 _fire_post_delivery(post_delivery)
         if not handed:
@@ -414,6 +523,14 @@ async def _execution_scope(authority, home):
 _post_delivery_tasks = set()
 
 
+def _claim(post_delivery):
+    """The turn's reply is still to be sent: keep a newer generation's sweep off its cleanup."""
+    owner, session_key, generation = post_delivery
+    claim = getattr(owner, 'claim_post_delivery', None)
+    if claim is not None:
+        claim(session_key, generation)
+
+
 def _fire_post_delivery(post_delivery):
     """Detached: bubble deletes can wait out a chat's flood limit, and the FIFO must not."""
     owner, session_key, generation = post_delivery
@@ -429,16 +546,23 @@ async def deliver_settled(authority, admission_id):
     turn's post-delivery cleanup. A send failure cannot rewrite that outcome; it is logged, and
     inference never runs again."""
     post_delivery = _registry(authority, 'post_deliveries').pop(admission_id, None)
+    handed = False
     try:
-        await _deliver_settled(authority, admission_id)
+        handed = await _deliver_settled(authority, admission_id)
     finally:
-        if post_delivery is not None:
+        if post_delivery is not None and handed:
+            # A waiter that registered after the turn started sends the reply after this returns
+            # (``_resolve_settled_waiter``): its sender fires the cleanup after that send.
+            _registry(authority, 'waiter_post_deliveries')[admission_id] = post_delivery
+        elif post_delivery is not None:
             _fire_post_delivery(post_delivery)
 
 
 async def _deliver_settled(authority, admission_id):
+    """True when the reply was handed to a waiter that registered late, which sends it itself."""
     held = _held_markers(authority).pop(admission_id, None)
     delivery = authority.pending_deliveries.get(admission_id)
+    handed = False
     if delivery is not None and admission_id in authority.native_waiters:
         # ``admit_message`` registered its delivery waiter after this turn started: the drain
         # hands that waiter the reply and its adapter lifecycle sends it, so this send is not owed.
@@ -448,12 +572,12 @@ async def _deliver_settled(authority, admission_id):
         if held is not None and adopter is not None:
             _move_marker(held, adopter)
             held = None
-        delivery = None
+        delivery, handed = None, True
     if delivery is None:
         if held is not None:
             # Fenced unknown: no answer is owed, so no later boot may deliver one either.
             await _release_turn_marker(authority, held)
-        return
+        return handed
     adapter, event, session_key, response, home = delivery
     try:
         with await _execution_scope(authority, home):
@@ -524,6 +648,11 @@ async def dispatch_shared_busy(adapter, event, session_key, *, durable=False):
             # which listens on the adopter (``event``).
             await adapter._release_turn_marker(delivery_event)
             await adapter._release_turn_marker(event)
+            # After the marker release, so bubble deletes waiting out a flood limit never hold the
+            # drain's bounded wait for it.
+            await fire_turn_post_delivery(event)
+            from gateway.platforms.base import release_temporary_notices
+            await release_temporary_notices(event)  # its busy ack: the queued turn has answered
 
     token, commit_token = busy_acceptance.set(accepted), busy_commit.set(committed)
     try:

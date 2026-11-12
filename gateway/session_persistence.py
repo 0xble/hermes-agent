@@ -87,7 +87,7 @@ class SessionPersistenceMixin:
             if len(kept) < len(data):
                 atomic_json_write(sessions_file, kept, mode=0o600)
 
-    def _open_session_db_for_active_scope(self, db_path: Optional[Path] = None):
+    def _open_session_db_for_active_scope(self, db_path: Optional[Path] = None, *, wait_for_open=False):
         """SessionDB for the active profile scope. ``db_path`` pins the store; otherwise
         ``_default_db_path()`` follows the context-local HERMES_HOME (resolved per call so
         multiplexed profiles reach their own store). Handles are cached per path; failed opens enter
@@ -109,7 +109,8 @@ class SessionPersistenceMixin:
                     print(f"[gateway] Warning: SQLite session store unavailable, falling back to JSONL: {e}")
                 raise
 
-        return self._db_handle_cache.get(path, _open, non_cacheable=_is_live_system_guard)
+        return self._db_handle_cache.get(
+            path, _open, non_cacheable=_is_live_system_guard, wait_for_open=wait_for_open)
 
     def _pinned_db(self):
         """Return the explicitly pinned DB (``store._db = x``), else ``_DB_UNPINNED``."""

@@ -9,6 +9,8 @@ from types import SimpleNamespace
 import psutil
 import pytest
 
+from hermes_cli.process_identity import worker_birth
+
 
 @pytest.mark.asyncio
 async def test_worker_register_requires_the_owners_launched_worker(tmp_path, monkeypatch):
@@ -17,7 +19,8 @@ async def test_worker_register_requires_the_owners_launched_worker(tmp_path, mon
     from gateway.session_contract import Principal, SessionRef
     from gateway.session_worker import worker_request
     from hermes_state import SessionDB
-    from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
+    from hermes_state_runtime import RuntimeStoreError
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     db = SessionDB(tmp_path / 'state.db')
@@ -33,7 +36,7 @@ async def test_worker_register_requires_the_owners_launched_worker(tmp_path, mon
 
     def scope(pid):
         return {'profile_id': 'p', 'session_id': 'owned', 'execution_id': f'compute-{pid}', 'generation': 0,
-                'pid': pid, 'birth': psutil.Process(pid).create_time(), 'secret': 'w' * 32, 'kind': 'compute'}
+                'pid': pid, 'birth': worker_birth(psutil.Process(pid)), 'secret': 'w' * 32, 'kind': 'compute'}
     interactive = SimpleNamespace(authority=authority, actor=Principal(
         'human', 'p', frozenset({'session:create', 'session:read', 'session:submit', 'session:control'}), 't'))
     worker = SimpleNamespace(authority=authority, actor=Principal('human', 'p', frozenset({'worker:adopt'}), 't'))

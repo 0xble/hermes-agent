@@ -149,6 +149,7 @@ class WorkerRPC:
         self.lock = threading.Lock()
         self.endpoint = None
         self.link = None
+        self.worker_scope = None
         self.request_id = 0
 
     def _connection(self, deadline=None):
@@ -183,6 +184,10 @@ class WorkerRPC:
         # A served secondary has no socket; its multiplexer's descriptor names it.
         from hermes_cli.gateway_runtime import discover_gateway_endpoint
         discovery = discover_gateway_endpoint(self.home, timeout=_connection_budget(deadline))
+        if discovery.reason_code == 'client_owned':
+            from hermes_cli.gateway_worker_discovery import discover_worker_gateway_endpoint
+            discovery = discover_worker_gateway_endpoint(self.home, self.worker_scope,
+                                                         timeout=_connection_budget(deadline))
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
@@ -230,6 +235,12 @@ class WorkerRPC:
             raise WorkerPersistenceError('synchronous_rpc_on_event_loop')
         from websockets.exceptions import ConnectionClosed
         with self.lock:
+            # Initial adopt and subsequent requests carry the owner's private
+            # assignment. Retain its closed adoption scope for rediscovery, not
+            # the creator PID or a caller-selected "worker" flag.
+            from gateway.session_worker import _SCOPE
+            if _SCOPE <= params.keys():
+                self.worker_scope = {key: params[key] for key in _SCOPE}
             deadline = time.monotonic() + OWNER_RESTART_TIMEOUT
             self.request_id += 1
             request_id = self.request_id
@@ -247,7 +258,12 @@ class WorkerRPC:
                     self._drop()
                     link = self._connection(deadline)
                     link.send(request_id, message)
-                response = link.receive(20)
+                try:
+                    response = link.receive(20)
+                except TimeoutError as exc:
+                    identity = ' '.join(f'{key}={params[key]}' for key in
+                                        ('execution_id', 'session_id', 'generation') if key in params)
+                    raise TimeoutError(f'{method} phase=answer timeout=20s {identity}: {exc}') from exc
             except BaseException:
                 # Outcome unknown once sent: surface the error and never resend; the next call redials.
                 self._drop()
@@ -298,9 +314,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('outbox_in_use')
         try:
             if self.path.exists():
-                if self.path.stat().st_size > max_bytes:
-                    raise WorkerPersistenceError('outbox_full')
-                self.journal = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                from agent.runtime_session_journal import read_journal
+                self.journal = read_journal(self.path, max_bytes)
                 reconciled = self.journal['scope'] != self.scope
                 if reconciled:
                     self._reconcile_adopted(adopted)
@@ -351,21 +366,14 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.journal = candidate
 
     def _save(self, journal):
-        if self._outbox_owner.closed:
-            raise WorkerPersistenceError('outbox_closed')
-        encoded = json.dumps(journal, ensure_ascii=True, allow_nan=False, separators=(',', ':')).encode()
-        if len(encoded) > self.max_bytes:
-            self.failure = 'outbox_full'
-            raise WorkerPersistenceError(self.failure)
-        from utils import atomic_write_bytes
-        # Owner-only journal (the dir is 0700 too); the rename and its directory entry are durable.
-        atomic_write_bytes(self.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
+        from agent.runtime_session_journal import save_journal
+        save_journal(self, journal)
 
     def _session(self, session_id):
         if session_id != self.scope['session_id']:
             raise WorkerPersistenceError('permission_denied')
 
-    def _apply(self, operation, payload):
+    def _apply(self, operation, payload, *, best_effort=False):
         with self.lock:
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
@@ -375,8 +383,16 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             candidate = json.loads(json.dumps(self.journal))
             candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
             candidate['next_sequence'] += 1
+            from agent.runtime_session_journal import OutboxCapacityError, check_worker_frame
             try:
+                check_worker_frame(self.scope, candidate['pending'][-1])
                 self._save(candidate)
+            except OutboxCapacityError:
+                # Only explicitly optional archives may skip an unsent rejection. Mandatory
+                # append callers can swallow errors: retain the failure for flush/finish.
+                if not best_effort:
+                    self.failure = 'outbox_full'
+                raise
             except Exception as exc:
                 self.failure = str(exc)
                 raise
@@ -422,6 +438,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.scope = candidate['scope']
             self.journal = candidate
             self.failure = None
+
+    def append_message(self, session_id, role, content=None, *, archived=False,
+                       compression_lock_holder=None, turn_lease_holder=None,
+                       turn_lease_ttl_seconds=300.0, **metadata):
+        self._session(session_id)
+        payload = dict(metadata, role=role, content=content, archived=archived,
+            compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+        return self._apply('transcript.append_one', payload)['row_id']
 
     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
@@ -552,8 +577,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self._apply('session.sidecars', {'patch': patch})
 
     def update_session_tool_names(self, session_id, pin):
-        # The tools[] freeze pin ({"version", "tools"}; None clears): without it every fresh worker
-        # re-probes check_fns and a config flip between turns silently forks the cached prefix.
+        # The tools[] freeze pin ({"version", "tools"[, "delegation_backend"]}; None clears): without it every
+        # fresh worker re-probes check_fns and a config flip between turns silently forks the cached prefix.
         self._session(session_id)
         self._apply('session.tools', {'tool_names': pin})
 

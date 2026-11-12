@@ -22,6 +22,17 @@ are owned by [Telegram rendering](telegram-rendering.md).
 - Synthetic gateway event IDs may identify notifications but never become Telegram reply
   anchors. Numeric Telegram message IDs still anchor ordinary DM-topic replies.
 
+## Root fallback is not topic recovery
+
+Fork patch identity: `telegram-delivery`.
+Contract tests: `tests/gateway/test_telegram_thread_fallback.py`.
+
+The 2026-11-09 investigation of https://github.com/NousResearch/hermes-agent/issues/152148 found that this fork's text retry ladder already returned `raw_response.thread_fallback`, and `cron/scheduler_delivery.py` already read it. The delivery-obligation finalizer, cancellation settlement, and recovered-obligation replay discarded it: `mark_delivered` unconditionally cleared `last_error`. Media anchor retries and control sends also removed routing without carrying the distinction into their results. This branch has no `telegram_dm_topic_send.py`; the corresponding routing helpers live in `plugins/platforms/telegram/adapter.py`.
+
+Successful root fallbacks retain `success=True` and report `thread_fallback=True` with `requested_thread_id`. Delivery obligations retain `state=delivered`, their requested `thread_id`, and their existing attempt count, with `last_error=thread_fallback_root`. This records receipt without claiming topic recovery or scheduling duplicate delivery. Anchored and newly created topic text sends retain their existing fail-closed contract. Each fallback logs a content-free WARNING naming the requested thread. Per-send context keeps media albums and control results honest without leaking a fallback into a later or concurrent send.
+
+The regression uses the fake Telegram transport and an explicitly selected temporary ledger database. It covers normal, cancellation, and recovered-obligation settlement, successful in-topic sends, native media, albums, and controls. No live Telegram call or live state database is needed. Retire when upstream carries equivalent result propagation and settlement. Roll back this logical change without a schema or data migration.
+
 ## Copy Block Delivery
 
 Canonical FIFO replies (`gateway/session_ingress.py::deliver_response`) send extracted
@@ -44,6 +55,59 @@ recovery, so the notice never resends the failed body under a different payload.
 This repair belongs to `telegram-delivery`. Retire it when released upstream provides
 the same FIFO copy handoff and shared failure visibility. Roll back the commit carrying
 that repair without changing persisted replies or delivery rows.
+
+## Literal inline copy context
+
+Patch identity: `telegram-inline-copy-quotes` (fork-authored). Preserve the existing
+separate-copy ledger identity, byte-exact bodies, ordered refusals and TTS exclusion
+while adding inline literal context. Display-only sentinels distinguish an inline
+main-reply ledger row from a raw-wrapped separate-copy row; replay must never promote
+the former into additional copy sends, or give the latter an extra inline message.
+No schema migration is involved. A downgrade should drain pending display-sentinel
+reply rows before reverting, because older renderers do not understand them.
+
+Rich-eligible copy-bearing replies retain native footnotes, details and tables on
+sends, rich drafts and final edits. Copy bodies are protected before all rich
+normalization and restored as HTML-escaped literal `<blockquote>` content, with
+`expandable` after six lines. Telegram's Rich Markdown does not parse Markdown
+inside HTML blockquotes; HTML escaping prevents tags/entities in the body from
+becoming markup. Literal details/math inside copy text cannot trigger the rich
+crash-shape guard; actual prose retains that guard and the CJK safety check.
+Rich-disabled, over-cap and unsupported-rich replies retain the MarkdownV2 quote
+fallback. Fences inside a body remain literal text, not nested pre entities.
+Large legacy bodies may create extra main-reply overflow messages; all use
+existing admission, pacing, flood and ambiguity handling, without a new producer
+or retry loop. The shared source chunk budget counts quote-line prefixes as
+well as MarkdownV2 escaping, including CR/CRLF bodies, so short source lines
+cannot overflow a legacy send or streamed preview after encoding.
+
+Media captions render display-only sentinels to marker-free inline text before
+plain-caption truncation. Voice captions still try formatted quotes first; both
+over-cap and rejected-entity fallbacks use the same caption boundary as audio,
+documents, photos, video, animation and albums. Auto-TTS speech excludes the copy
+body independently of its visible caption. `tests/gateway/test_telegram_copy_captions.py`
+covers real extraction, synthesis dispatch and caption transport with fake media.
+
+Source: `gateway/copy_blocks.py`, stream filtering/fence/overflow owners, extraction,
+reconcile and recovery, and `plugins/platforms/telegram/copy_quotes.py`. Proof:
+`tests/gateway/test_copy_inline_quotes.py` and `test_copy_quote_wire.py` plus
+copy/stream/ledger regressions. Wire coverage includes interim/final edits,
+rich-enabled drafts, overflow continuations, parse fallbacks and ledger replay.
+`tests/gateway/test_telegram_rich_copy_quotes.py` additionally drives raw and
+stream-display content through rich sends/drafts/final edits (including copies
+inside details), preserves surrounding rich constructs and literal bodies, and
+covers rich-to-legacy rejection plus escaped-payload size limits and exact plain
+copies. This rich follow-up inspected upstream guidance at
+`8bee456a5a161010bd08b49095c5f3b86cca48ad` and the existing rich renderer/tests;
+upstream quote PRs concern general Markdown syntax, not this paired copy feature.
+The implementation extends the existing adapter owner without dependencies.
+Upstream inspected at `a5f20c5c04d52dd92a55c01e58dcc004896b52c2`; open PRs
+[#89997](https://github.com/NousResearch/hermes-agent/pull/89997) and
+[#145608](https://github.com/NousResearch/hermes-agent/pull/145608) concern generic
+expandable-quote syntax, not this fork's paired inline/plain copy contract. No
+released equivalent was found. Retire only when the paired delivery and literal
+body tests pass on an accepted upstream release. Roll back this logical patch
+with its hint and regenerated prompt fixtures, after handling pending rows above.
 
 ## Cancelled Final Settlement
 
@@ -191,6 +255,34 @@ floored at the chat's gap. Bubble cleanup uses `deleteMessages` (100 ids per req
 the runner default (`TurnRunner._PROGRESS_EDIT_INTERVAL`, 3.0s). Telegram used 3.0s until
 2026-10-06, when the daily call counter showed progress-bubble edits were the largest share of
 typed-turn calls on a chat that hit a daily volume ban; Brian approved slower bubble updates.
+
+Progress cards widen that floor against `DailyQuota.call_pressure`: 10s below 50% of the
+effective daily call ceiling, 30s from 50% to 80%, and 60s from 80% onward. The fractions and
+multipliers live once in `daily_quota.PROGRESS_EDIT_BANDS`; a disabled call budget keeps 10s,
+and the existing recent-penalty scaling still applies. The progress consumer rechecks pressure
+between batches, sends the full accumulated text after each wait, and drains immediately at
+turn end. Overflow, reset markers and flood-refused batches retain their buffered text.
+Initial tool bubbles, cleanup, daily shedding and final-reply delivery retain their existing rules.
+Initial sends keep the normal adapter floor even after a failed or outbox-deferred send returns
+no message ID. The first event sends immediately, without absorbing pre-queued later events.
+Pressure only widens existing-card edits, so separate grouping keeps the normal adapter floor.
+Retryable edits retain their batch and back off from at least that floor, doubling to a 60s
+cap (or the floor if larger). A successful edit resets the backoff. Flood deadlines still apply.
+A transient overflow refusal first encountered during cancellation gets 1 paced retry;
+cleanup does not wait out a card that was already deferred or flooded.
+Interrupted batches discard queued events, including resets, without rendering or cancellation flushes.
+If the quota read fails, progress cadence falls back to the adapter floor.
+
+The hourly daily-volume INFO line also includes `edit classes`, counted at the existing request
+metering point. `progress` includes tool-card edits, while `unclassified` has no outbound label.
+These counters are process-local, with persisted edits from before process startup and edits from
+other writers reported as `unobserved`. They do not change the persistent ledger or its totals.
+They distinguish outbound classes, not every producer within a class. The 2026-11-06 retained
+logs had no class attribution: the call ledger could split 6,457 edits into 4,707 untagged,
+1,498 goal-triggered and 252 typed-triggered edits, but could not identify a dominant producer.
+Regression: `tests/gateway/test_telegram_progress_batch.py`,
+`tests/gateway/test_supervisor_turn_chrome.py::test_intermediate_supervisor_sends_are_suppressed_without_muting_humans`
+(unchanged: suppress supervisor chrome while preserving human sends and edits), plus the existing daily-quota suite.
 
 | Path | Private worst case | Group worst case |
 | --- | --- | --- |

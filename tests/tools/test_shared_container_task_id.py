@@ -309,7 +309,7 @@ def test_shared_key_ignored_outside_persistent_docker(monkeypatch):
 # backend that environment keeps the shell snapshot (exported variables, PATH),
 # so one job's ``export PATH=...`` resolved another job's bare ``hermes`` to a
 # stale checkout. Each cron run keys its own environment; its delegate_task
-# children still share it.
+# children own separate local shell snapshots.
 
 
 def _cron_run_scope(job_id, execution_id):
@@ -333,7 +333,7 @@ def test_concurrent_cron_runs_get_distinct_environments(monkeypatch):
     assert terminal_tool._resolve_container_task_id(first.task_id) == "default"
 
 
-def test_cron_subagent_shares_its_parent_run_environment(monkeypatch):
+def test_cron_subagent_owns_its_local_shell_environment(monkeypatch):
     monkeypatch.delenv("HERMES_SESSION_KEY", raising=False)
     monkeypatch.setenv("TERMINAL_ENV", "local")
     run = _cron_run_scope("job-a", "run-1")
@@ -341,7 +341,8 @@ def test_cron_subagent_shares_its_parent_run_environment(monkeypatch):
     try:
         assert terminal_tool._resolve_container_task_id(
             "subagent-0-abc"
-        ) == terminal_tool._resolve_container_task_id(run.task_id) == run.task_id
+        ) == "subagent-0-abc"
+        assert terminal_tool._resolve_container_task_id(run.task_id) == run.task_id
     finally:
         terminal_tool.clear_task_env_overrides("subagent-0-abc")
         run.exit()

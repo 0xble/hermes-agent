@@ -23,7 +23,8 @@ SESSION_COUNT = 300  # more than one LISTING_BATCH
 async def owner(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
-    from gateway.session_authority import LiveSession, initialize_session_authority
+    from gateway.session_authority import LiveSession
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))

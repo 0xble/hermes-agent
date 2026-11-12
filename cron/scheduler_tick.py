@@ -35,11 +35,28 @@ def process_due_job(job: dict, adapters, loop, verbose: bool) -> bool:
     """Run one due job via the shared ``run_one_job`` body."""
     from cron import scheduler as _sched
 
+    from cron.scheduler_admission import AgentAdmissionRequired
+
     # Claim only when the worker actually starts, so a queued lease can't expire first.
     note_dispatch_stage(job, "fire_claim_enter")
     try:
-        claimed = _sched.claim_job_for_fire(job["id"], return_job=True)
+        from cron.missed_windows import skip_before_start
+        skipped = skip_before_start(job, owns_claim=False)
+        if skipped:
+            _sched.finish_execution(job["execution_id"], success=False, error=skipped, output=skipped)
+            return True
+        from cron.scheduler_diagnostics import person_send_dispatch, script_dispatch
+        if person_send_dispatch():
+            claimed = _sched.claim_job_for_fire(
+                job["id"], return_job=True, require_no_agent=True, require_person_send=True)
+        elif script_dispatch():
+            claimed = _sched.claim_job_for_fire(job["id"], return_job=True, require_no_agent=True)
+        else:
+            claimed = _sched.claim_job_for_fire(job["id"], return_job=True)
         note_dispatch_stage(job, "fire_claim_exit")
+    except AgentAdmissionRequired:
+        # The executor handoff retains this execution and its in-flight dedup owner.
+        raise
     except OSError as exc:
         store_health.note_unwritable(exc, f"skipped job '{job.get('name') or job['id']}'", "claim", [job])
         _sched.settle_unstarted_execution(

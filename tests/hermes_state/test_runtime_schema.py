@@ -1,4 +1,5 @@
 """Real SQLite schema reconciliation and storage-failure controls."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 
 import pytest
@@ -26,7 +27,7 @@ def test_schema_reconciles_existing_sessions_without_losing_history(tmp_path):
         assert db.get_session('existing')['runtime_generation'] == 0
         assert [r['content'] for r in db.get_messages('existing')] == ['retained']
         assert db._conn.execute('SELECT version FROM schema_version').fetchone()[0] == SCHEMA_VERSION
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         assert rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='existing', request_id='r', payload={'text': 'next'})['status'] == 'queued'
         assert db._conn.execute('PRAGMA foreign_key_check').fetchall() == []
     finally:
@@ -37,10 +38,10 @@ def test_real_sqlite_full_aborts_admission_and_epoch_failure_is_atomic(tmp_path)
     db = SessionDB(db_path=tmp_path / 'state.db')
     try:
         db.create_session('s', source='test')
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         db._conn.execute("CREATE TRIGGER refuse_epoch BEFORE UPDATE ON runtime_epoch BEGIN SELECT RAISE(ABORT, 'epoch fixture'); END")
         with pytest.raises(sqlite3.IntegrityError, match='epoch fixture'):
-            rt.begin_runtime_epoch(db, instance_id='refused')
+            _begin_owned_runtime_epoch(db, instance_id='refused')
         assert tuple(db._conn.execute('SELECT epoch,instance_id FROM runtime_epoch').fetchone()) == (epoch, 'boot')
         db._conn.execute('DROP TRIGGER refuse_epoch')
         pages = db._conn.execute('PRAGMA page_count').fetchone()[0]

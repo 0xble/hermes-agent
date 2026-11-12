@@ -47,7 +47,11 @@ def _run(argv: list[str], cwd: str, timeout: int, env: dict) -> subprocess.Compl
 
 def _git(cwd: str, args: list[str], *, timeout: int = _GIT_TIMEOUT) -> tuple[int, str, str]:
     """(returncode, stdout, stderr) of ``git`` in ``cwd``; never raises on non-zero exit."""
-    proc = _run(["git", *harden_git_argv(args)], cwd, timeout, noninteractive_git_env())
+    env = noninteractive_git_env()
+    if args[:1] == ["worktree"]:
+        # Git localizes the persistent in-progress add lock as well as diagnostics.
+        env.update(LC_ALL="C", LANGUAGE="C")
+    proc = _run(["git", *harden_git_argv(args)], cwd, timeout, env)
     if proc is None:
         return 1, "", "git invocation failed"
     return proc.returncode, proc.stdout, proc.stderr

@@ -186,6 +186,57 @@ async def test_post_turn_paces_autonomous_turns_and_lets_results_through(hermes_
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("origin", [None, "relay_delivery"])
+@pytest.mark.parametrize("wait_kind", ["timed", "pid", "session", "user-message"])
+@pytest.mark.parametrize("wait_offset", [-1.0, 0.0, 1.0])
+async def test_post_turn_pierces_only_waits_predating_turn(
+    hermes_home, monkeypatch, origin, wait_kind, wait_offset,
+):
+    """An input may lift an older wait, not the wait armed in response to that input."""
+    runner, adapter, entry, src = _goal_runner()
+    clock = [50_000.0]
+    monkeypatch.setattr(goals.time, "time", lambda: clock[0])
+    monkeypatch.setattr(goals, "_pid_alive", lambda _pid: True)
+    monkeypatch.setattr(goals, "_session_waiting", lambda _sid: True)
+    mgr = goals.GoalManager(entry.session_id)
+    mgr.set("wait for tomorrow's report")
+    turn_start = clock[0] + 10
+    # This is the same turn-start source set by gateway/run_inbound.py.
+    runner._session_state(entry.session_key).conversation.last_turn_started_at = turn_start
+    clock[0] = turn_start + wait_offset
+    if wait_kind == "timed":
+        mgr.wait_for_seconds(86_400, reason="report is due tomorrow")
+    elif wait_kind == "pid":
+        mgr.wait_on(12345, reason="report process")
+    elif wait_kind == "session":
+        mgr.wait_on_session("report-worker", reason="report worker")
+    else:
+        mgr._park("report needs user input", waiting_on_user_message=True)
+    assert mgr.state is not None
+    parked = goals.GoalState.from_json(mgr.state.to_json())
+    clock[0] = turn_start + 60
+
+    with patch.object(goals, "judge_goal", return_value=("continue", "more work", False, None, False)) as judge:
+        await _after_turn(runner, src, "report update", internal=origin is not None, origin=origin)
+
+    state = goals.load_goal(entry.session_id)
+    assert state is not None
+    if wait_offset < 0:
+        judge.assert_called_once()
+        assert _queued_continuations(adapter) == 1
+        assert state.waiting_since == 0
+    else:
+        judge.assert_not_called()
+        assert _queued_continuations(adapter) == 0
+        assert state.waiting_since == parked.waiting_since
+        assert state.waiting_until == parked.waiting_until
+        assert state.waiting_on_pid == parked.waiting_on_pid
+        assert state.waiting_on_session == parked.waiting_on_session
+        assert state.waiting_on_user_message == parked.waiting_on_user_message
+        assert state.turns_used == parked.turns_used
+
+
+@pytest.mark.asyncio
 async def test_successive_automatic_continuations_obey_hard_gap_floor(hermes_home, monkeypatch):
     """A new result must not turn the goal into a sub-minute automatic poller."""
     runner, adapter, entry, src = _goal_runner()

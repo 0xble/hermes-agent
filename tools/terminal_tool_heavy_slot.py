@@ -16,8 +16,11 @@ Only the heavy process waits for and holds a slot.
 Not wrapped: non-local backends (Docker, SSH, Modal and other sandboxes),
 commands already inside a slot (``HEAVY_SLOT_HELD``), the opt-out
 ``HERMES_HEAVY_SLOT=off``, hosts without the helper, text that only mentions a
-runner (``grep pytest``, quoted strings, comments, heredoc bodies), and
-targeted runs of 1-10 explicit test files with only single-run options.
+runner (``grep pytest``, quoted strings, comments, heredoc bodies), targeted
+runs of 1-10 explicit test files or unittest names with only single-run options
+(redirections such as ``2>&1 | tail`` do not count as arguments), dependency
+sync/installation, and type checks or lint runs, which hold a slot for seconds
+(see ``maintenance/terminal-heavy-slot.md``).
 Foreground terminal commands leave admission unbounded and hand the live shell
 to the background registry at their foreground budget only while waiting for a
 slot. Already-admitted work keeps its foreground deadline. Queue age survives and
@@ -55,7 +58,7 @@ _CANDIDATE = re.compile(
 _SHELLS = {"bash", "sh", "zsh"}
 _PY_RUNNERS = {"pytest", "py.test"}
 _JS_RUNNERS = {"vitest", "jest"}
-# Package scripts and dependency installation can both fan out expensive work.
+# Package test/build/check scripts can fan out expensive work.
 _PACKAGE_MANAGERS = {"npm", "pnpm", "yarn", "bun"}
 _PACKAGE_VALUE_OPTIONS = {"--filter", "-F", "--dir", "-C", "--prefix", "--cwd", "--workspace", "-w"}
 # Subcommands whose positional words are package names, never script names.
@@ -75,11 +78,21 @@ _WATCH_FLAGS = {"--watch", "--watch=true", "--watchAll", "--watchAll=true"}
 # runner's own --workers or --jobs) may fan out, so it falls back to the slot.
 _TARGETED_FLAGS = {"-q", "-qq", "-v", "-vv", "-vvv", "-x", "-s", "-l", "--quiet", "--verbose", "--exitfirst",
                    "--no-header", "--lf", "--ff", "--last-failed", "--failed-first", "--sw", "--stepwise",
-                   "--run", "--no-watch", "--bail", "--silent", "--color", "--no-color", "--showlocals"}
+                   "--run", "--no-watch", "--bail", "--silent", "--color", "--no-color", "--showlocals",
+                   "--no-cov", "--disable-warnings", "--collect-only", "--co"}
 _TARGETED_VALUE_FLAGS = {"-k", "-m", "-p", "-o", "-W", "-r", "--tb", "-t", "--testNamePattern",
-                         "--file-timeout", "--file-retries"}
+                         "--file-timeout", "--file-retries", "--maxfail", "--junitxml", "--junit-xml",
+                         "--durations", "--timeout", "--basetemp", "--rootdir", "--import-mode"}
+# Short value options may carry their value attached: `-rA`, `-kfoo`, `-pno:cacheprovider`.
+_TARGETED_ATTACHED = {flag for flag in _TARGETED_VALUE_FLAGS if len(flag) == 2}
 _TEST_FILE = re.compile(r"(\.py(::.*)?|\.(test|spec)\.[cm]?[jt]sx?)$")
 _MAX_TARGETED_FILES = 10
+# unittest takes dotted test names, not paths: `python -m unittest test_a pkg.test_b.Case.test_x`.
+_UNITTEST_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)*$")
+_UNITTEST_FLAGS = {"-v", "-q", "-f", "-c", "-b", "--verbose", "--quiet", "--failfast", "--catch", "--buffer",
+                   "--locals", "--durations"}
+# Redirection words (`2>`, `>out`, `<<EOF`, `<<<`); group 1 is a target attached to the operator.
+_REDIRECT = re.compile(r"^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:>>|>|<<<|<<-|<<|<>|<)(.*)$")
 
 
 def heavy_slot_enabled(environment: Mapping[str, str]) -> bool:
@@ -116,13 +129,49 @@ def _is_targeted(args: list[str]) -> bool:
             continue
         if arg.startswith("-"):
             name = arg.split("=", 1)[0]
-            if arg in _TARGETED_FLAGS or (name != arg and name in _TARGETED_VALUE_FLAGS | {"--tb", "--color"}):
+            if (arg in _TARGETED_FLAGS or (name != arg and name in _TARGETED_VALUE_FLAGS | {"--tb", "--color"})
+                    or (not arg.startswith("--") and arg[:2] in _TARGETED_ATTACHED)):
                 continue
             return False  # unknown option: may add workers, so keep the slot
         if not _TEST_FILE.search(arg):
             return False  # a directory, `run` subcommand target set, or anything broad
         files += 1
     return 1 <= files <= _MAX_TARGETED_FILES
+
+
+def _is_targeted_unittest(args: list[str]) -> bool:
+    """1-10 dotted test names, or ``discover`` limited to one literal file pattern."""
+    if args[:1] == ["discover"]:
+        pattern = None
+        skip = None
+        for arg in args[1:]:
+            if skip:
+                if skip in {"-p", "--pattern"}:
+                    pattern = arg
+                skip = None
+            elif arg in {"-s", "--start-directory", "-p", "--pattern", "-t", "--top-level-directory", "-k"}:
+                skip = arg
+            elif arg.startswith("--pattern="):
+                pattern = arg.split("=", 1)[1]
+            elif arg not in _UNITTEST_FLAGS:
+                return False
+        # The default pattern `test*.py` imports every test module under the start directory.
+        return pattern is not None and not any(char in pattern for char in "*?[")
+    names = 0
+    skip_value = False
+    for arg in args:
+        if skip_value:
+            skip_value = False
+        elif arg == "-k":
+            skip_value = True
+        elif arg.startswith("-"):
+            if arg not in _UNITTEST_FLAGS:
+                return False
+        elif _UNITTEST_NAME.match(arg) or _TEST_FILE.search(arg):
+            names += 1
+        else:
+            return False
+    return 1 <= names <= _MAX_TARGETED_FILES
 
 
 def _first_positional(args: list[str], value_options: Collection[str] = ()) -> tuple[Optional[str], list[str]]:
@@ -141,8 +190,9 @@ def _first_positional(args: list[str], value_options: Collection[str] = ()) -> t
 
 
 def _script_label(word: str) -> Optional[str]:
+    # `lint` and `typecheck` scripts are deliberately absent: they release a slot in seconds.
     prefix = word.split(":", 1)[0]
-    return prefix if prefix in {"test", "build", "check", "lint", "typecheck"} else None
+    return prefix if prefix in {"test", "build", "check"} else None
 
 
 def _is_watch_script(word: str) -> bool:
@@ -172,10 +222,10 @@ def _classify_python(args: list[str]) -> Optional[str]:
         module, rest = args[1], args[2:]
         if module in _PY_RUNNERS:
             return None if _is_targeted(rest) else "pytest"
-        if module in {"unittest", "compileall", "build"}:
+        if module == "unittest":
+            return None if _is_targeted_unittest(rest) else "unittest"
+        if module in {"compileall", "build"}:
             return module
-        if module == "pip" and rest[:1] == ["install"]:
-            return "pip-install"
     if args and _basename(args[0]) == "run_tests_parallel.py":
         return "run_tests"
     if args and args[0].endswith("pm/launch.py") and args[1:2] == ["install"]:
@@ -196,22 +246,18 @@ def _classify_launchers(executable: str, args: list[str]) -> Optional[str]:
         return f"go-{args[0]}"
     if name == "check" and executable.endswith("bin/check"):
         return None if args[:1] in (["--help"], ["-h"], ["--list"]) else "check"
-    if name in {"eslint", "tsc"}:
-        return name
-    if name in {"pip", "pip3"} and args[:1] == ["install"]:
-        return "pip-install"
-    if name == "playwright" and args[:1] in (["test"], ["install"]):
+    # Dependency installs, `tsc` and `eslint` are not wrapped: they release a slot in seconds.
+    if name == "playwright" and args[:1] == ["test"]:
         return "playwright"
     return None
 
 
-def _classify_package(args: list[str]) -> Optional[str]:
+def _classify_package(name: str, args: list[str]) -> Optional[str]:
     sub, rest = _first_positional(args, _PACKAGE_VALUE_OPTIONS)
-    management = next((word for word in [sub, *rest][:3] if word in _PACKAGE_MANAGEMENT), None)
-    if management:
-        return "install" if management in {"add", "install", "i", "update", "up", "upgrade"} else None
-    if sub == "ci":
-        return "install"
+    if any(word in _PACKAGE_MANAGEMENT for word in [sub, *rest][:3]) or sub == "ci":
+        return None  # dependency installation and package metadata, never a script run
+    if name == "bun" and sub == "test":
+        return None if _is_targeted(rest) else "test"  # Bun's own test runner, not a package script
     if sub in {"exec", "dlx"}:
         inner, inner_rest = _first_positional(rest)
         return classify_words([inner, *inner_rest]) if inner else None
@@ -225,11 +271,7 @@ def _classify_environment(name: str, args: list[str]) -> Optional[str]:
         inner, inner_rest = _first_positional(rest, {"--with", "--group", "--extra", "--package", "--python",
                                                    "-p", "--env", "-e", "--directory", "--project"})
         return classify_words([inner, *inner_rest]) if inner else None
-    if sub in {"sync", "install", "add"}:
-        return f"{name}-{sub}"
-    if name == "uv" and sub == "pip" and rest[:1] in (["install"], ["sync"]):
-        return "uv-install"
-    return None
+    return None  # `sync`, `install`, `add` and `pip install` only realize the environment
 
 
 def classify_words(words: list[str]) -> Optional[str]:
@@ -269,7 +311,7 @@ def classify_words(words: list[str]) -> Optional[str]:
         inner, rest = _first_positional(args, {"--package", "-p", "--from", "--with"})
         return classify_words([inner, *rest]) if inner else None
     if name in _PACKAGE_MANAGERS:
-        return _classify_package(args)
+        return _classify_package(name, args)
     if name in _MONOREPO_RUNNERS:
         return _heavy_script(args)
     if executable.endswith("bin/ci") and _basename(executable) == "ci":
@@ -314,17 +356,32 @@ def _command_start(words: list[str]) -> tuple[int, Optional[int]]:
 
 
 def _simple_commands(command: str) -> list[list[tuple[int, str]]]:
-    """Top-level simple commands as ``[(offset, raw_word), ...]``; heredoc bodies are never scanned."""
+    """Top-level simple commands as ``[(offset, raw_word), ...]``; heredoc bodies and redirections are skipped."""
     from tools.self_repo_guard import _mask_heredocs
     from tools.terminal_tool_sudo import _scan_shell
 
     masked, _ = _mask_heredocs(command)  # same length: body characters become spaces
     segments: list[list[tuple[int, str]]] = [[]]
-    for kind, start, end, _at_start in _scan_shell(masked):
-        if kind == "op" or (kind == "ws" and masked[start:end] == "\n"):
+    events = list(_scan_shell(masked))
+    target = False  # the next word is a redirection target, not an argument
+    for index, (kind, start, end, _at_start) in enumerate(events):
+        text = masked[start:end]
+        if kind == "op" and text == "&":
+            # `2>&1`, `>&2` and `&>log` scan as `2>` `&` `1`: the `&` is part of the redirection.
+            after = events[index + 1] if index + 1 < len(events) else None
+            if (target and index and events[index - 1][2] == start) or (
+                    after and after[0] == "word" and after[1] == end and masked[end] == ">"):
+                continue
+        if kind == "op" or (kind == "ws" and text == "\n"):
             segments.append([])
+            target = False
         elif kind == "word":
-            segments[-1].append((start, masked[start:end]))
+            if target:
+                target = False
+            elif match := _REDIRECT.match(text):
+                target = not match.group(1)
+            else:
+                segments[-1].append((start, text))
     return [segment for segment in segments if segment]
 
 

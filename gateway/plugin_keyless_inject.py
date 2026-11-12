@@ -103,10 +103,17 @@ async def admit(runner, authority, live, *, content: str, plugin_id: str) -> boo
     """Commit the text to *live*'s durable FIFO through the keyed path's producer admission, under the
     plugin's profile (whose authority resolved it)."""
     from gateway.session_authorities import active_authority
+    from hermes_cli.plugin_injection import active_delivery
     if not runner._plugin_injection_accepting():
+        if delivery := active_delivery():
+            delivery.finish(False, "gateway_draining")
         return False
     entry = await runner.async_session_store.lookup_by_session_key(live.route)
-    if entry is None or not runner._plugin_injection_accepting():
+    if not runner._plugin_injection_accepting():
+        if delivery := active_delivery():
+            delivery.finish(False, "gateway_draining")
+        return False
+    if entry is None:
         return False
     scope = contextlib.nullcontext()
     if getattr(getattr(runner, "config", None), "multiplex_profiles", False) is True:

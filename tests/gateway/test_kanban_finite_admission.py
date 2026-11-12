@@ -212,8 +212,8 @@ def _lose_across_restart(authority, sid):
     """Claim the card's admission under this owner, then a new owner epoch boots on the same store
     and runs the real boot recovery (fence ``unknown``, then settle the unattended ones)."""
     from gateway.session_unattended_unknown import settle_recovered_unattended
-    from hermes_state_runtime import (begin_runtime_epoch, claim_session_input, list_session_admissions,
-                                      recover_session_inputs)
+    from hermes_state_runtime import claim_session_input, list_session_admissions, recover_session_inputs
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     db = authority.db
     claimed = claim_session_input(db, epoch=authority.epoch, session_id=sid)
     assert claimed and claimed['status'] == 'started'

@@ -4,6 +4,7 @@ Downgrading is unsupported (#106742, jquesnelle item 6): the older release canno
 the sessions with runtime history, so the move is refused before the tree changes and the message
 names the pre-update snapshot that predates the cutover.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import json
 import sqlite3
 import subprocess
@@ -42,7 +43,7 @@ def repo(tmp_path):
 def _ledgered_store(home):
     home.mkdir(parents=True, exist_ok=True)
     with closing(SessionDB(home / "state.db")) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
         db.create_session("s", source="cli")
         rt.admit_session_input(db, epoch=epoch, principal_id="p", session_id="s", request_id="r",
                                payload={"text": "x"})

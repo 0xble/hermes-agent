@@ -7,7 +7,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
-from gateway.session_authority import initialize_session_authority
+from tests.fakes.runtime_owner import initialize_session_authority
 from gateway.session_envelope import check_native_route, prepare_native, restore_native, snapshot_native
 from gateway.session_synthetic import is_synthetic, mark_synthetic
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions

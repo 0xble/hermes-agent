@@ -54,6 +54,10 @@ from hermes_cli.goals_autonomy import (
 )
 from hermes_cli.goals_status import GoalStatusMixin
 from hermes_cli.goals_peers import GoalPeersMixin, parse_pending_peers, validate_peer_completion
+from hermes_cli.goals_authoring_refs import (
+    _goal_authoring_is_labeled_reference, _goal_authoring_is_ordinal_hash,
+    _goal_authoring_is_ordinary_identifier, _goal_authoring_text_is_path,
+)
 from hermes_cli.lifecycle_snapshot import snapshot_control
 from hermes_time import safe_strftime
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
@@ -250,31 +254,6 @@ def _goal_authoring_values(goal: Any, contract: Any) -> dict[str, str]:
     }}
 
 
-def _goal_authoring_text_is_path(text: str, start: int, end: int) -> bool:
-    """Do not call a plan/file path a stale identifier merely because it has digits."""
-    token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
-    token_end_candidates = [index for index in (text.find(" ", end), text.find("\n", end), text.find("\t", end)) if index >= 0]
-    token_end = min(token_end_candidates, default=len(text))
-    token = text[token_start:token_end].strip(".,;:!?()[]{}<>\"'")
-    # owner/repo#N is a PR/issue reference, not a file path, even though it has a slash.
-    if re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", token):
-        return False
-    return "/" in token or "\\" in token or bool(
-        re.search(r"\.(?:md|markdown|txt|yaml|yml|json|toml)\b", token, re.IGNORECASE)
-    )
-
-
-def _goal_authoring_is_ordinal_hash(text: str, start: int) -> bool:
-    """Allow ordinal rankings such as ``Ranked #1`` while rejecting bare receipts."""
-    return bool(re.search(r"(?i)\b(?:ranked|top)\s*$", text[max(0, start - 24):start]))
-
-
-def _goal_authoring_is_ordinary_identifier(text: str, start: int, end: int) -> bool:
-    """Allow human identifiers such as ``cafe5678`` when clearly naming a table."""
-    context = text[max(0, start - 32):min(len(text), end + 32)]
-    return bool(re.search(r"(?i)\b(?:table|column|record|dataset)\b", context))
-
-
 def goal_authoring_findings(
     goal: Any,
     contract: Any = None,
@@ -332,7 +311,7 @@ def goal_authoring_findings(
             token = match.group(1)
             if not (any(char.isdigit() for char in token) and any(char in "abcdef" for char in token)):
                 continue
-            if _goal_authoring_text_is_path(value, match.start(), match.end()) or _goal_authoring_is_ordinary_identifier(value, match.start(), match.end()):
+            if _goal_authoring_text_is_path(value, match.start(), match.end()) or _goal_authoring_is_labeled_reference(value, match.start()) or _goal_authoring_is_ordinary_identifier(value, match.start(), match.end()):
                 continue
             findings.append(GoalAuthoringFinding(
                 "stale_identifier", field_name,
@@ -374,17 +353,21 @@ def goal_authoring_findings(
 
     verification = values["verification"] if "verification" in checked else ""
     if verification:
-        checklist = bool(_GOAL_AUTHORING_BULLET_RE.search(verification) or
-                          _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification) or
-                          re.search(r"(?i)\b(?:step|item|check)\s*\d+", verification))
+        checklist_span = ""
+        m = (_GOAL_AUTHORING_BULLET_RE.search(verification) or _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification)
+             or re.search(r"(?i)\b(?:step|item|check)\s*\d+", verification))
+        if m:
+            checklist_span = verification[m.start():m.start() + 60].strip()
         separators = len(re.findall(r"[,;]", verification))
-        if separators >= 3 and re.search(r"(?i)\b(?:and|or)\b", verification) and _GOAL_AUTHORING_RECEIPT_RE.search(verification):
-            checklist = True
-        if checklist:
+        if (not checklist_span and separators >= 3 and re.search(r"(?i)\b(?:and|or)\b", verification)
+                and _GOAL_AUTHORING_RECEIPT_RE.search(verification)):
+            checklist_span = f"{separators + 1} separated items: {verification[:60].strip()}"
+        if checklist_span:
             findings.append(GoalAuthoringFinding(
                 "verification_checklist", "verification",
-                "is a step/receipt checklist rather than one live end-state outcome",
-                "state one observable result and put per-step checks in the plan file",
+                f"is a step/receipt checklist ({checklist_span!r}) rather than one live end-state outcome",
+                "replace the list with one observable end state (for example 'X and Y are consistent'), "
+                "and put the per-item checks in the plan file",
             ))
     return findings
 
@@ -1050,6 +1033,9 @@ class GoalState:
     last_verdict: Optional[str] = None        # "done" | "blocked" | "continue" | "wait" | "skipped"
     last_reason: Optional[str] = None
     paused_reason: Optional[str] = None       # why we auto-paused (budget, etc.)
+    # Who paused it: "agent", "user" or "system". With goals.autonomy the agent may resume only
+    # its own pause. Never inferred from paused_reason text. Legacy rows load as "".
+    paused_by: str = ""
     # Tracked for diagnostics only; judge outages fail open and never pause a goal.
     consecutive_parse_failures: int = 0
     consecutive_transport_failures: int = 0
@@ -1125,6 +1111,7 @@ class GoalState:
             last_verdict=data.get("last_verdict"),
             last_reason=data.get("last_reason"),
             paused_reason=data.get("paused_reason"),
+            paused_by=str(data.get("paused_by") or ""),
             subgoals=contract_items("subgoals", raw_subgoals),
             waiting_on_pid=(int(data["waiting_on_pid"]) if data.get("waiting_on_pid") else None),
             waiting_on_pid_live_at_park=(
@@ -2965,6 +2952,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         self._state.clear_wait()
         self._state.status = "paused"
         self._state.paused_reason = reason
+        self._state.paused_by = "system"
         self._save()
 
     def _pause_decision(self, paused_reason: str, verdict: str, reason: str, message: str) -> dict[str, Any]:
@@ -3025,12 +3013,13 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         return self._mutate_current(_apply)
 
     @snapshot_control
-    def pause(self, reason: str = "user-paused") -> Optional[GoalState]:
+    def pause(self, reason: str = "user-paused", *, by: str = "user") -> Optional[GoalState]:
         def _apply(state):
             if state is None or state.status == "cleared":
                 return None   # a concurrent /goal clear stays cleared
             state.status = "paused"
             state.paused_reason = reason
+            state.paused_by = by
             state.clear_wait()   # a wait barrier is meaningless once paused
             state.consecutive_no_progress = 0
             state.backoff_level = 0
@@ -3038,10 +3027,15 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         return self._mutate_current(_apply)
 
     @snapshot_control
-    def resume(self, *, reset_budget: bool = True, user_override: bool = True) -> Optional[GoalState]:
-        """Resume through a live-row mutation, optionally recording a user override."""
+    def resume(self, *, reset_budget: bool = True, user_override: bool = True,
+               by: str = "user") -> Optional[GoalState]:
+        """Resume through a live-row mutation, optionally recording a user override.
+
+        ``by="agent"`` lifts only the agent's own pause, never a user or system pause."""
         def _apply(state):
             if state is None or state.status == "cleared":
+                return None
+            if by == "agent" and not (state.status == "paused" and state.paused_by == "agent"):
                 return None
             prior_block_reason = state.last_reason or state.paused_reason or "unknown blocker"
             record_override = user_override and (
@@ -3063,6 +3057,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
     def _resume_state(state: GoalState, *, reset_budget: bool) -> None:
         state.status = "active"
         state.paused_reason = None
+        state.paused_by = ""
         state.consecutive_no_progress = 0
         state.backoff_level = 0
         state.clear_wait()
@@ -3532,6 +3527,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
     def evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         external_event: bool = False,
+        turn_started_at: Optional[float] = None,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
@@ -3540,18 +3536,20 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
         ``external_event`` marks a watched-process/delegation notification. These
         events are allowed to pierce a timed continuation gap because they carry
-        new evidence; ordinary continuation-only turns are throttled.
+        new evidence; ordinary continuation-only turns are throttled. A wait armed
+        during this turn survives its own input when ``turn_started_at`` is supplied.
         """
         from hermes_cli.goals_evaluation import evaluate_goal_snapshot
         return evaluate_goal_snapshot(
             self, last_response, user_initiated=user_initiated, external_event=external_event,
             background_processes=background_processes, active_delegations=active_delegations,
-            evidence_session_id=evidence_session_id,
+            evidence_session_id=evidence_session_id, turn_started_at=turn_started_at,
         )
 
     def _evaluate_after_turn(
         self, last_response: str, *, user_initiated: bool = True,
         external_event: bool = False,
+        turn_started_at: Optional[float] = None,
         background_processes: Optional[List[Dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
@@ -3578,11 +3576,16 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         new_eligible_non_read_only = (
             evidence_scan_truncated_for_turn or not _evidence_only_read_only_status(turn_evidence)
         )
+        # Only input newer than the wait may pierce it. The agent can park again in
+        # response to that input, so the current turn must not undo its own wait.
+        pierce_wait = (user_initiated or external_event) and (
+            turn_started_at is None or state.waiting_since < turn_started_at
+        )
         if state.waiting_on_pid is not None or state.waiting_on_session is not None or getattr(state, "waiting_on_user_message", False):
             holds, age_notice, pause_reason = self._stage_live_barrier()
             # A real user message or delivered external event is fresh evidence: it pierces
-            # every wait kind and re-judges now. Synthetic continuation wakes do not.
-            if user_initiated or external_event:
+            # every older wait kind. Synthetic continuation wakes do not.
+            if pierce_wait:
                 state.clear_wait(preserve_notice_key=True)
                 holds, age_notice, pause_reason = False, None, None
             elif getattr(state, "waiting_on_user_message", False):
@@ -3595,8 +3598,8 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         elif state.waiting_until:
             if self._barrier_holds():
                 # A real user message or delivered external event is fresh evidence and re-judges
-                # a waiting goal immediately. Synthetic continuation wakes do not pierce it.
-                if user_initiated or external_event:
+                # an older waiting goal immediately, never a wait armed during this turn.
+                if pierce_wait:
                     state.clear_wait(preserve_notice_key=True)
                 else:
                     return self._waiting_decision(state)

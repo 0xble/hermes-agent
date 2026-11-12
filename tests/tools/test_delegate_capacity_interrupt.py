@@ -263,7 +263,7 @@ def test_rejected_background_child_stops_with_parent(
 
         monkeypatch.setattr(async_delegation, "_get_executor", lambda _n: RejectingExecutor())
     elif rejection == "no_async":
-        def pause_no_async(*_args):
+        def pause_no_async(*_args, oneshot_session=None):
             admission_started.set()
             assert continue_admission.wait(5)
             return None
@@ -464,7 +464,7 @@ def test_capacity_queues_background_batch_without_inline_execution(registry_stat
         session_key="other-session", runner=lambda: (release.wait(30), {"status": "completed"})[1],
         max_async_children=1,
     )
-    monkeypatch.setattr("tools.delegate_tool_dispatch._resolve_async_wake_sid", lambda *_args: "")
+    monkeypatch.setattr("tools.delegate_tool_dispatch._resolve_async_wake_sid", lambda *_args, oneshot_session=None: "")
     monkeypatch.setattr("tools.delegate_tool._get_max_async_children", lambda: 1)
     monkeypatch.setattr("tools.delegate_tool._get_max_queued_delegations", lambda: 1)
     parent, child = _Parent(), _ControlledChild()

@@ -20,6 +20,7 @@ import os
 import shutil
 import sqlite3
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -38,7 +39,7 @@ def real_uv() -> str | None:
 
 def git(*args: str, cwd: Path, check: bool = True, env: dict | None = None) -> str:
     cp = subprocess.run(["git", *args], cwd=str(cwd), capture_output=True, text=True,
-                        env=env or {**os.environ, "GIT_TERMINAL_PROMPT": "0"}, check=False)
+                        env=env or {**os.environ, "GIT_TERMINAL_PROMPT": "0"}, check=False, timeout=120)
     if check and cp.returncode != 0:
         raise AssertionError(f"git {args} failed in {cwd}: {cp.stderr}")
     return cp.stdout.strip()
@@ -90,6 +91,7 @@ def publish_commit(origin: Path, scratch: Path, message: str, files: dict[str, s
 class Sandbox:
     root: Path
     env: dict[str, str]
+    deadline: float | None = None
 
     @property
     def home(self) -> Path:
@@ -122,6 +124,10 @@ class Sandbox:
 
     def run(self, argv: list[str], *, timeout: float = 600, cwd: Path | None = None,
             input: str | None = None, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+        if self.deadline is not None:
+            remaining = self.deadline - time.monotonic()
+            assert remaining > 0, f"historical-install diagnostic budget exhausted before {argv}"
+            timeout = min(timeout, remaining)
         return H.run(argv, env=env or self.env, cwd=cwd or self.root, writable=[self.root], timeout=timeout,
                      input=input)
 

@@ -1,0 +1,51 @@
+name: Cache a pinned tool archive
+description: Restore or download an archive, verify its pinned SHA-256, then save it before running checks.
+inputs:
+  tool:
+    description: Tool or Rust component in ci/linux-artifacts.json.
+    required: true
+  source:
+    description: linux or uv archive manifest.
+    default: linux
+  version:
+    description: Exact uv version for the uv source.
+    default: ''
+  architecture:
+    description: Linux archive architecture.
+    default: amd64
+runs:
+  using: composite
+  steps:
+    - name: Read the pinned archive identity
+      id: pin
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        ARCHITECTURE: ${{ inputs.architecture }}
+        SOURCE: ${{ inputs.source }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        if [ "$RUNNER_OS" = Windows ]; then bootstrap=python; else bootstrap=python3; fi
+        "$bootstrap" scripts/ci/pinned_tools.py info --source "$SOURCE" --architecture "$ARCHITECTURE" --tool "$TOOL" --version "$VERSION" >> "$GITHUB_OUTPUT"
+    - name: Restore the exact archive
+      id: cache
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.pin.outputs.path }}
+        key: pinned-tool-v1-${{ inputs.source }}-${{ runner.os }}-${{ runner.arch }}-${{ inputs.architecture }}-${{ inputs.tool }}-${{ steps.pin.outputs.version }}-${{ steps.pin.outputs.checksum }}
+    - name: Download on miss and verify on every use
+      shell: bash
+      env:
+        TOOL: ${{ inputs.tool }}
+        ARCHITECTURE: ${{ inputs.architecture }}
+        SOURCE: ${{ inputs.source }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        if [ "$RUNNER_OS" = Windows ]; then bootstrap=python; else bootstrap=python3; fi
+        "$bootstrap" scripts/ci/pinned_tools.py fetch --source "$SOURCE" --architecture "$ARCHITECTURE" --tool "$TOOL" --version "$VERSION"
+    - name: Save the verified archive
+      if: steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.pin.outputs.path }}
+        key: ${{ steps.cache.outputs.cache-primary-key }}

@@ -1167,18 +1167,19 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
     # cwd/env overlay are embedded as JSON literals in the watcher source (no extra argv plumbing).
     watcher = textwrap.dedent(
         """
+        import sys
+        if sys.path[:1] == [""]: del sys.path[0]  # -c puts the cwd first: never import from it
         import os
         import subprocess
-        import sys
         import time
-        # Stdlib-only imports: the watcher runs on the updater's interpreter, which after the
-        # package-manager handoff is the bare store Python without the dependency environment.
-        # ``-c`` only puts the cwd on sys.path, so name the checkout explicitly.
+        # Stdlib-only imports: after the package-manager handoff this is the bare store Python;
+        # name the checkout explicitly.
         sys.path.insert(0, {project_root_literal})
         from hermes_cli._subprocess_compat import (
             _WINDOWS_GATEWAY_BREAKAWAY_ENV, pid_exists_stdlib, windows_detach_flags,
             windows_detach_flags_without_breakaway,
         )
+        from hermes_cli.gateway_launchd_runtime import start_gateway_job
 
         pid = int(sys.argv[1])
         cmd = sys.argv[2:]
@@ -1191,9 +1192,8 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
                 break
             time.sleep(0.2)
 
-        # Route the respawned gateway's stray stdout/stderr to the same sidecar log _spawn_detached
-        # uses: with DEVNULL a gateway killed moments after respawn (parent Job Object teardown when
-        # breakaway is denied) left ZERO trace. Best-effort: DEVNULL when the log dir is unavailable.
+        # Respawned stdout/stderr go to _spawn_detached's sidecar log: with DEVNULL a gateway killed moments
+        # after respawn (Job Object teardown when breakaway is denied) left ZERO trace. Best-effort.
         _stdio_target = subprocess.DEVNULL
         _stdio_fh = None
         try:
@@ -1206,13 +1206,10 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
         except Exception:
             pass
 
-        # Platform-appropriate detach for the respawned gateway: POSIX start_new_session (setsid);
-        # Windows needs explicit creationflags. CREATE_BREAKAWAY_FROM_JOB is critical: the watcher may
-        # itself sit inside a job object (Electron/Tauri parent) and without breakaway the respawned
-        # gateway dies when that job tears down. See _subprocess_compat.windows_detach_flags().
+        # Detach the respawn: POSIX setsid; Windows needs CREATE_BREAKAWAY_FROM_JOB, since the watcher may sit in a job
+        # object (Electron/Tauri parent) whose teardown would otherwise kill it (_subprocess_compat.windows_detach_flags).
         _popen_kwargs = {{"stdout": _stdio_target, "stderr": _stdio_target}}
-        # Anchor at the stable working dir and overlay the env (VIRTUAL_ENV / PYTHONPATH /
-        # HERMES_HOME) the windowless base interpreter needs to import hermes_cli. Empty on POSIX.
+        # Stable cwd + env overlay (VIRTUAL_ENV/PYTHONPATH/HERMES_HOME) the windowless interpreter needs; empty on POSIX.
         if _respawn_cwd:
             _popen_kwargs["cwd"] = _respawn_cwd
         _base_env = {{**os.environ, **_respawn_env_overlay}}
@@ -1231,6 +1228,9 @@ def _spawn_gateway_restart_watcher(old_pid: int, run_argv: list[str], *, host: b
                     _popen_kwargs["creationflags"] = windows_detach_flags_without_breakaway()
                     _popen_kwargs["env"] = {{**_base_env, _WINDOWS_GATEWAY_BREAKAWAY_ENV: "0"}}
                     subprocess.Popen(cmd, **_popen_kwargs)
+            elif sys.platform == "darwin" and _stdio_fh and start_gateway_job(
+                    cmd, env=_base_env, cwd=os.getcwd(), log_path=_log_dir / "gateway-stdio.log"):
+                pass  # a launchd job: its LAN access outlives whoever ran this one
             else:
                 if _respawn_env_overlay:
                     _popen_kwargs["env"] = _base_env
@@ -4748,7 +4748,7 @@ async def _acknowledge_release_when_running(*, poll_seconds: float = 1.0) -> Non
             except (OSError, RuntimeError, ValueError):
                 logger.warning("Pending release reload could not be acknowledged", exc_info=True)
 def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, force: bool = False,
-                idle_exit: bool = False):
+                idle_exit: bool = False, client_owned: bool = False):
     """Run the gateway in foreground. verbose 1=INFO/2+=DEBUG on stderr; quiet: no stderr logs; replace:
     kill an existing instance first (avoids systemd restart loops); force: skip the supervised guard;
     idle_exit: a client auto-started this unsupervised gateway, so it exits once idle
@@ -4778,7 +4778,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
 
     # Refresh the systemd unit on every boot so restart settings stay current even after an
     # exit-code-75 respawn (stale-code or /restart), which bypasses `hermes gateway restart`.
-    if supports_systemd_services():
+    if not client_owned and supports_systemd_services():
         try:
             refresh_systemd_unit_if_needed(system=False)
         except Exception:
@@ -4829,7 +4829,7 @@ def run_gateway(verbose: int = 0, quiet: bool = False, replace: bool = False, fo
     success = False
     try:
         success = asyncio.run(start_gateway(replace=replace, force=force, verbosity=verbosity,
-                                            idle_exit=idle_exit))
+                                            idle_exit=idle_exit, **({"client_owned": True} if client_owned else {})))
         _exit_diag("asyncio.run.returned", success=success)
     except KeyboardInterrupt:
         # Detached Windows runs absorb SIGINT above; keep the handler for console runs.
@@ -5255,11 +5255,8 @@ def _cmd_run(args):
     _refuse_forward_only_leftovers(retry_on_inspection_error=True)
     if getattr(args, "external_supervisor", False):
         os.environ[EXTERNAL_GATEWAY_SUPERVISOR_ENV] = "1"
-    run_gateway(
-        getattr(args, "verbose", 0), quiet=getattr(args, "quiet", False),
-        replace=getattr(args, "replace", False), force=getattr(args, "force", False),
-        idle_exit=getattr(args, "idle_exit", False),
-    )
+    from hermes_cli.gateway_runtime_cli import run_options
+    run_gateway(getattr(args, "verbose", 0), **run_options(args))
 
 
 def _cmd_setup(args):
@@ -5373,31 +5370,8 @@ def _handle_no_backend(subcommand: str, *, wsl: bool, s6: bool) -> None:
 
 
 def _install_systemd_from_cli(args, *, force: bool, system: bool, run_as_user) -> None:
-    if is_wsl():
-        print_warning("WSL detected — systemd services may not survive WSL restarts.")
-        _print_info_lines(
-            "  Consider running in foreground instead: hermes gateway run",
-            "  Or use tmux/screen for persistence: tmux new -s hermes 'hermes gateway run'",
-        )
-        print()
-    # Honor --start-now/--start-on-login; else prompt on a TTY, default True headless.
-    non_interactive = not (hasattr(sys.stdin, "isatty") and sys.stdin.isatty())
-
-    def _flag(name: str, question: str) -> bool:
-        value = getattr(args, name, None)
-        if value is not None:
-            return value
-        return prompt_yes_no(question, True) if not non_interactive else True
-
-    start_now = _flag("start_now", "Start the gateway now after installing the service?")
-    start_on_login = _flag("start_on_login", "Start the gateway automatically on login/boot with systemd?")
-    systemd_install(
-        force=force, system=system, run_as_user=run_as_user,
-        enable_on_startup=start_on_login, non_interactive=non_interactive,
-        force_unit_path=getattr(args, "force_unit_path", False),
-    )
-    if start_now:
-        systemd_start(system=system)
+    from hermes_cli.gateway_install_cli import install_systemd
+    install_systemd(args, force=force, system=system, run_as_user=run_as_user)
 
 
 def _cmd_install(args):
@@ -5418,13 +5392,15 @@ def _cmd_install(args):
     if _service_mgmt_blocked():
         _no_backend_exit("install", "termux")
     backend = _service_backend()
+    from hermes_cli.gateway_install_cli import launchd_options
+    options = launchd_options(args, backend=backend, system=system, run_as_user=run_as_user)
     if backend == "systemd":
         if refuses_container_user_scope_install(system):
             sys.exit(1)
         _install_systemd_from_cli(args, force=force, system=system, run_as_user=run_as_user)
     elif backend == "launchd":
         launchd_install(force, start_now=getattr(args, "start_now", None) is not False,
-                        force_unit_path=getattr(args, "force_unit_path", False))
+                        force_unit_path=getattr(args, "force_unit_path", False), **options)
     elif backend == "windows":
         _gw_windows().install(
             force=force,
@@ -5626,7 +5602,7 @@ def _stop_host_multiplexer(owner) -> int:
 
 
 def _restart_all(system: bool, detach: bool = False) -> None:
-    from hermes_cli.gateway_profile_lifecycle import host_scope_for_all_verb
+    from hermes_cli.gateway_profile_lifecycle import restart_all_verb_scope
     owner = _host_multiplexer_for_all_verb()
     if owner is not None and not _host_multiplexer_is_ours(owner):
         # `--all` means "restart the ONE host multiplexer" — and this profile does not own it.
@@ -5640,11 +5616,11 @@ def _restart_all(system: bool, detach: bool = False) -> None:
         sys.exit(GATEWAY_FATAL_CONFIG_EXIT_CODE)
     # No live owner: stop/kill/start as the host root, not as the invoking profile (whose own
     # gateway the run-side guard would refuse — the host stayed down after a Desktop update).
-    with host_scope_for_all_verb(owner):
-        _restart_all_as_host(owner, system, detach)
+    with restart_all_verb_scope(owner) as owe_online_notice:
+        _restart_all_as_host(owner, system, detach, owe_online_notice)
 
 
-def _restart_all_as_host(owner, system: bool, detach: bool = False) -> None:
+def _restart_all_as_host(owner, system: bool, detach: bool = False, owe_online_notice=lambda: None) -> None:
     service_stopped = _stop_installed_service(system)
     if owner is not None:
         # Stop ONLY the host process: its served set comes back with it, and any per-profile
@@ -5664,8 +5640,8 @@ def _restart_all_as_host(owner, system: bool, detach: bool = False) -> None:
     # Retract the stopped owner's rendezvous record. Leaving it made this very function a silent
     # no-op: the re-entered `gateway run` below read the corpse's record and ATTACHED to it.
     _discard_dead_host_record()
-    # The retraction only invalidates when it removed a record; the pre-stop memo must go either way.
-    _forget_host_gateway_probe()
+    _forget_host_gateway_probe()  # the retraction invalidates only a removed record; drop the memo anyway
+    owe_online_notice()  # old host gone, new one not started: only the new boot can see it
 
     print("Starting gateway...")
     # Even without a registered task, gateway_windows.start() uses the detached launcher.

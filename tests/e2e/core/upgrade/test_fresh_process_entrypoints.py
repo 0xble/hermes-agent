@@ -419,6 +419,20 @@ _SUBREAPER = r'''
 import ctypes, json, os, signal, subprocess, sys, time
 import psutil
 
+# Importing tests exports HERMES_TEST_ISOLATION, which would leak into serve.
+def process_alive(process):
+    try:
+        return process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+
+
+def process_cmdline(process):
+    try:
+        return process.cmdline()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return None
+
 out = sys.argv[1]
 ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)  # PR_SET_CHILD_SUBREAPER
 # Survive whatever the watched process sends its process group on the way out. A handler (not
@@ -430,11 +444,12 @@ status = proc.wait()
 deadline = time.monotonic() + 20
 orphans = []
 while True:
-    orphans = [p for p in psutil.Process().children(recursive=True) if p.status() != psutil.STATUS_ZOMBIE]
+    orphans = [p for p in psutil.Process().children(recursive=True) if process_alive(p)]
     if not orphans or time.monotonic() > deadline:
         break
     time.sleep(0.1)
-report = {"returncode": status, "orphans": [" ".join(p.cmdline()) for p in orphans]}
+report = {"returncode": status, "orphans": [" ".join(cmd) or f"pid={p.pid}" for p in orphans
+                                         if (cmd := process_cmdline(p)) is not None]}
 for p in orphans:
     try:
         p.kill()
@@ -828,6 +843,7 @@ def test_serve_announces_ready_and_stops_cleanly_on_sigterm(tmp_path):
             reaper_proc = next(p for p in [root, *root.children(recursive=True)]
                                if p.cmdline()[1:2] == [str(reaper)])
             serve = next(p for p in reaper_proc.children() if p.cmdline()[1:3] == ["-m", "hermes_cli.main"])
+            assert "HERMES_TEST_ISOLATION" not in serve.environ(), "serve inherited test isolation"
             descendants = [p.pid for p in serve.children(recursive=True)]
             serve.send_signal(signal.SIGTERM)
             wait_for(lambda: report_path.exists() and report_path.stat().st_size > 0, timeout=120,

@@ -29,6 +29,8 @@ import atexit
 from dataclasses import dataclass
 from typing import Optional, Dict, Any, List, Callable
 
+from gateway.session_context import bound_turn_origin
+
 logger = logging.getLogger(__name__)
 
 
@@ -41,8 +43,8 @@ def _redact_terminal_error_text(value: Any) -> str:
 
 from tools.registry import tool_error
 from tools.terminal_tool_lifecycle import (
-    _cleanup_inactive_envs, _create_configured_env,
-    _evict_environment_for_task, cleanup_all_environments, ensure_task_env,
+    _call_in_flight, _cleanup_inactive_envs, _create_configured_env,
+    _evict_environment_for_task, _local_shell_owner, cleanup_all_environments, ensure_task_env,
 )
 from tools.terminal_tool_config import (
     _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
@@ -73,13 +75,19 @@ def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
         return default
 
 
-# Hard cap on foreground timeout; override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
+# Interactive foreground timeout cap; cron keeps its requested deadline inline.
+# Override via TERMINAL_MAX_FOREGROUND_TIMEOUT env var.
 FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT", 600, int, "integer")
 
-# Foreground heavy-work budget: hand the live shell to the background registry.
+# Interactive foreground heavy-work budget: hand the live shell to the background registry.
 # The helper waits without expiry, so FIFO age and earlier shell side effects survive.
 _FOREGROUND_HEAVY_SLOT_WAIT_CAP = 120
 _FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
+
+# The backend starts its relative timer after shell setup, then polls (up to 0.2s)
+# and tears down the process tree / drains output before the cell RPC can reply.
+# Flooring alone can leave almost no slack; reserve a full second even then.
+_CRON_CELL_CLEANUP_MARGIN_S = 1.0
 
 
 def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
@@ -89,7 +97,7 @@ def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
 
 def _heavy_slot_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
     """Foreground local heavy calls hand off at this budget without expiring their ticket."""
-    if background or env_type != "local":
+    if background or env_type != "local" or bound_turn_origin() == "cron":
         return None
     return _foreground_heavy_slot_max_wait(effective_timeout)
 
@@ -193,7 +201,7 @@ from tools.environments.base import EnvironmentConnectionError
 
 
 # Tool description for LLM
-TERMINAL_TOOL_DESCRIPTION = """Execute shell commands on the OS, shell and backend named in your environment section. The working directory, files and exported variables persist between calls: activate a virtualenv or export once, not before every command.
+TERMINAL_TOOL_DESCRIPTION = """Run shell commands on the OS/shell/backend named in your environment section. The working directory, files and exported variables persist between calls: activate a virtualenv or export once, not before every command.
 
 Use read_file, search_files, patch and write_file instead of cat/head/tail, grep/find/ls, sed/awk and echo/heredoc. Output is auto-truncated with the full text saved to a file; never pipe through head/tail to shorten it.
 
@@ -211,6 +219,7 @@ _last_activity: dict[str, float] = {}
 _env_lock = threading.Lock()
 _creation_locks: dict[str, threading.Lock] = {}  # Per-task locks for sandbox creation
 _creation_locks_lock = threading.Lock()  # Protects _creation_locks dict itself
+_calls_in_flight: dict[str, int] = {}  # Foreground calls running per env key; the reaper skips these
 _cleanup_thread = None
 _cleanup_running = False
 
@@ -406,7 +415,7 @@ def register_container_alias(child_task_id: str, parent_task_id: Optional[str]) 
 def register_run_scoped_task(task_id: str) -> None:
     """Give session-less *task_id* (a cron run) its own local terminal environment.
 
-    Its delegate_task children still share it through the container alias."""
+    Its delegate_task children own separate local export snapshots."""
     if task_id:
         with _container_alias_lock:
             _run_scoped_tasks.add(task_id)
@@ -415,15 +424,6 @@ def register_run_scoped_task(task_id: str) -> None:
 def clear_run_scoped_task(task_id: str) -> None:
     with _container_alias_lock:
         _run_scoped_tasks.discard(task_id)
-
-
-def _run_scoped_owner(task_id: Optional[str]) -> Optional[str]:
-    """The registered run that owns *task_id* (itself or via aliases), else None."""
-    if not task_id:
-        return None
-    owner = _resolve_container_alias(task_id)
-    with _container_alias_lock:
-        return owner if owner in _run_scoped_tasks else None
 
 
 def _resolve_container_alias(task_id: str) -> str:
@@ -550,33 +550,37 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
 
     1. Image/``env_type`` overrides (RL/benchmark rollouts) key their own sandbox;
        CWD-only overrides (ACP workspace tracking) are NOT isolation signals.
-    2. Per-session isolation (docker + ``container_persistent: false``): each
+    2. Local delegated children and registered runs own separate shell snapshots,
+       even when a child's inherited session key or container alias names its parent.
+       Other backends retain their shared-container contract.
+    3. Per-session isolation (docker + ``container_persistent: false``): each
        session's task_id is its own key (a fresh chat gets a fresh sandbox with only
        ITS mounts); delegate_task children follow the alias registry to the parent.
        Routed profiles qualify the key (:func:`_qualify_task_key`, #123989).
-    3. Session key present (WebUI per-session, gateway per-message): persistent
+    4. Session key present (WebUI per-session, gateway per-message): persistent
        Docker is PROFILE-scoped — ``shared:<key>`` opt-in, else ``profile:<name>``,
        with the default profile staying literally ``"default"`` so CLI and
        default-profile gateway sessions share ONE container; other backends key
        ``session:<key>`` so switching profiles can't reuse another profile's
        SSHEnvironment on the wrong host.
-    4. No session key (CLI, cron): ``shared:<key>`` when opted in (else a CLI run of a
+    5. No session key (CLI, cron): ``shared:<key>`` when opted in (else a CLI run of a
        keyed profile would split from its gateway sessions); a routed multiplexed profile
-       keys its own home (``profile:<name>`` under persistent Docker, matching branch 3);
-       on the local backend a registered run (cron) keys itself so one job's shell exports
-       cannot reach another; else ``"default"``, which subagent ids collapse onto to share
-       the parent's container. Sandboxed backends keep their shared-container contract.
+       keys its own home (``profile:<name>`` under persistent Docker, matching branch 4);
+       otherwise ``"default"``. Sandboxed backends keep their shared-container contract.
     """
     if task_id and _has_isolation_overrides(task_id):
         return _qualify_task_key(task_id)
     scope = _session_scope()
+    shell_owner = _local_shell_owner(task_id) if scope.env_type == "local" else None
+    if shell_owner:
+        return _qualify_task_key(shell_owner)
     if task_id and scope.session_isolated:
         return _qualify_task_key(_resolve_container_alias(task_id))
     # Per-session isolation: when a session key is present (the WebUI streaming layer sets it per-session,
     # the gateway per-message via contextvars), scope the container to it so switching profiles can't reuse
     # a previous profile's SSHEnvironment and silently run commands on the wrong remote host. Subagents
-    # inherit the same session key, so they still collapse onto the parent's container (the #16177
-    # shared-container intent). CLI mode has no session key and falls through to "default", behaviour
+    # on non-local backends inherit the same session key and share the parent's container (#16177).
+    # Local children already resolved above. CLI mode has no session key and falls through to "default", behaviour
     # unchanged. See commit e00f940a9. This runs *after* the isolation-override and
     # docker/container_persistent branches above: those paths already key containers per task_id, so they
     # stay authoritative where they apply and this only covers the cases that would otherwise collapse to
@@ -588,8 +592,7 @@ def _resolve_container_task_id(task_id: Optional[str]) -> str:
         # ONE container/cache slot (and sandbox dir) regardless of profile name (#84671).
         return f"shared:{shared}"
     if not session_key:
-        run_owner = _run_scoped_owner(task_id) if scope.env_type == "local" else None
-        return run_owner or _routed_home_task_key(scope.docker_profile_scoped) or "default"
+        return _routed_home_task_key(scope.docker_profile_scoped) or "default"
     if not scope.docker_profile_scoped:
         return _qualify_task_key(f"session:{session_key}")
     profile = _container_profile()
@@ -1280,7 +1283,7 @@ def _plan_execution(
             guidance = _foreground_background_guidance(command)
             if guidance:
                 raise _Rejected(_error_json(guidance, status="error"))
-            if timeout and timeout > FOREGROUND_MAX_TIMEOUT:
+            if timeout and timeout > FOREGROUND_MAX_TIMEOUT and bound_turn_origin() != "cron":
                 promoted = timeout
     else:
         auto_bg = None
@@ -1362,7 +1365,8 @@ def _acquire_env(plan: _ExecPlan, task_id: Optional[str]) -> Any:
 def _yield_kwargs(command: str, **ctx) -> dict:
     """``env.execute`` kwargs enabling yield-to-background (local backend only)."""
     from agent.incognito import is_incognito
-    if is_incognito():
+    # Neither private sessions nor scheduled turns can persist an adopted command.
+    if is_incognito() or bound_turn_origin() == "cron":
         return {}
     handler = yield_to_background_handler(command=command, **ctx)
     return {"yield_handler": handler} if handler is not None else {}
@@ -1403,6 +1407,19 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
+            from tools.code_execution_rpc import cell_deadline
+            deadline = cell_deadline.get()
+            if bound_turn_origin() == "cron" and deadline is not None:
+                # Recompute per attempt from the absolute host deadline: setup/retries
+                # and earlier calls spent this budget. Leave explicit cleanup/reply slack
+                # BEFORE rounding down; a fractional remainder is not a safety margin.
+                effective_timeout = min(
+                    effective_timeout, int(deadline - time.monotonic() - _CRON_CELL_CLEANUP_MARGIN_S),
+                )
+                if effective_timeout <= 0:
+                    return _error_json(
+                        "Command not started: execute_code cell deadline expired", exit_code=124,
+                    )
             result = env.execute(
                 execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
                 **_yield_kwargs(command, env_type=env_type, cwd=command_cwd, effective_task_id=eff,
@@ -1434,6 +1451,11 @@ def _run_foreground(
             "pid": result.get("pid"), "notify_on_complete": True,
             "note": _HEAVY_SLOT_YIELDED_NOTE if result.get("yield_reason") == "heavy_slot_wait" else _YIELDED_NOTE,
         }, ensure_ascii=False)
+    if (bound_turn_origin() == "cron" and result.get("hermes_timed_out")
+            and yield_when is not None and yield_when()):
+        result["output"] = result.get("output", "") + (
+            "\n[Heavy command not started: terminal timeout expired while waiting for heavy-slot admission]"
+        )
     from agent.incognito import is_incognito
     if metered and not is_incognito(session_id):
         record_terminal_outcome(command, env_type, result)
@@ -1569,103 +1591,105 @@ def terminal_tool(
                 raise _Rejected(_error_json(
                     "Background and durable processes are unavailable in incognito mode.", status="error"))
         env = _acquire_env(plan, task_id)
-        env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
-        if survive_restart and (not background or pty or env_type != "local"):
-            raise _Rejected(_error_json(
-                "survive_restart requires a local non-PTY background command; it is not available "
-                "for sandbox backends or pseudo-terminals.",
-                status="error",
-            ))
+        # _lookup_active_env stamps whichever of the two keys holds the env.
+        with _call_in_flight(plan.effective_task_id, task_id):
+            env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
+            if survive_restart and (not background or pty or env_type != "local"):
+                raise _Rejected(_error_json(
+                    "survive_restart requires a local non-PTY background command; it is not available "
+                    "for sandbox backends or pseudo-terminals.",
+                    status="error",
+                ))
 
-        # Session key for cwd records: the contextvar doesn't cross tool-worker
-        # threads, so fall back to the raw task_id (the top-level agent's
-        # session_key) as a stable anchor.
-        from tools.approval import get_current_session_key
+            # Session key for cwd records: the contextvar doesn't cross tool-worker
+            # threads, so fall back to the raw task_id (the top-level agent's
+            # session_key) as a stable anchor.
+            from tools.approval import get_current_session_key
 
-        session_key = get_current_session_key(default="") or (task_id or "")
+            session_key = get_current_session_key(default="") or (task_id or "")
 
-        # The supervised-gateway identity probe ends in a kernel process query
-        # (psutil create_time) that has wedged for the better part of an hour on
-        # macOS; ``env.execute`` is already behind ``run_bounded_sync`` but this
-        # chain ran ahead of it, so the tool call never returned and the cron
-        # slot stayed occupied (#111922). Share the command's own deadline. A
-        # guard that never rendered a verdict fails CLOSED: these checks apply
-        # unconditionally (``force`` cannot bypass them), so the command is
-        # refused with a retryable error instead of running unguarded.
-        from agent.deadline import run_bounded_sync
-        from tools.interrupt import acting_for_tid
+            # The supervised-gateway identity probe ends in a kernel process query
+            # (psutil create_time) that has wedged for the better part of an hour on
+            # macOS; ``env.execute`` is already behind ``run_bounded_sync`` but this
+            # chain ran ahead of it, so the tool call never returned and the cron
+            # slot stayed occupied (#111922). Share the command's own deadline. A
+            # guard that never rendered a verdict fails CLOSED: these checks apply
+            # unconditionally (``force`` cannot bypass them), so the command is
+            # refused with a retryable error instead of running unguarded.
+            from agent.deadline import run_bounded_sync
+            from tools.interrupt import acting_for_tid
 
-        # The guard chain runs on the deadline worker; keep it answerable to /stop
-        # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
-        guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
-        _acting_token = acting_for_tid.set(threading.current_thread().ident)
-        try:
-            bounded_guard = run_bounded_sync(
-                lambda: _pre_exec_block(
-                    command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
-                ),
-                guard_timeout,
-                label="terminal.pre-exec-guard",
-            )
-        finally:
-            acting_for_tid.reset(_acting_token)
-        if bounded_guard.timed_out:
-            raise _Rejected(_error_json(
-                f"Terminal pre-execution guard did not finish within {guard_timeout}s "
-                "(process-identity probe wedged); the command was not run. Retry the call.",
-                status="error",
-            ))
-        # Pre-exec security checks (floors + dangerous command detection);
-        # force=True means the user already confirmed.
-        verdict = _run_approval_guards(command, env_type, plan.config, force=force)
+            # The guard chain runs on the deadline worker; keep it answerable to /stop
+            # aimed at this tool thread (a remote-backend script read polls is_interrupted()).
+            guard_timeout = max(plan.effective_timeout, _PRE_EXEC_GUARD_MIN_TIMEOUT_S)
+            _acting_token = acting_for_tid.set(threading.current_thread().ident)
+            try:
+                bounded_guard = run_bounded_sync(
+                    lambda: _pre_exec_block(
+                        command, env=env, env_type=env_type, cwd=cwd, workdir=workdir, session_key=session_key,
+                    ),
+                    guard_timeout,
+                    label="terminal.pre-exec-guard",
+                )
+            finally:
+                acting_for_tid.reset(_acting_token)
+            if bounded_guard.timed_out:
+                raise _Rejected(_error_json(
+                    f"Terminal pre-execution guard did not finish within {guard_timeout}s "
+                    "(process-identity probe wedged); the command was not run. Retry the call.",
+                    status="error",
+                ))
+            # Pre-exec security checks (floors + dangerous command detection);
+            # force=True means the user already confirmed.
+            verdict = _run_approval_guards(command, env_type, plan.config, force=force)
 
-        pty_disabled = pty and _command_requires_pipe_stdin(command)
-        if plan.promoted_from_foreground_timeout is not None and is_incognito(session_id):
-            return _error_json("Long-running process persistence is unavailable in incognito mode.", status="error")
-        if plan.promoted_from_foreground_timeout is not None:
-            # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
-            # caller could not have meant for a foreground call, and the two are exclusive anyway.
-            background, notify_on_complete, watch_patterns = True, True, None
-        # Approval and pre-exec security checks above saw the user-supplied command; only the
-        # local execution is rewritten, putting heavy-slot in front of each recognized test or
-        # CI simple command. HEAVY_SLOT_HELD (a nested run) or HERMES_HEAVY_SLOT=off disables it.
-        # Keep helper admission unbounded. The local wait loop yields the original
-        # shell at the foreground budget only while admission is pending.
-        max_wait_seconds = _heavy_slot_max_wait_for(
-            background=background, env_type=env_type, effective_timeout=plan.effective_timeout,
-        )
-        if background:
-            execution_command = wrap_heavy_command(
-                command, env_type=env_type, environment=getattr(env, "env", None),
-            )
-            result = spawn_background_process(
-                command=execution_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
-                task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
-                mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
-                effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
-                watch_patterns=watch_patterns, approval_note=verdict.note,
-                pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
-                completion_output_chars=_completion_output_chars,
-                heartbeat_seconds=heartbeat,
-                persist_on_release=persist_on_release,
-                survive_restart=survive_restart,
-                auto_backgrounded=auto_bg is not None and plan.promoted_from_foreground_timeout is None,
-            )
+            pty_disabled = pty and _command_requires_pipe_stdin(command)
+            if plan.promoted_from_foreground_timeout is not None and is_incognito(session_id):
+                return _error_json("Long-running process persistence is unavailable in incognito mode.", status="error")
             if plan.promoted_from_foreground_timeout is not None:
-                result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
-            return _metered(None if _host_local else plan, result)
+                # Promotion implies notify_on_complete; watch_patterns is a background-only flag the
+                # caller could not have meant for a foreground call, and the two are exclusive anyway.
+                background, notify_on_complete, watch_patterns = True, True, None
+            # Approval and pre-exec security checks above saw the user-supplied command; only the
+            # local execution is rewritten, putting heavy-slot in front of each recognized test or
+            # CI simple command. HEAVY_SLOT_HELD (a nested run) or HERMES_HEAVY_SLOT=off disables it.
+            # Keep helper admission unbounded. The local wait loop yields the original
+            # shell at the foreground budget only while admission is pending.
+            max_wait_seconds = _heavy_slot_max_wait_for(
+                background=background, env_type=env_type, effective_timeout=plan.effective_timeout,
+            )
+            if background:
+                execution_command = wrap_heavy_command(
+                    command, env_type=env_type, environment=getattr(env, "env", None),
+                )
+                result = spawn_background_process(
+                    command=execution_command, env=env, env_type=env_type, effective_task_id=effective_task_id,
+                    task_id=task_id, session_key=session_key, workdir=workdir, cwd=cwd,
+                    mounted_host=getattr(env, "host_cwd", None) or plan.host_cwd,
+                    effective_pty=pty and not pty_disabled, notify_on_complete=notify_on_complete,
+                    watch_patterns=watch_patterns, approval_note=verdict.note,
+                    pty_disabled_reason=_PTY_DISABLED_REASON if pty_disabled else None,
+                    completion_output_chars=_completion_output_chars,
+                    heartbeat_seconds=heartbeat,
+                    persist_on_release=persist_on_release,
+                    survive_restart=survive_restart,
+                    auto_backgrounded=auto_bg is not None and plan.promoted_from_foreground_timeout is None,
+                )
+                if plan.promoted_from_foreground_timeout is not None:
+                    result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
+                return _metered(None if _host_local else plan, result)
 
-        with foreground_heavy_command(
-            command, env_type=env_type, environment=getattr(env, "env", None),
-        ) as (execution_command, waiting_for_admission):
-            return _metered(None if _host_local else plan, _run_foreground(
-                command, env, plan, execution_command=execution_command,
-                yield_after_seconds=max_wait_seconds if execution_command != command else None,
-                yield_when=waiting_for_admission,
-                task_id=task_id, session_id=session_id, session_key=session_key,
-                workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
-                metered=not _host_local,
-            ))
+            with foreground_heavy_command(
+                command, env_type=env_type, environment=getattr(env, "env", None),
+            ) as (execution_command, waiting_for_admission):
+                return _metered(None if _host_local else plan, _run_foreground(
+                    command, env, plan, execution_command=execution_command,
+                    yield_after_seconds=max_wait_seconds if execution_command != command else None,
+                    yield_when=waiting_for_admission,
+                    task_id=task_id, session_id=session_id, session_key=session_key,
+                    workdir=workdir, approval_note=verdict.note, clear_interrupt=verdict.approved_run,
+                    metered=not _host_local,
+                ))
     except _Rejected as r:
         return r.result_json
     except EnvironmentConnectionError as e:
@@ -1706,7 +1730,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds (default 180, foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Above {FOREGROUND_MAX_TIMEOUT}s the command runs as a tracked background process with notify_on_complete=true (the result says so; do not re-run it).",
+                "description": f"Max seconds (default 180, interactive foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Interactive calls above {FOREGROUND_MAX_TIMEOUT}s run as tracked background processes with notify_on_complete=true (the result says so; do not re-run them). Cron foreground calls wait inline for heavy-slot admission and completion until their timeout, bounded by the enclosing code cell deadline when present; they are not automatically backgrounded.",
                 "minimum": 1
             },
             "workdir": {

@@ -2,11 +2,17 @@
 import asyncio
 import hashlib
 import json
+import time
 import uuid
+
+# A submit normally answers in 30s; even two contended SQLite writes take 20s each.
+# Leave room for ordered-admission queueing, and require repeated successful owner reads.
+MISSING_SUBMIT_GRACE_SECONDS = 600
+MISSING_SUBMIT_READS = 2
 
 
 class CronExecutionUnknown(RuntimeError):
-    """The owner may have accepted this fire; never book it as failed or re-fire."""
+    """The owner may have accepted this fire; retain it until settlement or the missing fence."""
 
 
 def journal_path(job_id, request_id):
@@ -15,9 +21,16 @@ def journal_path(job_id, request_id):
     return get_hermes_home() / 'cron' / 'admissions' / (key + '.json')
 
 
-def _pause_identity(paused):
-    """The exact pause this recovery uncertainty caused, so only that pause is ever lifted."""
-    return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason')} if paused else True
+def _pause_unless_paused(job_id, reason):
+    """Own only a pause created here; an existing hold belongs to its original owner."""
+    from cron.jobs import _jobs_lock, get_job, pause_job
+
+    with _jobs_lock():
+        job = get_job(job_id)
+        if job is None or job.get('state') == 'paused':
+            return None
+        paused = pause_job(job_id, reason=reason)
+        return {'paused_at': paused.get('paused_at'), 'reason': paused.get('paused_reason')} if paused else None
 
 
 def replayable_completions(job_id, completions):
@@ -29,34 +42,38 @@ def replayable_completions(job_id, completions):
 def pause_for_unknown(job_id, execution_id, reason):
     """The firer pauses the job for this fire's unverified admission and records that exact pause
     on the fire's journal, so the receipt that later proves the run terminal can lift it."""
-    from cron.jobs import pause_job
     from utils import atomic_json_write
-    paused = pause_job(job_id, reason=reason)
+    from cron.jobs import _jobs_lock
     journal = journal_path(job_id, execution_id)
-    if paused and journal.exists():
-        record = json.loads(journal.read_text(encoding='utf-8-sig'))
-        record['pause_recorded'] = _pause_identity(paused)
-        atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+    with _jobs_lock():
+        pause = _pause_unless_paused(job_id, reason)
+        if pause and journal.exists():
+            record = json.loads(journal.read_text(encoding='utf-8-sig'))
+            record.setdefault('submit_started_at', journal.stat().st_mtime)
+            record['pause_recorded'] = pause
+            atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
 
 
 def _lift_pause(job_id, pause):
     """A verified terminal receipt resolved the uncertainty that paused the schedule: resume it iff
     the job is still held by exactly that pause (an operator's own pause/resume is never touched)."""
-    from cron.jobs import get_job, resume_job
-    job = get_job(job_id) if isinstance(pause, dict) else None
-    if (job is not None and job.get('state') == 'paused'
-            and (job.get('paused_at'), job.get('paused_reason')) == (pause['paused_at'], pause['reason'])):
-        try:
-            resume_job(job_id)
-        except ValueError:  # a one-shot whose instant has passed stays paused for the operator
-            pass
+    from cron.jobs import _jobs_lock, get_job, resume_job
+    with _jobs_lock():
+        job = get_job(job_id) if isinstance(pause, dict) else None
+        if (job is not None and job.get('state') == 'paused'
+                and (job.get('paused_at'), job.get('paused_reason')) == (pause['paused_at'], pause['reason'])):
+            try:
+                resume_job(job_id)
+            except ValueError:  # a one-shot whose instant has passed stays paused for the operator
+                pass
 
 
 def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
     from gateway.session_cron import owner_for_home, operation
-    from hermes_cli.gateway_client import connect_gateway
+    from cron.scheduler_transport import recovering_cron_client
     from hermes_constants import get_hermes_home
     from utils import atomic_json_write
+    from cron.jobs import _jobs_lock
 
     request_id = execution_id or job.get('execution_id')
     if not request_id:
@@ -65,7 +82,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
               'extra_prompt': extra_prompt}
     root = get_hermes_home() / 'cron' / 'admissions'
     journal = journal_path(params['job_id'], params['request_id'])
-    record = {'params': params, 'receipt': None}
+    record = {'params': params, 'receipt': None, 'job': dict(job), 'submit_started_at': time.time()}
     if journal.exists():
         record = json.loads(journal.read_text(encoding='utf-8-sig'))
         if record['params'] != params:
@@ -74,8 +91,15 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
     owner = owner_for_home(get_hermes_home())
 
     def save():
-        root.mkdir(parents=True, exist_ok=True)
-        atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+        # Share the jobs transaction lock with recovery's pause write and terminal retirement.
+        # Atomic replace alone prevents torn JSON, not a lost read/merge/write update.
+        with _jobs_lock():
+            root.mkdir(parents=True, exist_ok=True)
+            saved = json.loads(journal.read_text(encoding='utf-8-sig')) if journal.exists() else {}
+            for key in ('pause_recorded', 'canonical_settled'):
+                if key in saved:
+                    record[key] = saved[key]
+            atomic_json_write(journal, dict(saved, **record), mode=0o600, fsync_dir=True)
 
     async def observe(call):
         nonlocal attempted
@@ -136,8 +160,8 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             delay = min(delay * 2, 2.0)
 
     async def remote():
-        async with connect_gateway() as client:
-            return await observe(lambda op, data: client.rpc('cron.' + op, **data))
+        async with recovering_cron_client(params) as call:
+            return await observe(call)
 
     try:
         if owner is not None:
@@ -155,7 +179,10 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
         if record.get('worker_result') is not None:
             return tuple(record['worker_result']['result'])
         if attempted:
-            raise CronExecutionUnknown(f'Cron execution unverified; reconcile {journal}: {exc}') from exc
+            identity = f"job_id={job['id']} request_id={request_id} receipt={record.get('receipt')}"
+            raise CronExecutionUnknown(
+                f'Cron execution unverified; {identity}; reconcile {journal} '
+                f'{type(exc).__name__}: {exc}') from exc
         error = f'{type(exc).__name__}: {exc}'
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
 
@@ -185,6 +212,62 @@ def _set_aside_unsettled(journal):
         journal.name, target.name)
 
 
+def retire_completed_journal(job_id, execution_id):
+    """Lift only this run's uncertainty pause, in the same transaction that retires its link."""
+    from cron.jobs import _jobs_lock
+
+    journal = journal_path(job_id, execution_id)
+    with _jobs_lock():
+        record = json.loads(journal.read_text(encoding='utf-8-sig')) if journal.exists() else {}
+        # A detached result still needs its SAME canonical admission to settle first.
+        if 'worker_result' not in record or record.get('canonical_settled'):
+            _lift_pause(job_id, record.get('pause_recorded'))
+            journal.unlink(missing_ok=True)
+            journal.with_suffix('.cancel').unlink(missing_ok=True)
+
+
+def _observe_unverified(journal, state, current):
+    """Bound a never-committed submit; a receipt/worker capture is never aged into failure."""
+    from cron.jobs import _jobs_lock
+    from utils import atomic_json_write
+
+    with _jobs_lock():
+        record = json.loads(journal.read_text(encoding='utf-8-sig'))
+        # Legacy journals have no start stamp. Preserve their original mtime before pause writes.
+        started = record.setdefault('submit_started_at', journal.stat().st_mtime)
+        record['missing_reads'] = record.get('missing_reads', 0) + 1 if state['status'] == 'missing' else 0
+        if state.get('admission_id') and state.get('session_id'):
+            record['receipt'] = {key: state[key] for key in ('session_id', 'admission_id')}
+        if state['status'] in ('missing', 'unknown') and not record.get('pause_recorded'):
+            reason = 'Canonical cron unverified; no automatic re-execution'
+            pause = _pause_unless_paused(record['params']['job_id'], reason)
+            if pause:
+                record['pause_recorded'] = pause
+        if (state['status'] == 'missing' and not record.get('receipt') and 'worker_result' not in record
+                and time.time() - started >= MISSING_SUBMIT_GRACE_SECONDS
+                and record['missing_reads'] >= MISSING_SUBMIT_READS and (record.get('job') or current)):
+            error = (f'Submit never committed; verified by {MISSING_SUBMIT_GRACE_SECONDS}s grace '
+                     f'and {record["missing_reads"]} consecutive missing owner reads')
+            record['refusal'] = [False, '', '', error]
+            record.setdefault('job', current)
+            state = {'status': 'terminal', 'result': record['refusal'], 'job': record['job']}
+        atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+        return record, state
+
+
+def _reset_missing_reads(journal):
+    """A refused/failed read breaks the streak; it is not another absence observation."""
+    from cron.jobs import _jobs_lock
+    from utils import atomic_json_write
+
+    with _jobs_lock():
+        if journal.exists():
+            record = json.loads(journal.read_text(encoding='utf-8-sig'))
+            if record.get('missing_reads'):
+                record['missing_reads'] = 0
+                atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
+
+
 def reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
 
@@ -195,11 +278,10 @@ def reconcile_pending(*, allow_connect=True):
     from hermes_constants import get_hermes_home
     from hermes_cli.gateway_client import connect_gateway
     from cron.executions import execution_owner_live, get_execution
-    from cron.jobs import get_job, pause_job
+    from cron.jobs import get_job
     from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
                                 _save_compose_deliver)
     from cron.scheduler_bookkeeping import fail_empty_response, finish_completed_run
-    from utils import atomic_json_write
     import logging
 
     root = get_hermes_home() / 'cron' / 'admissions'
@@ -220,8 +302,7 @@ def reconcile_pending(*, allow_connect=True):
             booked_completion = row is None and params['request_id'] in (current or {}).get('canonical_completions', [])
             pending_canonical = 'worker_result' in record and not record.get('canonical_settled')
             if (terminal_execution or booked_completion) and not pending_canonical:
-                journal.unlink(missing_ok=True)
-                journal.with_suffix('.cancel').unlink(missing_ok=True)
+                retire_completed_journal(params['job_id'], params['request_id'])
                 continue
             if 'refusal' in record:
                 state = {'status': 'terminal', 'result': record['refusal'], 'job': record['job']}
@@ -234,10 +315,14 @@ def reconcile_pending(*, allow_connect=True):
                         return await operation(owner[0], 'recover', params)
                     async with connect_gateway() as client:
                         return await client.rpc('cron.recover', **params)
-                if owner is not None:
-                    state = asyncio.run_coroutine_threadsafe(observe(), owner[1]).result(timeout=20)
-                else:
-                    state = asyncio.run(observe())
+                try:
+                    if owner is not None:
+                        state = asyncio.run_coroutine_threadsafe(observe(), owner[1]).result(timeout=20)
+                    else:
+                        state = asyncio.run(observe())
+                except Exception:
+                    _reset_missing_reads(journal)
+                    raise
             if terminal_execution or booked_completion:
                 # The worker already booked output/delivery, but the replacement
                 # owner must import its captured result before deleting the only link.
@@ -252,22 +337,10 @@ def reconcile_pending(*, allow_connect=True):
                         journal.unlink(missing_ok=True)
                     journal.with_suffix('.cancel').unlink(missing_ok=True)
                 continue
-            if state['status'] == 'missing':
-                # The owner holds no admission for this fire: a definite non-admission, booked as
-                # the same failed run the in-submit refusal books. Only ``unknown`` pauses.
-                if current is None:
-                    if not pending_canonical:
-                        journal.unlink(missing_ok=True)
-                    continue
-                error = 'Cron admission missing: the owner never admitted this fire'
-                state = {'status': 'terminal', 'job': current,
-                         'result': [False, f'# Cron Job: {params["job_id"]} (FAILED)\n\n{error}\n', '', error]}
             if state['status'] != 'terminal':
-                if state['status'] == 'unknown' and not record.get('pause_recorded'):
-                    reason = 'Canonical cron unknown; no automatic re-execution'
-                    record['pause_recorded'] = _pause_identity(pause_job(params['job_id'], reason=reason))
-                    atomic_json_write(journal, record, mode=0o600, fsync_dir=True)
-                continue
+                record, state = _observe_unverified(journal, state, current)
+                if state['status'] != 'terminal':
+                    continue
             received = state['result']
             success, output, answer, error = received
             job = dict(state['job'], **(state.get('job_flags') or {}))

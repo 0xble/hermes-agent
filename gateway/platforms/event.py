@@ -222,6 +222,10 @@ class MessageEvent:
     _gateway_accepted: bool = field(default=False, init=False, repr=False, compare=False)
     # The local inbox placeholder belongs to this event until native admission succeeds.
     _owned_local_pending: Optional[int] = field(default=None, init=False, repr=False, compare=False)
+    # Set when ``admit_internal_event`` hands its producer a receipt before any drain began. The
+    # producer will not retry, so a restart drain runs this event instead of refusing it at the
+    # drain gate or discarding it as a queued follow-up (#138123).
+    _admitted_before_drain: bool = field(default=False, init=False, repr=False, compare=False)
     # Run-owned final presentation snapshot; never deserialized from ingress metadata.
     _notification_reply_muted: Optional[bool] = field(default=None, init=False, repr=False, compare=False)
     # Run-owned identity of a queued chain's terminal turn, for the chain's single post-turn judge.

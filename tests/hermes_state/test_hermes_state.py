@@ -98,24 +98,6 @@ def db(tmp_path):
     session_db.close()
 
 
-@pytest.fixture(autouse=True)
-def _no_fts_rebuild_throttle(monkeypatch):
-    """Zero the FTS-rebuild inter-chunk throttle for every test in this file.
-
-    ``optimize_fts_storage`` sleeps ``max(_FTS_REBUILD_MIN_PAUSE,
-    chunk_cost * _FTS_REBUILD_DUTY_FACTOR)`` between chunks so a LIVE
-    gateway/CLI sharing the DB isn't starved of the write lock. Tests run
-    against a private tmp-path DB with no concurrent process — the sleep
-    protects nobody and was pure dead time (measured: 4.1s of a 4.6s
-    migration test was time.sleep; ~20s across the file, whose total was
-    ~52s). The duty-cycle POLICY (sleep >= 4x chunk cost) stays covered by
-    the production constants themselves; no test asserts on wall-clock
-    pacing.
-    """
-    monkeypatch.setattr(SessionDB, "_FTS_REBUILD_MIN_PAUSE", 0.0)
-    monkeypatch.setattr(SessionDB, "_FTS_REBUILD_DUTY_FACTOR", 0.0)
-
-
 # =========================================================================
 # Connection lifecycle
 # =========================================================================
@@ -1399,8 +1381,8 @@ class TestPruneSessions:
         monkeypatch.setattr(hermes_state_maintenance.time, "sleep", pauses.append)
         assert db.prune_sessions(older_than_days=90) == 51
         assert db._read_one("SELECT COUNT(*) FROM sessions WHERE id LIKE 'old-%'")[0] == 0
-        # 51 victims => 25 + 25 + 1, with a release/yield between each transaction.
-        assert pauses == [0.01, 0.01]
+        # 51 quick victims => 25 + 25 + 1, with a writer-fairness pause between each transaction.
+        assert len(pauses) == 2 and all(0.05 <= pause <= 2.0 for pause in pauses)
 
 
     def test_prune_preserves_guarded_compression_lineage_across_batches(self, db, monkeypatch):
@@ -2384,14 +2366,12 @@ class TestReconcileColumnsErrorHandling:
     def _db_missing_column(self, tmp_path):
         """A store whose sessions table lacks last_read_at."""
         db_path = tmp_path / "state.db"
-        seed = SessionDB(db_path=db_path)
-        seed.close()
-        conn = sqlite3.connect(str(db_path))
-        try:
+        SessionDB(db_path=db_path).close()
+        with contextlib.closing(sqlite3.connect(str(db_path))) as conn:
+            # A pre-column store also predates triggers that reference it.
+            conn.execute("DROP TRIGGER sessions_projection_update")
             conn.execute("ALTER TABLE sessions DROP COLUMN last_read_at")
             conn.commit()
-        finally:
-            conn.close()
         return db_path
 
     def test_locked_alter_propagates(self, tmp_path):

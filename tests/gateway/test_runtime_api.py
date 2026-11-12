@@ -45,7 +45,7 @@ async def test_owner_serves_existing_routes_and_ws_without_signal_ownership(monk
     if shared:
         from gateway.config import Platform
         from gateway.session import SessionSource
-        from gateway.session_authority import initialize_session_authority
+        from tests.fakes.runtime_owner import initialize_session_authority
         authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='api-owner')
         ref = authority.register(SessionSource(platform=Platform.TELEGRAM, chat_id='api-test', user_id='fixture'))
         request.update(method='session.resume', params={'session_id': ref.session_id})

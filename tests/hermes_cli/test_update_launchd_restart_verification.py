@@ -165,6 +165,13 @@ def _patch_launchd_env(
         def exists(self):
             return plist_exists
 
+        def with_name(self, name):
+            return self
+
+        def read_bytes(self):
+            # Legacy automatic-mode definition; no persisted explicit domain.
+            return b'<?xml version="1.0"?><plist version="1.0"><dict/></plist>'
+
     monkeypatch.setattr(gateway_cli, "get_launchd_plist_path", lambda: _Plist())
     monkeypatch.setattr(gateway_cli, "get_launchd_label", lambda: LABEL)
     monkeypatch.setattr(

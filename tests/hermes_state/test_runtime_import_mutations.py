@@ -1,4 +1,5 @@
 """Import rows and retry receipt either commit together or not at all."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 import pytest
 from hermes_state import SessionDB
@@ -7,7 +8,7 @@ import hermes_state_runtime as rt
 
 def test_import_rolls_back_rows_with_receipt_failure(tmp_path):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         args = dict(epoch=epoch, principal_id='human', session_id='first', request_id='import',
                     expected_revision=0, operation='import', payload={'sessions': [
                         {'id': 'first', 'source': 'cli', 'messages': [{'role': 'user', 'content': 'keep'}]},
@@ -29,7 +30,7 @@ def test_import_rolls_back_rows_with_receipt_failure(tmp_path):
 def test_import_never_overwrites_existing_live_rows(tmp_path):
     with SessionDB(db_path=tmp_path / 'state.db') as db:
         db.create_session('live', source='test')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id='live', request_id='queued', payload={'text': 'keep'})
         before = db.get_session('live')
         result = rt.mutate_runtime_session(db, epoch=epoch, principal_id='human', session_id='new',

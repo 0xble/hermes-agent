@@ -8,8 +8,10 @@ user message. If either anchor is unavailable or rejected, the adapter must
 avoid retrying with a partial topic route that can render outside the lane.
 """
 
+import asyncio
 import sys
 import socket
+import sqlite3
 import types
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -136,6 +138,107 @@ def _make_adapter():
     adapter._polling_error_callback_ref = None
     adapter.platform = Platform.TELEGRAM
     return adapter
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["text", "control", "image", "image_file", "document", "video", "voice", "animation", "album"])
+async def test_root_fallback_is_reported_without_leaking_into_next_send(kind, tmp_path, caplog):
+    """A received root message cannot prove the requested private topic recovered (#152148)."""
+    adapter = _make_adapter()
+    calls = []
+
+    async def send_message(**kwargs):
+        calls.append(kwargs)
+        if kwargs.get("message_thread_id") or kwargs.get("direct_messages_topic_id"):
+            raise FakeBadRequest("Message thread not found")
+        message = SimpleNamespace(message_id=782)
+        return [message] if "media" in kwargs else message
+
+    adapter._bot = SimpleNamespace(**{
+        name: send_message for name in ("send_message", "send_photo", "send_document", "send_video", "send_audio", "send_animation", "send_media_group")
+    })
+    metadata = {"thread_id": "20197", "direct_messages_topic_id": "20197", "telegram_dm_topic_reply_fallback": True}
+    media = tmp_path / "sample.mp3"
+    media.write_bytes(b"fake media")
+    sends = {
+        "text": (adapter.send, "private content"),
+        "control": (adapter.send_update_prompt, "private content"),
+        "image": (adapter.send_image, "https://example.com/photo.png"),
+        "animation": (adapter.send_animation, "https://example.com/anim.gif"),
+        "album": (adapter.send_multiple_images, [(f"file://{media}", "")]),
+        "image_file": (adapter.send_image_file, str(media)),
+        "document": (adapter.send_document, str(media)),
+        "video": (adapter.send_video, str(media)),
+        "voice": (adapter.send_voice, str(media)),
+    }
+    method, payload = sends[kind]
+    result = await method("123", payload, metadata=metadata)
+    assert result.success
+    assert result.raw_response["thread_fallback"] is True
+    assert str(result.raw_response["requested_thread_id"]) == "20197"
+    assert not calls[-1].get("message_thread_id")
+    assert not calls[-1].get("direct_messages_topic_id")
+    warnings = [record.getMessage() for record in caplog.records if "delivered to root" in record.getMessage()]
+    assert len(warnings) == 1
+    assert "20197" in warnings[0]
+    assert "private content" not in warnings[0]
+    clean = await adapter.send("123", "root message")
+    assert clean.success
+    assert not (clean.raw_response or {}).get("thread_fallback")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("settlement", ["normal", "cancelled", "replay"])
+@pytest.mark.parametrize("fallback", [False, True])
+async def test_delivery_obligation_preserves_root_fallback(settlement, fallback, tmp_path, monkeypatch):
+    from gateway import delivery_ledger as ledger
+    from gateway.run import GatewayRunner
+
+    # Never open the user's state.db, even if the test's home isolation changes.
+    path = tmp_path / "obligations.sqlite"
+    monkeypatch.setattr(ledger, "_db_path", lambda: path)
+    ledger.record_obligation(obligation_id="test", session_key="test", platform="telegram", chat_id="123", thread_id="20197", content="reply")
+    adapter = _make_adapter()
+    delivered_to_root = False
+
+    async def send_message(**kwargs):
+        nonlocal delivered_to_root
+        if fallback and not delivered_to_root and kwargs.get("message_thread_id"):
+            raise FakeBadRequest("Message thread not found")
+        delivered_to_root = not kwargs.get("message_thread_id")
+        return SimpleNamespace(message_id=782)
+
+    adapter._bot = SimpleNamespace(send_message=send_message)
+    if settlement == "replay":
+        runner = object.__new__(GatewayRunner)
+        runner._obligation_adapter = AsyncMock(return_value=adapter)
+        runner._redelivery_restart_note_event = AsyncMock(return_value=None)
+        runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+        assert await runner._redeliver_claimed_obligations([{
+            "obligation_id": "test", "platform": "telegram", "chat_id": "123", "thread_id": "20197",
+            "content": "reply\n[[copy]]\ncopy part\n[[/copy]]\n", "session_key": "test", "attempts": 0,
+        }]) == 1
+    else:
+        result = await adapter.send("123", "reply", metadata={"thread_id": "20197"})
+        if settlement == "cancelled":
+            from gateway.platforms.base import _PENDING_LEDGER_SETTLEMENT
+
+            async def cancelled_send(*_args, **_kwargs):
+                asyncio.current_task().cancel()
+                return result
+
+            adapter._send_with_retry_body = cancelled_send
+            token = _PENDING_LEDGER_SETTLEMENT.set(("test",))
+            try:
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.create_task(adapter._send_with_retry("123", "reply"))
+            finally:
+                _PENDING_LEDGER_SETTLEMENT.reset(token)
+        else:
+            await adapter._finalize_delivery_obligation("test", result, None, adapter)
+    with sqlite3.connect(path) as conn:
+        row = conn.execute("SELECT state, attempts, thread_id, last_error FROM delivery_obligations WHERE obligation_id='test'").fetchone()
+    assert row == ("delivered", 0, "20197", "thread_fallback_root" if fallback else None)
 
 
 def test_non_forum_group_reply_thread_id_does_not_fork_session_key():

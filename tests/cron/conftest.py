@@ -19,6 +19,16 @@ from uuid import uuid4
 import pytest
 
 
+@pytest.fixture
+def worktree_maintenance_ready(monkeypatch):
+    """Exercise sweep coordination after startup and inside the permitted deletion window."""
+    from cron import scheduler
+
+    monkeypatch.setattr(scheduler, "_worktree_maintenance_boot_started",
+                        scheduler.time.monotonic() - scheduler._WORKTREE_MAINTENANCE_BOOT_DELAY_SECONDS - 1)
+    monkeypatch.setattr("hermes_cli.maintenance_window.deletion_window_open", lambda: True)
+
+
 @pytest.fixture()
 def make_cron_provider():
     """Factory for minimal CronScheduler test doubles.

@@ -26,7 +26,7 @@ async def _owner(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
     from gateway.run_shutdown_session_end import GatewaySessionEndMixin
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
@@ -195,7 +195,8 @@ async def test_a_closed_sessions_refusal_goes_with_its_live_state(tmp_path, monk
 async def _local(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     from hermes_state import AsyncSessionDB, SessionDB
@@ -306,7 +307,8 @@ async def test_messaging_completion_still_starts_its_turn(tmp_path, monkeypatch)
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions

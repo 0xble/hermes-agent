@@ -26,7 +26,7 @@ def detached_worker(tmp_path, monkeypatch):
     monkeypatch.setattr(async_delegation_worker, 'bind_worker_delegation_store', lambda store: None)
     monkeypatch.setattr(detached_authority, 'owns_detached_execution', lambda *args: True)
     monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
-                        lambda *args, **kwargs: SimpleNamespace(state='absent', endpoint=None))
+                        lambda *args, **kwargs: SimpleNamespace(state='absent', endpoint=None, reason_code=None))
     real_dial = worker.WorkerRPC._dial
 
     class Link:
@@ -108,7 +108,7 @@ def test_detached_persistence_survives_multiple_owner_retry_deadlines(detached_w
     assert [r['method'] for r in clock.sent].count('worker.adopt') == 2
 
 
-@pytest.mark.parametrize('fault', ['lost_reply', 'double_entry_close', 'chained_write', 'receipt_timeout'])
+@pytest.mark.parametrize('fault', ['lost_reply', 'double_entry_close', 'chained_write', 'receipt_timeout', 'register_timeout'])
 def test_detached_receipt_replay_is_exactly_once(tmp_path, monkeypatch, fault):
     import threading
 
@@ -121,10 +121,8 @@ def test_detached_receipt_replay_is_exactly_once(tmp_path, monkeypatch, fault):
     from hermes_cli import gateway_client, gateway_runtime, gateway_runtime_discovery as discovery
     import hermes_constants
     from hermes_state import SessionDB
-    from hermes_state_runtime import (
-        RuntimeStoreError, adopt_worker_execution, begin_runtime_epoch,
-        mutate_worker_execution, register_worker_execution,
-    )
+    from hermes_state_runtime import RuntimeStoreError, adopt_worker_execution, mutate_worker_execution, register_worker_execution
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tools import async_delegation_worker
 
     db = SessionDB(tmp_path / 'owner.db')
@@ -157,6 +155,11 @@ def test_detached_receipt_replay_is_exactly_once(tmp_path, monkeypatch, fault):
                 if method == 'worker.register':
                     result = register_worker_execution(db, epoch=state.epoch, **assignment,
                         kind=params['kind'], adoption_secret=params['secret'])
+                    if fault == 'register_timeout' and not state.injected:
+                        state.injected = True
+                        state.committed.set()
+                        # Registration is durable, but the first link never gets its answer.
+                        continue
                 elif method == 'worker.adopt':
                     result = adopt_worker_execution(db, epoch=state.epoch, **assignment,
                                                     adoption_secret=params['secret'])
@@ -197,6 +200,10 @@ def test_detached_receipt_replay_is_exactly_once(tmp_path, monkeypatch, fault):
             raise ConnectionClosed(None, None) from BrokenPipeError('owner received the frame')
 
     def receive(link, timeout):
+        if link.test_method == 'worker.register' and fault == 'register_timeout' and not state.entry_closes:
+            assert state.committed.wait(5)
+            state.entry_closes += 1
+            raise TimeoutError('worker_receipt_timeout')
         if link.test_method == 'worker.persist' and fault == 'receipt_timeout' and len(state.sends) == 1:
             assert state.committed.wait(5)
             raise TimeoutError('worker_receipt_timeout')
@@ -220,7 +227,7 @@ def test_detached_receipt_replay_is_exactly_once(tmp_path, monkeypatch, fault):
             endpoint = SimpleNamespace(api_origin=f'http://127.0.0.1:{server.socket.getsockname()[1]}',
                                        control_home=None)
             monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
-                                lambda *args, **kwargs: SimpleNamespace(state='ready', endpoint=endpoint))
+                                lambda *args, **kwargs: SimpleNamespace(state='ready', endpoint=endpoint, reason_code=None))
             monkeypatch.setattr(discovery, 'query_identify', lambda *args, **kwargs: {'pid': -1})
             monkeypatch.setattr(gateway_client, '_session_ticket', lambda *args, **kwargs: 'test-ticket')
             try:
@@ -232,18 +239,23 @@ def test_detached_receipt_replay_is_exactly_once(tmp_path, monkeypatch, fault):
                 assert [row['content'] for row in db.get_messages('s')] == ['computed once']
                 assert db._read_one('SELECT COUNT(*) FROM worker_receipts')[0] == 1
                 store = state.stores[0]
-                assert store.scope['epoch'] == state.epoch == 2 and store.failure is None
+                assert store.scope['epoch'] == state.epoch == (1 if fault == 'register_timeout' else 2) and store.failure is None
                 assert json.loads(store.path.read_text(encoding='utf-8-sig'))['pending'] == []
                 identities = [{key: params[key] for key in
                                ('execution_id', 'session_id', 'generation', 'sequence', 'operation', 'payload')}
                               for params in state.sends]
-                assert len(identities) == (3 if fault == 'double_entry_close' else 2)
+                assert len(identities) == (1 if fault == 'register_timeout' else 3 if fault == 'double_entry_close' else 2)
+                registrations = [params for method, params in state.requests if method == 'worker.register']
+                assert all(params == registrations[0] for params in registrations)
+                assert db._read_one('SELECT COUNT(*) FROM worker_executions')[0] == 1
                 assert all(identity == identities[0] for identity in identities)
                 methods = [method for method, _ in state.requests]
-                assert methods == (['worker.register', 'worker.adopt', 'worker.adopt', 'worker.persist']
+                assert methods == (['worker.register', 'worker.register', 'worker.adopt', 'worker.persist']
+                    if fault == 'register_timeout' else
+                    ['worker.register', 'worker.adopt', 'worker.adopt', 'worker.persist']
                     if fault == 'double_entry_close' else
                     ['worker.register', 'worker.adopt', 'worker.persist', 'worker.adopt', 'worker.persist'])
-                assert len(state.results) == (1 if fault == 'double_entry_close' else 2)
+                assert len(state.results) == (1 if fault in ('double_entry_close', 'register_timeout') else 2)
                 assert all(result == state.results[0] for result in state.results)
             finally:
                 server.shutdown()

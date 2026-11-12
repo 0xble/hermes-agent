@@ -11,13 +11,16 @@ from gateway.status import read_runtime_status
 
 
 @pytest.fixture(autouse=True)
-def _host_attach_gate_is_not_under_test(monkeypatch):
+def _host_attach_gate_is_not_under_test(monkeypatch, tmp_path):
     """These tests exercise the STARTUP path, not the host-attach gate that now runs in front of it.
 
     Without the stub they pass only while the shared rendezvous dir happens to be empty: any record
     there makes ``start_gateway`` attach and return before reaching the code under test. The host
     role claimed along the way is released afterwards, so one test's owner is not the next one's.
     """
+    # A runner process pins its launch home at module import. These tests simulate separate
+    # launches in tmp_path, including their real control sockets and clean-shutdown markers.
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path)
     monkeypatch.setattr("gateway.run._host_attach_or_none", AsyncMock(return_value=None))
     yield
     from gateway import host_rendezvous as hr
@@ -746,14 +749,14 @@ async def test_transient_secret_failure_does_not_claim_a_fatal_config_fault(monk
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "adapter_factory, secrets_degraded, why",
+    "adapter_factory, secrets_degraded, expected_exit, why",
     [
-        (_MissingCredentialAdapter, False, "secrets healthy: an absent token IS misconfiguration"),
-        (_NonRetryableFailureAdapter, True, "an ownership conflict is not fixed by restarting"),
+        (_MissingCredentialAdapter, False, None, "secrets healthy: park the platform, retain local clients"),
+        (_NonRetryableFailureAdapter, True, GATEWAY_FATAL_CONFIG_EXIT_CODE, "an ownership conflict is not fixed by restarting"),
     ],
 )
 async def test_fatal_config_exit_is_preserved(monkeypatch, tmp_path, adapter_factory,
-                                              secrets_degraded, why):
+                                              secrets_degraded, expected_exit, why):
     """The transient-secrets escape hatch must not swallow genuine fatal conflicts.
 
     The second case is the one that sank the previous upstream attempt at this change:
@@ -764,7 +767,18 @@ async def test_fatal_config_exit_is_preserved(monkeypatch, tmp_path, adapter_fac
         monkeypatch, tmp_path, adapter_factory, secrets_degraded=secrets_degraded
     )
 
-    assert runner.exit_code == GATEWAY_FATAL_CONFIG_EXIT_CODE, why
+    try:
+        assert runner.exit_code == expected_exit, why
+        state = read_runtime_status()
+        if expected_exit is None:
+            assert runner.should_exit_cleanly is False
+            assert state["gateway_state"] == "degraded"
+            assert state["platforms"]["discord"]["state"] == "fatal"
+        else:
+            assert runner.should_exit_cleanly is True
+            assert state["gateway_state"] == "startup_failed"
+    finally:
+        await runner.stop()
 
 
 @pytest.mark.parametrize(
@@ -838,9 +852,15 @@ async def test_repeated_transient_failures_eventually_park(monkeypatch, tmp_path
     assert all(c != GATEWAY_FATAL_CONFIG_EXIT_CODE for c in codes[:-1]), (
         "early attempts must stay restartable so a brief outage self-heals"
     )
-    assert codes[-1] == GATEWAY_FATAL_CONFIG_EXIT_CODE, (
-        "a backend that never comes back must park instead of looping"
-    )
+    try:
+        assert codes[-1] is None, "park the platform without restarting or losing local clients"
+        assert runner.should_exit_cleanly is False
+        state = read_runtime_status()
+        assert state["gateway_state"] == "degraded"
+        assert state["platforms"]["discord"]["state"] == "fatal"
+        assert not runner._failed_platforms
+    finally:
+        await runner.stop()
 
 
 @pytest.mark.asyncio

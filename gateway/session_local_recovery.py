@@ -1,5 +1,6 @@
 """Restore only private, profile-bound local policy into the existing authority."""
 import asyncio
+import contextlib
 import json
 import logging
 from pathlib import Path
@@ -7,6 +8,7 @@ from pathlib import Path
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_contract import SessionRef
+from gateway.session_store_async import run_store_call
 from hermes_state_keys import local_identity
 from hermes_state_local import POLICY_PREFIX, local_receipt
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
@@ -49,6 +51,10 @@ def _refused_check(exc):
     where = f' at {frames[-1].name}:{frames[-1].lineno}' if frames else ''
     chained = f', caused by {_refused_check(exc.__cause__)}' if exc.__cause__ is not None else ''
     return f'{cause}{where}{chained}'
+
+
+class _LiveSessionChanged(RuntimeStoreError):
+    """The live cache changed during async restoration; a caller may re-read it."""
 
 
 class _ReceiptRefused(RuntimeStoreError):
@@ -112,6 +118,16 @@ def owned_receipt(authority, sid):
     return receipt, source, route, _checked_entry(authority, receipt, source, route)
 
 
+def unused_session(conn, session_id):
+    """*session_id* holds nothing: no transcript, ledger rows or children (what the SessionStore's
+    stale-route heal, #54878, mints as a route's replacement before any turn runs on it)."""
+    return conn.execute(
+        'SELECT 1 FROM messages WHERE session_id=? UNION ALL SELECT 1 FROM session_admissions '
+        'WHERE target_session_id=? UNION ALL SELECT 1 FROM worker_executions WHERE session_id=? '
+        'UNION ALL SELECT 1 FROM sessions WHERE parent_session_id=? LIMIT 1',
+        (session_id, session_id, session_id, session_id)).fetchone() is None
+
+
 def _stray_route_target(authority, receipt, session_id):
     """*session_id* is a replacement the SessionStore's stale-route self-heal minted on this local
     route before #140642: outside the receipt's lineage, never admitted, no transcript. The receipt
@@ -121,13 +137,8 @@ def _stray_route_target(authority, receipt, session_id):
     if not session_id or session_id in receipt.get('lineage', [receipt['session_id']]):
         return False
     with authority.db._read_ctx() as conn:
-        busy = conn.execute(
-            'SELECT 1 FROM messages WHERE session_id=? UNION ALL SELECT 1 FROM session_admissions '
-            'WHERE target_session_id=? UNION ALL SELECT 1 FROM worker_executions WHERE session_id=? '
-            'UNION ALL SELECT 1 FROM sessions WHERE parent_session_id=? LIMIT 1',
-            (session_id, session_id, session_id, session_id)).fetchone()
-    if busy is not None:
-        return False
+        if not unused_session(conn, session_id):
+            return False
     logging.getLogger(__name__).warning(
         'Local route for %s named an empty replacement %s outside its lineage; restoring the receipt target',
         receipt['session_id'], session_id)
@@ -139,12 +150,10 @@ def _read_local_session(authority, sid):
     try:
         # The catch-up writes, so the receipt as stored must already be this owner's (#140060).
         receipt, source, route, entry = owned_receipt(authority, sid)
-        chat_id, store = source.chat_id, authority.runner.session_store
         adopted = _with_untracked_compression(authority, sid, receipt)
         policy = restore_policy(adopted['policy'])
         if adopted is not receipt:  # re-read after a catch-up: check the copy that will be served
             receipt, entry = adopted, _checked_entry(authority, adopted, source, route)
-        target = entry.session_id
         from hermes_state_local_lineage import validate_local_lineage
         with authority.db._read_ctx() as conn:
             validate_local_lineage(conn, receipt)
@@ -199,10 +208,16 @@ def _restore_local_entry(authority, prepared, *, existing):
             store._entries[route] = entry
         else:
             current = store._entry_locked(route)
-            if current is None or (current.session_id not in receipt.get('lineage', [source.chat_id])
-                                   and not _stray_route_target(authority, receipt, current.session_id)):
+            if current is None:
+                # A route the loaded store cannot see (an older release's scope, a pruned row) is the
+                # receipt's to rebuild, as on a cold restore: refusing wedges every claim until a restart.
+                entry.origin = source
+                store._entries[route] = entry
+            elif (current.session_id not in receipt.get('lineage', [source.chat_id])
+                    and not _stray_route_target(authority, receipt, current.session_id)):
                 raise RuntimeStoreError('admission_conflict')
-            current.session_id = target
+            else:
+                current.session_id = target
 
 
 def _publish_local_session(authority, sid, adapter, prepared, live):
@@ -224,25 +239,28 @@ def restore_local_session(authority, sid):
     return _publish_local_session(authority, sid, adapter, prepared, live)
 
 
-async def restore_local_session_async(authority, sid):
+async def restore_local_session_async(authority, sid, *, admission_gate=True):
     """Producer restoration: blocking validation/store work off-loop, live publication on-loop.
 
     The producer's tracked ordered admission owns this whole preparation, including cancellation.
     Existing sessions still validate the durable receipt and lineage, never trust the live cache.
+    ``admission_gate=False`` is reserved for cron recovery of an already-admitted receipt while
+    the gateway is draining; it does not relax any conflict or lineage check.
     """
-    import asyncio
     live = authority.sessions.get(sid)
-    prepared = await asyncio.to_thread(_read_local_session, authority, sid)
-    authority._require_admission_open()
+    prepared = await run_store_call(_read_local_session, authority, sid)
+    if admission_gate:
+        authority._require_admission_open()
     if authority.sessions.get(sid) is not live:
-        raise RuntimeStoreError('admission_conflict')
+        raise _LiveSessionChanged('admission_conflict')
     adapter = _local_restore_adapter(authority)
     _check_restored_live(live, adapter, prepared)
-    await asyncio.to_thread(_restore_local_entry, authority, prepared, existing=live is not None)
-    authority._require_admission_open()
+    await run_store_call(_restore_local_entry, authority, prepared, existing=live is not None)
+    if admission_gate:
+        authority._require_admission_open()
     if (authority.sessions.get(sid) is not live
             or local_adapter_map(authority).get(Platform.LOCAL) is not adapter):
-        raise RuntimeStoreError('admission_conflict')
+        raise _LiveSessionChanged('admission_conflict')
     _check_restored_live(live, adapter, prepared)
     return _publish_local_session(authority, sid, adapter, prepared, live)
 
@@ -407,19 +425,71 @@ def reset_local_session(store, old_entry, session_id, now, display_name):
     return entry
 
 
+# The receipts boot restores: an open row (or one compressed away, for its catch-up), unsettled input
+# or a stored close. An ended session keeps its receipt and stays resumable; ``authorize`` restores it
+# on first touch, so the live registry no longer grows with every session ever opened (#143547 LC-36).
+_BOOT_RECEIPTS_SQL = (
+    "SELECT m.key FROM state_meta m LEFT JOIN sessions s "
+    "ON s.id = CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.entry.session_id') END "
+    "WHERE m.key LIKE ? AND (s.ended_at IS NULL OR s.end_reason = 'compression' "
+    "OR EXISTS (SELECT 1 FROM session_admissions a WHERE a.target_session_id = substr(m.key, ?) "
+    "AND a.status IN ('queued','started','unknown')) "
+    "OR EXISTS (SELECT 1 FROM state_meta c WHERE c.key = ? || substr(m.key, ?)))")
+
+
+def restore_completion_route(runner, session_key):
+    """Background work that outlived its local session reports after a restart: boot left that ended
+    session unrestored, so restore it first, as ``authorize`` does on a viewer's first touch, and its
+    completion is noted on it as before. Anything else is left to the delivery's own checks."""
+    from gateway.run import _parse_session_key
+    from gateway.session_authorities import active_authority
+    authority, parsed = active_authority(runner), _parse_session_key(session_key) or {}
+    if authority is None or parsed.get('platform') != Platform.LOCAL.value or parsed['chat_id'] in authority.sessions:
+        return
+    with contextlib.suppress(RuntimeStoreError):
+        restore_local_session(authority, parsed['chat_id'])
+
+
+def release_handed_off_receipts(db, *, epoch):
+    """Boot heal for #143286: an older build's ``/handoff`` (or a platform ``/resume``) moved a local
+    session onto a messaging lane but kept its local receipt, so every open, pin or rename refused it
+    (``stored identity mismatch``) and its title never resolved. Retire each such receipt, so the row
+    restores from its route like any other platform session, and move the rest of its conversation
+    there with it (``hand_off_conversations``). Only receipts whose CURRENT target a messaging lane
+    now holds: any other refused receipt stays as it is, logged when it is touched."""
+    from gateway.session_route_recovery import _messaging_platform
+    from hermes_state_local import hand_off_conversations, moved_receipts
+    from hermes_state_runtime import _epoch
+
+    def write(conn):
+        _epoch(conn, epoch)
+        moved = {owner: (target, source) for owner, (target, source) in moved_receipts(conn).items()
+                 if _messaging_platform(source) is not None}
+        return hand_off_conversations(conn, moved)
+    for owner, (target, source) in db._execute_write(write).items():
+        logging.getLogger(__name__).info(
+            'Local session %s was handed off to %s (row %s); released its local receipt', owner, source, target)
+
+
 def local_receipt_ids(authority):
+    from gateway.session_viewer_close import CLOSE_PREFIX
+    start = len(POLICY_PREFIX) + 1
     with authority.db._read_ctx() as conn:
         return [row[0][len(POLICY_PREFIX):] for row in conn.execute(
-            'SELECT key FROM state_meta WHERE key LIKE ?', (POLICY_PREFIX + '%',))]
+            _BOOT_RECEIPTS_SQL, (POLICY_PREFIX + '%', start, CLOSE_PREFIX, start))]
 
 
 def recover_local_sessions(authority, *, schedule=False):
+    orphans = []
     for sid in local_receipt_ids(authority):
         try:
             ref = restore_local_session(authority, sid)
             pending = list_session_admissions(authority.db, session_id=sid)
-            if schedule and pending and not any(row['status'] == 'unknown' for row in pending):
+            if any(row['status'] == 'unknown' for row in pending):
+                continue  # the drain pauses on it until its user's Discard
+            if schedule and pending:
                 authority._schedule(ref)
+            orphans.append(sid)
         except (_ReceiptRefused, _CatchUpPending):
             continue  # logged: the check that refused it, or the catch-up handed to a worker
         except RuntimeStoreError as exc:
@@ -433,3 +503,5 @@ def recover_local_sessions(authority, *, schedule=False):
             if any(row['status'] == 'unknown' for row in list_session_admissions(authority.db, session_id=sid)):
                 # A hard-killed owner's turn: the drain pauses on it, so the close resolves it.
                 track_mutation(authority, settle_viewer_close(authority, sid))
+        from gateway.session_viewer_close import arm_startup_orphan_closes
+        arm_startup_orphan_closes(authority, orphans)

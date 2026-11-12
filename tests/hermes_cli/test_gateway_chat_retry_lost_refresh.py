@@ -32,7 +32,7 @@ async def test_retry_after_a_lost_refresh_replays_the_same_rewind(tmp_path, monk
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from hermes_cli.gateway_chat_commands import run_command

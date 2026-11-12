@@ -10,6 +10,7 @@ from dataclasses import replace
 from datetime import datetime
 import json
 import logging
+import os
 
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
@@ -93,15 +94,74 @@ def _native_metadata(event):
     return project(metadata)
 
 
+def _absorbed_synthetic(event):
+    """Project every absorbed capability; None retains an unknown legacy merge history."""
+    from gateway.session_synthetic import project_synthetic
+    trail = getattr(event, '_native_absorbed_synthetic', [])
+    if not isinstance(trail, list):
+        return None
+    trail = deepcopy(trail)
+    for candidate in getattr(event, '_hermes_absorbed_events', ()):
+        prior = getattr(candidate, '_native_absorbed_synthetic', [])
+        if not isinstance(prior, list):
+            return None
+        trail.extend([project_synthetic(candidate), *deepcopy(prior)])
+    return trail
+
+
 def _adapter_event(event, **changes):
     """An adapter's event at the envelope boundary: an absent media list (``None``) is no media.
     Any other non-list still reaches ``_validate_native`` and refuses."""
     changes.update({name: [] for name in _MEDIA_FIELDS if getattr(event, name) is None})
     projected = replace(event, **changes) if changes else event
+    # Each absorbed input owns its stamp task. Do not replace the head's live clock: a task
+    # already persisting that clock could then mark a newer, unpersisted receipt as complete.
+    # Only the durable projection represents the newest receipt still needing a retry.
+    # A marked human follower must survive too: a synthetic head has no receipt of its own.
+    # Otherwise retain the head's marked clock; each absorbed receipt already persisted itself.
+    stamped = [candidate for candidate in (event, *getattr(event, '_hermes_absorbed_events', ()))
+               if getattr(candidate, '_attended_activity_received_at', None) is not None]
+    unmarked = [candidate for candidate in stamped
+                if not getattr(candidate, '_attended_activity_marked', False)]
+    receipt = event
+    if unmarked:
+        receipt = max(unmarked, key=lambda candidate: candidate._attended_activity_received_at)
+    elif stamped and getattr(event, '_attended_activity_received_at', None) is None:
+        # Carry the marked clock for provenance only, never to refresh attended activity.
+        receipt = max(stamped, key=lambda candidate: candidate._attended_activity_received_at)
+    if receipt is not event and projected is event:
+        projected = copy(event)
+    for name in ('_attended_activity_received_at', '_attended_activity_marked', '_reply_latency_receipt_id'):
+        if hasattr(receipt, name):
+            setattr(projected, name, getattr(receipt, name))
+    if unmarked:
+        projected._attended_activity_marked = False
     from gateway.session_synthetic import is_synthetic, mark_synthetic
     if is_synthetic(event):
         mark_synthetic(projected)
-    return projected
+    if (is_synthetic(event) or getattr(event, '_hermes_absorbed_events', ())
+            or hasattr(event, '_native_absorbed_synthetic')):
+        if projected is event:
+            projected = copy(event)
+        projected._native_absorbed_synthetic = _absorbed_synthetic(event)
+    return _drop_remote_media(projected)
+
+
+def _drop_remote_media(event):
+    """An adapter that could not cache a download leaves its remote URL in ``media_urls`` (DingTalk
+    always does). Capture takes only local files, so that one entry refused the whole message, text
+    included: drop it and tell the agent instead. Malformed media lists still reach validation."""
+    urls, types = event.media_urls, event.media_types
+    if not isinstance(event.text, str) or _media_clause(event) is not None or all(map(os.path.isabs, urls)):
+        return event
+    kept = [index for index, url in enumerate(urls) if os.path.isabs(url)]
+    notes = [f"[The user sent an attachment ({types[index] if types else 'file'}) that could not be retrieved.]"
+             for index in range(len(urls)) if index not in kept]
+
+    def keep(values):
+        return [values[index] for index in kept] if values else values
+    return replace(event, text='\n'.join(filter(None, [event.text, *notes])), media_urls=keep(urls),
+                   media_types=keep(types), media_text_inlined=keep(event.media_text_inlined))
 
 
 def _refuse(event, reason, clause):
@@ -257,16 +317,23 @@ async def prepare_native(runner, event):
         except BaseException:
             await abandon_capture(scope)
             raise
-    return _snapshot_native(runner, frozen, provenance, fresh_roles, encoded_source, media)
+    return await _snapshot_native_async(runner, frozen, provenance, fresh_roles, encoded_source, media)
 
 
-def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
+def _native_payload(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
     if encoded_source is None:
         encoded_source = _validate_native(runner, event, provenance, fresh_roles)
     envelope = {'source': encoded_source,
                 'route': runner.session_store._generate_session_key(event.source),
                 'event': deepcopy({name: getattr(event, name) for name in _EVENT_FIELDS}),
                 'timestamp': event.timestamp.isoformat()}
+    if (received_at := getattr(event, '_attended_activity_received_at', None)) is not None:
+        # Arrival survives FIFO restoration, including a restart.
+        envelope['attended_activity'] = {
+            'received_at': received_at, 'marked': bool(getattr(event, '_attended_activity_marked', False)),
+        }
+    if event.message_id is None and (receipt_id := getattr(event, '_reply_latency_receipt_id', None)):
+        envelope['reply_receipt_id'] = receipt_id
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -290,6 +357,8 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
         envelope['synthetic'] = synthetic
     elif metadata := _native_metadata(event):
         envelope['event']['metadata'] = metadata
+    if hasattr(event, '_native_absorbed_synthetic'):
+        envelope['absorbed_synthetic'] = deepcopy(event._native_absorbed_synthetic)
     # COMMAND that passed admission is path text (``/Users/x is broken``): replay it as text.
     if event.message_type not in (MessageType.TEXT, MessageType.COMMAND):
         envelope['message_type'] = event.message_type.value
@@ -299,21 +368,49 @@ def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_sourc
                                  media_text_inlined=list(event.media_text_inlined))
     # Keep the private dispatch key so previously committed text-only rows recover
     # under the same authority; optional media/context fields extend that envelope.
-    payload = {'text': event.text, 'native_text_v1': envelope}
+    return {'text': event.text, 'native_text_v1': envelope}
+
+
+def _legacy_retry_payload(runner, event, payload, entry):
     # Only an exact persisted legacy retry retains its old fingerprint. New
     # ordinary admissions must bind homes too, including execution after restart.
-    if provenance is not None and not getattr(runner.config, 'multiplex_profiles', False):
-        from hermes_state_runtime import list_session_admissions
-        from gateway.session_authorities import active_authority
-        authority = active_authority(runner)
-        entry = runner.session_store.lookup_by_session_key(envelope['route'])
-        if entry is not None:
-            legacy = deepcopy(payload)
-            legacy['native_text_v1'].pop('provenance')
-            for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
-                if row['request_id'] == event.message_id and row['payload'] == legacy:
-                    return legacy
+    from hermes_state_runtime import list_session_admissions
+    from gateway.session_authorities import active_authority
+    if entry is None:
+        return payload
+    legacy = deepcopy(payload)
+    legacy['native_text_v1'].pop('provenance')
+    legacy['native_text_v1'].pop('attended_activity', None)
+    legacy['native_text_v1'].pop('absorbed_synthetic', None)
+    authority = active_authority(runner)
+    for row in list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False):
+        prior = deepcopy(row['payload'])
+        if isinstance(prior.get('native_text_v1'), dict):
+            prior['native_text_v1'].pop('attended_activity', None)
+            prior['native_text_v1'].pop('absorbed_synthetic', None)
+        if row['request_id'] == event.message_id and prior == legacy:
+            return row['payload']
     return payload
+
+
+def _snapshot_native(runner, event, provenance, fresh_roles=False, encoded_source=None, media=None):
+    """Build a sync snapshot; sync callers may acquire the SessionStore lock."""
+    payload = _native_payload(runner, event, provenance, fresh_roles, encoded_source, media)
+    if provenance is not None and not getattr(runner.config, 'multiplex_profiles', False):
+        entry = runner.session_store.lookup_by_session_key(payload['native_text_v1']['route'])
+        return _legacy_retry_payload(runner, event, payload, entry)
+    return payload
+
+
+async def _snapshot_native_async(runner, event, provenance, fresh_roles=False,
+                                 encoded_source=None, media=None):
+    """Build an ingress snapshot without acquiring SessionStore._lock on the loop."""
+    payload = _native_payload(runner, event, provenance, fresh_roles, encoded_source, media)
+    if provenance is None or getattr(runner.config, 'multiplex_profiles', False):
+        return payload
+    from gateway.session_store_async import run_store_call, run_store_lookup
+    entry = await run_store_lookup(runner.session_store, 'lookup_by_session_key', payload['native_text_v1']['route'])
+    return await run_store_call(_legacy_retry_payload, runner, event, payload, entry)
 
 
 def restore_native_source(payload, runner=None):
@@ -344,6 +441,10 @@ def restore_native(payload, runner=None):
                         message_type=MessageType(envelope.get('message_type', 'text')),
                         media_urls=restore_native_media(envelope.get('media', [])),
                         **deepcopy(envelope['event']))
+    if activity := envelope.get('attended_activity'):
+        event._attended_activity_received_at = activity['received_at']
+        event._attended_activity_marked = activity['marked']
+    event._reply_latency_receipt_id = envelope.get('reply_receipt_id')
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):
@@ -360,14 +461,17 @@ def restore_native(payload, runner=None):
     if 'synthetic' in envelope:
         from gateway.session_synthetic import restore_synthetic
         restore_synthetic(event, envelope['synthetic'])
+    if 'synthetic' in envelope or 'absorbed_synthetic' in envelope:
+        # Absence on a legacy synthetic row is unknown, not proof that no human merged.
+        event._native_absorbed_synthetic = deepcopy(envelope.get('absorbed_synthetic'))
     return event
 
 
 async def check_native_route(runner, payload, session_id, available_source, adapter):
     """Read-only preflight: route/auth rejection must never consume a queued row."""
     if 'automation' in payload['native_text_v1']:
-        from gateway.session_automation import check_automation_route
-        return check_automation_route(runner, payload, session_id, available_source, adapter)
+        from gateway.session_automation import check_automation_route_async
+        return await check_automation_route_async(runner, payload, session_id, available_source, adapter)
     event = restore_native(payload, runner)
     # Validate the stored sender without recapturing files or trusting the binding caller.
     from gateway.session_ingress_context import reauthorize_roles
@@ -379,7 +483,8 @@ async def check_native_route(runner, payload, session_id, available_source, adap
     if (store._generate_session_key(event.source) != route
             or store._generate_session_key(available_source) != route):
         raise RuntimeStoreError('admission_conflict')
-    entry = store.lookup_by_session_key(route)
+    from gateway.session_store_async import run_store_lookup
+    entry = await run_store_lookup(store, 'lookup_by_session_key', route)
     if entry is None or entry.session_id != session_id:
         raise RuntimeStoreError('admission_conflict')
     if adapter is None or runner._adapter_for_source(event.source) is not adapter:

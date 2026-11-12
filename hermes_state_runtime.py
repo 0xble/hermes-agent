@@ -115,9 +115,9 @@ def begin_runtime_epoch(db, *, instance_id: str, successor: bool = False) -> int
 
     Refused while another process holds that lock: the live owner's epoch fences all of its writes,
     so a foreign bump stales every settlement and admission it makes, and the recovery a begin
-    precedes would turn the owner's running turns ``unknown``. A store nobody owns stays open to an
-    offline caller, whose epoch the next owner's own begin supersedes. ``successor`` is the zero-cut
-    promotion's allowance to begin while its predecessor slot still holds its own lock.
+    precedes would turn the owner's running turns ``unknown``. Offline callers must hold the
+    current thread's exclusive-maintenance reservation; an unreserved store is not writable.
+    ``successor`` allows a reserved zero-cut promotion beside its predecessor, not an unowned begin.
     """
     _text(instance_id)
     from pathlib import Path
@@ -131,7 +131,9 @@ def begin_runtime_epoch(db, *, instance_id: str, successor: bool = False) -> int
         conn.execute('''INSERT INTO runtime_epoch(singleton,epoch,instance_id) VALUES(1,1,?)
             ON CONFLICT(singleton) DO UPDATE SET epoch=runtime_epoch.epoch+1, instance_id=excluded.instance_id''', (instance_id,))
         return conn.execute('SELECT epoch FROM runtime_epoch WHERE singleton=1').fetchone()[0]
-    return db._execute_write(write)
+    from gateway.runtime_ownership import assert_runtime_epoch_owner
+    with assert_runtime_epoch_owner(db.db_path):
+        return db._execute_write(write)
 
 
 # Main's busy-queue cap (GatewayRunner._BUSY_QUEUE_MAX_PENDING): queued inputs one session holds.
@@ -375,6 +377,48 @@ def revert_steer_input(db, *, epoch: int, admission_id: str, generation: int) ->
         _epoch(conn, epoch)
         return _requeue_transfer(conn, admission_id=admission_id, epoch=epoch, generation=generation)
     return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result=False)
+
+
+def requeue_unstarted_claim(db, *, epoch: int, admission_id: str, generation: int, transfers=(),
+                            transcript_mark: int | None = None) -> bool:
+    """A claim this owner's own shutdown interrupted before its first model call ran nothing, so it goes
+    back to its FIFO place (``seq``) for the next owner to run once, like an undelivered steer; the
+    steers handed to it go back to theirs. ``recover_session_inputs`` only fences ``started`` rows, so
+    the successor drains it as ordinary committed input. The turn's own transcript rows after
+    ``transcript_mark`` (its user row and the core closer's failed-turn boundary) are archived so the
+    replay writes the input once; any other row there leaves the transcript as it is. False when the
+    claim is no longer this owner's started generation (settled, fenced or discarded meanwhile)."""
+    def write(conn):
+        _epoch(conn, epoch)
+        row = _admission(conn, admission_id)
+        if row['status'] != 'started' or row['owner_epoch'] != epoch or row['generation'] != generation:
+            return False
+        conn.execute("UPDATE session_admissions SET status='queued',outcome=NULL,generation=NULL "
+                     "WHERE admission_id=?", (admission_id,))
+        for transfer in transfers or ():
+            _requeue_transfer(conn, admission_id=transfer, epoch=epoch, generation=generation)
+        if type(transcript_mark) is int:
+            _archive_unstarted_turn(db, conn, row['target_session_id'], transcript_mark)
+        conn.execute('UPDATE sessions SET runtime_revision=runtime_revision+1 WHERE id=?', (row['target_session_id'],))
+        return True
+    return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id),), skip_result=False)
+
+
+def _archive_unstarted_turn(db, conn, session_id: str, mark: int) -> None:
+    from agent.turn_failure_copy import FAILED_TURN_DISPLAY_KIND
+    from hermes_state_local_lineage import local_physical_target
+    from hermes_state_messages import _SET_COUNTERS_SQL
+    target = _canonical_chain(conn, local_physical_target(conn, session_id))[-1]
+    rows = conn.execute("SELECT id, role, display_kind, observed, _compressed_summary FROM messages "
+                        "WHERE session_id=? AND active=1 AND id>? ORDER BY id", (target, mark)).fetchall()
+    # Only the exact shape a turn leaves without a model call: its one input row, then at most the
+    # core closer's boundary. A compaction handoff, a steer or any other row means more happened.
+    if not rows or len(rows) > 2 or rows[0][1] != 'user' or rows[0][3] or rows[0][4] or (
+            len(rows) == 2 and (rows[1][1] != 'assistant' or rows[1][2] != FAILED_TURN_DISPLAY_KIND)):
+        return
+    ids = [r[0] for r in rows]
+    conn.execute(f"UPDATE messages SET active=0 WHERE id IN ({','.join('?' * len(ids))})", ids)
+    conn.execute(f"{_SET_COUNTERS_SQL} WHERE id = ?", (*db._active_transcript_counts(conn, target), target))
 
 
 REPLACEMENT_PREFIX = 'gateway.queued_replacement.v1.'
@@ -961,6 +1005,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
                                              worker_tail_role, worker_tool_names)
     from hermes_state_worker_compression import WORKER_COMPRESSION_HANDLERS
     from hermes_state_worker_lifecycle import WORKER_LIFECYCLE_HANDLERS
+    from hermes_state_worker_messages import worker_append_message
     handlers = {
         **WORKER_LIFECYCLE_HANDLERS,
         **WORKER_COMPRESSION_HANDLERS,
@@ -971,6 +1016,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
         'session.tail_role': worker_tail_role,
         'session.row_role': worker_row_role,
         'transcript.append': _worker_append,
+        'transcript.append_one': worker_append_message,
         'execution.finish': _worker_finish,
         'usage.main': _worker_usage,
         'usage.auxiliary': lambda db, conn, sid, p: _worker_usage(db, conn, sid, p, auxiliary=True),
@@ -1000,10 +1046,8 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
     digest = admission_fingerprint(canonical_target=session_id,
                                   payload={'operation': operation, 'payload': json.loads(encoded)})
     def write(conn):
-        _epoch(conn, epoch)
         row = worker_receipt_assignment(conn, execution_id, session_id, generation, sequence, digest)
-        if row['owner_epoch'] != epoch:
-            raise RuntimeStoreError('stale_epoch')
+        terminal = row['status'] == 'terminal'
         old = conn.execute('SELECT * FROM worker_receipts WHERE execution_id=? AND sequence=?',
                            (execution_id, sequence)).fetchone()
         if old is not None:
@@ -1012,7 +1056,19 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             from hermes_state_runtime_workers import retired_receipt
             if retired_receipt(old['result_json']):
                 raise RuntimeStoreError('stale_generation')  # a terminal execution's read copy
-            return json.loads(old['result_json'])
+        elif terminal:
+            # Retirement is final, not an invitation to reconnect to a new epoch.
+            raise RuntimeStoreError('stale_generation')
+        try:
+            _epoch(conn, epoch)
+        except RuntimeStoreError:
+            if terminal:
+                raise RuntimeStoreError('stale_generation') from None
+            raise
+        if row['owner_epoch'] != epoch:
+            raise RuntimeStoreError('stale_generation' if terminal else 'stale_epoch')
+        if old is not None:
+            return json.loads(old['result_json'])  # retain exact mutation acknowledgements
         if row['status'] not in ('registered', 'running'):
             raise RuntimeStoreError('stale_generation')
         if sequence != row['last_sequence'] + 1:
@@ -1034,4 +1090,5 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             from hermes_state_runtime_workers import compact_terminal_receipts
             compact_terminal_receipts(conn, execution_id)
         return result
+    setattr(write, "_state_operation", operation)
     return db._execute_write(write, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S, session_ids=(session_id, payload,), skip_result={})

@@ -247,10 +247,20 @@ def home(tmp_path: Path) -> Path:
 def _resume(home: Path, sid: str) -> tuple[subprocess.CompletedProcess, dict | None]:
     """Run ``hermes --tui --resume SID``; return the process result and what the TUI child received."""
     out = home.parent / f"handoff-{uuid.uuid4().hex}.json"
+    node = shutil.which("node")
+    assert node is not None, "the attachment probe requires the test runner's Node.js"
+    # Resolve in the runner's real environment: PATH may contain a version-manager
+    # shim that cannot select its runtime under the child's hermetic HOME.
+    node = subprocess.run(
+        [node, "-p", "process.execPath"], capture_output=True, text=True,
+        check=True, timeout=10).stdout.strip()
+    assert Path(node).is_absolute() and Path(node).is_file(), f"invalid Node.js executable: {node!r}"
     result = run_hermes(
         ["--tui", "--resume", sid], home, timeout=90,
-        extra_env={"HERMES_TUI_DIR": str(home.parent / "tui-probe"), "HERMES_SKIP_NODE_BOOTSTRAP": "1",
-                   "ATTACH_PROBE_OUT": str(out)})
+        # The probe tests attachment, not a fresh PM/Node installation. The launcher's
+        # supported runtime override keeps downloads outside the attachment deadline.
+        extra_env={"HERMES_TUI_DIR": str(home.parent / "tui-probe"), "HERMES_NODE": node,
+                   "HERMES_DISABLE_LAZY_INSTALLS": "1", "ATTACH_PROBE_OUT": str(out)})
     handoff = json.loads(out.read_text(encoding="utf-8")) if out.exists() else None
     return result, handoff
 
@@ -297,6 +307,7 @@ def test_genuine_owner_is_attached(home: Path) -> None:
         owner.stop()
 
     assert result.returncode == 0 and handoff is not None, f"resume did not reach the TUI\n{_describe(result)}"
+    assert not (home / ".hermes" / "tools").exists(), "attachment bootstrapped a managed runtime"
     expected = owner.info["origin"].replace("http:", "ws:") + f"/api/ws?token={token}"
     assert handoff["gateway_url"] == expected, f"TUI not attached to the owner: {handoff}"
     assert handoff["resume"] == sid, handoff

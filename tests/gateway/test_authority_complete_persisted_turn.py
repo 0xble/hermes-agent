@@ -14,7 +14,7 @@ import pytest
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_contract import Principal, SessionRef, Submission
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from run_agent import AIAgent
 
 ACTOR = Principal('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')

@@ -15,7 +15,8 @@ def test_invalid_options_are_reported_before_reading_profile(monkeypatch, capsys
     monkeypatch.setattr("hermes_cli.main._confirm_startup_expensive_model_override", lambda args: unexpected())
     from hermes_cli.gateway_client import GatewayClientError
 
-    def refused():
+    def refused(*, one_shot=False):
+        assert one_shot is True
         raise GatewayClientError("transport reached")
     monkeypatch.setattr("hermes_cli.gateway_chat.connect_gateway", refused)
     assert launch_gateway_chat(Namespace(safe_mode=True, model="explicit", provider="custom", query="x")) == 1

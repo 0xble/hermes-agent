@@ -95,7 +95,8 @@ async def test_upstream_authorized_a2a_input_admits_durally_with_provenance(
 ):
     """The live path: ``admit_native`` inside the adapter's ``native_callback`` context, i.e. the
     same provenance-bearing re-check the unified gateway runs for every A2A task (#139199)."""
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback, register_transport_home
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions
@@ -135,7 +136,8 @@ async def test_same_principal_without_adapter_declaration_is_refused_by_native_a
     """The A2A peer admitted above, through real native admission on an adapter that does not
     declare ``authorization_is_upstream``, is still refused. A declaration stamped on the event's
     source (``forge``) changes nothing: only the adapter object is read."""
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback, register_transport_home
     from hermes_constants import get_hermes_home
     from plugins.platforms.a2a.adapter import A2AAdapter

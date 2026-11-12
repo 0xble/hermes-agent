@@ -493,6 +493,7 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
         "pinned": bool(str(job.get("model") or "").strip()),
         "base_url": job.get("base_url"),
         "schedule": job.get("schedule_display") or "?",
+        "max_catch_up_lateness_seconds": job.get("max_catch_up_lateness_seconds"),
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
         "keep_pinned_lane": bool(job.get("keep_pinned_lane", False)),

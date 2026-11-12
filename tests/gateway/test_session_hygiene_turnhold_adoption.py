@@ -151,12 +151,31 @@ def _install_fakes(monkeypatch, gateway_run, tmp_path, agent_cls):
     )
 
 
+async def _drain_retained_tasks(runner, attribute, timeout):
+    tasks = []
+    try:
+        async with asyncio.timeout_at(asyncio.get_running_loop().time() + timeout):
+            while tasks := list(getattr(runner, attribute, None) or ()):
+                pending = [task for task in tasks if not task.done()]
+                if pending:
+                    await asyncio.gather(*pending, return_exceptions=True)
+                # gather(all-done) need not suspend. Let discard callbacks run,
+                # including callbacks retaining more writes, and keep the deadline live.
+                await asyncio.sleep(0)
+    except TimeoutError as exc:
+        raise TimeoutError(
+            f"{attribute} did not drain within {timeout}s: {tasks!r}"
+        ) from exc
+
+
 async def _drain_deferred(runner, timeout=10.0):
-    tasks = getattr(runner, "_deferred_agent_cleanup_tasks", None) or set()
-    if tasks:
-        await asyncio.wait_for(
-            asyncio.gather(*list(tasks), return_exceptions=True), timeout
-        )
+    await _drain_retained_tasks(runner, "_deferred_agent_cleanup_tasks", timeout)
+
+
+async def _drain_background(runner, timeout=10.0):
+    """Await the adoption callback's retained writes (streak reset, token count). They run in
+    worker threads after the agent's cleanup, so asserting on them earlier races the thread."""
+    await _drain_retained_tasks(runner, "_background_tasks", timeout)
 
 
 @pytest.mark.asyncio
@@ -272,6 +291,7 @@ async def test_turn_hold_keeps_admission_and_adopts_watermark_fenced_summary(
     await _drain_deferred(runner)
     await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait, 5), timeout=6)
     FencedStreamingAgent.last_instance.close.assert_called_once()
+    await _drain_background(runner)
 
     # Successful adoption resets the hygiene failure streak and still never
     # advances it (the deferral is not a failure).

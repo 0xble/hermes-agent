@@ -4,7 +4,6 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 import json
 from pathlib import Path
-import subprocess
 import sys
 import threading
 import uuid
@@ -99,6 +98,8 @@ def _raise_worker_error(error: dict):
 
 def _request(operation, arguments, *, callbacks=None, pause_event=None, project_root=None):
     from pm import receipt
+    from pm.client_process import WORKER_TIMEOUT, WorkerDeadline, worker_process
+    from pm.worker_budget import operation_budget
     from pm.registry import package_definitions
 
     request_id = uuid.uuid4().hex
@@ -111,6 +112,7 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
         "id": request_id, "operation": operation, "arguments": arguments,
         "update_id": update_id,
         "callbacks": list(callbacks),
+        "accepts": ["deadline"],
         "packages": package_definitions(names),
         "context": {"repo": str(Path(project_root).absolute() if project_root is not None else paths.repo_root()),
                     "lockfile": str(paths.lockfile_path())},
@@ -122,8 +124,11 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
     stopped = threading.Event()
     write_lock = threading.Lock()
     monitor = None
-    with subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                          text=True, encoding="utf-8", env=environment) as process:
+    result_received = threading.Event()
+    timeout = max(WORKER_TIMEOUT, operation_budget(operation, arguments))
+    deadline = WorkerDeadline(timeout, result_received)
+    with worker_process(command, env=environment, operation=operation, timeout=timeout,
+                        result_received=result_received, deadline=deadline) as process:
         assert process.stdin is not None and process.stdout is not None
         writer = process.stdin
 
@@ -155,7 +160,16 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
                 response = json.loads(line)
                 if response["id"] != request_id:
                     raise InstallError("pm", "worker returned a different request id")
+                if response["type"] == "deadline":
+                    if "additional" in response:
+                        deadline.extend(response["additional"])
+                    elif response["suspended"]:
+                        deadline.suspend()
+                    else:
+                        deadline.resume()
+                    continue
                 if response["type"] == "result":
+                    result_received.set()
                     break
                 name = response["callback"]
                 try:
@@ -170,8 +184,9 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
             if monitor is not None:
                 monitor.join()
             writer.close()
-            if process.wait(timeout=5):
-                raise InstallError("pm", "worker exited unsuccessfully")
+            # The complete result is authoritative, including when the deadline
+            # killed the worker between its flush and our observation of it.
+            process.wait(timeout=5)
             receipt.accept_worker_receipt(response.get("receipt"), update_id)
             if callback_error is not None:
                 raise callback_error
@@ -182,9 +197,6 @@ def _request(operation, arguments, *, callbacks=None, pause_event=None, project_
             stopped.set()
             if monitor is not None:
                 monitor.join()
-            if process.poll() is None:
-                process.terminate()
-                process.wait(timeout=5)
 
 
 def ensure(name, *, base_env=None, explicit=False, verify=True, progress=None, pause_event=None,
@@ -233,7 +245,7 @@ def sync_venv(extras=None, *, explicit=False, plugins: PluginInput | None = None
     if isinstance(plugins, Selection) and "expected_config" not in plugins.data:
         from pm.filesystem import file_digest
         plugins = Selection({**plugins.data,
-                             "expected_config": file_digest(Path(plugins.data["home"]) / "config.yaml") or "missing"})
+                             "expected_config": file_digest(Path(plugins.data["home"]) / "config.yaml") or "missing"})  # config-reader: ok — pm publication: byte-level compare-and-swap rewrite of the local file
     foreign = project_root is not None and Path(project_root).resolve() != paths.repo_root().resolve()
     if is_runtime() and not foreign:
         from pm.install import sync_venv as direct

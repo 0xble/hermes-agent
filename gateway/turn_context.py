@@ -34,15 +34,8 @@ def silence_retry_prompt(agent: Any, ctx: "TurnContext"):
     wire_attr = "_gateway_silence_retry_wire_message"
     had_wire_attr = hasattr(agent, wire_attr)
     previous_wire_message = getattr(agent, wire_attr, None)
-    supervisor = ctx.persist_user_display_kind == "supervisor_checkin"
-    note = ("[System note: the previous execution did not write the required supervisor status. "
-            "This is still a generated check-in, not a new human message. Inspect the outstanding work "
-            "and write a visible 1–2 line status with the next check time, or deliver the final result. "
-            "NO_REPLY, [SILENT] and a reaction alone cannot satisfy this turn.]"
-            if supervisor else _GATEWAY_SILENCE_RETRY_NOTE)
-    agent.ephemeral_system_prompt = ((stable or "") + "\n\n" + note).strip()
-    setattr(agent, wire_attr, "Write the required supervisor status." if supervisor
-            else "Continue with the latest genuine user request.")
+    agent.ephemeral_system_prompt = ((stable or "") + "\n\n" + _GATEWAY_SILENCE_RETRY_NOTE).strip()
+    setattr(agent, wire_attr, "Continue with the latest genuine user request.")
     try:
         yield
     finally:
@@ -78,6 +71,9 @@ class TurnContext:
     # read-only turn identity / wiring
     source: Any = None
     reply_expected: Optional[bool] = None
+    # Folded human input owns final delivery without changing the persisted opener's provenance.
+    # Uses the same terminal contract keys as queued successors and silence continuations.
+    terminal_reply_metadata: dict = field(default_factory=dict)
     # Scheduled heartbeats are proactive work, not replies to the source message that
     # registered the watch.  Their routine delivery surfaces stay quiet.
     scheduled_heartbeat: bool = False

@@ -33,7 +33,7 @@ async def test_discard_after_resume_into_a_cold_conversation_resolves_its_lost_t
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
     from gateway.run_runtime import recover_profile_native_sessions
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback, register_transport_home
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import claim_session_input, get_session_admission

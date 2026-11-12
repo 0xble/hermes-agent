@@ -3,6 +3,7 @@
 A queued follower is what /reset and compression exist to serve: it waits on the logical
 owner and runs against whatever physical target the mutation publishes.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from contextlib import closing
 from dataclasses import asdict
 
@@ -43,7 +44,7 @@ def _mutate(db, epoch, sid, operation, **extra):
 def test_target_advance_allows_queued_follower_and_refuses_started_head(tmp_path, operation):
     prepare = {'_prepare_only': True} if operation == 'compress' else {}
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         sid = _local_session(db, epoch, tmp_path)
         rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id=sid,
                                request_id='head', payload={'text': 'head'})

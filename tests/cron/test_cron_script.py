@@ -539,6 +539,86 @@ class TestBuildJobPromptWithScript:
         assert "Simple job." in prompt
 
 
+@pytest.mark.parametrize("log_store", ["writable", "unwritable", "no-job", "invalid-job"])
+def test_large_script_error_is_bounded_and_full_redacted_output_is_recoverable(
+    cron_env, monkeypatch, log_store
+):
+    """Build logs must not flood prompts, even when the diagnostic store is unavailable."""
+    from agent.redact import redact_sensitive_text
+    from cron.scheduler import _build_job_prompt
+
+    # Assert the owner-only policy itself, as tests/cron/test_file_permissions.py does: containerized
+    # CI runners otherwise take the shared policy's container branch, which deliberately skips chmod.
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    for name in ("HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_HOME_MODE", "HERMES_UID", "HERMES_GID"):
+        monkeypatch.delenv(name, raising=False)
+
+    secret = "sk-" + "synthetic" * 6
+    stderr = "BUILD START " + secret + "\n" + "compiling unit\n" * 70000 + "BUILD FAILED"
+    stdout = "OUT START\n" + "build progress\n" * 20000 + secret + "\nOUT END"
+    script = cron_env / "scripts" / "build.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.stderr.write({stderr!r})\n"
+        f"sys.stdout.write({stdout!r})\n"
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
+    if log_store == "unwritable":
+        def refuse_write(*args, **kwargs):
+            raise OSError("store unavailable")
+        monkeypatch.setattr("utils.atomic_write_text", refuse_write)
+    job_id = {"no-job": "", "invalid-job": "../escape"}.get(log_store, "build-check")
+    prompt = _build_job_prompt({"id": job_id, "prompt": "Report status.", "script": str(script)})
+
+    assert "## Script Error" in prompt
+    assert "Script exited with code 3" in prompt
+    assert "Report status." in prompt
+    assert len(prompt) < 12000
+    assert secret not in prompt
+    redacted = [(name, redact_sensitive_text(text)) for name, text in (
+        ("stderr", stderr), ("stdout", stdout)
+    )]
+    for name, text in redacted:
+        omitted = len(text) - 4000
+        assert f"{name}:\n{text[:1000]}\n[... {omitted} characters omitted ...]\n{text[-3000:]}" in prompt
+    log = cron_env / "cron" / "output" / "build-check" / "script-error.log"
+    if log_store == "writable":
+        full = "\n".join(["Script exited with code 3"] + [f"{name}:\n{text}" for name, text in redacted])
+        assert f"Full output ({len(full)} characters): {log}" in prompt
+        assert log.read_text(encoding="utf-8") == full + "\n"
+        assert secret not in log.read_text(encoding="utf-8")
+        if os.name == "posix":
+            assert log.stat().st_mode & 0o777 == 0o600
+            assert log.parent.stat().st_mode & 0o777 == 0o700
+        assert not list(log.parent.glob("*.md")), "diagnostics are not cron run outputs"
+        # A later failure replaces the single log instead of accumulating build logs.
+        log.write_text("old failure", encoding="utf-8")
+        _build_job_prompt({"id": job_id, "prompt": "Report status.", "script": str(script)})
+        assert log.read_text(encoding="utf-8") == full + "\n"
+    else:
+        assert "Full output (" in prompt and "was not saved." in prompt
+        assert not log.exists()
+
+
+@pytest.mark.parametrize("exit_code,size", [(0, 50000), (2, 10), (2, 4000)])
+def test_script_output_without_truncation_is_unchanged(cron_env, exit_code, size):
+    from cron.scheduler_script import _run_job_script
+
+    script = cron_env / "scripts" / "output.py"
+    script.write_text(
+        f"import sys\nprint('x' * {size})\nprint('bad input', file=sys.stderr)\nsys.exit({exit_code})\n",
+        encoding="utf-8",
+    )
+    success, output = _run_job_script(str(script), cron_job_id="unchanged")
+    expected = "x" * size
+    if exit_code:
+        expected = f"Script exited with code {exit_code}\nstderr:\nbad input\nstdout:\n{expected}"
+    assert (success, output) == (exit_code == 0, expected)
+    assert not (cron_env / "cron" / "output" / "unchanged").exists()
+
+
 class TestCronjobToolScript:
     """Test the cronjob tool's script parameter."""
 

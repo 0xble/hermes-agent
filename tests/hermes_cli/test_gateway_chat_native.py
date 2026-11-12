@@ -104,6 +104,10 @@ finally:
                                   env={**env, "PYTHONPATH": str(gateway_root)},
                                   stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT)
         try:
+            # Keep the private server alive between chat sessions so new-session cannot
+            # connect to a server still shutting down after the last kill-session.
+            result = tmux("-f", os.devnull, "start-server", ";", "set-option", "-s", "exit-empty", "off")
+            assert result.returncode == 0, result.stderr
             deadline = time.monotonic() + 40
             descriptor = {}
             while daemon.poll() is None and time.monotonic() < deadline:
@@ -125,6 +129,9 @@ finally:
                 tmux("send-keys", "-t", "chat", "Enter")
 
             launch("--cli", "chat")
+            # Keep this test's server through empty-session gaps between client launches.
+            kept = tmux("set-option", "-s", "exit-empty", "off")
+            assert kept.returncode == 0, kept.stderr
             first = until("Welcome to Hermes Agent")
             until("❯ ")  # the banner prints before the prompt accepts input
             type_line("WS_SHARED")

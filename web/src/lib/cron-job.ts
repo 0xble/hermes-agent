@@ -162,11 +162,13 @@ export function cronNextRunOverdueMs(
   job: Pick<CronJob, "next_run_at" | "enabled" | "state">,
   nowMs: number = Date.now(),
 ): number | null {
-  if (job.enabled === false || job.state === "paused" || job.state === "completed") return null;
+  const held = job.state === "missed";
+  if (!held && (job.enabled === false || job.state === "paused" || job.state === "completed")) return null;
   const at = Date.parse(asString(job.next_run_at));
   if (Number.isNaN(at)) return null;
   const overdue = nowMs - at;
-  return overdue > CRON_NEXT_RUN_OVERDUE_GRACE_MS ? overdue : null;
+  // A known miss needs owner action even disabled and inside the doctor's ticker grace.
+  return overdue > (held ? 0 : CRON_NEXT_RUN_OVERDUE_GRACE_MS) ? overdue : null;
 }
 
 /** Mirrors hermes_cli/cron.py `STALE_AFTER`: ~3 missed ticker iterations (60s) plus slack. */
@@ -184,7 +186,7 @@ export function cronSchedulerStaleAgeS(
   for (const job of jobs) {
     const age = job.scheduler_heartbeat_age_s;
     if (typeof age !== "number" || age <= CRON_SCHEDULER_STALE_S) continue;
-    if (job.enabled === false || job.state === "paused" || job.state === "completed") continue;
+    if (job.enabled === false || ["paused", "completed", "missed"].includes(job.state ?? "")) continue;
     if (stale === null || age > stale) stale = age;
   }
   return stale;

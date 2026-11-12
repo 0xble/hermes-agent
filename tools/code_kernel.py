@@ -1076,6 +1076,8 @@ def _run_cell(kernel: SessionKernel, key: tuple, code: str, *, task_id: str, chi
             kernel.tool_call_counter[0] = 0
             kernel.cell_log_start = len(kernel.tool_call_log)
             kernel.raw.drain(), kernel.stderr.drain()  # raw output leaked between cells belongs to no cell
+            from tools.code_execution_rpc import cell_deadline
+            authority.ctx.run(cell_deadline.set, time.monotonic() + timeout if timeout else None)
             kernel.cell_authority = authority
             _log_kernel_lifecycle(kernel, "cell_start", task_id=task_id, caller=kernel.current_caller, reason="execute")
             started = True

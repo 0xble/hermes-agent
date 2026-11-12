@@ -24,7 +24,6 @@ from tools.registry import _MAX_TOOL_ERROR_CHARS as _TOOL_ERROR_MAX_LEN
 from toolsets import resolve_toolset, validate_toolset
 from tools.arg_coercion import coerce_tool_args
 from tools.todo_tool import TODO_LEGACY_ALIASES, TODO_SCHEMA
-from utils import file_signature
 
 logger = logging.getLogger(__name__)
 
@@ -182,8 +181,6 @@ _LEGACY_TOOLSET_MAP = {
     "vision_tools": ["vision_analyze"],
     "image_tools": ["image_generate"],
     "skills_tools": ["skills_list", "skill_view", "skill_manage"],
-    "browser_tools": ["browser_navigate", "browser_snapshot", "browser_click", "browser_type", "browser_scroll",
-                      "browser_back", "browser_press", "browser_get_images", "browser_vision", "browser_console"],
     "cronjob_tools": ["cronjob_manage"],
     "file_tools": ["read_file", "write_file", "patch", "search_files"],
     "tts_tools": ["text_to_speech"],
@@ -269,8 +266,8 @@ def _tool_defs_cache_key(
         return None
     try:
         from hermes_cli.config import get_config_path
-        cfg_stat = get_config_path().stat()
-        cfg_fp = file_signature(cfg_stat)
+        from hermes_cli.config_backend import config_version
+        cfg_fp = config_version(get_config_path())
     except (FileNotFoundError, OSError, ImportError):
         cfg_fp = None
     return (
@@ -391,7 +388,14 @@ def _rewrite_browser_exec(td: dict[str, Any], available: set) -> Optional[dict[s
     """browser_exec runs arbitrary host Python: a session without the terminal surface
     must not regain host execution via the browser toolset. Session-level gate rather
     than a check_fn because check_fns are TTL-cached process-wide across sessions."""
-    return td if "terminal" in available else None
+    if "terminal" not in available:
+        return None
+    from tools.vision_tools import _should_use_native_vision_fast_path
+    if "vision_analyze" in available and not _should_use_native_vision_fast_path(allow_network=False):
+        fn = td["function"]
+        return _fn_def({**fn, "description": fn.get("description", "")
+                        + " For images, pass its capture_screenshot() path to vision_analyze."})
+    return td
 
 
 def _rewrite_delegate_task(td: dict[str, Any], available: set) -> Optional[dict[str, Any]]:
@@ -439,9 +443,21 @@ def _rewrite_browser_vault(td: dict[str, Any], available: set) -> Optional[dict[
 
 _VAULT_NO_PASSWORD_NOTE = (
     " Vault: on a login, checkout or 2FA form, call browser_vault through tool_call (action=list first). "
-    "Do not type a password, card number, CVC or code copied from the page or supplied in chat. "
-    "A password or one-time code fetched from an authorized source for this service (1Password, email, or SMS) "
-    "may be typed into the matching field with this tool and must not be repeated. Card numbers and CVCs remain vault-only."
+    "Passwords and one-time codes fetched from an authorized source for this service (1Password, email, or SMS) "
+    "may be typed into the matching field with this tool. Prefer browser_vault fill first. Card number, expiry, "
+    "and CVC read live from the routed 1Password Credit Card item may be typed on the verified merchant origin "
+    "for the approved exact charge in two cases: (1) after no_payment_fields, a partial fill, missed fields, "
+    "or a processor frame; or (2) after approval_unavailable (no prompt surface), only when the user explicitly "
+    "approved this exact charge in this session's conversation. "
+    "Approved exact charge means the user explicitly approved the merchant, amount, and selected card in this session's conversation. "
+    "Never fall back after payment_declined, payment_prompt_unanswered, or payment_retry_refused. "
+    "Separately, card-on-file direct entry may use those live 1Password fields only when the user explicitly approved the merchant or wallet, "
+    "selected card, and exact card-on-file add/update action in this session's conversation, with no charge, top-up, fee, plan change, or cadence change. "
+    "Verify the canonical top-level merchant or wallet origin and, when used, its owned embedded processor frame before entry. "
+    "Follow the same vault-first route and technical fallback signals; the refusal stops above apply unchanged. "
+    "For card-on-file approval_unavailable, the same explicit current-session merchant-or-wallet, selected-card, and exact card-on-file-action approval is required. "
+    "No standing, default, or fallback-card authorization is implied. Card-on-file is not a $0 charge. "
+    "Values from the page or chat are not authorized sources. Never repeat a secret in replies, files, commits, or shell arguments."
 )
 
 
@@ -969,7 +985,7 @@ def handle_function_call(
 ) -> str:
     """Route a tool call through hooks/middleware to the registry; returns a JSON string.
 
-    task_id isolates terminal/browser sessions; user_task feeds browser_snapshot.
+    task_id isolates terminal/browser sessions; user_task is forwarded to every handler as a kwarg.
     enabled_tools picks execute_code's sandbox tools (default: the process-global
     ``_last_resolved_tool_names``). skip_pre_tool_call_hook: caller already fired
     it (single-fire contract). enabled/disabled_toolsets scope the Tool Search

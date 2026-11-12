@@ -23,6 +23,7 @@ from hermes_cli.auth_constants import (
     _decode_jwt_claims, AUTH_LOCK_TIMEOUT_SECONDS, AuthError,
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL,
     codex_oauth_user_agent, CODEX_RATE_LIMITED_CODE, DEFAULT_CODEX_BASE_URL, _codex_err, httpx)
+from hermes_cli.version_info import hermes_user_agent
 from utils import env_float, normalize_proxy_env_vars
 
 if TYPE_CHECKING:  # annotation-only; the runtime import would be a cycle
@@ -489,7 +490,7 @@ def refresh_codex_oauth_pure(
                          "codex_auth_missing_refresh_token", relogin=True)
     with _codex_http_client(
         timeout=httpx.Timeout(max(5.0, float(timeout_seconds))),
-        headers={"Accept": "application/json", "User-Agent": codex_oauth_user_agent()}) as client:
+        headers={"Accept": "application/json", "User-Agent": hermes_user_agent()}) as client:
         response = client.post(
             CODEX_OAUTH_TOKEN_URL, headers={"Content-Type": "application/x-www-form-urlencoded"},
             data={

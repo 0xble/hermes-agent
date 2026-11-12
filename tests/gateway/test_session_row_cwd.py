@@ -20,7 +20,7 @@ def _authority_fixture(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_row_cwd_is_recorded_apart_from_the_execution_cwd(tmp_path, monkeypatch):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from gateway.session_policy import restore_policy

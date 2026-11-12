@@ -21,7 +21,7 @@ from gateway.run_runtime import claim_gateway_runtime, initialize_gateway_runtim
 from gateway.runtime_ownership import process_ownership
 from gateway.session_authority import UNCLAIMED_EPOCH
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.fixture

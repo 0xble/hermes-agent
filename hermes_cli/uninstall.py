@@ -300,6 +300,7 @@ def _remove_systemd_gateway() -> bool:
 # gateway after the code tree is gone (#62209).
 _LAUNCHD_GATEWAY_PLIST_PATTERNS = (
     "ai.hermes.gateway*.plist",
+    "ai.hermes.login-bootstrap*.plist",
     "io.nousresearch.hermes-agent.gateway*.plist",
 )
 
@@ -315,7 +316,8 @@ def _launchd_gateway_plists() -> list[Path]:
 def _remove_launchd_gateway() -> bool:
     """macOS: boot out and uninstall every gateway LaunchAgent plist.
 
-    Sweeps BOTH label patterns (see ``_LAUNCHD_GATEWAY_PLIST_PATTERNS``):
+    Sweeps every label pattern (see ``_LAUNCHD_GATEWAY_PLIST_PATTERNS``),
+    including the login bootstrap kept outside the gateway fleet namespace:
     uninstalling only the current label's plist left older-label agents
     registered, and launchd kept respawning the gateway after removal.
     ``bootout`` (both Aqua and per-user domains, whichever holds the job) plus
@@ -616,7 +618,7 @@ def _uninstall_profile(profile) -> None:
     log_info(f"Uninstalling profile '{name}'...")
 
     # 1. Gateway service, via `python -m hermes_cli.main` (the `hermes` wrapper may be half-gone).
-    hermes_invocation = [sys.executable, "-m", "hermes_cli.main", "--profile", name]
+    hermes_invocation = [sys.executable, "-P", "-m", "hermes_cli.main", "--profile", name]
     for subcmd in ("stop", "uninstall"):
         try:
             subprocess.run(

@@ -133,7 +133,7 @@ async def test_resume_hands_a_worker_the_definition_of_every_server_it_names(tmp
 async def test_reload_never_changes_a_running_or_queued_turns_servers(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import SessionRef, Submission
     from gateway.session_policy import policy_for_source
     import hermes_state_runtime as rt
@@ -217,7 +217,7 @@ async def test_a_rotated_mcp_secret_commits_a_generation_with_the_new_value(tmp_
     """An edit that only rotates a server's ``env`` token leaves the redacted config as it was. The refresh
     compares the private values' fingerprints too: ``reload.mcp`` and a resume (also after an owner restart)
     commit it, and the next turn's worker gets the new token, which never reaches state.db."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_state_local import local_receipt
     home = _home(monkeypatch)
     (home / 'config.yaml').write_text(ADDED)
@@ -395,7 +395,7 @@ async def test_a_pick_whose_only_server_is_gone_selects_no_server_not_every_enab
 async def test_a_removed_pick_keeps_later_refreshes_following_config_after_a_restart(tmp_path, monkeypatch):
     """A server config removed stays known as one of the pick's servers: after an owner restart, disabling
     another picked server still reaches the chat (the removed name no longer fails the pick's validation)."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_policy import policy_for_source
     from tests.gateway.test_session_resume_config_refresh import _runner
     both = CONFIG.replace('{old: {command: old-mcp}}', '{old: {command: old-mcp}, keep: {command: keep-mcp}}')

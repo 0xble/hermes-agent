@@ -1,4 +1,4 @@
-"""Short-interval admission beside the unchanged FIFO general executor."""
+"""Isolated script and protected-interval lanes beside the FIFO general executor."""
 
 import concurrent.futures
 import logging
@@ -11,12 +11,71 @@ from hermes_constants import hermes_home_key
 
 logger = logging.getLogger("cron.scheduler")
 _reserved_pools: dict[str, concurrent.futures.ThreadPoolExecutor] = {}
+_lane_pools: dict[str, dict[str, concurrent.futures.ThreadPoolExecutor]] = {
+    "reserved": _reserved_pools, "script": {}, "person-send": {},
+}
 _reserved_claims: dict[str, tuple[str, object]] = {}
 _loaded_protected: dict[str, tuple[str, ...]] = {}
 _lock = threading.Lock()
 _wake = threading.Event()
 _tick_scans = threading.local()
 _SLOT_WAKE_CHECK_SECONDS = 0.25
+
+
+class AgentAdmissionRequired(Exception):
+    """The persisted fire requires agent capacity, not the script-only lane."""
+
+    lane = "general"
+
+
+class ScriptAdmissionRequired(AgentAdmissionRequired):
+    """A queued person-send no longer qualifies for its dedicated lane."""
+
+    lane = "script"
+
+
+PERSON_SEND_MARKER = b"# hermes: person-send"
+_SHEBANG_LINE_LIMIT = 256
+
+
+def is_person_send(job: dict) -> bool:
+    """Author opt-in for frozen one-shot sends, never a name/path heuristic.
+
+    This scheduling declaration is not authorization or a sandbox. Existing
+    script timeout, lifecycle guard and provider-side send checks still apply.
+    The marker is line 1, or line 2 when line 1 is a `#!` shebang. Read at most two
+    bounded lines inside this profile's validated scripts root.
+    """
+    schedule = job.get("schedule")
+    if (not job.get("no_agent") or job.get("deliver") != "local"
+            or not isinstance(schedule, dict) or schedule.get("kind") != "once"):
+        return False
+    from pathlib import Path
+    from cron import scheduler
+    from cron.lifecycle_guard import _on_cloud_path
+
+    try:
+        root = (scheduler._get_hermes_home() / "scripts").resolve()
+        raw = Path(job.get("script") or "").expanduser()
+        path = (raw if raw.is_absolute() else root / raw).resolve()
+        if not path.is_relative_to(root) or _on_cloud_path(path) or not path.is_file():
+            return False
+        with path.open("rb") as script:
+            first = script.readline(_SHEBANG_LINE_LIMIT)
+            if first.rstrip(b"\r\n") == PERSON_SEND_MARKER:
+                return True
+            # A complete shebang line may precede the marker; nothing else may.
+            if not (first.startswith(b"#!") and first.endswith(b"\n")):
+                return False
+            return script.readline(len(PERSON_SEND_MARKER) + 2).rstrip(b"\r\n") == PERSON_SEND_MARKER
+    except (OSError, ValueError, TypeError, RuntimeError):
+        return False
+
+
+def script_pool(home, lane="script"):
+    """Share the existing profile-owned auxiliary-pool lifecycle for script classes."""
+    with _lock:
+        return _get_lane_pool(hermes_home_key(home), lane)
 
 
 def reserved_job_id(jobs: list[dict], home) -> str | None:
@@ -37,12 +96,13 @@ def reserved_job_id(jobs: list[dict], home) -> str | None:
             if len(loaded) > 1:
                 logger.error(
                     "Cron has %d protected interval jobs but only 1 reserved worker; "
-                    "%s use the general pool best-effort (FIFO)", len(loaded), ", ".join(loaded[1:]))
+                    "%s use the general pool best-effort (FIFO), or the script lane for no_agent jobs",
+                    len(loaded), ", ".join(loaded[1:]))
     return eligible[0] if eligible else None
 
 
 def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
-    """Preserve general FIFO while sending only the selected protected job to its reserve."""
+    """Keep agent FIFO bounded without putting script-only fires behind agent waiters."""
     from cron import jobs, scheduler
 
     home = scheduler._get_hermes_home()
@@ -66,10 +126,27 @@ def submit_due_jobs(due_jobs: list[dict], pool, process_job) -> list:
     for job in due_jobs:
         if job["id"] == reserved_id:
             continue
-        future = scheduler._submit_with_guard(job, pool, process_job)
+        # Only no_agent guarantees no model work. Monitor/pre-run scripts may wake an agent.
+        if job.get("no_agent"):
+            lane = "person-send" if is_person_send(job) else "script"
+            future = scheduler._submit_with_guard(
+                job, script_pool(home, lane), process_job, dispatch_lane=lane)
+        else:
+            future = scheduler._submit_with_guard(job, pool, process_job)
         if future is not None:
             futures.append(future)
     return futures
+
+
+def _get_lane_pool(key: str, lane: str) -> concurrent.futures.ThreadPoolExecutor:
+    """Called under _lock. Each workload lane is serial and belongs to one profile."""
+    pools = _lane_pools[lane]
+    pool = pools.get(key)
+    if pool is None:
+        pool = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=f"cron-{lane}")
+        pools[key] = pool
+    return pool
 
 
 def submit_reserved(job: dict, process_job):
@@ -82,10 +159,7 @@ def submit_reserved(job: dict, process_job):
     with _lock:
         if key in _reserved_claims:
             return None
-        pool = _reserved_pools.get(key)
-        if pool is None:
-            pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="cron-reserved")
-            _reserved_pools[key] = pool
+        pool = _get_lane_pool(key, "reserved")
         _reserved_claims[key] = (job["id"], token)
     try:
         future = scheduler._submit_with_guard(
@@ -119,16 +193,17 @@ def worker_released(inflight_key: tuple, owner, *, wake: bool = True) -> None:
 def discard_reserved_pools(home_keys) -> None:
     for key in home_keys:
         with _lock:
-            pool = _reserved_pools.pop(key, None)
+            pools = [lane.pop(key) for lane in _lane_pools.values() if key in lane]
             _loaded_protected.pop(key, None)
-        if pool is not None:
+        for pool in pools:
             pool.shutdown(wait=False, cancel_futures=False)
 
 
 def shutdown_reserved_pools() -> None:
-    for pool in list(_reserved_pools.values()):
-        pool.shutdown(wait=True, cancel_futures=False)
-    _reserved_pools.clear()
+    for lane in _lane_pools.values():
+        for pool in list(lane.values()):
+            pool.shutdown(wait=True, cancel_futures=False)
+        lane.clear()
 
 
 def note_due_scan(started_at: datetime) -> None:

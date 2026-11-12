@@ -9,7 +9,8 @@ async def test_native_fifo_identity_is_stable_across_compression(tmp_path, monke
     from gateway.config import GatewayConfig, Platform, PlatformConfig
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority, SessionAuthority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import native_callback
     from hermes_constants import get_hermes_home
     from hermes_state_runtime import list_session_admissions

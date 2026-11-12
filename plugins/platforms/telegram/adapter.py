@@ -27,6 +27,7 @@ logger = logging.getLogger(__name__)
 
 _POLLING_GENERATION_CONTEXT: ContextVar[Optional[int]] = ContextVar("telegram_polling_generation", default=None)
 
+from agent.attachment_context import format_document_content
 from agent.deadline import run_bounded_async
 from agent.ssl_verify import platform_ssl_context
 from gateway.outbox import durable_control, durable_egress
@@ -36,8 +37,11 @@ from plugins.platforms.telegram.private_ingress import (
 )
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
+from plugins.platforms.telegram.thread_fallback import record_root_fallback, reports_thread_fallback
 from plugins.platforms.telegram.telegram_reconnect import TelegramReconnectMixin
-from plugins.platforms.telegram.daily_quota import DailyQuota, quota_from_platform_extra, send_outbound_class
+from plugins.platforms.telegram.progress import TelegramProgressMixin
+from plugins.platforms.telegram.telegram_media_download import fetch_telegram_file as _fetch_telegram_file
+from plugins.platforms.telegram.daily_quota import TelegramDailyQuotaMixin, send_outbound_class
 from plugins.platforms.telegram.session_control_cards import session_control_outcome
 from plugins.platforms.telegram.chat_budget import (
     EDIT_FLOOR_SECS, KIND_TYPING, ChatBudgetRateLimiter, ChatOutboundBudget, bind_trigger, call_counter,
@@ -215,6 +219,7 @@ from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, 
 from plugins.platforms.telegram.telegram_network import (
     SEED_FALLBACK_IPS, TelegramFallbackTransport, discover_fallback_ips, parse_fallback_ip_env, tcp_keepalive_socket_options)
 from plugins.platforms.telegram.telegram_topic_routing import TelegramTopicRoutingMixin
+from plugins.platforms.telegram.topic_creation import TopicCreationFailure
 from utils import env_float, env_int, is_truthy_value
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -459,19 +464,6 @@ _MDV2_ESCAPE_RE = re.compile(r'([_*\[\]()~`>#\+\-=|{}.!\\])')
 # pass shares its boundaries with the inline pass so code inside a block is never rewritten.
 _MULTI_TICK_CODE_SPAN_RE = re.compile(r'(?<![`\\])(?P<ticks>`{2,})(?!`)(?P<body>[^\n]+?)(?<!`)(?P=ticks)(?!`)')
 _MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^[ \t]*```)[ \t]*\r?$')
-_BACKTICK_RUN_RE = re.compile(r'`+')
-
-
-def _progress_code_span(text: str) -> str:
-    """``text`` as one CommonMark inline code span: a backtick run longer than any inside it, padded
-    with a space when it starts or ends with a backtick (or with a space on both sides, which
-    CommonMark would otherwise strip). Newlines fold to spaces, as a code span renders them anyway."""
-    text = " ".join(str(text).split("\n"))
-    if not text.strip():
-        return text
-    fence = "`" * (max((len(run) for run in _BACKTICK_RUN_RE.findall(text)), default=0) + 1)
-    pad = " " if text[0] == "`" or text[-1] == "`" or (text[0] == " " and text[-1] == " ") else ""
-    return f"{fence}{pad}{text}{pad}{fence}"
 
 
 def _escape_mdv2(text: str) -> str:
@@ -481,13 +473,17 @@ def _escape_mdv2(text: str) -> str:
 
 def _strip_mdv2(text: str) -> str:
     """Strip MarkdownV2 escapes and formatting markers for the plain-text fallback."""
+    from gateway.copy_blocks import protect_inline_copy_bodies, restore_inline_copy_bodies
+    text, bodies = protect_inline_copy_bodies(text)
+    from .copy_quotes import protect_quote_fallback
+    text, quote_bodies = protect_quote_fallback(text)
     cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)  # escape backslashes
     cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)  # **bold** BEFORE MarkdownV2 *bold*
     cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
     cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)  # italic; word-bounded so snake_case survives
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
-    return cleaned
+    return restore_inline_copy_bodies(cleaned, {**bodies, **quote_bodies})
 
 
 _CHUNK_INDICATOR_ON_FENCE_RE = re.compile(r'(?m)^``` (?P<indicator>(?:\\)?\(\d+/\d+(?:\\)?\))$')
@@ -543,7 +539,9 @@ def _rich_is_prose_line(line: str) -> bool:
         stripped,
     ):
         return False
-    if re.match(r"^</?(?:details|summary)(?:\s|>|$)", stripped, re.IGNORECASE):
+    # A raw HTML quote ends only at a blank line; a visual spacer would keep
+    # subsequent Markdown inside that HTML block, even after </blockquote>.
+    if re.search(r"^</?(?:details|summary|blockquote)(?:\s|>|$)|</blockquote\s*>$", stripped, re.IGNORECASE):
         return False
     return not bool(re.fullmatch(r"(?:[-*_]\s*){3,}", stripped))
 
@@ -650,8 +648,11 @@ def _normalize_dollar_entities(text: str) -> str:
     HTML-escaped its dollars to dodge LaTeX still reaches the user as ``$``."""
     if "&#" not in text:
         return text
-    return _RICH_DOLLAR_ENTITY_RE.sub(
-        lambda match: "$" if match.group(0).startswith("&#") else match.group(0), text)
+    from gateway.copy_blocks import map_outside_copy_blocks
+    return map_outside_copy_blocks(
+        text, lambda outside: _RICH_DOLLAR_ENTITY_RE.sub(
+            lambda match: "$" if match.group(0).startswith("&#") else match.group(0), outside),
+        keep_markers=True)
 
 
 _RICH_CURRENCY_AMOUNT_RE = re.compile(r"(?<![\\`\w])\$\d+(?:,\d{3})*(?:\.\d+)?")
@@ -966,8 +967,13 @@ class _PollingStallError(RuntimeError):
     """
 
 
-class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
+class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramReconnectMixin,
+                      TelegramHeldInboundMixin, TelegramTopicRoutingMixin, BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
+
+    # Immutable defaults also support connectors assembled without __init__ in tests.
+    _last_topic_creation_failure: TopicCreationFailure | None = None
+    _topic_creation_cooldown_until: float = 0.0
 
     # Bound for the per-(chat_id, thread_id, status_key) status-message cache; FIFO half-trim on overflow.
     _STATUS_MESSAGE_IDS_MAX = 2000
@@ -1646,9 +1652,6 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             except Exception as send_err:
                 if not self._should_retry_without_dm_topic_reply_anchor(send_err, metadata, reply_to_message_id):
                     raise
-                logger.warning(
-                    "[%s] Reply target deleted for Telegram %s, retrying without reply/topic anchor: %s",
-                    self.name, media_label, _redact_telegram_error_text(send_err))
                 if reset_media is not None:
                     reset_media()
                 retry_kwargs = dict(send_kwargs)
@@ -1661,8 +1664,10 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                         "[%s] Telegram flood control still active for chat %s (%.0fs left); refusing %s upload without an API call",
                         self.name, retry_kwargs.get("chat_id"), cooldown, media_label)
                     raise _MediaFloodRefusal(cooldown)
-                return await _await_with_thread_deadline(
+                message = await _await_with_thread_deadline(
                     send_fn(**retry_kwargs), timeout=_MEDIA_SEND_DEADLINE, label="telegram-media-send", dump_on_blocked_loop=False)
+                record_root_fallback(send_kwargs.get("message_thread_id") or send_kwargs.get("direct_messages_topic_id"))
+                return message
 
     def _fallback_ips(self) -> list[str]:
         """Return validated fallback IPs from config (populated by _apply_env_overrides)."""
@@ -1827,9 +1832,11 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
     def _rich_content_ok(self, content: str) -> bool:
         """Shape checks shared by rich sends and rich drafts (non-blank, no Desktop crash/garble
         shapes, under the cap, async-capable bot)."""
+        from gateway.copy_blocks import protect_inline_copy_bodies
+        prose, _ = protect_inline_copy_bodies(content)
         return bool(
             content and content.strip()
-            and not self._has_telegram_desktop_details_math_crash_shape(content)
+            and not self._has_telegram_desktop_details_math_crash_shape(prose)
             and (
                 getattr(self, "_allow_cjk_rich_messages", False)
                 or not self._has_telegram_desktop_cjk_rich_garble_shape(content)
@@ -1980,9 +1987,12 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 message_id = (msg.get("result") or {}).get("message_id")
         else:
             message_id = getattr(msg, "message_id", None)
+        from gateway.reply_latency import transport_confirmed
+        result = transport_confirmed(content, SendResult(success=True, message_id=str(message_id) if message_id is not None else None),
+                                     chat_id=chat_id, thread_id=thread_id)
         if message_id is not None:
             await self._record_rich_sent(chat_id, message_id, content)
-        return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
+        return result
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "rich_message": self._rich_message_payload(content)}
@@ -2025,8 +2035,10 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 return self._record_send_flood_cooldown(chat_id, wait)
             return self._rich_transient_result(exc, "rich editMessageText")
         # Mirror the fresh-send index: a streamed final finalized via edit is otherwise never recorded.
+        from gateway.reply_latency import transport_confirmed
+        result = transport_confirmed(content, SendResult(success=True, message_id=message_id), chat_id=chat_id, thread_id=self._metadata_thread_id(metadata))
         await self._record_rich_sent(chat_id, message_id, content)
-        return SendResult(success=True, message_id=message_id)
+        return result
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
@@ -3083,36 +3095,12 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
     async def _create_dm_topic(
         self, chat_id: int, name: str, icon_color: Optional[int] = None, icon_custom_emoji_id: Optional[str] = None) -> Optional[int]:
         """Create a forum topic in a private (DM) chat (Bot API 9.4+); message_thread_id or None."""
-        if not self._bot:
-            return None
-        try:
-            kwargs: dict[str, Any] = {"chat_id": chat_id, "name": name}
-            if icon_color is not None:
-                kwargs["icon_color"] = icon_color
-            if icon_custom_emoji_id:
-                kwargs["icon_custom_emoji_id"] = icon_custom_emoji_id
-            topic = await self._bot.create_forum_topic(**kwargs)
-            thread_id = topic.message_thread_id
-            logger.info("[%s] Created DM topic '%s' in chat %s -> thread_id=%s", self.name, name, chat_id, thread_id)
-            return thread_id
-        except Exception as e:
-            error_text = str(e).lower()
-            # Telegram has no "list topics" API: an existing topic is mapped from incoming messages.
-            if "topic_name_duplicate" in error_text or "already" in error_text:
-                logger.info(
-                    "[%s] DM topic '%s' already exists in chat %s (will be mapped from incoming messages)", self.name, name, chat_id)
-            elif "not a forum" in error_text or "forums_disabled" in error_text:
-                logger.warning(
-                    "[%s] Cannot create DM topic '%s' in chat %s: Threaded Mode is not enabled. "
-                    "The bot owner must open the BotFather Mini App (search 'botfather' in "
-                    "Telegram, tap Open on the search result) -> My bots -> this bot -> Bot "
-                    "Settings -> Threads Settings -> enable Threaded Mode. This cannot be enabled "
-                    "from the DM chat, nor from the BotFather /mybots text menu.",
-                    self.name, name, chat_id)
-            else:
-                logger.warning(
-                    "[%s] Failed to create DM topic '%s' in chat %s: %s", self.name, name, chat_id, _redact_telegram_error_text(e))
-            return None
+        from .topic_creation import create_dm_topic
+        return await create_dm_topic(self, chat_id, name, icon_color, icon_custom_emoji_id)
+
+    def topic_creation_error_message(self) -> str:
+        from .topic_creation import topic_creation_error_message
+        return topic_creation_error_message(self)
 
     async def create_handoff_thread(self, parent_chat_id: str, name: str) -> Optional[str]:
         """Create a forum topic for a session handoff; ``message_thread_id`` as str, or None."""
@@ -3523,11 +3511,11 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         """Save a newly created thread_id back into config.yaml so it survives restarts."""
         try:
             from hermes_constants import get_hermes_home
+            from hermes_cli.config import atomic_config_write, config_exists, read_user_config_raw
             config_path = get_hermes_home() / "config.yaml"
-            if not config_path.exists():
+            if not config_exists(config_path):
                 logger.warning("[%s] Config file not found at %s, cannot persist thread_id", self.name, config_path)
                 return
-            from hermes_cli.config import atomic_config_write, read_user_config_raw
             config = read_user_config_raw(config_path)
             # platforms.telegram.extra.dm_topics — create the path for topics not predeclared in config.yaml.
             dm_topics = config.setdefault("platforms", {}).setdefault("telegram", {}).setdefault("extra", {}).setdefault("dm_topics", [])
@@ -3617,7 +3605,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
     async def _register_command_menu(self) -> None:
         """Register the command menu (from COMMAND_REGISTRY) in every scope — Telegram picks the
         narrowest matching one per chat type; forum topics are handled lazily by _ensure_forum_commands."""
-        from telegram import BotCommand, BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault
+        from telegram import BotCommandScopeAllPrivateChats, BotCommandScopeAllGroupChats, BotCommandScopeDefault
         from hermes_cli.commands_platforms import telegram_menu_commands, telegram_menu_max_commands
         if not self._bot:
             return
@@ -4539,6 +4527,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     chunk, send_kwargs, plain=bool(metadata and metadata.get("copy_block")))
                 if isinstance(message, SendResult):
                     return message
+                record_root_fallback(thread_id, used_thread_fallback)
                 return message, used_thread_fallback
             except _NetErr as send_err:
                 # BadRequest subclasses NetworkError in PTB but is permanent; handle specific cases.
@@ -4549,10 +4538,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                         # One-off "thread not found" flakes recover on immediate retry: same thread_id once.
                         if not retried_thread_not_found:
                             retried_thread_not_found = True
-                            logger.warning("[%s] Thread %s not found, retrying once with same thread_id", self.name, effective_thread_id)
+                            logger.info("[%s] Thread %s not found, retrying once with same thread_id", self.name, effective_thread_id)
                             continue
                         # Thread is genuinely gone: retry without it and prune the stale binding.
-                        logger.warning("[%s] Thread %s not found, retrying without message_thread_id", self.name, effective_thread_id)
                         await asyncio.to_thread(self._prune_stale_dm_topic_binding, chat_id, effective_thread_id, metadata=metadata)
                         used_thread_fallback = True
                         effective_thread_id = None
@@ -4563,10 +4551,11 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                         if private_dm_topic_send:
                             return SendResult(success=False, error=safe_send_error, retryable=False)
                         # Reply target deleted; private-topic fallback sends drop anchor + topic id together.
-                        logger.warning("[%s] Reply target deleted, retrying without reply_to: %s", self.name, safe_send_error)
+                        logger.info("[%s] Reply target deleted, retrying without reply_to", self.name)
                         reply_to_id = None
                         if self._dm_topic_fallback(metadata):
                             thread_kwargs = {}
+                            used_thread_fallback = True
                         else:
                             thread_kwargs = self._thread_kwargs_for_send(
                                 chat_id, thread_id, metadata, reply_to_message_id=reply_to_id, reply_to_mode=self._reply_to_mode)
@@ -4771,6 +4760,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         _track(loop.create_task(_quiet()), tasks)
 
     @durable_egress("send")
+    @reports_thread_fallback
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None) -> SendResult:
         """Send a message to a Telegram chat."""
@@ -4865,7 +4855,12 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                         await self._retrigger_typing(chat_id, metadata)
                     return rich_result
             content = _normalize_dollar_entities((metadata or {}).get("rich_fallback_content", content))
-            chunks = self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)
+            from .copy_quotes import truncate_copy_source
+            copy_chunks = truncate_copy_source(
+                content, self.MAX_MESSAGE_LENGTH, utf16_len, self.CHUNK_INDICATOR_OVERHEAD, close_chunks=True)
+            chunks = ([self.format_message(chunk) for chunk in copy_chunks] if copy_chunks is not None else
+                      self.truncate_message(self.format_message(content), self.MAX_MESSAGE_LENGTH,
+                                            len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD))
             if len(chunks) > 1:
                 # truncate_message appends a raw " (1/2)" suffix; escape the MarkdownV2-special parentheses.
                 chunks = [
@@ -4905,6 +4900,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
         prior = len(delivered)
+        confirmed_at = None
         for chunk in chunks:
             if (delivered and current_outbound_class() == OUTBOUND_TOOL_PROGRESS
                     and self._daily_sheds(chat_id, OUTBOUND_PROGRESS)):
@@ -4916,12 +4912,15 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 # ambiguous timeouts raise instead, so the remainder is safe to resume from.
                 return self._with_partial_send(outcome, chunks[len(delivered) - prior:], delivered)
             msg, used_thread_fallback = outcome
+            from gateway.reply_latency import record_transport_reply
+            confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
             delivered.append(str(msg.message_id))
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
             raw_response={
-                "message_ids": list(delivered), "requested_thread_id": requested_thread_id, "thread_fallback": used_thread_fallback})
+                "message_ids": list(delivered), "requested_thread_id": requested_thread_id, "thread_fallback": used_thread_fallback,
+                **({"reply_latency_confirmed_at": confirmed_at} if confirmed_at is not None else {})})
 
     @staticmethod
     def _with_partial_send(
@@ -4977,7 +4976,11 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         key = (str(chat_id), str(thread_id) if thread_id is not None else "", str(status_key))
         cached_id = self._status_message_ids.get(key)
         if cached_id is not None:
-            result = await self.edit_message(chat_id, cached_id, content, finalize=True, metadata=metadata)
+            from gateway.reply_latency import current_receipt, delivery_scope, record_first_reply
+            receipt = current_receipt()
+            with delivery_scope(receipt, "progress_edit"):
+                result = await self.edit_message(chat_id, cached_id, content, finalize=True, metadata=metadata)
+            record_first_reply(receipt, content, result, kind="progress_edit")
             if result.success:
                 # Only write back if nobody evicted/replaced this key during the await.
                 if result.message_id and self._status_message_ids.get(key) == cached_id:
@@ -5006,6 +5009,17 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             kwargs["parse_mode"] = parse_mode
         await _await_with_thread_deadline(
             self._bot.edit_message_text(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+
+    async def _edit_preview(self, chat_id: str, message_id: str, content: str) -> None:
+        """Ordinary previews stay raw; literal copy context must be formatted on every tick."""
+        from gateway.copy_blocks import _has_copy_markers
+        if _has_copy_markers(content):
+            content = self.truncate_message(content, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
+            await self._edit_markdown_or_plain(
+                chat_id, message_id, self.format_message(content), _strip_mdv2(content),
+                "[%s] Copy preview MarkdownV2 rejected, using plain text: %s")
+        else:
+            await self._edit_text(chat_id, message_id, content)
 
     async def _edit_markdown_or_plain(self, chat_id: str, message_id: str, formatted: str, plain: str, warn_fmt: str) -> bool:
         """MarkdownV2 edit with plain-text fallback. Returns True on a "not modified" no-op (caller may
@@ -5113,7 +5127,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             self._last_overflow_preview.pop(_preview_key, None)
         try:
             if not finalize:
-                await self._edit_text(chat_id, message_id, content)
+                await self._edit_preview(chat_id, message_id, content)
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
@@ -5198,7 +5212,9 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         """Send one continuation chunk (MarkdownV2 then plain on finalize; raw when streaming); drops the
         reply anchor once on 'reply message not found'. Returns the sent message, a flood refusal, or None."""
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
-        for use_markdown in (True, False) if finalize else (False,):
+        from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
+        has_copy = _has_copy_markers(chunk)
+        for use_markdown in (True, False) if (finalize or has_copy) else (False,):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
                 return _flood_cap_result(cooldown)
@@ -5207,7 +5223,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
-                    text = _strip_mdv2(chunk) if finalize else chunk
+                    text = _strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk)
                 return await _await_with_thread_deadline(
                     self._bot.send_message(
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
@@ -5225,7 +5241,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     try:
                         return await _await_with_thread_deadline(
                             self._bot.send_message(
-                            chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else chunk,
+                            chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk),
                             **retry_thread_kwargs, **base),
                             timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
                     except Exception as _retry_err:
@@ -5256,7 +5272,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     chat_id, message_id, _separate_chunk_indicator_from_fence(self.format_message(first_chunk)), _strip_mdv2(first_chunk),
                     "[%s] Overflow split: MarkdownV2 first-chunk edit failed, falling back to plain text: %s")
             else:
-                await self._edit_text(chat_id, message_id, first_chunk)
+                from gateway.copy_blocks import _has_copy_markers
+                if _has_copy_markers(first_chunk):
+                    await self._edit_markdown_or_plain(
+                        chat_id, message_id, self.format_message(first_chunk), _strip_mdv2(first_chunk),
+                        "[%s] Copy overflow preview MarkdownV2 rejected, using plain text: %s")
+                else:
+                    await self._edit_text(chat_id, message_id, first_chunk)
         except Exception as e:
             if "not modified" not in str(e).lower():  # identical first chunk still sends continuations
                 wait = _telegram_retry_after(e)
@@ -5264,11 +5286,13 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     return self._record_send_flood_cooldown(chat_id, wait)
                 logger.error("[%s] Overflow split: first-chunk edit failed: %s", self.name, _redact_telegram_error_text(e), exc_info=True)
                 return SendResult(success=False, error=_redact_telegram_error_text(e))
+        from gateway.reply_latency import record_transport_reply
+        thread_id = self._metadata_thread_id(metadata)
+        confirmed_at = record_transport_reply(first_chunk, chat_id=chat_id, thread_id=thread_id)
         # Continuations call self._bot.send_message directly to skip self.send's pre-chunking.
         continuation_ids: list[str] = []
         delivered_chunks = [first_chunk]
         prev_id = message_id
-        thread_id = self._metadata_thread_id(metadata)
         for chunk in chunks[1:]:
             reply_to_id = int(prev_id) if prev_id else None
             thread_kwargs = self._thread_kwargs_for_send(chat_id, thread_id, metadata, reply_to_message_id=reply_to_id)
@@ -5289,12 +5313,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                         "continuation_message_ids": tuple(continuation_ids)},
                     continuation_message_ids=tuple(continuation_ids))
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
+            confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
             prev_id = new_id
         last_id = continuation_ids[-1] if continuation_ids else message_id
         logger.debug("[%s] Overflow split delivered %d chunks; last_id=%s", self.name, 1 + len(continuation_ids), last_id)
-        return SendResult(success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids))
+        return SendResult(success=True, message_id=last_id, continuation_message_ids=tuple(continuation_ids),
+                          raw_response={"reply_latency_confirmed_at": confirmed_at} if confirmed_at is not None else None)
 
     async def delete_message(self, chat_id: str, message_id: str) -> bool:
         """Delete a bot-posted message (Bot API allows it within 48h); failures are non-fatal.
@@ -5376,14 +5402,18 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             content) <= self.MAX_MESSAGE_LENGTH else self.truncate_message(content, self.MAX_MESSAGE_LENGTH, len_fn=utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD)[0]
         # Same MarkdownV2 conversion as ``send`` (MarkdownV2 then plain) so the draft doesn't snap at the end. Exception: a Rich
         # final with rich drafts disabled previews raw — the legacy formatter would turn pipe tables into bullets.
+        from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
+        has_copy = _has_copy_markers(text)
+        if has_copy:
+            text = self.truncate_message(text, self.MAX_MESSAGE_LENGTH, utf16_len)[0]
         plain_rich_preview = bool(
-            getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
+            not has_copy and getattr(self, "_rich_messages_enabled", False) and not getattr(self, "_rich_drafts_enabled", False)
             and self._needs_rich_rendering(text))
         draft_thread_kwargs = self._thread_kwargs_for_draft(chat_id, metadata)
         for use_markdown in ((False,) if plain_rich_preview else (True, False)):
             kwargs: dict[str, Any] = {
                 "chat_id": normalize_telegram_chat_id(chat_id), "draft_id": int(draft_id),
-                "text": self.format_message(text) if use_markdown else text}
+                "text": self.format_message(text) if use_markdown else render_copy_blocks_inline(text)}
             if use_markdown:
                 kwargs["parse_mode"] = ParseMode.MARKDOWN_V2
             kwargs.update(draft_thread_kwargs)
@@ -5422,14 +5452,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 self._bot.send_message(**kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
         except Exception as send_err:
             if (message_thread_id is not None and self._is_bad_request_error(send_err) and self._is_thread_not_found_error(send_err)):
-                logger.warning(
-                    "[%s] Thread %s not found for control message, retrying without message_thread_id", self.name, message_thread_id)
                 # Same prune as the streaming send path; control sends carry no gateway metadata.
                 await asyncio.to_thread(self._prune_stale_dm_topic_binding, kwargs.get("chat_id"), message_thread_id)
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("message_thread_id", None)
-                return await call_with_flood_guard(self, kwargs.get("chat_id"), lambda: _await_with_thread_deadline(
+                message = await call_with_flood_guard(self, kwargs.get("chat_id"), lambda: _await_with_thread_deadline(
                     self._bot.send_message(**retry_kwargs), timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False))
+                record_root_fallback(message_thread_id)
+                return message
             raise
 
     @durable_control
@@ -5447,6 +5477,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             chat_id, thread_id, metadata, reply_to_message_id=reply_to_id, reply_to_mode=reply_to_mode))
         return await self._send_message_with_thread_fallback(**kwargs)
 
+    @reports_thread_fallback
     async def _send_prompt(self, what: str, chat_id: str, metadata: Optional[dict[str, Any]], build, *,
                            parse_mode: Any = None, thread_id: Any = None, reply_to_mode: Any = None) -> SendResult:
         """Shared control-prompt shell: not-connected guard, ``build()`` → ``(text, keyboard, on_sent)`` (or a
@@ -6556,15 +6587,14 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
 
     @staticmethod
     def _caption_1024(caption: Optional[str]) -> Optional[str]:
-        return caption[:1024] if caption else None
+        from gateway.copy_blocks import render_copy_blocks_inline
+        return render_copy_blocks_inline(caption)[:1024] if caption else None
 
     async def _send_voice_bubble(self, audio_file, chat_id, reply_to, metadata, caption, duration_secs):
         """sendVoice with caption variants: MarkdownV2 when it fits 1024 chars, plain fallback when the
         Bot API rejects the entities; anything else is a real error."""
-        # Render caption markdown (#32029): auto-TTS captions carry the agent's markdown reply, which showed
-        # literal *asterisks* and [links](...) without a parse_mode. Format to MarkdownV2 when it fits the
-        # 1024-char caption cap; fall back to the raw text (previous behaviour) when formatting would
-        # overflow or the Bot API rejects the entities.
+        # Keep formatted quotes when they fit; plain fallbacks must render display markers BEFORE
+        # truncating, which could otherwise bisect a sentinel and leak internal control text.
         _caption_variants: list[tuple] = []
         if caption:
             try:
@@ -6573,7 +6603,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     _caption_variants.append((_formatted_caption, ParseMode.MARKDOWN_V2))
             except Exception:
                 logger.debug("[%s] voice caption MarkdownV2 formatting failed; sending plain caption", self.name, exc_info=True)
-            _caption_variants.append((caption[:1024], None))
+            _caption_variants.append((self._caption_1024(caption), None))
         else:
             _caption_variants.append((None, None))
         _last_parse_error: Optional[Exception] = None
@@ -6594,6 +6624,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         raise _last_parse_error or RuntimeError("Telegram send_voice failed for all caption variants")
 
     @durable_egress("send_voice")
+    @reports_thread_fallback
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -6644,6 +6675,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     os.unlink(_transcoded_voice_path)
 
     @durable_egress("send_multiple_images")
+    @reports_thread_fallback
     async def send_multiple_images(
         self, chat_id: str, images: list[tuple], metadata: Optional[dict[str, Any]] = None, human_delay: float = 0.0) -> SendResult:
         """Send images as Telegram albums (``send_media_group``, 10 per chunk). Animated GIFs can't join a
@@ -6759,6 +6791,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         return SendResult(success=delivered, error=None if delivered else "all images failed to send")
 
     @durable_egress("send_image_file")
+    @reports_thread_fallback
     async def send_image_file(
         self, chat_id: str, image_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -6829,6 +6862,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         return await fallback
 
     @durable_egress("send_document")
+    @reports_thread_fallback
     async def send_document(
         self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
         reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -6842,6 +6876,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 ).send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)))
 
     @durable_egress("send_video")
+    @reports_thread_fallback
     async def send_video(
         self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None, **kwargs) -> SendResult:
@@ -6877,6 +6912,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     os.remove(thumb_path)
 
     @durable_egress("send_image")
+    @reports_thread_fallback
     async def send_image(
         self, chat_id: str, image_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -6916,6 +6952,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 return await super().send_image(chat_id, image_url, caption, reply_to, metadata=metadata)
 
     @durable_egress("send_animation")
+    @reports_thread_fallback
     async def send_animation(
         self, chat_id: str, animation_url: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> SendResult:
@@ -7093,29 +7130,6 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             )
         return limiter
 
-    def _daily_quota(self) -> DailyQuota:
-        """Per-chat daily volume ledger; ``daily_message_soft_ceiling`` and ``daily_call_soft_ceiling``
-        in the platform extra set the budgets (0 disables that budget's shedding, counting continues)."""
-        quota = self.__dict__.get("_telegram_daily_quota")
-        if quota is None:
-            quota = self.__dict__["_telegram_daily_quota"] = quota_from_platform_extra(
-                getattr(getattr(self, "config", None), "extra", None),
-                profile_dir=getattr(self, "_update_receipt_dir", None), label=self.name)
-        return quota
-
-    def _daily_sheds(self, chat_id: Any, kind: Optional[str]) -> bool:
-        """True when the chat's daily volume says this outbound class must not spend a call."""
-        if kind is None:
-            return False
-        try:
-            shed = self._daily_quota().sheds(str(normalize_telegram_chat_id(chat_id)), kind, current_trigger())
-        except Exception:
-            logger.debug("[%s] daily volume check failed", self.name, exc_info=True)
-            return False
-        if shed:
-            logger.debug("[%s] shedding %s traffic for chat %s: daily volume budget", self.name, kind, chat_id)
-        return shed
-
     def _flood_inline_wait_cap(self, chat_id: Any) -> float:
         """Longest server ``retry_after`` slept inline. Floored at the chat's own routine gap so a
         group's (or a penalised chat's) ordinary spacing is waited out, never surfaced as a flood error."""
@@ -7229,11 +7243,15 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 e), exc_info=True)
             return {"name": str(chat_id), "type": "dm", "error": str(e)}
 
-    def format_progress_literal(self, text: str) -> str:
-        """Tool names and previews in progress lines are code spans, so neither the rich Markdown
-        parser nor ``format_message`` reads ``mcp__a__b``, ``**/*.md``, ``README.md`` or ``\\s+``
-        as markup or a link."""
-        return _progress_code_span(text)
+    @staticmethod
+    def truncate_message(content: str, max_length: int = 4096,
+                         len_fn: Optional[Callable[[str], int]] = None, *,
+                         indicator_overhead: int = 0) -> list[str]:
+        from .copy_quotes import truncate_copy_source
+        chunks = truncate_copy_source(content, max_length, len_fn or len, indicator_overhead)
+        if chunks is not None:
+            return chunks
+        return BasePlatformAdapter.truncate_message(content, max_length, len_fn, indicator_overhead=indicator_overhead)
 
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Telegram MarkdownV2: code is stashed behind placeholders first (never
@@ -7255,7 +7273,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
 
         # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
         #    before the normal MarkdownV2 conversions run.
-        text = _wrap_markdown_tables(content)
+        from .copy_quotes import protect_copy_quotes
+        text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
         # 1a) CommonMark multi-backtick inline code (``a `b` c``, as format_progress_literal emits). MarkdownV2
         # has only single-backtick code, so re-emit the content as one with ` and \ escaped. Runs before the
         # fenced pass; spans inside a real fence stay that fence's content. Lead-in prose remains outside
@@ -7898,8 +7917,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         if not (0 < self._int_or_zero(file_size) <= getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)):
             return "oversized", file_size
         try:
-            file_obj = await source.get_file()
-            data = bytes(await file_obj.download_as_bytearray())
+            file_obj, data = await _fetch_telegram_file(source, what)
             if not filename:
                 filename = os.path.basename(getattr(file_obj, "file_path", "") or "")
             cached = await cache_media_bytes_async(data, filename=filename, mime_type=mime, default_kind=kind)
@@ -8449,8 +8467,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 logger.info("[Telegram] Skipped oversized user %s (size=%s)", kind, getattr(source, "file_size", None))
                 await self.handle_message(event)
                 return True
-            file_obj = await source.get_file()
-            data = await file_obj.download_as_bytearray()
+            file_obj, data = await _fetch_telegram_file(source, f"user {kind}")
             if kind == "video":
                 ext = self._ext_from_path(getattr(file_obj, "file_path", None), SUPPORTED_VIDEO_TYPES, ext)
                 cached_path = await cache_video_from_bytes_async(bytes(data), ext=ext)
@@ -8498,8 +8515,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     event, f"The document is too large or its size could not be verified. Maximum: {self._max_doc_bytes // (1024 * 1024)} MB.")
             # Screenshots/photos sent as documents take the image cache + batching path.
             if ext in _TELEGRAM_IMAGE_EXTENSIONS or doc_mime.startswith("image/"):
-                file_obj = await doc.get_file()
-                image_bytes = await file_obj.download_as_bytearray()
+                _file_obj, image_bytes = await _fetch_telegram_file(doc, "image document")
                 image_ext = ext if ext in _TELEGRAM_IMAGE_EXTENSIONS else _TELEGRAM_IMAGE_MIME_TO_EXT.get(doc_mime, ".jpg")
                 try:
                     cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=image_ext)
@@ -8522,8 +8538,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                     image_mime_to_ext.setdefault(_mime, _ext)
                 ext = image_mime_to_ext.get(doc.mime_type, "")
             if ext in SUPPORTED_VIDEO_TYPES:
-                file_obj = await doc.get_file()
-                video_bytes = await file_obj.download_as_bytearray()
+                _file_obj, video_bytes = await _fetch_telegram_file(doc, "video document")
                 self._set_cached_media(
                     event, await cache_video_from_bytes_async(bytes(video_bytes), ext=ext), SUPPORTED_VIDEO_TYPES[ext], MessageType.VIDEO,
                     "[Telegram] Cached user video document at %s")
@@ -8531,8 +8546,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 return True
             # Any file type is accepted (authorization is the gate, not the extension); unknown types get
             # application/octet-stream. Image documents already returned above.
-            file_obj = await doc.get_file()
-            raw_bytes = bytes(await file_obj.download_as_bytearray())
+            _file_obj, raw_bytes = await _fetch_telegram_file(doc, "document")
             from gateway.platforms.base import cache_media_bytes_async
             cached = await cache_media_bytes_async(raw_bytes, filename=original_filename or f"document{ext or '.bin'}", mime_type=doc_mime)
             if cached is None:
@@ -8551,7 +8565,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
                 try:
                     text_content = raw_bytes.decode("utf-8")
                     display_name = re.sub(r'[^\w.\- ]', '_', original_filename or f"document{ext or '.txt'}")
-                    injection = f"[Content of {display_name}]:\n{text_content}"
+                    injection = format_document_content(display_name, text_content)
                     event.text = f"{injection}\n\n{event.text}" if event.text else injection
                     event.media_text_inlined = [True]
                 except UnicodeDecodeError:
@@ -8594,8 +8608,8 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
         # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
         if msg.photo:
             try:
-                file_obj = await msg.photo[-1].get_file()  # PhotoSize list sorted by size; largest last
-                image_bytes = await file_obj.download_as_bytearray()
+                file_obj, image_bytes = await _fetch_telegram_file(
+                    msg.photo[-1], "photo")  # PhotoSize list sorted by size; largest last
                 ext = self._ext_from_path(file_obj.file_path, [".png", ".webp", ".gif", ".jpeg", ".jpg"], ".jpg")
                 self._set_cached_media(
                     event, await cache_image_from_bytes_async(bytes(image_bytes), ext=ext), f"image/{ext.lstrip('.')}", event.message_type,
@@ -8658,8 +8672,7 @@ class TelegramAdapter(TelegramReconnectMixin, TelegramHeldInboundMixin, Telegram
             return
         fallback = f"a sticker with emoji {emoji}" if emoji else "a sticker"
         try:
-            file_obj = await sticker.get_file()
-            image_bytes = await file_obj.download_as_bytearray()
+            file_obj, image_bytes = await _fetch_telegram_file(sticker, "sticker")
             cached_path = await cache_image_from_bytes_async(bytes(image_bytes), ext=".webp")
             logger.info("[Telegram] Analyzing sticker at %s", cached_path)
             from tools.vision_tools import vision_analyze_tool
@@ -9089,7 +9102,6 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
 
 def interactive_setup() -> None:
     """Configure Telegram credentials and allowlist via the CLI setup wizard (lazy import)."""
-    from hermes_cli import setup as _setup_mod
     setup_platforms._setup_telegram()
 
 

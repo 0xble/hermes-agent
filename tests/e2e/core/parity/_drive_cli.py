@@ -15,10 +15,9 @@ Driver contract (every ``_drive_*.py`` module follows it)::
   SIGTERM, RPC) before returning; never SIGKILL except as a last resort after a
   bounded graceful wait (and then report it via ``graceful_exit=False``).
 
-``hermes -z`` and ``hermes chat -q`` are thin clients of the unified gateway
-runtime: the turn runs in the profile's ``gateway run`` daemon (spawned on first
-connect), which outlives the client by design. Their normal shutdown is therefore
-client exit + ``hermes gateway stop`` (``stop_profile_gateway``).
+Finite ``hermes -z`` and ``hermes chat -q -Q`` clients lease their freshly spawned
+local gateway. Normal shutdown is client exit alone: the driver verifies the owner
+is gone without an operator stop. Explicit gateway stop is failure cleanup only.
 """
 
 from __future__ import annotations
@@ -44,15 +43,22 @@ def _run_cli(ph: ParityHome, *args: str) -> subprocess.CompletedProcess:
 
 
 def _client_turn(ph: ParityHome, label: str, *args: str) -> DriveResult:
+    from gateway.status import live_gateway_pid_for_home
+    from tests.waiting import wait_until
+
     proc = _run_cli(ph, *args)
     try:
         assert proc.returncode == 0, f"{label} exited {proc.returncode}: {proc.stderr[-2000:]}"
-    finally:
-        # The daemon is the surface's process; a failed client still leaves it to stop.
-        stopped = stop_profile_gateway(ph)
+        # Stronger than an operator stop: finite client exit alone must release its
+        # private gateway. The matrix separately asserts MCP child/grandchild death.
+        wait_until(lambda: live_gateway_pid_for_home(ph.hermes_home) is None, timeout=7,
+                   what=f"{label} client-owned gateway to exit")
+    except BaseException:
+        stop_profile_gateway(ph)  # failure cleanup never counts as graceful client exit
+        raise
     return DriveResult(
-        final_text=proc.stdout.strip(), toolset="hermes-cli", graceful_exit=stopped,
-        extra={"exit_code": proc.returncode, "stderr_tail": proc.stderr[-2000:], "gateway_stopped": stopped},
+        final_text=proc.stdout.strip(), toolset="hermes-cli", graceful_exit=True,
+        extra={"exit_code": proc.returncode, "stderr_tail": proc.stderr[-2000:], "gateway_stopped": True},
     )
 
 

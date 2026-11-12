@@ -105,7 +105,7 @@ def owner(monkeypatch, tmp_path):
         state.relay = _Relay(server.socket.getsockname()[1])
         endpoint = SimpleNamespace(api_origin=f'http://127.0.0.1:{state.relay.port}', control_home=None)
         monkeypatch.setattr(gateway_runtime, 'discover_gateway_endpoint',
-                            lambda home, timeout: SimpleNamespace(state='ready', endpoint=endpoint))
+                            lambda home, timeout: SimpleNamespace(state='ready', endpoint=endpoint, reason_code=None))
         monkeypatch.setattr(discovery, 'query_identify', lambda home, timeout: {'pid': -1})
         monkeypatch.setattr(gateway_client, '_session_ticket', ticket)
         try:

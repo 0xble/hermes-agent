@@ -130,6 +130,65 @@ def _host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Iterator[Namespace
 
 
 @pytest.mark.platforms("linux")
+def test_owned_child_liveness_survives_hidden_environment(tmp_path, monkeypatch):
+    from tests.e2e.core.upgrade.handoff import _ns_agent as agent
+    from tests.e2e.core.upgrade.handoff._nshost import NamespaceHost
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_E2E_NAMESPACE_MODE", "home")
+    monkeypatch.setattr(agent, "_CHILDREN", {})
+    monkeypatch.setattr(agent, "_CHILD_STARTS", {}, raising=False)
+    replies = []
+    monkeypatch.setattr(agent, "_reply", lambda rid, **payload: replies.append(payload))
+
+    def call(req, *, timeout):
+        agent._handle(req)
+        reply = replies.pop()
+        assert "error" not in reply, reply
+        return reply
+
+    # Use the real host methods and agent dispatcher, with in-process transport.
+    host = NamespaceHost.__new__(NamespaceHost)
+    host.root, host.env, host.transcript = tmp_path, dict(os.environ), []
+    monkeypatch.setattr(host, "call", call)
+    release = tmp_path / "release"
+    os.mkfifo(release)
+    writer = os.open(release, os.O_RDWR | os.O_NONBLOCK)
+    pid = host.spawn([sys.executable, "-c", "import sys; open(sys.argv[1]).read(1)", str(release)],
+                     log=tmp_path / "child.log")
+    proc = agent._CHILDREN[pid]
+    try:
+        read = agent._read
+        monkeypatch.setattr(agent, "_read", lambda path: b"" if path == f"/proc/{pid}/environ" else read(path))
+        assert pid not in {row["pid"] for row in host.procs()}
+        assert proc.poll() is None
+        assert host.alive(pid)
+
+        # A different incarnation must never count as this owned live child.
+        stat = agent._stat
+        fields = stat(pid)
+        assert fields is not None
+        different = [*fields[:19], str(int(fields[19]) + 1), *fields[20:]]
+        with monkeypatch.context() as reused:
+            reused.setattr(agent, "_stat", lambda candidate: different if candidate == pid else stat(candidate))
+            assert not host.alive(pid)
+
+        os.write(writer, b"x")
+        assert proc.wait(timeout=10) == 0
+        agent._reap()
+        assert not host.alive(pid)
+        # Even a visible live PID reused after reaping is not the spawned child.
+        monkeypatch.setattr(agent, "_procs", lambda: [{"pid": pid, "state": "R", "start": int(different[19])}])
+        assert not host.alive(pid)
+    finally:
+        os.close(writer)
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait(timeout=10)
+        agent._reap()
+
+
+@pytest.mark.platforms("linux")
 def test_fallback_neither_exposes_nor_signals_another_fixture(tmp_path, monkeypatch):
     sibling = subprocess.Popen(
         [sys.executable, "-c", "import time; time.sleep(300)"],

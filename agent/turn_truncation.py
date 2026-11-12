@@ -50,7 +50,8 @@ def collapse_continuation_trail(
     finish_reason: str, parts: Optional[list[str]] = None,
 ) -> str:
     """Drop this turn's ``_length_continuation_fragment``/``_nudge`` rows and append one
-    assistant row holding the joined, think-stripped partial; returns that text ("" none).
+    assistant row holding the joined, think-stripped partial (a held turn's rewrite); returns
+    that text ("" none).
 
     ``parts=None`` (retry exhaustion, #119001): the text comes from the fragment rows and
     nothing happens without a valid turn index or a trail — an unanswered synthetic nudge
@@ -89,6 +90,11 @@ def collapse_continuation_trail(
     partial = agent._strip_think_blocks(
         _join_truncated_parts(join_parts)
     ).strip()
+    if partial and getattr(agent, "_hold_stream", False) is True:
+        # A held turn showed none of these fragments: the stitched text reaches the user and the
+        # stored row only through the turn's transform snapshot (fail closed: the withheld notice).
+        from agent.turn_finalizer import apply_llm_output_transform
+        partial, _, _ = apply_llm_output_transform(agent, partial, turn_id=getattr(agent, "_current_turn_id", "") or "")
     if partial:
         append_message(messages, {"role": "assistant", "content": partial, "finish_reason": finish_reason})
     agent._session_messages = messages
@@ -329,17 +335,19 @@ def _continue_text(st: _Trunc, _retry: TurnRetryState, assistant_message: Any) -
     filled = st.window_filled
     if n < 4 and filled is None:
         _dropped_tools = getattr(st.response, "_dropped_tool_names", None)
+        _dropped_tool_argument_chars = getattr(st.response, "_dropped_tool_argument_chars", 0)
         if st.is_stub and _dropped_tools:
             agent._vprint(
                 f"{agent.log_prefix}↻ Stream interrupted mid "
-                f"tool-call ({', '.join(_dropped_tools[:3])}) — requesting chunked retry ({n}/4)...", diagnostic=True,
+                f"tool-call ({', '.join(_dropped_tools[:3])}) — retrying automatically ({n}/4)...", diagnostic=True,
             )
         elif st.is_stub:
             agent._vprint(f"{agent.log_prefix}↻ Stream interrupted — requesting continuation ({n}/4)...", diagnostic=True)
         else:
             agent._vprint(f"{agent.log_prefix}↻ Requesting continuation ({n}/4)...", diagnostic=True)
         append_message(messages, {
-            "role": "user", "content": _get_continuation_prompt(st.is_stub, _dropped_tools),
+            "role": "user", "content": _get_continuation_prompt(
+                st.is_stub, _dropped_tools, _dropped_tool_argument_chars, n),
             "_length_continuation_nudge": True,
         })
         agent._session_messages = messages

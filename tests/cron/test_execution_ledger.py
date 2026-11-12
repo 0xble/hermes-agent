@@ -171,7 +171,7 @@ def test_retention_bounds_terminal_history_but_preserves_inflight(monkeypatch, t
     inflight = executions.create_execution("live", source="builtin")
     executions.mark_execution_running(inflight["id"])
     for index in range(8):
-        row = executions.create_execution(f"done-{index}", source="builtin")
+        row = executions.create_execution("done", source="builtin")
         executions.finish_execution(row["id"], success=True)
 
     records = executions.list_executions(limit=100)
@@ -186,7 +186,7 @@ def test_recently_finished_long_running_execution_survives_retention(
     monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 1)
     long_running = executions.create_execution("long-running", source="builtin")
     assert executions.mark_execution_running(long_running["id"]) is not None
-    newer = executions.create_execution("newer", source="builtin")
+    newer = executions.create_execution("long-running", source="builtin")
     assert executions.finish_execution(newer["id"], success=True) is not None
 
     finished = executions.finish_execution(long_running["id"], success=True)
@@ -194,7 +194,9 @@ def test_recently_finished_long_running_execution_survives_retention(
     assert finished is not None
     assert finished["status"] == "completed"
     assert executions.get_execution(long_running["id"])["status"] == "completed"
-    assert executions.get_execution(newer["id"]) is None
+    # The later-claimed attempt remains the job's current status, while the
+    # finishing call must retain the long-running attempt it just settled.
+    assert executions.get_execution(newer["id"])["status"] == "completed"
 
 
 def test_corrupt_store_fails_closed_without_overwrite(monkeypatch, tmp_path):

@@ -4,6 +4,7 @@ Every row drives the real authority verb end to end and asserts the named write 
 owner-loop thread (the population is listed in SWEEP_owner_loop_writes.md; the contended-writer
 stall itself is shown by test_mutation_prepare_off_loop / test_claim_reopen_off_loop).
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import asyncio
 import threading
 from types import SimpleNamespace
@@ -28,7 +29,7 @@ def _owner(tmp_path, monkeypatch, handle):
                              _resolve_session_agent_runtime=lambda **k: ('frozen', {}))
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
+                                 epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
     return store, authority, AuthorityConnection(authority, object(), {'user_id': 'human'})
 
 
@@ -116,7 +117,7 @@ async def _native_register(authority, owner, tmp_path, db):
 
 
 async def _initialize(authority, owner, tmp_path, db):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     authority.runner.session_authority = None
     authority.runner._session_db = db
     await initialize_session_authority(authority.runner, profile_id='owned', instance_id='second')
@@ -148,7 +149,7 @@ async def _first_read_adoption(authority, owner, tmp_path, db):
     runner.session_store, runner._session_db, runner.adapters = store, store._db, {}
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     cold = SessionAuthority(runner, profile_id='owned', instance_id='cold', db=store._db,
-                            epoch=rt.begin_runtime_epoch(store._db, instance_id='cold'))
+                            epoch=_begin_owned_runtime_epoch(store._db, instance_id='cold'))
     reader = AuthorityConnection(cold, object(), {'user_id': 'human'})
     try:
         reply = await reader.dispatch({'id': 1, 'method': 'session.resume', 'params': {'session_id': ref.session_id}})

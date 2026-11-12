@@ -23,6 +23,7 @@ from pm.package import InstallError, Package, Runner, StatePackage, compose_env
 from pm.plugin_inputs import Candidates, Members, PluginInput, Selection, StagedUpdate
 from pm.registry import get_package, walk
 from pm.store import Store, current_target, merge_tree, tree_digest
+from pm.worker_budget import unbounded
 
 LOG = logging.getLogger(__name__)
 _active_install_store: ContextVar[Store | None] = ContextVar("pm_active_install_store", default=None)
@@ -40,6 +41,7 @@ def _using_install_store(store: Store):
         _active_install_store.reset(token)
 
 
+@unbounded()
 def _prepare_artifacts(package, store, scratch, artifacts, version, target, *,
                        progress=None, pause_event=None, download_progress=None):
     def tick(done, total, ranges):
@@ -81,7 +83,7 @@ def _store() -> Store:
 
 
 def _heal_exec_bit(binary: Path) -> bool:
-    """agent-browser entries staged before stage() set the exec bit sit at 0644 and fail every
+    """Store entries staged from archives that drop the exec bit sit at 0644 and fail every
     launch with PermissionError. Modes are not part of the pinned digest, so restore it in place;
     an entry we cannot chmod (sealed store) is treated as not installed."""
     if os.name == "nt" or os.access(binary, os.X_OK):
@@ -378,6 +380,33 @@ def _entry_current(package, lockfile, facts, store, entry, previous, version, pi
     return recorded == pin and not package.verify(entry, target)
 
 
+def _refresh_recorded_env(package, facts, store, entry, previous, target) -> None:
+    """An entry's env is derived from the package code, not its bytes: when the code changes it (a
+    variable renamed or retired), re-record it so stores installed earlier match what admission
+    compares against. The recorded digest still vouches for the bytes, so nothing is re-fetched."""
+    env = package.env(entry, target)
+    if facts.env_for(package.name, store.root) != env:
+        facts.record(package.name, previous["version"], previous["entry"], env, store.root,
+                     target=previous.get("target"), artifacts=previous.get("artifacts"),
+                     digest=previous.get("digest"))
+
+
+def _refresh_found_env(package, location, target, operation) -> None:
+    """:func:`_refresh_recorded_env` for an entry ``ensure`` found installed: `hermes update` skips
+    installed defaults, so no install would re-record it. Only the writable store is re-recorded, under
+    its install lock (a sealed store's facts ship with the artifact)."""
+    facts, store = location
+    entry = store.entry(facts.get(package.name)["entry"])
+    if (facts.env_for(package.name, store.root) == package.env(entry, target)
+            or store.root != Store(paths.writable_store_root()).root):
+        return
+    with nullcontext() if operation is not None else store.install_lock():
+        facts.reload()
+        previous = facts.get(package.name)
+        if previous and previous.get("entry") == entry.name:
+            _refresh_recorded_env(package, facts, store, entry, previous, target)
+
+
 def _copy_verified_source(package, lockfile, copy_from, staged, version, target) -> None:
     source_facts, source_store = copy_from
     source = source_facts.get(package.name)
@@ -444,6 +473,8 @@ def _install(
         _reclaim_set_aside(store)
         if (_entry_current(package, lockfile, facts, store, entry, previous, version, pin, target)
                 and not _fresh_copy):
+            if facts is not None:
+                _refresh_recorded_env(package, facts, store, entry, previous, target)
             _remove_downloads(store, artifacts)
             return entry
         if not artifacts:
@@ -572,9 +603,11 @@ def ensure(
                     json.dumps(_identity(lockfile, package.name, target), sort_keys=True))
         if identity in checked:
             continue
-        if _installed_location(package, lockfile, target, verify=explicit and verify) is None:
+        location = _installed_location(package, lockfile, target, verify=explicit and verify)
+        if location is None:
             missing.append(package)
         else:
+            _refresh_found_env(package, location, target, _operation)
             checked.add(identity)
     if missing and not explicit and not lazy_installs_allowed():
         raise _refuse_lazy(name, ", ".join(p.name for p in missing))

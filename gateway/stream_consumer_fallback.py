@@ -24,9 +24,11 @@ class StreamFallbackMixin:
         if not text.strip():
             return reply_to_id
         try:
-            result = await self.adapter.send(
-                chat_id=self.chat_id, content=text, reply_to=reply_to_id,
-                metadata=self._metadata_for_send(final=final, expect_edits=not final))
+            from gateway.reply_latency import delivery_scope
+            with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_send"):
+                result = await self.adapter.send(
+                    chat_id=self.chat_id, content=text, reply_to=reply_to_id,
+                    metadata=self._metadata_for_send(final=final, expect_edits=not final))
             self._record_first_reply(text, result)
             if not (result.success and result.message_id):
                 self._edit_supported = False
@@ -85,8 +87,9 @@ class StreamFallbackMixin:
                            ) -> list[str]:
         """Split text for fallback sends: newline-preferred, fence-balanced across chunks."""
         from gateway.platforms.helpers import split_text_fence_aware
-        return split_text_fence_aware(text, limit, len_fn, prefer_paragraphs=False,
-                                      balance_fences=True)
+        from gateway.copy_blocks import balance_copy_quote_chunks
+        return balance_copy_quote_chunks(split_text_fence_aware(
+            text, limit, len_fn, prefer_paragraphs=False, balance_fences=True))
 
     def _truncate_for_stream(self, text: str, limit: int, len_fn: Callable[[str], int],
                              ) -> list[str]:
@@ -101,7 +104,8 @@ class StreamFallbackMixin:
             chunks = truncate(text, limit)
         if not isinstance(chunks, (list, tuple)) or not all(isinstance(c, str) for c in chunks):
             return self._split_text_chunks(text, limit, len_fn)
-        return list(chunks)
+        from gateway.copy_blocks import balance_copy_quote_chunks
+        return balance_copy_quote_chunks(list(chunks))
 
     async def _send_fallback_final(self, text: str) -> None:
         """Send the final continuation after streaming edits stop working (one flood retry
@@ -168,6 +172,8 @@ class StreamFallbackMixin:
         self._already_sent = True
         # Recorder substitutes the unsplit ledger on a split turn.
         self._mark_final_delivered(record=final_text)
+        from gateway.reply_latency import record_final_reply
+        record_final_reply(getattr(self, "_reply_latency_receipt", None), chunks[-1], result)
         self._last_sent_text = chunks[-1]
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
@@ -241,7 +247,9 @@ class StreamFallbackMixin:
             kwargs["reply_to"] = reply_to
         result = None
         for attempt in range(2):
-            result = await self.adapter.send(**kwargs)
+            from gateway.reply_latency import delivery_scope
+            with delivery_scope(getattr(self, "_reply_latency_receipt", None), "text_send"):
+                result = await self.adapter.send(**kwargs)
             if getattr(result, "success", False):
                 self._record_first_reply(content, result)
                 break
@@ -359,8 +367,8 @@ class StreamFallbackMixin:
         """Send a completed interim assistant commentary message."""
         # Commentary is a whole message, so whole-text extraction is exact here; copy
         # blocks belong only to the final answer's separate deliveries.
-        from gateway.copy_blocks import render_copy_blocks_inline
-        text = self._clean_for_display(render_copy_blocks_inline(text))
+        from gateway.copy_blocks import copy_free_text_for
+        text = self._clean_for_display(copy_free_text_for(self.adapter, text))
         if not text.strip():
             return False
         try:

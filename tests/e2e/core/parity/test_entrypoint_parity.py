@@ -16,10 +16,10 @@ Desktop/gateway/ACP/cron" class:
 * the documented toolset's core feature tools are present, the disabled toolset
   is absent;
 * the surface delivered the model's answer to its client;
-* after the surface's normal shutdown no MCP server / grandchild survives. For the
-  gateway-client surfaces (``-z``, ``chat -q``, ``acp``, ``cron run``) the turn runs
-  in the profile's ``gateway run`` daemon, which outlives the client by design;
-  their normal shutdown is client exit + ``hermes gateway stop``.
+* after the surface's normal shutdown no MCP server / grandchild survives. Finite
+  ``-z`` and ``chat -q -Q`` clients must release their private gateway on client exit
+  alone. Persistent ``acp``/``cron run`` clients reuse a daemon and still require
+  client exit + ``hermes gateway stop``.
 
 ``PARITY_TABLE_OUT=<path>`` appends a markdown row per entrypoint (REPORT.md table).
 """
@@ -47,6 +47,7 @@ from tests.e2e.core.parity._helpers import (
     check_invariants,
     collect_observation,
     describe_pids,
+    failure_log_tail,
     kill_tagged,
     mcp_pids,
     start_provider,
@@ -125,7 +126,8 @@ def _run_row(entrypoint: str, root: Path) -> Row:
             f"  surviving MCP-tree pids: {describe_pids(survivors)} (mcp pid log {pids})\n"
             f"  final text: {(result.final_text or '')[-300:]!r}\n"
             f"  host exit code: {result.extra.get('exit_code')}\n"
-            f"  host stderr tail: {stderr_tail[-1500:]}"
+            f"  host stderr tail: {stderr_tail[-1500:]}\n"
+            f"  plugin/discovery/hook log tail:\n{failure_log_tail(ph)}"
         )
     except Exception as exc:
         row.error = f"{type(exc).__name__}: {exc}"[:4000]

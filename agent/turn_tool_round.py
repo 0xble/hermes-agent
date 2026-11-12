@@ -24,6 +24,9 @@ _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session
 # Rounds whose visible line is the turn's reply if the follow-up is empty (no empty-response nudge):
 # housekeeping, and setup_beat, whose card already blocked for the user's answer.
 _LINE_IS_REPLY_TOOLS = _HOUSEKEEPING_TOOLS | {"setup_beat"}
+# Turns with no fresh user message. A guardrail halt there must not ask anyone to "continue".
+_UNATTENDED_TURN_ORIGINS = frozenset({"relay", "process", "goal_loop", "cron"})
+_UNATTENDED_HALT_LIMIT = 3
 
 
 @dataclass
@@ -44,6 +47,43 @@ class ToolRoundVerdict:
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
     result: Optional[dict[str, Any]] = None
+
+
+def _end_turn_on_guardrail_halt(agent: Any, messages: Any) -> Optional[str]:
+    """Handle a pending guardrail halt; returns the halt reply when the turn must end, else None.
+
+    An unattended turn (no fresh user message, or nobody reading) keeps working after the first
+    blocks: the blocked call already has a synthetic tool result, so the model can switch tools.
+    It still hard-stops on the ``_UNATTENDED_HALT_LIMIT``-th halt so a dead endpoint stays bounded,
+    and that reply states what failed without asking anyone to respond."""
+    from agent.session_source import is_attended
+
+    decision = agent._tool_guardrail_halt_decision
+    provenance = getattr(agent, "_turn_provenance", "unknown")
+    unattended = provenance in _UNATTENDED_TURN_ORIGINS or (provenance != "user" and not is_attended(agent))
+    if unattended:
+        agent._unattended_guardrail_halts = getattr(agent, "_unattended_guardrail_halts", 0) + 1
+        if agent._unattended_guardrail_halts < _UNATTENDED_HALT_LIMIT:
+            agent._tool_guardrail_halt_decision = None
+            clear_halt = getattr(agent._tool_guardrails, "clear_halt_decision", None)
+            if clear_halt is not None:
+                clear_halt(decision)
+            agent._emit_diagnostic_status(
+                f"⚠️ Tool guardrail blocked {decision.tool_name}: {decision.code}; continuing turn"
+            )
+            return None
+    final_response = agent._toolguard_controlled_halt_response(decision, unattended=unattended)
+    agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
+    append_message(messages, {"role": "assistant", "content": final_response})
+    # Emit the halt so it isn't mistaken for a crash; the stream callback is still
+    # alive, so SSE/TUI clients see the explanation. A held turn shows it as the final only.
+    if final_response:
+        agent._safe_print(f"\n{final_response}\n")
+        if agent.stream_delta_callback and not getattr(agent, "_hold_stream", False):
+            with suppress(Exception):
+                agent.stream_delta_callback(final_response)
+                agent.stream_delta_callback(None)
+    return final_response
 
 
 def run_tool_round(
@@ -168,6 +208,11 @@ def run_tool_round(
         with suppress(Exception):
             agent.stream_delta_callback(None)
 
+    # Opt-in (compression.prepare_ahead): when this response put the session near the trigger,
+    # write the next compaction summary while the tools run. No-op otherwise; never raises.
+    from agent.prepared_compaction import maybe_prepare
+    maybe_prepare(agent, messages, origin="tool-batch")
+
     agent._execute_tool_calls(assistant_message, messages, effective_task_id, api_call_count)
     from hermes_cli.observability.shared_metrics_harness import finish_tool_round
 
@@ -182,20 +227,11 @@ def run_tool_round(
         return _verdict("break")
 
     if agent._tool_guardrail_halt_decision is not None:
-        decision = agent._tool_guardrail_halt_decision
-        _turn_exit_reason = "guardrail_halt"
-        final_response = agent._toolguard_controlled_halt_response(decision)
-        agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
-        append_message(messages, {"role": "assistant", "content": final_response})
-        # Emit the halt so it isn't mistaken for a crash; the stream callback is still
-        # alive, so SSE/TUI clients see the explanation.
-        if final_response:
-            agent._safe_print(f"\n{final_response}\n")
-            if agent.stream_delta_callback:
-                with suppress(Exception):
-                    agent.stream_delta_callback(final_response)
-                    agent.stream_delta_callback(None)
-        return _verdict("break")
+        halt_reply = _end_turn_on_guardrail_halt(agent, messages)
+        if halt_reply is not None:
+            final_response = halt_reply
+            _turn_exit_reason = "guardrail_halt"
+            return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0
@@ -286,7 +322,7 @@ def stage_tool_call_message(
         agent._last_content_tools_all_housekeeping = _line_is_reply
         if _all_housekeeping and agent._has_stream_consumers():
             agent._mute_post_response = True
-        elif agent._should_emit_quiet_tool_messages():
+        elif agent._should_emit_quiet_tool_messages() and not getattr(agent, "_hold_stream", False):
             clean = agent._strip_think_blocks(turn_content).strip()
             if clean:
                 agent._vprint(f"  ┊ 💬 {clean}")

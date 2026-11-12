@@ -6,7 +6,7 @@ import threading
 
 
 def test_passed_gate_tick_and_queued_job_remain_busy_until_real_worker_exit(tmp_path, monkeypatch):
-    from cron import jobs, scheduler, scheduler_tick
+    from cron import jobs, scheduler, scheduler_admission, scheduler_tick
     from hermes_cli import backend_retirement
 
     fence = backend_retirement.RetirementFence()
@@ -33,8 +33,14 @@ def test_passed_gate_tick_and_queued_job_remain_busy_until_real_worker_exit(tmp_
 
     monkeypatch.setattr(scheduler, "get_due_jobs", get_due_jobs)
     monkeypatch.setattr(scheduler_tick, "process_due_job", process_job)
-    with ThreadPoolExecutor(max_workers=1) as pool, ThreadPoolExecutor(max_workers=1) as ticker:
+    with (
+        ThreadPoolExecutor(max_workers=1) as pool,
+        ThreadPoolExecutor(max_workers=1) as script_pool,
+        ThreadPoolExecutor(max_workers=1) as ticker,
+    ):
         monkeypatch.setattr(scheduler, "_get_parallel_pool", lambda *args: pool)
+        # no_agent jobs have their own lane; join its completion callback too.
+        monkeypatch.setattr(scheduler_admission, "_get_lane_pool", lambda *args: script_pool)
         tick = ticker.submit(scheduler.tick, verbose=False, sync=False, can_dispatch=lambda: gate_calls.append(True) or True)
         try:
             assert reached.wait(10)

@@ -7,6 +7,10 @@ checks an existing setup. `bin/ci list` describes the seven default lanes.
 `bin/ci check --lane node` is explicitly partial evidence, never a full pass.
 
 The desktop E2E workflow installs the same Python 3.14.7 it selects for sync.
+The Linux node lane, the gate's Linux job, and desktop core E2E also install
+`libx11-dev` and `libxi-dev` so `hud-modifier-monitor-x11.c` compiles. Without
+those headers the build warns and omits the Linux helper. Python shards do not
+build that monitor and do not install the headers.
 Desktop typechecking includes test sources, so native filesystem test helpers
 must import the operations they call even when the test runs only on Linux.
 Update receipt tests bind ContextVars through their scope and isolate ownership
@@ -33,6 +37,16 @@ when the parent leaves it unset; an empty value still autoloads built-in
 cmdlets from `$PSHOME\Modules` in both Windows PowerShell 5.1 and pwsh 7
 (native run 38399052622), and
 `tests/scripts/ci/test_portable_windows_environment.py` pins that contract.
+Common AppData's registry default is `%SystemDrive%\ProgramData`. Both
+`portable.environment()` and `scripts/run_tests.sh` keep `SystemDrive`,
+`SystemRoot`, `ProgramData`, and `ALLUSERSPROFILE` so that expansion lands
+outside the checkout. Stripping the drive makes shell components create a
+literal `%SystemDrive%` directory in the checkout (`Microsoft/Windows/Caches`,
+WER, Defender scan caches). `source_unchanged` still rejects those files;
+the allowlist is what keeps them from appearing. Per-user AppData stays in
+the disposable home. The uv-shim suite
+`scripts/tests/test-install-ps1-uv-shim-validation.ps1` must exist: the
+native lane names it under both `powershell` and `pwsh`.
 
 The full gate runs all selected lanes and returns nonzero if any fails. Within
 static checks and container lint, independent commands also aggregate failures.
@@ -75,18 +89,153 @@ There is no host-wide install lock. Fork patch identity: `ci-shared-download-cac
 When Linux makes the normal disk-backed Python scratch path read-only, Python
 fixtures use a unique directory under the runner's original disk-backed HOME,
 outside the isolated child HOME. Temporary parents with Git or Node dependency
-ancestry are rejected. Only invocation-owned directories are cleaned. A kernel lock prevents concurrent setup/check in that checkout and is
+ancestry are rejected. Startup also reclaims abandoned CI homes under that same
+temporary parent, as specified below. A kernel lock prevents concurrent setup/check in that checkout and is
 released automatically on process exit. Checkouts never use another checkout's
 venv or personal pytest plugin. Setup and checks reject a symlinked checkout
 `.venv` before syncing dependencies or selecting its interpreter, including
 chained and dangling links. Remove the symlink explicitly and run `bin/ci setup`
 to create a checkout-owned environment; the gate never removes it for you.
 This isolation guard extends `fork-ci-reliability`; focused regressions live in
-`scripts/ci/tests/test_portable.py`. Credential and test-selection environment
+`scripts/ci/tests/test_portable.py`. `git()`, `run()`, `git_environment()`, and
+`source_files()` resolve an omitted checkout against the current module `ROOT`
+when called, so a fixture that patches `ROOT` runs Git in that checkout rather
+than the checkout captured at import. Explicit `git_environment(root=None)` still
+trusts no checkout. Credential and test-selection environment
 variables are absent from the child environment. Installed rustup users share
 only the resolved toolchain executable directory. Cargo configuration/cache is
 checkout-owned. Setup/check detect any edits to pre-existing source files and
 fail without overwriting the contributor's work.
+
+Portable temporary-parent selection treats non-empty `TMPDIR` as a required
+parent, even when Python's temporary-directory cache already names another
+volume. Missing paths, non-directories and failed write probes stop setup before
+any lane and name the requested path, without fallback. Unset or empty `TMPDIR`
+keeps the stdlib default. All implicit CI temp parents share this helper, while
+the existing Git/Node ancestry check stays unchanged. This extends
+`fork-ci-reliability`. Retire it when the replacement CI runner enforces the
+same requested-volume contract.
+
+Contract tests: `tests/scripts/ci/test_portable_tmpdir.py`
+
+On macOS, every execution profile additionally probes its invocation-owned
+scratch filesystem before environment setup or any lane starts. Creating `a`
+must not make `A` resolve. A case-insensitive scratch volume fails explicitly
+because the desktop security tests need distinct `Vault`/`vault` and
+`.hermes`/`.HERMES` identities. Linux and Windows retain their existing behavior.
+Direct npm runs of `plugin-files-spellings.test.ts` also probe their actual
+scratch directory before the case-only fixtures, so they cannot pass vacuously.
+This extends `fork-ci-reliability`; native macOS precondition regressions live
+in `tests/scripts/ci/test_portable_case_sensitive.py`.
+
+Provision disposable scratch explicitly, outside the gate:
+
+```bash
+ci_tmp=$(scripts/ci/case-sensitive-tmpdir.sh)
+TMPDIR="$ci_tmp" ./bin/ci gate "$(git rev-parse HEAD)"
+# Or run the desktop file directly with the same TMPDIR:
+TMPDIR="$ci_tmp" npm --prefix apps/desktop run test:desktop:platforms -- electron/plugin-files-spellings.test.ts
+```
+
+The helper creates and attaches a disposable 20-GB sparse case-sensitive APFS
+image with `-nobrowse`, prints only its TMPDIR on stdout, and prints cleanup
+commands on stderr. An optional argument selects a new scratch directory and
+refuses an existing one. It never provisions implicitly inside CI or touches
+an existing image. After all owned CI children exit, detach by the printed
+mount path, remove that image, and remove its empty mount and parent directories:
+
+```bash
+ci_scratch=${ci_tmp%/mnt/tmp}
+hdiutil detach "$ci_scratch/mnt"
+rm "$ci_scratch/scratch.sparseimage"
+rmdir "$ci_scratch/mnt" "$ci_scratch"
+```
+
+## portable-ci-home-sweep
+
+Fork patch identity: `portable-ci-home-sweep`. The identity exactly matches this
+unit's section title. Source baseline: `d26ea98988f516e2c46d455ea428e8d486ee02af`.
+
+Every `hermes-ci-home-*` wrapper holds `.owner.lock` for its lifetime and records
+PID, OS process creation time, and hostname in `.owner.json`. Creation, owner
+publication, sweeping, and normal teardown share a parent registry lock. A sweep
+only considers direct, real directories with this prefix. It never removes a
+home with a held owner lock, even when its PID marker is incorrect. An unlocked
+marked home is abandoned, including after SIGKILL or PID reuse. The kernel lock,
+rather than a process-list snapshot or hostname comparison, is authoritative.
+Do not replace it with PID-only ownership.
+
+Unmarked homes need at least 24 hours of inactivity by the newest mtime of the
+home and its immediate entries. No recursive `lsof +D` scan is attempted against
+potentially 68-GB trees. This is the conservative age-only legacy fallback, not
+proof that every legacy descendant is closed. Symlinks and Windows reparse
+directories are not traversed. Per-home filesystem errors are logged and left
+for a later run. Reclamation logs home count and allocated bytes. Allocated bytes
+are summed without following links, not a measurement of APFS exclusive extents.
+The registry lock is held during reclamation, so startup can wait behind a large
+deletion. Windows uses the equivalent kernel byte lock and closes it before
+removing its file under the registry lock. Native Windows execution remains
+separate qualification.
+
+Removal restores owner permissions on read-only entries before retrying the
+failed operation, preserving `TemporaryDirectory`'s normal teardown behavior.
+The portable runner keeps this stdlib-only because importing `utils` also loads
+the application's YAML dependency. Payload entries are removed before
+`.owner.json` and `.owner.lock`. A partial payload failure therefore retains
+both ownership files, so the next sweep retries immediately instead of applying
+the 24-hour legacy delay.
+
+### Environment materialization
+
+The wrapper creates an empty HOME, not a copy of the installed runtime. PM's
+`Venv.apply` in `pm/packages.py` makes UUID generations under
+`installs/<checkout-path-hash>/environments`, including a writable dependency
+workspace. `pm/runtime.py::prepare_runtime` separately stages and selects the
+manager runtime. `hermes_cli/boot_bootstrap.py` records per-install boot steps.
+The install ID hashes the checkout path, not the dependency lock. Different
+extras, plugin graphs, source changes and repair operations can create distinct
+generations in the same install. The original prepare-before-select rationale is
+recorded in `92686159d13cf56ee47fc9d0f4854d093b9f859f`.
+
+Sharing these whole trees by lock hash would couple writable selections,
+workspaces, leases, editable paths and repair state. The real cold-runtime test
+`tests/pm/test_cold_runtime_e2e.py` changes the source lock, builds a new app,
+removes a dependency, and repairs it into another environment. The real-build
+contract `tests/pm/test_environment_build.py` changes a plugin dependency and
+checks that failed preparation preserves the selected environment. Those
+operations require isolated, writable state. Materialization is retained.
+The cold CLI source fixture derives a first-party import closure from
+`hermes_bootstrap` and `hermes_cli`, treating repository packages as atomic so
+lazy worker imports and package data ship together. It scans deferred imports
+as well as module-load imports, without executing the application. The root
+application manifest and lock remain excluded. This avoids the old hand-copied
+package list drifting when the CLI imports another package, such as
+`gateway.client_lifetime`. The every-host contract in
+`tests/pm/test_cold_snapshot.py` checks resolution independently of the Linux
+cold-runtime E2E toolchain. This extends `fork-ci-reliability`.
+The tiny app recipe also supplies `python-dotenv`, required by the real legacy
+launch's config migration. No production root manifest or lock is copied, and
+the provisioning, plugin discovery, source-update and repair assertions remain
+unchanged.
+
+Contract tests: `tests/pm/test_cold_snapshot.py`, `tests/pm/test_cold_runtime_e2e.py`.
+
+This patch adds no shared environment cache and makes no per-run storage
+reduction claim. The existing portable uv download cache already requests APFS
+clones where supported. PM's private engine deliberately strips ambient `UV_*`
+settings and selects its own cache, so that portable optimization does not imply
+all PM generation builds share its cache. Retain that boundary in this scoped
+fix rather than redirecting test dependency state into a shared runtime.
+
+### Regression and retirement
+
+Contract tests: `tests/scripts/ci/test_portable_homes.py`. They exercise dead
+owners, a held lock despite a bad PID, PID reuse, fresh and old legacy homes,
+top-level activity, symlink boundaries, read-only teardown and reclamation,
+retry after partial removal, and SIGKILL followed by a fresh process using the
+real wrapper. All parents are test-owned. Retire this fork patch only
+when the replacement wrapper proves the same crash reclamation and live-owner
+preservation contracts. Reverting the patch restores normal-exit cleanup only.
 
 Docs generators run in a disposable copy of source, including uncommitted
 contributor edits. Parity compares file content and the complete added/deleted
@@ -261,6 +410,12 @@ The explicit checkpoint exception imports upstream Python 3.14 and the native PM
 Release, signing, store publishing and channel promotion workflows remain removed under the fork workflow policy. Tests whose entire owner disappeared are retired with that owner. Generic archive/link, SHA admission, ancestry and receipt security tests remain. Workflow policy coverage remains in `scripts/ci/tests/test_portable.py` and `tests/ci/test_workflow_job_graph.py`. The resumable reconciliation evidence records each removed test owner and partial retirement separately.
 
 ## Native Checkpoint Fixture Boundaries
+
+The plugin subdirectory-update scan fixture depends on the shared `admission_env`
+fixture, which pins local uv/Python and runs the real PM dependency transaction
+in-process. Its callers cannot accidentally bootstrap a downloadable toolchain
+before reaching the caution/dangerous scan assertions. Worker transport remains
+covered by the separate plugin worker fixtures.
 
 Release-publication corruption tests call the actual `scripts.bundles.release_artifacts promote` and builds-table CLI owners. Termux build tests call the native build driver directly. Neither depends on a deleted Actions workflow. Archive fixtures force-add their declared local wheel directory, so a contributor's global Git ignore cannot silently remove the fixture dependency from the archived source. Python payload signing requires both a Darwin host and a Darwin target.
 

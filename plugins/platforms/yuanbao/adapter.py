@@ -217,6 +217,7 @@ class SignManager:
                 timestamp = cls.build_timestamp()
                 payload = {"app_key": app_key, "nonce": nonce,
                            "signature": cls.compute_signature(nonce, timestamp, app_key, app_secret), "timestamp": timestamp}
+                version = get_version_info().base_version
                 headers = {"Content-Type": "application/json", "X-AppVersion": version, "X-OperationSystem": _OPERATION_SYSTEM,
                            "X-Instance-Id": _YUANBAO_INSTANCE_ID, "X-Bot-Version": version}
                 if route_env:
@@ -1885,8 +1886,7 @@ class ConnectionManager:
         if self._ws is None:
             return False
         uid = adapter._bot_id or token_data.get("bot_id", "")
-        msg_id = str(uuid.uuid4())
-        version = get_version_info().base_version
+        msg_id, version = str(uuid.uuid4()), get_version_info().base_version
         await self._ws.send(encode_auth_bind(
             biz_id="ybBot", uid=uid, source=token_data.get("source") or "bot", token=token_data.get("token", ""),
             msg_id=msg_id, app_version=version, operation_system=_OPERATION_SYSTEM, bot_version=version,

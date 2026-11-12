@@ -100,6 +100,7 @@ def test_remapped_session_key_shares_protected_state_across_fill_and_readers():
     """A task whose browser runs under a remapped session key (hybrid sidecar) must hit the
     same protected-date entry from the fill, the output egress and the pixel guard."""
     from agent.browser_output_egress import scrub_browser_result
+    from agent.vault_backends.local import LocalLoginBackend
     from agent.vault_store import VaultItemMeta
     from tools import browser_vault_tool
     from tools.browser_tool_vision import blocked_protected_date_pixels
@@ -107,7 +108,7 @@ def test_remapped_session_key_shares_protected_state_across_fill_and_readers():
     meta = VaultItemMeta(id="op:field:remap", kind="protected_field", label="Traveler date of birth",
                          origin=ORIGIN, created_at="", allowed_origins=(ORIGIN,), field_token="bday")
 
-    class Backend:
+    class Backend(LocalLoginBackend):
         name, display_name, needs_unlock, binds_cards_to_page = "onepassword", "1Password", False, False
 
         def is_unlocked(self):

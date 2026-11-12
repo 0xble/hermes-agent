@@ -9,7 +9,7 @@ async def test_telegram_fifo_runs_task_wakes_once_without_ingress_redelivery(mon
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress import executing_admission
     from gateway.session_results import execution_result
     from hermes_constants import get_hermes_home
@@ -74,4 +74,5 @@ async def test_telegram_fifo_runs_task_wakes_once_without_ingress_redelivery(mon
     assert len(await rows()) == 2
     store = Outbox(get_hermes_home())
     for row, (_, _, turn_id) in zip(await rows(), turns):
-        assert store.lookup('default', 'telegram', 'admission:' + row['admission_id'], 'text') == (turn_id, 'completed')
+        claim = f"admission:{row['admission_id']}:{row['generation']}"
+        assert store.lookup('default', 'telegram', claim, 'text') == (turn_id, 'completed')

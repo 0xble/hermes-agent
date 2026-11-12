@@ -437,6 +437,9 @@ def _drive_authority_fallback(monkeypatch, *, capabilities, profile_id, method):
         def __init__(self, authority, transport, identity, operator=False):
             self.actor = type("Actor", (), {"capabilities": frozenset(capabilities), "profile_id": profile_id})()
 
+        def awaits_profile_start(self, req, held):
+            return None  # no profile is starting
+
         async def dispatch(self, req):
             return {"jsonrpc": "2.0", "id": req["id"], "error": {"code": -32601, "message": "unknown method"}}
 
@@ -545,7 +548,7 @@ def test_legacy_fallback_never_writes_an_authority_owned_session(monkeypatch, tm
     from types import SimpleNamespace
     from gateway.session_authority import LiveSession, SessionAuthority
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
     with SessionDB(db_path=tmp_path / "state.db") as db:

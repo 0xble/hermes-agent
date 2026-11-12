@@ -10,7 +10,7 @@ from typing import Any
 
 from agent.i18n import t
 from hermes_cli.gateway_client import GatewayClientError
-from hermes_cli.goal_notices import goal_notices_enabled
+from hermes_cli.goal_notices import goal_notices_enabled, loop_notices_enabled
 from rich.markup import escape as _escape
 
 
@@ -695,6 +695,7 @@ class CLILoopsMixin:
         if getattr(self, "_heartbeat_watchdog_started", False):
             return
         self._heartbeat_watchdog_started = True
+        from hermes_cli.gateway_automation import GatewayHeartbeatManager
         from hermes_cli.heartbeat import POLL_SECONDS
 
         def _loop():
@@ -703,6 +704,10 @@ class CLILoopsMixin:
                     time.sleep(POLL_SECONDS)
                     try:
                         mgr = self._get_heartbeat_manager()
+                        if isinstance(mgr, GatewayHeartbeatManager):
+                            # The gateway poller stands down while this watchdog runs, so a resume,
+                            # set or re-anchor from another viewer must reach this copy.
+                            mgr.refresh()
                         if mgr is None or not mgr.is_active():
                             continue
                         busy = (
@@ -808,7 +813,9 @@ class CLILoopsMixin:
         # judge; complete them immediately (caps and scheduling still apply).
         if wakeup.lstrip().startswith("/"):
             try:
-                _print_decision_message(mgr.complete_tick(""))
+                decision = mgr.complete_tick("")
+                if loop_notices_enabled():
+                    _print_decision_message(decision)
             except Exception:
                 pass
 
@@ -861,6 +868,8 @@ class CLILoopsMixin:
         # earlier reply's marker is not this wakeup's response.
         response, successful = self._post_turn_response()
         decision = mgr.complete_tick(response if successful else "")
+        if not loop_notices_enabled():
+            return
         # With the live-work dock up its loop row carries the countdown; the one-shot line would go stale.
         if (not _print_decision_message(decision) and decision.get("status") == "active"
                 and mgr.state is not None and getattr(self, "_subagent_monitor", None) is None):
@@ -940,6 +949,7 @@ class CLILoopsMixin:
             _bg_procs = None
         decision = mgr.evaluate_after_turn(
             last_response, user_initiated=getattr(self, "_goal_turn_user_initiated", True),
+            turn_started_at=getattr(self, "_last_turn_started_at", None),
             background_processes=_bg_procs, active_delegations=_active_deleg)
         if goal_notices_enabled():
             _print_decision_message(decision)

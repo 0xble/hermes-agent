@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
 from hermes_constants import get_hermes_home, get_process_hermes_home, hermes_home_key
+from hermes_cli.plugin_injection import GatewayInjectionHandle
 from registration_lifecycle import replacement_coordinator
 from utils import env_var_enabled
 from hermes_cli.config import load_config_readonly
@@ -37,7 +38,7 @@ from hermes_cli.plugin_capabilities import plugin_capability_granted
 from hermes_cli.relay_plugin_cutover import RELAY_PLUGINS_CONFIG_ENV, legacy_relay_plugin_keys
 # Sibling modules' names are re-exported here (origin) so plugins and tests keep one import path.
 from hermes_cli.plugins_manifest import (
-    _CONFIG_SCHEMA_TYPES, SUPPORTED_MANIFEST_VERSION, PluginManifest, _portable_skill_namespace,
+    _CONFIG_SCHEMA_TYPES, SUPPORTED_MANIFEST_VERSION, PluginManifest, _portable_data_namespace,
     manifest_key, parse_manifest_file, resolve_module_origin, resolve_plugin_load_order,
     validate_config_schema,
 )
@@ -61,8 +62,9 @@ from hermes_cli.plugins_dispatch import (
     _join_background_discovery, _loop_observer_snapshot,
     format_system_prompt_sections, is_valid_system_prompt_section_id, resolve_plugin_command_result,
 )
+from hermes_cli.plugins_capability_ctx import PluginCapabilityCtxMixin
 from hermes_cli.plugins_ledger import PluginLedgerMixin, PluginRegistration
-from hermes_cli.plugins_registrars import _NAME_NORMALIZERS, _SCOPED_PROVIDER_REGISTRARS
+from hermes_cli.plugins_registrars import _SCOPED_PROVIDER_REGISTRARS, make_scoped_provider_registrar
 from hermes_cli.plugins_state import (
     PluginState, _locked_plugin_state, _nested_plugin_mapping, _nested_plugin_value,
     _plugin_relative_segments, _plugin_settings_entry, save_plugin_setting,
@@ -235,7 +237,7 @@ class LoadedPlugin:
     deferred: bool = False
 
 
-class PluginContext:
+class PluginContext(PluginCapabilityCtxMixin):
     """Facade given to plugins so they can register tools and hooks."""
 
     def __init__(self, manifest: PluginManifest, manager: PluginManager):
@@ -290,7 +292,7 @@ class PluginContext:
     @cached_property
     def state(self) -> PluginState:
         """This plugin's profile-scoped durable JSON state facade."""
-        return PluginState(self.plugin_id, self.manifest.skill_namespace)
+        return PluginState(self.plugin_id, self.manifest.data_namespace)
 
     @cached_property
     def platform_actions(self):
@@ -400,8 +402,8 @@ class PluginContext:
 
     @cached_property
     def delegation_backends(self) -> Any:
-        """``agent.delegation_backends.DelegationBackends``: list delegation backends and switch them per session or
-        globally (a ``/delegation`` command); a host remote facade, so it acts on the owner process."""
+        """``agent.delegation_backends.DelegationBackends``: list delegation backends and save one, optionally
+        rebuilding the calling session's tools now (``/delegation``); a host remote facade on the owner process."""
         from agent.delegation_backends import DelegationBackends
         return DelegationBackends()
 
@@ -508,15 +510,6 @@ class PluginContext:
                      " (override)" if override else "")
         return handle
 
-    # -- capability probing (#64228) -----------------------------------------
-    def has_capability(self, capability: str) -> bool:
-        """True when *capability* is live for this plugin (probe, then degrade gracefully). Bundled
-        plugins are trusted for ``tools.override``; otherwise granted_capabilities or the legacy
-        ``allow_*`` key decides. Unknown ids / unreadable consent -> False (fail closed)."""
-        if self.manifest.source == "bundled" and capability == "tools.override":
-            return True
-        return plugin_capability_granted(self.plugin_id, capability)
-
     def call_mcp(
         self, server: str, tool: str, arguments: Optional[dict[str, Any]] = None,
         timeout: float = 30,
@@ -606,7 +599,8 @@ class PluginContext:
     def inject_message(
         self, content: str, role: str = "user", *, session_key: str | None = None,
         origin: Mapping[str, Any] | None = None,
-    ) -> bool:
+        await_dispatch: bool = False, correlation_id: str | None = None,
+    ) -> bool | GatewayInjectionHandle:
         """Inject a message into a CLI, Ink TUI/desktop, or messaging-gateway conversation.
 
         CLI uses the attached REPL queues. Ink TUI and desktop use a separate injector
@@ -617,10 +611,16 @@ class PluginContext:
         chat's session in THIS plugin's own profile and runs a turn there; the plugin cannot
         target another profile. Non-CLI injection needs ``session_key`` or ``origin`` plus
         ``plugins.entries.<plugin_id>.allow_gateway_injection`` in the plugin's profile config.
-        ``True`` means a host accepted the request, not that the turn completed.
+        By default ``True`` acknowledges scheduling, not durable admission. Opt in
+        with ``await_dispatch=True`` for an awaitable ``GatewayInjectionHandle``;
+        a worker thread may use ``handle.result(timeout=30)`` instead. Its result
+        carries ``accepted``, ``admission_id`` (under an authority), ``reason`` and
+        ``correlation_id``. Timeout/cancellation after possible commit is
+        indeterminate, never retry-safe. This waits for admission, not the turn.
         """
         from hermes_cli.plugins_injection import inject_plugin_message
-        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin)
+        return inject_plugin_message(self, content, role, session_key=session_key, origin=origin,
+                                     await_dispatch=await_dispatch, correlation_id=correlation_id)
 
     def session_cwd(self) -> str:
         """The calling session's recorded cwd, never the gateway's own (``plugin_session``)."""
@@ -960,9 +960,9 @@ class PluginContext:
                 logger.warning("Plugin '%s' locale file %s skipped: %s", self.manifest.name, file, exc)
         return handles
 
-    def register_hook(self, hook_name: str, callback: Callable) -> PluginRegistration:
-        """Register a lifecycle hook callback (unknown names warn but are still stored)."""
-        return self._track_callback("hook", hook_name, callback, self._manager._hooks, VALID_HOOKS)
+    def register_hook(self, hook_name: str, callback: Callable, *, hold_stream: bool = False) -> PluginRegistration:
+        """Register a lifecycle hook callback (``PluginDispatchMixin.track_hook``)."""
+        return self._manager.track_hook(self, hook_name, callback, hold_stream=hold_stream)
 
     def register_middleware(self, kind: str, callback: Callable) -> PluginRegistration:
         """Register behavior-changing middleware (request kinds rewrite the payload, execution kinds
@@ -1052,34 +1052,8 @@ class PluginContext:
 
 # -- scoped provider registrars ------------------------------------------------------------------
 # One generated ``register_<category>_provider`` method per row of plugins_registrars.py's table.
-
-
-
-def _make_scoped_provider_registrar(method_name, kind, registry_mod, base_ref, label, doc, options):
-    """Build one ``register_<category>_provider`` method from a ``_SCOPED_PROVIDER_REGISTRARS`` row."""
-    base_mod, base_attr = base_ref.split(":")
-    normalize_fn = _NAME_NORMALIZERS[options.get("normalize", "strip")]
-    register_name = options.get("register")
-
-    def register(self, provider) -> Optional[PluginRegistration]:
-        registry = importlib.import_module(registry_mod)
-        return self._register_scoped_provider(
-            provider, kind=kind, base_class=getattr(importlib.import_module(base_mod), base_attr),
-            registry=registry, label=label, article=options.get("article", "a"), normalize=normalize_fn,
-            register=getattr(registry, register_name) if register_name else None,
-            reject_message=options.get("reject_message"),
-        )
-
-    def register_source(self, source) -> Optional[PluginRegistration]:  # secret sources: ``source``
-        return register(self, source)
-
-    method = register_source if options.get("param") == "source" else register
-    method.__name__, method.__qualname__, method.__doc__ = method_name, f"PluginContext.{method_name}", doc
-    return _serialized_replacement(method)
-
-
 for _row in _SCOPED_PROVIDER_REGISTRARS:
-    setattr(PluginContext, _row[0], _make_scoped_provider_registrar(*_row))
+    setattr(PluginContext, _row[0], make_scoped_provider_registrar(*_row))
 del _row
 
 
@@ -1231,7 +1205,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         """Return whether a live gateway can accept plugin-triggered turns."""
         return self._gateway_message_injector is not None
 
-    def set_gateway_message_injector(self, owner: object, injector: Callable[..., bool]) -> None:
+    def set_gateway_message_injector(self, owner: object, injector: Callable[..., bool | GatewayInjectionHandle]) -> None:
         """Publish a live gateway injector and its lifecycle owner."""
         self._gateway_message_injector = (owner, injector)
 
@@ -1240,9 +1214,15 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         if self._gateway_message_injector is not None and self._gateway_message_injector[0] is owner:
             self._gateway_message_injector = None
 
-    def inject_gateway_message(self, **kwargs: Any) -> bool:
+    def inject_gateway_message(self, **kwargs: Any) -> bool | GatewayInjectionHandle:
         """Submit a plugin-triggered turn to the live gateway."""
         registered = self._gateway_message_injector
+        if kwargs.get("await_dispatch"):
+            from hermes_cli.plugin_injection import immediate_result
+            if registered is None:
+                return immediate_result(False, "gateway_unavailable", session_key=kwargs.get("session_key"),
+                                        correlation_id=kwargs.get("correlation_id"))
+            return registered[1](**kwargs)
         return registered is not None and bool(registered[1](**kwargs))
 
     @property
@@ -1488,7 +1468,7 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
             try:  # lazy: this is a startup probe, keep agent_plugins unimported unless needed
                 from hermes_cli.agent_plugins import _discover_mcp
                 if _discover_mcp(Path(manifest.path), get_hermes_home() / "plugin-data"
-                                 / (manifest.skill_namespace or lookup_key), [], create_data=False):
+                                 / (manifest.data_namespace or lookup_key), [], create_data=False):
                     return True
             except (OSError, RuntimeError, ValueError):
                 continue  # fail closed on an unreadable package; full discovery reports it
@@ -1624,7 +1604,7 @@ def _known_plugin_managers() -> list[PluginManager]:
     return managers
 
 
-def publish_gateway_message_host(owner: object, injector: Callable[..., bool]) -> None:
+def publish_gateway_message_host(owner: object, injector: Callable[..., bool | GatewayInjectionHandle]) -> None:
     """Remember the process gateway host and stamp managers that already exist."""
     global _published_gateway_message_injector
     # Keep publication + stamping atomic with owner-safe clear. Managers created concurrently are

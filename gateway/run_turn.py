@@ -18,6 +18,7 @@ import queue
 import threading
 import time
 from agent.i18n import t
+from agent.incognito import log_private_failure
 from agent.notice_style import ContextNotice
 from agent.error_classifier import is_context_overflow_reason
 from agent.session_activity import AwakeIdleMeter, format_iteration_progress
@@ -34,6 +35,7 @@ from gateway.platforms.event import MessageEvent, turn_origin_for_event
 from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.session_context import bound_turn_origin, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
+from gateway.run_turn_pending import _drain_leftover_steer
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin, _acp_launch
 from gateway.response_filters import (
@@ -67,6 +69,18 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 logger = logging.getLogger("gateway.run")
 
 _tool_call_logger_lock = threading.Lock()
+# Detached deletes of superseded turns' cards: a chat's flood wait never holds the turn's unwind.
+_STALE_CLEANUP_TASKS: set = set()
+
+
+async def _run_temporary_cleanups(cleanups) -> None:
+    for cleanup in cleanups:
+        try:
+            result = cleanup()
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.debug("Superseded turn's temporary cleanup failed", exc_info=True)
 _NO_ATTENDED_ACTIVITY_STAMP = object()
 # Bound on the hygiene gate's wait for a cooldown write scheduled by an unwinding or deferred attempt.
 _HYGIENE_PENDING_COOLDOWN_WAIT_S = 10.0
@@ -982,10 +996,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             db.update_session_meta(session_id, json.dumps(config), model=model)
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)
-
-    def _event_thread_metadata(self, event, source):
-        """Thread metadata for a send that replies to ``event`` on ``source``."""
-        return self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
 
     @staticmethod
     def _pop_post_delivery_callback(adapter, key, generation):
@@ -2429,6 +2439,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # Fix for #18765.
         if not _intentional_silence:
             response = _normalize_empty_agent_response(agent_result, response, history_len=len(history))
+            if agent_result.get("failed"):
+                log_private_failure(logger, operation="agent turn", reason=agent_result.get("failure_reason"),
+                                    session_id=getattr(session_entry, "session_id", None))
             response = _sanitize_gateway_final_response(
                 source.platform, response, interrupted=bool(agent_result.get("interrupted")),
             )
@@ -2585,19 +2598,41 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             return PARTIAL_FAILED_TURN_NOTICE
         return FAILED_TURN_NOTICE
 
-    async def _hmwa_close_failed_turn(self, session_id, notice):
+    async def _hmwa_close_failed_turn(self, session_id, notice, own_boundary_row_id=None):
         """Append the gateway-owned assistant boundary iff the durable tail is open (a user row, or the
         tool row of a call that ran before the failure).
 
         The tail, not "did the gateway write the user row", is the key: on the primary path the
         agent's turn-start flush already persisted the row (so the platform-id dedupe skips the
         gateway write), and a platform redelivery of an already-closed turn must not stack a
-        second assistant row."""
+        second assistant row.
+
+        ``own_boundary_row_id``: the row the agent's core closer flushed for THIS turn. When the
+        gateway owns better copy (the supervisor's normalized status), that boundary is rewritten in
+        place while it is still the live tail, so the transcript keeps one boundary saying what was
+        delivered; an earlier turn's boundary or any later row is never touched."""
         if await self.async_session_store.transcript_tail_role(session_id) not in OPEN_TURN_TAIL_ROLES:
+            if own_boundary_row_id is not None:
+                await self.async_session_store.replace_failed_turn_boundary(
+                    session_id, own_boundary_row_id, notice)
             return
         await self.async_session_store.append_to_transcript(session_id, {
             "role": "assistant", "content": notice, "timestamp": time.time(), "display_kind": FAILED_TURN_DISPLAY_KIND,
         })
+
+    def _hmwa_own_failed_boundary_row_id(self, agent_result):
+        """Row id of the failed-turn boundary the agent's core closer flushed for THIS turn (the last
+        message, typed ``failed_turn``, after the turn's start), or ``None`` when it wrote none."""
+        messages = agent_result.get("messages") or []
+        start = agent_result.get("current_turn_user_idx", agent_result.get("history_offset"))
+        if not messages or not isinstance(start, int) or not 0 <= start < len(messages) - 1:
+            return None
+        tail = messages[-1]
+        if not isinstance(tail, dict) or tail.get("role") != "assistant" or tail.get(
+                "display_kind") != FAILED_TURN_DISPLAY_KIND:
+            return None
+        row_id = tail.get("_row_id")
+        return row_id if isinstance(row_id, int) and not isinstance(row_id, bool) else None
 
     def _hmwa_classify_turn_failure(self, agent_result, history, session_entry):
         """Classify a finished turn for transcript persistence. Returns
@@ -2779,8 +2814,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 # The provider may have compressed the full history in-place. RAM replaces
                 # the private transcript without creating a persistent child or summary.
                 await self.async_session_store.rewrite_transcript(sid, agent_messages)
-                await self._hmwa_store_turn_prompt_tokens(session_key, session_entry.session_key, agent_result)
-                await self._refresh_agent_cache_message_count(session_key, len(agent_messages))
+                await self._hmwa_store_turn_prompt_tokens(
+                    store, session_entry.session_key, session_key, agent_result.get("last_prompt_tokens", 0),
+                    getattr(prepared, "hygiene_adoption_epoch", 0),
+                    touch_activity=not bool(getattr(event, "internal", False)),
+                )
+                await self._refresh_agent_cache_message_count(session_key, sid)
                 return
             agent_persisted = False
         _user_row = self._hmwa_user_transcript_entry(event, prepared, ts)
@@ -2820,7 +2859,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                 # Close the failed turn: a user-only tail lets alternation repair merge this request
                 # into an unrelated future message and replay stale side effects (#107070).
-                await self._hmwa_close_failed_turn(sid, self._hmwa_failed_turn_notice(agent_result))
+                supervisor_status = bool(response) and agent_result.get(
+                    "queued_terminal_display_kind", prepared.persist_user_display_kind) == "supervisor_checkin"
+                notice = response if supervisor_status else self._hmwa_failed_turn_notice(agent_result)
+                await self._hmwa_close_failed_turn(
+                    sid, notice, self._hmwa_own_failed_boundary_row_id(agent_result) if supervisor_status else None)
             else:
                 # Only the NEW messages: history_offset (what the agent saw), not len(history), which
                 # counts session_meta entries stripped before the agent saw them.
@@ -2892,6 +2935,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         response = strip_trailing_loop_complete_marker(response)
         # Intentional silence is a delivery decision: the [SILENT] turn stays persisted (alternation).
         if _intentional_silence:
+            from gateway.reply_latency import record_no_reply
+            record_no_reply(event)
             logger.info("Suppressing intentional silence marker for session %s", session_entry.session_id)
             response = ""
 
@@ -2944,17 +2989,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 )
                 copy_delivered = any(getattr(result, "success", False) for result in copy_results)
                 copy_failed = any(not getattr(result, "success", False) for result in copy_results)
-            if adapter and agent_result.get("interrupted") and response:
-                from gateway.copy_blocks import adapter_sends_copy_blocks, extract_copy_blocks
-                _, _partial_bodies = extract_copy_blocks(response)
-                if _partial_bodies and adapter_sends_copy_blocks(adapter):
-                    # The stream hid these bodies for separate sending, but an interrupted block
-                    # may be partial: show them as ordinary reply text instead of dropping them.
-                    try:
-                        await adapter.send(source.chat_id, "\n".join(_partial_bodies),
-                                           metadata=self._event_thread_metadata(event, source))
-                    except Exception as _e:
-                        logger.warning("interrupted copy text send failed: %s", _e)
+            # Interrupted copy fragments already appeared inline in the stream;
+            # never append a second unquoted copy of those partial bodies.
             if copy_failed:
                 agent_result["failed"] = True
                 agent_result["error"] = "one or more [[copy]] blocks failed to deliver"
@@ -3012,6 +3048,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         # Retain Slack thread/workspace routing so a failed turn cannot leave its status visible.
         await self._hmwa_stop_typing_for_turn(event, source)
         logger.exception("Agent error in session %s", session_key)
+        # A private turn's record above is redacted whole; keep a content-free class for diagnosis.
+        log_private_failure(logger, e, operation="agent turn", session_id=getattr(session_entry, "session_id", None))
         status_code = getattr(e, "status_code", None)
         if status_code in {400, 500} and len(prepared.history) > 50:
             # Context overflow / payload too large: a deterministic rejection (#107567), and the same
@@ -3062,17 +3100,25 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # The session's own frozen route credential is gone or changed: name it, not the model.
             status_hint = f" {e.reason} ({e.field}: {e.detail or 'unavailable'})."
         from gateway.session_results import record_unexecuted_failure
+        local_error = f"{type(e).__name__}: {e}"[:500] if source.platform == Platform.LOCAL else None
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
-        ))
+        ), error=local_error)
 
     def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
-        """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
+        """A newer run generation superseded this turn: drop its deferred post-delivery callback,
+        except the part that deletes its temporary progress cards, which still runs."""
         logger.info(
             "Discarding stale agent result for %s — generation %d is no longer current",
             _quick_key or "?", run_generation,
         )
-        self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
+        callback = self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
+        from gateway.platforms.base import temporary_cleanups
+        cleanups = temporary_cleanups(callback)
+        if cleanups:
+            task = asyncio.get_running_loop().create_task(_run_temporary_cleanups(cleanups))
+            _STALE_CLEANUP_TASKS.add(task)
+            task.add_done_callback(_STALE_CLEANUP_TASKS.discard)
 
     @dataclasses.dataclass
     class _PreparedTurn:
@@ -3368,8 +3414,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             if not started:
                 self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
                 return
-            from gateway.run_checkins import silence_fallback
-            agent_result = await silence_fallback(self, event, session_entry, agent_result)
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -3416,7 +3460,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # Streaming already delivered the body: the footer goes out as a trailing send instead.
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
                 response = f"{response}\n\n{_footer_line}"
-            await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
+            _terminal_display_kind = agent_result.get("queued_terminal_display_kind", prepared.persist_user_display_kind)
+            if _terminal_display_kind != "supervisor_checkin":
+                await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
 
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
@@ -3426,6 +3472,16 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,
             )
+            # Normalize supervisor output after generic error/empty-reply shaping, so a provider
+            # explainer cannot replace it in either delivery or the captured completion.
+            from gateway.run_checkins import silence_fallback
+            checkin_result = await silence_fallback(self, event, session_entry, agent_result)
+            if checkin_result is not agent_result:
+                agent_result = checkin_result
+                response = agent_result["final_response"]
+                _intentional_silence = agent_result["intentional_silence"]
+            if _terminal_display_kind == "supervisor_checkin":
+                await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
             await self._hmwa_persist_turn_transcript(
                 event=event, source=source, session_entry=session_entry, session_key=session_key,
                 agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,
@@ -4781,7 +4837,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 if worker.timeout_fired.is_set():
                     break
                 _idle_secs = turn_ctx.awake_idle.measure(self._agent_activity_summary(agent_holder[0]).get("seconds_since_activity", 0.0))
-                if not _warning_fired and worker.agent_warning is not None and _idle_secs >= worker.agent_warning:
+                if (not _warning_fired and worker.agent_warning is not None
+                        and _idle_secs >= worker.agent_warning
+                        and turn_ctx.persist_user_display_kind != "supervisor_checkin"):
                     _warning_fired = True
                     await self._run_agent_inactivity_warning(worker, turn_ctx.source, turn_ctx._status_thread_metadata)
                 if _idle_secs >= worker.agent_timeout:
@@ -4882,51 +4940,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 if pending:
                     logger.debug("Processing queued message after agent completion: '%s...'", pending[:40])
 
-        # Leftover /steer (arrived after the last tool batch): deliver as the next user turn.
-        leftover_steer = (result.get("pending_steer") or "").strip() if result else None
-        if leftover_steer:
-            if not pending and not pending_event:
-                pending = leftover_steer
-                logger.debug("Delivering leftover /steer as next turn: '%s...'", pending[:40])
-            elif pending_event and adapter and session_key:
-                # User steered during the turn, but a background event or queued message arrived.
-                # Deliver the user's steer first and restore the pending event to the head of the queue.
-                overflow = self._overflow_queue(session_key)
-                if hasattr(adapter, "_pending_messages") and isinstance(adapter._pending_messages, dict):
-                    promoted = adapter._pending_messages.get(session_key)
-                    if promoted is not None:
-                        if overflow is not None:
-                            overflow.insert(0, promoted)
-                        else:
-                            self._session_state(session_key).conversation.queued_events.insert(0, promoted)
-                    adapter._pending_messages[session_key] = pending_event
-                else:
-                    if overflow is not None:
-                        overflow.insert(0, pending_event)
-                    else:
-                        self._session_state(session_key).conversation.queued_events.insert(0, pending_event)
-                pending_event = None
-                pending = leftover_steer
-                logger.debug(
-                    "Delivering leftover /steer before queued event for session %s: '%s...'",
-                    session_key, pending[:40],
-                )
-            elif pending and not pending_event:
-                from gateway.platforms.base import MessageEvent
-                # A deferred steer continues the active channel context, just like an
-                # eventless follow-up. Reuse its pins without marking the user as internal.
-                steer_prompt, steer_source = self._pinned_channel_inputs(
-                    session_key, None, source, internal=True,
-                )
-                steer_event = MessageEvent(
-                    text=leftover_steer, source=steer_source, channel_prompt=steer_prompt,
-                )
-                if session_key:
-                    self._enqueue_fifo(session_key, steer_event, adapter)
-                logger.debug(
-                    "Enqueued leftover /steer behind pending message for session %s: '%s...'",
-                    session_key or "?", leftover_steer[:40],
-                )
+        pending_event, pending = _drain_leftover_steer(
+            self, result, adapter, source, session_key, pending_event, pending, logger=logger,
+        )
 
         # Safety net: a pending slash command is never passed to the agent as user input.
         if pending and pending.strip().startswith("/"):
@@ -4942,7 +4958,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                         pending_event = None
                         pending = None
 
-        if self._draining and (pending_event or pending) and not handover_runs_followups(self):
+        if self._draining and (pending_event or pending) and not handover_runs_followups(self) and getattr(pending_event, "_admitted_before_drain", False) is not True:
             # The adapter slot was already dequeued; spool it so startup recovery can replay it.
             from gateway.shutdown_flush import flush_pending_to_file
             # Media-only events can have no text even after transcription; persist the resolved
@@ -4989,6 +5005,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                                  session_key)
             pending_event = None
             pending = None
+        if self._draining and result and adapter and session_key and pending_event is None and not handover_runs_followups(self):
+            pending_event = self._take_wake_admitted_before_drain(session_key, adapter)
+            pending = (pending_event.text or _build_media_placeholder(pending_event)) if pending_event is not None else None
         return pending_event, pending
 
     async def _run_agent_deliver_first_response(
@@ -5022,10 +5041,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         if self._is_intentional_silence(_delivery_result, first_response):
             # Runtime provenance describes the continuation row, not the original human's silence
             # contract. A queued successor must not make the retry's second marker silently legal.
-            silence_kind = None if getattr(turn_ctx, "silence_retry", False) else turn_ctx.persist_user_display_kind
+            silence_kind = (None if getattr(turn_ctx, "silence_retry", False) else _delivery_result.get(
+                "queued_terminal_display_kind", turn_ctx.persist_user_display_kind))
+            silence_reply_expected = _delivery_result.get("queued_terminal_reply_expected", turn_ctx.reply_expected)
             from gateway.response_filters import reaction_answered
             if ((reaction_answered(_delivery_result) and silence_kind != "supervisor_checkin")
-                    or silence_allowed(silence_kind, turn_ctx.reply_expected)):
+                    or silence_allowed(silence_kind, silence_reply_expected)):
                 logger.info(
                     "Queued follow-up for session %s: suppressing intentional silence marker before continuing.",
                     session_key or "?",
@@ -5152,6 +5173,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     callback_result = callback()
                     if inspect.isawaitable(callback_result):
                         await callback_result
+            if pending_event is not None:
+                # The queued follow-up's turn starts now: its busy ack has done its job.
+                from gateway.platforms.base import release_temporary_notices
+                await release_temporary_notices(pending_event)
 
         updated_history = result.get("messages", history)
         next_source, next_message, next_session_key = source, pending, session_key
@@ -5275,6 +5300,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             _head_origin = bound_turn_origin()
             if pending_event is not None:
                 set_turn_origin(turn_origin_for_event(pending_event))
+                # In-band turns bypass the inbound slot claim. Keep the conversation clock on
+                # the latest actual input, like its terminal goal identity; never restore the head.
+                self._session_state(next_session_key).conversation.last_turn_started_at = time.time()
             _consumed_events = (
                 (pending_event, *getattr(pending_event, "_hermes_absorbed_events", ()))
                 if pending_event is not None else ()
@@ -5401,7 +5429,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
         ``response["already_sent"]`` and log ``ok``. A returned failure logs ``fail_result`` as
         ``(session, error)`` and an exception logs ``fail_exc`` as ``(session, exc)``; either way
         ``already_sent`` stays unset so the normal final send delivers the content."""
-        # The streamed message is the body only; copy blocks go out as separate messages.
+        # Keep the adapter-specific inline copy display on reconcile edits too.
         from gateway.copy_blocks import copy_free_text_for
         content = copy_free_text_for(_sc.adapter, content or "")
         try:
@@ -5559,6 +5587,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             logger.info("Temp bubble cleanup complete for session %s: requested=%d deleted=%d failed=%d",
                         key, len(snapshot), deleted, len(failures))
 
+        cleanup._temporary_cleanup = True
         owner.register_post_delivery_callback(key, cleanup, generation=turn_ctx.run_generation)
         turn_ctx._post_delivery_adapter = owner
         turn_ctx._bubble_cleanup_registered = True
@@ -5805,11 +5834,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             pending_event, pending = defer_review_followup(self, turn_ctx, adapter, pending_event, pending)
+            from gateway.run_turn_silence_recovery import apply_terminal_reply_metadata, silence_recovery_due
+            apply_terminal_reply_metadata(turn_ctx, response, result)
             if pending_event or pending:
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )
-            from gateway.run_turn_silence_recovery import silence_recovery_due
             if silence_recovery_due(self, response, turn_ctx, silence_retry=_silence_retry,
                                     scheduled_heartbeat=scheduled_heartbeat):
                 # End-of-turn filtering must finish BEFORE a new consumer can preview the retry.

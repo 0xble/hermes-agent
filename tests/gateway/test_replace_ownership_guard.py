@@ -426,7 +426,9 @@ async def _swallow(coro):
 
 
 _CHILD_SCRIPT = '''
-import asyncio, sys, time
+import asyncio, sys, threading
+from types import SimpleNamespace
+from unittest.mock import patch
 sys.path.insert(0, r"@@REPO@@")
 
 import gateway.run as gateway_run
@@ -436,13 +438,34 @@ import gateway.status as status
 status.get_running_pid = lambda *args, **kwargs: 424242
 gateway_run._replace_target_belongs_to_other_profile = lambda pid: True
 
-# A stalled disk: the background writer takes five seconds to persist, so an
-# unflushed stamp dies with the process (the CLI exits through os._exit).
+# Hold the real disk write until the caller waits for completion. Advance the
+# waiter's clock beyond its deadline while I/O is blocked, rather than racing a
+# five-second sleep against a five-second timeout on a loaded CI runner.
+write_started = threading.Event()
+release_write = threading.Event()
 def _slow_write(path, payload):
-    time.sleep(5.0)
+    write_started.set()
+    release_write.wait()
     status._write_json_file(path, payload)
 
-status._get_runtime_status_writer = lambda: status._RuntimeStatusWriter(write_fn=_slow_write)
+writer = status._RuntimeStatusWriter(write_fn=_slow_write)
+real_wait = writer.wait
+real_condition_wait = writer._condition.wait
+
+def _wait_for_write(generation, timeout=None):
+    assert write_started.wait(10), "status writer never started"
+    clock = iter((0.0, 6.0))
+    with patch.object(status, "time", SimpleNamespace(monotonic=lambda: next(clock, 6.0))):
+        return real_wait(generation, timeout=timeout)
+
+def _release_on_completion_wait(timeout=None):
+    if threading.current_thread() is threading.main_thread():
+        release_write.set()
+    return real_condition_wait(timeout)
+
+writer.wait = _wait_for_write
+writer._condition.wait = _release_on_completion_wait
+status._get_runtime_status_writer = lambda: writer
 
 result = None
 try:

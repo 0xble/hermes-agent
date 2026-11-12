@@ -91,7 +91,7 @@ class BotLoopGuard:
         self._settings = settings
         self._clock = clock
         self._lock = threading.Lock()
-        self._events: dict[Hashable, deque[float]] = {}
+        self._events: dict[Hashable, deque[tuple[float, object | None]]] = {}
         self._cooldown_until: dict[Hashable, float] = {}
         self._last_sweep = 0.0
 
@@ -107,7 +107,7 @@ class BotLoopGuard:
         with self._lock:
             return self._cooldown_until.get(conversation, 0.0) > self._clock()
 
-    def admit(self, conversation: Hashable) -> tuple[bool, str]:
+    def admit(self, conversation: Hashable, *, charge: object | None = None) -> tuple[bool, str]:
         """Count one admitted bot-authored message for ``conversation``.
         Returns ``(allowed, state)``; state is ``disabled``, ``ok``, ``tripped`` (this message started the cooldown) or ``cooldown``."""
         settings = self._settings()
@@ -120,14 +120,31 @@ class BotLoopGuard:
                 return False, "cooldown"
             events = self._events.setdefault(conversation, deque())
             cutoff = now - settings.window_seconds
-            while events and events[0] <= cutoff:
+            while events and events[0][0] <= cutoff:
                 events.popleft()
             if len(events) >= settings.max_events:
                 self._cooldown_until[conversation] = now + settings.cooldown_seconds
                 events.clear()
                 return False, "tripped"
-            events.append(now)
+            events.append((now, charge))
             return True, "ok"
+
+    def refund(self, conversation: Hashable, charge: object) -> bool:
+        """Remove only this admission's charge, once; never reset a conversation or cooldown.
+
+        Identity, not clock equality, distinguishes concurrent inputs at the same instant.
+        Expired charges (or charges cleared when a budget tripped) are already gone.
+        """
+        if charge is None:
+            return False
+        with self._lock:
+            events = self._events.get(conversation)
+            if events is not None:
+                for index, (_, token) in enumerate(events):
+                    if token is charge:
+                        del events[index]
+                        return True
+        return False
 
     def _sweep(self, now: float, settings: BotLoopGuardSettings) -> None:
         """Drop idle conversations at most once per window so memory stays bounded."""
@@ -135,7 +152,7 @@ class BotLoopGuard:
             return
         self._last_sweep = now
         idle_cutoff = now - settings.window_seconds
-        for key in [k for k, dq in self._events.items() if not dq or dq[-1] <= idle_cutoff]:
+        for key in [k for k, dq in self._events.items() if not dq or dq[-1][0] <= idle_cutoff]:
             del self._events[key]
         for key in [k for k, until in self._cooldown_until.items() if until <= now]:
             del self._cooldown_until[key]

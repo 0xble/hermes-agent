@@ -407,7 +407,7 @@ _cleanup_all_terminals = _lazy_shim("tools.terminal_tool", "cleanup_all_environm
 set_sudo_password_callback = _lazy_shim("tools.terminal_tool", "set_sudo_password_callback")
 set_approval_callback = _lazy_shim("tools.terminal_tool", "set_approval_callback")
 set_secret_capture_callback = _lazy_shim("tools.skills_tool", "set_secret_capture_callback")
-_cleanup_all_browsers = _lazy_shim("tools.browser_tool_lifecycle", "_emergency_cleanup_all_sessions", "_cleanup_all_browsers")
+_cleanup_all_browsers = _lazy_shim("tools.browser_session_lifecycle", "emergency_cleanup_all_sessions", "_cleanup_all_browsers")
 
 _cleanup_done = False  # _run_cleanup runs exactly once
 _cleanup_in_progress = False
@@ -577,16 +577,16 @@ def _cleanup_worktree(info: dict[str, str] | None = None) -> None:
             print(f"  {_t('cli.worktree.clean_up_manually', path=wt_path)}")
         return
 
-    from hermes_cli.worktree_ops import removal_blocked
+    from hermes_cli.worktree_ops import _unlock_owned_worktree, removal_blocked
     blocked = removal_blocked(wt_path)  # an embedded repo or private ref dies with it
     if blocked:
         _cprint(f"\n\033[33m{_t('cli.worktree.kept_reason', path=wt_path, reason=blocked[1])}\033[0m")
         return
 
-    # Release the tree's language servers while the path still exists, then unlock so `remove`
-    # isn't blocked by the lock placed at creation. Fail-soft.
     release_lsp_clients(wt_path)
-    _git_quiet(["worktree", "unlock", wt_path], repo_root, log="git worktree unlock failed (non-fatal)")
+    if not _unlock_owned_worktree(repo_root, wt_path):
+        _cprint(f"\n\033[33m{_t('cli.worktree.kept_reason', path=wt_path, reason=_t('cli.worktree.lock_unverifiable_reason'))}\033[0m")
+        return
     _git_quiet(["worktree", "remove", wt_path, "--force"], repo_root, timeout=15, log="Failed to remove worktree")
     _git_quiet(["branch", "-D", branch], repo_root, log=f"Failed to delete branch {branch}")
     _cprint(f"\033[32m{_t('cli.worktree.cleaned_up', path=wt_path)}\033[0m")
@@ -778,8 +778,8 @@ def save_config_value(key_path: str, value: any) -> bool:
     try:
         from hermes_constants import mkdir_under_hermes_home
         mkdir_under_hermes_home(config_path.parent)
-        from utils import atomic_roundtrip_yaml_update
-        atomic_roundtrip_yaml_update(config_path, key_path, value)
+        from hermes_cli.config_backend import write_config_key
+        write_config_key(config_path, key_path, value)
         try:  # owner-only: config files contain API keys
             os.chmod(config_path, 0o600)
         except (OSError, NotImplementedError):
@@ -977,18 +977,6 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
         except Exception:
             pass  # never block startup
 
-    def _show_browser_backend_notice(self):
-        """Once-per-24h hint when the default Browser Use backend silently fell back to built-in tools."""
-        try:
-            from tools.browser_use_cli import default_downgrade_notice
-
-            notice = default_downgrade_notice()
-            if notice:
-                from gateway.warning_notifications import render_notification
-                render_notification(lambda: self._console_print(f"[yellow]⚠ {notice}[/yellow]"), platform="cli")
-        except Exception:
-            logger.debug("browser backend notice failed", exc_info=True)
-
     def finalize_preloaded_skills(self) -> None:
         """Join the background --skills preload and fold it into the prompt (idempotent).
 
@@ -1055,14 +1043,15 @@ class HermesCLI(CLIInitMixin, CLITuiRuntimeMixin, CLIProcessNotificationsMixin, 
 
     def show_config(self):
         """Display current configuration with kawaii ASCII art."""
+        from hermes_cli.config_backend import config_exists
         terminal_env = os.getenv("TERMINAL_ENV", "local")
         terminal_cwd = os.getenv("TERMINAL_CWD", os.getcwd())
         terminal_timeout = os.getenv("TERMINAL_TIMEOUT", "60")
 
         config_path = _hermes_home / 'config.yaml'
-        if not config_path.exists():
+        if not config_exists(config_path):
             config_path = Path(__file__).parent / 'cli-config.yaml'
-        config_status = _t("cli.config.loaded") if config_path.exists() else _t("cli.config.not_found")
+        config_status = _t("cli.config.loaded") if config_exists(config_path) else _t("cli.config.not_found")
 
         # ``api_key`` may be a callable bearer provider (Entra ID, Vertex OAuth, key_cmd, ...):
         # label it by its tagged source and never invoke it (that would mint a token just to mask

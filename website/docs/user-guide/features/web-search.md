@@ -66,7 +66,7 @@ Each provider dispatch is also bounded by a wall-clock timeout (`web.extract_tim
 
 ### When truncation gets in the way
 
-If you specifically need the live DOM rather than extracted markdown — for example, a JS-heavy page where extraction returns little content — use `browser_navigate` + `browser_snapshot` instead. The browser tool returns the live accessibility tree (subject to its own snapshot cap on huge pages).
+If you specifically need the live DOM rather than extracted markdown — for example, a JS-heavy page where extraction returns little content — use `browser_exec` instead: open the page with `new_tab(url)` + `wait_for_load()`, then read it with `page_info()` or a `js()` DOM extraction. It works on the live, rendered page.
 
 ---
 
@@ -451,6 +451,8 @@ If no shared backend has **ever** been selected (no `web.backend` written by you
 **Keyless free-tier ring:** when *no* credential above is present, requests rotate across the ring vendors' public free tiers (Exa, Parallel, Firecrawl, Keenable) so web tools work on a fresh install with zero setup — and a rate-limited request, or a search the vendor refuses, fails over to the next vendor in the ring automatically. Pin one vendor in `hermes tools` to stop the rotation (the ring is then only used as failover succession on throttles). All free tiers are vendor-rate-limited under burst load; sustained normal usage goes through fine. Set `web.keyless_fallback: false` to turn the tier off — with it off and no credentials, web tools are unavailable until a provider is configured. A Nous identity (guest included) is unaffected by that switch: managed `web_search` still applies, though `web_extract` needs a configured provider.
 
 **One-shot keyless rescue for keyed backends:** when your chosen/keyed backend — including the Nous Tool Gateway route (`web.backend: nous`) — fails a call (bad key, outage, unreachable gateway, upstream 5xx), that single call automatically retries on the keyless free-tier ring instead of erroring — the result notes which vendor served it and why (`rescued_from` / `backend_error`). The failover is never sticky: the very next `web_search`/`web_extract` call attempts your chosen backend again. Disable with `web.keyless_rescue: false` (also off whenever `keyless_fallback` is off).
+
+**Exa Lite pause:** `web.exa_lite_paused` defaults to `true` and sends every Exa search to Auto. `hermes config set web.exa_lite_paused false` restores guarded Lite.
 
 xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
 

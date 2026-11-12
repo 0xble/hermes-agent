@@ -14,7 +14,7 @@ async def _owner(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
@@ -80,3 +80,22 @@ async def test_plain_detach_never_stamps(tmp_path, monkeypatch):
     resumed = await _call(viewer, 'session.resume', session_id='old-tui')
     await _call(viewer, 'session.detach', session_id='old-tui', subscription_id=resumed['subscription_id'])
     assert db.get_session('old-tui')['end_reason'] is None
+
+
+@pytest.mark.asyncio
+async def test_a_closed_session_stays_in_the_stored_picker_after_a_restart(tmp_path, monkeypatch):
+    from gateway.session_local import create_local_session
+
+    db, authority = await _owner(tmp_path, monkeypatch)
+    viewer = _native(authority, tmp_path)
+    sid = create_local_session(authority, viewer.actor, {
+        'request_id': 'r1', 'source': 'tui', 'cwd': str(tmp_path), 'model': 'm', 'toolsets': []}).session_id
+    db.append_message(sid, 'user', 'q')
+    resumed = await _call(viewer, 'session.resume', session_id=sid)
+    await _call(viewer, 'session.detach', session_id=sid, subscription_id=resumed['subscription_id'],
+                end_reason='tui_close')
+
+    _, restarted = await _owner(tmp_path, monkeypatch)  # the gateway restarts
+    stored = await _call(_native(restarted, tmp_path), 'session.list', scope='stored')
+    assert [row['id'] for row in stored['sessions']] == [sid]
+    assert sid not in restarted.sessions  # the listing restored nothing

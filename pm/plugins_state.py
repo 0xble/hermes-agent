@@ -11,6 +11,9 @@ import logging
 
 LOG = logging.getLogger(__name__)
 
+# plugins.<RECORD> maps each plugin an update disabled to {enabled, reason}: what to undo once it fits.
+RECORD = "disabled_by_update"
+
 
 def _profiles_root() -> Path:
     # Plugin discovery and dependency publication must use the same home root.
@@ -26,20 +29,25 @@ def read_home_selection(home: Path) -> Optional[dict[str, Any]]:
     An unreadable selection raises rather than shrinking the next dependency generation;
     empty YAML is an explicit empty configuration, as in the CLI loader.
     """
+    from hermes_cli.config_backend import config_version, read_config_doc
+
     config_path = home / "config.yaml"
+    # Stat before the YAML stack: a home without config needs none (PM's own runtime tree has none).
+    # Only a missing file means "no config"; a symlink loop or permission error still refuses.
     try:
-        text = config_path.read_text(encoding="utf-8-sig")
+        config_version(config_path)
+    except FileNotFoundError:
+        return None
+    except OSError as exc:
+        raise ValueError(f"could not read plugin selection: {config_path}") from exc
+    # Missing YAML support is a broken runtime, not an empty plugin selection.
+    from ruamel.yaml.error import YAMLError
+    try:
+        config = read_config_doc(config_path)
     except FileNotFoundError:
         return None
     except (OSError, UnicodeError) as exc:
         raise ValueError(f"could not read plugin selection: {config_path}") from exc
-
-    # Missing YAML support is a broken runtime, not an empty plugin selection.
-    import utils
-    from ruamel.yaml.error import YAMLError
-
-    try:
-        config = utils.fast_safe_load(text)
     except YAMLError as exc:
         raise ValueError(f"could not parse plugin selection: {config_path}") from exc
     if config is None:
@@ -150,12 +158,17 @@ def enabled_plugins_ordered(*, proposed_home=None, enabled=None, disabled=None,
 
 
 def _provider_from_config(home: Path, config: dict[str, Any], *, installing: Path | None = None) -> Optional[str]:
-    """The configured memory provider when its bundled or installed plugin exists."""
+    """The configured active memory provider when its bundled or installed plugin exists."""
     provider = (config.get("memory") or {}).get("provider")
     if not provider or not provider.strip():
         return None
     name = provider.strip()
-    return name if provider_directory(home, name, installing=installing) is not None else None
+    plugin_dir = provider_directory(home, name, installing=installing)
+    if plugin_dir is None:
+        return None
+    if installing is not None and plugin_dir.resolve() == installing.resolve():
+        return name
+    return None if _parked(plugin_dir, config) else name
 
 
 def provider_directory(home: Path, name: str, *, installing: Path | None = None) -> Optional[Path]:
@@ -174,3 +187,31 @@ def provider_directory(home: Path, name: str, *, installing: Path | None = None)
             (installing is not None and installed.resolve() == installing.resolve())):
         return installed
     return None
+
+
+def _parked(plugin_dir: Path, config: dict[str, Any]) -> bool:
+    """Whether plugins.disabled names this provider plugin. The provider loader honours the same
+    spellings (plugins.memory._explicitly_disabled), so a parked provider is never loaded and
+    installing its dependencies could only fail the generation for nothing."""
+    from pm.paths import repo_root
+
+    if (repo_root() / "plugins" / "memory") in plugin_dir.parents:
+        return False
+    disabled = (config.get("plugins") or {}).get("disabled") or []
+    return bool(plugin_spellings(plugin_dir) & set(disabled))
+
+
+def plugin_spellings(plugin_dir: Path, key: str | None = None) -> set[str]:
+    """Every name a plugins list may use for this plugin: the selection key and its bare leaf, the
+    directory name and the manifest ``name:``. Read from the plugin itself, so it holds in any home."""
+    from pm.plugin_declarations import native_manifest_file, read_native_manifest
+
+    names = {plugin_dir.name} | ({key, key.rsplit("/", 1)[-1]} if key else set())
+    try:
+        manifest_file = native_manifest_file(plugin_dir)
+        if manifest_file is not None:
+            names.add(str(read_native_manifest(manifest_file).get("name") or ""))
+    except ValueError:
+        pass  # no readable manifest: the other spellings still hold
+    names.discard("")
+    return names

@@ -92,7 +92,7 @@ def test_micro_compaction_live_dicts_persist_through_the_worker_like_direct(work
                   MICRO_COMPACT_MARKER_KEY: True, '_compressed_summary_has_user_turn': False}
         compacted = [live[0], marker, live[2]]
         assert MicroCompactionMixin._sync_micro_compact_to_db(
-            types.SimpleNamespace(_session_db=sdb, _session_id=sid), compacted)
+            types.SimpleNamespace(_session_db=sdb, _session_id=sid), compacted) is None
         assert marker[MICRO_COMPACT_MARKER_KEY] and marker['_db_persisted'] and isinstance(marker['_row_id'], int)
         sdb.append_messages_batch(sid, [{'role': 'assistant', 'content': 'after'}])
         durable[sid] = [r['content'] for r in db.get_messages_as_conversation(sid)]

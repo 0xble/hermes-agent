@@ -1,5 +1,182 @@
 # Fork CI reliability
 
+## Reset cleanup fixture scope
+
+The reset resource-cleanup probe has a cached agent but no persisted old
+conversation. Its mock route index stays empty so cold goal/loop retirement
+cannot consume the close-start window before resource cleanup begins. Keep the
+real reset handler, off-loop close, heartbeat and survivor assertions unchanged.
+The fixture correction reuses owner commit `42a358abfdd1183332132a178c19e6130b01318a`
+and changes no production behavior or wait bounds.
+
+The shared-metrics worker join retains its 10-second bound and assertion. On
+failure it dumps all thread stacks to distinguish a native flush wait from
+SQLite contention. The hosted database-locked warnings alone do not establish
+the worker's blocking point, and inserting another join between sessions would
+only split the time budget without diagnosing the stall.
+
+## Historical git-install download isolation
+
+The dispatcher-restart E2E also covers the gateway submitter's spawn/publication gap. The
+submitter adopts its PID on the live run before contacting the owner, using the same registration
+as the former CLI worker. A killed dispatcher therefore leaves a live handle for TTL extension,
+and a reclaimed submitter exits before admission. Native CLI PTY coverage keeps its private tmux
+server alive across empty-session gaps and destroys it in teardown, avoiding last-session shutdown
+racing the next client launch.
+
+The shallow/partial clone suites retain smart HTTP, complete subject ancestry, historical
+N-1 installer bytes, all clone-shape/transfer assertions and the 900-second nightly file bound.
+Their three simultaneous real installs share only explicit runner content caches (uv, managed
+Python, npm and SHA256-keyed PM archives). Each native store, checkout, PM install identity,
+venv, active selection record and Hermes user home remains distinct. PM's machine uv cache is
+linked to the explicit content cache because PM intentionally does not use `UV_CACHE_DIR`.
+The shell runner carries explicit `UV_CACHE_DIR`, `UV_PYTHON_INSTALL_DIR`, and `npm_config_cache`
+inputs across its `env -i` boundary under private names. The file runner restores them only for
+files inside `tests/e2e/core/upgrade` and removes the private names from every worker. Ordinary
+tests and their subprocesses receive none of these caches, even in a mixed invocation. The runner
+regression also proves installed/runtime/user state and credentials remain scrubbed.
+Only absolute explicit cache paths are eligible. Resolve symlinks and refuse descendants of
+`.hermes`, `.cache/uv`, `.npm` and `.local/share/uv` under the OS password-database home, even
+when `HOME` names a sandbox. Failure to resolve that account also drops these inputs.
+N-1 receives a private copy of the runner's actual uv, avoiding repeated Astral bootstrap.
+The Git worlds pass the existing `--skip-browser` option to both real installer versions.
+Their contract is clone shape, transfer, hydration and update behavior, not optional browser
+provisioning. In the local Linux reproduction on failing commit `80718d41`, partial/shallow
+installers spent time in `npx playwright install --with-deps chromium` (a separate 600-second
+optional step), then completed in 566/586 seconds. Only `test_upgrade_path.py` reproduced the
+900-second kill, during its sixth scenario. These observations do not establish the exact
+subprocess responsible for either historical partial/shallow kill.
+Skipping that unrelated step does not replace the installer or bypass Git/dependency assertions.
+Cold real installer download coverage remains in
+`test_install_fresh.py::test_fresh_install_serves_head_and_runs_a_turn`: its `installed` fixture
+starts with an empty machine home, does not use `InstallCache` or copy uv/runtime artifacts,
+and runs the real installer against its pinned download sources. This PR does not preseed that
+separate cold path; all three git worlds retain the download-sharing optimization.
+
+`make_leg(root, template_home)` remains supported for other upgrade suites. Omitting the optional
+cache creates download storage under that leg's own root; only explicit fixture-cache callers share
+content and opt into the shared fixture deadline and PM archive preparation. Keep caller audits and a two-argument regression when extending shared test helpers.
+
+`test_upgrade_path` uses the same download-only fixture for its repeated N-1/update legs. Its
+bare origin advertises only the subject branch, like `_install_helpers.make_origin`, rather than
+all branches of a developer's partial clone (whose unrelated missing blobs could trigger network
+fetches during a local fixture clone). No source clone is redirected to external GitHub. The
+small local-repository regression proves the unrelated branch stays unadvertised; cache
+regressions prove user state and installed environments are not shared.
+
+## Bounded archive acquisition and diagnostics
+
+`InstallCache.artifact` retains only bytes matching a lockfile SHA256. A complete cache hit
+performs no HTTP request. A cold request uses curl's 10-second connection and 30-second total
+bounds, no retries, and atomic publication. Status, URL and checksum failures surface immediately.
+Preparation tries each lock URL first, then the maintained pinned mirror on download or checksum
+failure, checking the same SHA256 for either source. If both fail, diagnostics name both URLs.
+Each sandbox receives
+private copies of PM's `fetch-<sha256>` entries. PM may delete those copies after publication
+without losing the retained archive. Retained archives are stored beside the explicit uv cache
+(in `<uv-cache-name>-pm-archives`), outside uv-owned buckets, so `uv cache prune` cannot
+discard them. Only shell-installer worlds extract bootstrap uv from the exact pinned archive
+into the slot the unmodified historical shell installer already checks. Legacy handoff legs seed
+archives without pre-extracting that slot: the staged-uv bootstrap assumes the launching Python
+is suitable, while N-1 may run Python 3.13 and HEAD requires 3.14. PM must acquire its complete
+pinned toolchain on that path before preparing the new runtime.
+
+The previous shared `HERMES_RUNTIME_DIR` was a mutable native store. Its `.install.lock`
+serialized the nominally parallel installs across downloads. It was not an immutable download
+cache, and its archive entries disappeared after successful publication. PM runtime preparation
+and venv selection are separately scoped to each install, so this does not establish a runtime
+preparation deadlock.
+
+The three target files share a per-file fixture deadline of 840 seconds, leaving room for
+process-tree cleanup and pytest diagnostics before the unchanged 900-second file watchdog.
+Installer, update, passive checks, version probes, dependency staging and freeze-point waits
+use the remaining budget. Raw Git helper operations are bounded too. uv and npm HTTP requests
+receive explicit shorter transport limits. No assertion, clone shape, update scenario or outer
+watchdog is relaxed. A slow or failed setup produces an ordinary failure with subprocess output
+instead of losing every result to SIGKILL.
+
+Contract tests: `tests/e2e/core/upgrade/test_install_downloads.py` `tests/e2e/core/upgrade/test_install_cache.py`
+
+## Worker deadline exit observation
+
+The deadline probe keeps its 2-second request bound and immediate worker-reaped
+assertion. A killed non-child can close its inherited stdout pipe before the
+kernel marks it a zombie. The caller has already read EOF, so the sleeper cannot
+still retain that pipe, but an immediate liveness probe can still see it exiting.
+Observe descendant exit within the existing 5-second cleanup bound, matching the
+sibling worker lifetime tests, and kill any owned survivor on failure. Keep the
+no-survivor assertion and production cleanup unchanged. Hosted run
+https://github.com/0xble/hermes-agent/actions/runs/42753302737 recorded this race in
+`test_worker_deadline_reaps_the_worker_and_its_child[True]`.
+
+Contract tests: `tests/pm/test_worker_deadline.py`, `tests/pm/test_worker_lifetime.py`.
+
+Retire this fixture correction when upstream observes asynchronous descendant exit
+without assuming zero signal-delivery latency. Rollback changes no product state.
+
+## Upgrade scenario scheduling
+
+The historical N-1 migration file previously ran 7 cases serially. On failing
+commit `80718d41`, its real Linux reproduction reached the sixth case at 14:39
+and was killed at 900 seconds. With bounded downloads on `56ff43da`, the first
+3 cases passed, the lock-only recovery exhausted the 840-second diagnostic
+budget, and the remaining 3 cases reported that budget exhaustion. The active
+subprocess reached HEAD runtime preparation, not a perpetual Git freeze seam.
+
+Schedule clean/long-scalar, autostash, interrupted-pull, interrupted-dependencies
+and offline cases in separate files, following the existing hostile-commit layout.
+All 6 complete test-function ASTs (7 parametrized cases), assertions, guards and
+historical base selection remain identical. Each file owns its provider, seed,
+installed environments and user state. Only explicit download caches are shared.
+This adds 4 seed builds while removing serial aggregation under 1 file watchdog.
+The nightly command discovers the whole directory with retries disabled. Both the
+840-second diagnostic deadline and 900-second watchdog remain unchanged.
+
+Retire this scheduling adaptation when the upstream harness schedules the same
+fresh-install scenarios within the existing finite budget. Rollback restores the
+original file grouping without changing product code or stored user state.
+
+## Fork upgrade release contract
+
+Git-world N-1 means the newest `origin` `deploy/nightly-*` promotion that is a strict
+ancestor of the candidate, not the nearest upstream CalVer tag. Discover refs using a bounded
+`ls-remote` and fetch a missing promotion object without changing `nightly.yml`. When those refs
+are unavailable, use the immutable `deploy/nightly-20261103` floor
+`002f8807dbdef3b9aa450980baa501c6e9920f58`; fail loudly if neither resolves. Ignore promotions
+before that floor. Both it and subsequent promotions contain upstream #126150's shallow healing
+fix (#123254), while upstream `v2026.9.24` performs an unfiltered `git fetch origin main` before
+swapping updater code. A depth-1 *install* does not make that later fetch depth-limited: the real
+smart-HTTP backend correctly sends hundreds of MB of historical blobs. This is a historical
+product defect, not a cache, browser, dumb-HTTP or fixed-pack fixture defect.
+
+Provision the genuine promoted runtime first, then seed its retained depth-1 Git metadata with a
+fresh real depth-1 smart-HTTP clone of the same commit. Modern bootstrap heals shallow clones at
+install time, so seeding before bootstrap cannot model retained legacy user state. Replace only
+the sandbox checkout's `.git`; never its source or installed dependencies. Record the real clone's
+shape and transfer baseline. Use this shared `World.seed_clone_shape` for partial cells too,
+asserting exact tree:0/blob:none/full input shapes so bootstrap cannot silently erase updater
+coverage. Keep the original shape, transfer, ancestry and two-update
+assertions. Passive checks advance through 3 synthetic releases on the real origin after HEAD,
+so a recent promotion cannot collapse their 3 distinct shallow grafts. Current shallow-healer
+real-Git regressions remain independent of release selection;
+never truncate history, patch the historical updater or raise either timeout to make this pass.
+
+Local prerequisite: run historical upstream-tag suites from a tag-pinned object store rather than
+sharing mutable refs with other worktrees. A global `fetch.pruneTags=true` (with prune enabled)
+lets another fetch against the fork delete a just-hydrated upstream tag the fork does not publish,
+silently selecting August again. Verify the selected tag/SHA at execution time. This is separate
+from immutable object hydration needed for a partial developer checkout; hosted full-history,
+fresh-tag checkout is the arbiter for unchanged `test_upgrade_path.py`.
+
+Contract tests: `tests/e2e/core/upgrade/git/test_release_selection.py` `tests/hermes_cli/test_update_shallow_heal.py`
+
+Historical baseline: nightly 41454766643 completed shallow/partial/upgrade_path in 659.5/677.8/816.0
+seconds; 41834945580 timed out all three at 900 seconds. That establishes expensive successful
+runs, not a proven deadlock. Local process snapshots show installer dependency/runtime downloads
+and N-1's npm workspace install after the loopback Git clone has completed. Network is still
+required on a cold dependency cache; do not describe this fixture as offline or claim complete
+nightly coverage from a focused run.
+
 ## Required behavior
 
 The current CI interface is owned by [repository-ci-contract.md](repository-ci-contract.md);
@@ -15,10 +192,55 @@ carry different evidence and must not be confused:
   `scripts/run_tests.sh` harness plus all nine nonrelease Node checks, E2E, docs, Rust and
   container lint. Claims of complete coverage need this profile, not the gate.
 
+The hosted static job runs `python -m scripts.code_health --base
+"$(git merge-base origin/main HEAD)" --head HEAD` as a blocking step in a small
+`uv run --no-project` environment with checkout-pinned Python and Ruff (no full
+application install). The repository-owned `static` lane runs the same ratchet
+with its checkout Python.
+This compares committed PR changes with their merge-base, preserving existing
+findings while rejecting new blocking patterns (including BLE001) and per-unit
+cap growth. Global Ruff selection is unchanged. `qualification` already requires
+the static job; no new required check or branch-protection setting is needed.
+The git-guard wrapper delegates to `./bin/ci`; its lane list is not authoritative.
+
+Upstream's `ca682666b8c` later wired code health into `lint.yml`. The fork had
+already removed that workflow in `d77a654d860`; subsequent upstream integrations
+retained its deletion and never added the ratchet to the portable static lane.
+This is a missed upstream enforcement port, not evidence that a working fork
+ratchet was deliberately disabled. Adding it at this source-owned boundary
+preserves the separate ratchet instead of imposing legacy findings through Ruff.
+Retire this wiring only when its replacement proves the same base-to-head
+blocking behavior. This source-only patch changes no installed runtime.
+
 Profile-owned plugins are tested from their canonical source repository, not from this
 Hermes application checkout. A selected lane (`check --lane`) is partial evidence. No
 profile uses changed-file classification, and the complete profile never substitutes a
 smoke manifest for complete discovery.
+
+Upstream-sync fixtures retain the fork's admission, detached-pruner, native
+browser, resident-completion and degraded-platform contracts. Use a real base
+interpreter and valid `pyvenv.cfg` when a release fixture executes Python,
+instead of linking a fake environment back through another virtualenv. A
+parked bot keeps the gateway serving local clients, while ownership conflicts
+still terminate startup. Assertions must verify those outcomes, not merely
+relax an exit-code expectation. Regenerate prompt-surface fixtures through
+`scripts/ci/prompt_surface.py render` after changing tool catalog descriptions.
+
+`run_tests_parallel.py` retains the child return code (and terminating signal),
+runner status and presence/absence of a terminal pytest summary on every failed
+attempt. A timed-out or crashed child with no parsed outcomes is reported as
+"NO TEST OUTCOMES RECOVERED", never asserted to have run no tests. Keep the
+failure-count headline and every cause bucket visible.
+
+Update-finish fixtures copy the native `plugins` tree as well as core packages:
+bootstrap performs real registry discovery, so an incomplete fixture creates a
+false gateway-restart followup after a genuine build failure. Startup fixtures
+pin the import-time process home to their simulated launch home. Do not stub
+control-socket admission or weaken the real-home I/O guard to make them pass.
+
+TypeScript qualification keeps the composer's actual `void | boolean` promise
+return and one finite `PromptSubmitResponse.status` union, including `rejected`.
+Do not replace these with broad strings or suppress type errors.
 
 Shared update E2E signal injection must never enumerate or signal another file's
 processes when CI lacks usable bubblewrap. The existing fixture HOME boundary
@@ -35,6 +257,52 @@ local helper/reaper stubs, without importing Unix-only dependencies. All eight
 controlled cases remain unmarked for Linux, macOS and Windows. Native Linux
 regressions retain foreign-sibling refusal and detached cleanup.
 No test is skipped and no worker count or timeout is relaxed.
+Before destructive signal delivery, the live-system guard records independently
+verified identities from the test's full subtree. Bottom-up TERM can kill a
+foreground child, reap its shell, and orphan a TERM-ignoring sibling before the
+sibling is signalled. Remembering only the first recipient's descendants loses
+that valid owner. Retained ownership still requires a fresh matching creation
+time and each surviving group member's independent proof. Foreign, mixed,
+recycled and unverifiable identities remain refused. Deterministic regressions
+force sibling reparenting between delivery calls, and the real POSIX grace-kill
+regression must pass without guard bypasses or longer timeouts.
+
+Local native Electron case-spelling security tests require a case-sensitive
+temporary filesystem. On a default case-insensitive macOS volume, provide a
+job-owned case-sensitive APFS scratch image through `TMPDIR` to the canonical
+`./bin/ci gate <sha>` entrypoint. Prove distinct case-only directory identities
+before running. Keep the checkout's pinned toolchain and every assertion intact,
+then detach and remove only the invocation's disposable image after all owned
+processes have exited. Portable CI enforces this precondition before setup or
+lanes on macOS. Direct npm case-spelling tests enforce it at their fixture
+boundary too. Use `scripts/ci/case-sensitive-tmpdir.sh` to provision scratch
+explicitly. [portable-ci.md](portable-ci.md) documents the commands and cleanup.
+
+Electron fixture cost must stay proportional to the assertion under the full
+project's default worker concurrency. The channel-version MSIX test shares the
+checkout's import-only PM and release packages through directory junctions,
+as it already does for Node dependencies, and admits each exact request once
+through the existing synchronous batch validator before loading the real
+packager configs. All four rollover cases still use the real MSIX writer and
+Python artifact recorder, including the wrong-application rejection, but share
+one in-process Node module and one Python recorder instead of eight cold
+process starts. The writer module stays beside its disposable packaging tree
+so its real module resolution and build hooks retain the fixture boundary.
+
+The review payload-cap fixture uses Git's index and one shared blob for most
+of its over-cap rows, plus real untracked files on both sides of the cutoff.
+It still exercises real Git status/diffs, line counting and the renderer cap,
+without creating, reading and deleting thousands of physical files. The
+source-handoff fixture gets the canonical install key from Python once and
+stages channel records directly. One Git fast-import creates its four empty
+commits instead of a commit/rev-parse subprocess pair per commit. The config
+writer has its own Python tests;
+both release-channel forced handoff probes remain real. Main's unchanged
+branch snapshot is reused for the UI fallbacks, with the no-publication-I/O
+assertion starting before its real Python check. Keep existing
+deadlines, worker policy and behavior assertions. Retire these adaptations
+when upstream fixtures provide the same bounded work and coverage.
+
 The post-commit restart oracle follows the pause-record recovery warning rather
 than the older fleet-restart wording, while still proving that the warning
 clears only after a gateway serves the new commit.
@@ -67,6 +335,56 @@ but, on failure, reports per-profile request counts, heartbeat/success age, and
 canary job state (no prompts or keys) so the next missed fire can be attributed
 to enumeration, ticker liveness, claim, or execution instead of an opaque timeout.
 
+The real-process self-reaping-supervisor fixture waits for both the child's
+startup and a parent-ready marker written after its TERM trap is installed.
+A controlled FIFO hold after the fork reproduced the old fixture accepting
+child readiness alone: the actual registry delivered TERM before the handler
+existed and the supervisor exited -15. Holding that same point now keeps the
+readiness predicate false until release. Exit-zero and parent-only TERM
+assertions remain unchanged, as do production parent-first signalling, grace
+windows, worker counts and timeouts.
+
+The process-registry unit fixture isolates PM's PATH store with a temporary
+`HERMES_RUNTIME_DIR` (as in `test_store_path_dirs_cache`) and console-script
+discovery with `_resolve_hermes_bin_dir = lambda: None` (as in
+`test_persist_on_release`). These tests exercise process spawning and teardown,
+not the operator's managed Hermes installation. The payload-aware resolver
+introduced in `3383a1d8b3` probes a sibling `manifest.json`; in a checkout under
+real `HERMES_HOME`, that sibling is correctly outside HomeIOGuard's source-tree
+exemption. The persistence lifecycle fixture owns the same temporary PM store
+and stubs unrelated dependency activation when importing `run_agent` for cleanup
+hooks; it still executes the real lifecycle method, survivor wrapper and registry.
+An exact-main fixture reproduced all eighteen original guard failures before
+this isolation; isolating console-script discovery alone did not fix PM's
+independent store lookup. Leave payload discovery, the home guard and every
+process assertion unchanged. Run both process files alongside the real-home
+tripwire tests; retire this adaptation when upstream isolates those host lookups.
+
+Prompt-surface review keeps full commit ancestry for the merge-base comparison,
+but its checkout uses Git's `blob:none` partial-clone filter. Fetching every
+historical blob exhausted the job's 5-minute budget before review could run,
+even though the review reads only the head tree and the merge-base snapshot.
+Checkout and base `git archive` hydrate the content actually read. A real local
+Git regression leaves an unrelated historical artifact missing while rendering
+the base-to-head prompt diff. The job timeout, staleness test, committed
+snapshots, qualification requirement, and core-approval path are unchanged.
+
+The PM upgrade harness must re-pin its local-origin `main` channel after writing
+fake-provider configuration. Replacing `config.yaml` otherwise erases the
+installer's channel record and makes an official-origin sandbox fall back to
+`stable`, spending live anonymous GitHub API quota. Keep the managed-environment
+`update --check` behind a dead HTTP(S) proxy and assert `Update channel: main`;
+its Git origin is a local path and must remain usable without release HTTP.
+`tests/hermes_cli/test_pm_update_check_harness.py` reproduces a rate-limited
+403 through the real checker before configuring, then verifies that the real
+harness restores `main`, makes no release HTTP request, and leaves HEAD and
+configuration unchanged during `--check`. This ports upstream
+[PR #147904](https://github.com/NousResearch/hermes-agent/pull/147904), with an
+additional deterministic regression. Retire this fork note when the upstream
+fix and equivalent no-network coverage are present through normal integration.
+Do not substitute a GitHub token, retries, skips, or a successful unknown state
+for the fixture's local-origin contract.
+
 The nightly fetches upstream CalVer release tags before its historical upgrade E2E:
 `actions/checkout` sees only fork tags (latest `v2026.8.3`), otherwise the test's
 `git describe HEAD~1` stages an obsolete updater instead of the previous release.
@@ -87,6 +405,21 @@ offline. Otherwise its daemon can outlive the test, resolve a later test's pool,
 and send an earlier key into that test's HTTP recorder. Host and exact-key
 assertions remain unchanged. Dedicated usage tests still exercise real workers.
 
+The OpenRouter image-provider catalog ownership test supplies fixture HTTP
+responses and explicit runtime endpoints instead of reading OpenRouter's live
+inventory. Every curated Image API id must still appear for OpenRouter and none
+for Nous. A separate catalog-failure test builds the Image-API-enabled provider
+and preserves that same snapshot/isolation contract when HTTP raises.
+Recorded requests also prove the live parsing path ran rather than its
+offline snapshot fallback, and that Nous never queried `/images/models`.
+Upstream catalog churn must not turn this routing contract into a change detector.
+Production continues to prefer live inventory and use curated metadata as the
+offline snapshot; catalog absence alone does not prove a model's generation
+endpoint or existing explicit overrides are unsupported. Related SDK-wiring,
+accounting and plugin-only resolution tests stub the DeepInfra inventory,
+OpenRouter pricing catalog and models.dev provider catalog respectively, without
+replacing the behavior each test actually asserts.
+
 See [portable-ci.md](portable-ci.md) for tool versions, worktree isolation,
 coverage allocation, native qualification and release boundaries. Contributors
 need no personal tooling or publisher credentials. Both exact-SHA profiles bind
@@ -102,7 +435,8 @@ checks. That check is no longer required; `qualification` replaced it.
 
 ## Provenance and disposition
 
-Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`.
+Fork patch identities: `fork-ci-reliability`, `ci-gate-cancelled-blocks`, `fork-ci`.
+The `fork-ci` identity owns the subagent process handoff test synchronization below.
 
 Fork-Patch-Backfill: ed3b7d08dfcd7475238cf8ec4c946a9b9ac9ddf6; fork-ci-reliability
 
@@ -229,6 +563,23 @@ zombie launchers as dead in `tools/bot_desktop/runtime.py::_pid_alive`, so this 
 synchronization, not a production liveness correction. Retire when the watcher exposes an owned
 synchronous poll/flush boundary or upstream makes this test isolation unnecessary.
 
+## Subagent process handoff preconditions
+
+The `fork-ci` identity covers `tests/tools/test_subagent_process_handoff.py`. Its
+handed-off child ran `sleep 0.4` and its sibling and foreign processes ran fixed
+sleeps, while the test enabled notification and spawned the sibling before calling
+handoff. Under hosted load the handed child exited first, and the unchanged handler
+correctly refused it as already exited, so the test read `status` from an error-only
+result (hosted job 127391871875). Controlled scheduling of the unchanged test
+reproduced that `KeyError`. Each real process now waits on a test-owned release
+file until its ownership and notification preconditions exist. The handed process
+is released only after handoff, and the test waits on completion publication
+without consuming the parent's notification. Real subprocesses, parent delivery,
+orphan accounting and exited, foreign and non-child refusals remain asserted.
+Product code is unchanged. Retire when upstream synchronizes these preconditions.
+
+Contract tests: `tests/tools/test_subagent_process_handoff.py`.
+
 ## Update pause consumer publish race
 
 The `fork-ci-reliability` identity also covers
@@ -267,6 +618,16 @@ also repairs the four sibling test files that fail under the same poison config.
 A poison global config with `commit.gpgsign=true` fails setup before the patch,
 and all 95 affected tests pass after it. Retire the fork adaptation when a
 released upstream revision provides the same hermetic tests.
+
+## Escalated-kill finalization ownership
+
+The `fork-ci-reliability` identity also covers
+`tests/tools/test_kill_verify_tree_death.py::test_escalated_kill_of_sigterm_ignoring_child_reports_killed`.
+After SIGKILL, the reader thread can observe exit and claim finalization before
+the kill commits. The kill then returns `killed` without waiting for the owner's
+receipt IO, by design. The owner moves the session to `_finished` and then sets
+`_completion_event`. The test waits on that event before asserting the finished
+map and the durable `killed` receipt. A `reader_owns` case forces this interleaving.
 
 ## Audio playback isolation
 
@@ -316,6 +677,18 @@ checkout, and fails on the previous probe order. Upstream main (after
 (`scripts/_activation.sh`, `activate`), which builds a test environment for
 each worktree. Retire this probe when the fork adopts a released upstream
 runner with that activation.
+
+## Explicit-interpreter dependency paths
+
+The `fork-ci-reliability` identity covers `scripts/run_tests.sh` preserving the
+Nix devShell interpreter's inherited `PYTHONPATH` across its `env -i` boundary.
+Only the explicit, unactivated `HERMES_PYTHON` lane inherits this path; a normal
+checkout activation still starts with an empty extra path. If the live-gateway
+pytest guard is installed, append its directory instead of replacing the
+interpreter's dependency path. `tests/scripts/test_run_tests_shell.py` runs the
+real shell harness with an import available only through that inherited path,
+both with and without the guard. Retire this adaptation when the supported Nix
+interpreter no longer depends on `PYTHONPATH` for its locked environment.
 
 ## Hosted load-progress fixture isolation
 
@@ -418,6 +791,20 @@ Linux handoff behavior requires native Linux evidence, not a macOS platform skip
 Retire this adaptation when the accepted upstream guard proves the same owned
 process topologies without allowing signals to unrelated live processes.
 
+## Attachment Probe Runtime Isolation
+
+The `fork-ci-reliability` identity also covers the attachment-handshake probe.
+It supplies the test runner's already-required Node.js through `HERMES_NODE`,
+resolved with `node -p process.execPath` in the runner's real environment, not
+as a PATH shim that depends on version-manager configuration under `HOME`.
+It disables lazy installs in its credential-stripped child environment. An
+unused bootstrap flag did not prevent a fresh PM runtime and Node installation
+inside each isolated home. The genuine-owner control also requires that no
+managed tool store was created. Keep the real CLI, HTTP discovery, owner lease,
+90-second deadline and live-system guard unchanged. Run the attachment file
+on Linux and macOS. Retire this adaptation when upstream's attachment fixture
+selects its supplied runtime without provisioning one during the assertion.
+
 ## Verification and retirement
 
 The host-installation tripwire also protects the captured account's `.local/bin`
@@ -499,11 +886,68 @@ descendants. It mocks the pane and needs no tmux, so it lives outside
 Retire these driver adaptations when upstream supplies equivalent bounded,
 condition-based synchronization and output capture.
 
+Scripted CLI homes also persist `sessions.auto_prune: false`. An undecided
+preference lets hosted free-disk pressure introduce a synchronous startup
+question once a prior launch has cached its reclaim estimate, before resume
+recap or the composer. Runs 41272803389 and 41264196401 captured that offer at
+6.7 GB free of 71.6 GB while the unchanged 120-second resume-ready wait expired.
+The preference answers unrelated onboarding without enabling deletion or
+changing production startup. Keep both home factories decided; preserve every
+tmux journey, assertion and deadline. Retire this fixture choice only when the
+accepted upstream scripted homes have equivalent startup isolation.
+Contract tests: `tests/ci/test_tmux_home_startup_offers.py`.
+
+The TUI gateway drop scenario holds its first provider request until five
+heartbeat RPCs have actually completed while that request is in flight. A
+legal slow first RPC otherwise consumes most of a short failed turn, so elapsed
+time cannot establish the sampler's count. The provider emits the partial SSE
+immediately and sends empty content chunks during observation, keeping each
+read/stale gap short without changing either timeout. Only then does it close
+without a finish chunk. The first marked request must have served that drop to
+an open peer, with no retry before release. The turn's original deadline includes observation,
+and all heartbeat latency, terminal, retry-bound, history, reaping and subsequent
+prompt assertions remain. Each parallel scenario owns its provider and barrier.
+Retire this synchronization when upstream supplies equivalent observation-driven
+fault injection.
+
+The PM wheelhouse fixture uses the four unmodified universal wheels vendored in
+`tests/pm/fixtures/runtime-wheelhouse`, not live PyPI or a host cache. It checks
+the selected wheels' hashes against the current `pm/uv.lock` before copying them
+into the isolated wheelhouse, and requires the fixture archives to match that
+selection exactly. Missing fixtures name their lock entry. Keep the fixtures
+and lock together when updating PM. The offline sealing, relocation and missing-locked-wheel rejection checks are
+unchanged. Retire the vendored source if upstream provides an equally hermetic
+real-wheel fixture.
+
 Run `bin/ci` and `git diff --check`. Record the exact candidate, environment,
 completed lanes and failures. Focused regression success never closes a
 complete-suite gap or proves an installed runtime.
 Retire fixture adaptations when the accepted release tests already cover the maintained
 behavior. Retire superseded hosted orchestration after its replacement qualifies.
+
+## API admission thread-affinity proof
+
+The API held-writer test measures the actual blocking write's thread, not the
+maximum gap between owner-loop ticks. The old 0.5-second tick budget included
+unrelated callbacks and shared-runner descheduling: injecting one unrelated
+0.6-second callback reproduced the failure with the already off-loop admission
+driver unchanged (`gateway/session_api.py::run_steps_off_loop` and
+`gateway/session_runtime_workers.py::tracked_write`). The production off-loop
+fix originated in upstream commit `47b24028dd8`.
+
+For Chat Completions, Responses and Runs, the test guards the real
+`SessionDB._execute_write` against the owner thread and observes a real SQLite
+busy retry while another connection retains `BEGIN IMMEDIATE`. An event must
+reach the owner loop while the request remains pending; only then does the test
+release the writer and require the original successful HTTP status. The event
+and request watchdogs bound deadlocks, not admission latency. No production
+path, skip, timeout or performance threshold is relaxed.
+
+Contract tests: `tests/gateway/test_api_admission_off_loop.py`.
+
+Retire this `fork-ci-reliability` adaptation when the accepted upstream test
+uses equivalent causal thread-affinity and real-contention evidence rather
+than a subsecond wall-clock scheduling budget.
 
 ## Portable source gate migration
 
@@ -513,6 +957,109 @@ worktree isolation, complete allocation of the 36 workflows, and residual native
 OS/integration/release lanes. The candidate removes hosted orchestration while
 remote enforcement remains until replacement qualification and cutover. A partial
 lane or a Linux pass cannot establish all-platform coverage.
+
+## Trailing-amp reader home isolation
+
+The `fork-ci-reliability` identity covers the real-process tests in
+`tests/tools/test_terminal_trailing_amp_auto_background.py`. Their reader threads
+can finish after a later test changes process-global `HERMES_HOME`.
+`_track_started` already copies the producer's context, but an environment-only
+home has no context-local binding to copy. A delayed `_publish_finished` can then
+write `processes.json` into the incognito refusal test's home despite neither
+acquiring an environment nor spawning a process there. Hosted run 41755656382,
+attempt 1, exposed this race.
+
+A module-local autouse fixture binds the existing temporary home with
+`set_hermes_home_override` as well as `HERMES_HOME`, so real reader callbacks keep
+their producer's home. An event-held real reader completion deterministically
+crosses a subsequent home change and must checkpoint only in its original home.
+The incognito no-acquire, no-spawn and no-checkpoint assertions stay intact. No
+production behavior, timeout, retry or checkpoint persistence is relaxed.
+Upstream guidance was checked at `29a61cb7ab509cda0c376bf3860edb87210b0755`;
+[merged PR #140317](https://github.com/NousResearch/hermes-agent/pull/140317)
+is related origin, not a fix for callback test isolation. Retire this adaptation
+when released upstream binds these real-process tests to fixture-owned homes.
+
+Contract tests: `tests/tools/test_terminal_trailing_amp_auto_background.py`
+
+## Attached native-kill readiness probe
+
+The `fork-ci-reliability` identity covers the attached-job readiness probe in
+`tests/tools/test_process_registry_attached_boundary.py`. Login-shell startup
+can leave a child in a psutil snapshot that is reaped before its name is read.
+Only `NoSuchProcess` and `ZombieProcess` mean that candidate is gone; continue
+looking for a real `sleep` before timing the native kill. Access and other probe
+errors still fail. The killed-status, sub-0.5-second kill, and no-exit-receipt
+assertions are unchanged. Deterministic vanished-child probes require both a
+negative result without a sleeper and a positive result after a vanished child.
+This is independent of the broader teardown-helper change in fork PR #1120.
+Retire when released upstream carries equivalent race-safe readiness probing;
+roll back the commit carrying `Fork-Patch: fork-ci-reliability` for this probe.
+
+Contract tests: `tests/tools/test_process_registry_attached_boundary.py`
+
+## Host terminal paste cancellation
+
+The `fork-ci-reliability` identity covers the host terminal's real-PTY cancellation
+observation in `tests/hermes_cli/test_host_terminal_viewer_ownership.py`.
+The wait-for-room hook proves that a paste hit backpressure. It cannot prove
+where cancellation lands: Linux may make the master writable again before the
+tab's close is processed, so the write resumes and cancellation reaches its
+worker-thread await instead. Observe `CancelledError` leaving `bridge.write`,
+while preserving every live-shell, detach, registry and retention assertion.
+Production still delivers already-received input until backpressure after close.
+
+This adopts upstream [PR #145620](https://github.com/NousResearch/hermes-agent/pull/145620),
+commit `bcc5e486cf60a6dad7345d0fb8ed26def261e034`, with contributor authorship
+preserved. The fork's hosted run `42444478246` failed the narrower observation.
+On the unchanged base, Linux CPython 3.14.7 reproduced it in 1/200 runs under
+24 `yes` workers. An event-controlled first-wait drain reproduced it in 200/200
+runs while the outer write was cancelled and the shell stayed alive and detached.
+Retire this adaptation when the maintained release includes the upstream fix.
+Rollback reverts this fixture change, with no runtime or stored-state migration.
+
+Contract tests: `tests/hermes_cli/test_host_terminal_viewer_ownership.py`
+
+## Webapp sign-out navigation
+
+The `fork-ci-reliability` identity covers the gated sign-out journey in
+`apps/desktop/e2e/core/webapp-gateway-attach.spec.ts`. After sign-out, the browser
+transport navigates to `/login` when an authenticated request is refused. Observe
+that navigation instead of issuing a competing reload, which can address a
+Chromium target during detachment. Keep the socket-closure, command-summary,
+API-401, login-URL, hidden-composer and successful-re-sign-in assertions.
+
+Nightly run `42450734092`, job `128639191910`, failed at the competing reload
+with `Page.reload: Not attached to an active page`. Its retained trace contains
+only test-runner events, so it cannot establish the browser's navigation timing.
+A Linux Chromium probe of the unchanged journey confirmed script-initiated
+`/login` navigation after sign-out and successful re-sign-in. No renderer change
+is needed. Retire this adaptation when upstream observes the same navigation
+contract. Rollback reverts the test change without altering runtime state.
+
+## Descendant reap races in test probes
+
+Test liveness and teardown probes share `tests.waiting.process_alive` (PID or
+retained Process), `kill_if_alive`, `terminate_if_alive`, `process_children`,
+`process_name`, and `process_cmdline`.
+A descendant can exit between any two psutil reads; NoSuchProcess and
+ZombieProcess mean gone, not a test failure. Recorded creation times and retained
+Process handles preserve identity checks. AccessDenied and live-system guard
+refusals remain errors, never evidence of exit. The helper design extends the
+four-file upstream proposal [#146926](https://github.com/NousResearch/hermes-agent/pull/146926)
+(`055dd8c4914f943899bf0229735fba991a440765`) across the test suite, including the
+LSP cancellation wait. Runtime liveness checks under `gateway/` and `tools/`
+already catch these exceptions; no product behavior is changed.
+
+The deterministic regression exercises both reap errors from Process.status()
+after is_running() returns true. process_alive never calls pid_exists. The fresh
+serve subreaper inlines its psutil probes to avoid importing tests, which exports
+HERMES_TEST_ISOLATION, and checks that the serve child does not inherit that marker.
+Retire this adaptation once an accepted upstream release
+provides equivalent race-safe helpers and all converted probes. Roll back the
+commits carrying `Fork-Patch: fork-ci-reliability` for this change together.
+
+Contract tests: `tests/test_process_liveness.py`, `tests/gateway/test_managed_worker_launch.py`, `tests/agent/lsp/test_client_e2e.py`
 
 ## Release-sync scope
 
@@ -530,3 +1077,76 @@ The same sync exposed an upstream desktop build bug: `xcrun` honors an inherited
 `macos-sysroot-native.test.mjs` failed on its stale-SDKROOT rung. The helper
 builds now pass `xcrunEnv()`, which drops `SDKROOT` after the resolver has chosen
 the SDK. Offer this upstream; drop the patch once upstream carries an equivalent.
+
+## Tenancy teardown environment race
+
+The `fork-ci-reliability` identity covers permission races in the routing case
+teardown helper. Hosted run
+https://github.com/0xble/hermes-agent/actions/runs/42655586734, shard 8/10, failed in
+`fallback_named_after_401` when the environment recheck before termination raised
+`psutil.AccessDenied`. Both termination and kill now share the ownership check.
+After a permission failure, a fresh status read treats a vanished process or
+zombie as stopped. A still-live or unreadable process stays in the bounded wait
+without receiving a signal whose ownership cannot be proved. The discovery scan
+still skips inaccessible environments. The containment assertion and final
+case-owned survivor verification remain mandatory.
+
+Contract tests: `tests/e2e/core/tenancy/test_routing_process_races.py`, `tests/e2e/core/tenancy/test_routing_process_cleanup.py`.
+
+This extends the fork-local `routing-test-process-cleanup` harness, with no product
+runtime change. Retire when the accepted upstream case teardown handles the same
+race without weakening ownership or survivor checks. Rollback reverts this helper
+and its regression, with no runtime or stored-state migration.
+
+## Classic command output synchronization
+
+The classic PTY harness shares its existing 45-second screen poll between
+`send()` and assertions for separately painted output. Bare `/title` prints
+`Session ID:` before reading the session and painting `Title:`. Seeing the ID
+does not prove the title line is visible. The title and retry assertions wait
+for their own text without changing deadlines, command completion markers, or
+the requirement to observe a new occurrence of a command acknowledgement.
+
+`tests/hermes_cli/test_gateway_chat_title_repaint.py` holds the real CLI's
+title paint behind a FIFO until the harness captures an incomplete frame.
+It fails with the original immediate assertion and passes with the shared
+screen wait. No runtime behavior changes. Retire this synchronization only
+when the renderer supplies an atomic command-output completion boundary.
+
+## Pinned tool archive caches
+
+`.github/actions/cache-pinned-tool` restores exact SHA-pinned `actions/cache`
+entries, runs the installer's unconditional SHA-256 verifier, and saves verified
+archives immediately. A later failing check does not discard a successful
+download. No restore prefixes permit a different pin to satisfy the key.
+Keys include source, runner OS and architecture, archive architecture, tool,
+pinned version, and the full expected SHA-256. Cold or evicted caches still
+require the origin. Warm caches remove release-origin requests for these inputs.
+
+`.github/actions/cache-linux-tools` applies that mechanism to all 7 components
+in `ci/linux-artifacts.json` for both Linux jobs in `gate.yml` and `nightly.yml`.
+The installer verifies restored bytes again before extraction or execution.
+Retries, extraction validation, checks and qualification semantics are unchanged.
+The image-build caller in `ci/Dockerfile` retains its existing layer cache.
+
+The independent `setup-uv` callers in native nightly, Desktop core E2E, and live
+providers use the same archive transport. After verification,
+`scripts/ci/pinned_tools.py` seeds the exact `@actions/tool-cache` layout.
+The unchanged `setup-uv` action finds that tool locally and keeps its normal
+outputs, PATH, and dependency-cache behavior. `ci/uv-artifacts.json` pins the
+[uv 0.12.13 release asset digests](https://api.github.com/repos/astral-sh/uv/releases/tags/0.12.13).
+The pinned setup-uv revision's built-in table has no 0.12.13 checksums, so this
+adds explicit verification. PM tools retain their existing SHA-verified archive
+store and tree-digest checks through `setup-pm`. Runtime installers (`rustup`,
+`uv python`, setup-node/setup-python) and npm/Cargo registry downloads retain
+their own verification and cache policies.
+
+Installer tests cover misses, offline hits, corrupt bytes, retries and checksum
+failure before installation. uv seeding tests cover tar/zip, refreshing installed
+bytes from verified archives, and refusing corruption. The first PR workflow run
+exercises the new namespace's miss/save path. Rerun the same head for hosted
+restore/hit qualification. PR caches are scoped to the PR merge ref and cannot
+warm main's nightly. The first main nightly seeds its own entries.
+
+Rollback by reverting this cache change. Retire it when the owning CI bootstrap
+provides equivalent pinned, verified, outage-independent warm archive inputs.

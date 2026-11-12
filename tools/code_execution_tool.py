@@ -124,7 +124,7 @@ def check_sandbox_requirements() -> bool:
 # Per-tool stub templates: (signature, docstring, args_dict_expr — the JSON payload sent over RPC).
 _TOOL_STUBS = {
     "web_search": ("query: str, limit: int = 5, stakes: str = None",
-        '"""Search the web. Optional stakes="standard" marks low-stakes searches for Lite, subject to the protected-topic guard. Otherwise Auto. Returns dict with data.web list of {url, title, description}."""',
+        '"""Search the web. Optional quality hint. Exa Lite is paused by default: all Exa searches use full Auto regardless of this hint. If Lite is explicitly re-enabled, standard permits low-stakes lookups; high or omission retains Auto. Use high or omit for protected, time-sensitive or costly-if-wrong research. Returns dict with data.web list of {url, title, description}."""',
         '{"query": query, "limit": limit, "stakes": stakes}'),
     "web_extract": ("urls: list, char_limit: int = None",
         '"""Extract content from URLs (no LLM summarization). Returns dict with results list of {url, title, content, error}. Pages over char_limit (default 15000) are head+tail truncated with the full text stored on disk; the content footer gives the path. content is markdown."""',
@@ -640,7 +640,8 @@ def _run_remote_per_call(env, env_type: str, code: str, effective_task_id: str,
         rpc_thread = threading.Thread(
             target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
             args=(env, f"{sandbox_dir}/rpc", effective_task_id, tool_call_log, tool_call_counter,
-                  max_tool_calls, sandbox_tools, stop_event, rpc_token))
+                  max_tool_calls, sandbox_tools, stop_event, rpc_token),
+            kwargs={"deadline": time.monotonic() + timeout if timeout else None})
         rpc_thread.start()
         # The token travels in a sourced env file, never in argv. No umask on
         # the launch command: the 700 dirs + explicit 0600 writes cover Hermes'
@@ -686,40 +687,43 @@ def _execute_remote(code: str, task_id: Optional[str], enabled_tools: Optional[l
     """Run code on the remote terminal backend: the owner's persistent remote session kernel
     (tools/code_kernel_remote.py) first, else the per-call script ship — the fail-open route when
     a kernel cannot be spawned and the only route for hosts that cannot sustain a background process."""
+    from tools.terminal_tool import _resolve_container_task_id
+    from tools.terminal_tool_lifecycle import _call_in_flight
     _cfg = _load_config()
     timeout, max_tool_calls = _cfg.get("timeout", DEFAULT_TIMEOUT), _cfg.get("max_tool_calls", DEFAULT_MAX_TOOL_CALLS)
     sandbox_tools, effective_task_id = _sandbox_tools_for(enabled_tools), task_id or "default"
     env, env_type = _get_or_create_env(effective_task_id)
-    exec_start = time.monotonic()
-    try:
-        py_check = env.execute("command -v python3 >/dev/null 2>&1 && echo OK", cwd="/", timeout=15)
-        if "OK" not in py_check.get("output", ""):
-            return _error_result(f"Python 3 is not available in the {env_type} terminal "
-                                 "environment. Install Python to use execute_code with remote backends.")
-        # Session-kernel path: one persistent kernel per owner on the
-        # run-to-completion transport. Spawn failure falls OPEN to the per-call
-        # path below so a degraded remote host never blocks execution.
+    with _call_in_flight(_resolve_container_task_id(effective_task_id)):
+        exec_start = time.monotonic()
         try:
-            # --- Session-kernel path (hermes-agent#96873) ------------------- Same always-on model as
-            # local: one persistent kernel per owner, rebuilt on the run-to-completion transport (detached
-            # runner + file cell protocol).
-            from tools.code_kernel_remote import execute_in_remote_kernel
-            kernel_result = execute_in_remote_kernel(
-                code, env=env, env_type=env_type, task_env_id=effective_task_id,
-                sandbox_tools=frozenset(sandbox_tools), timeout=timeout,
-                max_tool_calls=max_tool_calls, reset=bool(reset),
-                idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
-            )
-        except Exception:  # health: allow BLE001 -- spawn-only fail-open must not log credentials from transport exceptions.
-            logger.warning("remote session-kernel path failed; falling back to per-call (details omitted)")
-            kernel_result = None
-        if kernel_result is not None:
-            return _finish_remote_kernel_result(kernel_result, timeout=timeout, exec_start=exec_start)
-        logger.info("remote session kernel unavailable on %s; using per-call path", env_type)
-    except Exception as exc:
-        return _remote_failure(exc, exec_start, 0)
-    return _run_remote_per_call(env, env_type, code, effective_task_id, sandbox_tools,
-                                timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start)
+            py_check = env.execute("command -v python3 >/dev/null 2>&1 && echo OK", cwd="/", timeout=15)
+            if "OK" not in py_check.get("output", ""):
+                return _error_result(f"Python 3 is not available in the {env_type} terminal "
+                                     "environment. Install Python to use execute_code with remote backends.")
+            # Session-kernel path: one persistent kernel per owner on the
+            # run-to-completion transport. Spawn failure falls OPEN to the per-call
+            # path below so a degraded remote host never blocks execution.
+            try:
+                # --- Session-kernel path (hermes-agent#96873) ------------------- Same always-on model as
+                # local: one persistent kernel per owner, rebuilt on the run-to-completion transport (detached
+                # runner + file cell protocol).
+                from tools.code_kernel_remote import execute_in_remote_kernel
+                kernel_result = execute_in_remote_kernel(
+                    code, env=env, env_type=env_type, task_env_id=effective_task_id,
+                    sandbox_tools=frozenset(sandbox_tools), timeout=timeout,
+                    max_tool_calls=max_tool_calls, reset=bool(reset),
+                    idle_exit=int(_cfg.get("kernel_idle_timeout", 1800)),
+                )
+            except Exception:  # health: allow BLE001 -- transport exceptions may contain credentials.
+                logger.warning("remote session-kernel path failed; falling back to per-call (details omitted)")
+                kernel_result = None
+            if kernel_result is not None:
+                return _finish_remote_kernel_result(kernel_result, timeout=timeout, exec_start=exec_start)
+            logger.info("remote session kernel unavailable on %s; using per-call path", env_type)
+        except Exception as exc:
+            return _remote_failure(exc, exec_start, 0)
+        return _run_remote_per_call(env, env_type, code, effective_task_id, sandbox_tools,
+                                    timeout=timeout, max_tool_calls=max_tool_calls, exec_start=exec_start)
 
 
 # ---- Main entry point ----

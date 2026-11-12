@@ -50,6 +50,59 @@ async def recover_failed_settlement(authority, row):
             await asyncio.sleep(1)
 
 
+async def requeue_shutdown_unstarted(authority, ref, live, row):
+    """A native turn this owner's restart or shutdown stopped before its first model call ran
+    nothing: the claim goes back to its FIFO place for the successor, which runs it once, and this
+    process sends nothing for it (no "send it again"). True when requeued; anything else settles
+    as before. An API, LOCAL or managed claim has its own caller and receipts, so it never qualifies."""
+    if not authority.runner._draining or authority.retiring:
+        return False  # the common case: no restart, nothing to decide
+    admission_id = row['admission_id']
+    result = (authority.pending_results.get(admission_id) or {}).get('result') or {}
+    from gateway.run_interrupt_cause import is_owner_shutdown_interrupt
+    if not ('native_text_v1' in (row.get('payload') or {}) and result.get('interrupted')
+            and type(result.get('api_calls')) is int and result['api_calls'] == 0
+            and is_owner_shutdown_interrupt(result)):
+        return False
+    from gateway.session_ingress import deliver_settled, waiter_replies
+    from gateway.session_queued_controls import publish_transfers
+    from gateway.session_runtime_workers import track_mutation
+    from hermes_state_runtime import requeue_unstarted_claim
+    try:
+        transfers = tuple(_transfers(authority, live, row) or ())
+        requeued = await asyncio.shield(track_mutation(authority, asyncio.to_thread(
+            requeue_unstarted_claim, authority.db, epoch=authority.epoch, admission_id=admission_id,
+            generation=row['generation'], transfers=transfers, transcript_mark=row.get('transcript_mark'))))
+    except (OSError, sqlite3.Error, RuntimeStoreError):
+        logger.warning('Requeue of shutdown-interrupted admission %s failed; settling it', admission_id, exc_info=True)
+        return False
+    if not requeued:
+        return False
+    logger.info('Admission %s was stopped by shutdown before its first model call; requeued for the next owner',
+                admission_id)
+    authority.pending_results.pop(admission_id, None)
+    authority.pending_deliveries.pop(admission_id, None)
+    waiter_replies(authority).pop(admission_id, None)
+    with live.event_stream.lock:
+        live.event_stream.execution = {}
+    for pending in (authority.pending_stops, authority.pending_stop_causes, authority.pending_steers, authority.adopted):
+        pending.pop(ref.session_id, None)
+    publish_transfers(authority, ref, row['generation'])
+    authority.deferred_resets.pop(live.route, None)
+    # Nothing was interrupted mid-work: the successor's replay is the resume, not a synthetic one.
+    store = getattr(authority.runner, 'async_session_store', None)
+    if store is not None:
+        try:
+            await store.clear_resume_pending(live.route)
+        except Exception:
+            logger.debug('clear_resume_pending after requeue failed for %s', live.route, exc_info=True)
+    if authority.sessions.get(ref.session_id) is live:
+        authority._publish_pending(ref)
+    await deliver_settled(authority, admission_id)  # nothing to send: releases a held crash marker
+    await authority._resolve_settled_waiter(admission_id, '')
+    return True
+
+
 def completion_payload(row, settled, response, captured):
     # ``status`` is the message.complete contract's TurnStatus: the Desktop
     # extends a Stopped bubble to the persisted partial only on 'interrupted'.
@@ -78,6 +131,10 @@ def completion_payload(row, settled, response, captured):
             complete['response_previewed'] = True
         if captured_result.get('response_transformed'):
             complete['response_transformed'] = True
+            # The stream carried the raw reply and the turn counts as delivered (``response`` is
+            # None): this frame is the only carrier of the rewrite the session stored.
+            if not response and (final := captured_result.get('final_response')):
+                complete['text'] = complete['content'] = final
         if isinstance(captured_result.get('warning'), str) and captured_result['warning']:
             complete['warning'] = captured_result['warning']
         if isinstance(captured_result.get('billing_block'), dict):
@@ -146,7 +203,7 @@ def owner_stop_notice(captured, outcome, row=None):
 
 def gateway_refusal_boundary(captured, outcome):
     """``(notice, display_metadata)`` for a failed turn the gateway itself refused with a renderable
-    descriptor (``session_cron.execute``: the only producer of ``result.error_surface``), else None."""
+    descriptor (``result.error_surface``: ``session_cron.execute``, ``session_policy.refused_turn_result``), else None."""
     value = (captured or {}).get('result') or {}
     surface, error = value.get('error_surface'), value.get('error')
     if outcome != 'failed' or not isinstance(surface, dict) or not isinstance(error, str) or not error:
@@ -201,6 +258,8 @@ async def settle_with_retry(authority, live, ref, row, response, outcome, captur
     A fence refusal (``RuntimeStoreError``) is not transient and is raised at once."""
     from gateway.session_ingress_media import release_admission_media_later
     from gateway.session_runtime_workers import track_mutation
+    from gateway.checkin_delivery import fence_local_settlement
+    response = await fence_local_settlement(authority, live, row, response, captured)
     for delay in (*_SETTLE_RETRY_DELAYS_S, None):
         try:
             await asyncio.shield(track_mutation(authority, asyncio.to_thread(

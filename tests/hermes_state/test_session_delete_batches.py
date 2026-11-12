@@ -1,4 +1,5 @@
 """Deletion must release the writer between bounded message/FTS batches."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 
 import sqlite3
 from contextlib import closing
@@ -20,7 +21,7 @@ def _retire_without_reclaiming(db, monkeypatch, session_id):
 
 def test_retired_session_rejects_worker_registration(tmp_path, monkeypatch):
     with closing(SessionDB(tmp_path / "state.db")) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
         db.create_session("retired", source="cli")
         _retire_without_reclaiming(db, monkeypatch, "retired")
         with pytest.raises(rt.RuntimeStoreError, match="not_found"):
@@ -32,7 +33,7 @@ def test_retired_session_rejects_worker_registration(tmp_path, monkeypatch):
 def test_input_admission_rechecks_retirement_after_read_probe(tmp_path, monkeypatch):
     path = tmp_path / "state.db"
     with closing(SessionDB(path)) as db, closing(SessionDB(path)) as deleter:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
         db.create_session("retired", source="cli")
         execute_write = db._execute_write
         raced = False
@@ -60,7 +61,7 @@ def test_blocked_cleanup_does_not_wedge_other_deletes(tmp_path, monkeypatch, cap
     import hermes_state_deletion as deletion
     from hermes_state_mutation_retirement import RETIRED_PREFIX
     with closing(SessionDB(tmp_path / "state.db")) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
         db.create_session("blocked", source="cli")
         db.append_message("blocked", "user", "pending cleanup")
         _retire_without_reclaiming(db, monkeypatch, "blocked")
@@ -131,7 +132,7 @@ def test_retirement_refuses_local_child_producers(tmp_path, monkeypatch, produce
     from hermes_state_local_lineage import reset_local_target
     from tests.hermes_state.test_ledger_delete_consistency import _local_session
     with closing(SessionDB(tmp_path / "state.db")) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
         sid, entry = _local_session(db, epoch)
         before = db.get_session(sid)
         _retire_without_reclaiming(db, monkeypatch, sid)
@@ -193,7 +194,8 @@ def test_large_delete_bounds_each_transaction(tmp_path, operation):
         elif operation == "prune":
             assert db.prune_sessions(older_than_days=1) == 1
         else:
-            from hermes_state_runtime import begin_runtime_epoch, mutate_runtime_session
+            from hermes_state_runtime import mutate_runtime_session
+            from tests.fakes.runtime_owner import begin_runtime_epoch
             epoch = begin_runtime_epoch(db, instance_id="delete-test")
             snap = db.get_session("large")
             assert snap is not None

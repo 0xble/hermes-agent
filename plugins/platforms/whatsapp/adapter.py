@@ -14,6 +14,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Dict, Optional, Any
 
+from agent.attachment_context import format_document_content
 from gateway.platforms._shared import (
     apply_yaml_bridge as _apply_yaml_bridge, extra_or_secret as _extra_or_secret, get_scoped_secret, send_error
 )
@@ -873,7 +874,12 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
         return await self._send_media_to_bridge(chat_id, video_path, "video", caption)
 
-    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None, **kwargs) -> SendResult:
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
+                         is_voice: Optional[bool] = None, **kwargs) -> SendResult:
+        # The bridge turns every "audio" send into a voice note (ptt, transcoded to Opus); a plain
+        # audio MEDIA file (is_voice=False: music, a sound effect) goes as a named document instead.
+        if is_voice is False:
+            return await self.send_document(chat_id, audio_path, caption=caption, reply_to=reply_to)
         return await self._send_media_to_bridge(chat_id, audio_path, "audio", caption)
 
     async def send_document(self, chat_id: str, file_path: str, caption: Optional[str] = None, file_name: Optional[str] = None,
@@ -995,7 +1001,7 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                     continue
                 content = p.read_text(encoding="utf-8-sig", errors="replace")
                 parts = p.name.split("_", 2)  # strip the doc_<hex>_ prefix for display
-                injection = f"[Content of {parts[2] if len(parts) >= 3 else p.name}]:\n{content}"
+                injection = format_document_content(parts[2] if len(parts) >= 3 else p.name, content)
                 body = f"{injection}\n\n{body}" if body else injection
                 inlined[i] = True
                 print(f"[{self.name}] Injected text content from: {doc_path}", flush=True)

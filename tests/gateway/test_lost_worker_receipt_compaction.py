@@ -8,18 +8,17 @@ from types import SimpleNamespace
 
 import psutil
 
+from hermes_cli.process_identity import worker_birth
 from hermes_state import SessionDB
-from hermes_state_runtime import (
-    admit_session_input, begin_runtime_epoch, claim_session_input, mutate_worker_execution,
-    recover_session_inputs, register_worker_execution,
-)
+from hermes_state_runtime import admit_session_input, claim_session_input, mutate_worker_execution, recover_session_inputs, register_worker_execution
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 READ = dict(target='s', include_ancestors=False, include_inactive=False, repair_alternation=False,
             include_row_ids=False, include_compacted=False)
 
 
 def hello(process):
-    return {'type': 'hello', 'pid': process.pid, 'birth': psutil.Process(process.pid).create_time(), 'ancestors': [os.getpid()]}
+    return {'type': 'hello', 'pid': process.pid, 'birth': worker_birth(psutil.Process(process.pid)), 'ancestors': [os.getpid()]}
 
 
 def _receipt_sizes(db):

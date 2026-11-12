@@ -77,3 +77,21 @@ def test_cli_barrier_lift_keeps_wake_and_cleanup(monkeypatch, enabled):
     assert client._pending_input.get_nowait() == "Continue after wait"
     manager.mark_automatic_continuation_dispatched.assert_called_once_with(expected_instance="instance")
     manager.clear_lifted_wait.assert_called_once_with(123)
+
+
+@pytest.mark.parametrize("notices,shown", [("true", True), ("hidden", False)])
+def test_cli_loop_outcome_follows_loop_notices(notices, shown):
+    from hermes_cli.cli_loops_mixin import CLILoopsMixin
+    from hermes_constants import get_hermes_home
+    get_hermes_home().joinpath("config.yaml").write_text(f"loops:\n  notices: {notices}\n")
+    manager = Mock()
+    manager.state = SimpleNamespace(awaiting_response=True)
+    manager.complete_tick.return_value = {"status": "done", "message": "✓ Loop finished — ran 3/3 times."}
+    client = CLILoopsMixin.__new__(CLILoopsMixin)
+    client._get_loop_manager = lambda: manager
+    client._last_turn_interrupted = False
+    client._post_turn_response = lambda: ("LOOP_COMPLETE", True)
+    with patch("cli._cprint") as output:
+        client._maybe_complete_loop_tick_after_turn()
+    manager.complete_tick.assert_called_once_with("LOOP_COMPLETE")
+    assert output.call_count == int(shown)

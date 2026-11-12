@@ -26,6 +26,8 @@ def _add_rename_and_discard(sessions_subparsers) -> None:
     sessions_rename.add_argument("title", nargs="+", help="New title for the session")
     from hermes_cli.sessions_discard import add_discard_parser
     add_discard_parser(sessions_subparsers)
+    from hermes_cli.sessions_adopt import add_adopt_parser
+    add_adopt_parser(sessions_subparsers)
 
 
 def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
@@ -152,13 +154,13 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         "defaults to 90 days; any filter matches all ages)")
     _flag(sessions_prune, "--include-archived",
         help="Also delete archived sessions (excluded by default)")
-    _flag(sessions_prune, "--include-pinned",
-        help="Also delete pinned sessions (excluded by default — pin is a keep flag)")
+    _flag(sessions_prune, "--include-pinned", help="Also delete pinned sessions (excluded by default — pin is a keep flag)")
     _flag(sessions_prune, "--never-active",
         help="Instead of ended sessions, delete keyed gateway rows that were "
             "opened and never used (no messages, tokens, tool calls or title) "
             "and are older than AGE (default 30 days). Ordinary prune can "
             "never reach these — it only ever selects ended sessions")
+    _flag(sessions_prune, "--now", help="Delete now even outside maintenance.deletion_window (prune deletes only inside it by default: a large delete stalls the live gateway's writes)")
     _flag(sessions_prune, "--force",
         help="With no gateway running: run even while another Hermes process (Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped. With the gateway running, prune always goes through it")
 
@@ -199,16 +201,16 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
             "external-content layout. On large databases this reclaims a "
             "large fraction of state.db (the old layout stored duplicate "
             "copies of every message and indexed tool output). Runs "
-            "foreground with a progress bar, throttles so a running gateway "
-            "stays responsive, and VACUUMs at the end. Safe to interrupt and "
-            "re-run — it resumes where it left off. No conversation data is "
+            "foreground with progress for every phase (refusing while a gateway "
+            "or other Hermes process holds state.db, pacing itself if one opens it mid-run) and "
+            "VACUUMs at the end. Safe to interrupt and re-run — it resumes where it left off. No conversation data is "
             "changed; only the search index is rebuilt.")
     _flag(sessions_optimize_storage, "--no-vacuum", default=False,
         help="Skip the final VACUUM (index is rebuilt but freed pages aren't returned to the OS until a later VACUUM)")
     _flag(sessions_optimize_storage, "--yes", "-y", default=False,
         help="Skip the disk-space confirmation prompt")
     _flag(sessions_optimize_storage, "--force",
-        help="Run even while another Hermes process (gateway, Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped")
+        help="Run even while another Hermes process (gateway, Desktop, dashboard, cron) holds state.db — rewriting the store under a live writer can leave every agent refusing turns until all writers are stopped; the rebuild then paces itself so that process stays responsive (much slower)")
 
     sessions_repair = sessions_subparsers.add_parser(
         "repair", help="Repair a malformed state.db schema so hidden sessions reappear",

@@ -5,11 +5,10 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-import psutil
 import pytest
 
 from gateway.session_contract import Principal, SessionRef
-from tests.waiting import async_wait_until
+from tests.waiting import async_wait_until, process_alive
 
 
 @pytest.mark.platforms("linux")
@@ -45,15 +44,16 @@ def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch)
     assert authority.pending_results['adm']['result']['interrupted'] is True
     assert ref.session_id not in authority._managed_workers
     child = spawned[0]
-    assert child.poll() is not None and not psutil.pid_exists(child.pid) or psutil.Process(child.pid).status() == psutil.STATUS_ZOMBIE
+    assert child.poll() is not None and not process_alive(child.pid)
 
 
 CHILD = """import json, os, sys, psutil
+from hermes_cli.process_identity import worker_birth
 me = psutil.Process()
 out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0)
 def send(frame):
     out.write((json.dumps(frame) + '\\n').encode())
-send({'type': 'hello', 'pid': me.pid, 'birth': me.create_time(), 'ancestors': [p.pid for p in me.parents()[:3]]})
+send({'type': 'hello', 'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]})
 for line in sys.stdin.buffer:
     frame = json.loads(line)
     with open(sys.argv[1], 'a') as log:
@@ -78,7 +78,8 @@ def test_stop_acknowledged_during_spawn_never_bootstraps_the_worker(tmp_path, mo
     from gateway.session_controls import AuthorityConnection
     from gateway.session_policy import build_policy
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input
+    from hermes_state_runtime import claim_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     db = SessionDB(db_path=tmp_path / 'state.db')

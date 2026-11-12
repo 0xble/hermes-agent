@@ -3,6 +3,7 @@
 Real ``SessionDB`` + the real plugin hook registry. The callback reads the row back, so each event
 also proves dispatch ran AFTER the commit, never before.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 
 import pytest
 
@@ -37,7 +38,7 @@ def hook(db):
 
 
 def _canonical(db, sid, operation, payload):
-    epoch = rt.begin_runtime_epoch(db, instance_id="test")
+    epoch = _begin_owned_runtime_epoch(db, instance_id="test")
     row = db.get_session(sid)
     return rt.mutate_runtime_session(
         db, epoch=epoch, principal_id="human", session_id=sid, request_id=f"{operation}-{sid}",

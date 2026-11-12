@@ -25,7 +25,12 @@ more newlines collapse to the same single spacer, and normalization is
 idempotent. A pipe table also gets a blank line, not a hard break, on any side
 where a single newline separates it from other content: Telegram cannot open a
 table inside a caption's open paragraph, and GFM continues a table through prose
-directly below it as one more row.
+directly below it as one more row. HTML `<blockquote>` boundaries, including
+literal copy previews and quotes with an opening newline, retain their blank
+line rather than becoming an NBSP spacer: GFM otherwise keeps the following
+bold labels, links, lists, headings, fences and tables inside a raw HTML block.
+Regression: `tests/gateway/test_telegram_rich_copy_quotes.py` exercises real
+send/draft/edit payloads and parses the surrounding Markdown, including details.
 
 Rich Message prose treats a pair of literal `$` on one line as inline LaTeX, so
 two currency amounts in a sentence render as an unwrapped italic formula with

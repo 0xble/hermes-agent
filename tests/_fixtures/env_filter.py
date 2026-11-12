@@ -159,6 +159,9 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     "HERMES_SESSION_SOURCE",
     "HERMES_SESSION_KEY",
     "HERMES_GATEWAY_SESSION",
+    # Busy policies are launch settings, not test defaults. Tests opt into each mode.
+    "HERMES_GATEWAY_BUSY_INPUT_MODE",
+    "HERMES_GATEWAY_BUSY_TEXT_MODE",
     "HERMES_CRON_SESSION",
     "_HERMES_GATEWAY",
     "HERMES_PLATFORM",

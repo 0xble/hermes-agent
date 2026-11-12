@@ -2,6 +2,7 @@
 its ``_branched_from`` naming the deleted segment, and the delete's tombstones age out after the retry
 horizon. The retired-session marker does not, so that name can never be issued to a new session the
 surviving branch would then claim as its parent."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import time
 
 import pytest
@@ -20,7 +21,7 @@ def test_a_deleted_compressed_root_leaves_its_branch_and_no_reusable_id(tmp_path
     from hermes_state_mutation_retirement import RETIRED_PREFIX
     from hermes_state_terminal import ADMISSION_PREFIX, IDENTITY_PREFIX, RESULT_PREFIX
     with SessionDB(tmp_path / 'state.db') as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         db.create_session('root', source='cli')
         rt.admit_session_input(db, epoch=epoch, principal_id='owner', session_id='root', request_id='r1',
                                payload={'text': 'turn'})

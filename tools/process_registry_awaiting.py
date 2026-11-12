@@ -98,13 +98,14 @@ def awaits_notification(registry, owner_task_ids) -> bool:
     owners = {o for o in owner_task_ids if o}
     if not owners:
         return False
-    # (1) Running. _any_running refreshes checkpoint-recovered entries (outside the registry lock) first, so a
-    # recovered PID that died unobserved reads as gone instead of pinning its owner.
+    # (1) Running. _any_running refreshes checkpoint-recovered entries first, so a
+    # recovered PID that died unobserved is finished and announced instead of
+    # looking still-running. The one unknown-status completion pins only while queued.
     if registry._any_running(lambda s: s.owner_task_id in owners and _notifies(s)):
         return True
     with registry._lock:
-        # (2) Exit recorded, completion not yet published. Entries closed without a collected exit (recovered PID
-        # gone or reused) set _completion_event too, so they never count.
+        # (2) Exit recorded, completion not yet published. A published unknown-status
+        # exit sets _completion_event, so it counts only while its event is still queued.
         if any(s.owner_task_id in owners and s.notify_on_complete and s.exited and not s._completion_event.is_set()
                for store in (registry._running, registry._finished) for s in store.values()):
             return True

@@ -20,6 +20,44 @@ class ProcessTerminationMixin:
     """The subclass supplies ``_host_pid_is_ours``, ``_is_host_pid_alive``,
     ``_detached_host_fate`` and ``_daemon_term_grace_seconds``. See ProcessRegistry."""
 
+    def _already_exited_kill_result(self, session, consume_output: bool, deadline) -> dict:
+        """Retry a finished scope without replacing the collected exit or consuming partial output."""
+        scope_stopped = self._stop_scope(session, deadline)
+        with session._lock:
+            result = self._exit_snapshot(session, "already_exited")
+            finalizing = self._reader_finalizing(session)
+        if not scope_stopped:
+            result["scope_stop_failed"] = session.systemd_unit
+        if consume_output and not finalizing:
+            self._completion_consumed.add(session.id)
+            self._consume_survivor_completion(session.id)
+        return result
+
+    def _partition_kill_targets(self, targets, deadline, stop_event, scope_retries, consume_output):
+        """Collect published results before checking PID identity or planning any signals."""
+        active, detached_nonrunning = [], []
+        # As with pre-cut receipts, reserve half the remaining sweep for live signals.
+        collection_deadline = (time.monotonic() + max(0.0, deadline - time.monotonic()) / 2
+                               if deadline is not None else None)
+        for session in targets:
+            budget_expired = ((stop_event is not None and stop_event.is_set())
+                              or (deadline is not None and time.monotonic() >= deadline))
+            if (not budget_expired
+                    and self._collect_recorded_exit(session, deadline=collection_deadline)):
+                if session.systemd_unit:
+                    scope_retries.append(session)
+                if consume_output and not self._reader_finalizing(session):
+                    self._completion_consumed.add(session.id)
+                    self._consume_survivor_completion(session.id)
+                continue
+            if (not budget_expired and session.detached and session.pid_scope == "host"
+                    and session.pid
+                    and self._detached_host_fate(session.pid, session.host_start_time) != "running"):
+                detached_nonrunning.append(session)
+            else:
+                active.append(session)
+        return active, detached_nonrunning
+
     @staticmethod
     def _proc_alive(proc) -> bool:
         """True if a psutil.Process is running and not a zombie (already dead, just unreaped)."""
@@ -112,6 +150,13 @@ class ProcessTerminationMixin:
         if not _deadline_active():
             return
 
+        # A file-backed wrapper waits in a subshell which may spawn more children
+        # during the parent's grace window. Capture them BEFORE terminating that
+        # subshell: its exit would reparent them and hide them from the final scan.
+        with suppress(*gone):
+            if cls._proc_alive(parent):
+                known = {proc.pid for proc in descendants}
+                descendants.extend(p for p in parent.children(recursive=True) if p.pid not in known)
         # The snapshot is an anti-orphan guarantee: only descendants still alive
         # after the parent had its chance are asked to terminate themselves.
         remaining = descendants if grace <= 0 else [

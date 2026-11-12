@@ -1037,6 +1037,10 @@ class Chromium(Package):
 
     name = "chromium"
     optional = True
+    # browser_exec's launcher drives this build, and its readiness check
+    # installs it only once per process, so default-install it like the
+    # other OS tools; `install.sh --skip-browser` declines it.
+    default = True
     on_path = False
     # Neither Chrome-for-Testing nor Playwright's mirror builds for Android.
     gaps = {
@@ -1050,7 +1054,7 @@ class Chromium(Package):
     # playwright's dbazure mirror with its own platform names.
     # win32-arm64 uses the win64 (x64) build: CfT publishes no native
     # win-arm64 chromium, and Windows ARM64 runs x64 binaries via built-in
-    # emulation — the same choice agent-browser's own postinstall makes.
+    # emulation.
     _CFT = {
         "linux-x64": "linux64",
         "darwin-x64": "mac-x64",
@@ -1097,6 +1101,10 @@ class Chromium(Package):
         binary = self.binary(entry, target)
         if binary is None:
             raise InstallError(self.name, f"Chromium executable missing under {native(entry)}")
+        # Playwright launches without an executable_path (e.g. the
+        # har-derived-api-client skill's `chromium.launch(channel="chromium")`)
+        # find this build through the root; Hermes's own launcher asks
+        # hermes_cli.browser_runtime.chromium_executable() instead.
         return {
             "PLAYWRIGHT_BROWSERS_PATH": str(entry.parent),
             "AGENT_BROWSER_EXECUTABLE_PATH": str(binary),

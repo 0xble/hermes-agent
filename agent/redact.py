@@ -39,6 +39,12 @@ _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_DATE_PARTS: dict = {}  # (profile home, tab key, origin) → ordered {(component, value)}
 _VAULT_CARD_PARTS: dict = {}  # same scope → separately bounded card metadata components
 _VAULT_REDACTION_LOCK = threading.Lock()
+_REDACTION_GENERATION = 0
+
+
+def redaction_generation() -> int:
+    """Return a process-wide generation for dynamic egress redaction rules."""
+    return _REDACTION_GENERATION
 
 
 def _vault_scope() -> str:
@@ -56,6 +62,7 @@ def register_vault_redaction_value(value) -> None:
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
         for v in (value, normalized):
@@ -64,6 +71,7 @@ def register_vault_redaction_value(value) -> None:
                 bucket[v] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+        _REDACTION_GENERATION += 1
 
 
 def _date_scope(tab: str, origin: str) -> tuple[str, str, str]:
@@ -75,6 +83,7 @@ def register_vault_date_component(token: str, value: str, *,
     """Register one exact date component for a browser tab and its filled origin."""
     if token not in ("bday-month", "bday-day", "bday-year") or not isinstance(value, str) or not value.isdigit():
         return
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_DATE_PARTS.setdefault(_date_scope(tab, origin), {})
         key = (token.removeprefix("bday-"), value)
@@ -82,12 +91,17 @@ def register_vault_date_component(token: str, value: str, *,
         bucket[key] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+        _REDACTION_GENERATION += 1
 
 
 def register_vault_card_component(field: str, value: str, *, tab: str, origin: str) -> None:
-    """Keep low-entropy card metadata on its filled tab and origin, not in the global secret set."""
-    if field not in {"cardholder_name", "exp_month", "exp_year", "billing_postal_code"} or not isinstance(value, str) or not value:
+    """Keep low-entropy card metadata on its filled tab and origin, not in the global secret set.
+
+    An unavailable origin is conservatively tab-scoped until the existing browser cleanup.
+    """
+    if field not in {"cardholder_name", "exp_month", "exp_year", "billing_postal_code", "cvc", "expiry"} or not isinstance(value, str) or not value:
         return
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_CARD_PARTS.setdefault(_date_scope(tab, origin), {})
         key = (field, value)
@@ -95,13 +109,16 @@ def register_vault_card_component(field: str, value: str, *, tab: str, origin: s
         bucket[key] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+        _REDACTION_GENERATION += 1
 
 
 def mark_vault_protected_tab(tab: str, origin: str) -> None:
     """Record a protected fill on a tab/origin even when no short component exists
     (a combined ``input[type=date]``): pixel capture must still be refused there."""
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
         _VAULT_DATE_PARTS.setdefault(_date_scope(tab, origin), {})
+        _REDACTION_GENERATION += 1
 
 
 def vault_read_has_protected_field_context(expression: str) -> bool:
@@ -111,11 +128,16 @@ def vault_read_has_protected_field_context(expression: str) -> bool:
 
 def clear_vault_date_components(tab: str, origin: str | None = None) -> None:
     """Forget a tab's birthday and card components on close or cross-origin navigation."""
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
+        changed = False
         for registry in (_VAULT_DATE_PARTS, _VAULT_CARD_PARTS):
             for key in list(registry):
                 if key[:2] == (_vault_scope(), str(tab)) and (origin is None or key[2] != str(origin).lower()):
                     del registry[key]
+                    changed = True
+        if changed:
+            _REDACTION_GENERATION += 1
 
 
 def has_vault_date_components(tab: str) -> bool:
@@ -136,39 +158,71 @@ def has_any_vault_date_components() -> bool:
         return any(key[0] == _vault_scope() for key in _VAULT_DATE_PARTS)
 
 
-def _date_parts(tab: str, origin: str = "") -> tuple:
-    """Birthday parts persist across focused origins; card parts require the filled origin."""
+def _date_parts(tab: str | None, origin: str = "") -> tuple:
+    """Keep birthday semantics; card parts need an owned tab, not necessarily a known origin."""
     with _VAULT_REDACTION_LOCK:
         merged = {}
+        scope = (_vault_scope(), "default" if tab is None else str(tab))
         for key, bucket in _VAULT_DATE_PARTS.items():
-            if key[:2] == (_vault_scope(), str(tab)):
+            if key[:2] == scope:
                 merged.update(bucket)
+        # Omitted browser context must not turn the task named "default" into
+        # a source of short card masks for generic terminal/log output.
         for key, bucket in _VAULT_CARD_PARTS.items():
-            if key[:2] == (_vault_scope(), str(tab)) and origin and key[2] == origin.lower():
+            if tab is not None and key[:2] == scope and (not key[2] or not origin or key[2] == origin.lower()):
                 merged.update(bucket)
         return tuple(merged)
 
 
+def _expiry_pattern(value: str) -> str | None:
+    """Derive equivalents without spending bounded registry slots or inventing a century."""
+    if not value.isascii():
+        return None
+    match = (re.fullmatch(r"(0?[1-9]|1[0-2])\s*/\s*([0-9]{4}|[0-9]{2})", value)
+             or re.fullmatch(r"(0[1-9]|1[0-2])([0-9]{4}|[0-9]{2})", value))
+    if match is None:
+        return None
+    month, year = match.groups()
+    month = str(int(month))
+    month_pattern = f"0?{month}" if len(month) == 1 else month
+    year_pattern = f"(?:{year}|{year[-2:]})" if len(year) == 4 else year
+    return rf"{month_pattern}(?:\s*/\s*)?{year_pattern}"
+
+
 def redact_registered_vault_number(value: Any, *,
-                                   tab: str = "default", origin: str = "") -> Any:
-    """Scrub an exact registered date component on its owning tab and origin."""
+                                   tab: str | None = None, origin: str = "") -> Any:
+    """Scrub registered global secrets and scoped components returned as numbers."""
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return value
-    return "«redacted-vault-secret»" if any(str(value) == part for _, part in _date_parts(tab, origin)) else value
+    text = str(int(value)) if isinstance(value, float) and value.is_integer() else str(value)
+    with _VAULT_REDACTION_LOCK:
+        registered = text in _VAULT_REDACTION_VALUES.get(_vault_scope(), ())
+    parts = _date_parts(tab, origin)
+    if registered or any(text == part for _, part in parts):
+        return "«redacted-vault-secret»"
+    if any(field == "expiry" and (pattern := _expiry_pattern(part)) is not None
+           and re.fullmatch(pattern, text) for field, part in parts):
+        return "«redacted-vault-secret»"
+    return value
 
 
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
+        changed = _vault_scope() in _VAULT_REDACTION_VALUES
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
         for registry in (_VAULT_DATE_PARTS, _VAULT_CARD_PARTS):
             for key in list(registry):
                 if key[0] == _vault_scope():
                     del registry[key]
+                    changed = True
+        if changed:
+            _REDACTION_GENERATION += 1
 
 
 def redact_registered_vault_values(text: str, *,
-                                   tab: str = "default", origin: str = "") -> str:
+                                   tab: str | None = None, origin: str = "") -> str:
     """Redact exact vault values and date components on the owning tab and origin."""
     if not isinstance(text, str) or not text:
         return text
@@ -184,13 +238,18 @@ def redact_registered_vault_values(text: str, *,
             text = re.sub(pattern, "«redacted-vault-secret»", text)
         if value in text:
             text = text.replace(value, "«redacted-vault-secret»")
-    for _, value in parts:
+    # Full expiries must be consumed before month/year components can split them.
+    for field, value in parts:
+        if field == "expiry" and (pattern := _expiry_pattern(value)) is not None:
+            text = re.sub(rf"(?<![A-Za-z0-9_]){pattern}(?![A-Za-z0-9_])",
+                          "«redacted-vault-secret»", text)
+    for _, value in sorted(parts, key=lambda part: len(part[1]), reverse=True):
         text = re.sub(rf"(?<![A-Za-z0-9_]){re.escape(value)}(?![A-Za-z0-9_])",
                       "«redacted-vault-secret»", text)
     return text
 
 
-def redact_registered_vault_snapshot(text: str, *, tab: str = "default", origin: str = "") -> str:
+def redact_registered_vault_snapshot(text: str, *, tab: str | None = None, origin: str = "") -> str:
     """Apply the same tab/origin component rule used by every browser output."""
     return redact_registered_vault_values(text, tab=tab, origin=origin)
 
@@ -266,6 +325,11 @@ _PREFIX_PATTERNS = [
     # ``***``. Kept free of nested unbounded repeats so the pattern passes the
     # same structural gate plugins must.
     r"sk-[A-Za-z0-9_-](?:\.?[A-Za-z0-9_-]){9,}",
+    # Context7 API keys: a fixed vendor prefix (``ctx7sk-``) plus an opaque body.
+    # The generic ``sk-`` family cannot catch it: the matcher's lookbehind
+    # rejects a prefix preceded by a word char, and here the ``sk-`` sits inside
+    # ``ctx7sk-`` - so a bare Context7 key passed through unmasked (#142576).
+    r"ctx7sk-[A-Za-z0-9_-]{10,}",
     r"ghp_[A-Za-z0-9]{10,}",            # GitHub PAT (classic)
     r"github_pat_[A-Za-z0-9_]{10,}",    # GitHub PAT (fine-grained)
     r"gho_[A-Za-z0-9]{10,}",            # GitHub OAuth access token
@@ -667,6 +731,12 @@ _URL_BARE_TOKEN_RE = re.compile(
 # JWTs always start with "eyJ" (base64 "{"); 1-, 2- and 3-part forms.
 _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_-]{10,}(?:\.[A-Za-z0-9_=-]{4,}){0,2}")
 
+# Links ``hermes webapp`` prints that sign a browser in as the user: the gateway's browser credential
+# after ``hermes-session=`` and the one-use ticket of a ``/webapp/launch`` link. Both values are
+# URL-safe base64 (43 characters); the 20-character floor leaves placeholders and code (``${token}``).
+_WEBAPP_LINK_CREDENTIAL_RE = re.compile(
+    r"((?<![A-Za-z0-9_-])hermes-session=|/webapp/launch#(?:[^\s#]*?&)?ticket=)[A-Za-z0-9_-]{20,}")
+
 # E.164 phone numbers, 7-15 digits; the lookahead rejects hex strings / identifiers.
 _SIGNAL_PHONE_RE = re.compile(r"(\+[1-9]\d{6,14})(?![A-Za-z0-9])")
 
@@ -831,7 +901,7 @@ def _redact_python_repr_fields(text: str) -> str:
 
 
 def _redact_python_diagnostic_repr_fields(text: str) -> str:
-    """Mask repr fields only on pytest/error lines in source-preserving output."""
+    """Mask repr fields and opaque Bearers only on pytest/error diagnostic lines."""
     lines = text.splitlines(keepends=True)
     for index, line in enumerate(lines):
         ending = ""
@@ -847,7 +917,9 @@ def _redact_python_diagnostic_repr_fields(text: str) -> str:
         if match is not None:
             lines[index] = (
                 match.group("prefix")
-                + _redact_python_repr_fields(match.group("body"))
+                + _BEARER_RESIDUE_RE.sub(
+                    "Bearer [redacted]", _redact_python_repr_fields(match.group("body"))
+                )
                 + ending
             )
     return "".join(lines)
@@ -1035,10 +1107,14 @@ def redact_sensitive_json(value, **kwargs):
     if isinstance(value, (list, tuple)):
         return [redact_sensitive_json(leaf, **kwargs) for leaf in value]
     if isinstance(value, (int, float)) and not isinstance(value, bool):
+        scrubbed = redact_registered_vault_number(
+            value, tab=kwargs.get("vault_tab"), origin=kwargs.get("vault_origin", ""))
+        if isinstance(scrubbed, str):
+            return scrubbed
         # Serialized dumps scrubbed registered numeric values too; keep that boundary structurally.
         text = str(value)
         scrubbed = redact_registered_vault_values(
-            text, tab=kwargs.get("vault_tab", "default"), origin=kwargs.get("vault_origin", ""))
+            text, tab=kwargs.get("vault_tab"), origin=kwargs.get("vault_origin", ""))
         return value if scrubbed == text else scrubbed
     return value
 
@@ -1046,7 +1122,7 @@ def redact_sensitive_json(value, **kwargs):
 def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = False,
                           file_read: bool = False, secret_file: bool = False,
                           redact_url_credentials: bool = False,
-                          vault_tab: str = "default", vault_origin: str = "") -> str:
+                          vault_tab: str | None = None, vault_origin: str = "") -> str:
     """Apply all redaction patterns to a block of text.
 
     Safe on any string. Enabled by default (``security.redact_secrets: false``
@@ -1134,6 +1210,11 @@ def redact_sensitive_text(text: str, *, force: bool = False, code_file: bool = F
 
     if "eyJ" in text:
         text = _JWT_RE.sub(lambda m: _mask_token(m.group(0)), text)
+
+    # A Webapp sign-in link signs a browser in as the user, so its credential is masked whatever the
+    # web-URL policy below.
+    if "hermes-session=" in text or "/webapp/launch#" in text:
+        text = _WEBAPP_LINK_CREDENTIAL_RE.sub(lambda m: m.group(1) + "***", text)
 
     if redact_url_credentials:  # opt-in; known credential shapes in URLs are caught above
         # NOTE: Web-URL redaction (query params + userinfo + HTTP access-log request targets) is
@@ -1340,9 +1421,10 @@ def redact_terminal_output(output: str, command: str | None = None, *, force: bo
     code_file = not (is_env_dump_command(command) or _command_reads_secret_file(command))
     redacted = redact_sensitive_text(output, force=force, code_file=code_file)
     # Source-preserving output still gets the Python-repr pass on high-confidence
-    # diagnostic lines (pytest ``E   `` introspection, final exception lines): that is
-    # where {'BRAVE_API_KEY': '…'} leaks, not in source dumps.
-    if code_file and (force or _redact_enabled()) and ":" in redacted and "'" in redacted:
+    # diagnostic lines (pytest ``E   `` introspection, final exception lines):
+    # keyed mapping fields and unkeyed ``b'Bearer …\\n'`` values, not source dumps.
+    if (code_file and (force or _redact_enabled())
+            and ((":" in redacted and "'" in redacted) or "bearer" in redacted.lower())):
         redacted = _redact_python_diagnostic_repr_fields(redacted)
     return redacted
 

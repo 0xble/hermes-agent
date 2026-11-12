@@ -39,7 +39,7 @@ async def _until(predicate, timeout=10):
 async def test_stop_during_agent_construction_latches_so_the_turn_runs_no_tools(monkeypatch):
     from gateway.platforms.event import MessageEvent
     from gateway.run_turn_runner import TurnRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
     from gateway.turn_context import TurnContext
     from hermes_state_runtime import list_session_admissions
@@ -95,7 +95,8 @@ async def test_stop_during_agent_construction_latches_so_the_turn_runs_no_tools(
 @pytest.mark.parametrize('command', ['/stop', '/new'])
 async def test_idle_stop_and_new_cancel_the_queued_followup(monkeypatch, command):
     from gateway.platforms.event import MessageEvent
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import SessionRef
     from gateway.session_ingress import admit_message
     from gateway.session_ingress_context import native_callback

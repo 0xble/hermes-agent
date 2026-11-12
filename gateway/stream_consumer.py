@@ -36,6 +36,7 @@ from gateway.response_filters import (
     strip_trailing_loop_complete_marker as _strip_trailing_loop_complete_marker,
     strip_edge_silence_markers as _strip_edge_silence_markers)
 from gateway.copy_blocks import CopyMarkerStreamFilter, adapter_sends_copy_blocks, copy_free_text_for
+from gateway.stream_consumer_directives import has_pending_media_directive, strip_image_tags_for_display
 from gateway.stream_consumer_fences import ensure_closed_code_fences
 from gateway.stream_consumer_transport import StreamTransportMixin
 from gateway.stream_consumer_fallback import StreamFallbackMixin
@@ -186,11 +187,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._final_is_silence_marker = False
         self._in_think_block = False  # think-tag filter state (mirrors CLI _stream_delta)
         self._think_buffer = ""
-        # Copy blocks are delivered as separate messages after the turn, so they never
-        # enter the stream buffers; every preview, split, and fallback send inherits that.
+        # Plain-copy adapters also render literal inline quotes; retain their markers
+        # until formatting, while other surfaces keep their existing inline bodies.
         # One filter per turn: a block or fence may span a segment break, and a held
         # partial marker line carries into the next segment instead of being flushed.
-        self._copy_filter = CopyMarkerStreamFilter(drop_bodies=adapter_sends_copy_blocks(adapter))
+        self._copy_filter = CopyMarkerStreamFilter(keep_markers=adapter_sends_copy_blocks(adapter))
         self._before_finalize_notified = False
         self._reset_message_state()
 
@@ -337,7 +338,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             acked = acked[: -len(self.cfg.cursor)]
         self._mark_final_delivered(record=acked)
 
-    def _mark_final_delivered(self, record: Optional[str] = None) -> None:
+    def _mark_final_delivered(self, record: Optional[str] = None, *, confirmed: bool = True) -> None:
         """Set both turn-final flags; ``record`` also records the delivered payload."""
         self._final_response_sent = True
         # Only claim final delivery if the sealed chunks and final tail actually landed. ``_already_sent``
@@ -349,6 +350,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         self._final_content_delivered = True
         if record is not None:
             self._record_turn_final_payload(record)
+        from gateway.reply_latency import record_stream_final
+        if confirmed:
+            record_stream_final(getattr(self, "_reply_latency_receipt", None),
+                                self._display_payload(self._accumulated))
 
     def _display_payload(self, text: str) -> str:
         """Normalize like ``_send_or_edit`` output: directive strip + fence close + strip."""
@@ -370,7 +375,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         must not confirm delivery).  True: recorded payload (or an earlier segment /
         commentary) matches.  False: payload differs, or payload-less split.  None: nothing
         recorded on a legacy/ambiguous path (caller trusts flags)."""
-        final_text = copy_free_text_for(self.adapter, final_text or "")  # buffers never hold copy blocks
+        final_text = copy_free_text_for(self.adapter, final_text or "")
         target = self._display_payload(self._with_cumulative_prefix(final_text))
         if not target:
             return None
@@ -893,7 +898,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         return should_edit and not _is_partial_silence_marker(_segment) and not (
             self.cfg.strip_trailing_silence_markers and (
                 _ends_with_partial_silence_marker(_visible) or _opens_with_silence_marker(_segment))
-        ) and not _ends_with_partial_loop_complete_marker(_visible)
+        ) and not _ends_with_partial_loop_complete_marker(_visible) and not has_pending_media_directive(_visible)
 
     async def _split_first_send(self, tick: _Tick) -> bool:
         """No message to edit yet and the buffer overflows: seal only the head chunks; the
@@ -972,7 +977,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
             if self._fallback_final_send or not ok:
                 break  # keep the full text intact for the fallback final send
             await self._journal_split_delivery(self._preview_message_ids | {self._message_id})
-            self._accumulated = self._accumulated[split_at:].lstrip("\n")
+            from gateway.copy_blocks import copy_quote_continuation
+            self._accumulated = copy_quote_continuation(chunk) + self._accumulated[split_at:].lstrip("\n")
             self._message_id = None
             self._last_sent_text = ""
             await self._enter_split_delivery()
@@ -1128,5 +1134,14 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
     # non-streaming paths share the same regex, so a tag is treated identically whichever path delivered the
     # text.
     def _clean_for_display(text: str) -> str:
-        """Hide MEDIA:<path> / [[audio_as_voice]] directives; media is delivered post-stream."""
-        return _BasePlatformAdapter.strip_media_directives_for_display(text)
+        """Hide MEDIA:<path> / [[audio_as_voice]] directives and markdown/HTML image tags; both are
+        delivered post-stream as native attachments.
+
+        Image tags are the ones the non-streaming path's ``extract_images`` split attaches: once a
+        tag becomes an attachment it must not also render as text — on Discord ``![alt](url)``
+        shows as ``!alt`` plus an unfurl (#141806). The tag is removed without trimming the text
+        around it, so interim frames stay prefix-stable.
+        """
+        from gateway.copy_blocks import map_outside_copy_blocks
+        return strip_image_tags_for_display(map_outside_copy_blocks(
+            text, _BasePlatformAdapter.strip_media_directives_for_display, keep_markers=True))

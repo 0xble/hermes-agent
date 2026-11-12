@@ -12,6 +12,9 @@ def test_requested_service_name_does_not_borrow_callers_home(tmp_path, monkeypat
     from hermes_cli.gateway_runtime_service import service_suffix
     from hermes_cli.gateway import _profile_suffix
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
+    # Both naming paths must see the same simulated account, even when the
+    # runner's scratch directory lives below the real account's Hermes home.
+    monkeypatch.setattr('hermes_constants._account_home', lambda: tmp_path)
     requested = tmp_path / 'custom'
     if named:
         requested = requested / 'profiles' / 'worker'
@@ -20,6 +23,30 @@ def test_requested_service_name_does_not_borrow_callers_home(tmp_path, monkeypat
     installed = _profile_suffix()
     monkeypatch.setenv('HERMES_HOME', str(tmp_path / '.hermes'))
     assert service_suffix(requested) == installed
+
+
+@pytest.mark.parametrize('layout', ['nested', 'profile', 'custom', 'custom-profile'])
+def test_requested_service_name_matches_installer(tmp_path, monkeypatch, layout):
+    import hermes_constants
+    from hermes_cli.gateway import _profile_suffix, get_launchd_label, get_service_name
+    from hermes_cli.gateway_runtime_service import service_suffix
+
+    # Simulate an account whose HOME is the runner's sandbox. Do not patch
+    # Path.home(): installer and runtime must resolve the same native root.
+    monkeypatch.setattr(hermes_constants, '_account_home', Path.home)
+    native = hermes_constants.account_default_hermes_home().resolve()
+    requested = {
+        'nested': native / 'cache' / 'custom' / 'profiles' / 'worker',
+        'profile': native / 'profiles' / 'worker',
+        'custom': tmp_path / 'custom',
+        'custom-profile': tmp_path / 'custom' / 'profiles' / 'worker',
+    }[layout]
+    monkeypatch.setenv('HERMES_HOME', str(requested))
+
+    suffix = service_suffix(requested)
+    assert suffix == _profile_suffix()
+    assert f'ai.hermes.gateway-{suffix}' == get_launchd_label()
+    assert f'hermes-gateway-{suffix}' == get_service_name()
 
 
 @pytest.mark.platforms("linux")

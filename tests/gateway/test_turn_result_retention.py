@@ -26,8 +26,8 @@ from gateway.session_results import admission_result, finish_result
 
 
 
-from hermes_state_runtime import (RuntimeStoreError, admit_session_input, begin_runtime_epoch,
-    claim_session_input, get_session_admission, recover_session_inputs)
+from hermes_state_runtime import RuntimeStoreError, admit_session_input, claim_session_input, get_session_admission, recover_session_inputs
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 

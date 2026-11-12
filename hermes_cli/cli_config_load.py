@@ -9,9 +9,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sys
 from pathlib import Path
 from typing import List, Dict, Any
-from utils import fast_safe_load
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cli")
@@ -138,8 +138,10 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
         terminal_config.pop("cwd", None)
 
     # TERMINAL_CWD is force-exported (beats stale .env) except inside a gateway process,
-    # whose config bridge already set it.
-    _is_gateway = os.environ.get("_HERMES_GATEWAY") == "1"
+    # whose config bridge already set it. Ask whether THIS process imported gateway.run:
+    # its _HERMES_GATEWAY env marker is inherited by every shell the gateway's terminal
+    # tool spawns, so a `hermes chat` launched there would keep the gateway's directory.
+    _is_gateway = "gateway.run" in sys.modules
     for config_key, env_var in _TERMINAL_ENV_MAPPINGS.items():
         if config_key not in terminal_config:
             continue
@@ -192,7 +194,7 @@ def _cli_config_defaults():
             "docker_shared_container_key": "",
         },
         "browser": {
-            "inactivity_timeout": 120, "record_sessions": False, "engine": "auto",  # auto (Chrome) | lightpanda | chrome
+            "inactivity_timeout": 120, "record_sessions": False, "engine": "auto",
             "camofox": {"rewrite_loopback_urls": False, "loopback_host_alias": "host.docker.internal"},
         },
         # threshold: fraction of the model's context limit; min_tail: real user messages kept in the tail
@@ -267,15 +269,16 @@ def load_cli_config() -> dict[str, Any]:
     """
     from cli import _cli_config_defaults, _merge_file_config, _mirror_config_to_env
     from hermes_constants import get_hermes_home
+    from hermes_cli.config_backend import config_exists, read_config_doc
     # The import-time home is the seam tests patch (cli._hermes_home). Read it live, and fall
     # back to the live home when the import-time value is stale so a redirected HERMES_HOME wins.
     cli_home = getattr(_cli(), "_hermes_home", None)
     config_path = (cli_home if cli_home is not None else get_hermes_home()) / 'config.yaml'
-    if not config_path.exists():
+    if not config_exists(config_path):
         live_path = get_hermes_home() / 'config.yaml'
-        if live_path.exists():
+        if config_exists(live_path):
             config_path = live_path
-    if not config_path.exists() or os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
+    if not config_exists(config_path) or os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
         config_path = Path(__file__).parent / 'cli-config.yaml'
 
     defaults = _cli_config_defaults()
@@ -283,12 +286,11 @@ def load_cli_config() -> dict[str, Any]:
     # Only a file's terminal section may overwrite terminal env vars already set by .env.
     _file_has_terminal_config = False
 
-    if config_path.exists():
+    if config_exists(config_path):
         try:
-            with open(config_path, "r", encoding="utf-8-sig") as f:
-                from hermes_cli.config import _normalize_root_model_keys
+            from hermes_cli.config import _normalize_root_model_keys
 
-                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
+            file_config = _normalize_root_model_keys(read_config_doc(config_path) or {})
 
             _file_has_terminal_config = "terminal" in file_config
             _merge_file_config(defaults, file_config)

@@ -214,10 +214,10 @@ class GatewayGoalManager(_Remote):
         return GoalCommandResult(**{k: v for k, v in result.items() if k in GoalCommandResult.__dataclass_fields__})
 
     def evaluate_after_turn(self, last_response, *, user_initiated=True, background_processes=None,
-                            active_delegations=0):
+                            active_delegations=0, turn_started_at=None):
         """The judge runs in the gateway (``auxiliary.goal_judge``), with the gateway's background
         processes and delegations; the decision dict is main's."""
-        decision = self._rpc("evaluate_after_turn", last_response or "")
+        decision = self._rpc("evaluate_after_turn", last_response or "", turn_started_at=turn_started_at)
         if not isinstance(decision, dict):
             return {"status": None, "should_continue": False, "continuation_prompt": None,
                     "verdict": "inactive", "reason": "gateway unavailable", "message": ""}
@@ -299,7 +299,7 @@ class GatewayHeartbeatManager(_Remote):
     def due_prompt(self, now=None):
         s = self._state
         if s is None or not s.is_due(now):
-            return None  # main's cheap local check first: the idle poll costs no round trip
+            return None  # main's cheap local check first (the watchdog refreshes the state each poll)
         return self._rpc("due_prompt")
 
     def abandon_fire(self):

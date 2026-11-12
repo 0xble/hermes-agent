@@ -39,7 +39,10 @@ def _run_chat(monkeypatch, argv, *, provider_configured):
     monkeypatch.setattr(consent, "offer_consent_before_chat", lambda _args: calls.append("offer"))
     monkeypatch.setattr(main_mod, "_launch_tui", launch_tui)
     monkeypatch.setattr(main_mod, "_pin_kanban_board_env", lambda: None)
-    monkeypatch.setattr(main_mod, "_start_chat_background_prefetch", lambda: None)
+    def prefetch(*, prefetch_banner=True):
+        assert prefetch_banner == ("--tui" not in argv)
+
+    monkeypatch.setattr(main_mod, "_start_chat_background_prefetch", prefetch)
     monkeypatch.setattr(main_mod, "_confirm_startup_expensive_model_override", lambda _args: None)
     monkeypatch.setattr(main_mod, "_sync_bundled_skills_for_startup", lambda: None, raising=False)
     fake_cli = types.ModuleType("cli")

@@ -173,7 +173,7 @@ async def test_fenced_webhook_retry_only_observes_existing_receipt(fence):
         if fence == 'draining':
             authority.runner._draining = True
         else:
-            from hermes_state_runtime import begin_runtime_epoch
+            from tests.fakes.runtime_owner import begin_runtime_epoch
             begin_runtime_epoch(authority.db, instance_id='replacement-owner')
         schedules = []
         authority._schedule = schedules.append

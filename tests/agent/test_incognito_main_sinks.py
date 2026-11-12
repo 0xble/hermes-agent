@@ -3,6 +3,7 @@
 import asyncio
 
 from agent.incognito import incognito_scope, register_session
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def test_private_turn_cannot_create_relay_host_or_shared_metrics(monkeypatch):
@@ -14,10 +15,13 @@ def test_private_turn_cannot_create_relay_host_or_shared_metrics(monkeypatch):
 
     monkeypatch.setattr(relay_runtime, "current_profile_key", unexpected_profile_lookup)
     registry = relay_runtime.RelayHostRegistry()
+    monkeypatch.setattr(relay_shared_metrics, "_consent_reconcile_done", False)
     with incognito_scope():
         assert registry.for_profile() is None
         assert not relay_runtime.relay_instrumentation_enabled()
         assert not relay_shared_metrics.enabled()
+        relay_shared_metrics.observe_lifecycle("session:start")
+        assert not relay_shared_metrics._consent_reconcile_done
     assert not registry._hosts
 
 
@@ -59,7 +63,7 @@ def test_delayed_native_result_and_worker_receipt_are_withheld(tmp_path):
 
     db = SessionDB(tmp_path / "state.db")
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id="test")
+        epoch = begin_runtime_epoch(db, instance_id="test")
         db.create_session("session", "telegram")
         admitted = rt.admit_session_input(db,
             epoch=epoch, principal_id="telegram:topic", session_id="session",
@@ -102,7 +106,7 @@ def test_native_result_carries_identity_across_privacy_transition(tmp_path, monk
 
     db = SessionDB(tmp_path / "state.db")
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id="test")
+        epoch = begin_runtime_epoch(db, instance_id="test")
         db.create_session("session", "telegram")
         admitted = rt.admit_session_input(db,
             epoch=epoch, principal_id="telegram:topic", session_id="session",

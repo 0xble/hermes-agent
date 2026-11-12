@@ -1,4 +1,5 @@
 """Transactional contracts against exclusively owned temporary profile databases."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import sqlite3
 
 import pytest
@@ -22,7 +23,7 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
     with pytest.raises(ValueError):
         admission_fingerprint(canonical_target='s', payload={'a': float('nan')})
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='one', payload={'text': 'hello'})
         first = rt.admit_session_input(db, **args)
         assert rt.admit_session_input(db, **args) == first
@@ -44,7 +45,7 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         assert running['admission_id'] == second['admission_id'] and running['generation'] > claimed['generation']
         db.close()
         db = SessionDB(db_path=tmp_path / 'state.db')
-        new_epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
+        new_epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
         assert new_epoch > epoch
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
         assert rt.recover_session_inputs(db, epoch=new_epoch) == 0
@@ -64,11 +65,45 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         db.close()
 
 
+def test_native_activity_is_local_only_at_the_admission_envelope_boundary(tmp_path):
+    from copy import deepcopy
+    import hermes_state_runtime as rt
+
+    payload = {'text': 'hello', 'attended_activity': 'semantic top-level input',
+        'native_text_v1': {'attended_activity': {'received_at': 1800000000.0, 'marked': False},
+            'metadata': {'attended_activity': 'semantic metadata'}}}
+    untouched = deepcopy(payload)
+    with store(tmp_path) as db:
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
+        args = dict(principal_id='human', session_id='s', request_id='native')
+        first = rt.admit_session_input(db, epoch=epoch, payload=payload, **args)
+        retry = deepcopy(payload)
+        retry['native_text_v1']['attended_activity'] = {'received_at': 1800003600.0, 'marked': True}
+        assert rt.admit_session_input(db, epoch=epoch, payload=retry, **args) == first
+        del retry['native_text_v1']['attended_activity']
+        assert rt.admit_session_input(db, epoch=epoch, payload=retry, **args) == first
+        assert first['payload'] == untouched
+        assert payload == untouched, 'fingerprinting must not discard durable receipt data'
+        for change in ('top-level', 'metadata', 'native-field', 'intent'):
+            changed = deepcopy(retry)
+            if change == 'top-level':
+                changed['attended_activity'] = 'changed'
+            elif change == 'metadata':
+                changed['native_text_v1']['metadata']['attended_activity'] = 'changed'
+            elif change == 'native-field':
+                changed['native_text_v1']['semantic'] = 'changed'
+            with pytest.raises(rt.RuntimeStoreError, match='admission_conflict'):
+                rt.admit_session_input(db, epoch=epoch, payload=changed, intent='steer' if change == 'intent' else 'queue', **args)
+    # The helper also identifies non-admission operations. A similarly named field there is semantic.
+    fingerprint = rt.admission_fingerprint
+    assert fingerprint(canonical_target='s', payload=payload) != fingerprint(canonical_target='s', payload=retry)
+
+
 def test_sqlite_failure_never_acknowledges_or_partially_claims(tmp_path):
     db = store(tmp_path)
     import hermes_state_runtime as rt
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
         args = dict(epoch=epoch, principal_id='human', session_id='s', request_id='one', payload={'text': 'hello'})
         db._conn.execute("CREATE TRIGGER refuse_admission BEFORE INSERT ON session_admissions BEGIN SELECT RAISE(ABORT, 'full fixture'); END")
         with pytest.raises(sqlite3.IntegrityError, match='full fixture'):

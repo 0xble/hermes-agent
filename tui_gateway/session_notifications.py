@@ -211,6 +211,13 @@ def _notif_loop_status(sid: str, text: str) -> None:
     _emit("status.update", sid, {"kind": "loop", "text": text})
 
 
+def _notif_loop_card(sid: str, text: str) -> None:
+    """An automatic loop status line, which ``loops.notices`` false or hidden suppresses."""
+    from hermes_cli.goal_notices import loop_notices_enabled
+    if loop_notices_enabled():
+        _notif_loop_status(sid, text)
+
+
 def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str) -> None:
     """Slash-command /loop wakeup: route through the slash pipeline, not the model. No model reply to evaluate, so the
     tick completes immediately — unless the command resolves to a prompt (skill command etc.), which runs as a normal
@@ -235,7 +242,7 @@ def _notif_slash_loop_tick(rid: str, sid: str, session: dict, mgr, wakeup: str) 
         pass
     decision = mgr.complete_tick("")
     if decision.get("message"):
-        _notif_loop_status(sid, decision["message"])
+        _notif_loop_card(sid, decision["message"])
     _publish_session_control_snapshot(sid, session)  # next_due_at moved: clients re-anchor the countdown
 
 
@@ -403,7 +410,7 @@ def _maybe_fire_tui_loop_tick(sid: str, session: dict) -> None:
     rid = f"__loop__{int(time.time() * 1000)}"
     _publish_session_control_snapshot(sid, session)  # awaiting_response: clients swap the countdown for "running"
     try:
-        _notif_loop_status(sid, f"↻ /loop wakeup #{mgr.state.ticks_fired if mgr.state else '?'} firing…")
+        _notif_loop_card(sid, f"↻ /loop wakeup #{mgr.state.ticks_fired if mgr.state else '?'} firing…")
         if wakeup.lstrip().startswith("/"):
             _notif_slash_loop_tick(rid, sid, session, mgr, wakeup)
         else:

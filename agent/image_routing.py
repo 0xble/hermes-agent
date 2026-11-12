@@ -271,29 +271,29 @@ def _explicit_aux_vision_override(cfg: Optional[dict[str, Any]]) -> bool:
     )
 
 
-def _probe_managed_runtime(provider: str, model: str, cfg: Optional[dict[str, Any]]) -> Optional[bool]:
+def _probe_managed_runtime(
+    provider: str, model: str, cfg: Optional[dict[str, Any]], *, allow_network: bool = True,
+) -> Optional[bool]:
     """Managed local runtime verdict: the server receiving the image is the authority
     on whether it can see (its /props reports modalities). Cloud catalogs have never
     heard of a local GGUF, so without this every local model reads as text-only and
     screenshots detour to a cloud auxiliary."""
+    if not allow_network:
+        return None  # Schema metadata must not probe the local server either.
     from hermes_cli.local_runtime.capabilities import is_managed_provider, managed_model_supports_vision
 
     managed = is_managed_provider(provider, _resolve_inference_base_url(cfg, provider) or "")
     return managed_model_supports_vision(model) if managed else None
 
 
-def _probe_models_dev(provider: str, model: str, cfg: Optional[dict[str, Any]]) -> Optional[bool]:
-    """models.dev catalog verdict. ``allow_network=True`` on purpose: this runs only
-    when an image needs routing, and the text-only-main guard depends on catalog
-    data — a cold cache returning "unknown" would reintroduce attempting the call.
-    The fetch is cached (4h TTL) and backoff-limited."""
+def _probe_models_dev(
+    provider: str, model: str, cfg: Optional[dict[str, Any]], *, allow_network: bool = True,
+) -> Optional[bool]:
+    """Catalog verdict. Actual image routing may fetch cold metadata to protect
+    text-only models. Schema/availability checks use cached metadata only,
+    without waiting for an in-flight background catalog refresh."""
     from agent.models_dev import get_model_capabilities
 
-    # allow_network=True on purpose: vision-capability lookup runs when an image actually needs routing (not
-    # per turn), and the #31179 text-only-main guard depends on catalog data — a cold cache returning
-    # "unknown" would fall back to attempting the call and reintroduce the bug. This preserves the
-    # historical network-on-cold-cache behavior for this one path; the fetch is cached (4h TTL) and
-    # backoff-limited after failures.
     if (provider or "").strip().lower() == "openai-codex":
         # A VALID Codex ``-900k`` picker variant is a Hermes-side alias of its base slug; the catalog
         # only knows the base, so look that up. The runtime model id stays untouched (the transport
@@ -301,12 +301,16 @@ def _probe_models_dev(provider: str, model: str, cfg: Optional[dict[str, Any]]) 
         from agent.model_metadata import strip_codex_context_variant_suffix
 
         model = strip_codex_context_variant_suffix(model)
-    caps = get_model_capabilities(provider, model, allow_network=True)
+    caps = get_model_capabilities(provider, model, allow_network=allow_network)
     return None if caps is None else caps.supports_vision
 
 
-def _probe_ollama(provider: str, model: str, cfg: Optional[dict[str, Any]]) -> Optional[bool]:
+def _probe_ollama(
+    provider: str, model: str, cfg: Optional[dict[str, Any]], *, allow_network: bool = True,
+) -> Optional[bool]:
     """Ollama ``/api/show`` verdict for local endpoints (see :func:`_should_probe_ollama_vision`)."""
+    if not allow_network:
+        return None
     base_url = _resolve_inference_base_url(cfg, provider)
     if not base_url and _clean_str(provider).lower() == "ollama":
         base_url = "http://localhost:11434/v1"
@@ -333,9 +337,11 @@ def _lookup_supports_vision(
     cfg: Optional[dict[str, Any]] = None,
     *,
     requested_provider: str = "",
+    allow_network: bool = True,
 ) -> Optional[bool]:
     """Return True/False if vision capability can be resolved, None if unknown.
 
+    ``allow_network=False`` keeps config/catalog metadata but skips endpoint probes.
     Order: config ``supports_vision`` override → :data:`_VISION_PROBES`
     (managed local runtime → models.dev catalog → Ollama probe). A plugin's
     per-model ``ProviderProfile.model_capabilities`` reaches this through the
@@ -363,7 +369,7 @@ def _lookup_supports_vision(
 
     for label, probe in _VISION_PROBES:
         try:
-            verdict = probe(provider, model, cfg)
+            verdict = probe(provider, model, cfg, **({} if allow_network else {"allow_network": False}))
         except Exception as exc:  # pragma: no cover - defensive
             logger.debug("image_routing: %s failed for %s:%s — %s", label, provider, model, exc)
             continue
@@ -378,6 +384,7 @@ def decide_image_input_mode(
     cfg: Optional[dict[str, Any]],
     *,
     requested_provider: str = "",
+    allow_network: bool = True,
 ) -> str:
     """Return ``"native"`` or ``"text"`` for the given turn (``cfg`` None behaves as
     auto; ``requested_provider`` is the identity before runtime canonicalization)."""
@@ -388,6 +395,8 @@ def decide_image_input_mode(
         return "text"
     # Keep the three-argument call contract for callers/tests that replace the lookup hook.
     extra = {"requested_provider": requested_provider} if requested_provider else {}
+    if not allow_network:
+        extra["allow_network"] = False
     return "native" if _lookup_supports_vision(provider, model, cfg, **extra) is True else "text"
 
 

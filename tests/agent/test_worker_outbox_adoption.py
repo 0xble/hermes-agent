@@ -4,8 +4,8 @@ import pytest
 
 from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
 from hermes_state import SessionDB
-from hermes_state_runtime import (adopt_worker_execution, begin_runtime_epoch,
-                                  mutate_worker_execution, register_worker_execution)
+from hermes_state_runtime import adopt_worker_execution, mutate_worker_execution, register_worker_execution
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def _owner(db):

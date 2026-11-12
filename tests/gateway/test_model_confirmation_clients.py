@@ -4,6 +4,7 @@ The real session authority answers a flagged ``session.mutate operation=model`` 
 ``confirmation_required`` and a one-time token; the classic CLI chat view and the ACP adapter must
 ask, re-send once with the token on yes, and leave the session untouched on no.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 from types import SimpleNamespace
 
 import pytest
@@ -36,7 +37,7 @@ class _Owner:
                                  _resolve_session_agent_runtime=lambda **k: ('frozen', {}))
         runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
         authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=self.db,
-                                     epoch=rt.begin_runtime_epoch(self.db, instance_id='owner'))
+                                     epoch=_begin_owned_runtime_epoch(self.db, instance_id='owner'))
         self.connection = AuthorityConnection(authority, object(), {'user_id': 'human'})
         self.sid = create_local_session(authority, self.connection.actor, dict(
             request_id='m', source='cli', cwd=str(tmp_path), model='frozen', toolsets=[])).session_id

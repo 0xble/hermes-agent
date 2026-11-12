@@ -24,7 +24,7 @@ async def bot(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local import create_local_session
     from gateway.session_local_title import title_new_session
     from hermes_state import SessionDB

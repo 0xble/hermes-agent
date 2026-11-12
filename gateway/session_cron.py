@@ -19,6 +19,15 @@ _execution: ContextVar[tuple | None] = ContextVar('cron_owner_execution', defaul
 _owners = {}
 
 
+async def _restore_local_session_for_cron(authority, sid, *, admission_gate):
+    """Retry only when the live cache changed during restore, not on receipt conflicts."""
+    from gateway.session_local_recovery import _LiveSessionChanged, restore_local_session_async
+    try:
+        return await restore_local_session_async(authority, sid, admission_gate=admission_gate)
+    except _LiveSessionChanged:
+        return await restore_local_session_async(authority, sid, admission_gate=admission_gate)
+
+
 def bind_owner(authority):
     home = Path(authority.db.db_path).resolve().parent
     _owners[home] = (os.getpid(), authority, asyncio.get_running_loop())
@@ -36,6 +45,36 @@ def owner_for_home(home):
     if bound is not None and bound[0] == os.getpid() and not bound[2].is_closed():
         return bound[1:]
     return None
+
+
+async def _admit_local_delivery(authority, chat_id, text, metadata):
+    from gateway.config import Platform
+    from gateway.session_authorities import owner_scope
+    from gateway.session_automation import admit_route_wake
+    from gateway.session_local_recovery import local_adapter_map
+    with owner_scope(authority):
+        await _restore_local_session_for_cron(authority, chat_id, admission_gate=True)  # a chat closed before this fire
+        source = authority.sessions[chat_id].source
+        return await admit_route_wake(authority.runner, local_adapter_map(authority)[Platform.LOCAL], source,
+                                      text, 'cron', metadata)
+
+
+def deliver_to_local_chat(home, chat_id, text, *, diagnostic=False):
+    """Admit a cron result into local chat *chat_id*'s FIFO; at the head it is written into the chat's
+    history as a note, never a turn (``session_completion_notes``). A local chat has no push transport
+    (``LocalSessionAdapter.send`` only acknowledges a turn's own output), so only the owner in this
+    process can deliver. Called off the owner loop; None once admitted, else the error."""
+    owner = owner_for_home(home)
+    if owner is None:
+        return f"local chat {chat_id}: no gateway in this process owns its session"
+    authority, loop = owner
+    metadata = {'notification_category': 'diagnostic'} if diagnostic else {}
+    try:
+        admitted = asyncio.run_coroutine_threadsafe(
+            _admit_local_delivery(authority, chat_id, text, metadata), loop).result(timeout=60)
+    except (RuntimeStoreError, KeyError, TimeoutError) as exc:  # unknown chat, refused admission, stalled owner
+        return f"local chat {chat_id}: delivery not confirmed: {exc!r}"
+    return None if admitted else f"local chat {chat_id}: delivery refused: the chat has no committed route"
 
 
 def current_execution():
@@ -116,7 +155,7 @@ CRON_SESSION_READ_ONLY_SURFACE = {'layer': 'gateway', 'code': 'cron_session_read
 # (cron/quota_hold.py parks past a closed usage window; cron/unreachable_retry.py re-runs a
 # never-reached model; a store-unavailable refusal preserves repeat budget). They cross the
 # authority boundary inside the cron result.
-RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_session_store_unavailable')
+RUN_JOB_FLAGS = ('_model_unreachable', '_quota_hold_seconds', '_session_store_unavailable', '_script_failed')
 
 
 async def operation(authority, name, params, actor=None):
@@ -140,10 +179,9 @@ async def operation(authority, name, params, actor=None):
         if row is None:
             return {'status': 'missing', 'result': None}
         state = await operation(authority, 'status', {'session_id': sid, 'admission_id': row['admission_id']}, actor)
-        from gateway.session_local_recovery import restore_local_session
-        restore_local_session(authority, sid)
-        from gateway.config import Platform
         from gateway.session_local_recovery import local_adapter_map
+        await _restore_local_session_for_cron(authority, sid, admission_gate=False)
+        from gateway.config import Platform
         policy = local_adapter_map(authority)[Platform.LOCAL].policies[sid]
         frozen = json.loads(policy.request_json)
         if frozen['extra_prompt'] != params['extra_prompt']:

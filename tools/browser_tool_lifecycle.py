@@ -157,7 +157,10 @@ def _cleanup_inactive_browser_sessions():
 
     with _bt._cleanup_lock:
         sessions_to_cleanup = [task_id for task_id, last_time in list(_bt._session_last_activity.items())
-                               if current_time - last_time > _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT]
+                               if current_time - last_time > _bt.BROWSER_SESSION_INACTIVITY_TIMEOUT
+                               # Borrowed attachments belong to the plugin/task lifecycle. Dropping
+                               # one here would silently route the next call to parked Camofox.
+                               and not (_bt._active_sessions.get(task_id) or {}).get("external_task_browser")]
 
     for task_id in sessions_to_cleanup:
         with _session_owner_scope(task_id):
@@ -733,6 +736,10 @@ def _cleanup_single_browser_session(task_id: str) -> None:
     _bt._maybe_stop_recording(task_id)  # saves the file before close
 
     protected = has_vault_date_components(task_id)
+    if session_info.get("external_task_browser"):
+        if not protected:
+            _release_session_resources(task_id, session_info)
+        return  # Borrowed browser: never send close, even on task/shutdown cleanup.
     # Skipped/failed close does not prove the filled page is gone.
     if protected and ((session_info.get("features") or {}).get("lightpanda") or _session_has_expired(session_info)):
         _bt.logger.warning("Keeping protected browser session %s: close cannot be confirmed", task_id)

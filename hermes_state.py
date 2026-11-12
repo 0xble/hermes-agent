@@ -22,7 +22,7 @@ import time
 import uuid
 from collections import deque
 from contextlib import contextmanager, suppress
-from hermes_state_publication import state_lock, measure_write, raise_if_nonretryable_contention
+from hermes_state_publication import PublicationConnection, state_lock, measure_write, raise_if_nonretryable_contention
 from pathlib import Path
 from hermes_dir_acl import make_user_dir
 
@@ -85,6 +85,7 @@ from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
 from hermes_state_transactions import settle_write_transaction
+from hermes_state_write_stalls import observe_write, write_attempt
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
     import psutil
@@ -855,7 +856,7 @@ class SessionDB(
         jittered application-level retry handles contention, not SQLite's busy handler;
         isolation_level=None: explicit BEGIN IMMEDIATE."""
         conn = _connect_tracked_db(
-            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None,
+            str(self.db_path), check_same_thread=False, timeout=1.0, isolation_level=None, factory=PublicationConnection,
         )
         try:
             conn.row_factory = sqlite3.Row
@@ -1086,7 +1087,7 @@ class SessionDB(
         session_ids: Any = (), skip_result: Any = None,
     ) -> T:
         """Run *fn(conn)* in a write transaction; see :meth:`_execute_write_marked`."""
-        with _storage_write_in_progress(), measure_write():
+        with observe_write(self.db_path, fn), _storage_write_in_progress(), measure_write():
             return self._execute_write_marked(
                 fn, patience_s, session_ids=session_ids, skip_result=skip_result, session_id=session_id, input_rows=input_rows)
 
@@ -1134,7 +1135,7 @@ class SessionDB(
             fn_started = False
             try:
                 acquisition_started = time.monotonic()
-                with state_lock(self._lock, db_path=self.db_path, deadline=deadline), write_admission(session_ids) as admitted:
+                with write_attempt(), state_lock(self._lock, db_path=self.db_path, deadline=deadline), write_admission(session_ids) as admitted:
                     if not admitted:
                         return cast(T, skip_result)
                     if generation_clean:

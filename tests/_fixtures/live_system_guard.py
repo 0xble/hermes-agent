@@ -226,7 +226,9 @@ def _live_system_guard(request, monkeypatch):
         if int(sig) == 0:
             return real_kill(pid, sig, *args, **kwargs)
         if _is_own_subtree(int(pid)) or _is_zombie(int(pid)):
-            _remember_descendants(int(pid))
+            # Bottom-up TERM can reap a helper's parent and orphan its siblings.
+            # Verify the test's whole subtree while those identities still have ancestry.
+            _remember_descendants(test_pid)
             return real_kill(pid, sig, *args, **kwargs)
         raise RuntimeError(
             f"tests/conftest.py live-system guard: blocked os.kill("

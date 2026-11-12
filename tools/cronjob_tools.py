@@ -783,6 +783,7 @@ def _action_create(a: dict[str, Any]) -> str:
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
             reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]),
             hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"],
+            max_catch_up_lateness_seconds=a["max_catch_up_lateness_seconds"],
             failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])),
             keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False,
             review=_review_value(a["review_json"], clear=bool(a["clear_review"])),
@@ -955,18 +956,15 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
         updates["pinned"] = bool(a["pinned"])
     if a["base_url"] is not None:
         updates["base_url"] = _normalize_optional_job_value(a["base_url"], strip_trailing_slash=True)
-    if a["hard_wall_timeout_seconds"] is not None:
-        # Operator-only lane, absent from the model schema. Zero restores the profile cap.
-        updates["hard_wall_timeout_seconds"] = a["hard_wall_timeout_seconds"]
-    if a["reasoning_effort"] is not None:
-        # CLI-only lane; update_job validates, empty string clears the pin.
-        updates["reasoning_effort"] = a["reasoning_effort"]
+    # Preserve strict zero and explicit '' clears; None means unchanged. These values
+    # share the same forwarding contract, with field-specific validation in update_job.
+    for key in ("hard_wall_timeout_seconds", "max_catch_up_lateness_seconds",
+                "reasoning_effort", "interpreter"):
+        if a[key] is not None:
+            updates[key] = a[key]
     if a["job_timezone"] is not None:
         # CLI-only lane like reasoning_effort; update_job validates the IANA name, '' clears.
         updates["timezone"] = a["job_timezone"] or None
-    if a["interpreter"] is not None:
-        # CLI-only lane like reasoning_effort; update_job trims, empty string clears.
-        updates["interpreter"] = a["interpreter"]
     if a["review_json"] is not None or a["clear_review"]:
         updates["review"] = _review_value(a["review_json"], clear=bool(a["clear_review"]))
     # Re-validate the EFFECTIVE provider/base_url on EVERY update: a job persisted before
@@ -1129,6 +1127,7 @@ def cronjob(
     pinned: Optional[bool] = None,
     interpreter: Optional[str] = None,
     hard_wall_timeout_seconds: Optional[float] = None,
+    max_catch_up_lateness_seconds: Optional[float | str] = None,
     review_json: Optional[str] = None,
     clear_review: bool = False,
     allow_shrink: bool = False) -> str:
@@ -1175,16 +1174,21 @@ def _cronjob_schema_overrides() -> dict:
 
 CRONJOB_SCHEMA = {
     "name": "cronjob_manage",
-    "description": """Manage scheduled cron jobs: action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires an enabled job immediately in the BACKGROUND (resume paused/disabled jobs first; returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
+    "description": """Schedule recurring or one-off agent tasks (cron jobs): create, list, edit, run. action='create' schedules a job from a prompt and/or skills; 'list' inspects jobs; 'update'/'pause'/'resume'/'remove' manage one by job_id (always list first — never guess job IDs); 'run' fires an enabled job (resume paused/disabled jobs first) immediately in the BACKGROUND (returns a handle at once, outcome re-enters the conversation when done — do not wait or poll; optional 'prompt' adds transient context for that fire only).
 
-Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless pinned.
-
-Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
+    Jobs run in a fresh session with no current-chat context, so prompts must be self-contained, and the agent's FINAL RESPONSE is what gets delivered — cron runs are autonomous and cannot ask questions. Jobs run on the main agent model (whatever `hermes model` is set to when they fire) unless the user pins one. Prefer updating an existing job over creating near-duplicates.""",
     "parameters": {
         "type": "object",
         "properties": {
             "paused": {"type": "boolean", "description": "Create only: persist disabled atomically. Resume before scheduled or manual runs. Default false."},
             "paused_reason": {"type": "string", "description": "Create only: auditable reason; requires paused=true."},
+            "max_catch_up_lateness_seconds": {
+                "anyOf": [
+                    {"type": "number", "minimum": 0},
+                    {"type": "string", "enum": [""]},
+                ],
+                "description": "For create/update: maximum scheduled catch-up lateness in finite nonnegative seconds. 0 allows no lateness; unset means legacy unlimited catch-up. Omit or null leaves an existing value unchanged; pass '' to clear it back to unlimited."
+            },
             "action": {
                 "type": "string",
                 "description": "One of: create, list, update, pause, resume, remove, run. When action=create, the 'schedule' and 'prompt' fields are REQUIRED."
@@ -1220,7 +1224,7 @@ Jobs run in a fresh session with no current-chat context, so prompts must be sel
             },
             "deliver": {
                 "type": "string",
-                "description": "Where the job's output is POSTED as a one-way message (the job itself always runs in a fresh session with no chat context). Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (inject into a Bot Chat as a real message), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'."
+                "description": "Where the job's output is POSTED as a one-way message (the job itself always runs in a fresh session with no chat context). Omit to address the chat/topic this job was created from. Otherwise: 'local' (save only, no delivery), 'all' (every connected home channel, resolved at fire time), 'bot-chat' or 'bot-chat:<profile>' (inject into a Bot Chat as a real message), or platform:chat_id:thread_id (e.g. 'telegram:-1001234567890:17585'). Comma-combine like 'origin,all'. From a local chat (CLI, TUI or Desktop) the default writes the result into that chat's history as a note, seen when the chat is reopened and by its next turn, not as a live message."
             },
             "failure_deliver": {
                 "type": "string",
@@ -1306,7 +1310,8 @@ def check_cronjob_requirements() -> bool:
 _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "keep_pinned_lane", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
-    "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review")
+    "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review",
+    "max_catch_up_lateness_seconds")
 
 
 def _cronjob_handler(args, **kw):

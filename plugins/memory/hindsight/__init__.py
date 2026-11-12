@@ -55,6 +55,9 @@ from .retention import PendingRetainOperation, filter_retain_messages
 
 logger = logging.getLogger(__name__)
 
+# Socket/session teardown is not a memory request and must not inherit its 120s timeout.
+_CLIENT_CLOSE_TIMEOUT_S = 1.0
+
 # The route (private no-store or public) a queued background recall was requested under.
 # A recall must never take the other route because privacy changed while it waited.
 _QUEUED_PRIVATE_ROUTE: ContextVar[bool | None] = ContextVar("hindsight_queued_private_route", default=None)
@@ -1731,19 +1734,37 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._session_id, self._parent_session_id, reset, self._document_id)
 
     def _close_client(self) -> None:
+        client = self._client
+        assert client is not None
+        deadline = time.monotonic() + _CLIENT_CLOSE_TIMEOUT_S
+        def cancel_close(future):
+            future.cancel()
+            logger.warning("Hindsight client close exceeded %.2fs cap; cancelled pending close", _CLIENT_CLOSE_TIMEOUT_S)
         if self._mode != "local_embedded":
-            self._run_sync(self._client.aclose())
+            _run_sync(client.aclose(), timeout=_CLIENT_CLOSE_TIMEOUT_S, keep_pending=cancel_close)
             return
         # HindsightEmbedded.close() closes its sync client from this thread ("attached
         # to a different loop" before aiohttp releases the session): aclose the inner
         # client on the shared loop first, then let the wrapper clean up bookkeeping.
-        inner_client = getattr(self._client, "_client", None)
+        inner_client = getattr(client, "_client", None)
         if inner_client is not None and hasattr(inner_client, "aclose"):
-            _run_sync(inner_client.aclose())
+            _run_sync(inner_client.aclose(), timeout=max(0, deadline - time.monotonic()), keep_pending=cancel_close)
             with contextlib.suppress(Exception):
-                self._client._client = None
-        with contextlib.suppress(RuntimeError):
-            self._client.close()
+                client._client = None
+        # A few embedded SDK versions also do synchronous wrapper cleanup.
+        # Keep that bookkeeping inside the same close cap, not a fresh request timeout.
+        def close_wrapper():
+            try:
+                client.close()
+            except RuntimeError:
+                pass  # The SDK may report its already-closed inner event loop.
+            except Exception as exc:
+                logger.warning("Hindsight embedded wrapper close failed: %s", exc)
+        closer = spawn_context_thread(close_wrapper, name="hindsight-close")
+        closer.start()
+        closer.join(timeout=max(0, deadline - time.monotonic()))
+        if closer.is_alive():
+            logger.warning("Hindsight embedded wrapper close exceeded %.2fs cap", _CLIENT_CLOSE_TIMEOUT_S)
 
     def shutdown(self) -> None:
         logger.debug("Hindsight shutdown: stopping writer + waiting for background threads")
@@ -1770,9 +1791,12 @@ class HindsightMemoryProvider(MemoryProvider):
                                self._retain_queue.qsize())
         self._join_prefetch(5.0)
         if self._client is not None:
-            with contextlib.suppress(Exception):
-                self._close_client()
-            self._client = None
+            if any(t is not None and t.is_alive() for t in (self._writer_thread, self._prefetch_thread)):
+                logger.warning("Hindsight skipped client close: background writer/prefetch is still active")
+            else:
+                with contextlib.suppress(Exception):
+                    self._close_client()
+                self._client = None
         # Drop the bound atexit callback: it strongly references this provider, so an evicted
         # gateway session (and its transcript buffers) would otherwise live until process exit.
         # A later retain re-registers through _register_atexit().

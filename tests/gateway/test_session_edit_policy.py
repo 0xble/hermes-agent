@@ -39,7 +39,7 @@ async def test_edit_policy_is_a_durable_session_setting_every_viewer_reads(tmp_p
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_policy import policy_for_source
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {})
@@ -98,7 +98,7 @@ async def test_a_branch_of_a_dont_ask_session_starts_at_ask(tmp_path, monkeypatc
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())

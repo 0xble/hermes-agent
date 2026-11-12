@@ -554,6 +554,22 @@ class SessionTranscriptMixin:
             logger.debug("transcript tail lookup failed for %s", session_id, exc_info=True)
             return None
 
+    def replace_failed_turn_boundary(self, session_id: str, row_id: int, content: str) -> bool:
+        """Replace this turn's own failed-turn boundary copy in place (``row_id`` from the agent's
+        flushed boundary), on the route ``transcript_tail_role`` reads. False (no write) without a
+        DB, when the row is not that session's live tail boundary, or on failure."""
+        session_id = self._compression_tip_for_session_id(self._follow_reroutes(session_id))
+        if self._private_history(session_id) is not None:
+            return False
+        db = self._db_for_session_id(session_id)
+        if not db or not hasattr(db, "set_failed_turn_boundary_content"):
+            return False
+        try:
+            return db.set_failed_turn_boundary_content(session_id, row_id, content) == 1
+        except Exception:
+            logger.debug("failed-turn boundary replace failed for %s", session_id, exc_info=True)
+            return False
+
     def rewrite_transcript(
         self, session_id: str, messages: list[dict[str, Any]], active_only: bool = False,
         reject_active_turn_lease: bool = False) -> bool:

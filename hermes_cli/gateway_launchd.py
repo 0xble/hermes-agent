@@ -24,6 +24,9 @@ LAUNCHD_THROTTLE_INTERVAL_S = 30
 from datetime import UTC
 
 from hermes_cli import gateway_service_owner
+from hermes_cli.gateway_launchd_lifetime import (
+    configured_launchd_domain, migrate_launchd_domain, uninstall_launchd_lifetime,
+)
 
 
 def _gw():
@@ -56,6 +59,15 @@ def _probe_launchd_domain_for_label(label: str, *, budget=None) -> str:
     budget = budget or (lambda cap: cap)
     uid = os.getuid()  # windows-footgun: ok — POSIX launchd (macOS) helper, never invoked on Windows
     gui_domain, user_domain = f"gui/{uid}", f"user/{uid}"
+    configured = configured_launchd_domain(label)
+    if configured is not None:
+        from hermes_cli.gateway_launchd_lifetime import _state
+        for observed in (gui_domain, user_domain):
+            loaded, _ = _state(subprocess.run, observed, label, timeout=budget(5))
+            if loaded and observed != configured:
+                from hermes_cli.gateway_command_errors import LaunchdServiceError
+                raise LaunchdServiceError(f"{label} is loaded in {observed}, configured for {configured}; stop conflicting copy")
+        return configured
 
     launchctl_errors = (subprocess.CalledProcessError, subprocess.TimeoutExpired, FileNotFoundError)
     for domain in (gui_domain, user_domain):
@@ -195,8 +207,12 @@ def _launchctl_supervised_pid(label: str, *, timeout: float = 10, strict: bool =
     ``timeout`` lets a bounded caller (the guardian) pass the time left in its own deadline.
     ``strict`` preserves probe failures for callers that must diagnose unknown ownership."""
     try:
+        domain = configured_launchd_domain(label)
+        if domain is not None:
+            from hermes_cli.gateway_launchd_lifetime import _state
+            return _state(subprocess.run, domain, label, timeout=timeout)[1]
         result = subprocess.run(["launchctl", "list", label], check=False, timeout=timeout, **_gw()._CAPTURE_TEXT)
-    except (subprocess.TimeoutExpired, OSError) as exc:
+    except (subprocess.TimeoutExpired, OSError, RuntimeError) as exc:
         if strict:
             raise RuntimeError(f'cannot probe launchd supervised PID for {label}: {exc}') from exc
         return None
@@ -402,7 +418,7 @@ def _launchd_degrade_or_raise(exc: subprocess.CalledProcessError, what: str) -> 
     install/update can tell that nothing ties the gateway to launchd any more. A live supervised PID is
     direct evidence this macOS does manage the job, so surface the failure instead of branding the host.
     """
-    if not _launchctl_domain_unsupported(exc.returncode):
+    if configured_launchd_domain() is not None or not _launchctl_domain_unsupported(exc.returncode):
         raise exc
     label = _gw().get_launchd_label()
     if _gw()._launchctl_label_supervising_process(label):
@@ -434,7 +450,8 @@ def _installed_service_path_entries(home: Path) -> list[str]:
             if entry and not any(Path(entry).is_relative_to(root) for root in owned)]
 
 
-def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a") -> str:
+def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a",
+                           domain: str | None = None) -> str:
     """Render a candidate definition without moving ``current`` first.
 
     The release updater must persist these exact bytes in its write-ahead record
@@ -442,6 +459,13 @@ def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a
     ``slot="b"`` renders the zero-cut standby job: the ``.b`` label plus ``HERMES_GATEWAY_SLOT=b``;
     the default active slot is byte-identical to the historical output.
     """
+    if domain not in {None, "gui", "user"}:
+        raise ValueError("launchd domain must be gui or user")
+    selected = domain or (configured_launchd_domain() or "").split("/")[0]
+    session_xml = {
+        "user": "<string>Background</string>",
+        "gui": "<string>Aqua</string>",
+    }.get(selected, "<array>\n        <string>Aqua</string>\n        <string>Background</string>\n    </array>")
     # Stable cwd anchor — never the volatile source checkout (same rot risk as systemd's WorkingDirectory).
     working_dir = str(_gw().get_hermes_home() / "current") if release_target else _gw()._stable_service_working_dir()
     hermes_home = str(_gw().get_hermes_home().resolve())
@@ -523,10 +547,7 @@ def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a
     </dict>
 
     <key>LimitLoadToSessionType</key>
-    <array>
-        <string>Aqua</string>
-        <string>Background</string>
-    </array>
+    {session_xml}
 
     <!-- Without a ProcessType, launchd starts the agent at UTILITY QoS, which
          every child inherits: the gateway then loses CPU and I/O to any
@@ -596,6 +617,12 @@ def _mark_planned_gateway_restart(gateway_pid: int | None) -> None:
     write_planned_restart_marker(gateway_pid)
 
 
+def _reload_drain_timeout_action(submit_label: str, *, fail_closed: bool) -> str:
+    """Render the timeout branch directly; explicit mode must never bootstrap beside a writer."""
+    return (f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null; exit 1;"
+            if fail_closed else "break;")
+
+
 def _spawn_deferred_launchd_reload(
     *, domain: str, label: str, target: str, plist_path: Path, gateway_pid: int
 ) -> bool:
@@ -617,16 +644,23 @@ def _spawn_deferred_launchd_reload(
     # Require a POSITIVE PID: `launchctl list` also exits 0 for a registered-but-not-running
     # definition, and a crashed job reports `"PID" = -1` (mirrors _parse_launchd_pid_from_list_output).
     listed = f"launchctl list {q_label} 2>/dev/null | grep -qE '\\\"PID\\\" = [1-9][0-9]*;'"
+    explicit = configured_launchd_domain() is not None
+    registered = f"launchctl list {q_label}"
+    if explicit:
+        registered = f"launchctl print {q_target}"
+        listed = f"{registered} 2>/dev/null | grep -qE '^[[:space:]]*pid = [1-9][0-9]*[[:space:]]*$'"
     # Unique per reload so concurrent/repeated reloads never collide.
     submit_label = f"{label}.reload.{os.getpid()}.{int(time.time())}"
+    drain_timeout_action = _reload_drain_timeout_action(submit_label, fail_closed=explicit)
+    drain_outcome = "refusing bootstrap" if explicit else "bootstrapping anyway"
     reload_script = (
         f"sleep 2; "
         f"launchctl bootout {q_target} 2>/dev/null; "
         # Wait for the OLD gateway to exit: bootout only SIGTERMs and every bootstrap during the drain fails EIO.
         f"_wait_deadline=$(($(date +%s) + {_exit_budget})); "
         f"while kill -0 {gateway_pid} 2>/dev/null; do   if [ $(date +%s) -ge $_wait_deadline ]; then "
-        f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_exit_budget}s drain wait — bootstrapping anyway\" >> {q_log}; "
-        f"    break;   fi;   sleep 1; done; "
+        f"    echo \"[{stamp}] old gateway pid {gateway_pid} still alive after {_exit_budget}s drain wait — {drain_outcome}\" >> {q_log}; "
+        f"    {drain_timeout_action}   fi;   sleep 1; done; "
         # Probe unregister completion, rather than delaying every already-unloaded job.
         # The probe is best-effort: it fails on macOS-26 per-user domains and degrades to this retry path.
         # The shared reload deadline bounds every bootstrap failure. Backoff is in tenths so Bash needs no float math.
@@ -642,7 +676,7 @@ def _spawn_deferred_launchd_reload(
         # Successful registration may not yet have a PID. Wait for supervision only while the label remains registered;
         # macOS can report a successful bootstrap without registering the label at all.
         f"      while :; do if {listed}; then break; fi; "
-        f"        if ! launchctl list {q_label} >/dev/null 2>&1; then "
+        f"        if ! {registered} >/dev/null 2>&1; then "
         f"          _supervised=0; _rc=not-registered; _reason='bootstrap returned 0 but label was not registered'; break; fi; "
         f"        if [ $(date +%s) -ge $_deadline ]; then _supervised=0; break; fi; sleep 0.2; done; "
         f"      if [ $_supervised -eq 1 ]; then break; fi; "
@@ -659,6 +693,20 @@ def _spawn_deferred_launchd_reload(
         # Submitted jobs stay registered after the script exits; removing our own label ends the one-shot job.
         f"launchctl remove {shlex.quote(submit_label)} 2>/dev/null"
     )
+    if explicit:
+        # Serialise the whole state-changing phase with migration/stop/guardian. A
+        # helper queued before operator stop must never bootstrap after stop completes.
+        home = _gw().get_hermes_home()
+        wrapper = (
+            "import fcntl, pathlib, subprocess, sys; "
+            f"h=pathlib.Path({str(home)!r}); "
+            "lock=(h / 'logs/launchd-lifetime.lock').open('a+'); "
+            "fcntl.flock(lock, fcntl.LOCK_EX); "
+            "stopped=(h / 'gateway-guardian-stopped').exists(); "
+            f"sys.exit(subprocess.call(['launchctl', 'remove', {submit_label!r}]) if stopped "
+            f"else subprocess.call(['/bin/bash', '-c', {reload_script!r}]))"
+        )
+        reload_script = shlex.join([_gw().get_python_path(), "-I", "-c", wrapper])
     _mark_planned_gateway_restart(gateway_pid)
     try:
         # `launchctl submit` rather than setsid: setsid does NOT leave the launchd coalition that bootout kills.
@@ -706,6 +754,27 @@ def refresh_launchd_plist_if_needed() -> bool | str:
     return _reload_installed_launchd_plist(plist_path)
 
 
+def _bootout_drain_and_rebootstrap(domain, plist_path, label, old_pid, budget: float) -> bool:
+    """Boot the job out, wait out the old gateway's drain, then bootstrap until launchd registers it.
+
+    Bootstrap can fail silently under load during a drain, and KeepAlive can't revive an
+    unregistered job, so the retry runs to a deadline. Waiting for *old_pid* first keeps the
+    budget from burning on guaranteed EIO ("already loaded"). The bootout is best effort (the job
+    may already be unloaded) and captured to keep expected noise off the terminal.
+    """
+    target = f"{domain}/{label}"
+    _mark_planned_gateway_restart(old_pid)
+    exit_budget = _launchd_old_gateway_exit_budget()
+    subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_gw()._CAPTURE_TEXT)
+    if old_pid is not None and not _gw()._wait_for_pid_exit(old_pid, exit_budget):
+        _gw()._append_launchd_reload_log(
+            f"old gateway pid {old_pid} still alive after "
+            f"{int(exit_budget)}s drain wait — bootstrapping {target} anyway"
+        )
+    return _gw()._retry_launchctl_bootstrap_until_registered(
+        domain, plist_path, label, deadline=time.monotonic() + budget)
+
+
 def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     """Re-register the installed bytes (including a saved source-checkout plist)."""
     label = _gw().get_launchd_label()
@@ -734,21 +803,9 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
         )
         return "deferred"
 
-    # Bootout/bootstrap so launchd reads the new definition; bootstrap can fail silently under load
-    # during a drain, and KeepAlive can't revive an unregistered job.
-    # Captured: best-effort (the job may already be unloaded), keep expected noise off the terminal.
-    _mark_planned_gateway_restart(gateway_pid)
-    subprocess.run(["launchctl", "bootout", target], check=False, timeout=90, **_gw()._CAPTURE_TEXT)
+    # Bootout/bootstrap so launchd reads the new definition.
     _reload_budget = _launchd_reload_budget()
-    # Wait out the old gateway's drain first so the budget isn't burned on guaranteed EIO ("already loaded").
-    _exit_budget = _launchd_old_gateway_exit_budget()
-    if gateway_pid is not None and not _gw()._wait_for_pid_exit(gateway_pid, _exit_budget):
-        _gw()._append_launchd_reload_log(
-            f"old gateway pid {gateway_pid} still alive after "
-            f"{int(_exit_budget)}s drain wait — bootstrapping {target} anyway"
-        )
-    _deadline = time.monotonic() + _reload_budget
-    if not _gw()._retry_launchctl_bootstrap_until_registered(domain, plist_path, label, deadline=_deadline):
+    if not _bootout_drain_and_rebootstrap(domain, plist_path, label, gateway_pid, _reload_budget):
         _gw()._append_launchd_reload_log(
             f"FAILED launchd reload of {target} — service NOT registered after "
             f"retrying for {int(_reload_budget)}s (in-process fallback path)"
@@ -762,7 +819,34 @@ def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     return True
 
 
-def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_path: bool = False):
+def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_path: bool = False,
+                    domain: str | None = None):
+    configured = configured_launchd_domain()
+    selected = domain if domain is not None else (configured.split("/", 1)[0] if configured else None)
+    if selected is not None:
+        from hermes_cli.gateway_command_errors import GatewayInstallError
+        try:
+            from hermes_cli.gateway_launchd_lifetime import _uid
+            # Reuse migration's owned-definition rendering and stopped transaction.
+            refresh = force and configured == f"{selected}/{_uid()}"
+            if refresh:
+                migrate_launchd_domain(selected, start_now=start_now, force_refresh=True)
+            else:
+                migrate_launchd_domain(selected, start_now=start_now)
+        except BlockingIOError as exc:
+            raise GatewayInstallError("Launchd lifetime operation is busy; retry shortly.") from exc
+        except subprocess.CalledProcessError as exc:
+            raise GatewayInstallError(
+                f"Could not install gateway launchd service: {exc}. {exc.stderr or ''} "
+                "Inspect macOS launchd with `hermes gateway status --deep` before retrying."
+            ) from exc
+        except RuntimeError as exc:
+            raise GatewayInstallError(f"Could not install gateway launchd service: {exc}") from exc
+        return
+    return _install_launchd_definition(force, start_now=start_now, force_unit_path=force_unit_path)
+
+
+def _install_launchd_definition(force: bool, *, start_now: bool, force_unit_path: bool):
     if start_now:
         from hermes_cli.gateway_guardian import set_intent
         set_intent(_gw().get_hermes_home(), stopped=False)
@@ -775,6 +859,11 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
     # Loading the plist starts the gateway (RunAtLoad), so a no-start install writes it without
     # loading it. A gateway that launchd already runs is still reloaded; this install did not start it.
     load = start_now or _gw()._launchctl_label_supervising_process(label)
+    # A forced reinstall over a live job must remember the incumbent before bootstrap starts.
+    # _launchctl_bootstrap() handles EIO by booting the stale label out and retrying once, but
+    # that immediate retry races the old gateway's drain (#120629). The install path can wait
+    # because it runs outside the supervised gateway process.
+    force_old_pid = _gw()._launchctl_supervised_pid(label) if force and load else None
 
     if plist_path.exists() and not (force or force_unit_path):
         if _gw().launchd_plist_is_current():
@@ -818,11 +907,26 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
         print("  hermes gateway status             # Check status")
         return
 
-    try:
-        _gw()._launchctl_bootstrap(_gw()._launchd_domain(), plist_path, label, timeout=30)
-    except subprocess.CalledProcessError as e:
-        _gw()._launchd_degrade_or_raise(e, "launchctl bootstrap")
-        return
+    if force_old_pid is not None:
+        domain = _gw()._launchd_domain()
+        target = f"{domain}/{label}"
+        budget = _gw()._launchd_reload_budget()
+        if not _bootout_drain_and_rebootstrap(domain, plist_path, label, force_old_pid, budget):
+            _gw()._append_launchd_reload_log(
+                f"FAILED forced launchd install of {target} — service NOT registered after "
+                f"retrying for {int(budget)}s"
+            )
+            _gw().print_error(
+                f"launchctl bootstrap did not register {target} within {int(budget)}s; "
+                "the gateway service is NOT loaded."
+            )
+            sys.exit(1)
+    else:
+        try:
+            _gw()._launchctl_bootstrap(_gw()._launchd_domain(), plist_path, label, timeout=30)
+        except subprocess.CalledProcessError as e:
+            _gw()._launchd_degrade_or_raise(e, "launchctl bootstrap")
+            return
 
     print()
     print("✓ Service installed and loaded!")
@@ -835,6 +939,12 @@ def launchd_install(force: bool = False, *, start_now: bool = True, force_unit_p
 
 
 def launchd_uninstall():
+    from hermes_cli.gateway_launchd_login import _login_trigger_label
+    trigger = _login_trigger_label(_gw().get_launchd_label())
+    if (configured_launchd_domain() is not None or
+            _gw().get_launchd_plist_path().with_name(f"{trigger}.plist").exists()):
+        uninstall_launchd_lifetime()
+        return
     gateway_service_owner.refuse_foreign_launchd_plist("uninstall")
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=True)
@@ -850,6 +960,12 @@ def launchd_uninstall():
 
 
 def launchd_start():
+    from hermes_cli.gateway_launchd_lifetime import lifetime_lock
+    with lifetime_lock(_gw().get_hermes_home(), announce_wait=True):
+        return _launchd_start_locked()
+
+
+def _launchd_start_locked():
     gateway_service_owner.refuse_foreign_launchd_plist("start")
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=False)
@@ -904,6 +1020,12 @@ def _launchd_ok(message: str) -> None:
 
 
 def launchd_stop():
+    from hermes_cli.gateway_launchd_lifetime import lifetime_lock
+    with lifetime_lock(_gw().get_hermes_home(), announce_wait=True):
+        return _launchd_stop_locked()
+
+
+def _launchd_stop_locked():
     gateway_service_owner.refuse_foreign_launchd_plist("stop")
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=True)
@@ -945,6 +1067,16 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    if configured_launchd_domain() is None:
+        return _launchd_restart_locked()
+    from hermes_cli.gateway_launchd_lifetime import lifetime_lock
+    with lifetime_lock(_gw().get_hermes_home(), announce_wait=True):
+        # An explicit restart authorizes a start, but a later stop waits for this
+        # transaction and remains authoritative after it returns.
+        return _launchd_restart_locked()
+
+
+def _launchd_restart_locked():
     gateway_service_owner.refuse_foreign_launchd_plist("restart")
     from hermes_cli.gateway_guardian import set_intent
     set_intent(_gw().get_hermes_home(), stopped=False)
@@ -1094,8 +1226,20 @@ def launchd_status(deep: bool = False):
         service_listed = False
         list_output = ""
 
-    # `launchctl list` exits 0 for any registered definition (even `state = not running`); only a PID proves a process.
-    launchd_pid = _gw()._parse_launchd_pid_from_list_output(list_output) if service_listed else None
+    # Explicit mode must not infer the service namespace from the calling shell.
+    domain = configured_launchd_domain()
+    observed_domains = []
+    if domain is not None:
+        from hermes_cli.gateway_launchd_lifetime import _state
+        # Inspection failures propagate as LaunchdServiceError: the CLI exits 1,
+        # rather than letting scripts mistake an unknown service state for success.
+        service_listed, launchd_pid = _state(subprocess.run, domain, label)
+        uid = os.getuid()  # windows-footgun: ok — launchd status is a macOS-only path.
+        for candidate in (f"gui/{uid}", f"user/{uid}"):
+            if candidate == domain and service_listed or candidate != domain and _state(subprocess.run, candidate, label)[0]:
+                observed_domains.append(candidate)
+    else:
+        launchd_pid = _gw()._parse_launchd_pid_from_list_output(list_output) if service_listed else None
 
     # Hermes PID may be a detached fallback process; when launchd IS supervising both PIDs match — don't double-count.
     from gateway.status import get_running_pid
@@ -1107,6 +1251,11 @@ def launchd_status(deep: bool = False):
     launchd_unsupported = _gw()._launchd_unsupported_marker_exists()
 
     print(f"Launchd plist: {plist_path}")
+    print(f"Launchd domain: {domain or _gw()._launchd_domain()}")
+    if domain is not None:
+        print(f"Launchd registrations: {', '.join(observed_domains) or 'none'}")
+        if observed_domains and observed_domains != [domain]:
+            print("⚠ Unexpected/duplicate launchd domain; stop conflicting copies before repair")
     if _gw().launchd_plist_is_current():
         print("✓ Service definition matches the current Hermes install")
     else:

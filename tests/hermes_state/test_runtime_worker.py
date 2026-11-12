@@ -1,3 +1,4 @@
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import pytest
 import sqlite3
 
@@ -9,7 +10,7 @@ def setup_worker(tmp_path):
     assert callable(getattr(rt, 'register_worker_execution', None)), 'canonical worker receipts missing'
     db = SessionDB(db_path=tmp_path / 'state.db')
     db.create_session('s', source='test')
-    epoch = rt.begin_runtime_epoch(db, instance_id='boot')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
     assignment = dict(execution_id='worker', session_id='s', generation=0)
     rt.register_worker_execution(db, epoch=epoch, **assignment, kind='compute', adoption_secret='private-fixture')
     return db, epoch, assignment
@@ -38,7 +39,7 @@ def test_worker_receipts_require_exact_sequence_assignment_and_adoption(tmp_path
         for change, reason in [({'content': 'different'}, 'admission_conflict'), ({'sequence': 3}, 'invalid_params'), ({'session_id': 'other'}, 'permission_denied'), ({'generation': 1}, 'stale_generation')]:
             with pytest.raises(rt.RuntimeStoreError, match=reason):
                 append(db, **(args | change))
-        new_epoch = rt.begin_runtime_epoch(db, instance_id='replacement')
+        new_epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
         rt.recover_session_inputs(db, epoch=new_epoch)
         with pytest.raises(rt.RuntimeStoreError, match='stale_epoch'):
             append(db, **args)

@@ -9,7 +9,10 @@ Asserts the things a successful ``hermes update`` does not itself prove:
   sync cannot silently drop a patch, and a new patch cannot land without a documented owner);
 - the candidate extensions are installed in the profile and register through real plugin discovery;
 - the configuration keys the slices depend on resolve to the expected values;
-- the newest update receipt, when present, matches the active release (or legacy checkout).
+- the newest update receipt, when present, matches the active release (or legacy checkout);
+- every behavioural test a maintenance unit pins on a ``Contract tests:`` line still exists at the
+  checked revision, so a sync cannot silently delete or rename the proof of a fork behaviour. The
+  hosted suite runs those tests; ``--list-contract-tests`` prints them for a focused run.
 
 Exit 0 when every check passes, 1 otherwise, with one line per failure. Read-only.
 """
@@ -85,6 +88,10 @@ _TRAILER = re.compile(r"^Fork-Patch:[ \t]*(?P<identity>[^;\s][^;\n]*?)[ \t]*(?:;
 # continuation line of such a list. Ordinary code spans (paths, config keys, commands) do not own.
 _OWNED_TOKEN = re.compile(r"`([^`\n]+)`")
 _IDENTITY_LINE = re.compile(r"identit", re.I)
+# A unit pins the behavioural tests that prove its fork behaviour as backticked pytest targets on a
+# ``Contract tests:`` line (or its indented continuation): ``tests/x.py`` or ``tests/x.py::test_name``.
+_CONTRACT_LINE = re.compile(r"^[-*\s]*(?:\*\*)?Contract tests?:", re.I)
+_CONTRACT_TARGET = re.compile(r"^(?P<path>tests/[\w./-]+\.py)(?P<nodes>(?:::\w+)*)$")
 MAINTENANCE_ROOT = "MAINTENANCE.md"
 MAINTENANCE_DIR = "maintenance"
 
@@ -119,6 +126,82 @@ def _maintenance_texts(revision: str = "HEAD") -> list[str]:
     return [_git("show", f"{revision}:{n}") for n in sorted(paths)]
 
 
+def _unit_files(revision: str = "HEAD") -> list[tuple[str, str]]:
+    """``(path, text)`` for each ``maintenance/*.md`` unit at ``revision`` (``HEAD``: working tree)."""
+    if revision == "HEAD":
+        units = sorted((REPO / MAINTENANCE_DIR).glob("*.md")) if (REPO / MAINTENANCE_DIR).is_dir() else []
+        return [(f"{MAINTENANCE_DIR}/{p.name}", p.read_text(encoding="utf-8-sig")) for p in units]
+    names = _git("ls-tree", "--name-only", revision, "--", f"{MAINTENANCE_DIR}/").split("\n")
+    return [(n, _git("show", f"{revision}:{n}")) for n in sorted(names) if n.endswith(".md")]
+
+
+def _line_blocks(text: str, opens) -> list[str]:
+    """Lines belonging to a block whose first line satisfies ``opens`` (text before the first
+    backtick), plus that block's indented continuation lines."""
+    lines: list[str] = []
+    in_block = False
+    for line in text.splitlines():
+        stripped = line.strip()
+        continuation = bool(stripped) and line[:1] in (" ", "\t") and not stripped.startswith(("-", "*", "|", "#"))
+        if not continuation:
+            # A blank line, heading, new list item, table row, or unindented paragraph ends the block.
+            in_block = opens(stripped.split("`", 1)[0])
+        if in_block:
+            lines.append(stripped)
+    return lines
+
+
+def contract_tests(revision: str = "HEAD") -> dict[str, list[str]]:
+    """Pinned behavioural tests by unit path, in declaration order."""
+    pinned: dict[str, list[str]] = {}
+    for name, text in _unit_files(revision):
+        lines = _line_blocks(text, lambda head: _CONTRACT_LINE.match(head) is not None)
+        targets = [t.strip() for line in lines for t in _OWNED_TOKEN.findall(line)]
+        if targets:
+            pinned[name] = list(dict.fromkeys(targets))
+    return pinned
+
+
+def _defines(source: str, node: str) -> bool:
+    import ast
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return False
+    return any(isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)) and n.name == node
+               for n in ast.walk(tree))
+
+
+def check_contract_tests(revision: str = "HEAD", contract: str = "HEAD") -> list[str]:
+    """Every pinned contract test exists at ``revision``: its file, and its named test when given."""
+    failures: list[str] = []
+    for unit, targets in contract_tests(contract).items():
+        for target in targets:
+            match = _CONTRACT_TARGET.match(target)
+            if match is None:
+                failures.append(f"{unit} pins {target!r}, which is not a tests/<file>.py[::test] target")
+                continue
+            path, nodes = match["path"], match["nodes"].split("::")[1:]
+            try:
+                source = ((REPO / path).read_text(encoding="utf-8-sig") if revision == "HEAD"
+                          else _git_raw("show", f"{revision}:{path}"))
+            except (OSError, subprocess.CalledProcessError):
+                failures.append(f"{unit} pins contract test {target}, but {path} is missing")
+                continue
+            missing = [node for node in nodes if not _defines(source, node)]
+            if missing:
+                failures.append(f"{unit} pins contract test {target}, but {path} no longer defines {missing[0]}")
+    return failures
+
+
+def uncovered_units(contract: str = "HEAD") -> list[str]:
+    """Units that own a patch identity but pin no contract test: behaviour a sync can drop unseen."""
+    pinned = contract_tests(contract)
+    return [name for name, text in _unit_files(contract)
+            if name not in pinned and any(_OWNED_TOKEN.findall(line) for line in
+                                          _line_blocks(text, lambda head: _IDENTITY_LINE.search(head) is not None))]
+
+
 def _owned_identities(revision: str = "HEAD") -> set[str] | None:
     """Backticked tokens on identity lines of the root contract or a maintenance unit; None when neither exists."""
     texts = _maintenance_texts(revision)
@@ -126,15 +209,8 @@ def _owned_identities(revision: str = "HEAD") -> set[str] | None:
         return None
     owned: set[str] = set()
     for text in texts:
-        in_identity_block = False
-        for line in text.splitlines():
-            stripped = line.strip()
-            continuation = bool(stripped) and line[:1] in (" ", "\t") and not stripped.startswith(("-", "*", "|", "#"))
-            if not continuation:
-                # A blank line, heading, new list item, table row, or unindented paragraph ends the block.
-                in_identity_block = _IDENTITY_LINE.search(stripped.split("`", 1)[0]) is not None
-            if in_identity_block:
-                owned.update(t.strip() for t in _OWNED_TOKEN.findall(stripped))
+        for line in _line_blocks(text, lambda head: _IDENTITY_LINE.search(head) is not None):
+            owned.update(t.strip() for t in _OWNED_TOKEN.findall(line))
     return owned
 
 
@@ -471,9 +547,18 @@ def main(argv: list[str] | None = None) -> int:
                     help="last commit whose history is classified by the maintenance units; later commits need "
                          "trailers. Located by exact subject when a sync has rewritten the SHA.")
     ap.add_argument("--skip-config", action="store_true", help="skip the config-key checks (fixture profiles)")
+    ap.add_argument("--list-contract-tests", action="store_true",
+                    help="print the pinned contract tests (one pytest target per line) and exit")
+    ap.add_argument("--list-uncovered", action="store_true",
+                    help="print units that own a patch identity but pin no contract test, and exit")
     args = ap.parse_args(argv)
     if args.repo:
         REPO = args.repo.resolve()
+    if args.list_contract_tests or args.list_uncovered:
+        lines = (list(dict.fromkeys(t for ts in contract_tests().values() for t in ts))
+                 if args.list_contract_tests else uncovered_units())
+        print("\n".join(lines))
+        return 0
     if not _is_git_checkout():
         # A package-managed install has no history to check; say so instead of tracebacking.
         print(f"FAIL {REPO} is not a git checkout; the trailer and receipt checks need the source checkout")
@@ -495,6 +580,8 @@ def main(argv: list[str] | None = None) -> int:
         args.baseline = _recorded_baseline(None if contract == "HEAD" else contract) or DEFAULT_BASELINE
     failures = [pointer_failure] if pointer_failure else check_trailers(
         args.baseline, args.trailer_floor, floor_subject, revision=revision, contract=contract)
+    if not pointer_failure:
+        failures += check_contract_tests(revision, contract)
     if not args.source_only:
         failures += check_extensions(args.home)
         if not args.skip_config:

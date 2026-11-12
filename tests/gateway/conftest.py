@@ -32,12 +32,45 @@ incident.
 """
 
 import ast
+import datetime as dt
 import os
 import sys
+from functools import wraps
 from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def fixed_daily_quota_wall(monkeypatch):
+    """Keep default quota ledgers in one UTC day; explicit rollover clocks win.
+
+    Pressure/count tests must not lose their setup when the real wall crosses
+    midnight, including adapters and limiters that construct their own quota.
+    Leave monotonic pacing, flood deadlines, and global wall time untouched.
+    """
+    from plugins.platforms.telegram.daily_quota import DailyQuota
+
+    fixed = dt.datetime(2026, 11, 3, 23, 59, 59, tzinfo=dt.timezone.utc).timestamp()
+
+    def wall():
+        return fixed
+
+    original_init = DailyQuota.__init__
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        kwargs.setdefault("wall", wall)
+        original_init(self, *args, **kwargs)
+
+    monkeypatch.setattr(DailyQuota, "__init__", init)
+    return wall
+
+# Bootstrap selects the checkout's dependencies at process start. Gateway tests
+# also reach it through lazy imports, after the per-test real-home I/O guard is
+# active, so initialize it once here while the collection sandbox is in force.
+import hermes_bootstrap  # noqa: F401
 
 
 @pytest.fixture
@@ -652,7 +685,7 @@ def owner(tmp_path):
     from gateway.session import SessionStore
     from gateway.session_authority import SessionAuthority
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     db = SessionDB(tmp_path / 'state.db')
     store = SessionStore(config=GatewayConfig(), sessions_dir=tmp_path / 'sessions')
@@ -690,7 +723,7 @@ def hosted_owner(tmp_path, monkeypatch):
 
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway import run, session_policy
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {'default': 'fixture'}, 'platform_toolsets': {'cli': []}})

@@ -83,7 +83,7 @@ async def test_terminal_peer_entrypoint_attaches_only_to_current_session(monkeyp
 
     endpoint = object()
     monkeypatch.setattr(gateway_runtime, "discover_gateway_endpoint",
-                        lambda home: SimpleNamespace(state="ready", endpoint=endpoint))
+                        lambda home: SimpleNamespace(state="ready", endpoint=endpoint, reason_code=None))
     monkeypatch.setattr(gateway_client, "connect_gateway", lambda **kw: Client())
     monkeypatch.setenv("HERMES_SESSION_ID", "current-parent")
     from gateway.session_context import scoped_current_session_id

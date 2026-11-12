@@ -9,7 +9,7 @@ async def test_delete_prunes_launch_and_config_secrets(tmp_path, monkeypatch):
     from gateway import run, session_mutations
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     config = {'platform_toolsets': {'cli': []}, 'model': {
@@ -46,7 +46,7 @@ async def _branching_owner(tmp_path, monkeypatch):
     from gateway import run, session_mutations
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_policy import launch_key, policy_for_source
     config = {'platform_toolsets': {'cli': []}, 'model': {

@@ -476,6 +476,7 @@ def keep_trigger(callback: Callable[[], Any]) -> Callable[[], Awaitable[None]]:
         finally:
             _TRIGGER.reset(token)
 
+    run.__wrapped__ = callback
     return run
 
 

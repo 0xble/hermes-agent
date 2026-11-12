@@ -20,6 +20,7 @@ import uuid
 from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
+from agent.attachment_context import CHANNEL_CONTEXT_HEADERS
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource
 from gateway.relay.descriptor import CapabilityDescriptor
@@ -118,7 +119,7 @@ def _render_relay_context(context: Any) -> Optional[str]:
         lines.append(f"{author}: {text}" if author else str(text))
     if not lines:
         return None
-    return "[Recent channel messages]\n" + "\n".join(lines)
+    return CHANNEL_CONTEXT_HEADERS["recent"] + "\n" + "\n".join(lines)
 
 
 def _normalize_slack_parent_command(text: str, message_type: MessageType) -> tuple[str, MessageType]:

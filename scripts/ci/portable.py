@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
+import errno
 import hashlib
 import importlib.util
 import json
@@ -11,12 +12,18 @@ import os
 from pathlib import Path
 import re
 import shutil
+import socket
+import stat
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterator, Mapping
 
 ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+from scripts.ci.temporary import temporary_parent
+
 STATE = ROOT / '.ci'
 # Checkout-owned npm and ripgrep at the exact pins; host tools only bootstrap them.
 TOOLCHAIN = STATE / 'toolchain'
@@ -39,10 +46,9 @@ OPTIONAL_LANES = {
 # explicit profiles rather than treating partial --lane runs as qualification.
 GATE_LANES = ('static', 'node-gate')
 # Upgrade requires upstream release tags and a 900s per-file bound. The SQLite
-# torture chamber and the transfer runner remain nightly-only while their
-# environment/process races are resolved.
+# torture chamber remains nightly-only while its environment race is resolved.
 NIGHTLY_ONLY_E2E = ('tests/e2e/core/upgrade', 'tests/e2e/core/sqlite/test_torture_chamber.py')
-NIGHTLY_ONLY_TESTS = (*NIGHTLY_ONLY_E2E, 'tests/gateway/test_generation_transfer_runner.py')
+NIGHTLY_ONLY_TESTS = NIGHTLY_ONLY_E2E
 
 
 def is_nightly_only(path: Path, root: Path = ROOT) -> bool:
@@ -140,17 +146,32 @@ def nightly_only_e2e(env: dict[str, str], workers: int) -> None:
         raise failures[0]
 
 
-def git_environment(*, root: Path | None = ROOT, base: dict[str, str] | None = None,
+_CURRENT_ROOT = object()
+
+
+def git_environment(*, root: Path | None | object = _CURRENT_ROOT, base: dict[str, str] | None = None,
                     config_path: Path | None = None) -> dict[str, str]:
-    """Isolate repository selection while trusting only the requested checkout."""
+    """Isolate repository selection while trusting only the requested checkout.
+
+    An omitted root uses the current module ROOT. Passing root=None trusts no checkout.
+    """
+    checkout: Path | None
+    if root is _CURRENT_ROOT:
+        checkout = ROOT
+    elif isinstance(root, Path):
+        checkout = root
+    elif root is None:
+        checkout = None
+    else:
+        raise TypeError(f'git root must be a path or None, not {type(root).__name__}')
     source = os.environ if base is None else base
     env = {key: value for key, value in source.items() if not key.startswith('GIT_')}
-    if root is None:
+    if checkout is None:
         env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=os.devnull)
         return env
     config = (config_path or STATE / 'gitconfig').resolve()
     config.parent.mkdir(parents=True, exist_ok=True)
-    config.write_text(f'[safe]\n\tdirectory = {root.resolve().as_posix()}\n', encoding='utf-8')
+    config.write_text(f'[safe]\n\tdirectory = {checkout.resolve().as_posix()}\n', encoding='utf-8')
     env.update(GIT_CONFIG_NOSYSTEM='1', GIT_CONFIG_GLOBAL=config.as_posix())
     return env
 
@@ -192,17 +213,20 @@ def windows_command(name: str, env: Mapping[str, str]) -> str:
     return name
 
 
-def run(argv: list[str], *, cwd: Path = ROOT, env: dict[str, str] | None = None) -> None:
+def run(argv: list[str], *, cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
+    cwd = ROOT if cwd is None else cwd
     argv = [windows_command(argv[0], env or os.environ), *argv[1:]]
     print('+ ' + ' '.join(map(str, argv)), flush=True)
     subprocess.run(argv, cwd=cwd, env=env, check=True)
 
 
-def git(*args: str, cwd: Path = ROOT) -> str:
+def git(*args: str, cwd: Path | None = None) -> str:
+    cwd = ROOT if cwd is None else cwd
     return subprocess.check_output(['git', *args], cwd=cwd, env=git_environment(root=cwd)).decode('utf-8', errors='surrogateescape')
 
 
-def source_files(root: Path = ROOT) -> list[str]:
+def source_files(root: Path | None = None) -> list[str]:
+    root = ROOT if root is None else root
     # Include unstaged/new source for contributor checks, but never dependency/build state.
     return sorted(set(git('ls-files', '-z', '--cached', '--others', '--exclude-standard', cwd=root).split('\0')) - {''})
 
@@ -234,12 +258,199 @@ def source_unchanged() -> Iterator[None]:
 @contextmanager
 def external_temporary_directory(prefix: str, parent: Path | None = None) -> Iterator[Path]:
     """Own one temporary directory without repository/dependency ancestry."""
-    parent = (parent if parent is not None else Path(tempfile.gettempdir())).resolve()
+    parent = temporary_parent(parent)
     for ancestor in (parent, *parent.parents):
         if (ancestor / '.git').exists() or (ancestor / 'node_modules').exists():
             raise RuntimeError(f'Temporary directory parent has Git or Node dependency ancestry: {parent}')
+    if prefix == 'hermes-ci-home-':
+        with owned_ci_home(parent) as home:
+            yield home
+        return
     with tempfile.TemporaryDirectory(prefix=prefix, dir=parent) as temporary:
         yield Path(temporary)
+
+
+@contextmanager
+def temporary_home_lock(path: Path, *, wait: bool) -> Iterator[bool]:
+    """Do not follow a substituted lock file, or mistake lock contention for death."""
+    if path.is_symlink():
+        raise OSError(f'Symlink HOME lock: {path}')
+    flags = os.O_CREAT | os.O_RDWR | getattr(os, 'O_NOFOLLOW', 0)
+    descriptor = os.open(path, flags, 0o600)
+    with os.fdopen(descriptor, 'r+b') as lock:
+        if not stat.S_ISREG(os.fstat(lock.fileno()).st_mode) or path.is_symlink():
+            raise OSError(f'Not a regular HOME lock: {path}')
+        if os.name == 'nt':
+            import msvcrt
+            if os.fstat(lock.fileno()).st_size == 0:
+                lock.write(b'0')
+                lock.flush()
+            lock.seek(0)
+            while True:
+                try:
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                    break
+                except OSError as error:
+                    if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                        raise
+                    if not wait:
+                        yield False
+                        return
+                    time.sleep(0.05)
+        else:
+            import fcntl
+            try:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX | (0 if wait else fcntl.LOCK_NB))
+            except BlockingIOError:
+                yield False
+                return
+        yield True
+
+
+def ci_owner_identity() -> dict[str, str | int]:
+    """Record OS process creation time, rather than trusting a reusable PID."""
+    if os.name == 'nt':
+        import ctypes
+        from ctypes import wintypes
+        kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+        kernel.GetCurrentProcess.restype = wintypes.HANDLE
+        kernel.GetProcessTimes.argtypes = [wintypes.HANDLE, *([ctypes.POINTER(wintypes.FILETIME)] * 4)]
+        created, exited, system, user = (wintypes.FILETIME() for _ in range(4))
+        if not kernel.GetProcessTimes(kernel.GetCurrentProcess(), ctypes.byref(created), ctypes.byref(exited),
+                                      ctypes.byref(system), ctypes.byref(user)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        started = str((created.dwHighDateTime << 32) | created.dwLowDateTime)
+    elif sys.platform.startswith('linux'):
+        # Slim CI containers need no procps package just to record ownership.
+        fields = Path('/proc/self/stat').read_text(encoding='utf-8-sig').rsplit(')', 1)[1].split()
+        boot = Path('/proc/sys/kernel/random/boot_id').read_text(encoding='utf-8-sig').strip()
+        started = f'{boot}:{fields[19]}'
+    else:
+        started = subprocess.check_output(
+            ['ps', '-p', str(os.getpid()), '-o', 'lstart='], text=True, encoding='utf-8',
+            env=dict(os.environ, LC_ALL='C'), timeout=10,
+        ).strip()
+    return {'pid': os.getpid(), 'process_start': started, 'host_id': socket.gethostname()}
+
+
+def ci_home_bytes(home: Path) -> int:
+    """Allocated bytes, without traversing directory links or junctions."""
+    total = 0
+    with os.scandir(home) as entries:
+        for entry in entries:
+            info = entry.stat(follow_symlinks=False)
+            total += getattr(info, 'st_blocks', (info.st_size + 511) // 512) * 512
+            if entry.is_dir(follow_symlinks=False) and not _home_reparse_point(info):
+                total += ci_home_bytes(Path(entry.path))
+    return total
+
+
+def _home_reparse_point(info: os.stat_result) -> bool:
+    return bool(getattr(info, 'st_file_attributes', 0) & getattr(stat, 'FILE_ATTRIBUTE_REPARSE_POINT', 0))
+
+
+def _rmtree_readonly(path: Path, *, repeated: bool = False) -> None:
+    # utils imports application dependencies unavailable during CI bootstrap.
+    # Match TemporaryDirectory's permission recovery, including unreadable dirs.
+    def retry(_function, failed, error):
+        if not isinstance(error, PermissionError) or (repeated and Path(failed) == path):
+            raise error
+        target = Path(failed)
+        for candidate in (target.parent, target):
+            if not candidate.is_symlink() and not _home_reparse_point(candidate.lstat()):
+                candidate.chmod(candidate.stat().st_mode | 0o700)
+        try:
+            os.unlink(target)
+        except IsADirectoryError:
+            _rmtree_readonly(target)
+        except PermissionError:
+            if not target.is_dir() or target.is_symlink() or _home_reparse_point(target.lstat()):
+                raise
+            _rmtree_readonly(target, repeated=(target == path))
+
+    if sys.version_info >= (3, 12):
+        shutil.rmtree(path, onexc=retry)
+    else:
+        shutil.rmtree(path, onerror=lambda function, failed, info: retry(function, failed, info[1]))
+
+
+def remove_ci_home(home: Path) -> None:
+    """Keep abandoned ownership discoverable until every payload entry is gone."""
+    home.chmod(home.stat().st_mode | 0o700)
+    for child in home.iterdir():
+        if child.name in ('.owner.json', '.owner.lock'):
+            continue
+        if child.is_dir() and not child.is_symlink():
+            _rmtree_readonly(child)
+        else:
+            try:
+                child.unlink()
+            except PermissionError:
+                if child.is_symlink() or _home_reparse_point(child.lstat()):
+                    raise
+                child.chmod(child.stat().st_mode | 0o700)
+                child.unlink()
+    _rmtree_readonly(home)
+
+
+def sweep_ci_homes(parent: Path) -> None:
+    """Called under the parent lock, including publication of the next owner."""
+    count = reclaimed = 0
+    for home in parent.iterdir():
+        if not home.name.startswith('hermes-ci-home-'):
+            continue
+        try:
+            info = home.lstat()
+            if not stat.S_ISDIR(info.st_mode) or _home_reparse_point(info):
+                continue
+            # Inspect legacy age before opening our lock, which changes directory mtime.
+            newest = max([info.st_mtime, *(entry.lstat().st_mtime for entry in home.iterdir())])
+            marker = home / '.owner.json'
+            marked = stat.S_ISREG(marker.lstat().st_mode) if not marker.is_symlink() and marker.exists() else False
+            if not marked and time.time() - newest < 24 * 60 * 60:
+                continue
+            with temporary_home_lock(home / '.owner.lock', wait=False) as held:
+                if not held:
+                    continue
+                size = ci_home_bytes(home)
+            # Windows cannot remove an open lock file. The parent lock
+            # still fences all creators and sweepers after this close.
+            remove_ci_home(home)
+            count += 1
+            reclaimed += size
+        except FileNotFoundError:
+            continue  # A normally exiting owner can remove its home during enumeration.
+        except OSError as error:
+            print(f'portable CI: skipped {home.name}: {error}', file=sys.stderr)
+    print(f'portable CI: reclaimed {count} home(s), {reclaimed} allocated bytes', flush=True)
+
+
+@contextmanager
+def owned_ci_home(parent: Path) -> Iterator[Path]:
+    # Serialize mkdir/marker/lock publication with sweep, never the CI workload.
+    with ExitStack() as owner:
+        with temporary_home_lock(parent / '.hermes-ci-homes.lock', wait=True) as held:
+            if not held:
+                raise RuntimeError('Could not acquire temporary HOME registry lock')
+            sweep_ci_homes(parent)
+            home = Path(tempfile.mkdtemp(prefix='hermes-ci-home-', dir=parent))
+            try:
+                if not owner.enter_context(temporary_home_lock(home / '.owner.lock', wait=True)):
+                    raise RuntimeError('Could not acquire new temporary HOME lock')
+                (home / '.owner.json').write_text(json.dumps(ci_owner_identity()), encoding='utf-8')
+            except BaseException:
+                owner.close()
+                remove_ci_home(home)
+                raise
+        try:
+            yield home
+        finally:
+            # Keep sweepers excluded until the owner lock and tree are both gone.
+            with temporary_home_lock(parent / '.hermes-ci-homes.lock', wait=True) as held:
+                if not held:
+                    raise RuntimeError('Could not acquire temporary HOME cleanup lock')
+                owner.close()
+                remove_ci_home(home)
 
 
 def windows_appdata_environment(home: Path) -> dict[str, str]:
@@ -451,7 +662,12 @@ def environment(home: Path) -> dict[str, str]:
     require_checkout_venv_isolation()
     # Allowlist location variables only. No API keys, NODE_OPTIONS, pytest selectors,
     # npm user config, git credentials, or personal Hermes plugin directories.
-    env = {key: os.environ[key] for key in ('PATH', 'SYSTEMROOT', 'WINDIR', 'COMSPEC', 'PATHEXT') if key in os.environ}
+    # SystemDrive must survive: Common AppData's default is %SystemDrive%\ProgramData.
+    # An isolated env that omits it makes shell components create that literal
+    # relative directory in the checkout. Keep the host system locations; do not
+    # relocate ProgramData into the disposable home.
+    locations = {'PATH', 'SYSTEMROOT', 'SYSTEMDRIVE', 'WINDIR', 'COMSPEC', 'PATHEXT', 'PROGRAMDATA', 'ALLUSERSPROFILE'}
+    env = {key.upper(): value for key, value in os.environ.items() if key.upper() in locations}
     if os.name == 'nt':
         # Unset and explicitly empty differ: Windows PowerShell reconstructs
         # the hosted machine's module search path only when this is absent.
@@ -706,6 +922,8 @@ def static(env: dict[str, str]) -> None:
         # pyproject.toml carries the maintained rules, while evals/ is research code outside
         # the shipped package and has its own probes.
         [py, '-m', 'ruff', '--config', 'pyproject.toml', 'check', '.', '--exclude', 'evals'],
+        [py, '-m', 'scripts.code_health', '--base', git('merge-base', 'origin/main', 'HEAD').strip(),
+         '--head', 'HEAD'],
         [py, 'scripts/check-windows-footguns.py', '--all'],
         [py, 'scripts/check_no_tmp_literals.py'],
         [py, 'scripts/ci/check_os_marker_fakes.py'],
@@ -744,8 +962,9 @@ def python_tests(env: dict[str, str], roots: list[str], workers: int,
     require_tools(('rg',), env)
     env = dict(env)
     env['HERMES_PYTHON'] = py
-    browser_test = ROOT / 'tests/tools/test_vault_shadow_dom_live.py'
-    if any(browser_test == ROOT / path or browser_test.is_relative_to(ROOT / path) for path in roots):
+    browser_tests = [ROOT / path for path in ('tests/tools/test_vault_shadow_dom_live.py',
+                                              'tests/tools/test_browser_vault_checkout_live.py')]
+    if any(test == ROOT / path or test.is_relative_to(ROOT / path) for path in roots for test in browser_tests):
         # Every lane that owns the real-browser tests must supply Chromium,
         # including the complete contributor suite as well as a shard.
         env['PLAYWRIGHT_BROWSERS_PATH'] = '0'
@@ -917,6 +1136,22 @@ def checkout_lock() -> Iterator[None]:
         yield
 
 
+def require_case_sensitive_tmpdir(parent: Path) -> None:
+    with tempfile.TemporaryDirectory(prefix='hermes-ci-case-probe-', dir=parent) as directory:
+        probe = Path(directory)
+        (probe / 'a').touch()
+        if (probe / 'A').exists():
+            raise RuntimeError(
+                f'macOS CI scratch is case-insensitive: {parent}. '
+                'Desktop security tests require distinct case-only paths: '
+                'run with TMPDIR on a case-sensitive volume. '
+                'Provision and run: '
+                'TMPDIR="$(scripts/ci/case-sensitive-tmpdir.sh)" '
+                './bin/ci gate "$(git rev-parse HEAD)". '
+                'See maintenance/portable-ci.md for cleanup.'
+            )
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('command', nargs='?', default='full', choices=('full', 'setup', 'check', 'list', 'preflight', 'gate', 'nightly', 'nightly-native'))
@@ -953,6 +1188,8 @@ def main() -> int:
         return 0
     STATE.mkdir(exist_ok=True)
     with checkout_lock(), external_temporary_directory('hermes-ci-home-') as home, source_unchanged():
+        if sys.platform == 'darwin':
+            require_case_sensitive_tmpdir(home)
         env = resolve_local_toolchain(environment(home))
         if args.command in ('setup', 'full', 'gate', 'nightly', 'nightly-native'):
             setup(env)

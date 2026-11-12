@@ -11,7 +11,7 @@ import weakref
 
 async def probe(mode):
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.run_api import start_gateway_api, stop_gateway_api
     from gateway.session_contract import SessionRef
     from hermes_cli import web_server

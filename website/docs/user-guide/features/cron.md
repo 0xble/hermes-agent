@@ -431,8 +431,13 @@ a worker deadlocked on a lock stops stamping and is released once the bound
 passes. Unknown attempts are audit records and are never automatically rerun.
 
 Inspect recent attempts with `hermes cron runs [job-id] --limit 20` (alias:
-`history`). Terminal history is bounded; active attempts are never pruned. The
-ledger is included in quick backups.
+`history`). Terminal history defaults to 8 elapsed days after finish, with a
+100,000-row backstop and at most 500 deletions per terminal transition. Set
+`cron.execution_retention_days` in `config.yaml` to change the window, or `0`
+to disable age expiration while keeping the row backstop. Active attempts,
+each job's latest attempt, unsettled deliveries, and attempts with admission
+journals are preserved even beyond these bounds. The ledger is included in
+quick backups.
 
 Scheduled attempts also record their exact scheduled instant, separately from
 the time they were claimed. If an old `jobs.json` snapshot re-arms an occurrence
@@ -1184,7 +1189,41 @@ hours) is re-anchored to its next future occurrence without firing now. The skip
 logged. Jobs inside grace and explicit manual triggers still run normally; if the
 next occurrence cannot be computed, the existing run-once fallback is preserved.
 This does not change one-shot expiry, resume behavior, or the hosted-provider sweep
-below. There is no per-job override.
+below. There is no per-job override of `catch_up_missed`.
+
+### Per-job catch-up deadline
+
+For a window-bound recurring job, set `max_catch_up_lateness_seconds` on
+`cronjob_manage` with `action: "create"` or `action: "update"`. For example, `300`
+permits a scheduled occurrence to start up to five minutes late. The create,
+update, and list tool responses include this field so you can verify the stored
+policy.
+
+The CLI exposes the same policy:
+
+```bash
+hermes cron create "0 3 * * *" "Run the maintenance checks" \
+  --max-catch-up-lateness-seconds 300
+hermes cron edit <job-id> --max-catch-up-lateness-seconds 600
+hermes cron edit <job-id> --clear-max-catch-up-lateness
+```
+
+The value must be a finite, nonnegative number of seconds. Unset/null preserves
+the existing unlimited catch-up behavior; `0` allows no lateness. A start exactly
+at the limit is still eligible. To clear the field through the update tool,
+pass an empty string.
+
+Hermes checks the original scheduled instant both before admission and again
+when the worker starts, including after a wait for capacity or detached-worker
+startup. An expired occurrence does not execute or consume its repeat budget.
+Instead, Hermes records `last_status: "skipped"`, a `skipped: missed window`
+diagnostic and a structured `last_missed_window` result, then advances to the
+next future occurrence. It queues one owner notice through the cron failure
+route even when normal or failure delivery is `local`.
+
+This deadline is independent of the backlog grace window and applies to both
+interval and cron schedules. One-shots and an explicit manual Run now are
+unchanged. Leaving it unset on other jobs does not change their behavior.
 
 ### Misfire catch-up
 
@@ -1355,6 +1394,17 @@ print(json.dumps({"wakeAgent": True, "context": {"new_issues": latest - prev}}))
 ```
 
 When `wakeAgent` is omitted, the default is `true` (wake the agent as usual).
+
+A nonzero exit, timeout, or termination of the pre-run script marks the run as
+failed, even if the agent replies normally or stays silent. The agent still
+receives the script error so it can explain the failure. The script's exit code
+and reason are retained in the run error and the job's `last_error`. Failure
+delivery names the script and exit code, followed by the agent's reply when it
+is non-empty and not a silence marker. An unavailable exit code is reported as
+unknown. Script failures are classified as script incidents, even when stderr
+contains provider-like errors such as HTTP 429 or 401. Script-only jobs also
+state that no model was invoked. `wakeAgent=false` only skips the agent when the
+script succeeds.
 
 #### Recipes: cheap pre-run gates
 

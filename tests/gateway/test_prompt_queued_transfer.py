@@ -12,10 +12,8 @@ import pytest
 from agent.interrupt_control import InterruptControlMixin
 from gateway import session_finite, session_queued_controls
 from gateway.session_contract import SessionRef
-from hermes_state_runtime import (
-    begin_runtime_epoch, claim_session_input, find_session_admission, get_session_admission,
-    recover_session_inputs,
-)
+from hermes_state_runtime import claim_session_input, find_session_admission, get_session_admission, recover_session_inputs
+from tests.fakes.runtime_owner import begin_runtime_epoch
 from tests.gateway.test_prompt_queued_controls import Turn, _call, _completions, _connection, _ledger, interactive
 from tests.gateway.test_session_authority_cancel_settlement import ACTOR, REF, _authority, _submit
 from tests.waiting import async_wait_until, wait_until

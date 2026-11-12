@@ -18,7 +18,7 @@ async def owner(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
 
     home = tmp_path / 'home'
@@ -57,6 +57,20 @@ async def test_tui_status_is_main_tui_status(owner):
     assert labels == ['Model', 'Created', 'Last Activity', 'Tokens', 'Agent Running'], out
     assert 'Model: fake-model (custom)' in out and 'Agent Running: No' in out
     assert '**' not in out and 'Gateway Status' not in out
+
+
+@pytest.mark.asyncio
+async def test_tui_status_names_the_custom_entry_a_bare_custom_agent_runs_on(owner):
+    relay = 'http://127.0.0.1:8080/v1'
+    (owner.home / 'config.yaml').write_text(
+        f'model: {{default: deepseek-v4.1-flash, provider: custom, base_url: "{relay}"}}\n'
+        f'providers:\n  glm: {{api: "{relay}", default_model: glm-5.3}}\n'
+        f'  deepseek: {{api: "{relay}", default_model: deepseek-v4.1-flash}}\n')
+    sid = (await owner.call('session.create', request_id='t', source='tui', cwd=str(owner.workdir)))['session_id']
+    agent = SimpleNamespace(model='deepseek-v4.1-flash', provider='custom', requested_provider='custom:deepseek',
+                            base_url=relay)
+    owner.authority.runner._cached_agent_for = lambda route: agent
+    assert 'Model: deepseek-v4.1-flash (custom:deepseek)' in await _exec(owner, sid, 'status')
 
 
 @pytest.mark.asyncio

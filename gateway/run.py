@@ -25,7 +25,7 @@ import threading
 import time
 import traceback
 from collections import OrderedDict
-from contextvars import Context, copy_context
+from contextvars import Context, ContextVar, copy_context
 from pathlib import Path
 from datetime import datetime
 from typing import Callable, Dict, Optional, Any, List, Tuple, cast
@@ -46,7 +46,8 @@ from agent.message_metadata import (
 )
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance, AwakeIdleMeter
-from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get
+from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get, config_exists
+from gateway.run_common import _csv_or_list_to_set
 from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
@@ -601,7 +602,7 @@ def _format_exec_approval_fallback(
     steps a surface without buttons needs."""
     from gateway.platforms.base_exec_approval import (
         approval_timeout_seconds, ea_header_text, ea_reason_label_text, format_approval_deadline_line)
-    cmd_preview = command[:200] + "..." if len(command) > 200 else command
+    cmd_preview = BasePlatformAdapter._truncate_preview(command, BasePlatformAdapter._EA_CMD_BUDGET)  # as on a card
     heading = (t("gateway.exec_approval.smart_deny_heading") if smart_denied
                else f"⚠️ **{ea_header_text()}**")
 
@@ -1245,15 +1246,6 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
-def _csv_or_list_to_set(raw: Any) -> set[str]:
-    """Normalize a config list or comma-separated scalar into a string set."""
-    if raw is None:
-        return set()
-    if isinstance(raw, list):
-        return {str(part).strip() for part in raw if str(part).strip()}
-    return {part.strip() for part in str(raw).split(",") if part.strip()}
-
-
 def _slack_ignored_channels_from_gateway_config(config: Any, adapter: Any = None) -> set[str]:
     """Return Slack channels that the generic gateway must never dispatch.
 
@@ -1631,11 +1623,11 @@ def _restart_notification_pending() -> bool:
 
 
 def _planned_restart_notification_path() -> Path:
-    return _hermes_home / ".restart_pending.json"
+    from gateway.restart_notice import planned_restart_marker_path
+    return planned_restart_marker_path(_hermes_home)
 
 
 def _planned_restart_notification_pending() -> bool:
-    """Return True when a non-chat planned restart should notify home channels."""
     return _planned_restart_notification_path().exists()
 
 
@@ -1677,7 +1669,7 @@ def _bridge_max_turns_from_config(home: Path) -> None:
     if profile_scoped():
         return
     config_path = home / 'config.yaml'
-    if not config_path.exists():
+    if not config_exists(config_path):
         return
     try:
         cfg = _load_bridge_config(config_path)
@@ -1699,7 +1691,7 @@ def _current_max_iterations() -> int:
     if override:
         config_path = Path(override) / 'config.yaml'
         try:
-            cfg = _load_bridge_config(config_path) if config_path.exists() else {}
+            cfg = _load_bridge_config(config_path) if config_exists(config_path) else {}
         except Exception:
             cfg = {}
         agent_cfg = cfg.get("agent")
@@ -1887,6 +1879,8 @@ def _profile_runtime_scope(
         home_token = set_hermes_home_override(str(profile_home))
         if prepared_secret_scope is not None:
             secrets = prepared_secret_scope
+        elif (prepared := _PREPARED_AUTHORIZATION_SCOPE.get()) is not None and prepared[0] == _home_key(profile_home):
+            secrets = prepared[1]  # this ingress task already loaded this profile off the loop
         elif hydrate_secrets:
             secrets = _load_profile_secret_scope(Path(profile_home))
         else:
@@ -1913,6 +1907,43 @@ async def _async_profile_runtime_scope(profile_home: Path):
     secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(profile_home))
     with _profile_runtime_scope(Path(profile_home), secrets):
         yield
+
+
+# One authorization home's secrets, loaded off the loop for the synchronous gates awaited inside
+# ``prepared_authorization_scope`` (``GatewayRunner._under_authorization_profile`` reads it).
+_PREPARED_AUTHORIZATION_SCOPE: ContextVar[Optional[tuple[str, dict]]] = ContextVar(
+    "_PREPARED_AUTHORIZATION_SCOPE", default=None)
+
+
+@_asynccontextmanager
+async def prepared_authorization_scope(runner, source):
+    """Hydrate *source*'s authorization-profile secrets off the event loop for the auth and bot
+    budget checks awaited inside, so a receive path never loads them inline. The checks still
+    enter that profile's scope; they only skip the load."""
+    home = runner._authorization_home_for_source(source)
+    if home is None:
+        yield
+        return
+    secrets = await asyncio.to_thread(_load_profile_secret_scope, Path(home))
+    token = _PREPARED_AUTHORIZATION_SCOPE.set((_home_key(home), secrets))
+    try:
+        yield
+    finally:
+        _PREPARED_AUTHORIZATION_SCOPE.reset(token)
+
+
+def _home_key(home) -> str:
+    from hermes_constants import hermes_home_key
+    return hermes_home_key(home)
+
+
+def without_prepared_authorization_scope():
+    """A copy of the current context with no prepared authorization secrets, for a task that
+    outlives ingress (a session drain): its turns load the profile afresh, so a failed secret
+    source is still retried."""
+    context = copy_context()
+    context.run(_PREPARED_AUTHORIZATION_SCOPE.set, None)
+    return context
 
 
 def load_gateway_config_for_runner() -> "GatewayConfig":
@@ -2196,7 +2227,7 @@ def _load_bridge_config(config_path: Path) -> dict:
 
 _config_path = _hermes_home / 'config.yaml'
 _cfg: dict = {}
-if _config_path.exists():
+if config_exists(_config_path):
     try:
         _cfg = _load_bridge_config(_config_path)
         _bridge_config_to_env(_cfg)
@@ -2869,17 +2900,15 @@ def _is_control_interrupt_message(message: Optional[str]) -> bool:
 
 def _strip_response_attachments_for_direct_send(response: str, adapter) -> str:
     """Return the visible text portion of a response before direct send().
-    Only explicit ``MEDIA:`` attachments are stripped; bare paths/URLs stay visible. No broad regex after
-    ``extract_media()``: it deliberately preserves protected code spans and unvalidated tags.
-
-    Queued follow-up resends only replay explicit ``MEDIA:`` attachments in this path. Keep bare local paths
-    and ordinary image URLs visible because the post-stream uploader intentionally ignores them (#20834).
+    Explicit ``MEDIA:`` attachments and the image tags ``extract_images`` attaches are stripped, because
+    the post-stream uploader delivers both; bare local paths stay visible (it ignores them, #20834). No
+    broad regex after ``extract_media()``: it deliberately preserves protected code spans and unvalidated tags.
     """
     # Copy bodies are literal text: separately sent ones are dropped, inline ones are opaque
     # to directive extraction and restored byte-exact.
     from gateway.copy_blocks import restore_inline_copy_bodies, split_copy_blocks_protected
     response, _, inline_bodies = split_copy_blocks_protected(adapter, response)
-    _, cleaned = adapter.extract_media(response)
+    _, cleaned = BasePlatformAdapter.extract_images(adapter.extract_media(response)[1])
     cleaned = cleaned.replace("[[audio_as_voice]]", "").replace("[[as_document]]", "")
     return restore_inline_copy_bodies(cleaned, inline_bodies).strip()
 
@@ -3128,10 +3157,14 @@ def _shorten_command_for_display(command: str, limit: int = 80) -> str:
 
 
 def _format_concise_process_notification(
-    session_id: str, command: str, exit_code, output: str, duration_seconds=None) -> str:
-    """One-line completion message for ``concise`` display mode; failure appends a short output tail."""
-    ok = exit_code in {0, None}
-    parts = [t("gateway.background.task_finished") if ok else t("gateway.background.task_failed")]
+    session_id: str, command: str, exit_code, output: str, duration_seconds=None,
+    *, completion_reason="", termination_source="") -> str:
+    """One-line completion; failed and uncollected exits append a short output tail."""
+    from tools.process_registry_notifications import process_exit_unknown
+    unknown = process_exit_unknown(exit_code, completion_reason, termination_source)
+    ok = exit_code == 0 and not unknown
+    parts = [t("gateway.background.task_unknown") if unknown else (
+        t("gateway.background.task_finished") if ok else t("gateway.background.task_failed"))]
     short_cmd = _shorten_command_for_display(command)
     if short_cmd:
         parts.append(f"— `{short_cmd}`")
@@ -3144,7 +3177,7 @@ def _format_concise_process_notification(
             details.append(f"{secs // 60}m {secs % 60}s")
         else:
             details.append(f"{secs}s")
-    if not ok:
+    if not ok and not unknown:
         details.append(t("gateway.background.exit_code", code=exit_code))
     if details:
         parts.append(f"({', '.join(details)})")
@@ -3238,20 +3271,12 @@ def _normalize_empty_agent_response(
 
     api_calls = int(agent_result.get("api_calls", 0) or 0)
     if agent_result.get("interrupted"):
-        # Interrupted with api_calls > 0 = deliberately stopped/steered; silence is intentional (queued
-        # messages arrive via the recursive drain). ZERO api_calls = never processed (stale /stop flag).
-        # An interrupted run that did work (api_calls > 0) is the drain of a run the user deliberately
-        # stopped or steered — its silence is intentional, and any queued/interrupting message is delivered
-        # by the recursive drain inside _run_agent before this result is seen. An interrupted run with ZERO
-        # api_calls never processed the user's message at all: it was killed at the top of the tool loop by
-        # an interrupt flag left over from a recent /stop (#44212). Pure silence there swallows a real user
-        # message, so surface it.
-        # api_calls == 0, not failed, not interrupted: the agent never ran for this turn. This is the
-        # post-/stop generation-race pattern where the gateway would otherwise silently drop the turn
-        # (response=0 chars) and the user sees no reply at all. Surface a short retry hint so the message
-        # isn't lost in silence. (#31884)
+        # api_calls > 0: deliberately stopped/steered work; silence is intentional (queued messages arrive
+        # via the recursive drain). ZERO api_calls: the message was never processed (#44212), so the reply
+        # names the recorded cause; a restart's unstarted native turn is replayed, not answered.
         if api_calls == 0:
-            return t("gateway.errors.interrupted_before_start")
+            from gateway.run_interrupt_cause import interrupted_before_start_key
+            return t(interrupted_before_start_key(agent_result))
         return response
     from gateway.response_filters import reaction_answered
     if reaction_answered(agent_result):
@@ -3469,6 +3494,7 @@ class GatewayRunner(
     """Main gateway controller: manages adapter lifecycles, routes messages to/from the agent."""
 
     # Class-level defaults so partial construction in tests doesn't blow up on attribute access.
+    _client_owned: bool = False  # finite local lease, never a daemon/restart enrollment
     _busy_input_mode: str = "interrupt"
     _busy_text_mode: str = "interrupt"
     _restart_drain_timeout: float = DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -4132,10 +4158,11 @@ class GatewayRunner(
 
         return self._under_authorization_profile(source, _check)
 
-    def _admit_bot_message_for_source(self, source: SessionSource) -> bool:
+    def _admit_bot_message_for_source(self, source: SessionSource, *, charge: object | None = None) -> bool:
         """Count a bot message under the profile that authorized it, so the guard's peek, count and
         config all read the transport profile's ``gateway.bot_loop_guard``."""
-        return self._under_authorization_profile(source, lambda: self._admit_bot_message(source))
+        return self._under_authorization_profile(source, lambda: (
+            self._admit_bot_message(source) if charge is None else self._admit_bot_message(source, charge=charge)))
 
     def _under_authorization_profile(self, source: SessionSource, check):
         authorization_home = self._authorization_home_for_source(source)
@@ -4865,7 +4892,7 @@ def _housekeeping_install_orphans() -> None:
 
 def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
     """Drain each profile's worker queue through its matching live adapters. A credential-less satellite
-    profile (empty adapter map) drains through the primary's adapters routed by its own profile routes."""
+    profile (no bot of its own) drains through the primary's adapters routed by its own profile routes."""
     from cron import scheduler as cron_scheduler
     from cron import scheduler_preflight as sched_preflight
 
@@ -4874,14 +4901,14 @@ def _drain_restart_safe_cron_deliveries(adapters, loop, runner=None) -> None:
             cron_scheduler.drain_delivery_queue(adapters, loop)
         return
     for profile_name, profile_home in _handoff_watch_scopes(runner):
-        if profile_name is None:
-            profile_adapters = adapters
-        else:
-            profile_adapters = getattr(runner, "_profile_adapters", {}).get(profile_name)
+        profile_adapters = (adapters if profile_name is None
+                            else getattr(runner, "_profile_adapters", {}).get(profile_name))
         if profile_adapters is None:
             continue
         with _profile_runtime_scope(profile_home or get_hermes_home()):
-            if profile_name is not None and not profile_adapters and adapters:
+            owned = (getattr(runner, "_profile_bot_platforms", None) or {}).get(profile_name)
+            if (profile_name is not None and adapters
+                    and not sched_preflight.has_credential_platform(profile_adapters, owned)):
                 routes = sched_preflight._primary_profile_routes_for_current_home()
                 if routes:
                     profile_adapters = sched_preflight.SharedRouteAdapters(adapters, routes)
@@ -4897,18 +4924,18 @@ def _start_gateway_housekeeping(
     Cadences are ticks of ``interval``; inner gates own the real cadence."""
     from gateway.run_delivery_queue_watch import DRAIN_LABEL, DeliveryQueueWatch, wait_for_next_tick
     from gateway.run_profile_reconcile import _mcp_config_reconciler, profile_scoped_chore
+    from gateway.reply_latency import record_coverage
     chores: list[tuple[int, str, Any, bool]] = [
-        # First every tick: re-stamp ``updated_at`` in gateway_state.json so it is a real heartbeat.
-        # ``hermes gateway status`` / ``/api/status`` warn when it ages past 2x ``interval`` with the
-        # PID alive — the thread (or a chore blocked on the loop) wedged (#113372). Runs first so a
-        # wedged chore stops the NEXT stamp instead of a slow one delaying this tick's.
-        (1, "Runtime heartbeat", _write_runtime_status_quiet, False)]
+        # Stamp first so a wedged chore stops the next runtime heartbeat (#113372),
+        # rather than delaying this tick's and hiding the stall.
+        (1, "Runtime heartbeat", _write_runtime_status_quiet, False),
+        (1, "Reply latency coverage", record_coverage, False)]
     if adapters is not None or runner is not None:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner), False))
-    if runner is not None and loop is not None:
-        chores.append((1, "Update notice retry", lambda: runner._schedule_update_notice_retry(loop), False))
+    from gateway.runtime_health import health_notice_chores
+    chores.extend(health_notice_chores(runner, loop))
     if runner is not None:
         from gateway.session_epoch_watch import check_runtime_epochs
         chores.append((1, "Runtime epoch watch", lambda: check_runtime_epochs(runner), False))
@@ -5331,87 +5358,6 @@ def _start_gateway_make_restart_signal_handler(runner):
     return restart_signal_handler
 
 
-def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
-    """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
-    planned_stop_seen = [False]
-
-    def shutdown_signal_handler(received_signal=None):
-        # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
-        def _takeover() -> bool:
-            from gateway.status import consume_takeover_marker_for_self
-            return consume_takeover_marker_for_self()
-
-        # Planned stop: CLI marks first, else its SIGTERM looks like an external kill. SIGINT = Ctrl+C.
-        def _planned_stop() -> bool:
-            from gateway.status import consume_planned_stop_marker_for_self
-            return consume_planned_stop_marker_for_self()
-
-        # Planned reload: a launchd bootout issued only to re-read the plist (update, guardian rollback).
-        def _planned_restart() -> bool:
-            from gateway.restart_loop_guard import consume_planned_restart_signal
-            return consume_planned_restart_signal()
-
-        # Fast (<10ms) sync snapshot: stdlib + /proc, no subprocesses (`ps aux` here once blocked ~3s).
-        def _snapshot():
-            from gateway.shutdown_forensics import snapshot_shutdown_context
-            return snapshot_shutdown_context(received_signal)
-
-        planned_takeover = bool(_best_effort(_takeover, "Takeover marker check failed: %s"))
-        planned_stop = received_signal == signal.SIGINT or (
-            not planned_takeover and bool(_best_effort(_planned_stop, "Planned stop marker check failed: %s")))
-        # `hermes gateway stop` writes the marker, THEN signals: the planned-stop watcher can consume
-        # the marker in between, and the CLI's own SIGTERM must not then read as an external kill.
-        if planned_stop:
-            planned_stop_seen[0] = True
-        elif planned_stop_seen[0] and not planned_takeover:
-            planned_stop = True
-        planned_restart = not (planned_takeover or planned_stop) and bool(
-            _best_effort(_planned_restart, "Planned restart marker check failed: %s"))
-        _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
-        sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
-
-        if planned_takeover:
-            logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
-        elif planned_stop:
-            logger.info("Received %s as a planned gateway stop — exiting cleanly", sig_name or "SIGTERM/SIGINT")
-        elif planned_restart:
-            logger.info("Received %s with planned-restart marker — taking the bounded restart path",
-                        sig_name or "SIGTERM")
-        else:
-            # Mirrored onto the runner so _stop_impl suppresses the gateway_state=stopped persist for
-            # unexpected signals; operator stops take the `planned_stop` branch and leave it False (DO persist).
-            _signal_initiated_shutdown[0] = runner._signal_initiated_shutdown = True
-            logger.info("Received %s — initiating shutdown", sig_name or "SIGTERM/SIGINT")
-
-        if _shutdown_ctx is not None:
-            def _log_context() -> None:
-                # The most useful line for "gateway keeps dying" tickets.
-                from gateway.shutdown_forensics import format_context_for_log
-                logger.warning("Shutdown context: %s", format_context_for_log(_shutdown_ctx))
-
-            def _diagnostic() -> None:
-                # Heavyweight (comm-only ps, pstree, dmesg), detached so it finishes even if our cgroup is torn
-                # down; bounded by an internal timeout, never blocks.
-                from gateway.shutdown_forensics import spawn_async_diagnostic
-                spawn_async_diagnostic(
-                    _hermes_home / "logs" / "gateway-shutdown-diag.log", _shutdown_ctx["signal"], timeout_seconds=5.0)
-
-            _best_effort(_log_context, "format_context_for_log failed: %s")
-            _best_effort(_diagnostic, "spawn_async_diagnostic failed: %s")
-        if not planned_takeover:
-            # Supervisor/operator SIGNAL stop (bootout, kickstart -k, systemd, s6, bare kill) — the
-            # only kind launchd times with ExitTimeOut. In-band SIGUSR1 restarts never pass through
-            # here, and a sibling-driven --replace takeover is not launchd-timed either, so both
-            # keep the configured drain. _stop_impl uses this to cap the drain to the live budget.
-            runner._stop_requested_by_signal = True
-        if planned_restart:
-            # The SIGUSR1 restart's stop() without its after-turn wait, which launchd's ExitTimeOut
-            # would not allow: bounded post-interrupt sweep, exit 75.
-            asyncio.create_task(runner.stop(restart=True, service_restart=True))
-        else:
-            asyncio.create_task(runner.stop())
-    return shutdown_signal_handler
-
 
 def _start_gateway_claim_pid_file(force: bool = False) -> bool:
     """Claim the runtime lock + PID file (O_EXCL winner is the authoritative gateway). False = lost."""
@@ -5709,27 +5655,8 @@ async def _start_gateway_start_control_socket(runner):
         # pause-for-update asks the updater to drain and exit cleanly; marshal socket-thread calls onto the loop.
         _main_loop = asyncio.get_running_loop()
 
-        def _pause_for_update_handler() -> dict:
-            try:
-                from hermes_cli.gateway import _get_restart_drain_timeout
-                _drain = float(_get_restart_drain_timeout())
-            except Exception:
-                _drain = 30.0
-            accepted_box: list[bool] = []
-            _done = threading.Event()
-
-            def _request() -> None:
-                try:
-                    accepted_box.append(runner.request_restart(detached=False, via_service=True))
-                finally:
-                    _done.set()
-
-            _main_loop.call_soon_threadsafe(_request)
-            _done.wait(timeout=5.0)
-            accepted = bool(accepted_box and accepted_box[0])
-            return {
-                "pausing": accepted, "already_stopping": not accepted,
-                "pid": os.getpid(), "drain_timeout": _drain}
+        from gateway.run_control_pause import make_update_pause_handler
+        _pause_for_update_handler = make_update_pause_handler(runner, _main_loop)
 
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now
@@ -5752,23 +5679,8 @@ async def _start_gateway_start_control_socket(runner):
             spawn=_spawn_detached_update, is_managed=is_managed,
         )
 
-        def _identify_runtime():
-            from gateway.drain_control import RESTART_WAIT_REASON
-            payload = build_identify_payload()
-            descriptor = getattr(runner, "session_runtime_descriptor", {})
-            payload.update({key: descriptor[key] for key in (
-                "instance_id", "runtime_protocol", "authority_epoch", "state", "api_origin",
-                "served_profiles", "parked_profiles", "capabilities") if key in descriptor})
-            if getattr(runner, "_draining", False):
-                payload.update(state="draining")
-                # The restart's after-turn wait still owns its turns, so the endpoint stays dialable.
-                if descriptor.get("drain_reason") != RESTART_WAIT_REASON:
-                    payload["capabilities"] = []
-            if payload.get("state") == "draining" and descriptor.get("drain_reason"):
-                payload["drain_reason"] = descriptor["drain_reason"]
-            payload["supervisor"] = {"manual": "none", "desktop": "none"}.get(
-                payload.get("supervisor"), payload.get("supervisor", "none"))
-            return payload
+        from gateway.run_control_identity import make_runtime_identify
+        _identify_runtime = make_runtime_identify(runner, build_identify_payload)
 
         from gateway.cron_review import CronReviewControl
         from gateway.session_snapshot import make_session_snapshot_handler
@@ -5793,6 +5705,8 @@ async def _start_gateway_start_control_socket(runner):
                            "handover": lambda: request_handover(runner, _main_loop),
                            "handover-status": lambda: handover_status(runner)})
         _control_server.ticket_store = runner.session_ticket_store
+        from gateway.session_worker_discovery import worker_discovery_handler
+        _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5928,15 +5842,20 @@ async def _start_gateway_shutdown_tail(
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
-                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False) -> bool:
+                        verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
+                        client_owned: bool = False) -> bool:
     """Run the maintained bootstrap lifecycle through the public runner facade."""
     from gateway.run_bootstrap import start_gateway as bootstrap
+    if client_owned:
+        return await bootstrap(config, replace, verbosity, force, idle_exit, client_owned=True)
     return await bootstrap(config, replace, verbosity, force, idle_exit)
 
 
 async def _start_gateway_impl(config: Optional[GatewayConfig] = None, replace: bool = False,
                               verbosity: Optional[int] = 0, force: bool = False) -> bool:
     """Legacy in-module lifecycle retained for compatibility with older direct callers."""
+    from gateway.run_bootstrap import _start_gateway_make_shutdown_signal_handler
+
     os.environ["HERMES_EXEC_ASK"] = "1"
 
     configured_cwd = os.environ.get("TERMINAL_CWD", "")
@@ -6220,22 +6139,17 @@ def main():
 
 
 def _exit_after_graceful_shutdown(exit_code: int) -> None:
-    """Flush stdio, release the PID file + runtime lock, then hard-exit.
+    """Flush stdio, release the PID file + lock, stamp the clean exit, flush opt-in metrics, hard-exit.
     ``os._exit`` (not ``sys.exit``): SystemExit runs ``Py_FinalizeEx``, which joins every non-daemon
-    thread — exactly the hang a wedged worker causes. It bypasses ``atexit``, so PID/lock release and the
-    bounded log drain (file handlers sit behind a ``QueueListener`` thread) are done here explicitly.
-
-    Graceful teardown is already complete by the time this runs, so there is nothing left that needs a clean
-    interpreter shutdown. See #53107.
-    ``os._exit`` bypasses ``atexit`` handlers, so we cannot rely on the ``atexit``-registered
-    ``remove_pid_file`` / ``release_gateway_runtime_lock`` (registered in ``start_gateway``) to run. The
-    full-shutdown path releases both explicitly in ``_stop_impl``, but the EARLY exit paths —
-    clean-fatal-config (#51228) and startup-aborted-before-running — raise ``SystemExit`` right after
-    ``runner.start()`` without going through ``_stop_impl``, so on those paths ``atexit`` was the only thing
-    releasing them. Now that those paths are routed through this backstop (#53107), release both here
-    explicitly. Both calls are idempotent — ``remove_pid_file`` only unlinks a PID file that belongs to this
-    process, and ``release_gateway_runtime_lock`` no-ops when the lock is already released — so this is a
-    no-op on the normal shutdown path and the actual cleanup on the early-exit paths.
+    thread — exactly the hang a wedged worker causes. It bypasses ``atexit``, so the metrics flush,
+    PID/lock release and the bounded log drain (file handlers sit behind a ``QueueListener`` thread)
+    are done here explicitly; graceful teardown is already complete by the time this runs. See #53107.
+    The atexit-registered ``remove_pid_file`` / ``release_gateway_runtime_lock`` (``start_gateway``) never
+    run either. ``_stop_impl`` releases both on the full shutdown, but the EARLY exits — clean-fatal-config
+    (#51228) and startup-aborted-before-running — raise ``SystemExit`` right after ``runner.start()``
+    without ``_stop_impl``, so atexit was all that released them there; this backstop does now (#53107).
+    Both are idempotent (``remove_pid_file`` only unlinks this process's PID file; the lock release no-ops
+    once released): a no-op on the normal shutdown, the actual cleanup on the early exits.
     """
     for stream in (sys.stdout, sys.stderr):
         with suppress(Exception):
@@ -6257,13 +6171,17 @@ def _exit_after_graceful_shutdown(exit_code: int) -> None:
         from gateway.lifecycle_ledger import mark_exited
         mark_exited(exit_code, reason="graceful_shutdown")
 
+    def _flush_metrics() -> None:  # after the clean stamp: a supervisor kill mid-flush is no unclean death
+        from hermes_cli.observability.shared_metrics_process import flush_before_hard_exit
+        flush_before_hard_exit()  # the runtimes' atexit flush: open sessions + queued opt-in rows (bounded)
+
     def _drain_logs() -> None:
         # os._exit bypasses the listener's atexit drain. Bounded, no restart — NOT flush_log_queue():
         # a listener wedged on the rotation lock would re-freeze shutdown in an unbounded stop() join.
         from hermes_logging import drain_log_queue
         drain_log_queue(timeout=1.0)
 
-    for _step in (_release_locks, _mark_exited, _drain_logs):
+    for _step in (_release_locks, _mark_exited, _flush_metrics, _drain_logs):
         _best_effort(_step)
     os._exit(exit_code)
 

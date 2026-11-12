@@ -2,6 +2,7 @@
 store routes the physical reset child. The unknown-turn barrier must resolve the child to that
 owner: neither the crash marker release nor legacy auto-resume may treat the child as admission-
 free and silently re-run a turn whose canonical admission is ``unknown``."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import asyncio
 from contextlib import closing
 from datetime import datetime
@@ -21,12 +22,12 @@ from tests.gateway.test_unknown_resolution_physical_worker import _local_reset
 
 def _unknown_after_reset(tmp_path, runner):
     db = SessionDB(tmp_path / 'state.db')
-    epoch = rt.begin_runtime_epoch(db, instance_id='crashed')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='crashed')
     logical = _local_reset(db, epoch, 'logical', 'physical')
     rt.admit_session_input(db, epoch=epoch, principal_id='human', session_id=logical,
                            request_id='turn', payload={'text': 'turn'})
     rt.claim_session_input(db, epoch=epoch, session_id=logical)
-    epoch = rt.begin_runtime_epoch(db, instance_id='restarted')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='restarted')
     rt.recover_session_inputs(db, epoch=epoch)  # the crashed turn is now 'unknown'
     return db, SessionAuthority(runner, profile_id='profile', instance_id='restarted', db=db, epoch=epoch)
 

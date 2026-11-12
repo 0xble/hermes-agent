@@ -113,9 +113,13 @@ def _prune_sessions(body: SessionPrune):
                 "newest_started_at": max(r["started_at"] for r in rows) if rows else None,
                 "sessions": [{k: r.get(k) for k in _PRUNE_ROW_KEYS} for r in rows]}
         sessions_dir = profile_home / "sessions"
-        removed = db.prune_sessions(
-            sessions_dir=sessions_dir if sessions_dir.exists() else None,
-            exclude_active_write_guards=True, **filters)
+        from hermes_state_prune_pacing import DeletionWindowClosedError, PruneInProgressError
+        try:
+            removed = db.prune_sessions(
+                sessions_dir=sessions_dir if sessions_dir.exists() else None,
+                exclude_active_write_guards=True, within_deletion_window=not body.now, **filters)
+        except (DeletionWindowClosedError, PruneInProgressError) as exc:
+            raise HTTPException(status_code=409, detail=str(exc)) from exc
         return {"ok": True, "removed": removed, "skipped_open": skipped_open}
     finally:
         db.close()
@@ -979,6 +983,9 @@ async def prune_sessions_endpoint(body: SessionPrune):
     """Delete ended sessions matching filters without blocking the event loop."""
     if body.dry_run:
         return await asyncio.to_thread(_prune_sessions, body)
+    from hermes_cli.maintenance_window import deletion_window_refusal
+    if not body.now and (refusal := deletion_window_refusal('send "now": true')):
+        raise HTTPException(status_code=409, detail=refusal)
     # Same destructive rule as the rest of the family; a dry run deletes nothing, so it
     # keeps working unnamed (it is the preview the confirm dialog reads).
     body = body.model_copy(update={

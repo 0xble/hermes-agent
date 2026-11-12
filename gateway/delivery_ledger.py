@@ -411,8 +411,15 @@ def mark_attempting(obligation_id: str) -> None:
     _update_state(obligation_id, "attempting")
 
 
-def mark_delivered(obligation_id: str) -> None:
-    _update_state(obligation_id, "delivered")
+def mark_delivered(obligation_id: str, result: Any = None) -> None:
+    raw = getattr(result, "raw_response", None)
+    fallback = isinstance(raw, dict) and raw.get("thread_fallback")
+    _update_state(obligation_id, "delivered", error="thread_fallback_root" if fallback else "")
+
+
+def abandon_obligation(obligation_id: str, reason: str) -> None:
+    """Retire output that its owning policy no longer permits, without claiming a send ACK."""
+    _update_state(obligation_id, "abandoned", error=reason)
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:

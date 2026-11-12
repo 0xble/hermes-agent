@@ -81,7 +81,7 @@ async def settled_before_finalizer(*, compress=False):
 async def test_restart_finalizes_settled_webhook_without_provider_retry(monkeypatch):
     async with settled_before_finalizer() as (_client, _body, _headers, runner, authority, row):
         from gateway import run_runtime
-        from gateway.session_authority import initialize_session_authority
+        from tests.fakes.runtime_owner import initialize_session_authority
 
         async def skip_unrelated_hosted_service(_runner):
             return None
@@ -113,7 +113,7 @@ async def test_restart_reauthorizes_compressed_route_but_finalizes_logical_webho
         _client, _body, _headers, runner, authority, row
     ):
         from gateway.platforms.webhook_ingress import recover_webhook_finalizations
-        from gateway.session_authority import initialize_session_authority
+        from tests.fakes.runtime_owner import initialize_session_authority
 
         logical = row["target_session_id"]
         physical = row["physical_session_id"]

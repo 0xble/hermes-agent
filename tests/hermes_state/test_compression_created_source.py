@@ -3,6 +3,7 @@
 Automatic compression does not create the child again, so the worker's ``usage.main``
 is the write that fills the column, and it carries the surface to the NULL root.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import pytest
 
 from hermes_state import SessionDB
@@ -38,7 +39,7 @@ def test_desktop_worker_heals_gui_to_desktop(tmp_path, child_created):
         with db._lock:
             db._conn.execute("UPDATE sessions SET created_source=? WHERE id=?", (child_created, child))
             db._conn.commit()
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
         scope = dict(epoch=epoch, execution_id="w", session_id=child, generation=0)
         rt.register_worker_execution(db, **scope, kind="compute", adoption_secret="private")
         rt.mutate_worker_execution(db, **scope, sequence=1, operation="usage.main", payload={

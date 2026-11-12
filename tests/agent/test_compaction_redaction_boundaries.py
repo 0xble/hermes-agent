@@ -40,6 +40,14 @@ def _redaction_globally_disabled(monkeypatch):
     monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
 
 
+@pytest.fixture(autouse=True)
+def _source_checkout_env(tmp_path, monkeypatch):
+    # Lazy conversation-loop imports bootstrap PM; keep checkout discovery in
+    # scratch rather than probing payload metadata beside a real-home checkout.
+    monkeypatch.setattr("pm.paths.repo_root", lambda: tmp_path / "source")
+    monkeypatch.setattr("pm.environments._payload_manifest", lambda _: None)
+
+
 def _compressor() -> ContextCompressor:
     with patch(
         "agent.context_compressor.get_model_context_length",

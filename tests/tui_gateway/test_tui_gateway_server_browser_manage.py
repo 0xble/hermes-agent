@@ -1,7 +1,7 @@
 """``browser.manage`` RPCs: connect/disconnect/status (split from ``test_tui_gateway_server.py``).
 
 Since CLI-9 (#134889) the live ``/browser connect`` endpoint is the requesting profile's (a per-home
-map in ``tools.browser_tool_cdp``), and only that profile's browsers are reaped.
+map in ``tools.browser_session_cdp``), and only that profile's browsers are reaped.
 """
 import json
 import os
@@ -79,10 +79,8 @@ def test_browser_manage_status_falls_back_to_config_cdp_url(monkeypatch):
     config.yaml so users see what the next tool call will read."""
     monkeypatch.delenv("BROWSER_CDP_URL", raising=False)
 
-    fake_cfg = types.SimpleNamespace(
-        read_raw_config=lambda: {"browser": {"cdp_url": "http://lan:9222"}}
-    )
-    with patch.dict(sys.modules, {"hermes_cli.config": fake_cfg}):
+    with patch("hermes_cli.config.load_config_readonly",
+               lambda: {"browser": {"cdp_url": "http://lan:9222"}}):
         resp = server.handle_request(
             {"id": "1", "method": "browser.manage", "params": {"action": "status"}}
         )
@@ -121,8 +119,8 @@ def test_browser_manage_use_swaps_the_profiles_browser_tools_for_new_agents(monk
 @pytest.fixture(autouse=True)
 def _no_live_cdp(monkeypatch):
     """Each test starts with no profile's live ``/browser connect`` endpoint."""
-    from tools import browser_tool_cdp
-    monkeypatch.setattr(browser_tool_cdp, "_live_overrides", {})
+    from tools import browser_tool_cdp as browser_session_cdp
+    monkeypatch.setattr(browser_session_cdp, "_live_overrides", {})
 
 
 def _live_cdp() -> str:

@@ -1,0 +1,37 @@
+name: Cache pinned Linux tool archives
+description: Cache every archive used by the pinned Linux toolchain installer.
+inputs:
+  architecture:
+    description: Linux archive architecture.
+    default: amd64
+runs:
+  using: composite
+  steps:
+    - uses: ./.github/actions/cache-pinned-tool
+      with:
+        tool: rustc
+        architecture: ${{ inputs.architecture }}
+    - uses: ./.github/actions/cache-pinned-tool
+      with:
+        tool: cargo
+        architecture: ${{ inputs.architecture }}
+    - uses: ./.github/actions/cache-pinned-tool
+      with:
+        tool: rust-std
+        architecture: ${{ inputs.architecture }}
+    - uses: ./.github/actions/cache-pinned-tool
+      with:
+        tool: uv
+        architecture: ${{ inputs.architecture }}
+    - uses: ./.github/actions/cache-pinned-tool
+      with:
+        tool: shellcheck
+        architecture: ${{ inputs.architecture }}
+    - uses: ./.github/actions/cache-pinned-tool
+      with:
+        tool: hadolint
+        architecture: ${{ inputs.architecture }}
+    - uses: ./.github/actions/cache-pinned-tool
+      with:
+        tool: rg
+        architecture: ${{ inputs.architecture }}

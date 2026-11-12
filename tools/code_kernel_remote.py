@@ -525,7 +525,8 @@ def _run_attached_cell(kernel: RemoteKernel, key: tuple, code: str, *, env, task
     rpc_thread = threading.Thread(
         target=propagate_context_to_thread(_rpc_poll_loop), daemon=True,
         args=(env, f"{kernel.kernel_dir}/rpc", task_env_id, tool_call_log, tool_call_counter,
-              max_tool_calls, sandbox_tools, stop_event, kernel.rpc_token))
+              max_tool_calls, sandbox_tools, stop_event, kernel.rpc_token),
+        kwargs={"deadline": time.monotonic() + timeout if timeout else None})
     rpc_thread.start()
     cell_status, cell_payload = "no-result", {}
     try:

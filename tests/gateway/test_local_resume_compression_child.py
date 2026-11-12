@@ -42,7 +42,7 @@ async def _resume(authority, user_id, sid):
 
 async def _compressed(tmp_path, monkeypatch):
     from gateway import run
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})
@@ -65,7 +65,7 @@ async def _compressed(tmp_path, monkeypatch):
 
 
 async def _cold(compressed):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     return await initialize_session_authority(_runner(compressed.tmp_path), profile_id='fixture',
                                               instance_id='second')
 

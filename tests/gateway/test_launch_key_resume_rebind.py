@@ -10,7 +10,7 @@ async def test_resume_rebinds_only_the_launch_key_after_restart(tmp_path, monkey
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from gateway.session_policy import launch_key, policy_for_source

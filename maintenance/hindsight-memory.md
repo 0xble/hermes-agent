@@ -1,6 +1,24 @@
 # Hindsight memory provider
 
-**Patch identity:** `hindsight-retain-visibility`, `evict-memory-shutdown`, and `hindsight-client-selection`.
+**Patch identity:** `hindsight-retain-visibility`, `evict-memory-shutdown`, `hindsight-client-selection`.
+
+**Memory sync redaction patch identity:** `memory-sync-redaction` keeps per-turn provider egress
+redaction output identical while caching repeated scrubs and learned-token matching.
+
+**Release-readiness patch identity:** `hindsight-memory` owns advisory recovery
+preflight, origin-relative forward checks, and release-scoped readiness notices.
+
+Shutdown must skip whole-transcript egress redaction when every provider inherits
+`MemoryProvider.on_session_end` unchanged. The 58s shutdown watchdog dump at
+2026-11-01 07:36Z showed `hk_1` spending shutdown in that unnecessary scrub; it
+was not evidence of a logging lock deadlock. Real session-end consumers must
+still receive scrubbed copies. Hindsight client close has its own 1s cap, separate
+from request timeout, covering cloud, embedded inner async close and embedded
+wrapper bookkeeping; timed-out async close is cancelled with a warning. Retain
+FIFO/backlog drain and retry semantics stay unchanged. Preserve both behaviors
+until upstream includes equivalent regressions.
+
+Contract tests: `tests/plugins/memory/test_hindsight_shutdown_budget.py`.
 
 Soft agent-cache eviction must drain and shut down the agent's memory manager
 (including Hindsight's writer and the mem-sync executor), then release clients
@@ -106,6 +124,56 @@ strategy and cron-exclusion behavior.
   formatter boundary decides, keeping any human text merged after it. Add a new generated prompt there, beside its producer constant,
   rather than in a provider. `memory.recall_synthetic_turns` (default off) restores recall on
   generated turns. Proof: `tests/agent/test_synthetic_prompt.py`.
+- Automatic recall also excludes producer-owned inline document bodies and channel backfill.
+  All text-document producers use `agent.attachment_context.format_document_content`, whose
+  character count frames the existing filename/content injection without altering file text.
+  Scan producer framing structurally: ignore counts in channel backfill, then honor complete
+  counted document spans before interpreting subsequent channel boundaries. A marker inside
+  a counted file is never a boundary. Only start-of-message, current-message-boundary, or
+  blank-line-separated document frames are producer positions, including the gateway's
+  optional current-speaker prefix. A channel header inside a document is not a prelude. Extract those frames before
+  trimming whitespace or interpreting generated-prompt boundaries. Unframed legacy document
+  text has no provable end and is preserved rather than guessed. The shared channel marker
+  registry also owns Discord's unverified notice and reply-only context, Slack's trusted and
+  unverified thread headers, and the relay recent-history header. Channel history ends at its
+  last `[New message]` boundary, accepting the same quoted-boundary limitation as generated
+  templates. A backfill-quoted boundary followed by a complete counted document frame can
+  also be byte-identical to a genuine current-message document, including a count reaching EOF.
+  Text alone cannot prevent that frame from swallowing a later question while preserving counted
+  document opacity. Deferred follow-up: carry a producer-trusted current-message split on the
+  event into recall; do not resolve this ambiguity with a text heuristic. The original backfill
+  test covers invalid counts, not this ambiguous complete-frame case. Model input and retention
+  keep the complete file and channel content.
+  Inbound voice/image enrichment runs before channel context is added, leaving transcripts and
+  descriptions after `[New message]`; sender attribution stays in its original position inside
+  enrichment. The enrichers transcribe attachment paths or analyze images with a fixed prompt,
+  rather than reading channel backfill. For image-only shared turns, bracket-only remaining text
+  (such as `[Brian]`) no longer blocks the description fallback: recall puts the description first
+  and preserves the suffix, since text cannot prove it is attribution rather than a typed caption.
+  Shared media-batch caption merging preserves the exact document bytes, including trailing
+  whitespace covered by the count, while still comparing stripped captions for deduplication.
+  Proof: `tests/agent/test_document_channel_recall_query.py`,
+  `tests/gateway/test_media_channel_recall_query.py`, `tests/agent/test_attachment_recall_query.py`,
+  `tests/gateway/test_document_media_batch_framing.py` (Feishu, Telegram, Slack, Discord,
+  and WhatsApp real batching paths), and the platform document suites.
+  Retire when upstream carries the human caption separately through all attachment producers.
+- Recall-note peeling preserves the original leftmost regex choice and image-description fallback,
+  including notes that become complete across a deletion seam. `agent.recall_context` compiles only
+  the existing recall regex subset into ordered states. A literal-opener regex derived from
+  that registry skips bracket-dense benign text without per-character state. Complete notes
+  use the original regex matches and a single join, with the post-deletion stripped EOF.
+  A failed opener or a retained suffix that is a partial literal opener falls back to the
+  bounded engine before consuming a later image, preserving description-capture order.
+  Memoized lookahead evaluates each
+  `(state, input offset)` at most once for each of the 2 possible EOF positions, and retained-prefix
+  snapshots avoid restarting at the beginning after deletion. This bounds work and space linearly
+  in input length for the fixed registry. The compiler uses CPython's internal regex parser, so
+  qualifying Python-version upgrades must run the corpus against the original eraser. Unsupported
+  regex constructs fail explicitly rather than silently changing the format contract.
+  Proof: `tests/agent/test_recall_context_scanning.py` compares producer, malformed, nested/seam,
+  escaped-quote, EOF, and whitespace cases, checks adversarial execution-step growth by input
+  size, and rejects bounded-state allocation on 1 MB of bracket-dense JSON with or without a note.
+  Retire when upstream has equivalent bounded peeling with the same semantics.
 - A generated-only turn also excludes its assistant reply from automatic transcript retention.
   Filtering only the user half creates an orphan assistant result that can turn test, relay or
   recall feedback into apparent personal evidence. Reuse the shared human-part classifier, not
@@ -196,16 +264,76 @@ extension point, passive availability, and bounded dependencies. Upstream
 related missing-client symptom. [#144642](https://github.com/NousResearch/hermes-agent/issues/144642)
 is related Windows import behavior. Neither establishes this exact PM path bug.
 
-The immutable-release boundary already carries declared extras from the previous
-release's committed PM generation, not just its base `.venv`. The `hindsight`
-extra is declared in this source, so the recorded recovery selection survives
-`prepare_venv`. A ready candidate built by older code uses `carry_active_extras`
-from the candidate's own code before activation. The existing tests in
-`tests/hermes_cli/test_immutable_releases.py` cover build-time carry, old-builder
-ready-candidate carry, and selecting the committed-generation smoke interpreter.
-No separate extras framework or release activation path is added here. Subsequent
-PM rebuilds are protected by the configured-provider union fix, independently of
-the retained extra. Release integration and promotion remain with Maintenance.
+The immutable-release boundary carries declared extras from the previous
+release's committed PM generation, not just its base `.venv`. If any applicable
+extra is missing, candidate-owned `carry_active_extras` syncs the full applicable
+active selection, including extras already present in the candidate's `.venv`.
+PM's first committed generation replaces that payload and its anchor inference
+may not cover every declared extra, so syncing only the missing subset can drop
+clients the payload already had. `tests/hermes_cli/test_release_extras_carry.py`
+exercises this transition with real offline wheels, PM sync, and import probes.
+Build-time carry and candidate-owned carry remain the repair paths. They are not
+activation gates: an older updater, direct promotion, rollback, or recovered
+transaction can reach the pointer flip without importing candidate-owned PM.
+Every transaction probes the selected candidate PM interpreter before
+changing `current`, including source-layout rollback. Fresh forward activation
+preflights before writing transaction intent, so a refusal leaves no WAL to replay
+and cannot block rollback or a later healthy promotion. Recovered transactions
+recheck readiness before replaying their intent. A replay may refuse only while
+both pointers still equal their recorded originals and no reload has been issued.
+A refusal at that point removes the unapplied WAL and its plist backup. Once
+either pointer changes or reload is issued, a definite regression is logged
+loudly and replay completes the recorded intent, still requiring observed reload
+acknowledgement. This also covers completion of a pending first migration and
+the updater's pending-transaction finish. Guardian abandonment verifies and
+archives the applied WAL without re-running forward preflight before rollback.
+Forward activation refuses
+only regressions from the origin: a previously importable extra still declared
+by the candidate loses a direct requirement, or an available configured memory
+provider becomes unavailable. Identical existing degradation warns and proceeds.
+An extra the target no longer
+declares emits a loud warning naming the extra and the operator's choice to
+proceed without it or select a release/plugin that supplies it. Rollback, restore,
+and source-layout rollback only read back dependencies and never carry or repair.
+Every recovery preflight outcome is advisory, including missing extras, unavailable
+providers, old provider API signatures, probe crashes and timeouts. Each failure
+is logged loudly and recovery continues.
+Forward activation without a caller deadline retries candidate-owned carry.
+Budgeted activation requires prior preparation instead of entering unbounded PM
+sync. Metadata and primary-module import probes share one remaining deadline,
+ending 15 seconds before the caller's deadline to reserve bootout and reload time.
+An exhausted preflight skips remaining probes before switching pointers. Unknown
+availability cannot establish a regression and warns without refusing. Each distribution's primary
+module is imported, without importing unrelated top-level tooling. The gate
+reads back the selected environment rather than trusting PM's return value or
+the payload venv.
+Configured-provider checks use each release's `is_available` and
+`unavailable_reason`, not client construction or network requests. False availability
+is compared even without a reason. Refusals name the candidate path and direct
+the operator to re-run the update so candidate-owned carry rebuilds that
+environment with the full applicable extra set. If that keeps failing, repair
+the candidate environment explicitly.
+
+At gateway startup and each 60-second housekeeping tick, configured providers use
+those same readiness APIs. Client degradation emits an ERROR with client package
+names and PM repair guidance, and an operator home-channel notice. Per-profile,
+per-release markers suppress repeat errors and delivered notices across ticks and
+restarts. A saved `.logged` issue is reused without re-probing while muted or
+without a home transport. Before attempting delivery, a saved issue gets 1 fresh
+readiness check. A recovered provider drops the notice and records `.resolved`
+instead of delivering stale advice. Saved notices accept a UTF-8 BOM from Windows editors,
+while newly written notices remain BOM-free. Logged issues are written by atomic
+temp-file replacement, and empty markers are treated as absent so an interrupted
+write cannot suppress an alarm. Cron store notice setup and the boot memory check
+fail independently. Unsent notices remain eligible for retry. No provider readiness, PM
+selection, or status-command implementation is duplicated or changed by this gate.
+The existing `hermes memory status` red readiness contract remains #845's owner.
+Proof: `tests/hermes_cli/test_release_extras_preflight.py`,
+`tests/hermes_cli/test_release_preflight_recovery.py`,
+`tests/hermes_cli/test_refused_release_activation.py`,
+`tests/hermes_cli/test_release_transaction_preflight.py`,
+`tests/gateway/test_memory_health.py`, and the existing immutable-release and
+memory-status suites. Release integration and promotion remain with Maintenance.
 
 Additional isolated proof lives in
 `tests/pm/test_bundled_memory_selection.py` (real offline union build with a named

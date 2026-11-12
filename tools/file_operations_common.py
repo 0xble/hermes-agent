@@ -7,7 +7,7 @@ the model.
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 
 @dataclass
@@ -74,7 +74,7 @@ class PatchResult:
     lsp_diagnostics: Optional[str] = None  # see WriteResult.lsp_diagnostics
     error: Optional[str] = None
     match_count: Optional[int] = None
-    match_lines: List[int] = field(default_factory=list)
+    match_lines: list[int] = field(default_factory=list)
     match_lines_truncated: bool = False
     # Success-shaped no-op: the edit was already present, nothing written; ``note`` says why.
     no_change: bool = False
@@ -205,6 +205,8 @@ class ExecuteResult:
     # the command never ran, so the verdict is about the working directory, not
     # the requested path (callers must neither cache it nor blame the path).
     cwd_error: str = ""
+    # Separate, bounded diagnostics for filename searches. Never parsed as paths.
+    stderr: str = ""
 
 
 # ---------------------------------------------------------------------------

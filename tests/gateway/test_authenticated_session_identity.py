@@ -71,7 +71,7 @@ async def test_bundled_provider_issuer_subject_owns_durable_receipts(tmp_path, m
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local import create_local_session
     from gateway.session_contract import Principal
     from hermes_cli.web_server_sessions import _session_mutation_context
@@ -115,8 +115,8 @@ async def test_bundled_provider_issuer_subject_owns_durable_receipts(tmp_path, m
     foreign_issuer = await actor(oidc('user-a', '/other'))
     with pytest.raises(RuntimeStoreError, match='permission_denied'):
         await authority.resolve(foreign_issuer, ref)
-    from tui_gateway.methods_browser_control import _principal_digest
-    assert _principal_digest({'provider': oauth.provider, 'issuer': oauth.issuer, 'user_id': oauth.user_id}) != _principal_digest(
+    from gateway.session_identity import authenticated_principal_digest
+    assert authenticated_principal_digest({'provider': oauth.provider, 'issuer': oauth.issuer, 'user_id': oauth.user_id}) != authenticated_principal_digest(
         {'provider': oauth.provider, 'issuer': oauth.issuer + '/other', 'user_id': oauth.user_id})
     runner.adapters = {}
     cold = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='second')
@@ -137,7 +137,7 @@ async def test_private_native_subject_preserves_existing_creation_and_mutation_r
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session

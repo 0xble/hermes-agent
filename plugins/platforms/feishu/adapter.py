@@ -85,6 +85,7 @@ FEISHU_WEBSOCKET_AVAILABLE = websockets is not None
 FEISHU_WEBHOOK_AVAILABLE = aiohttp is not None
 
 from gateway.config import Platform, PlatformConfig
+from agent.attachment_context import format_document_content
 from agent.i18n import t
 from gateway.platforms.base import (
     BasePlatformAdapter, ExecApprovalPrompt, SendResult,
@@ -1865,10 +1866,15 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None, **kwargs,
+        metadata: Optional[dict[str, Any]] = None, is_voice: Optional[bool] = None, **kwargs,
     ) -> SendResult:
         """Native voice message (Feishu only accepts Opus): non-opus audio is transcoded via ffmpeg
-        first; without ffmpeg the original file goes out as a file attachment."""
+        first; without ffmpeg the original file goes out as a file attachment. ``is_voice=False``
+        (an audio MEDIA file without [[audio_as_voice]]: music, a sound effect) is a file
+        attachment under its real name, never transcoded into a voice note."""
+        if is_voice is False:
+            return await self.send_document(
+                chat_id, audio_path, caption=caption, reply_to=reply_to, metadata=metadata)
         transcoded_path: Optional[str] = None
         ext = Path(audio_path).suffix.lower()
         if ext not in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
@@ -3090,7 +3096,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 return ""
             content = Path(cached_path).read_text(encoding="utf-8-sig")
             display_name = self._display_name_from_cached_path(cached_path)
-            return f"[Content of {display_name}]:\n{content}"
+            return format_document_content(display_name, content)
         except (OSError, UnicodeDecodeError):
             logger.warning("[Feishu] Failed to inject text document content from %s", cached_path, exc_info=True)
             return ""
@@ -4060,9 +4066,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _resolve_outbound_file_routing(*, file_path: str, requested_message_type: str) -> tuple[str, str]:
-        # requested_message_type is accepted for call-site symmetry; routing is by extension only.
+        # Opus only becomes an ``audio`` message (Lark's in-app voice recording) when the caller asked
+        # for one (send_voice with voice intent); a document/plain-audio send of an .ogg stays a file.
         ext = Path(file_path).suffix.lower()
-        if ext in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
+        if ext in _FEISHU_OPUS_UPLOAD_EXTENSIONS and requested_message_type == "audio":
             return "opus", "audio"
         if ext in _FEISHU_MEDIA_UPLOAD_EXTENSIONS:
             return "mp4", "media"

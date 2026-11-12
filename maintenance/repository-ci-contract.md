@@ -10,6 +10,8 @@ All exact-SHA profiles reject a wrong SHA or dirty tracked tree before setup, im
 
 The fork's `main` had **no workflow files** at the original CI migration base (`9abae85c03`); its inherited CI workflows were retired earlier. [portable-ci.md](portable-ci.md#coverage-allocation-before-workflow-removal) maps all 36 original files and checks. The migration added `gate.yml` and `nightly.yml`; this change adds native macOS and Windows jobs **only to nightly**, following Brian's approval for the public fork. The PR gate remains Linux-only. The workflows use a pinned Node Linux image, SHA-pinned checkout, exact ref assertion and read-only token permissions. The PR's `qualification` job is the sole aggregation status; do not require a cancelled/skipped lane as success. Nightly's concurrency never cancels an earlier night. Existing upstream-sync automation is external to this repo's current workflows and is not modified.
 
+Before native macOS qualification, nightly provisions a case-sensitive APFS scratch image under `runner.temp` with `scripts/ci/case-sensitive-tmpdir.sh` and exports its printed path as `TMPDIR` through `GITHUB_ENV`. Portable CI creates its isolated home on that volume before probing case sensitivity and places child `TMPDIR` beneath that home. An always-run macOS step detaches by mount path and removes the image and empty directories, including after qualification fails.
+
 | Previously active workflow at last CI-enabled revision | Disposition |
 | --- | --- |
 | `ci.yaml` and reusable `tests.yml`, `lint.yml`, `js-tests.yml`, `rust-tests.yml`, `docs-site-checks.yml`, `docker-lint.yml` | Linux PR gate runs static, six bounded Node checks, and all ordinary Python plus PR-safe E2E files across eight hosted shards; nightly reuses those shards and adds complete Node, upgrade E2E, SQLite torture, docs, Rust and container lint. See `portable-ci.md` for every subcheck. |
@@ -25,6 +27,19 @@ The fork's `main` had **no workflow files** at the original CI migration base (`
 Cost estimate (billed Linux runner minutes; workload dependent): before retirement the last 30 job-bearing CI runs averaged ~60 min, Nix ~5.6/run, Docker ~1/run, plus review-comment ~4/run across 100 triggers; roughly **70 min/PR**, excluding duplicate push runs and Windows/macOS matrices. The previous focused Linux gate took roughly **6–8 min/PR**. The eight-way PR matrix deliberately spends more aggregate runner-minutes to bound full-suite wall clock; its actual duration and cost must be measured from the trial run, not inferred from this old estimate. Nightly parallel shards replace the formerly serial ~63-minute Linux Python lane, with separate broad and native jobs. The public fork incurs no GitHub-hosted Actions minute charges. The former `CI review comment` workflow started on every `CI` **in_progress** and polled up to 50 minutes; among the last 100 runs its 60 active jobs billed roughly 401 Linux minutes, 61 of them cancelled. Do not revive it. If comments become a requirement, use a completed-event single commenter with no polling and restrict its write privilege to a trusted workflow, not PR-controlled gate code.
 
 A passing source gate does not certify external integrations, Nix, native installers, image publication, or signed desktop releases. GitHub Actions billing limits may prevent all jobs from starting; until an actual hosted run executes, local verification is evidence only and `qualification` cannot be claimed green.
+
+## Bounded channel metadata smoke
+
+The complete-request smoke test keeps its 15-second deadline and real CLI
+process-boundary assertions. Its in-process stamp and plist mutation matrix
+uses the shared MSIX bridge's synchronous batch scope: validate the admitted
+request bytes with the authoritative Python decoder once, then reuse only
+those exact bytes in that scope. Changed JSON, duplicate keys, packaging
+conflicts and package-version conflicts must still fail; leaving the scope,
+including by exception, restores ordinary validation. No unscoped or
+persistent admission cache is allowed. The test counts its own direct child
+launches and caps them at twelve (ten CLI checks plus one batch validator),
+independent of host timing. CLI children continue to run their real validators.
 
 Fork-Patch-Backfill: 739ced4676c82324042e5b0b8d7e3ba1ed7bf432; repository-ci-contract
 Fork-Patch-Backfill: b1fd9e549fa185d80060a9116fa6b2201162cd0c; repository-ci-contract

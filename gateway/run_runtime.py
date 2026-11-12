@@ -41,8 +41,8 @@ async def _build_profile_authority(runner, name, home, *, register, claim=True):
     instance_id = runner.session_runtime_descriptor['instance_id']
     # Each home's store resolves through the runner's scope-following handle cache, exactly
     # the handle every later scoped read of that profile uses (one writer per state.db).
+    db = await asyncio.to_thread(open_profile_store, runner, home)
     with _profile_runtime_scope(home, hydrate_secrets=False):
-        db = getattr(runner._session_db, '_db', runner._session_db)
         if db is None:
             raise RuntimeError(_store_open_failure(runner, home))
         if (await asyncio.to_thread(Path(db.db_path).resolve)).parent != home:
@@ -56,6 +56,22 @@ async def _build_profile_authority(runner, name, home, *, register, claim=True):
             raise
     registry.replace(home, authority)
     return authority
+
+
+def open_profile_store(runner, home):
+    """Resolve once off-loop under the owning scope; a pending open is not a broken store."""
+    from gateway.run import _profile_runtime_scope, _SESSION_DB_UNPINNED
+    from gateway.session import SessionStore
+    from gateway.session_persistence import _DB_UNPINNED
+    with _profile_runtime_scope(home, hydrate_secrets=False):
+        store = getattr(runner, "session_store", None)
+        pinned = getattr(runner, "_session_db_pinned", _SESSION_DB_UNPINNED)
+        if isinstance(store, SessionStore) and pinned is _SESSION_DB_UNPINNED:
+            db = store._pinned_db()
+            return (store._open_session_db_for_active_scope(wait_for_open=True)
+                    if db is _DB_UNPINNED else db)
+        wrapper = runner._session_db
+        return getattr(wrapper, "_db", wrapper)
 
 
 def _store_open_failure(runner, home):
@@ -150,9 +166,12 @@ async def initialize_gateway_runtime(runner):
     descriptor = {
         'instance_id': instance_id, 'runtime_protocol': 1,
         'state': 'starting', 'capabilities': [],
+        'client_owned': bool(getattr(runner, '_client_owned', False)),
         'served_profiles': [],
     }
     runner.session_runtime_descriptor = descriptor
+    from gateway.run import _write_runtime_status_quiet
+    _write_runtime_status_quiet(client_owned=descriptor['client_owned'])
     registry = SessionAuthorities(homes[0][1], multiplexed=getattr(runner.config, 'multiplex_profiles', False))
     runner.session_authorities = registry
     # A zero-cut standby boots beside the serving slot, which still owns every store: it builds its
@@ -540,9 +559,56 @@ async def recover_bot_mailbox(authority):
 async def start_gateway_runtime_api(runner):
     if not hasattr(runner, "session_runtime_descriptor"):
         return
-    from gateway.run_api import start_gateway_api
-    runner.session_api = await start_gateway_api(runner)
+    from gateway import run_api
+    from gateway.webapp_listener import (
+        STARTING, BrowserCredentialError, browser_session_token, dial_origin, listener_plan, register_control_verbs,
+    )
+    from hermes_constants import get_hermes_home
+    home = get_hermes_home()
+    # The bootstrap registered these before its control socket answered; a runner started without it
+    # (an embedded gateway) gets them here, before the listener's slow start.
+    register_control_verbs(runner, home)
+    host, port, webapp, unusable = listener_plan(home)
+    # A webapp: block that asks for the Webapp but cannot be used is reported with its reason.
+    runner.webapp_status = ({"state": "unavailable", "url": None, "reason": unusable} if unusable
+                            else {"state": "off", "url": None, "reason": None} if webapp is None
+                            else dict(STARTING))
+    try:
+        # Without the Webapp the listener is main's: the same call, a private ephemeral port.
+        runner.session_api = await (run_api.start_gateway_api(runner, host=host, port=port, webapp=webapp)
+                                    if webapp is not None else run_api.start_gateway_api(runner))
+    except (Exception, SystemExit) as exc:
+        if webapp is None:
+            raise
+        # The Webapp's listener could not start (port taken, address unavailable, its browser credential
+        # not storable in the home, or the dashboard's auth gate exiting on a wildcard bind with no
+        # sign-in provider): native clients still need this gateway, so it keeps main's private
+        # listener and reports why the Webapp is not served.
+        if isinstance(exc, SystemExit):
+            reason = str(exc.code).strip()  # the gate's own message names the fix
+        elif isinstance(exc, BrowserCredentialError):
+            reason = str(exc)  # names the file and why it cannot be stored
+        elif isinstance(exc, OSError) and exc.filename:  # the browser credential's file, not the port
+            reason = f"could not use {exc.filename} ({exc.strerror or exc})"
+        else:
+            cause = (exc.strerror or exc) if isinstance(exc, OSError) else exc
+            reason = f"could not listen on {host}:{port} ({cause})"
+        logger.error("Webapp unavailable: %s", reason)
+        runner.webapp_status = {"state": "unavailable", "url": None, "reason": reason}
+        # Open tabs keep sending their credential to whatever answers on the Webapp's port, and that
+        # is not this gateway now. Replace it, so one captured there never opens this gateway; the
+        # tabs sign in again once the Webapp is back.
+        try:
+            browser_session_token(home, rotate=True)
+        except OSError as write_error:
+            logger.warning("Could not replace the Webapp's browser credential: %s", write_error)
+        runner.session_api = await run_api.start_gateway_api(runner)
+    else:
+        if webapp is not None:
+            runner.webapp_status = {"state": "serving", "url": dial_origin(host, port), "reason": None}
     runner.session_runtime_descriptor['api_origin'] = runner.session_api.api_origin
+    if getattr(runner, "_client_owned", False):
+        return
     from gateway.session_authority import UNCLAIMED_EPOCH
     for authority in _authorities(runner):
         if getattr(authority, 'epoch', None) != UNCLAIMED_EPOCH:  # a standby recovers it at promotion
@@ -633,7 +699,8 @@ def publish_gateway_runtime_ready(runner):
     descriptor.update(state='ready', capabilities=[
         'session-authority-v1', 'durable-admission-v1', 'event-replay-v1'])
     from gateway.session_hosted_service import start_ready_hosted_services
-    start_ready_hosted_services(runner)
+    if not getattr(runner, "_client_owned", False):
+        start_ready_hosted_services(runner)
 
 
 async def wait_gateway_runtime(runner):

@@ -176,16 +176,17 @@ def test_import_and_startup_exclude_each_other_before_publication(tmp_path, monk
 def test_recovery_output_exemption_excludes_canonical_activation(tmp_path):
     import hashlib
     import pytest
-    from gateway.runtime_ownership import ProfileOwnership
+    from gateway.runtime_ownership import process_ownership
     from hermes_cli.session_recovery import recover_session_database, SessionRecoverySafetyError
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, admit_session_input
+    from hermes_state_runtime import admit_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     source_home, target_home = tmp_path / 'source', tmp_path / 'target'
     source_home.mkdir()
     target_home.mkdir()
     source = source_home / 'state.db'
-    owner = ProfileOwnership()
+    owner = process_ownership
     owner.reserve([source_home, target_home])
     try:
         with SessionDB(db_path=source) as db:

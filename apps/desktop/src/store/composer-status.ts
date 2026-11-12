@@ -23,7 +23,7 @@ export {
 } from './runtime-gone'
 
 /** Composer status stack feed — merged todos, subagents, background per session. */
-export type StatusItemState = 'done' | 'failed' | 'running'
+export type StatusItemState = 'done' | 'failed' | 'running' | 'unknown'
 export type StatusItemType = 'background' | 'goal' | 'subagent' | 'todo'
 
 export interface ComposerStatusItem {
@@ -290,7 +290,9 @@ const writeBackground = (sid: string, items: ComposerStatusItem[]) => {
 // `tui_gateway` process.list entry (tools/process_registry.list_sessions + output_tail).
 interface GatewayProcessEntry {
   command?: string
-  exit_code?: number
+  exit_code?: null | number
+  completion_reason?: string
+  termination_source?: string
   output_tail?: string
   session_id?: string
   status?: string
@@ -300,12 +302,21 @@ const toBackgroundItem = (proc: GatewayProcessEntry): ComposerStatusItem => {
   const exited = proc.status === 'exited'
   const exitCode = typeof proc.exit_code === 'number' ? proc.exit_code : undefined
 
+  const unknown =
+    exited &&
+    (exitCode === undefined ||
+      proc.completion_reason === 'lost' ||
+      proc.termination_source === 'checkpoint.exit_uncollected' ||
+      proc.termination_source === 'survivor_lost')
+
+  const command = (proc.command ?? '').split('\n')[0]!.trim() || 'background process'
+
   return {
-    exitCode,
+    exitCode: unknown ? undefined : exitCode,
     id: proc.session_id ?? '',
     output: proc.output_tail || undefined,
-    state: exited ? (exitCode ? 'failed' : 'done') : 'running',
-    title: (proc.command ?? '').split('\n')[0]!.trim() || 'background process',
+    state: !exited ? 'running' : unknown ? 'unknown' : exitCode !== 0 ? 'failed' : 'done',
+    title: unknown ? `${command} — finished, exit status unknown` : command,
     type: 'background'
   }
 }
@@ -353,11 +364,14 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
         body,
         kind: 'backgroundDone',
         sessionId: sid,
-        title: translateNow(
-          item.state === 'failed'
-            ? 'notifications.native.backgroundFailedTitle'
-            : 'notifications.native.backgroundDoneTitle'
-        )
+        title:
+          item.state === 'unknown'
+            ? 'Background task finished, exit status unknown'
+            : translateNow(
+                item.state === 'failed'
+                  ? 'notifications.native.backgroundFailedTitle'
+                  : 'notifications.native.backgroundDoneTitle'
+              )
       })
     }
   }
@@ -387,7 +401,10 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
   const finishedDelay = new Map(
     next
       .filter(item => item.state !== 'running')
-      .map(item => [item.id, item.state === 'failed' ? FAILURE_LINGER_MS : SUCCESS_LINGER_MS])
+      .map(item => [
+        item.id,
+        item.state === 'failed' || item.state === 'unknown' ? FAILURE_LINGER_MS : SUCCESS_LINGER_MS
+      ])
   )
 
   for (const [id, delay] of finishedDelay) {

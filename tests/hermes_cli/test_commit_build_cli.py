@@ -9,6 +9,8 @@ import sys
 
 import pytest
 
+from hermes_constants import _SCRATCH_PRUNE_STAMP
+
 MESSAGE = "This build doesn't get updates. Ask the developer who gave it to you for a new build."
 
 
@@ -36,6 +38,10 @@ def test_sealed_cli_never_checks_or_spawns_updater(payload, tmp_path, args):
     root, source = payload
     home = tmp_path / "home"
     home.mkdir()
+    # Keep unrelated scratch upkeep current so the audit observes update attempts.
+    scratch = home / "cache" / "scratch"
+    scratch.mkdir(parents=True)
+    (scratch / _SCRATCH_PRUNE_STAMP).touch()
     env = {**os.environ, "HERMES_HOME": str(home), "HERMES_INSTALL_ROOT": str(root),
            "PYTHONPATH": os.pathsep.join((str(root), str(source)))}
     # Real imports and parser, no admission mocks. Audit attempts even if a caller swallows the error.

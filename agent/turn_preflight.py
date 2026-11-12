@@ -239,9 +239,9 @@ def run_preflight_compression(
         # All recovery passes consumed and still over threshold: fail closed —
         # llama.cpp may silently truncate an oversized retry.
         return _done("return", _exhausted_result())
-    elif _eligible and not defer_preflight(request_pressure_tokens) and _compression_cooldown:
-        # Summary-LLM cooldown blocks compression: deduped warning only when over
-        # threshold (should_compress_info reason is None below it).
+    elif _eligible and not defer_preflight(request_pressure_tokens):
+        # Any compressor backoff can block an over-threshold request, not just
+        # summary failures. The reason stays None below the threshold.
         _block_reason = _blocked_compress_reason(compressor, request_pressure_tokens)
         if _block_reason:
             agent._warn_context_overflow_blocked(

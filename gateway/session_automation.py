@@ -85,6 +85,23 @@ async def admit_process_notice(runner, authority, adapter, event, evt):
     """Admit a process notice. A completion and the withdrawal of its process's waiting ticks hold
     the heartbeat lock together; a tick already holds it (``deliver_heartbeat``)."""
     identity = producer_identity(runner, evt)
+    # A trusted process notice recovers a stored origin, not a new sender assertion.
+    # Validate its original route and session pin before borrowing committed provenance.
+    # Direct automation callers still undergo the strict source comparison below.
+    if event.source.platform not in (Platform.LOCAL, Platform.API_SERVER):
+        import asyncio
+        from gateway.session_envelope import restore_native
+        from gateway.session_identity import replace_source
+
+        entry = await asyncio.to_thread(_owner, runner, event, authority)
+        envelope = await asyncio.to_thread(committed_route_envelope, authority, entry)
+        if envelope is not None and not route_rebound(entry, envelope):
+            restored = restore_native({'text': event.text, 'native_text_v1': {
+                key: value for key, value in envelope.items() if key != 'media'}}, runner)
+            if (runner.session_store._generate_session_key(restored.source) != entry.session_key
+                    or runner._adapter_for_source(restored.source) is not adapter):
+                raise RuntimeStoreError('admission_conflict')
+            event.source = replace_source(restored.source, message_id=None)
     if evt.get('type') == 'heartbeat':
         # The tick's raw output rides its stored admission: a later tick folds from the ledger.
         event.metadata['heartbeat_tick'] = {'output': str(evt.get('output') or ''),
@@ -112,9 +129,10 @@ async def prepare_heartbeat(runner, event):
     queues behind it. A retry of a tick already admitted is dropped."""
     import asyncio
     from gateway.session_authorities import active_authority
+    from gateway.session_store_async import run_store_lookup
     authority = active_authority(runner)
-    entry = await asyncio.to_thread(
-            runner.session_store.lookup_by_session_key, str(event.get('session_key') or '')) if authority else None
+    entry = await run_store_lookup(
+            runner.session_store, 'lookup_by_session_key', str(event.get('session_key') or '')) if authority else None
     if entry is None:
         return event
     owner = await asyncio.to_thread(_route_owner, authority, entry)
@@ -173,9 +191,10 @@ async def withdraw_process_ticks(runner, event):
     import asyncio
     from gateway.session_authorities import active_authority
     try:
+        from gateway.session_store_async import run_store_lookup
         authority = active_authority(runner)
-        entry = await asyncio.to_thread(
-            runner.session_store.lookup_by_session_key, str(event.get('session_key') or '')) if authority else None
+        entry = await run_store_lookup(
+            runner.session_store, 'lookup_by_session_key', str(event.get('session_key') or '')) if authority else None
         if entry is None:
             return
         finished = {identity[1] for identity in _identities(
@@ -263,6 +282,24 @@ def _route_owner(authority, entry):
             else authority.logical_owner(entry.session_id))
 
 
+def _owned_by(db, session_id, current):
+    """Whether ``session_id``, or a (nested) delegate_task conversation it runs under, is the route's
+    live ``current`` session or compressed into it. The walk stops at the first such hop: a resumed
+    delegate run is the chat's own conversation, never the parent it was spawned from. As in the
+    completion pre-flight (``_lookup_completion_owner``), only ``model_config._delegate_from`` leads
+    out of an execution transcript: ``parent_session_id`` also records compression and branches.
+    Likewise a session closed at a user boundary (/new, a resume away) leads nowhere."""
+    from gateway.run import _USER_BOUNDARY_END_REASONS
+    lineage = [session_id]
+    while lineage[-1] != current and db.get_compression_tip(lineage[-1]) != current:
+        row = db.get_session(lineage[-1]) or {}
+        parent = db.get_session_model_config_value(lineage[-1], '_delegate_from')
+        if (row.get('ended_at') and row.get('end_reason') in _USER_BOUNDARY_END_REASONS) or parent in (None, *lineage):
+            return False
+        lineage.append(parent)
+    return True
+
+
 def _owner(runner, event, authority):
     route = event.metadata.get('gateway_session_key') or runner.session_store._generate_session_key(event.source)
     entry = runner.session_store.lookup_by_session_key(route)
@@ -286,12 +323,10 @@ def _owner(runner, event, authority):
     if runner.session_store._generate_session_key(event.source) != route:
         raise RuntimeStoreError('admission_conflict')
     expected = event.metadata.get('gateway_session_id')
-    if not expected:
+    # A completed child may follow compression, and a process a subagent started its parent
+    # conversation, but never /new or an unrelated resume.
+    if not expected or not _owned_by(authority.db, expected, entry.session_id):
         raise RuntimeStoreError('admission_conflict')
-    if expected != entry.session_id:
-        # A completed child may follow compression, but never /new or an unrelated resume.
-        if authority.db.get_compression_tip(expected) != entry.session_id:
-            raise RuntimeStoreError('admission_conflict')
     return entry
 
 
@@ -373,10 +408,6 @@ def admission_display(payload):
     return card
 
 
-# Telegram omits a forum topic's name on ordinary messages inside the topic, so a route origin
-# that recorded ``chat_topic`` never matched its committed envelope, and every completion
-# borrowing that envelope was refused (``admission_conflict``) and retried forever. The topic
-# name labels a thread, never selects one; other labels (``user_name``) stay part of the check.
 _UNCOMPARED_FIELDS = frozenset({'message_id', 'chat_topic'})
 
 
@@ -406,7 +437,9 @@ def committed_route_envelope(authority, entry):
 
 def snapshot_automation(authority, adapter, event, identity, captured=None):
     runner = authority.runner
-    if (not event.internal or event.message_type != MessageType.TEXT or event.is_command()
+    from gateway.session_synthetic import is_synthetic
+    private_goal = is_synthetic(event) and event.metadata.get('goal_continuation') is True
+    if ((not event.internal and not private_goal) or event.message_type != MessageType.TEXT or event.is_command()
             or not isinstance(event.text, str) or not identity
             or event.media_urls or event.prompt_response or event.source.platform == Platform.API_SERVER):
         raise RuntimeStoreError('invalid_params', field='automation_event')
@@ -440,18 +473,24 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     # Synthetic wakes clear ``message_id`` (#52694, #123097) while the committed human source keeps
     # it, so compare the routing/provenance identity, never the platform reply anchor.
     if (_route_identity(restored.source) != _route_identity(event.source)
+            or runner.session_store._generate_session_key(restored.source) != entry.session_key
             or runner._adapter_for_source(restored.source) is not adapter):
         raise RuntimeStoreError('admission_conflict')
     provenance = deepcopy(envelope['provenance'])
     source = deepcopy(envelope['source'])
     # Never anchor the wake to the stale human message; ``to_dict`` already omits a null anchor.
     source.pop('message_id', None)
+    if 'relay' in provenance:
+        # The relay seal binds the source; restore_native verified it over the anchored source.
+        from gateway.session_ingress_context import reseal_relay
+        provenance = reseal_relay(adapter, source, provenance)
     # Producer timestamps and platform reply IDs change on retry. Neither belongs
     # in the identity/fingerprint of the same immutable completion.
     envelope = {'source': source, 'route': entry.session_key,
         'timestamp': datetime.fromtimestamp(0, UTC).isoformat(),
         'event': {'message_id': identity}, 'provenance': provenance,
-        'automation': {'identity': identity, 'owner': owner}}
+        'automation': {'identity': identity, 'owner': owner},
+        'absorbed_synthetic': []}  # Producer wakes never absorb native ingress merges.
     envelope['automation'].update(notification)
     if synthetic is not None:
         envelope['synthetic'] = synthetic
@@ -465,21 +504,43 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
     return {'text': event.text, 'native_text_v1': envelope}, entry
 
 
-def check_automation_route(runner, payload, session_id, available_source, adapter):
+def _check_automation_route(runner, payload, session_id, available_source, adapter, entry):
     from gateway.session_envelope import restore_native
     event = restore_native(payload, runner)
     envelope = payload['native_text_v1']
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
-    if authority is None:  # a late preflight for a profile this runtime no longer serves
+    if authority is None:
         raise RuntimeStoreError('not_found')
-    entry = _owner(runner, event, authority)
     if (entry.session_id != session_id
             or envelope['automation']['owner'] != authority.logical_owner(session_id)
             or runner.session_store._generate_session_key(available_source) != entry.session_key
             or adapter is None or runner._adapter_for_source(event.source) is not adapter):
         raise RuntimeStoreError('admission_conflict')
     return event.source, entry.session_key
+
+
+def check_automation_route(runner, payload, session_id, available_source, adapter):
+    """Synchronous compatibility API for worker-only callers."""
+    from gateway.session_envelope import restore_native
+    from gateway.session_authorities import active_authority
+    authority = active_authority(runner)
+    if authority is None:
+        raise RuntimeStoreError('not_found')
+    return _check_automation_route(runner, payload, session_id, available_source, adapter,
+                                    _owner(runner, restore_native(payload, runner), authority))
+
+
+async def check_automation_route_async(runner, payload, session_id, available_source, adapter):
+    from gateway.session_envelope import restore_native
+    from gateway.session_authorities import active_authority
+    authority = active_authority(runner)
+    if authority is None:
+        raise RuntimeStoreError('not_found')
+    from gateway.session_store_async import run_store_call
+    event = restore_native(payload, runner)
+    entry = await run_store_call(_owner, runner, event, authority)
+    return _check_automation_route(runner, payload, session_id, available_source, adapter, entry)
 
 
 def snapshot_local_automation(authority, adapter, event, identity, entry, *, ref=None):
@@ -554,7 +615,7 @@ def restore_local_automation(authority, ref, row):
     return event
 
 
-async def admit_automation(authority, adapter, event, identity, replaces=None):
+async def admit_automation(authority, adapter, event, identity, replaces=None, *, authorize_write=None):
     """Capture and commit within the existing ordered tracked admission reservation.
 
     ``replaces`` cancels a queued predecessor in this admission's own transaction.
@@ -565,6 +626,12 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
     from gateway.session_runtime_workers import tracked_write
     authority._require_admission_open()
     prepared, replaced = {}, []
+
+    def authorize(conn):
+        if authorize_write is not None:
+            authorize_write(conn)
+        if replaces:
+            _replace_queued(replaces, prepared['ref'].session_id, replaced)(conn)
 
     async def prepare():
         authority._require_admission_open()
@@ -581,11 +648,19 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
         payload, entry = snapshot_automation(authority, adapter, event, identity, (entry, captured, owner))
         sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
         prepared['ref'] = SessionRef(authority.profile_id, sid)
-        authority.sessions.setdefault(sid, LiveSession(event.source, entry.session_key))
+        source, envelope = event.source, payload.get('native_text_v1')
+        if envelope is not None and 'relay' in envelope['provenance']:
+            from gateway.session_envelope import restore_native_source
+            source = restore_native_source(payload, authority.runner)
+        if sid not in authority.sessions:
+            from gateway.session_route_recovery import moved_local
+            handed_off = await asyncio.to_thread(moved_local, authority, sid, source)
+            authority._require_admission_open()
+            authority.sessions[sid] = LiveSession(source, entry.session_key, handed_off=handed_off)
         return partial(admit_session_input, authority.db, epoch=authority.epoch,
             principal_id='automation:' + entry.session_key, session_id=sid, request_id=identity,
             payload=deepcopy(payload),
-            _authorize_write=authority._admission_gate(replaces and _replace_queued(replaces, sid, replaced)))
+            _authorize_write=authority._admission_gate(authorize))
 
     def admitted(row):
         ref = prepared['ref']
@@ -598,6 +673,17 @@ async def admit_automation(authority, adapter, event, identity, replaces=None):
 
 
 _ROUTE_WAKE_PRODUCERS = frozenset({'kanban-wake', 'loop-tick'})
+
+
+def route_owner_lock(runner, session_id):
+    """*session_id*'s live owner's ``mutation_lock`` (a no-op without one). Held across a route
+    rotation and ``move_route_wakes``: its drain refuses a wake on the rotated route, so it must not
+    claim one the move has not taken yet."""
+    import contextlib
+    from gateway.session_authorities import active_authority
+    authority = active_authority(runner)
+    live = authority.sessions.get(authority.logical_owner(session_id)) if authority and session_id else None
+    return live.mutation_lock if live is not None else contextlib.nullcontext()
 
 
 async def _cancel_reset_pinned_wake(authority, row, new_session_id):
@@ -796,47 +882,7 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
 
 
 async def admit_route_wake(runner, adapter, source, text, producer, metadata=None, *, event=None):
-    """Commit a producer wake (Kanban push wake, /loop tick) for ``source``'s route into the
-    authority FIFO, like heartbeats and process completions, instead of a classic turn that
-    interrupts or races the admitted one. ``False`` when no authority serves the scope or the
-    route holds no committed human turn to borrow provenance from: the caller keeps the adapter
-    path (nothing is queued there either). Raises ``RuntimeStoreError`` on a refusal."""
-    from gateway.session_authorities import active_authority
-    authority = active_authority(runner)
-    key = runner._session_key_for_source(source)
-    entry = runner.session_store.lookup_by_session_key(key) if authority is not None else None
-    if authority is None or entry is None:
-        return False
-    import uuid
-    identity = json.dumps([producer, key, uuid.uuid4().hex], separators=(',', ':'))
-    if source.platform == Platform.LOCAL:
-        # A local route has no messaging provenance to borrow: its wake rides local_automation_v1 on
-        # the live session's own source object (``snapshot_local_automation`` checks identity).
-        live = authority.sessions.get(source.chat_id)
-        if live is None or live.route != key:
-            return False
-        source = live.source
-    else:
-        from gateway.session_envelope import restore_native
-        envelope = committed_route_envelope(authority, entry)
-        if envelope is None:
-            return False
-        if route_rebound(entry, envelope):
-            # The session moved after its last human turn: the wake rides the route it serves now,
-            # which ``snapshot_automation`` revalidates against the live adapter.
-            source = runner._restored_source(entry)
-        else:
-            # The route's committed source, which ``snapshot_automation`` re-derives and compares.
-            source = restore_native({'text': text, 'native_text_v1': {
-                k: v for k, v in envelope.items() if k != 'media'}}, runner).source
-    wake = MessageEvent(text=text, message_type=MessageType.TEXT, source=source, internal=True,
-                        message_id=identity, metadata=dict(metadata or {}))
-    from gateway.session_synthetic import project_synthetic, restore_synthetic
-    if event is not None and (synthetic := project_synthetic(event)) is not None:
-        # Borrow only the producer's private projection, never inbound metadata as a capability.
-        restore_synthetic(wake, synthetic)
-        wake.reply_expected = event.reply_expected
-        wake.inherit_channel_pin = event.inherit_channel_pin
-    wake.metadata.update(gateway_session_key=key, gateway_session_id=entry.session_id)
-    await authority.admit_automation(adapter, wake, identity)
-    return True
+    """Compatibility boolean for producers whose adapter fallback is still supported."""
+    from gateway.session_route_wake import admit_route_wake_receipt
+    return await admit_route_wake_receipt(runner, adapter, source, text, producer, metadata,
+                                          event=event) is not None

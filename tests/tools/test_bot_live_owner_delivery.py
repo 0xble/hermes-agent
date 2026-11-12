@@ -193,7 +193,7 @@ def test_terminal_receipt_is_immutable(tmp_path, terminal_status):
 def _ready(instance_id):
     from types import SimpleNamespace
 
-    return lambda home, timeout: SimpleNamespace(state="ready", endpoint=SimpleNamespace(instance_id=instance_id))
+    return lambda home, timeout: SimpleNamespace(state="ready", endpoint=SimpleNamespace(instance_id=instance_id), reason_code=None)
 
 
 def test_canonical_owner_is_the_authority_and_follows_compression(tmp_path, monkeypatch):
@@ -203,7 +203,7 @@ def test_canonical_owner_is_the_authority_and_follows_compression(tmp_path, monk
     from types import SimpleNamespace
 
     monkeypatch.setattr(runtime, "discover_gateway_endpoint",
-                        lambda home, timeout: SimpleNamespace(state="absent", endpoint=None))
+                        lambda home, timeout: SimpleNamespace(state="absent", endpoint=None, reason_code=None))
     with pytest.raises(ValueError, match="authority"):
         mailbox.find_canonical_live_owner(tmp_path)
 
@@ -319,7 +319,7 @@ def test_authority_delivery_dials_from_a_thread_with_a_running_loop(tmp_path, mo
 
     def discover(home, timeout):
         probed.append(Path(home))
-        return SimpleNamespace(state="stopped", endpoint=None)
+        return SimpleNamespace(state="stopped", endpoint=None, reason_code=None)
 
     monkeypatch.setattr(gateway_runtime, "discover_gateway_endpoint", discover)
 

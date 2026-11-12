@@ -5,12 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import os
-import tempfile
 
 import pytest
 
 from hermes_cli.web_routers import display
 from tools.bot_desktop import lease
+from tests.socket_paths import short_socket_dir
 
 
 class _Ws:
@@ -57,7 +57,8 @@ async def _bridge_once(close_code: int, home: str) -> lease.Lease:
 @pytest.mark.parametrize(("close_code", "human_keeps_control"), [(1006, True), (1005, True), (1000, False)])
 def test_only_a_clean_viewer_close_hands_the_screen_back(monkeypatch, close_code, human_keeps_control):
     lease._reset_for_tests()
-    with tempfile.TemporaryDirectory() as home:
+    with short_socket_dir("bot-desktop/rfb.sock") as directory:
+        home = str(directory)
         lease.acquire("desk-1", profile_key=home)
         after = asyncio.run(_bridge_once(close_code, home))
     lease._reset_for_tests()
@@ -123,7 +124,8 @@ def test_a_takeover_made_by_another_process_stops_input_within_the_refresh_inter
             server.close()
 
     lease._reset_for_tests()
-    with tempfile.TemporaryDirectory() as home:
+    with short_socket_dir("bot-desktop/rfb.sock") as directory:
+        home = str(directory)
         lease.acquire("desk-1", profile_key=home)
         elapsed = asyncio.run(_run(home))
     lease._reset_for_tests()
@@ -155,6 +157,7 @@ def test_no_bridge_task_or_socket_outlives_the_bridge():
             server.close()
 
     lease._reset_for_tests()
-    with tempfile.TemporaryDirectory() as home:
+    with short_socket_dir("bot-desktop/rfb.sock") as directory:
+        home = str(directory)
         leftover = asyncio.run(_run(home))
     assert leftover == set(), [t.get_coro() for t in leftover]

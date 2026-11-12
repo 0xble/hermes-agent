@@ -907,12 +907,26 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - The public replace seam now forwards to the extracted bootstrap implementation, restoring
   the durable ownership-refusal stamp while retaining process-slot PID isolation. Its scoped-lock
   release uses the canonical source module, not the removed status export.
+  The refusal is a synchronous persistence checkpoint: it must not return to the CLI hard exit
+  while a slow disk write remains queued. A bounded wait can return false just before
+  `os._exit` kills the daemon writer, leaving the stale `running` record intact.
   Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
+  The subprocess durability regression holds the writer until its caller waits and advances the
+  wait clock past the former deadline, then checks the real stamp after hard exit. It neither
+  races equal-duration sleeps nor weakens the persisted-state assertions.
 - Fork patch identity: `v0225-merge-integration`.
 - The Windows gateway checks the legacy venv's Python major/minor before processing
   its site-packages or .pth files. Missing version metadata refuses the overlay,
   while same-ABI and committed-generation behavior remain unchanged.
   Guard: `tests/gateway/test_windows_venv_import_guard.py`.
+- Gateway reservation retries when a browse holder releases between the failed
+  all-home reservation and the per-home conflict probes. The original deadline
+  still applies, and each retry must acquire the actual ownership locks.
+  Guard: `tests/gateway/test_browse_reservation_release_race.py` and browse schema drift.
+- Ink submission replies retain one bounded status type, derived from the generated
+  legacy prompt, canonical admission, and correction contracts. Queue-edit dispatch
+  preserves both the synchronous queue mutation result and asynchronous send result
+  in its Promise callback. Guards: Ink typecheck and submission/queue suites.
 - Integrating fork main through #818 keeps atomic fanout prepare/stamp/admission alongside
   overflow resume notices and their physical-drain barrier. Routing replacement performs its
   diff and retirement-fence check in SQLite and returns only rejected route keys, without
@@ -1315,3 +1329,24 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_model_not_found_notice_absent_for_a_normally_finished_task` and
   `test_model_not_found_notice_counts_only_rejected_tasks`; `tests/tools/test_async_delegation.py`
   model-rejection notices (a real rejection that exhausts iterations still raises it).
+
+## TUI Launcher Banner Prefetch Lifetime
+
+- Fork patch identity: `cli-banner-prefetch-lifetime`.
+- `cmd_chat` started classic-banner git/update daemon threads even for the TUI,
+  which never displays that Python banner. A fast attachment handoff or refusal
+  could exit while `git rev-parse --short=8 HEAD` was running, orphaning the
+  subprocess and violating process ownership at launcher cleanup.
+- Skip both banner prefetches for TUI launches. Preserve bundled-skills sync on
+  both paths and classic-banner warming on the classic CLI. Do not weaken the
+  attachment probe or its live-process guard.
+- Guards: `tests/hermes_cli/test_chat_banner_prefetch.py`,
+  `tests/hermes_cli/test_tui_first_run_routing.py`, and the real-process
+  `tests/e2e/core/security/test_attach_handshake.py`.
+- Upstream guidance checked at `780d5a3313d7e1f64c0a0f3ec6b644d50f156e90`.
+  Related merged [PR #97280](https://github.com/NousResearch/hermes-agent/pull/97280)
+  suppresses background probes inside pytest, not in real launcher subprocesses.
+  No equivalent TUI-launch lifetime fix was found. This is an upstream-origin
+  bug fix suitable for contribution, with publication outside this local change.
+- Retire when upstream skips unused launcher prefetch or reaps every prefetch
+  child before launcher exit. Roll back the commit carrying this patch identity.

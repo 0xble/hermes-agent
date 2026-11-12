@@ -116,6 +116,9 @@ def routed_browser_handler(
 ) -> Any:
     """Lazy registry-handler route wrapper for ``browser_*`` tools.
     Feature off (or gateway unimportable) ⇒ the legacy handler runs unchanged."""
+    from tools.browser_task_cdp import task_browser_url
+    if task_browser_url(task_id):
+        return fallback()
     try:
         from gateway.browser_control_broker import browser_control_enabled, get_browser_control_broker
     except Exception as exc:  # pragma: no cover - defensive, gateway always present

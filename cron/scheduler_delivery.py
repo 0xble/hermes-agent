@@ -969,8 +969,12 @@ def _send_media_via_adapter(
                 method, path_kw = "send_image_file", "image_path"
             else:
                 method, path_kw = "send_document", "file_path"
+            # The voice sender decides bubble vs music-file from ``is_voice`` (Telegram
+            # transcodes non-Opus only when it is set), matching the gateway dispatch
+            # in BasePlatformAdapter._send_one.
+            extra = {"is_voice": _is_voice} if method == "send_voice" else {}
             coro = getattr(adapter, method)(
-                chat_id=chat_id, metadata=metadata, **{path_kw: media_path})
+                chat_id=chat_id, metadata=metadata, **{path_kw: media_path}, **extra)
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
                 _note_target_error(
@@ -995,11 +999,7 @@ def _send_media_via_adapter(
     return errors
 
 
-def _result_field(send_result, key: str, default=None):
-    """Read ``key`` from a SendResult-like object or the plain dict the silence filter returns."""
-    if isinstance(send_result, dict):
-        return send_result.get(key, default)
-    return getattr(send_result, key, default)
+from cron.scheduler_delivery_results import _deliver_bot_chat_result as _deliver_bot_chat_result, _result_field as _result_field
 
 
 def _confirm_adapter_delivery(
@@ -2049,18 +2049,17 @@ def _deliver_result(
             continue
         # Bot Chat owns admission; never concurrently resume a live owner's transcript.
         if target["platform"] == BOT_CHAT_PLATFORM:
-            bot_chat_content = delivery_content
-            if copy_blocks:
-                bot_chat_content = "\n\n".join(part for part in (delivery_content, *copy_blocks) if part)
-            bot_chat_error = _deliver_to_bot_chat(job, bot_chat_content, target["chat_id"], for_failure=for_failure)
-            suppressed_targets += job.pop("_notification_all_targets_suppressed", False)
-            if bot_chat_error:
-                receipt_target = f"bot-chat:{target['chat_id'] or '(own)'}"
-                receipt = job.get("_bot_chat_delivery_receipts", {}).get(receipt_target)
-                if not receipt or receipt["status"] not in ("queued", "claimed"):
-                    delivery_errors.append(bot_chat_error)
-                if receipt and receipt["status"] == "ambiguous":
-                    unverified_targets.append(bot_chat_error)
+            suppressed_targets = _deliver_bot_chat_result(
+                job, target, delivery_content, copy_blocks, suppressed_targets, for_failure=for_failure,
+                delivery_errors=delivery_errors, unverified_targets=unverified_targets)
+            continue
+        if target["platform"] == "local":
+            from gateway.session_cron import deliver_to_local_chat
+            from hermes_constants import get_hermes_home
+            local_error = deliver_to_local_chat(get_hermes_home(), target["chat_id"],
+                                                cleaned_delivery_content, diagnostic=for_failure)
+            if local_error:
+                delivery_errors.append(local_error)
             continue
 
         t = _prepare_target_delivery(

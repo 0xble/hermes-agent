@@ -220,8 +220,10 @@ def test_selected_recovery_keeps_destination_plan_but_next_hop_uses_logical_inpu
     if next_destination:
         assert calls[-1]["messages"] == [{"role": "user", "content": "gpt-5-mini input"}]
         assert calls[-1]["extra_body"]["reasoning"]["effort"] == "low"
-    assert route == {"provider": "openai" if next_destination else "openrouter",
-                     "model": "gpt-5-mini" if next_destination else "backup"}
+    assert {key: route[key] for key in ("provider", "model")} == {
+        "provider": "openai" if next_destination else "openrouter",
+        "model": "gpt-5-mini" if next_destination else "backup",
+    }
     assert recovered == ([] if recovery == "transient" else ["openrouter"] * (2 if recovery == "rotation" and next_destination else 1))
 
 
@@ -347,7 +349,7 @@ def test_auxiliary_per_call_chain_inherits_only_when_none(moa_transport, monkeyp
               "messages": [{"role": "user", "content": "run"}]}
     route = {}
     assert aux.call_llm(**kwargs, fallback_chain=None, route_info=route).choices[0].message.content == "backup executed"
-    assert route == {"provider": "openrouter", "model": "backup"}
+    assert {key: route[key] for key in ("provider", "model")} == {"provider": "openrouter", "model": "backup"}
     calls.clear()
     with pytest.raises(TimeoutError):
         aux.call_llm(**kwargs, fallback_chain=[])

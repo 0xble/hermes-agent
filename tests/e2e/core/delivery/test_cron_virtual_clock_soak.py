@@ -588,6 +588,9 @@ def _run_scenario(sc: Scenario, soak_env) -> dict[str, int]:
     monkeypatch.setenv("TZ", sc.process_tz)
     time.tzset()
     lines = ["platforms:", "  telegram:", "    enabled: true", "    token: fake-soak-token"]
+    # This oracle checks every run over the entire virtual span. Retention has
+    # its own contract tests, so keep history longer than this scheduling soak.
+    lines.extend(["cron:", f"  execution_retention_days: {sc.days + 1}"])
     if sc.hermes_tz:
         lines.insert(0, f"timezone: {sc.hermes_tz}")
     (hermes_home / "config.yaml").write_text("\n".join(lines) + "\n", encoding="utf-8")

@@ -1,8 +1,7 @@
-"""Hosted Group Chat rooms (``groups.*``), cross-connection bot relay (``bot_relay.*``) and the
-dashboard browser controller (``browser.controller.*``).
+"""Hosted Group Chat rooms (``groups.*``), cross-connection bot relay (``bot_relay.*``),
+and the authenticated dashboard browser controller (``browser.controller.*``).
 
-Handlers: ``tui_gateway/methods_groups.py``, ``tui_gateway/methods_bot_relay.py``,
-``tui_gateway/methods_browser_control.py``. Room / event / page shapes are produced by
+Handlers: ``tui_gateway/methods_groups.py``, ``tui_gateway/methods_bot_relay.py``. Room / event / page shapes are produced by
 ``gateway/hosted_rooms.py`` (``_room_from_row`` / ``_event_from_row`` / ``read_events``) and
 ``gateway/hosted_room_replicas.py``; the RoomLink catalog by ``gateway/hosted_room_peer.py``.
 """
@@ -31,8 +30,14 @@ class RoomMember(OpenModel):
 
 
 class RoomActor(Result):
+    """``hosted_rooms._ACTOR_FIELDS``; member replies carry ``profile`` plus, when known,
+    ``display_name`` and the peer ``connection_id`` (``hosted_room_discussion._member_actor``)."""
+
     kind: str
     id: str
+    profile: str | None = None
+    display_name: str | None = None
+    connection_id: str | None = None
 
 
 class RoomEvent(Result):
@@ -218,7 +223,8 @@ class RoomMemberActivity(Result):
 
 
 class RoomDriverStatus(Result):
-    """``HostedRoomService.status(room_id)``; ``pending_actions`` rows are ``{kind: retry, task_id}``
+    """``HostedRoomService.status(room_id)``; ``pending_actions`` rows are the exact attempt
+    (``hosted_room_service.attempt_action``: ``kind`` + ``member_id``/``task_id``/``execution_generation``)
     or the driver's approval action (``kind: approval`` + run/session/approval context).
     ``member_activity`` lists live tasks in admission order (absent from older gateways)."""
 
@@ -348,6 +354,9 @@ method("groups.approve", params=GroupsApproveParams, result=GroupsApproveResult,
 
 class GroupsRetryParams(RoomParams):
     task_id: str
+    # The pending action's exact attempt; absent only from clients that predate it.
+    member_id: str | None = None
+    execution_generation: int | None = None
 
 
 class RoomTaskReceipt(Result):

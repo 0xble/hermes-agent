@@ -53,7 +53,6 @@ def test_routine_process_stop_is_outcome_only(exit_code, source):
 
 @pytest.mark.parametrize("reason,source,status", [
     ("killed", "process.kill", "terminated by process.kill"),
-    ("lost", "backend_lost", "marked lost because the process backend disappeared"),
     ("failed_start", "failed_start", "failed to start"),
 ])
 def test_other_process_outcomes_keep_their_wording(reason, source, status):

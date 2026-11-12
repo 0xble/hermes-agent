@@ -45,8 +45,13 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   `gateway/restart_loop_planned_exit.json`; boot consumes it once even with no pending
   sessions. Signal/home marker timestamps and the chat `/restart` marker's mtime must
   be within the configured chain gap. Unreadable intent grants no exemption; I/O failure
-  never blocks shutdown or startup. Regressions: `tests/gateway/test_restart_loop_guard.py`
-  and `tests/hermes_cli/test_gateway_restart_loop.py`.
+  never blocks shutdown or startup. The sole shutdown-handler factory lives in
+  `gateway/run_bootstrap.py`, where startup installs it; the legacy facade lifecycle
+  imports that same factory. Takeover and planned-stop intent take precedence over
+  planned restart, and a bare SIGTERM remains unplanned. Regressions:
+  `tests/gateway/test_bootstrap_shutdown_signal.py`,
+  `tests/gateway/test_restart_loop_guard.py`, and
+  `tests/hermes_cli/test_gateway_restart_loop.py`.
 
 The `routine-restart-resume-note` patch also covers background process completion
 notices and delegation interruption/recovery text in

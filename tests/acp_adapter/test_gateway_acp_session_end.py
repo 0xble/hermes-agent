@@ -14,7 +14,7 @@ async def test_last_viewer_or_shutdown_ends_only_idle_acp_sessions(tmp_path, mon
     from gateway.config import GatewayConfig
     from gateway.run_runtime import settle_gateway_runtime
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Submission
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
@@ -83,7 +83,7 @@ async def test_acp_session_left_mid_turn_ends_once_its_fifo_drains(tmp_path, mon
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Submission
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session

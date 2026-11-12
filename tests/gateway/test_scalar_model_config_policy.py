@@ -10,7 +10,7 @@ async def test_scalar_model_config_creates_sessions(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_policy import restore_policy
     from hermes_state_local import local_receipt

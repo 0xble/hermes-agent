@@ -261,8 +261,8 @@ def foreign_runtime_owner(home: Path, *, successor: bool = False) -> bool:
     does hold: a slot-b process that booted active beside a serving slot a must not take a's epoch.
     A sibling that answers as an unpromoted standby begins no epoch, so it does not block. The one
     other allowance is ``successor``, which only a zero-cut promotion passes: its predecessor still
-    holds slot a while it finishes its in-flight turns. A home nobody holds (an offline store, a
-    test's temporary home) is open: the next owner's own begin supersedes such an epoch.
+    holds slot a while it finishes its in-flight turns. This is a foreign-owner refusal, not
+    permission to write: assert_runtime_epoch_owner separately requires an exact-home reservation.
     """
     from gateway.gateway_slot import SLOT_ACTIVE, SLOT_STANDBY, slot_lock_held
     home = canonical_home(home)
@@ -277,6 +277,27 @@ def foreign_runtime_owner(home: Path, *, successor: bool = False) -> bool:
 
 
 _maintenance = threading.local()
+
+
+@contextmanager
+def assert_runtime_epoch_owner(db_path):
+    """Pin this process's exact-home ownership through an epoch write.
+
+    Maintenance authority is synchronous and thread-local. Holding the owner's
+    mutex prevents another thread from releasing the reservation mid-write.
+    """
+    home = Path(db_path).expanduser().resolve().parent
+    owners = [process_ownership]
+    state = getattr(_maintenance, 'state', None)
+    if state is not None and state[0] == os.getpid():
+        owners.append(state[1])
+    for owner in owners:
+        with owner._mutex:
+            if owner.owns(home):
+                yield
+                return
+    from hermes_state_runtime import RuntimeStoreError
+    raise RuntimeStoreError('not_owner')
 
 
 def maintenance_holder(home: Path, purpose: str) -> dict | None:

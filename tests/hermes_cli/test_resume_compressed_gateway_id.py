@@ -38,7 +38,7 @@ def _compress(db, parent, child, source):
 
 
 async def _compressed(tmp_path):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
     authority = await initialize_session_authority(_runner(tmp_path), profile_id='fixture', instance_id='first')

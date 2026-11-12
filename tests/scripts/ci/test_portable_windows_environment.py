@@ -1,5 +1,6 @@
 """The hermetic native Windows environment distinguishes missing and empty module paths."""
 
+import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -31,6 +32,9 @@ def test_native_windows_environment_preserves_or_defaults_module_path(tmp_path, 
     env = portable.environment(tmp_path / "isolated")
 
     assert env["PSModulePath"] == (module_path if module_path is not None else "")
+    drive = os.environ.get("SystemDrive") or os.environ.get("SYSTEMDRIVE")
+    assert drive, "Windows CI must expose SystemDrive so Common AppData does not resolve inside the checkout"
+    assert env["SYSTEMDRIVE"] == drive
 
 
 @pytest.mark.parametrize("host", ["powershell", "pwsh"])

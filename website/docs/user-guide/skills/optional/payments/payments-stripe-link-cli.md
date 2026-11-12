@@ -143,7 +143,8 @@ For MPP merchants add `--credential-type shared_payment_token`.
 
 ### 5. Retrieve the credential — SECURELY
 
-**Do not print card details to stdout.** Use `--output-file` so the PAN never enters the agent's transcript or logs:
+Retrieve the approved Link one-time card, not a different card from a password
+manager. Use `--output-file` rather than printing the raw credential to stdout:
 
 ```
 link-cli spend-request retrieve <lsrq_id> \
@@ -152,11 +153,18 @@ link-cli spend-request retrieve <lsrq_id> \
   --format json
 ```
 
-The file is written with `0600` perms; stdout shows only redacted fields (brand, last4, expiry) plus a `card_output_file` path.
+The file is written with `0600` permissions; stdout contains redacted metadata and
+its path. Keep the spend-request ID for native MPP use below.
 
 ### 6. Use the credential
 
-- For web checkout: hand the file path to the user, OR pass it to a browser-driving tool that fills the form directly from disk. Never `read_file` or `cat` the card file into the agent's reasoning context.
+- For web checkout: use the retrieved Link one-time card for this approved charge
+  on the verified merchant checkout and its expected processor frame. A supported
+  disk-to-field fill is preferred; direct entry with `browser_type` or `fill_input`
+  is also authorized. Reading the retrieved card for direct entry exposes it to
+  model context, the session record and provider logs; the owner accepts that
+  exposure. Never repeat it in replies, commits, shell arguments or extra files.
+  Do not retry or route around a denied or unanswered Link approval.
 - For MPP merchants:
 
   ```
@@ -168,11 +176,14 @@ The file is written with `0600` perms; stdout shows only redacted fields (brand,
 
 ### 7. Clean up
 
-Delete the card file as soon as the purchase is done:
+Delete the retrieved card file as soon as the purchase is done:
 
 ```
 rm -f ~/.hermes/cache/scratch/link-card.json
 ```
+
+Verify the merchant receipt without reading back entered secrets; never retry a
+declined payment.
 
 ## Optional: run as an MCP server instead
 
@@ -187,7 +198,7 @@ Then `hermes mcp list` should show `stripe-link`. The same approval rules apply 
 ## Pitfalls
 
 - **US-only.** Outside the US, `auth login` will fail. Tell the user, don't keep retrying.
-- **Card PAN must never enter agent context.** Use `--output-file` every time. If you've already retrieved without it, immediately `link-cli auth logout` is not enough — the card is one-time-use but rotate hygiene matters.
+- **Use the approved Link credential.** Direct entry of the retrieved one-time card is authorized; model/session exposure is accepted for that route. Never substitute a password-manager card or repeat the values in replies, commits, shell arguments or extra files.
 - **`--request-approval` blocks until the user acts.** If the user is asleep, the CLI will hit its timeout. Set expectations.
 - **Multi-step `_next` commands.** Some commands return `_next.command` that must be executed to continue. When in doubt, prefer the inline-polling flags (`--interval`/`--timeout`).
 - **Output format defaults to `toon`** in non-TTY mode. Fine for prose, but if a downstream step needs to parse a specific field, pass `--format json`.

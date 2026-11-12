@@ -276,10 +276,11 @@ class GatewayAgentCacheMixin:
 
     async def _rehydrate_session_model_override_async(self, session_key: str) -> None:
         """Serialize restart hydration with route edits, publishing only on the loop."""
+        from gateway.session_store_async import run_store_lookup
         async with self._session_model_override_lock(session_key):
             if self._session_model_override(session_key) is None:
                 epoch = self._session_model_override_epoch(session_key)
-                loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
+                loaded = await run_store_lookup(self, "_load_session_model_override", session_key)
                 self._commit_session_model_override(session_key, loaded, epoch)
 
     def _rehydrate_session_model_override(self, session_key: str) -> None:
@@ -303,14 +304,14 @@ class GatewayAgentCacheMixin:
         store = getattr(self, "session_store", None)
         if store is None:
             return
+        from gateway.session_store_async import run_store_lookup
         async with self._session_model_override_lock(session_key):
             state = self._session_state(session_key)
             if state.conversation.model_role is None:
-                state.conversation.model_role = await asyncio.to_thread(
-                    store.get_model_role, session_key)
+                state.conversation.model_role = await run_store_lookup(store, "get_model_role", session_key)
             if self._session_model_override(session_key) is None:
                 epoch = self._session_model_override_epoch(session_key)
-                loaded = await asyncio.to_thread(self._load_session_model_override, session_key)
+                loaded = await run_store_lookup(self, "_load_session_model_override", session_key)
                 self._commit_session_model_override(session_key, loaded, epoch)
 
     def _load_session_model_override(self, session_key: str) -> tuple[Optional[dict], str]:
@@ -609,9 +610,6 @@ class GatewayAgentCacheMixin:
             model_role = state.conversation.model_role if reason == "resume" else None
             state.conversation.clear()
             state.conversation.model_role = model_role
-        # A /delegation backend pick is conversation-scoped like /model's, but lives with the backends.
-        from agent.delegation_backends import set_session_backend
-        set_session_backend(session_key, None)
         # Legacy plain-dict stores still in _CONVERSATION_SCOPED_STATE (not yet folded into
         # SessionState), e.g. _pending_model_notes. SessionState-backed names resolve to MutableMapping
         # views (not dict), so the isinstance(dict) guard skips them — already handled above.
@@ -1096,7 +1094,6 @@ class GatewayAgentCacheMixin:
         ``release_after_turn``: an agent still mid-turn is released when that turn's running slot
         clears (``_release_running_agent_state``) instead of being left to the garbage collector.
         """
-        from gateway.run import _AGENT_PENDING_SENTINEL
         # Prompt-stability state rides the agent-cache lifecycle: a fresh agent must re-render its
         # session-context bytes (the pin) and re-see the current voice-channel state once.
         state = self._peek_session_state(session_key)
@@ -1114,6 +1111,16 @@ class GatewayAgentCacheMixin:
             _cache = getattr(self, "_agent_cache", None)
             if _cache is not None:
                 evicted = _cache.pop(session_key, None)
+        self._release_evicted_entry(session_key, evicted, state, commit_memory=commit_memory,
+                                    release_after_turn=release_after_turn)
+
+    def _release_parked_incognito_agent(self, session_key: str, parked: Any) -> None:
+        """Retire the pre-incognito agent that /new will never restore, exactly as an eviction would."""
+        self._release_evicted_entry(session_key, parked, self._peek_session_state(session_key))
+
+    def _release_evicted_entry(self, session_key: str, evicted: Any, state: Any, *,
+                               commit_memory: bool = False, release_after_turn: bool = False) -> None:
+        from gateway.run import _AGENT_PENDING_SENTINEL
         agent = _first_agent(evicted)
         # Never tear down an agent that's mid-turn — its client, sandbox and child subagents are in use.
         # Running fallback drift and mid-turn /model pop the cache entry here; the turn worker owns

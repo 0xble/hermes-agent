@@ -198,7 +198,8 @@ async def _native_turn_across_activation(tmp_path, profile_home):
     owner and switch the process to multi-profile hosting while the turn is running."""
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
-    from gateway.session_authority import LiveSession, initialize_session_authority
+    from gateway.session_authority import LiveSession
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from tui_gateway.launch_profile_policy import activate_multi_profile_hosting
 

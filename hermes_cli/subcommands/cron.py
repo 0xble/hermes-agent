@@ -174,9 +174,20 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
 
     for job_parser in (cron_create, cron_edit):
         job_parser.add_argument(
+            "--max-catch-up-lateness-seconds", type=float, default=None,
+            help="Maximum scheduled catch-up lateness in finite nonnegative seconds. "
+                 "0 allows no lateness; unset means legacy unlimited catch-up.",
+        )
+        job_parser.add_argument(
             "--keep-pinned-lane", action=argparse.BooleanOptionalAction, default=None,
             help="Keep explicit delivery targets pinned instead of converting them to the subject lane.",
         )
+
+    cron_edit.add_argument(
+        "--clear-max-catch-up-lateness", dest="max_catch_up_lateness_seconds",
+        action="store_const", const="", default=None,
+        help="Clear the catch-up lateness limit and restore legacy unlimited catch-up.",
+    )
 
     # lifecycle actions
     cron_pause = cron_subparsers.add_parser("pause", help="Pause a scheduled job")

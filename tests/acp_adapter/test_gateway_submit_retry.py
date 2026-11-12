@@ -8,7 +8,8 @@ import pytest
 from acp_adapter.gateway_server import GatewayACPAgent
 from gateway.config import GatewayConfig, Platform
 from gateway.session import SessionSource, SessionStore
-from gateway.session_authority import LiveSession, initialize_session_authority
+from gateway.session_authority import LiveSession
+from tests.fakes.runtime_owner import initialize_session_authority
 from gateway.session_controls import AuthorityConnection
 from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError
 from hermes_state_runtime import list_session_admissions

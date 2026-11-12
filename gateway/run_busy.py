@@ -13,6 +13,7 @@ import asyncio
 import contextlib
 import contextvars
 import functools
+import inspect
 import json
 import os
 import time
@@ -20,7 +21,7 @@ from agent.i18n import DEFAULT_LANGUAGE, t
 from agent.session_activity import format_iteration_progress
 from gateway.config import Platform
 from gateway.platforms.base import EphemeralReply
-from gateway.platforms.event import MessageEvent, MessageType
+from gateway.platforms.event import MessageEvent, MessageType, turn_origin_for_event
 from gateway.response_filters import (
     apply_agent_origin_reply_expectation,
     is_agent_origin_text,
@@ -33,6 +34,16 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
     from gateway.run import GatewayRunner
     from gateway.run_turn_runner import TurnRunner
+
+
+def _call_with_steer_delivery(method, text: str, on_delivered=None) -> bool:
+    """Native controls report insertion. Legacy controls expose acceptance only."""
+    if on_delivered is not None and "on_delivered" in inspect.signature(method).parameters:
+        return bool(method(text, on_delivered=on_delivered))
+    accepted = bool(method(text))
+    if accepted and on_delivered is not None:
+        on_delivered()
+    return accepted
 
 
 def approval_input_words(input_key: str) -> tuple[str, ...]:
@@ -147,6 +158,21 @@ class GatewayBusySessionMixin:
             adapter._pending_messages[session_key] = overflow.pop(0)
         # else: no adapter — leave the head in place so we don't silently drop it.
         return pending_event
+
+    def _take_wake_admitted_before_drain(self, session_key: str, adapter: Any) -> Optional[MessageEvent]:
+        """Pop the first wake admitted before the drain began from the pending slot, else from the
+        overflow FIFO, keeping the slot filled while overflow remains; every other event stays
+        queued. Its producer holds a receipt and will not retry it, so a follow-up ahead of it that
+        the drain rejects must not strand it."""
+        slot = getattr(adapter, "_pending_messages", None)
+        if slot and getattr(slot.get(session_key), "_admitted_before_drain", False) is True:
+            return self._promote_queued_event(session_key, adapter, slot.pop(session_key))
+        overflow = self._overflow_queue(session_key) or []
+        for index, event in enumerate(overflow):
+            if event._admitted_before_drain is True:
+                return overflow.pop(index)
+        return None
+
 
     def _queue_depth(self, session_key: str, *, adapter: Any = None) -> int:
         """Total pending /queue items for a session — slot + overflow."""
@@ -331,11 +357,15 @@ class GatewayBusySessionMixin:
                 logger.warning("Steer into subagent %r failed: %s", getattr(child, "_delegate_id", child), exc)
         return accepted
 
-    def _steer_running_agent(self, running_agent: Any, text: str) -> bool:
+    def _steer_running_agent(self, running_agent: Any, text: str, *, on_delivered=None) -> bool:
         """``running_agent.steer(text)`` plus fan-out to its active subagents (see
         :meth:`_steer_active_subagents`); True when the parent or any child queued it."""
-        accepted = bool(running_agent.steer(text))
-        return bool(self._steer_active_subagents(running_agent, text)) or accepted
+        accepted = _call_with_steer_delivery(running_agent.steer, text, on_delivered)
+        child_accepted = bool(self._steer_active_subagents(running_agent, text))
+        if child_accepted and not accepted and on_delivered is not None:
+            # Child-only acceptance: the parent never owns the text, so its callback will not fire.
+            on_delivered()
+        return child_accepted or accepted
 
     async def _session_has_compression_in_flight(self, session_key: str) -> bool:
         """True when a compression lock is held for this session's id (callers demote interrupt →
@@ -391,6 +421,11 @@ class GatewayBusySessionMixin:
         """
         if not await self._session_has_compression_in_flight(session_key):
             return False
+        from gateway.session_results import record_compression_deferral
+        if record_compression_deferral(session_key):
+            # Restored native events retain their durable claim, never a RAM slot.
+            event._gateway_compression_deferred = True
+            return True
         # A retry bounce of an input already held for this episode is older than
         # anything queued since. Keep it at the head instead of requeueing it last.
         prepend = prepend or bool(getattr(event, "_gateway_compression_deferred", False))
@@ -601,22 +636,27 @@ class GatewayBusySessionMixin:
             return reply_anchor if event.source.chat_type == "dm" else None
         return None if getattr(event, "internal", False) else event.message_id
 
-    async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False) -> None:
-        """Send a busy-path reply anchored to the event (thread metadata included)."""
+    async def _send_busy_reply(self, event: MessageEvent, adapter, content: str, *, plain_anchor: bool = False,
+                               temporary: bool = False) -> None:
+        """Send a busy-path reply anchored to the event (thread metadata included). A *temporary* one
+        is deleted once the event's own turn has delivered its reply (``release_temporary_notices``)."""
         reply_anchor = self._reply_anchor_for_event(event)
-        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class
+        from gateway.platforms.base import OUTBOUND_NOTICE, outbound_class, track_temporary_notice
         from agent.notice_style import notice_metadata
 
         async def labelled_send():
             # A busy reply is a non-final notice: the first shed after cosmetics when the chat's
             # daily volume runs low. The label is set where the send runs, including a spawned task.
             with outbound_class(OUTBOUND_NOTICE):
-                return await adapter._send_with_retry(
+                result = await adapter._send_with_retry(
                     chat_id=event.source.chat_id, content=content,
                     reply_to=reply_anchor if plain_anchor else self._busy_reply_to(event, reply_anchor),
                     metadata=notice_metadata(self._thread_metadata_for_source(event.source, reply_anchor),
                                              platform=event.source.platform, style=getattr(content, "notice_style", None)),
                 )
+            if temporary:
+                track_temporary_notice(event, adapter, result)
+            return result
 
         send = labelled_send()
         # On the platform's update consumer, never wait out the chat's outbound budget: every later
@@ -782,9 +822,7 @@ class GatewayBusySessionMixin:
                 steered = self._try_agent_verb(
                     running_agent, "steer", steer_text, session_key, event=event
                 )
-            if steered:
-                self._fold_into_running_turn(running_agent, session_key, event)
-            elif not redirected:
+            if not steered and not redirected:
                 effective_mode = "queue"
         elif (
             effective_mode == "interrupt" and plain_text and agent_live
@@ -810,9 +848,13 @@ class GatewayBusySessionMixin:
         """Call ``running_agent.<verb>(text)`` (steer/redirect); False + warning on failure."""
         try:
             call_text = self._steer_text_with_origin(text, event) if event else text
+            on_delivered = (
+                functools.partial(self._fold_into_running_turn, running_agent, session_key, event)
+                if event is not None else None
+            )
             if verb == "steer":
-                return self._steer_running_agent(running_agent, call_text)
-            return bool(getattr(running_agent, verb)(call_text))
+                return self._steer_running_agent(running_agent, call_text, on_delivered=on_delivered)
+            return _call_with_steer_delivery(getattr(running_agent, verb), call_text, on_delivered)
         except Exception as exc:
             logger.warning("Gateway %s failed for session %s: %s", verb, session_key, exc)
             return False
@@ -827,8 +869,8 @@ class GatewayBusySessionMixin:
         """
         if not self._try_agent_verb(running_agent, "redirect", text, session_key, event=event):
             return False
-        turn = self._fold_into_running_turn(running_agent, session_key, event)
-        if turn is None:
+        turn = self._session_state(session_key).turn
+        if turn.agent is not running_agent:
             return True  # a newer turn already owns the slot; never re-anchor it
         anchor = self._reply_anchor_for_event(event)
         inbound_id = str(event.message_id) if event.message_id else None
@@ -848,9 +890,21 @@ class GatewayBusySessionMixin:
         if turn.agent is not running_agent:
             return None
         if turn.event is not None and turn.event is not event:
+            apply_agent_origin_reply_expectation(event)
+            human_reply = (event.reply_expected is not False and turn_origin_for_event(event) == "user"
+                           and not is_agent_origin_text(event.text))
             turn.event.absorb_reply_expected(event)
+            # Goal/loop openers retain False when absorbing unknown adapter addressing. A real
+            # human takeover still needs the normal human fallback, including on those turns.
+            if human_reply and turn.event.reply_expected is False:
+                turn.event.reply_expected = event.reply_expected
             if turn.ctx is not None:
                 turn.ctx.reply_expected = turn.event.reply_expected
+                if human_reply:
+                    turn.ctx.terminal_reply_metadata.update({
+                        "queued_terminal_display_kind": None,
+                        "queued_terminal_reply_expected": turn.ctx.reply_expected,
+                    })
             # The agent read reply_expected at turn start; a folded-in human message must reach
             # its final-response recovery too, or a contentless stop resolves to silence.
             if hasattr(running_agent, "_turn_reply_expected"):
@@ -951,6 +1005,9 @@ class GatewayBusySessionMixin:
             head, tail = t("gateway.busy.interrupting_head"), t("gateway.busy.interrupting_tail")
         from agent.notice_style import ContextNotice
         message = ContextNotice(t("gateway.busy.ack", head=head, detail=status_detail, tail=tail))
+        # A queued or interrupting follow-up becomes a turn of its own, so its ack is status that
+        # goes once that turn's reply is delivered. A steer folds into the running turn: it stays.
+        message._temporary = not (is_steer_mode or is_redirect_mode)
 
         # One-time onboarding hint about the queue/interrupt knob (flag persisted to config.yaml).
         try:
@@ -962,7 +1019,7 @@ class GatewayBusySessionMixin:
                     else "redirect" if is_redirect_mode
                     else "interrupt"
                 )
-                message = ContextNotice(f"{message}\n\n{busy_input_hint_gateway(_hint_mode)}")
+                message = ContextNotice(f"{message}\n\n{busy_input_hint_gateway(_hint_mode)}")  # stays: a one-time hint
                 mark_seen(_hermes_home / "config.yaml", BUSY_INPUT_FLAG)
         except Exception as _onb_err:
             logger.debug("Failed to apply busy-input onboarding hint: %s", _onb_err)
@@ -970,7 +1027,7 @@ class GatewayBusySessionMixin:
 
     async def _send_busy_ack_reply(self, event: MessageEvent, adapter, message: str) -> None:
         try:
-            await self._send_busy_reply(event, adapter, message)
+            await self._send_busy_reply(event, adapter, message, temporary=getattr(message, "_temporary", False))
             event._gateway_busy_ack_sent = True
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
@@ -1491,20 +1548,20 @@ class GatewayBusySessionMixin:
             return await _queue_fallback(t("gateway.steer.queued_starting"))
         if not running_agent or not hasattr(running_agent, "steer"):
             return await _queue_fallback(t("gateway.steer.queued_no_agent"))
+        # Normalize before submission: insertion can happen on the worker before steer() returns.
+        silent_relay = is_agent_origin_text(steer_text) and event.reply_expected is not True
+        if silent_relay:
+            event.reply_expected = False
         try:
-            accepted = self._steer_running_agent(running_agent, self._steer_text_with_origin(steer_text, event))
+            accepted = self._steer_running_agent(
+                running_agent, self._steer_text_with_origin(steer_text, event),
+                on_delivered=functools.partial(self._fold_into_running_turn, running_agent, quick_key, event),
+            )
         except Exception as exc:
             logger.warning("Steer failed for session %s: %s", quick_key, exc)
             return t("gateway.steer.failed", error=exc)
         if not accepted:
             return t("gateway.steer.rejected_empty")
-        # Admission saw "/steer <header>", so mark agent origin on the stripped text before the
-        # fold; otherwise absorbing an unknown expectation resets a relay turn's False to None.
-        # An explicitly addressed relay (True) keeps its expectation and its ack.
-        silent_relay = is_agent_origin_text(steer_text) and event.reply_expected is not True
-        if silent_relay:
-            event.reply_expected = False
-        self._fold_into_running_turn(running_agent, quick_key, event)
         if silent_relay:
             return None
         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")

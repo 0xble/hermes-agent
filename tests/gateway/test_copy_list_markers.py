@@ -42,7 +42,7 @@ def test_list_marker_boundaries_match_on_every_copy_surface(prefix, newline):
     assert map_outside_copy_blocks(text, str.upper) == ordinary.upper() + "".join(body + newline for body in bodies) + "AFTER"
     protected, tokens = protect_inline_copy_bodies(text)
     assert restore_inline_copy_bodies(protected, tokens) == inline
-    for platform, shown, copies in (("telegram", remaining, bodies), ("discord", inline, [])):
+    for platform, shown, copies in (("telegram", copy_free_text_for(SimpleNamespace(platform="telegram"), text), bodies), ("discord", inline, [])):
         adapter = SimpleNamespace(platform=platform)
         shown_protected, extracted, tokens = split_copy_blocks_protected(adapter, text)
         assert restore_inline_copy_bodies(shown_protected, tokens) == shown

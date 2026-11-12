@@ -118,7 +118,13 @@ loops:
   max_ticks: 100                 # backstop budget (0 = unlimited)
   self_paced_floor_seconds: 60   # self-paced starting cadence
   self_paced_ceiling_seconds: 86400  # self-paced max backoff (default: 24h; overrides still apply)
+  notices: true                  # false hides loop outcome cards and loop_set receipts; hidden also hides approval cards and control receipts
+  autonomy: false                # true lets the agent run its loop lifecycle without your quotes
 ```
+
+`loops.autonomy` (fork setting) lets the agent revise any field, replace the loop, pause it, resume its own pause, and finish it, without quoting you. The interval floors and `max_ticks` still apply: a replacement keeps counting ticks, and neither a replacement nor a resume fires sooner than the interval allows. Only you can clear a loop, or resume or end a pause you made, including Ctrl+C and backstop pauses.
+
+With `loops.notices: hidden`, a loop that stalls (backstop pause or an unachievable stop condition) wakes the agent instead of posting a card, so it can fix it or tell you.
 
 Self-paced unchanged replies use the same quiet backoff ladder as goals: 15m, 1h, 4h, then 24h. A changed reply or trusted external event resets the loop to its configured floor.
 

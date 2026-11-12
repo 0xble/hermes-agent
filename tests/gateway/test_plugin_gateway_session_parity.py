@@ -20,7 +20,8 @@ from tests.waiting import async_wait_until
 async def test_keyless_injection_from_a_cli_session_turn_lands_in_that_session(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_context import set_session_vars
     from gateway.session_contract import Principal
     from gateway.session_local import create_local_session
@@ -71,7 +72,7 @@ async def test_keyed_local_injection_stays_inside_the_plugins_own_profile(tmp_pa
     from gateway.session_local import create_local_session
     from gateway.session_policy import _ACTIVE_POLICY
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     launch = tmp_path / ".hermes"
     beta = launch / "profiles" / "beta"

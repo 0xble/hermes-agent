@@ -5,6 +5,38 @@ the browser vault fill tool, or the 1Password backends.
 
 - Fork patch identity: `vault-origin-aliases`.
 
+## Native Browser Extraction Boundary
+
+Upstream main `69f73ec5f11f5a945cc864f29c4e2ad2307eaec3` extracts the native
+browser and Camofox into catalog plugins. Keep the maintained native owner until
+an extracted provider preserves named identity resolution, vault authorization,
+and authenticated browser-controller ownership together. Do not mix its session
+cache or lifecycle with the extracted browser-session owner, and do not install
+a second Camofox provider during configuration migration. Preserve
+`browser.backend` and `browser.extension_control` while adopting the upstream
+launcher-setting migration. The Camofox no-install and v52 migration regressions
+exercise that intentional fork contract rather than upstream's removal policy.
+Delist `plugin-catalog/camofox.yaml` while this native owner remains: its declared
+`browser_*` tools collide with the retained built-ins. This is the catalog's
+superseded-entry delisting route, not a blocklist entry or a collision-check
+exception. Restore the entry only together with an equivalent native extraction.
+Keep plugin admission and install-time collision checks unchanged.
+
+Controller and isolation fixtures must exercise `tools.browser_tool_cdp` and
+`tools.browser_tool_lifecycle`, the retained native owners, not the extracted
+`browser_session_*` modules. Keep both origin checks and guarded backend
+`fill_context` behavior in vault fixtures. The migrated `browser.headed` value
+belongs to the active profile, so a legacy process-wide headed environment
+variable must not retain a headless profile's browser. Browser Use child
+environments pass through the shared credential scrubber before adding their
+nonsecret CLI settings. Lazy toolset discovery must load native registrations
+without enabling a profile-disabled backend.
+
+Adopt upstream vault `fill_context`, guarded metadata snapshots, and protected
+OTP writes around the native origin and account checks. Attribute Browser Use
+metrics to the session that served the call, including cloud-to-local fallback,
+without changing the native browser or its consent surface.
+
 ## Required behavior
 
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.
@@ -57,8 +89,12 @@ the browser vault fill tool, or the 1Password backends.
   current page origin at fill time and the existing payment confirmation names that origin;
   local-vault cards keep their saved-origin binding. A card handle never resolves as a login.
 - A payment fill prompts only after the origin check and a stamped inspection find a card-number
-  target. A page without one returns `no_payment_fields` and never asks: card inputs in a payment
-  processor's cross-origin frame are unreachable by design. That inspection only decides whether to
+  target in the page or an approved processor document. A page without one returns
+  `no_payment_fields` and never asks. Cross-origin hosted fields require the narrow
+  exact-origin/document-bound companion capabilities in [vault payment controls](vault-payment-controls.md),
+  not a page-wide fallback. [Camofox PR54](https://github.com/0xble/camofox-browser/pull/54)
+  merged as `58f1d0a9fcde563eaf7902de4afcc75b67005b07`; source merge alone does not
+  establish availability in the running companion. That inspection only decides whether to
   ask. After consent the page is inspected again with a fresh nonce, and only those stamps are
   written. Card consent is one-shot: the prompt offers Allow Once and Deny, and a session or
   permanent answer never approves or consumes it (adopted from upstream PR 118429).
@@ -80,7 +116,12 @@ the browser vault fill tool, or the 1Password backends.
 - Payment PAN and CVC remain profile-global exact-value redactions. Name, expiry month/year
   (including padded/unpadded month and four-/two-digit year), and billing ZIP use whole-token
   redaction only on the filled browser session and origin. Neither terminal/log output nor
-  other tabs/origins inherit these low-entropy matches; card fills do not trigger the
+  other tabs/known unrelated origins inherit these low-entropy matches. If either
+  registration or read-time origin is unavailable, protect the owning tab until
+  cleanup, including snapshot redaction before truncation and cache writes.
+  Omitted tab scope is not the browser task named `default`: generic output
+  redactors must not acquire that task's short card values.
+  Birthday components retain their existing tab-wide semantics. Card fills do not trigger the
   protected-birthday pixel quarantine. Browser close (including a failed card-only
   close that releases session resources), force-reap, and timed-out generation discard
   clear the scoped card metadata so a reused task key cannot inherit it. Protected
@@ -106,6 +147,24 @@ the browser vault fill tool, or the 1Password backends.
   interactive session); a missing token raises instead of listing empty. Invalid, duplicate,
   or token-sharing entries are skipped. `browser_account` pins fills and one-time codes to a
   task bound to that named Camofox account, checked before any secret is resolved.
+- Login and one-time-code fills tick one visible, enabled "Remember me"-style checkbox
+  (remember me, keep/stay signed in, trust this device/browser, don't ask again) in the
+  filled field's own form or tight container, with a real click, inside the exact-origin
+  assertion, and report `remembered`. Marketing, terms, consent, privacy, cookie and
+  public-computer boxes are never ticked. `vault.remember_logins` (default on) maps browser
+  account aliases to booleans with a `default` key, so an identity can keep logins
+  unremembered. A per-call `remember: false` further opts out; it never overrides an
+  identity opt-out or unchecks an already-checked box. Password and automatic-code
+  writes, including the checkbox click, stay inside the backend's guarded
+  `fill_context` after the exact-origin pre-check and metadata snapshot re-check.
+- Fork patch identity: `vault-remember-logins` (local, no upstream submission).
+- Contract test: `tests/tools/test_browser_vault_remember.py` (real Chromium).
+
+The shared fill template keeps checkout's final value-blind readback, per-event
+authority checks, `retain_stamps`, and non-mutating `verify_only` mode. Remember
+selection applies only to password/code tokens, never checkout or address controls.
+Its click revalidates the credential's origin, inspection stamp, and liveness
+before input/change events.
 
 ## Provenance and patches
 
@@ -215,7 +274,60 @@ the browser vault fill tool, or the 1Password backends.
   PAN formatting, issue dates and masked CVV). Roll back the bundle's small commits bearing
   the existing identities; do not retire the surrounding fork features.
 
+## Direct typed-card privacy
+
+Fork patch identity: `browser-typed-card-privacy` (fork-only). Direct
+`browser_type` registers PANs before either transport injects them. CVC and
+expiry require the existing checkout field classifier and stay scoped to the
+filled session/origin; standalone matching values on other pages remain usable.
+This does not authorize a payment, change secret-source policy, or remove the
+accepted model-context/session-record exposure of direct entry.
+
+The existing browser egress boundary scrubs registered strings and numeric
+leaves even without scoped components, preserving element refs and unrelated
+ordinals. Agent-browser fills send literal input through batch stdin, never
+argv or a staging file. CLI output is bounded in memory; inherited daemon
+handles are drained without waiting for daemon exit or retaining late output.
+Raw stdout/stderr and malformed/timeout diagnostics are not logged.
+
+- Candidates accepted by this owner include compact `MMYY` or `MMYYYY` (four or
+  six ASCII digits with a valid month) and slash-separated `MM/YY` or `MM/YYYY`.
+  Entries register their raw spelling plus month/year components before injection.
+  The shared `agent/redact.py` owner derives equivalent matches from each validated
+  `expiry` composite at egress, rather than registering generated strings that would
+  consume the bounded registry and evict unrelated entries. Accepted composites use
+  ASCII digits, a month from 1 through 12, and a 2- or 4-digit year, separated
+  by a slash with optional whitespace or compact with a padded month. Matching
+  covers padded/unpadded months, slash spacing and compact forms, retaining the
+  original year or its 2-digit suffix without inferring a century. Numeric leaves
+  use the existing integer/float normalization, including lost leading zeros.
+  Whole-token composite matches precede component masks so a month/year cannot
+  partially consume the expiry first. Invalid composites retain literal masking
+  without inferred equivalents. Profile, task, origin and cleanup filtering remain
+  unchanged, as does literal backend input. Labels such as `Expiration date`,
+  `Expiration (MM/YY)`, and `MM/YY` already share the checkout classifier; issue
+  dates, search fields and order numbers still do not register card metadata.
+
+Verify with `scripts/run_tests.sh tests/tools/test_browser_typed_card_privacy.py
+ tests/tools/test_browser_typed_expiry_privacy.py
+ tests/tools/test_browser_typed_card_expiry.py tests/tools/test_browser_open_timeout.py
+ tests/agent/test_browser_output_egress.py` and the browser transport, cleanup,
+redaction and PM fixture regressions. Windows pipe behavior needs the native
+Windows-marked test; macOS does not qualify that branch. No live account or
+card is required. Retire when released upstream preserves this transport and
+egress contract; roll back this patch as a unit, not the existing vault policy
+or protected-field guards.
+
 ## Verification
+
+Keyed MCP trust consent accepts explicit Once, Session or Always and persists
+only its offered approval key. Unkeyed elicitation remains Once/Deny only.
+Unsupported broader answers leave gateway requests pending and decline in the
+CLI, never recording or granting a broader authorization. The keyed acceptance
+path must not reuse the unkeyed one-shot response filter.
+
+Contract tests: `tests/tools/test_mcp_trust_approval_scope.py`,
+`tests/gateway/test_mcp_consent_scope.py`, `tests/tools/test_mcp_trust_gating.py`.
 
 `scripts/run_tests.sh` on `tests/tools/test_browser_camofox_accounts.py`,
 `tests/agent/test_vault_connect.py`, `tests/agent/test_vault_backends.py`,
@@ -226,10 +338,17 @@ the browser vault fill tool, or the 1Password backends.
 `tests/agent/test_vault_onepassword_listing_quota.py` (counts `op` calls per list and fill),
 `tests/agent/test_onepassword_secrets.py` (last-good fallback, error classification,
 first-429 stop and cross-process cooldown),
-`tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`, and
+`tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_manager_card.py`,
+`tests/tools/test_browser_vault_remember.py`, and
 `tests/tools/test_vault_shadow_dom_live.py` (real headless Chrome), and for card consent
 `tests/gateway/test_mcp_consent_scope.py` and `tests/tools/test_mcp_trust_gating.py`. Check for synthetic
 `198.18.0.0/15` DNS answers before attributing a browser fixture failure to a regression.
+
+Direct typing classifies textbox, spinbutton, combobox and select roles through
+the shared checkout classifier. A standalone `CID` label is card-code evidence;
+an ambiguous `cid` DOM id/name alone is not, and `autocomplete=cc-csc` remains
+authoritative. Keep `test_checkout_cvc_targeting.py`, `test_browser_typed_card_origin.py`,
+and the typed-card privacy/expiry suites in the focused regression matrix.
 
 ## Retirement and rollback
 

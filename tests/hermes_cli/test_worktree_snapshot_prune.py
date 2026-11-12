@@ -83,6 +83,50 @@ def _set_worktrees_config(text):
     (home / "config.yaml").write_text(text, encoding="utf-8")
 
 
+@pytest.mark.parametrize("target", ["socket:[123]", "pipe:[456]", "anon_inode:[eventpoll]", "relative.txt"])
+def test_process_target_must_be_absolute_even_when_sweeper_cwd_is_in_tree(tmp_path, monkeypatch, target):
+    from hermes_cli.worktree_sweep import _inside
+
+    monkeypatch.chdir(tmp_path)
+    root = os.path.normcase(str(tmp_path.resolve()))
+    assert _inside(target, [root]) is None
+    assert _inside(str(tmp_path / "real.txt"), [root]) == root
+
+
+@pytest.mark.platforms("linux")
+def test_exit_archive_removes_tree_with_only_own_cwd_and_other_process_pseudo_fds(repo, monkeypatch):
+    from hermes_cli import worktree_sweep as sweep
+
+    wt = _tree(repo, "exit-pseudo-fds", dirty=True)
+    _idle(wt)
+    monkeypatch.chdir(wt)
+    # Keep the real /proc reader and exclude handling, but restrict links to an
+    # unrelated process's pipe/socket fds so ambient host work cannot affect it.
+    ready = repo.parent / "pseudo-fds-ready"
+    child = subprocess.Popen(
+        [sys.executable, "-c", "import os, pathlib, sys; "
+         "pathlib.Path(sys.argv[1]).touch(); sys.stdin.read()", str(ready)],
+        cwd=repo, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        from tests.waiting import wait_until
+        wait_until(ready.exists, timeout=10, what="pseudo-fd holder")
+        links = sweep._proc_links
+        monkeypatch.setattr(sweep, "_proc_links", lambda pid_dir: links(pid_dir)
+                            if int(pid_dir.name) in (os.getpid(), child.pid) else ())
+        # Our cwd really blocks ordinary reclaim, but not the exiting session.
+        assert os.getpid() in sweep.live_process_pids([str(wt)])[str(wt)]
+        ref, _, removed, why = sweep.archive_then_remove(
+            str(repo), str(wt), reason="exit", max_untracked_mb=50,
+            unlock=False, exclude_pids=(os.getpid(),))
+        monkeypatch.chdir(repo)
+        assert removed, why
+        assert not wt.exists()
+        assert _git(["show", f"{ref}:notes.md"], repo) == "uncommitted"
+    finally:
+        monkeypatch.chdir(repo)
+        child.communicate(timeout=10)
+
+
 def test_removed_dirty_tree_restores_byte_for_byte_and_archiving_never_touches_the_tree(repo):
     """I1 + I4: HEAD, staged, unstaged (CRLF) and untracked bytes survive delete -> restore,
     even under eol rules from info/attributes and core.attributesFile (which ``--attr-source``

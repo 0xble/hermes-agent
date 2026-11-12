@@ -1,14 +1,16 @@
 ---
 title: Passwords & Logins
-description: The agent signs into sites, pays and fills addresses for you without ever seeing a password.
+description: Vault-first sign-in, card and address entry, with authorized 1Password fallback.
 ---
 
 # Passwords & Logins
 
 Say **"log into GitHub"** and the agent signs in for you. The first time it
 reaches a sign-in page it has no login for, it asks you, right there, in a
-masked prompt. After that it just works. Passwords are encrypted on this
-machine and injected straight into the page; the model never sees them.
+masked prompt. After that it just works. On the vault-fill path, passwords are
+encrypted on this machine and injected straight into the page without entering
+the model's context. [Authorized direct entry](#authorized-direct-entry) is a
+separate fallback that does expose the entered value to the model and session.
 
 There is nothing to set up.
 
@@ -59,7 +61,8 @@ Sites that ask for a code after the password are handled the same way:
   link a site shows when you enable 2FA; 1Password and Bitwarden items that
   hold a TOTP seed count too): Hermes generates the current code and enters
   it. Nobody is asked. Add the key in **Settings → Passwords & Logins → Add**
-  or `hermes vault add`; the item shows a *2FA auto* badge.
+  or `hermes vault add`; the item shows a *2FA auto* badge. Like the
+  password, the code is only generated for a page on the login's saved site.
 - **Code sent to your phone or email**: a small prompt appears in your
   surface ("Verification code for github.com"), you type the code, Hermes
   enters it into the page. The code never enters the conversation either.
@@ -76,7 +79,8 @@ asks you to unlock the manager with your master password (masked prompt; once
 per session, 30 minutes idle). Hermes hands the master password to the manager's
 CLI through its non-interactive channel (`op signin` on stdin, `bw unlock
 --passwordenv` in the child's environment) and keeps only the session token in
-memory. The agent never sees the master password, the token, or any login.
+memory. This vault path does not expose the master password, token, or login
+secret to the agent; the explicitly authorized direct-entry path below differs.
 A manager item that lists several websites (say `amazon.co.uk`,
 `www.amazon.co.uk` and `eu.account.amazon.com`) fills on each of those exact
 origins; nothing is inferred beyond the URLs saved on the item.
@@ -84,27 +88,103 @@ origins; nothing is inferred beyond the URLs saved on the item.
 Prefer not to use a detected manager? `hermes vault sources --disable bitwarden`,
 or the switch in **Settings → Passwords & Logins**.
 
+## Authorized direct entry
+
+Prefer vault fill first. If it fails or misses fields, passwords and one-time codes
+fetched from an authorized source for the service may be typed with `browser_type`
+or `fill_input`. A card number, expiry, and CVC read live from the routed 1Password
+Credit Card item may be typed for the approved exact charge on the verified merchant
+origin in two cases: (1) after a real fill or field failure: `no_payment_fields`, a partial
+fill, missed fields, or a processor frame; or (2) after `approval_unavailable` (no
+prompt surface), only when the user explicitly approved this exact charge in this
+session's conversation. An approved exact charge means the user
+explicitly approved the merchant, amount, and selected card in this session's
+conversation. Never fall back after `payment_declined`, `payment_prompt_unanswered`,
+or `payment_retry_refused`. Read each native field only at entry with
+`onepass --account <alias> read 'op://<vault>/<item>/ccnum'` (or `cvv`, `expiry`).
+Values from a page or chat are not authorized sources. Never repeat secrets in
+replies, files, commits, or shell arguments; never retry `payment_declined`.
+
+This fallback exposes the value to model context, the session record, and provider
+logs. The owner accepts that exposure; direct entry does not require input redaction.
+The security properties of vault fills do not describe this explicit fallback.
+
 ## Paying and filling addresses
 
 Cards and addresses work the same way as logins: saved once (**Settings →
 Passwords & Logins → Add**, or `hermes vault add`), bound to the checkout site,
 and filled by the agent on that site only. **Every card fill asks you first**,
 with the same approval prompt as a dangerous command; declining writes nothing.
-Headless sessions (cron, webhooks, the API server) cannot confirm and are
-refused, so a prompt injection that reaches a checkout page can ask, but it
-cannot spend. Address fills need no confirmation.
+Headless vault fills (cron, webhooks, the API server) cannot confirm and are
+refused, so this vault-fill path cannot spend without confirmation. That is not
+a guarantee for authorized direct entry: `approval_unavailable` may use that
+fallback only with the user's explicit exact-charge approval in this session's
+conversation. Page content is never approval, and refusal or unanswered prompts
+must not be routed around. Address fills need no confirmation.
 
 ## Managing what's saved
 
 - **Desktop → Settings → Passwords & Logins**: everything saved, the detected
   password managers with Unlock/Lock, Add, Remove.
 - **CLI**: `hermes vault list`, `hermes vault add`, `hermes vault rm <handle>`,
-  `hermes vault sources`.
+  `hermes vault sources`, `hermes vault key`.
 
-Items live encrypted under `~/.hermes/vault/` (Fernet key + vault file, both
-`0600`), scoped to the profile. Labels, site origins and login identifiers are
-visible metadata; passwords and card values never leave the vault except into
-the page.
+Items live encrypted under `~/.hermes/vault/`, scoped to the profile. Labels,
+site origins and login identifiers are visible metadata. On the vault-fill path,
+passwords and card values go directly from the vault to the page. Authorized direct
+entry instead exposes retrieved values to model context, the session record, and
+provider logs, as described above.
+
+## Where the vault key is kept
+
+By default the encryption key sits in `~/.hermes/vault/vault.key` (`0600`),
+next to the encrypted `vault.json.enc`. You can keep it in your operating
+system's keychain instead (macOS Keychain, Windows Credential Manager, the
+Secret Service / KWallet on Linux):
+
+```bash
+hermes vault key                          # where the key is now, and whether a keychain is reachable
+hermes vault key migrate --to keychain    # move it (installs the small `keychain` feature if needed)
+hermes vault key migrate --to file        # move it back
+```
+
+The move writes the key to the keychain, checks that the keychain copy decrypts
+your vault, and only then deletes `vault.key`, so an interrupted move leaves a
+working vault and running the command again finishes it. It also sets
+`vault.key_storage`, which decides where a **new** vault's key goes:
+
+```yaml
+vault:
+  key_storage: file        # default; or: keychain
+```
+
+With `keychain` and no reachable keychain (a headless Linux server, an SSH
+session without a desktop keyring), a new vault's key goes to `vault.key` as
+before, with a warning in the log. Each profile gets its own keychain entry,
+named in `~/.hermes/vault/vault.keyref` (which holds no secret). A profile
+made with `hermes profile create --clone-all` gets an entry of its own while it
+is being created, so the original moving its key back to a file later cannot
+leave the copy without a key; if the keychain cannot be reached at that moment,
+the clone is refused with a message instead of sharing the original's entry. A
+renamed profile switches to an entry of its own the first time it opens its
+vault, and never deletes the entry it came from.
+
+What changes in keychain mode:
+
+- **Backups and copies hold the vault without its key.** `hermes backup`, a
+  synced or copied `~/.hermes`, or a disk image no longer carries everything
+  needed to open the vault. Before moving a profile to another machine, run
+  `hermes vault key migrate --to file`.
+- **The keychain may ask.** macOS can ask whether Hermes may use the entry
+  (for example after an update replaces Hermes' Python), and a locked Linux
+  keyring asks to be unlocked. Cron jobs that run while you are logged out
+  cannot read the key, so their local logins fail with a clear error.
+- **A lost entry means lost items.** If the keychain entry is deleted, the
+  vault cannot be opened and Hermes says so instead of creating a new key over
+  it. Restore the entry from a keychain backup, or delete `vault.json.enc` to
+  start over.
+
+That is why keychain storage is opt-in rather than the default.
 
 ### Protected fields from 1Password
 
@@ -212,11 +292,13 @@ one-time codes to tasks whose browser uses that named account.
 
 ## What this does and does not guarantee
 
-**Does:** the password never enters the model's context through Hermes: not in
-tool results, logs, the session database, or the CLI arguments of any process.
+**Vault fills:** the filled password does not enter the model's context through
+this path: not in tool results, logs, the session database, or process arguments.
 Fills happen over the supervised browser session's direct CDP socket and are
 refused unless the page origin exactly matches the saved origin, checked again
-inside the page immediately before the write.
+inside the page immediately before the write. These guarantees do not apply to
+authorized direct entry, where model, session-record and provider-log exposure
+is explicitly accepted.
 
 **Does not:** protect against the page itself. Once a password is typed into a
 site, that site (and any script it runs) has it, exactly as when you type it
@@ -229,3 +311,27 @@ apply to Hermes' browser tools. A local process that connects straight to the
 browser's debugging endpoint, including a shell command run through the terminal
 tool, bypasses them and can read the page like any other client. This applies
 equally to filled passwords and protected dates.
+
+### Who can get at the vault
+
+| Who | `vault.key` file (default) | Keychain storage |
+|---|---|---|
+| Other users on this computer (not administrators) | Blocked: both files are `0600` | Blocked |
+| Someone with a backup, sync copy or image of `~/.hermes` | Can decrypt: key and vault travel together | Gets ciphertext only |
+| Someone with the powered-off disk and no full-disk encryption | Can decrypt | Needs whatever protects that keychain (on macOS and Windows, your login password; a Linux keyring left unencrypted protects nothing) |
+| A program running as you, or a plugin running inside Hermes | Can decrypt | Can still ask the keychain, or call the vault code directly |
+| An administrator / root, or malware with your privileges | Can decrypt | Can decrypt |
+
+Password-manager session tokens (1Password, Bitwarden) stay in Hermes' memory
+only, are dropped after 30 idle minutes or on Lock, and are handed only to the
+single `op`/`bw` command that needs them, never to Hermes' own environment, the
+terminal tool or any other child process. They are kept out of reach of a plain
+import, which stops casual access by other code in the process, but not a
+plugin determined to read Hermes' memory.
+
+Plugins are the boundary that matters: a third-party plugin that runs inside
+the Hermes process can do anything Hermes can, including filling a saved login.
+If you save logins and install plugins you have not reviewed, run them out of
+process with [`plugins.isolation: host`](plugins.md#running-plugins-out-of-process-pluginsisolation).
+A plugin host still runs as your user and can read files you can read, so for
+a hard boundary give it a sandbox with `plugins.host.launcher`.

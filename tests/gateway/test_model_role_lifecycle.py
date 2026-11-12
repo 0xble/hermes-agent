@@ -434,6 +434,8 @@ async def test_real_session_boundary_role_io_is_off_loop_and_unchanged_is_not_wr
     if held:
         await runner._set_session_model_role(lane.key, "fast")
     runner._session_db = SimpleNamespace(get_session_title=AsyncMock(return_value="target"))
+    monkeypatch.setattr("gateway.session_route_recovery.conversation_head",
+                        AsyncMock(return_value=(None, None, "target")))
     monkeypatch.setattr(runner, "_resolve_resume_target", AsyncMock(return_value=("target", "target")))
     monkeypatch.setattr(runner, "_resume_access_denied_reply", AsyncMock(return_value=None))
     monkeypatch.setattr(runner, "_cleanup_old_agent_for_reset", AsyncMock())
@@ -482,17 +484,16 @@ async def test_invalid_hold_does_not_keep_previous_automatic_attended_route(lane
 
 
 @pytest.mark.asyncio
-async def test_compression_exhaustion_reset_does_not_reacquire_its_route_lock(lane, monkeypatch, armed_loop_guard):
+async def test_compression_exhaustion_keeps_role_without_reacquiring_route_lock(lane, monkeypatch, armed_loop_guard):
     runner = lane.runner
     await runner._set_session_model_role(lane.key, "fast")
-    monkeypatch.setattr(runner, "_sync_telegram_topic_binding", lambda *a, **k: None)
-    monkeypatch.setattr(runner.session_store, "set_session_yolo", lambda *a: None)
-    response, entry = await asyncio.wait_for(runner._hmwa_compression_exhaustion_reset(
-        {"compression_exhausted": True}, "", lane.entry, lane.key, lane.source), 2)
-    assert entry.session_id != lane.entry.session_id
+    async with runner._session_model_override_lock(lane.key):
+        response, entry = await asyncio.wait_for(runner._hmwa_compression_exhaustion_reset(
+            {"compression_exhausted": True}, "", lane.entry, lane.key, lane.source), 2)
+    assert entry is lane.entry
     assert response
-    assert await asyncio.to_thread(runner.session_store.get_model_role, lane.key) is None
-    assert runner._session_state(lane.key).conversation.model_role is None
+    assert await asyncio.to_thread(runner.session_store.get_model_role, lane.key) == "fast"
+    assert runner._session_state(lane.key).conversation.model_role == "fast"
 
 
 @pytest.mark.asyncio

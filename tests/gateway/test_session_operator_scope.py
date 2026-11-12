@@ -14,7 +14,7 @@ async def test_operators_share_local_sessions_without_reassigning_receipts(tmp_p
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local import create_local_session
     from gateway.session_local_title import resolve_titled_session
     from gateway.session_mutations import mutate_session
@@ -81,7 +81,7 @@ async def test_identity_fields_cannot_grant_operator_or_first_claim(tmp_path, mo
     from gateway import run
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local import create_local_session
 
     monkeypatch.setattr(run, '_load_gateway_config', lambda: {'platform_toolsets': {'cli': []}})

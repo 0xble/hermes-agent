@@ -9,7 +9,8 @@ import pytest
 
 from gateway.session_ingress_media import _media_root, capture_native_media, release_admission_media
 from hermes_state import SessionDB
-from hermes_state_runtime import admit_session_input, begin_runtime_epoch, claim_session_input, settle_session_input
+from hermes_state_runtime import admit_session_input, claim_session_input, settle_session_input
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def _settled_native_document(tmp_path, monkeypatch, note):

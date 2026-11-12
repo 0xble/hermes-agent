@@ -19,8 +19,8 @@ remains bound to the actual adapter. Native routing invariants live in
 
 ## FIFO Execution Outbox Identity
 
-A claimed session FIFO row uses `admission:<admission_id>` as its durable outbox
-identity. Its transport envelope was already admitted before the FIFO snapshot,
+A claimed session FIFO row uses `admission:<admission_id>:<generation>` as its
+durable outbox identity. Its transport envelope was already admitted before the FIFO snapshot,
 and restoring that snapshot creates a new event without the process-local
 admission scope. Reusing the provider update ID would suppress the claimed turn
 as a redelivery of its own ingress. Keep transport redelivery dedup unchanged,
@@ -29,6 +29,15 @@ and never let caller metadata select or bypass the claimed identity.
 Verify `tests/gateway/test_native_fifo_outbox_identity.py` alongside the durable
 outbox and native messaging FIFO suites. Distinct maintenance wakes sharing a
 task must execute once each, while a repeated provider update remains suppressed.
+
+The generation is part of the identity because a claim can run twice: a native
+turn that the owner's own restart or shutdown interrupted before its first model
+call goes back to its FIFO place (`requeue_unstarted_claim`), the stopping owner
+sends nothing for it, and the successor runs it under a new generation. Without
+the generation the replay is dropped as a duplicate of the first claim. A turn
+that made a model call, or any API, LOCAL or managed claim, still settles
+`interrupted` and is never replayed. Verify
+`tests/gateway/test_shutdown_unstarted_turn_replay.py`.
 
 ## Resume Marker Freshness
 
@@ -53,7 +62,7 @@ freshness window. Keep the existing DST invariants in
 
 This was written as a **fork plan** before implementation; [Shipped Status](#shipped-status) records what landed. The maintained fork `0xble/hermes-agent` `main` is the implementation base; the runtime installation and source checkout are distinct ([runtime ownership](runtime-ownership.md)). Before S1, `cron/scheduler.py::_launch_external_cron_worker` used `restart_safe_gateway_child_argv`; on non-Linux that resolver returns `in_process` (`tools/process_registry.py`), so a macOS launchd gateway does not get an external restart-safe cron worker. Linux's systemd transient-scope model cannot be copied to macOS: `launchctl bootout` terminates the job process group, but a `start_new_session` child and double-forked `setsid` grandchild can survive outside that group. Design the macOS worker boundary and explicit kill semantics around that topology, without claiming bootout alone reaps all descendants.
 
-The profile-local `cron/executions.py` ledger records attempt owner PID/start fingerprint and immutable terminal states; it is **not a retry queue**. The current cron inactivity watchdog is idle-based, not a hard wall-clock cap. Scheduler tick locking, `pending_slot`/`scheduled_instant` deduplication, profile scope, and delivery ownership remain authoritative ([cron contract](../cron/AGENTS.md)). Current restart/delegation policy can wait or offer explicit parent-driven recovery, but does not provide uninterrupted overlapping execution ([delegation restart](delegation-restart.md)). The gateway's control socket presently supports identity/status/pause-for-update; it is a candidate coordination seam, not yet a handoff protocol. Upstream's open [structured safe restart PR #71876](https://github.com/NousResearch/hermes-agent/pull/71876) addresses agent-request coordination, not evidence that release pinning or two-generation handoff already exists. Recheck upstream and fork source before each implementation slice.
+The profile-local `cron/executions.py` ledger records attempt owner PID/start fingerprint and immutable terminal states; it is **not a retry queue**. The current cron inactivity watchdog is idle-based, not a hard wall-clock cap. Scheduler tick locking, `pending_slot`/`scheduled_instant` deduplication, profile scope, and delivery ownership remain authoritative ([cron contract](../cron/AGENTS.md)). Current restart/delegation policy can wait or offer explicit parent-driven recovery, but does not provide uninterrupted overlapping execution ([delegation restart](delegation-restart.md)). The gateway's control socket presently supports identity/status/pause-for-update; it is a candidate coordination seam, not yet a handoff protocol. POSIX update pause/replay excludes finite client-owned gateways; their explicit refusal and lease boundary are maintained in [Disposable one-shot gateway lifetime](disposable-home-gateway-lifetime.md#contract). Upstream's open [structured safe restart PR #71876](https://github.com/NousResearch/hermes-agent/pull/71876) addresses agent-request coordination, not evidence that release pinning or two-generation handoff already exists. Recheck upstream and fork source before each implementation slice.
 
 **Global invariants:** Never automatically retry an interrupted execution, chat turn, or delegation. Preserve one admitted owner per event/occurrence and one active Telegram poller per token; require a receipt from the owning process before acknowledging forwarded input. Preserve both gateway busy-message guards, identity/authorization and per-profile secret scope, prompt-cache stability, turn alternation, and existing durable delivery semantics. Shared databases and `~/.hermes/plugins` must remain readable and writable by both `current` and `previous` during rollback; use additive/backward-compatible migrations and dual-version contract tests, never a destructive migration during promotion. Do not infer a live runtime revision from source `HEAD`.
 

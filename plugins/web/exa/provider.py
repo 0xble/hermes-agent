@@ -45,12 +45,16 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
     SEARCH_ENDPOINT = "https://api.exa.ai/search"
     SEARCH_TYPE = "auto"
     SEARCH_TYPE_REASON = "default"
-    _stakes = None
+    _prepared = False
 
     def prepare_search(self, query: str, *, stakes: str | None = None) -> ExaWebSearchProvider:
+        from tools.web_tools import _load_web_config
+
         request = copy(self)
-        request._stakes = stakes
-        request.SEARCH_TYPE, request.SEARCH_TYPE_REASON = select_search_policy(query, stakes)
+        request.SEARCH_TYPE, request.SEARCH_TYPE_REASON = select_search_policy(
+            query, stakes, lite_paused=_load_web_config().get("exa_lite_paused", True) is not False,
+        )
+        request._prepared = True
         return request
 
     def search(self, query: str, limit: int = 5) -> dict[str, Any]:
@@ -58,12 +62,15 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
             if use_keyless("exa", provider_env("EXA_API_KEY")):
                 return keyless_search("Exa", "exa", query, limit, logger)
             logger.info("Exa search: '%s' (limit=%d)", query, limit)
-            search_type, reason = select_search_policy(query, self._stakes)
+            # Use the same policy snapshot for the cache identity and SDK call.
+            request = self if self._prepared else self.prepare_search(query)
+            search_type, reason = request.SEARCH_TYPE, request.SEARCH_TYPE_REASON
             response = _get_exa_client().search(
                 query, type=search_type, num_results=limit, contents={"highlights": True},
             )
             result = search_ok([
-                web_hit(r.url or "", r.title or "", " ".join(r.highlights or []), i + 1)
+                web_hit(r.url or "", r.title or "", " ".join(r.highlights or []), i + 1,
+                        image=getattr(r, "image", None))
                 for i, r in enumerate(response.results or [])
             ])
             result["data"].update(search_type=search_type, search_type_reason=reason)
@@ -77,7 +84,11 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
                 return keyless_extract("Exa", "exa", urls, logger)
             logger.info("Exa extract: %d URL(s)", len(urls))
             response = _get_exa_client().get_contents(urls, text=True)
-            return [document(r.url or "", r.title or "", r.text or "") for r in response.results or []]
+            # /contents preserves the response id separately from its final URL.
+            # Only a requested URL is an identity: opaque IDs must not imply a redirect.
+            return [document(r.url or "", r.title or "", r.text or "",
+                             source_url=r.id if getattr(r, "id", None) in urls else None)
+                    for r in response.results or []]
 
         return run_extract("Exa", logger, urls, _body, sdk=True)
 

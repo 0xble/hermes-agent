@@ -449,7 +449,7 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     monkeypatch.setattr(gateway_run, "_log_standalone_profiles_at_boot", lambda *a: None)
     monkeypatch.setattr(gateway_run, "_ensure_windows_gateway_venv_imports", lambda: None)
     monkeypatch.setattr(gateway_run, "_enable_multiplex_log_routing", lambda *a: None)
-    monkeypatch.setattr(gateway_run, "_start_gateway_make_shutdown_signal_handler", lambda *a: None)
+    monkeypatch.setattr("gateway.run_bootstrap._start_gateway_make_shutdown_signal_handler", lambda *a: None)
     monkeypatch.setattr(gateway_run, "_start_gateway_make_restart_signal_handler", lambda *a: None)
     monkeypatch.setattr(gateway_run, "_start_gateway_replace_existing_instance", lambda *a: True)
     monkeypatch.setattr(gateway_run, "_shutdown_gateway_health_export", lambda *a: None)

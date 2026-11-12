@@ -5,15 +5,17 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_origin_aliases import _configured_aliases
 from agent.vault_store import VaultItemMeta
 from tools import browser_vault_tool as vault
 
 
-class _Backend:
+class _Backend(LocalLoginBackend):
     name = "onepassword"
     display_name = "1Password"
     needs_unlock = False
@@ -375,11 +377,11 @@ def test_multi_account_handle_round_trips_and_unions_with_raw_item_id(tmp_path, 
     env["HERMES_HOME"] = str(home)
     repo = Path(__file__).resolve().parents[2]
     set_command = [
-        "uv", "run", "python", "hermes", "config", "set",
+        sys.executable, "hermes", "config", "set",
         f"vault.origin_aliases.{handle}", '["https://login.planetfitness.com"]',
     ]
     get_command = [
-        "uv", "run", "python", "hermes", "config", "get",
+        sys.executable, "hermes", "config", "get",
         f"vault.origin_aliases.{handle}", "--json",
     ]
     subprocess.run(set_command, cwd=repo, env=env, capture_output=True, text=True, check=True)
@@ -408,7 +410,7 @@ def test_agent_written_config_set_form_is_honored_without_restart(tmp_path, monk
     env["HERMES_HOME"] = str(home)
     repo = Path(__file__).resolve().parents[2]
     command = [
-        "uv", "run", "python", "hermes", "config", "set",
+        sys.executable, "hermes", "config", "set",
         "vault.origin_aliases.example-item", '["https://signin.example.com"]',
     ]
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -507,8 +509,11 @@ def test_saved_origin_fill_skips_prompt_and_alias_recheck(monkeypatch):
     _fill_patches(monkeypatch, backend, page_origin="https://gusto.com")
     prompts, loads = [], []
     monkeypatch.setattr(vault, "_confirm_alias_fill", lambda *args: prompts.append(args) or "accept")
-    with patch("hermes_cli.config.load_config_readonly", side_effect=lambda: loads.append(1) or {"vault": {}}):
+    # Persistence has its own config read; isolate it so this still catches alias revalidation.
+    with patch("hermes_cli.config.load_config_readonly", side_effect=lambda: loads.append(1) or {"vault": {}}), \
+         patch.object(vault, "_remember_login", return_value=True) as remember:
         result = json.loads(vault.browser_vault_fill(backend.meta.id, task_id="saved-only"))
+    remember.assert_called_once_with("saved-only")
     assert result["success"] is True
     assert prompts == []
     assert len(loads) == 1

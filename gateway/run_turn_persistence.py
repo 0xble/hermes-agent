@@ -326,13 +326,11 @@ class GatewayTurnPersistenceMixin:
     async def _hmwa_compression_exhaustion_reset(
         self, agent_result, response, session_entry, session_key, source,
     ):
-        """Auto-reset a permanently oversized session so the next message starts fresh instead of
-        replaying the oversized context forever. Never on a lock-contended defer — that is the
-        OPPOSITE case (a concurrent path holds the lock and is shrinking it). Returns
-        ``(response, session_entry)``."""
-        # When compression is exhausted, the session is permanently too large to process. (#9893) Never wipe
-        # the session for that — retry-next-message semantics apply (#69870 lock-skip consumer; salvaged
-        # from #49874).
+        """Pause compression failures on their original session, never implicitly start /new.
+
+        Retain the failure response and append the existing recovery notice for messaging callers.
+        Deferred compression and API callers keep their existing response contract.
+        """
         if agent_result.get("compression_deferred"):
             logger.info(
                 "Compression deferred for session %s — the compression "
@@ -347,9 +345,8 @@ class GatewayTurnPersistenceMixin:
             logger.info("Keeping API session %s after compression exhaustion.",
                         session_entry.session_id if session_entry else "?")
         elif agent_result.get("compression_exhausted") and session_entry and session_key:
-            if not self._hmwa_defer_exhaustion_reset(session_entry, session_key, source):
-                session_entry = await self._hmwa_rotate_exhausted_session(session_entry, session_key, source)
-            response = (response or "") + t("gateway.session.auto_reset_context_exhausted")
+            logger.warning("Keeping session %s after compression exhaustion.", session_entry.session_id)
+            response = (response or "") + "\n\n" + t("gateway.compress.hygiene_failed")
         return response, session_entry
 
     def _hmwa_defer_exhaustion_reset(self, session_entry, session_key, source):
@@ -537,12 +534,21 @@ class GatewayTurnPersistenceMixin:
         from agent.plan_limits import chat_refusal_wording
         return chat_refusal_wording(response, agent_result.get("failure_resets_at"))
 
+    def _event_thread_metadata(self, event, source):
+        """Thread metadata for a send that replies to ``event`` on ``source``."""
+        from gateway.checkin_delivery import delivery_metadata
+        return delivery_metadata(event, self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)))
+
     async def _deliver_turn_response_then_limit_offer(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, footer_line, intentional_silence,
     ):
         """``_hmwa_deliver_turn_response``, then, for a usage-window refusal, the limit offer: the limit
         sentence is the reply, and the button follows it once it lands."""
+        from gateway.checkin_delivery import delivery_metadata, permits_metadata, suppress_result
+        if not await permits_metadata(self, delivery_metadata(event, {})):
+            suppress_result(agent_result)
+            return ""
         delivered = await self._hmwa_deliver_turn_response(
             event, source, session_entry, session_key, run_generation,
             agent_result, agent_messages, response, footer_line, intentional_silence,
@@ -657,18 +663,14 @@ class GatewayTurnPersistenceMixin:
                 status_hint = t("gateway.errors.hint_usage_limit")
         elif status_code == 400:
             status_hint = t("gateway.errors.hint_rejected")
-        elif getattr(e, "reason", None) == "launch_credentials_unavailable" and getattr(e, "field", None):
-            # The session's own frozen route credential is gone or changed: name it, not the model.
-            status_hint = f" {e.reason} ({e.field}: {e.detail or 'unavailable'})."
         from gateway.session_results import record_unexecuted_failure
+        if getattr(e, "reason", None) == "launch_credentials_unavailable":
+            # The session's own route key is gone or changed: /retry repeats it, /new is the way out.
+            from agent.turn_failure_copy import launch_credentials_copy
+            return record_unexecuted_failure(launch_credentials_copy(e), 'launch_credentials_unavailable')
+        # A local client (CLI, TUI, Desktop) is the operator at this host: its result carries the
+        # real cause, so its details line is not the chat apology with the log pointer cut off.
+        local_error = f"{type(e).__name__}: {e}"[:500] if source.platform == Platform.LOCAL else None
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
-        ))
-
-    def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
-        """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
-        logger.info(
-            "Discarding stale agent result for %s — generation %d is no longer current",
-            _quick_key or "?", run_generation,
-        )
-        self._pop_post_delivery_callback(self._delivery_adapter_for(source), _quick_key, run_generation)
+        ), error=local_error)

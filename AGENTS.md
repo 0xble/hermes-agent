@@ -248,6 +248,13 @@ stop its processes and intentionally remove it before regeneration. The runner
 clears `PYTHONPATH`, so PM shell activation alone does not supply pytest. For a
 fresh output outside the checkout, set `HERMES_PYTHON` to its interpreter.
 
+If the checkout environment is missing or stale, `scripts/run_tests.sh` refuses
+to run that setup when the inherited `HERMES_HOME` is a live runtime home (a
+`current` release pointer, `gateway_state.json`, a running gateway pid, or the
+OS account default home). Rebuild the checkout venv with the command above, or
+set `HERMES_HOME` to a scratch directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1`
+overrides the refusal only when setup against that home is deliberate.
+
 ```bash
 scripts/run_tests.sh                                    # full suite
 scripts/run_tests.sh tests/gateway/                     # one directory

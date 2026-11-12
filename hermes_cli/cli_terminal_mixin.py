@@ -3,6 +3,7 @@ CLI. Mixin on ``HermesCLI``; cli.py symbols are imported lazily inside methods (
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import errno
 import os
@@ -147,12 +148,32 @@ class CLITerminalMixin:
         repaint without SIGWINCH, so prompt_toolkit's tracked ``_cursor_pos`` is stale
         and the next incremental redraw stacks on old content (ghost status bars).
         """
-        from cli import _replay_output_history
         if getattr(self, "_terminal_io_broken", False):
             return
         app = getattr(self, "_app", None)
         if not app:
             return
+        # The renderer and output belong to the app's loop. Callers on another thread (the
+        # input worker's interrupt recovery, #33271) queue the repaint there, rechecking at run
+        # time; on the loop itself, or with no running loop, it stays synchronous.
+        loop = getattr(app, "loop", None)
+        if isinstance(loop, asyncio.AbstractEventLoop) and loop.is_running():
+            try:
+                current_loop = asyncio.get_running_loop()
+            except RuntimeError:
+                current_loop = None
+            if current_loop is not loop:
+                def _redraw_on_loop():
+                    if getattr(self, "_terminal_io_broken", False) or getattr(self, "_app", None) is not app:
+                        return
+                    self._redraw_app_now(app)
+                _run_on_app_loop(app, _redraw_on_loop)
+                return
+        self._redraw_app_now(app)
+
+    def _redraw_app_now(self, app) -> None:
+        """The ``_force_full_redraw`` repaint itself, on the thread that owns *app*'s renderer."""
+        from cli import _replay_output_history
         fit = self._clear_prompt_toolkit_screen(app, rebuild_scrollback=self._redraw_rebuilds_scrollback())
         if getattr(self, "_terminal_io_broken", False):
             return

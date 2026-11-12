@@ -7,13 +7,13 @@ import sys
 import pytest
 
 
-@pytest.mark.platforms("linux")
+@pytest.mark.platforms("posix")
 def test_full_observer_cannot_block_real_authority_execution(tmp_path):
     repo = Path(__file__).resolve().parents[2]
     home, state = tmp_path / 'home', tmp_path / 'state'
     home.mkdir()
     state.mkdir()
-    env = {key: os.environ[key] for key in ('PATH', 'LANG', 'TZ') if key in os.environ}
+    env = {key: os.environ[key] for key in ('HERMES_TEST_ISOLATION', 'PATH', 'LANG', 'TZ') if key in os.environ}
     env.update(HOME=str(home), USERPROFILE=str(home), HERMES_HOME=str(state),
                PYTHONPATH=str(repo), PYTHONUNBUFFERED='1')
     result = subprocess.run(
@@ -32,7 +32,8 @@ async def test_replay_matches_subscription_watermark_or_requires_snapshot(tmp_pa
 
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionSource, SessionStore
-    from gateway.session_authority import LiveSession, initialize_session_authority
+    from gateway.session_authority import LiveSession
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_contract import SessionRef, Submission
     from gateway.session_controls import AuthorityConnection
     from tui_gateway import event_replay

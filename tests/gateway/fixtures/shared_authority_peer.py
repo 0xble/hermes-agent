@@ -93,7 +93,7 @@ async def probe():
 
     runner = GatewayRunner()
     if importlib.util.find_spec("gateway.session_authority") is not None:
-        from gateway.session_authority import initialize_session_authority
+        from tests.fakes.runtime_owner import initialize_session_authority
         await initialize_session_authority(runner, profile_id="default", instance_id="test-owner")
     adapter = CaptureAdapter()
     runner.adapters[Platform.TELEGRAM] = adapter

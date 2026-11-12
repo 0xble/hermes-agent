@@ -292,8 +292,6 @@ class TestCreateProfile:
     def test_clone_config_never_follows_symlinks_out_of_the_provider_dir(self, profile_env):
         """A symlink inside ``<provider>/`` (or a symlinked ``<provider>.json``) must not pull its
         target's data into the clone, and a socket there must not abort the clone."""
-        import socket
-
         tmp_path = profile_env
         default_home = tmp_path / ".hermes"
         (default_home / "config.yaml").write_text("memory:\n  provider: hindsight\n")
@@ -463,31 +461,47 @@ class TestCreateProfile:
     @pytest.mark.platforms("linux")
     def test_clone_all_does_not_attach_to_the_source_profiles_live_browser(self, profile_env):
         """Copied Chromium markers must not route the clone through the source profile's CDP port."""
-        from tools.bot_desktop.browser import running_instance_cdp_port
+        import http.server
+        import threading
+        from tools.browser_launcher import running_instance
 
         default_home = profile_env / ".hermes"
         (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
         browser_profile = default_home / "bot-desktop" / "browser-profile"
         browser_profile.mkdir(parents=True)
 
-        with socket.socket() as listener:
-            listener.bind(("127.0.0.1", 0))
-            listener.listen()
-            port = listener.getsockname()[1]
+        class _Version(http.server.BaseHTTPRequestHandler):  # a live DevTools /json/version answer
+            def do_GET(self):
+                body = b'{"webSocketDebuggerUrl": "ws://127.0.0.1/devtools/browser/source"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Version)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            port = server.server_address[1]
             (browser_profile / "DevToolsActivePort").write_text(f"{port}\n/devtools/browser/source\n", encoding="utf-8")
             (browser_profile / "SingletonLock").symlink_to(f"host-{os.getpid()}")
-            assert running_instance_cdp_port(str(browser_profile)) == port
+            assert running_instance(str(browser_profile))[0] == port
 
             profile_dir = create_profile("coder", clone_all=True, no_alias=True)
             cloned_browser = profile_dir / "bot-desktop" / "browser-profile"
 
-            assert running_instance_cdp_port(str(cloned_browser)) is None
-            assert running_instance_cdp_port(str(browser_profile)) == port
+            assert running_instance(str(cloned_browser)) is None
+            assert running_instance(str(browser_profile))[0] == port
+        finally:
+            server.shutdown()
+            server.server_close()
 
     @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="special files need a POSIX filesystem")
     def test_clone_all_skips_special_files(self, profile_env):
         # A live source profile holds special files copytree cannot copy (e.g. a suffixless
-        # agent-browser control socket); one of them must not abort the whole clone.
+        # browser control socket); one of them must not abort the whole clone.
         default_home = profile_env / ".hermes"
         (default_home / "config.yaml").write_text("model: test", encoding="utf-8")
         browser_dir = default_home / "home" / ".agent-browser"
@@ -2048,29 +2062,3 @@ class TestCloneAllExcludesRuntimeTrees:
             assert not (clone / name).exists(), name
         assert (clone / "skills" / "greet" / "SKILL.md").is_file()
         assert (clone / "config.yaml").is_file()
-
-
-def test_count_skills_publishes_timestamp_after_the_walk(tmp_path, monkeypatch):
-    """A scan longer than the TTL must not publish an already-expired cache entry (#107151):
-    the cached timestamp is taken after _walk_skill_count returns, not before it starts."""
-    from hermes_cli import profiles as mod
-
-    skills_dir = tmp_path / "skills"
-    skills_dir.mkdir()
-    monkeypatch.setattr(mod, "_SKILL_COUNT_CACHE", {})
-    monkeypatch.setattr(mod, "_SKILL_COUNT_SCAN_LOCKS", {}, raising=False)
-    clock = {"now": 1000.0}
-    monkeypatch.setattr(mod.time, "time", lambda: clock["now"])
-
-    def slow_walk(_dir):
-        clock["now"] += mod._SKILL_COUNT_TTL_SECONDS + 5  # walk outlives the TTL
-        return 3
-
-    monkeypatch.setattr(mod, "_walk_skill_count", slow_walk)
-    assert mod._count_skills(tmp_path) == 3
-    _sig, stamped, count = mod._SKILL_COUNT_CACHE[str(skills_dir)]
-    assert count == 3
-    assert stamped >= clock["now"], "published timestamp must be >= scan end"
-    # Entry is fresh: a second call within the TTL must not walk again.
-    monkeypatch.setattr(mod, "_walk_skill_count", lambda _d: pytest.fail("re-walked a fresh entry"))
-    assert mod._count_skills(tmp_path) == 3

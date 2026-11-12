@@ -24,7 +24,7 @@ async def headless(tmp_path, monkeypatch):
     from gateway import run
     from gateway.config import GatewayConfig, Platform
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     # A following Bot Chat reads the profile config by path.

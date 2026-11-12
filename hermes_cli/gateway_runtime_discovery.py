@@ -34,6 +34,21 @@ class DiscoveryError(ValueError):
         return cause + notice
 
 
+def client_owner_refusal(payload: dict, client_lease_token: str | None, worker_authorized: bool):
+    """Only the creator or a privately authenticated adopted worker may attach."""
+    from hermes_cli.gateway_runtime import GatewayDiscovery
+    client_owned = payload.get("client_owned", False)
+    if type(client_owned) is not bool:
+        return GatewayDiscovery("inaccessible", reason_code="invalid_client_ownership")
+    if client_owned and not worker_authorized and (
+            not client_lease_token or not isinstance(payload.get("client_lease_token"), str) or
+            payload["client_lease_token"] != client_lease_token):
+        return GatewayDiscovery("conflict", reason_code="client_owned",
+                                detail="another finite client owns this gateway; retry after it exits "
+                                       "or use a separate HERMES_HOME")
+    return None
+
+
 def _may_have_access_acl(path: Path) -> bool:
     """A Linux POSIX access ACL is present, or its absence cannot be established. Python has no
     os.listxattr on macOS (whose chmod +a ACLs are separate); mode bits stay the policy there."""

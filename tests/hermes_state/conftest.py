@@ -17,7 +17,8 @@ def worker(tmp_path):
     # Imported here, not at module level: this conftest loads for every hermes_state test file.
     from agent.runtime_session_store import RuntimeSessionStore
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, mutate_worker_execution, register_worker_execution
+    from hermes_state_runtime import mutate_worker_execution, register_worker_execution
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     db = SessionDB(tmp_path / 'state.db')
     db.create_session('owned', 'cli', system_prompt='prefix')

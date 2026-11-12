@@ -26,7 +26,7 @@ def owner(tmp_path, monkeypatch, server_spec):
     from gateway import run, session_local_mcp
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
 

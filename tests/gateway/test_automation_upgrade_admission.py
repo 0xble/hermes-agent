@@ -9,7 +9,7 @@ from gateway import admission_canary
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.platforms.base import SendResult
 from gateway.run import GatewayRunner
-from gateway.session_authority import initialize_session_authority
+from tests.fakes.runtime_owner import initialize_session_authority
 from gateway.session_results import execution_result
 from hermes_state_runtime import list_session_admissions
 from tests.waiting import async_wait_until

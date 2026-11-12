@@ -27,7 +27,7 @@ from agent.i18n import t
 from agent.retry_utils import jittered_backoff
 from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _should_bypass_proxy
 from gateway.copy_blocks import (
-    protect_inline_copy_bodies, restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
+    restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
 from gateway.platforms.reaction_lifecycle import reaction_operation
 
@@ -160,7 +160,8 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 def _thread_metadata_for_event(event) -> dict | None:
     """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
-    return _thread_metadata_for_source(event.source, _reply_anchor_for_event(event))
+    from gateway.checkin_delivery import delivery_metadata
+    return delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -837,12 +838,12 @@ def _sqlite_files(name: str) -> tuple[str, ...]:
 # Credential stores at the HERMES_HOME root, denied per-file so skills/, logs/ and agent-written
 # files stay deliverable (cache subdirs are allowlisted BEFORE this). A superset of the
 # agent/file_safety.py read+write denies so exfil never trails the read guard. google_token.json's mtime bumps every turn (defeats the
-# recency window); pairing/ and mcp-tokens/ (live OAuth tokens) are denied as whole trees.
+# recency window); pairing/, mcp-tokens/ (live OAuth tokens) and webapp/ (the Webapp's credential) are whole trees.
 _ROOT_CREDENTIAL_PATHS = (
     ".env", "auth.json", "auth.lock", "credentials", "config.yaml", ".anthropic_oauth.json",
     "google_token.json", "google_oauth_pending.json", os.path.join("auth", "google_oauth.json"),
     "webhook_subscriptions.json", os.path.join("cache", "bws_cache.json"),
-    os.path.join("cache", "bws_cache.enc.json"), "pairing", "mcp-tokens",
+    os.path.join("cache", "bws_cache.enc.json"), "pairing", "mcp-tokens", "webapp",
     # Whole conversation history (every secret ever pasted into a chat) and the copied browser
     # cookie/login store; sessions/ is the legacy transcript dir. SQLite sidecars are listed
     # too: WAL mode touches state.db-wal on every write, so recency trust alone would leak them.
@@ -1017,37 +1018,6 @@ def _parse_docker_volume_mounts() -> list[tuple[Path, Path]]:
     return mounts
 
 
-def _docker_sandbox_dir_candidates(session_key: str = "") -> list[str]:
-    """Candidate host sandbox dir names for the delivering session, best first. Mirrors
-    ``_resolve_container_task_id`` (tools/terminal_tool.py): containers are PROFILE-scoped
-    (``default``, else ``profile:<name>``); legacy ``session:<key>`` sandboxes stay as a fallback.
-    The key is passed explicitly because delivery runs after the turn's contextvars were cleared.
-
-    Takes the key explicitly because the delivery pipeline runs after ``_handle_message_with_agent`` cleared
-    the turn's session contextvars (#93950) — an ambient lookup here would silently collapse onto
-    ``default`` and miss the session's real sandbox.
-    """
-    try:
-        from tools.environments.path_utils import sanitize_task_id_for_path
-    except Exception:
-        return ["default"]
-    try:
-        from hermes_cli.profiles import get_active_profile_name
-        profile = get_active_profile_name() or "default"
-    except Exception:
-        profile = "default"
-    candidates: list[str] = []
-    # Explicit trusted-profiles opt-in: one shared container identity.
-    if shared := _tenv("TERMINAL_DOCKER_SHARED_CONTAINER_KEY", "").strip():
-        candidates.append(sanitize_task_id_for_path(f"shared:{shared}"))
-    if profile != "default":
-        candidates.append(sanitize_task_id_for_path(f"profile:{profile}"))
-    candidates.append("default")
-    if session_key:  # bug-window legacy layout: per-session sandboxes
-        candidates.append(sanitize_task_id_for_path(f"session:{session_key}"))
-    return candidates
-
-
 _TRUTHY = {"1", "true", "yes", "on"}
 
 
@@ -1058,35 +1028,6 @@ def _docker_env_active() -> bool:
 def _docker_persistent_active() -> bool:
     """Docker backend with persistent containers (the default) enabled."""
     return _docker_env_active() and _tenv("TERMINAL_CONTAINER_PERSISTENT", "true").strip().lower() in _TRUTHY
-
-
-def _docker_persistent_sandbox_roots(session_key: str, leaf: str) -> list[Path]:
-    """Existing ``<sandbox>/docker/<candidate>/<leaf>`` host dirs in candidate order;
-    the translator tries each until the file resolves. Empty unless Docker + persistent."""
-    if not _docker_persistent_active():
-        return []
-    try:
-        from tools.environments.base import get_sandbox_dir
-        base = get_sandbox_dir() / "docker"
-        return [cand for name in _docker_sandbox_dir_candidates(session_key)
-                if (cand := (base / name / leaf).resolve(strict=False)).is_dir()]
-    except Exception:
-        return []
-
-
-def _default_docker_workspace_host_roots(session_key: str = "") -> list[Path]:
-    """Existing host candidates for ``/workspace``: the explicit cwd mount
-    (``TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE``) if set, else the persistent sandbox layouts."""
-    if not _docker_persistent_active():
-        return []
-    if _tenv("TERMINAL_DOCKER_MOUNT_CWD_TO_WORKSPACE", "false").strip().lower() in _TRUTHY:
-        cwd = _tenv("TERMINAL_CWD") or os.getcwd()
-        try:
-            host = Path(os.path.expanduser(cwd)).resolve(strict=False)
-        except (OSError, RuntimeError, ValueError):
-            return []
-        return [host] if host.is_dir() else []
-    return _docker_persistent_sandbox_roots(session_key, "workspace")
 
 
 def _cache_dir_container_mounts() -> list[tuple[Path, Path]]:
@@ -1116,9 +1057,15 @@ def _warn_unresolved_docker_media(candidate: Path, session_key: str, reason: str
                    f", session_key={session_key}" if session_key else "")
 
 
-def _translate_docker_container_media_path(candidate: Path, session_key: str = "", *, quiet: bool = False) -> Optional[Path]:
+def _translate_docker_container_media_path(
+    candidate: Path, session_key: str = "", workspace_key: str = "", *, quiet: bool = False, workspace_cwd: str = "",
+) -> Optional[Path]:
     """Container-absolute path -> host path via longest-prefix match over ``docker_volumes``, the
-    auto-mounted cache dirs (``/root/.hermes/...``), persistent ``/workspace`` and ``/root``."""
+    auto-mounted cache dirs (``/root/.hermes/...``), persistent ``/workspace`` and ``/root``.
+
+    ``workspace_key`` is the 16-hex digest of one session's host cwd ``workspace_cwd`` (its cwd
+    mount). It selects that session's ``<base>:ws:<digest>`` sandbox and is empty for MEDIA delivery.
+    """
     if not candidate.as_posix().startswith("/"):  # POSIX even on Windows gateways (not is_absolute)
         return None
     # In-process gateways (Desktop, `hermes serve`) may not have bridged terminal.* config into
@@ -1126,17 +1073,24 @@ def _translate_docker_container_media_path(candidate: Path, session_key: str = "
     with contextlib.suppress(Exception):
         from tools.terminal_tool import _ensure_terminal_env_bridged
         _ensure_terminal_env_bridged()
+    from gateway.platforms.docker_media_paths import (
+        _default_docker_workspace_host_roots, _docker_persistent_sandbox_roots,
+    )
     mounts = [*_parse_docker_volume_mounts(), *_cache_dir_container_mounts()]
     mounted = {c.as_posix() for _, c in mounts}
-    # Synthetic /workspace mounts: profile-scoped layout first, then legacy per-session.
+    # Synthetic /workspace mounts: this session's workspace sandbox, then the
+    # shared profile layout, then the legacy per-session dir.
     if "/workspace" not in mounted:
-        mounts.extend((root, Path("/workspace")) for root in _default_docker_workspace_host_roots(session_key))
+        mounts.extend(
+            (root, Path("/workspace"))
+            for root in _default_docker_workspace_host_roots(session_key, workspace_key, workspace_cwd))
     # Synthetic /root mounts catch stray home writes (/root/out.png; cache mounts are longer
     # prefixes). /root/.hermes/* that missed a cache mount is the container's credential surface —
     # translating it via the home mount would dodge the host denylist.
     if "/root" not in mounted and not candidate.as_posix().startswith("/root/.hermes"):
         mounts.extend(
-            (root, Path("/root")) for root in _docker_persistent_sandbox_roots(session_key, "home"))
+            (root, Path("/root"))
+            for root in _docker_persistent_sandbox_roots(session_key, "home", workspace_key))
     if not mounts:
         _warn_unresolved_docker_media(candidate, session_key, "no sandbox mounts resolved", quiet)
         return None
@@ -1316,6 +1270,11 @@ _MEDIA_EXT_ALTERNATION = "|".join(sorted((e.lstrip(".") for e in MEDIA_DELIVERY_
 # ``MEDIA:D:\path\早报.pdf（782.6 KB）`` or ``MEDIA:...pdf：内容`` — without these, the lookahead fails and the
 # attachment is silently dropped (#88038).
 _MEDIA_CJK_TERMINATORS = "（）〈〉《》：，。；！？、\u201c\u201d\u2018\u2019【】"
+
+# Image tags ``extract_images`` turns into attachments (the streamed display hides the same tags).
+MD_IMAGE_TAG_PATTERN = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
+HTML_IMAGE_TAG_PATTERN = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
+_IMAGE_URL_MARKERS = ('.png', '.jpg', '.jpeg', '.gif', '.webp', 'fal.media', 'fal-cdn', 'replicate.delivery')
 
 MEDIA_TAG_CLEANUP_RE = re.compile(
     r'''[`"'*_]{0,3}MEDIA:\s*'''
@@ -2000,6 +1959,58 @@ def resolve_channel_skills(
                     nm for name in skills if isinstance(name, str) and (nm := name.strip()))
                 return list(seen) or None
     return None
+
+
+def track_temporary_notice(event: Any, adapter: Any, result: Any) -> None:
+    """Remember a status notice sent about ``event`` (a busy ack) for deletion once the event's own
+    turn has delivered its reply. A receipt that arrives after that is deleted right away."""
+    message_id = getattr(result, "message_id", None) if getattr(result, "success", False) else None
+    if not message_id:
+        return
+    notice = (adapter, event.source.chat_id, str(message_id))
+    if getattr(event, "_temporary_notices_released", False):
+        task = asyncio.get_running_loop().create_task(_delete_temporary_notices([notice]))
+        _TEMPORARY_NOTICE_TASKS.add(task)
+        task.add_done_callback(_TEMPORARY_NOTICE_TASKS.discard)
+        return
+    notices = getattr(event, "_temporary_notices", None)
+    if notices is None:
+        notices = event._temporary_notices = []
+    notices.append(notice)
+
+
+async def release_temporary_notices(event: Any) -> None:
+    """Delete the status notices sent about ``event``: its own turn is over and its reply delivered."""
+    event._temporary_notices_released = True
+    notices = getattr(event, "_temporary_notices", None) or []
+    event._temporary_notices = []
+    await _delete_temporary_notices(notices)
+
+
+_TEMPORARY_NOTICE_TASKS: set = set()
+
+
+async def _delete_temporary_notices(notices) -> None:
+    for adapter, chat_id, message_id in notices:
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(adapter.delete_message(chat_id, message_id), _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+
+
+def temporary_cleanups(callback: Any) -> list:
+    """The parts of a (possibly chained or wrapped) post-delivery callback that only delete a turn's
+    temporary messages (marked ``_temporary_cleanup``). A superseded turn runs these and drops the
+    rest: its deferred notices describe a result nobody will see, but its cards must still go."""
+    if not callable(callback):
+        return []
+    if getattr(callback, "_temporary_cleanup", False):
+        return [callback]
+    parts = getattr(callback, "_post_delivery_parts", None)
+    if parts is not None:
+        return [found for part in parts for found in temporary_cleanups(part)]
+    wrapped = getattr(callback, "__wrapped__", None)
+    if wrapped is not None and getattr(wrapped, "_temporary_cleanup", False):
+        return [callback]  # keep the wrapper: it restores the context the cleanup runs under
+    return temporary_cleanups(wrapped)
 
 
 def _split_post_delivery_entry(entry: Any) -> tuple[Optional[int], Any]:
@@ -3309,15 +3320,10 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     def extract_images(content: str) -> tuple[list[tuple[str, str]], str]:
         """Extract ``![alt](url)`` and ``<img src=...>`` image URLs from a response;
         returns ``([(url, alt_text), ...], content with those tags removed)``."""
-        md_pattern = r'!\[([^\]]*)\]\((https?://[^\s\)]+)\)'
-        # <img src="url"> / <img src="url"></img> / <img src="url"/>
-        html_pattern = r'<img\s+src=["\']?(https?://[^\s"\'<>]+)["\']?\s*/?>\s*(?:</img>)?'
-        # Only extract URLs that look like actual images.
-        markers = ('.png', '.jpg', '.jpeg', '.gif', '.webp', 'fal.media', 'fal-cdn',
-                   'replicate.delivery')
+        md_pattern, html_pattern = MD_IMAGE_TAG_PATTERN, HTML_IMAGE_TAG_PATTERN
         images = [(m.group(2), m.group(1)) for m in re.finditer(md_pattern, content)
                   if any(m.group(2).lower().endswith(ext) or ext in m.group(2).lower()
-                         for ext in markers)]
+                         for ext in _IMAGE_URL_MARKERS)]  # only URLs that look like actual images
         images.extend((match.group(1), "") for match in re.finditer(html_pattern, content))
         if not images:
             return images, content
@@ -3798,6 +3804,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         else:
             owned[(session_key, generation)] = callback
 
+    def claim_post_delivery(self, session_key: str, generation: int | None) -> None:
+        """A deliverer will fire this generation's callback once its reply is sent, so a newer
+        generation's stale sweep must leave it alone until then."""
+        if session_key and generation is not None:
+            _lazy_attr(self, "_post_delivery_claims", set).add((session_key, int(generation)))
+
     @staticmethod
     def _chain_callbacks(*callbacks: Callable) -> Callable[[], Awaitable[None]]:
         """Async wrapper running ``callbacks`` in order with per-callback exception isolation;
@@ -3810,6 +3822,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                         await _result
                 except Exception:
                     logger.debug("Post-delivery callback failed", exc_info=True)
+        _chained._post_delivery_parts = callbacks
         return _chained
 
     def pop_post_delivery_callback(
@@ -4025,7 +4038,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         pending = _PENDING_LEDGER_SETTLEMENT.get()
         if pending is not None and task is not None and task.cancelling():
             if getattr(result, "success", False):
-                self._settle_delivered_obligation_sync(pending[0])
+                self._settle_delivered_obligation_sync(pending[0], result)
         return result
 
     async def _send_with_retry_body(
@@ -4211,7 +4224,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """True when a failed send must be returned as-is: neither a retry nor the plain-text
         fallback can fix it (a structured auth/target refusal, or a non-final send a platform's
         volume budget shed on purpose)."""
-        return getattr(result, "error", None) == SEND_SHED_BY_BUDGET
+        from gateway.checkin_delivery import DISARMED
+        return getattr(result, "error", None) in {SEND_SHED_BY_BUDGET, DISARMED}
 
     @staticmethod
     def _is_partial_delivery(result: SendResult) -> bool:
@@ -4247,7 +4261,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             return new_text
         if new_text.strip() in [c.strip() for c in existing_text.split("\n\n")]:
             return existing_text
-        return f"{existing_text}\n\n{new_text}".strip()
+        # Stripping is for comparison only: trailing whitespace can belong to
+        # a counted document body and must survive media batching verbatim.
+        return f"{existing_text}\n\n{new_text}"
 
     def _text_debounce_store(self) -> dict[str, TextDebounceState]:
         return _lazy_attr(self, "_text_debounce", dict)
@@ -4440,6 +4456,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if task is not None and not task.done():
             logger.debug("[%s] Cancelling active processing for session %s", self.name, session_key)
             self._expected_cancelled_tasks.add(task)
+            if discard_pending:
+                setattr(task, "_hermes_pending_owner", "discard")
             task.cancel()
             try:
                 await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
@@ -4480,6 +4498,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             # Send BEFORE cancelling so cancellation side effects can't drop the "/new"
             # confirmation.
             await self._dispatch_inline_reply(event, log_cmd=cmd)
+            task = self._session_tasks.get(session_key)
+            if task is not None:
+                setattr(task, "_hermes_pending_owner", "command_tail")
             await self.cancel_session_processing(session_key, release_guard=False, discard_pending=False)
         except Exception:
             # On failure restore the original guard so the session isn't left half-reset.
@@ -4851,7 +4872,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             logger.debug("delivery ledger record failed", exc_info=True)
             return None
 
-    def _settle_delivered_obligation_sync(self, obligation_id: str) -> None:
+    def _settle_delivered_obligation_sync(self, obligation_id: str, result: Any = None) -> None:
         """Mark delivered a send that already landed when this task was cancelled.
 
         Another await would itself raise CancelledError and skip the write, which is how a
@@ -4862,7 +4883,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """
         try:
             from gateway.delivery_ledger import mark_delivered
-            mark_delivered(obligation_id)
+            mark_delivered(obligation_id, result)
         except Exception:
             logger.debug("delivery ledger update failed", exc_info=True)
 
@@ -4876,8 +4897,13 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         try:
             from gateway.dead_targets import classify_dead_error
             from gateway.delivery_ledger import is_reconnect_only, mark_delivered, mark_failed
+            from gateway.checkin_delivery import DISARMED
+            if getattr(result, "error", None) == DISARMED:
+                from gateway.delivery_ledger import abandon_obligation
+                await asyncio.to_thread(abandon_obligation, obligation_id, DISARMED)
+                return
             if getattr(result, "success", False):
-                await asyncio.to_thread(mark_delivered, obligation_id)
+                await asyncio.to_thread(mark_delivered, obligation_id, result)
                 return
             error = str(getattr(result, "error", "") or "")
             await asyncio.to_thread(mark_failed, obligation_id, error)
@@ -4995,11 +5021,13 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         settlement = _PENDING_LEDGER_SETTLEMENT.set(
             (obligation_id, event, delivery_adapter) if obligation_id is not None else None)
         try:
-            result = await delivery_adapter._send_with_retry(
-                chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
-            from gateway.reply_latency import record_first_reply
-            record_first_reply(getattr(event, "_terminal_reply_latency_receipt",
-                                       getattr(event, "_reply_latency_receipt", None)), text_content, result)
+            from gateway.reply_latency import delivery_scope, record_final_reply
+            receipt = getattr(event, "_terminal_reply_latency_receipt",
+                              getattr(event, "_reply_latency_receipt", None))
+            with delivery_scope(receipt, "text_send"):
+                result = await delivery_adapter._send_with_retry(
+                    chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
+            record_final_reply(receipt, text_content, result)
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
         # Let records_delivery count the captured result before cancellation propagates,
@@ -5187,14 +5215,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         pipeline. History dedup is bare-path only, off-loop, fail-open. An emptied non-empty response is
         recovered."""
         pre_extract = response
-        # Platforms without a plain copy send keep blocks inline; their bodies ride through
-        # directive extraction as opaque tokens, so literal text never becomes an attachment.
+        # All inline bodies stay opaque through directive extraction. Telegram keeps
+        # display markers for literal quotes; interrupted blocks never become copy sends.
+        response, copy_blocks, inline_bodies = split_copy_blocks_protected(self, response)
         if getattr(event, "_copy_blocks_inline_only", False):
-            # Interrupted turn: a block may be partial, so it stays inline, still literal.
-            response, inline_bodies = protect_inline_copy_bodies(response)
             copy_blocks = []
-        else:
-            response, copy_blocks, inline_bodies = split_copy_blocks_protected(self, response)
         # Captured after copy extraction: [[as_document]] inside a copy block is literal copied text.
         force_document = "[[as_document]]" in response
         # Gateway-authored text (slash-command output, ephemeral notices) only mentions paths.
@@ -5248,11 +5273,16 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     ) -> None:
         """Run the one-shot callback for the generation captured after this handler returned, after
         any older generation's callback for the session that nothing fired: that turn is over, and its
-        callback (temporary progress cleanup above all) would otherwise be held forever."""
+        callback (temporary progress cleanup above all) would otherwise be held forever. An older
+        generation a deliverer has claimed (``claim_post_delivery``) is not over: its reply may still
+        be sending, and its own deliverer fires it after that send."""
         callbacks = []
         if generation is not None:
+            claims = _lazy_attr(self, "_post_delivery_claims", set)
+            claims.discard((session_key, int(generation)))
             owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
-            stale = sorted(k for k in owned if k[0] == session_key and k[1] < int(generation))
+            stale = sorted(k for k in owned
+                           if k[0] == session_key and k[1] < int(generation) and k not in claims)
             callbacks.extend(owned.pop(k) for k in stale)
         callbacks.append(self.pop_post_delivery_callback(session_key, generation=generation))
         for _post_cb in callbacks:
@@ -5278,15 +5308,20 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             return
         if interrupt_event.is_set():
             self._invalidate_deferred_commands(session_key)
+        # Fence only when the canceller explicitly owns the pending slot (replay,
+        # spool, or discard). Retire-now retains work for this finalizer to drain.
+        if (current_task is not None and current_task.cancelling()
+                and getattr(current_task, "_hermes_pending_owner", None) is not None):
+            self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
         deferred = None if interrupt_event.is_set() else self._pop_deferred_command(session_key)
         if deferred is not None:
             if not self._spawn_drain_task(deferred, session_key):
                 if current_task is not None and self._session_tasks.get(session_key) is current_task:
                     self._cleanup_finished_session_task(session_key, interrupt_event)
             return
-        # A cancelled compression waiter must not resurrect itself from its visible
-        # pending slot. Shutdown spools it, while /stop and /new discard it.
         pending = self._pending_messages.get(session_key)
+        # Preserve the compression waiter's existing self-requeue cancellation fence.
         if (current_task is not None and current_task.cancelling()
                 and pending is getattr(current_task, "_hermes_event", None)
                 and getattr(pending, "_gateway_compression_deferred", False)):
@@ -5512,7 +5547,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
             if not (self._pending_messages.get(session_key) is event
                     and getattr(event, "_gateway_compression_deferred", False)):
-                await self._fire_post_delivery_callback(session_key, delivery_generation)
+                # A FIFO-run turn names its exact owner and generation; the interrupt event's
+                # generation is the fallback for in-process turns.
+                from gateway.session_ingress import fire_turn_post_delivery
+                if not await fire_turn_post_delivery(event):
+                    await self._fire_post_delivery_callback(session_key, delivery_generation)
+                await release_temporary_notices(event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(
                 event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
@@ -5629,6 +5669,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 break
             for task in tasks:
                 self._expected_cancelled_tasks.add(task)
+                setattr(task, "_hermes_pending_owner", "shutdown_spool")
                 task.cancel()
             try:
                 await asyncio.wait_for(

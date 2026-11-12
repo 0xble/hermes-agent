@@ -3,6 +3,8 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 
 from model_tools import (
     handle_function_call,
@@ -413,7 +415,7 @@ class TestDisabledToolsetsPlatformBundle:
             "is what lets `disabled_toolsets: [browser]` strip it (#64503)"
         )
         # browser still owns its own tools, and web/search still own web_search.
-        assert "browser_navigate" in browser_tools
+        assert "browser_exec" in browser_tools
         assert "web_search" in set(resolve_toolset("web"))
         assert "web_search" in set(resolve_toolset("search"))
 
@@ -527,13 +529,36 @@ class TestBrowserRetrievalHints:
         # Real static schemas + rewriters: the rewritten browser descriptions must not mention absent web tools.
         from model_tools import _apply_dynamic_schemas
         from tools.browser_cdp_tool import BROWSER_CDP_SCHEMA
-        from tools.browser_tool import BROWSER_TOOL_SCHEMAS
+        from tools.browser_use_cli import BROWSER_EXEC_SCHEMA
 
-        navigate = next(s for s in BROWSER_TOOL_SCHEMAS if s["name"] == "browser_navigate")
-        defs = [{"type": "function", "function": navigate}, {"type": "function", "function": BROWSER_CDP_SCHEMA}]
+        defs = [{"type": "function", "function": BROWSER_EXEC_SCHEMA}, {"type": "function", "function": BROWSER_CDP_SCHEMA}]
         rendered = " ".join(d["function"]["description"] for d in _apply_dynamic_schemas(defs + self._defs("terminal")))
         assert "web_search" not in rendered
         assert "web_extract" not in rendered
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_browser_exec_points_at_vision_analyze_only_when_the_session_has_it(monkeypatch, native):
+    """An auxiliary vision route exists (check_vision_requirements is True) but the session may not
+    expose vision_analyze: the browser_exec description names it only when it is in the tool list,
+    and never under the native header, where screenshots already arrive in the result."""
+    from model_tools import _apply_dynamic_schemas
+    from tools import browser_use_cli as bu_cli
+
+    def native_vision(*, allow_network):
+        assert allow_network is False
+        return native
+
+    monkeypatch.setattr("tools.vision_tools._should_use_native_vision_fast_path", native_vision)
+    monkeypatch.setattr("tools.vision_tools.check_vision_requirements", lambda: True)
+    monkeypatch.setattr("tools.browser_tool_lightpanda_fallback.lightpanda_engine_status", lambda: (False, ""))
+    exec_def = {"type": "function", "function": {"name": "browser_exec", **bu_cli._dynamic_schema_overrides()}}
+    for names in (("terminal",), ("terminal", "vision_analyze")):
+        others = [{"type": "function", "function": {"name": n, "description": n}} for n in names]
+        rendered = next(d for d in _apply_dynamic_schemas([exec_def, *others])
+                        if d["function"]["name"] == "browser_exec")["function"]["description"]
+        assert ("pass its capture_screenshot() path to vision_analyze" in rendered) is (
+            not native and "vision_analyze" in names)
 
     def test_secret_entry_surface_allows_fetched_passwords_and_codes(self):
         # This is the regression guard for upstream syncs: tool descriptions may keep
@@ -556,16 +581,31 @@ class TestBrowserRetrievalHints:
         assert "Never type a password, card number, CVC or code" not in rendered["browser_type"]
         assert "mailbox, or phone" in rendered["browser_vault"]
         assert "Never type, ask for or repeat a password" not in rendered["browser_vault"]
-        assert "card numbers and CVCs" in rendered["browser_vault"]
-        assert "Card numbers and CVCs remain vault-only" in rendered["browser_type"]
-        assert "code copied from the page or supplied in chat" in rendered["browser_type"]
+        assert (
+            "card number, expiry, and cvc read live from the routed 1password credit card item "
+            "may be typed on the verified merchant origin for the approved exact charge "
+            "in two cases: (1) after no_payment_fields, a partial fill, missed fields, or a processor "
+            "frame; or (2) after approval_unavailable (no prompt surface), only when the user "
+            "explicitly approved this exact charge in this session's conversation."
+        ) in rendered["browser_vault"].lower()
+        assert "1Password Credit Card item may be typed" in rendered["browser_type"]
+        assert "Values from the page or chat" in rendered["browser_type"]
         vault = rendered["browser_vault"]
         assert "1Password passkey through the canonical-origin browser/system prompt" in vault
         assert "issuer's web/desktop approval" in vault
         assert "Never use iPhone Mirroring" in vault
         assert "Hand off phone-only approvals, passkeys not in 1Password" in vault
-        assert "Never type a value shown on the page or supplied in chat" in vault
-        assert "numbers and CVCs in vault fills" in vault
+        assert "Values from the page or chat are not authorized sources" in vault
+        assert "approved exact charge" in vault
+        for name, description in rendered.items():
+            assert "Separately, card-on-file direct entry" in description, name
+            assert "explicitly approved the merchant or wallet, selected card, and exact card-on-file add/update action in this session's conversation" in description, name
+            assert "Verify the canonical top-level merchant or wallet origin and, when used, its owned embedded processor frame before entry" in description, name
+            assert "no charge, top-up, fee, plan change, or cadence change" in description, name
+            assert "same vault-first route and technical fallback signals" in description, name
+            assert "For card-on-file approval_unavailable, the same explicit current-session merchant-or-wallet, selected-card, and exact card-on-file-action approval is required" in description, name
+            assert "No standing, default, or fallback-card authorization is implied" in description, name
+            assert "Card-on-file is not a $0 charge" in description, name
 
 
 def test_tool_defs_cache_key_sees_config_replacement_with_pinned_mtime(tmp_path):

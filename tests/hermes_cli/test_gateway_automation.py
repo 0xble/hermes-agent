@@ -89,6 +89,31 @@ def test_judge_decision_comes_from_the_gateway(cli, monkeypatch):
     assert mgr.state.status == 'done'
 
 
+@pytest.mark.parametrize("turn_age", [None, -1.0, 1.0])
+def test_gateway_proxy_pierces_only_waits_predating_turn(cli, monkeypatch, turn_age):
+    from unittest.mock import Mock
+    from hermes_cli import goals
+
+    judge = Mock(return_value=('continue', 'more work', False, None, False))
+    monkeypatch.setattr(goals, 'judge_goal', judge)
+    mgr = cli.cli._get_goal_manager()
+    mgr.set('wait for the report')
+    mgr.wait_for_seconds(86_400, reason='report due tomorrow')
+    since = mgr.state.waiting_since
+    turn_started_at = None if turn_age is None else since + turn_age
+
+    decision = mgr.evaluate_after_turn('report update', turn_started_at=turn_started_at)
+
+    if turn_age is None or turn_age > 0:
+        judge.assert_called_once()
+        assert decision['should_continue'] is True
+        assert mgr.state.waiting_since == 0
+    else:
+        judge.assert_not_called()
+        assert decision['should_continue'] is False
+        assert mgr.state.waiting_since == since
+
+
 def test_idle_polls_cost_no_round_trip(cli):
     hb = cli.cli._get_heartbeat_manager()
     loop = cli.cli._get_loop_manager()
@@ -101,6 +126,31 @@ def test_idle_polls_cost_no_round_trip(cli):
     loop.set('check', interval_seconds=60, times=1)
     assert loop.is_due() and loop.fire_tick().startswith('[/loop wakeup #1')
     assert loop.complete_tick('done')['message'] == '✓ Loop finished — ran 1/1 times.'
+
+
+def test_the_watchdog_fires_a_heartbeat_another_viewer_resumed(cli, monkeypatch):
+    """The poller stands down for a CLI running its watchdog, so the watchdog must see a resume made elsewhere."""
+    import queue
+    import time
+    from hermes_cli import cli_loops_mixin
+    from hermes_cli.gateway_automation import GatewayHeartbeatManager
+    from hermes_cli.heartbeat import load_heartbeat, save_heartbeat
+    from tests.waiting import wait_until
+    hb = cli.cli._get_heartbeat_manager()
+    hb.set('pulse', 60)
+    hb.pause()  # /heartbeat pause in this CLI
+    GatewayHeartbeatManager('sid-1', cli.conn).resume()  # Desktop resumes it
+    state = load_heartbeat('sid-1')
+    state.last_fired_at -= 120  # and an interval passes
+    save_heartbeat('sid-1', state)
+
+    cli.cli._pending_input, cli.cli._agent_running = queue.Queue(), False
+    # One poll: the sleep before the tick asks the loop to exit after it.
+    monkeypatch.setattr(cli_loops_mixin, 'time', SimpleNamespace(
+        sleep=lambda _s: setattr(cli.cli, '_should_exit', True), time=time.time))
+    cli.cli._start_heartbeat_watchdog()
+    wait_until(lambda: not cli.cli._heartbeat_watchdog_started, what='the watchdog exited')
+    assert [p for p in cli.cli._pending_input.queue if 'pulse' in p]
 
 
 def test_goal_draft_drafts_on_the_gateway(cli, monkeypatch):

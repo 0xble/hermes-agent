@@ -16,11 +16,12 @@ from gateway.session_contract import Principal, SessionRef
 from tests.waiting import wait_until
 
 CHILD = """import json, os, sys, time, psutil
+from hermes_cli.process_identity import worker_birth
 me = psutil.Process()
 out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0)
 def send(frame):
     out.write((json.dumps(frame) + '\\n').encode())
-send({'type': 'hello', 'pid': me.pid, 'birth': me.create_time(), 'ancestors': [p.pid for p in me.parents()[:3]]})
+send({'type': 'hello', 'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]})
 for line in sys.stdin.buffer:
     frame = json.loads(line)
     if 'version' in frame:
@@ -41,7 +42,8 @@ def test_reservation_and_loss_writes_never_block_the_loop(tmp_path, monkeypatch,
     from gateway.session_contract import Submission
     from gateway.session_policy import build_policy
     from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch, claim_session_input
+    from hermes_state_runtime import claim_session_input
+    from tests.fakes.runtime_owner import begin_runtime_epoch
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
     db = SessionDB(db_path=tmp_path / 'state.db')

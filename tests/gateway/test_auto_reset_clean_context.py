@@ -1,27 +1,8 @@
-"""Regression tests for #35809 — compression-exhaustion auto-reset loop.
+"""Explicit session resets create empty context without destroying the original transcript.
 
-After compression is exhausted the gateway auto-resets the session so the
-next message starts on a fresh, empty conversation (#9893 / #10063). That
-guarantee regressed once the Telegram topic-binding heal landed
-(#20470 / #29712 / #33414):
-
-    1. Compression rotates ``session_entry.session_id`` to an oversized
-       compressed *child* session mid-turn and the agent-result sync rewrites
-       the ``(chat_id, thread_id) -> child`` topic binding.
-    2. ``reset_session`` swaps in a clean, parentless session — but its return
-       value was discarded and the topic binding was left pointing at the
-       bloated child.
-    3. On the next inbound message in that topic, the binding-heal walk
-       ``switch_session``'d the freshly-reset lane *back* onto the bloated
-       child, ``load_transcript`` reloaded the oversized transcript, and
-       compression exhaustion re-fired — a new session id every loop.
-
-The fix captures the fresh entry from ``reset_session`` and re-syncs the
-topic binding to it (a no-op on non-topic lanes).
-
-``TestAutoResetLoadsCleanContext`` — a behavioral contract on the real
-``SessionStore``: after ``reset_session`` the next turn loads an EMPTY
-transcript for the new session_id, never the bloated child's transcript.
+Compression exhaustion now retains its session instead of invoking this reset. An explicit reset
+must still select a clean, parentless session rather than leaking a compressed child's history
+into the new conversation (#35809).
 """
 
 from __future__ import annotations
@@ -61,12 +42,10 @@ def _bloat(n):
     ]
 
 
-class TestAutoResetLoadsCleanContext:
-    """#35809: after the gateway auto-resets a session because compression
-    was exhausted, the NEXT turn must load an EMPTY transcript for the new
-    session_id — never the bloated compressed-child transcript."""
+class TestExplicitResetLoadsCleanContext:
+    """Explicit reset must load an empty transcript for the new session, not the old child."""
 
-    def test_next_turn_transcript_is_empty_after_auto_reset(self, tmp_path):
+    def test_next_turn_transcript_is_empty_after_explicit_reset(self, tmp_path):
         store = _make_store(tmp_path)
         source = _make_source()
 
@@ -88,7 +67,7 @@ class TestAutoResetLoadsCleanContext:
         loaded = store.load_transcript(resolved.session_id)
 
         assert loaded == [], (
-            f"Auto-reset must yield an empty context, got {len(loaded)} "
+            f"Explicit reset must yield an empty context, got {len(loaded)} "
             f"messages — the bloated compressed child leaked into the new session."
         )
         # The old transcript is still searchable, not destroyed.

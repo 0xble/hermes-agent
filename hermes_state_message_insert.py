@@ -13,6 +13,35 @@ _INSERT_PAGE_ROWS = 200
 _INSERT_PAGE_BYTES = 1024 * 1024
 
 
+def prepare_single_message(db, session_id, message):
+    """Share single-occurrence encoding without adopting an existing transcript row."""
+    from hermes_state_messages import _coerce_timestamp, _parse_tool_calls, _tool_calls_count
+
+    message['display_metadata'] = db._encode_display_metadata(message.get('display_metadata'))
+    tool_calls = _parse_tool_calls(message.get('tool_calls'))
+    timestamp = _coerce_timestamp(message.get('timestamp'), time.time())
+    stamp_message_uid(message)
+    db._stamp_tool_call_uids(message, tool_calls, {})
+    params = db._message_row_params(
+        session_id, message['role'], message, tool_calls, timestamp, keep_reasoning=True)
+    return params, _tool_calls_count(tool_calls)
+
+
+def insert_single_message(db, conn, session_id, params, tool_count, *, archived=False,
+                          compression_lock_holder=None, turn_lease_holder=None,
+                          turn_lease_ttl_seconds=300.0):
+    """Keep insertion, archival, counters and the caller's receipt in one transaction."""
+    from hermes_state_messages import _INSERT_MESSAGE_SQL
+
+    db._check_transcript_write_guards(conn, session_id, compression_lock_holder,
+        turn_lease_holder=turn_lease_holder, turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+    row_id = conn.execute(_INSERT_MESSAGE_SQL, params).lastrowid
+    if archived:
+        conn.execute('UPDATE messages SET active=0, compacted=1 WHERE id=?', (row_id,))
+    db._bump_session_counters(conn, session_id, 1, tool_count, unit=True)
+    return row_id
+
+
 def _bound_bytes(params):
     return sum(len(value.encode("utf-8")) if isinstance(value, str) else len(value)
                if isinstance(value, (bytes, bytearray, memoryview)) else 8 for value in params if value is not None)

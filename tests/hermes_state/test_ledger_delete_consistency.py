@@ -3,6 +3,7 @@ with the ``session_admissions`` / ``worker_executions`` ledger (ON DELETE RESTRI
 
 Reported by @GodsBoy and @ahrazzle on #106742; fix shape by @dialapus.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import logging
 import time
 from contextlib import closing
@@ -50,7 +51,7 @@ def _ledger_rows(db, sid):
 ])
 def test_legacy_delete_retires_terminal_ledger_rows_and_refuses_live_work(tmp_path, delete):
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         _old_ended(db, 'settled')
         admission_id = _settled_admission(db, epoch, 'settled')
         _old_ended(db, 'busy')
@@ -81,7 +82,7 @@ def test_legacy_delete_publishes_the_full_retirement_fence(tmp_path, delete):
     row (which would let the same request be admitted a second time)."""
     from hermes_state_mutation_retirement import retired_session
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         _old_ended(db, 's', source='tui')
         db.save_gateway_routing_entry('route:s', '{"session_id": "s"}')
         request = dict(epoch=epoch, principal_id='human', session_id='s', request_id='once',
@@ -100,7 +101,7 @@ def test_legacy_delete_publishes_the_full_retirement_fence(tmp_path, delete):
 def test_legacy_delete_fences_cascaded_delegate_children(tmp_path):
     from hermes_state_mutation_retirement import retired_session
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         db.create_session('parent', source='cli')
         db.create_session('child', source='cli', parent_session_id='parent',
                           model_config={'_delegate_from': 'parent'})
@@ -116,7 +117,7 @@ def test_legacy_delete_fences_cascaded_delegate_children(tmp_path):
 
 def test_sweeps_skip_sessions_with_live_work_and_retire_the_rest(tmp_path):
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         for sid, source in (('ghost_settled', 'tui'), ('ghost_busy', 'tui'),
                             ('old_settled', 'cli'), ('old_busy', 'cli'), ('old_plain', 'cli')):
             _old_ended(db, sid, source)
@@ -190,7 +191,7 @@ def _local_session(db, epoch):
 def test_local_reset_refuses_over_started_admission_then_fences_generation(tmp_path):
     from hermes_state_local_lineage import reset_local_target
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         sid, reset = _local_session(db, epoch)
         started = _started_admission(db, epoch, sid)
         before = db.get_session(sid)
@@ -218,7 +219,7 @@ def test_local_reset_refuses_over_live_compute_worker_but_not_a_queued_follower(
     leave the queued follower unclaimable. A queued follower alone must still allow reset."""
     from hermes_state_local_lineage import reset_local_target
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         sid, reset = _local_session(db, epoch)
         scope = dict(execution_id='worker', session_id=sid, generation=0)
         rt.register_worker_execution(db, epoch=epoch, **scope, kind='compute',
@@ -255,7 +256,7 @@ def test_discarding_an_unadmitted_row_leaves_no_fence_but_an_admitted_row_is_fen
         assert db.get_session('fresh') is not None
 
         db.create_session('used', source='desktop')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         _settled_admission(db, epoch, 'used')
         assert db.discard_unadmitted_session('used') is True
         assert db.get_meta(RETIRED_PREFIX + 'used') is not None
@@ -267,7 +268,7 @@ def test_local_reset_stamps_ended_at_on_the_same_float_clock_as_started_at(tmp_p
     recorded a session that ended before it started."""
     from hermes_state_local_lineage import reset_local_target
     with closing(SessionDB(tmp_path / 'state.db')) as db:
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         sid, reset = _local_session(db, epoch)
         before = time.time()
         reset_local_target(db, epoch=epoch, parent_session_id=sid, entry=reset)
@@ -284,7 +285,7 @@ def test_pending_and_idle_probes_do_not_scan_finished_history(tmp_path, monkeypa
     from hermes_state_mutation_retirement import _LIVE_LEDGER_SQL
     with closing(SessionDB(tmp_path / 'state.db')) as db:
         db.create_session('s', source='api_server')
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         def history(conn):
             conn.executemany(
                 "INSERT INTO session_admissions(admission_id,request_id,principal_id,target_session_id,lineage_json,"

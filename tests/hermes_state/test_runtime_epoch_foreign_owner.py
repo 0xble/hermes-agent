@@ -12,9 +12,10 @@ import sys
 
 import pytest
 
-from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership, exclusive_maintenance
+from gateway.runtime_ownership import OwnershipConflict, exclusive_maintenance, process_ownership
 from hermes_state import SessionDB
 from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch as begin_fixture_epoch
 
 pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="POSIX flock stand-in for the live owner")
 
@@ -32,7 +33,7 @@ def store(tmp_path):
     home = tmp_path / "home"
     home.mkdir()
     db = SessionDB(db_path=home / "state.db")
-    live_epoch = begin_runtime_epoch(db, instance_id="live-gateway")
+    live_epoch = begin_fixture_epoch(db, instance_id="live-gateway")
     yield home, db, live_epoch
     db.close()
 
@@ -66,12 +67,12 @@ def test_foreign_begin_is_refused_and_leaves_the_live_epoch(store, live_owner):
 
 def test_begin_succeeds_once_the_owner_is_gone(store):
     _home, db, live_epoch = store
-    assert begin_runtime_epoch(db, instance_id="next-gateway") == live_epoch + 1
+    assert begin_fixture_epoch(db, instance_id="next-gateway") == live_epoch + 1
 
 
 def test_a_reservation_in_this_process_is_not_foreign(store):
     home, db, live_epoch = store
-    owner = ProfileOwnership()
+    owner = process_ownership
     owner.reserve([home])
     try:
         assert begin_runtime_epoch(db, instance_id="gateway") == live_epoch + 1
@@ -105,7 +106,7 @@ def test_an_unopenable_lock_counts_as_held(store):
 def _reserve_as(monkeypatch, home, slot):
     """This process reserves *home* as gateway slot *slot*, the way its runtime startup does."""
     monkeypatch.setattr("gateway.gateway_slot.effective_gateway_slot", lambda config=None: slot)
-    owner = ProfileOwnership()
+    owner = process_ownership
     owner.reserve([home])
     return owner
 

@@ -11,6 +11,7 @@ import logging
 import inspect
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, Optional
 from tools.terminal_tool_backends import (
     _container_config_from_config,
@@ -104,10 +105,37 @@ def _unregister_env(task_id: str):
     return env
 
 
+@contextmanager
+def _call_in_flight(*keys: Optional[str]):
+    """Hold the env cached under *keys* against the idle reaper for the duration of a call.
+
+    Only background processes on workspace keys refresh ``_last_activity`` mid-run, so a
+    foreground command longer than ``lifetime_seconds`` had its sandbox reaped out from under
+    it. Refcounted (parallel calls share a key); exit restamps, so the idle countdown starts at
+    call end.
+    """
+    from tools.terminal_tool import _calls_in_flight, _env_lock, _last_activity
+    held = [k for k in dict.fromkeys(keys) if k]
+    with _env_lock:
+        for k in held:
+            _calls_in_flight[k] = _calls_in_flight.get(k, 0) + 1
+    try:
+        yield
+    finally:
+        with _env_lock:
+            now = time.time()
+            for k in held:
+                left = _calls_in_flight.pop(k) - 1
+                if left:
+                    _calls_in_flight[k] = left
+                if k in _last_activity:
+                    _last_activity[k] = now
+
+
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     """Clean up environments that have been inactive for longer than lifetime_seconds."""
     from tools.terminal_tool import (
-        _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
+        _active_environments, _calls_in_flight, _creation_locks, _creation_locks_lock, _env_lock,
         _last_activity,
     )
     current_time = time.time()
@@ -128,7 +156,9 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # Phase 1: unregister stale entries atomically under the lock; phase 2:
     # stop them outside it (see _unregister_env for why).
     with _env_lock:
-        stale = [t for t, last in list(_last_activity.items()) if current_time - last > lifetime_seconds]
+        # A key with a foreground call in flight is busy, however old its stamp.
+        stale = [t for t, last in list(_last_activity.items())
+                 if current_time - last > lifetime_seconds and t not in _calls_in_flight]
         envs_to_stop = [(t, _active_environments.pop(t, None)) for t in stale]
         for t in stale:
             _last_activity.pop(t, None)
@@ -149,6 +179,24 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
 def _is_workspace_key(key: str) -> bool:
     """A persistent Docker key bound to one session workspace (``<base>:ws:<digest>``)."""
     return ":ws:" in str(key or "")
+
+
+def _local_shell_owner(task_id: Optional[str]) -> Optional[str]:
+    """Local exports belong to one child/run, not its inherited parent session.
+
+    Container aliases deliberately share a filesystem/backend for delegation.
+    A local environment also owns a mutable bash export snapshot, so following
+    those aliases would let a reviewer change the parent's HERMES_HOME. Use the
+    registered child ID (including nested/lifecycle children), never an ID prefix.
+    """
+    from tools import terminal_tool as tt
+
+    if not task_id:
+        return None
+    with tt._container_alias_lock:
+        if task_id in tt._container_aliases or task_id in tt._run_scoped_tasks:
+            return task_id
+    return None
 
 
 def get_active_env(task_id: str):

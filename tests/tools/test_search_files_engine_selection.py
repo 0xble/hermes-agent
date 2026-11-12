@@ -65,7 +65,7 @@ def test_filename_thread_budget_scales_but_never_exceeds_four(
     )
 
     assert result.error is None
-    assert len(env.rg_commands) == 1
+    assert len(env.rg_commands) == 2
     command = shlex.split(env.rg_commands[0])
     assert command[command.index("--threads") + 1] == str(expected_threads)
     assert ("--sortr=modified" in command) == (order == "modified")
@@ -399,7 +399,7 @@ def test_off_path_windows_rg_miss_is_reprobed_then_success_is_cached(
 
     assert ops._resolve_command("rg") is None
     candidate.parent.mkdir(parents=True)
-    candidate.write_text("")
+    candidate.write_text("", encoding="utf-8")
     expected = str(candidate).replace("\\", "/")
     assert ops._resolve_command("rg") == expected
     assert ops._resolve_command("rg") == expected
@@ -482,10 +482,10 @@ def test_modified_multi_path_search_preserves_exact_order_request():
     )
 
     assert result.files == ["/two/new.py", "/one/old.py"]
-    assert len(env.rg_commands) == 1
-    assert "--sortr=modified" in env.rg_commands[0]
-    assert "'/one'" in env.rg_commands[0]
-    assert "'/two'" in env.rg_commands[0]
+    assert len(env.rg_commands) == 2
+    assert all("--sortr=modified" in command for command in env.rg_commands)
+    assert " -- 'one')" in env.rg_commands[0]
+    assert " -- 'two')" in env.rg_commands[1]
 
 
 def test_comma_delimited_file_roots_preserve_internal_spaces_in_one_search():
@@ -514,8 +514,10 @@ def test_comma_delimited_file_roots_preserve_internal_spaces_in_one_search():
 
     assert result.error is None
     assert result.files == ["C:/root one/a.py", "C:/root two/b.py"]
-    assert len(env.rg_commands) == 1
-    assert "'C:/root one' 'C:/root two'" in env.rg_commands[0]
+    assert len(env.rg_commands) == 2
+    assert all("(cd -- 'C:/' &&" in command for command in env.rg_commands)
+    assert " -- 'root one')" in env.rg_commands[0]
+    assert " -- 'root two')" in env.rg_commands[1]
 
 
 def test_multi_path_modified_capability_error_propagates():

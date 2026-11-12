@@ -20,7 +20,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message, without_persistence_fields
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
-from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
+from agent.model_metadata import CHARS_PER_TOKEN, MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_builder import RUNTIME_ENVIRONMENT_END, RUNTIME_ENVIRONMENT_HEADING
 from agent.prompt_caching import (
@@ -36,6 +36,7 @@ from agent.surface_switch import (
 )
 from agent.turn_context import PreflightCompressionTimedOut, build_turn_context
 from hermes_cli.observability.shared_metrics_efficiency import record_cache_break, record_prompt_rebuild
+from hermes_cli.plugins_dispatch import held_stream_transforms
 from agent.turn_retry_state import TurnRetryState
 from agent.turn_scripted_prelude import Prelude, play_prelude
 # Phase helpers of the turn loop, bound at import so a source-tree swap cannot load a
@@ -361,32 +362,15 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
     agent._stream_needs_break = True
 
 
-def _is_copilot_provider(agent: Any) -> bool:
-    """Delegate to ``AIAgent._is_copilot_provider``; the fallback keeps the ``github-copilot`` /
-    ``github`` aliases so credential recovery is not skipped for them."""
-    try:
-        return bool(agent._is_copilot_provider())
-    except Exception:
-        return (getattr(agent, "provider", "") or "").strip().lower() in {
-            "copilot",
-            "github-copilot",
-            "github",
-        }
+def _credential_refresh_profile(agent: Any) -> Any:
+    """The profile owning the live credential's runtime refresh: the agent's provider by name, else
+    (a ``custom`` route at a provider's host) the profile serving the base URL's host. Only profiles
+    that override ``refresh_runtime_credentials`` qualify."""
+    from agent.provider_route_hooks import route_profiles
 
-
-def _is_stale_copilot_credential_error(status_code: Optional[int], error_message: str) -> bool:
-    """Detect a Copilot 400 that is really a STALE / DEGRADED credential (status 400 AND an
-    integrator/model-not-supported marker, so a wrong model name never triggers the
-    single-shot re-exchange). Caller enforces scoping/guard."""
-    lowered = (error_message or "").lower()
-    if status_code != 400 and "error code: 400" not in lowered:
-        return False
-    return any(marker in lowered for marker in (
-        "model_not_available_for_integrator",
-        "not available for integrator",
-        "model_not_supported",
-        "the requested model is not supported",
-    ))
+    profiles = route_profiles("refresh_runtime_credentials", (getattr(agent, "provider", "") or "").strip().lower(),
+                              str(getattr(agent, "base_url", "") or ""))
+    return profiles[0] if profiles else None
 
 
 def _pressure_with_real_floor(compressor: Any, rough_tokens: int) -> int:
@@ -1008,23 +992,23 @@ _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB = (
     "[System: The previous response was cut off by a network error mid-stream. Continue exactly "
     "where you left off. Do not restart or repeat prior text. Finish the answer directly.]"
 )
-# The dropped-tools variant interpolates tool names; matched by prefix.
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
-
-
-def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[list[str]] = None) -> str:
+_DROPPED_TOOL_ARGUMENTS_LARGE_THRESHOLD_CHARS = 8_000 * CHARS_PER_TOKEN
+def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[list[str]] = None,
+    dropped_tool_argument_chars: int = 0, dropped_tool_continuation_count: int = 0) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
+        if (dropped_tool_argument_chars > _DROPPED_TOOL_ARGUMENTS_LARGE_THRESHOLD_CHARS
+                or dropped_tool_continuation_count >= 2):
+            return (f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was too large and the stream "
+                "timed out before it could be delivered. Do NOT retry the same tool call with the same "
+                "large content. Break the content into multiple smaller tool calls under ~8K tokens. "
+                "The cut was a transport interruption, not a capability change — your tools remain fully available.]")
         return (
-            f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was too large and "
-            "the stream timed out before it could be delivered. Do NOT retry the same tool call "
-            "with the same large content. Instead, break the content into multiple smaller tool "
-            "calls (e.g. use multiple patch calls or write smaller files). Each tool call's "
-            "arguments must be under ~8K tokens to avoid stream timeouts. The cut was a transport "
-            "interruption, not a capability change — your tools remain fully available.]"
-        )
+            f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was cut off by a transport interruption "
+            "before it could be delivered. Re-issue the same tool call unchanged. The action was not "
+            "executed. The cut was not a capability change — your tools remain fully available.]")
     return _LENGTH_CONTINUATION_NETWORK_STUB if is_partial_stub else _LENGTH_CONTINUATION_OUTPUT_LIMIT
-
 
 # Codex/Responses turns that returned only internal reasoning: a bare retry would be
 # byte-identical, so the model repeats it.
@@ -1476,7 +1460,7 @@ def _preflight_timeout_result(agent, exc, conversation_history) -> dict[str, Any
         "Turn-start preflight compression timed out — ending turn with typed recovery result: %s", exc,
     )
     # Clear the tripwire slot note_turn_start registered (the early return skips the persist
-    # funnel). The user row is deliberately NOT persisted (#7100).
+    # funnel). Turn setup archived the rejected input without adding it to model replay (#7100).
     from agent.agent_runtime_helpers import note_turn_persisted
     note_turn_persisted(agent)
     # Not _COMPRESSION_TIMEOUT_FINAL_RESPONSE — that describes a different state
@@ -1643,7 +1627,7 @@ def _codex_app_server_turn(agent: Any, s: Any) -> Optional[dict[str, Any]]:
     codex_result = agent._run_codex_app_server_turn(
         user_message=s.user_message, original_user_message=s.original_user_message,
         messages=s.messages, effective_task_id=s.effective_task_id,
-        should_review_memory=s._should_review_memory,
+        should_review_memory=s._should_review_memory, turn_id=s.turn_id,
     )
     from agent.turn_recovery import activate_codex_app_server_fallback
     if not activate_codex_app_server_fallback(agent, codex_result):
@@ -1704,6 +1688,12 @@ def _run_conversation_turn(
         agent._try_refresh_env_client_credentials()
     except Exception:
         logger.debug("per-turn env credential refresh failed", exc_info=True)
+
+    # A loaded ``hold_stream`` transform in this profile: the user sees only its rewritten final, made
+    # by the transforms live now (a plugin reload mid-turn cannot drop them before the final). Set
+    # before any exit, so an early one never reads the previous turn's hold.
+    agent._held_transforms = held_stream_transforms()
+    agent._hold_stream = bool(agent._held_transforms)
 
     # Per-turn setup: build_turn_context mutates ``agent`` and returns the locals the loop reads.
     try:
@@ -1869,6 +1859,7 @@ def run_conversation(
     addresses, after every history rewrite including post-turn micro-compaction.
     """
     from agent.turn_context import export_current_turn_boundary
+    from agent.turn_finalizer import settle_held_final
     from agent.voice_turn_route import end_voice_turn_route
     from tools.vision_tools_history_budget import native_turn_images
 
@@ -1909,6 +1900,7 @@ def run_conversation(
             end_voice_turn_route(agent)
             from agent.turn_preflight_gate import _clear_preflight_output_state
             _clear_preflight_output_state(agent)
+    settle_held_final(agent, result)
     result = export_current_turn_boundary(agent, result, user_message)
     if isinstance(result, dict):
         result["user_intervened"] = bool(getattr(agent, "_turn_user_intervened", False))

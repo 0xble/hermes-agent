@@ -24,6 +24,8 @@ def ensure_closed_code_fences(text: str) -> str:
     if not isinstance(text, str) or not text:
         return text
 
+    from gateway.copy_blocks import protect_inline_copy_bodies, restore_inline_copy_bodies
+    text, bodies = protect_inline_copy_bodies(text, keep_markers=True)
     if text.count("```") % 2 == 1:
         text = text.rstrip("\n") + "\n```"
 
@@ -35,4 +37,4 @@ def ensure_closed_code_fences(text: str) -> str:
     if without_fences.count("`") % 2 == 1:
         text = text + "`"
 
-    return text
+    return restore_inline_copy_bodies(text, bodies)

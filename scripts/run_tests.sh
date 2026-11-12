@@ -30,8 +30,142 @@
 # separator required. The explicit '--' form still works and stacks with
 # bare flags. Positional path arguments override the default discovery
 # root (tests/).
+#
+# A missing or stale checkout environment is rebuilt by run-in-hermes-env,
+# which runs setup-hermes.sh. That setup writes tool, dependency, and
+# test-env state into the inherited HERMES_HOME. The fallback refuses when
+# that home is a live runtime home: a current release pointer
+# ($HERMES_HOME/current symlink, including a dangling one), gateway_state.json,
+# a running gateway pid (gateway.pid or gateway.b.pid), or the OS account's
+# default Hermes home. The account default comes from the password database,
+# not $HOME — workers pin HOME to scratch. Rebuild the checkout-local venv
+# instead, from the checkout, after stopping anything that is using .venv and
+# removing it if it exists:
+#   python -m pm.build_env --source . --out .venv --group dev --group test
+# Or set HERMES_HOME to a scratch directory that is not a live runtime home.
+# HERMES_ALLOW_LIVE_HOME_SETUP=1 overrides the refusal only when setup against
+# that home is deliberate. hermes update and the installer do not use this guard.
 
 set -euo pipefail
+
+# Predicate for the test-runner fallback. Sourcing this file defines it and
+# returns; it does not run the suite. The runner body below executes only when
+# this file is the program.
+hermes_account_default_home() {
+  local py=""
+  if [ -x /usr/bin/python3 ]; then
+    py=/usr/bin/python3
+  elif command -v python3 >/dev/null 2>&1; then
+    py="$(command -v python3)"
+  else
+    return 1
+  fi
+  "$py" -c 'import os, pwd, sys
+from pathlib import Path
+suffix = os.environ.get("HERMES_DATA_DIR_SUFFIX", "")
+try:
+    account = Path(pwd.getpwuid(os.getuid()).pw_dir)
+except Exception:
+    raise SystemExit(1)
+if sys.platform == "win32":
+    local = os.environ.get("LOCALAPPDATA", "").strip()
+    base = Path(local) if local else account / "AppData" / "Local"
+    print(base / ("hermes" + suffix))
+else:
+    print(account / (".hermes" + suffix))
+' || return 1
+}
+
+hermes_canonical_home() {
+  local path="${1%/}"
+  [ -n "$path" ] || return 1
+  if [ -d "$path" ]; then
+    (cd "$path" && pwd -P) || return 1
+    return 0
+  fi
+  printf '%s\n' "$path"
+}
+
+hermes_same_home() {
+  local left right
+  left="$(hermes_canonical_home "$1")" || return 1
+  right="$(hermes_canonical_home "$2")" || return 1
+  [ "$left" = "$right" ]
+}
+
+hermes_pid_from_file() {
+  local file="$1" line pid
+  [ -f "$file" ] || [ -L "$file" ] || return 1
+  # JSON {"pid": N} or a legacy bare integer. Read only; never unlink.
+  line="$(sed -n '1,20p' "$file" 2>/dev/null || true)"
+  pid="$(printf '%s\n' "$line" | sed -n \
+    -e 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' \
+    -e 's/^\([0-9][0-9]*\)$/\1/p' | sed -n '1p')"
+  [ -n "$pid" ] || return 1
+  [ "$pid" -gt 0 ] 2>/dev/null || return 1
+  printf '%s\n' "$pid"
+}
+
+hermes_gateway_pid_running() {
+  local home="$1" file pid
+  for file in "$home/gateway.pid" "$home/gateway.b.pid"; do
+    pid="$(hermes_pid_from_file "$file" 2>/dev/null || true)"
+    [ -n "$pid" ] || continue
+    if kill -0 "$pid" 2>/dev/null; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+hermes_effective_test_home() {
+  local os
+  if [ -n "${HERMES_HOME:-}" ]; then
+    printf '%s\n' "$HERMES_HOME"
+    return 0
+  fi
+  os="$(uname -s 2>/dev/null || printf '%s' unknown)"
+  case "$os" in
+    MINGW*|MSYS*|CYGWIN*) printf '%s\n' "${LOCALAPPDATA:-${HOME:-}/AppData/Local}/hermes" ;;
+    *) printf '%s\n' "${HOME:-}/.hermes" ;;
+  esac
+}
+
+# Prints why HOME is a live runtime home, or nothing and status 1.
+# The optional second argument is an already-resolved account default.
+hermes_runtime_home_live_reason() {
+  local home="$1"
+  local account_default="${2-}"
+  [ -n "$home" ] || return 1
+  if [ -L "$home/current" ]; then
+    printf '%s\n' "current release pointer"
+    return 0
+  fi
+  if [ -e "$home/gateway_state.json" ] || [ -L "$home/gateway_state.json" ]; then
+    printf '%s\n' "gateway_state.json"
+    return 0
+  fi
+  if hermes_gateway_pid_running "$home"; then
+    printf '%s\n' "running gateway pid"
+    return 0
+  fi
+  if [ -z "$account_default" ]; then
+    account_default="$(hermes_account_default_home 2>/dev/null || true)"
+  fi
+  if [ -n "$account_default" ] && hermes_same_home "$home" "$account_default"; then
+    printf '%s\n' "account default home"
+    return 0
+  fi
+  return 1
+}
+
+hermes_runtime_home_is_live() {
+  hermes_runtime_home_live_reason "$@" >/dev/null
+}
+
+if [ "${BASH_SOURCE[0]}" != "$0" ]; then
+  return 0
+fi
 
 # ── Locate repo root ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -82,6 +216,23 @@ else
       echo "error: run-in-hermes-env did not produce a current environment for $REPO_ROOT" >&2
       exit 1
     fi
+    # Only this fallback. hermes update and the installer call setup directly.
+    if [ "${HERMES_ALLOW_LIVE_HOME_SETUP:-}" != 1 ]; then
+      _live_home="$(hermes_effective_test_home)"
+      _live_reason="$(hermes_runtime_home_live_reason "$_live_home" || true)"
+      if [ -n "$_live_reason" ]; then
+        echo "error: refusing to run test-environment setup against a live runtime home: $_live_home ($_live_reason)." >&2
+        echo "That setup writes tool, dependency, and test-env state into HERMES_HOME." >&2
+        echo "Rebuild the checkout-local venv instead. From the checkout, stop anything using .venv, remove it if it exists, then run:" >&2
+        echo "  python -m pm.build_env --source . --out .venv --group dev --group test" >&2
+        echo "Then explicitly select that interpreter (clearing any stale activation for this command only):" >&2
+        echo '  env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh' >&2
+        echo "Append your original test arguments to that command." >&2
+        echo "Or set HERMES_HOME to a scratch directory that is not a live runtime home." >&2
+        echo "Set HERMES_ALLOW_LIVE_HOME_SETUP=1 only when setup against this home is deliberate." >&2
+        exit 1
+      fi
+    fi
     echo "▶ environment missing or stale for $REPO_ROOT — re-running under run-in-hermes-env" >&2
     export __HERMES_TESTS_REEXEC=1
     exec "$SCRIPT_DIR/run-in-hermes-env" "$BASH" "${BASH_SOURCE[0]}" "$@"
@@ -113,11 +264,16 @@ fi
 # These are location variables, not
 # credentials, so forwarding them keeps the isolation intent intact. Each is
 # only forwarded when actually set, so POSIX runs are byte-for-byte unchanged.
+# SystemDrive/ProgramData/ALLUSERSPROFILE are system locations, not per-user
+# AppData. Dropping SystemDrive makes Windows expand Common AppData to a
+# literal %SystemDrive% directory inside the checkout. Git bash is
+# case-sensitive, so both casings must cross this env -i boundary.
 # Portable CI also binds PowerShell's module-analysis cache to its disposable
 # parent home; retain that exact location across the hermetic env boundary.
 WIN_ENV=()
-for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT TEMP TMP \
-    ComSpec PATHEXT PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData PSModuleAnalysisCachePath; do
+for _win_var in USERPROFILE HOMEDRIVE HOMEPATH LOCALAPPDATA APPDATA SYSTEMROOT SystemRoot TEMP TMP \
+    ComSpec PATHEXT PROGRAMFILES ProgramFiles PROGRAMDATA ProgramData ALLUSERSPROFILE \
+    SYSTEMDRIVE SystemDrive PSModuleAnalysisCachePath PSMODULEANALYSISCACHEPATH; do
   if [ -n "${!_win_var:-}" ]; then
     WIN_ENV+=("$_win_var=${!_win_var}")
   fi
@@ -180,6 +336,8 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 #     tests/tools/test_docker_backend_real.py); remote-backends.yml points them at
 #     a throwaway sshd container and a small public image. The key is a
 #     per-run throwaway, never a credential.
+#   * VAULT_BROWSER_FIXTURE_MODULES / SOURCE opt into the isolated native
+#     checkout fixture using installed companion modules/source, not user profiles.
 #
 # These are test-infrastructure knobs, not credentials — same class as the
 # HERMES_RUN_SLOW_PET_TESTS / HERMES_E2E_BROWSER / HERMES_RUN_E2E opt-ins
@@ -191,13 +349,38 @@ _pf86="$(env | sed -n 's/^ProgramFiles(x86)=//p' | head -n1)"
 # credential can leak" property stays auditable at a glance.
 # Admission state is deliberately scrubbed: the helper recognizes held ancestors
 # after env -i, while tests must still exercise terminal promotion as unheld.
+# Download-only caches are explicit upgrade inputs, not installed/user state. Historical
+# installer fixtures need the portable lane's primed downloads; dropping these at env -i
+# silently makes every independent N-1 install redownload the same artifacts.
+# Resolve symlinks against the OS account home, never the sandbox HOME. Refuse live
+# Hermes/default caches and relative paths; an unresolvable account is fail-closed.
+# Do not forward UV_PROJECT_ENVIRONMENT, HERMES_HOME, or HERMES_RUNTIME_DIR here.
 TEST_ENV=()
+for _cache_var in UV_CACHE_DIR UV_PYTHON_INSTALL_DIR npm_config_cache; do
+  if [ -n "${!_cache_var:-}" ] && "$PYTHON" -c '
+import os, sys
+from pathlib import Path
+try:
+    import pwd
+    home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    cache = Path(sys.argv[1])
+    protected = (home / ".hermes", home / ".cache/uv", home / ".npm", home / ".local/share/uv")
+    safe = cache.is_absolute() and not any(cache.resolve().is_relative_to(p.resolve()) for p in protected)
+except (ImportError, KeyError, OSError, RuntimeError, ValueError):
+    safe = False
+raise SystemExit(0 if safe else 1)
+' "${!_cache_var}"; then
+    # The file runner exposes these only to upgrade files, never ordinary test children.
+    TEST_ENV+=("_HERMES_UPGRADE_$_cache_var=${!_cache_var}")
+  fi
+done
 for _test_var in HERMES_PYTHON HERMES_TEST_IMAGE HERMES_TEST_PATHS \
   HERMES_TEST_FILE_TIMEOUT HERMES_TEST_FILE_RETRIES HERMES_TEST_SLICE \
   HERMES_TEST_SCRATCH_ROOT PLAYWRIGHT_BROWSERS_PATH SSL_CERT_FILE SSL_CERT_DIR HERMES_GATEWAY_LOCK_DIR HERMES_E2E_REQUIRE_TUI CI GITHUB_ACTIONS \
   HERMES_E2E_WINDOWS_INSTALL HERMES_E2E_MACHINE_ROOT HERMES_E2E_PROFILES_ROOT HERMES_E2E_ARTIFACTS \
   HERMES_E2E_STRICT_ACCEPTANCE HERMES_TEST_SSH_HOST HERMES_TEST_SSH_USER HERMES_TEST_SSH_PORT \
-  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE; do
+  HERMES_TEST_SSH_KEY HERMES_TEST_DOCKER_IMAGE HERMES_TEST_LIVE_TASK_CDP \
+  VAULT_BROWSER_FIXTURE_MODULES VAULT_BROWSER_FIXTURE_SOURCE; do
   if [ -n "${!_test_var:-}" ]; then
     TEST_ENV+=("$_test_var=${!_test_var}")
   fi

@@ -11,7 +11,7 @@ async def test_claimed_turn_dropped_as_outbox_duplicate_settles_failed(monkeypat
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress import executing_admission
     from hermes_state_runtime import list_session_admissions
     from plugins.platforms.telegram.adapter import TelegramAdapter

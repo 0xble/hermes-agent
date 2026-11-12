@@ -27,7 +27,7 @@ High-level categories:
 | **Web** | `web_search`, `web_extract` | Search the web and extract page content. |
 | **X Search** | `x_search` | Search X (Twitter) posts and threads via xAI's built-in `x_search` Responses tool — gated on xAI credentials (SuperGrok OAuth or `XAI_API_KEY`); off by default, opt in via `hermes tools` → 🐦 X (Twitter) Search. |
 | **Terminal & Files** | `terminal`, `process`, `read_file`, `patch` | Execute commands and manipulate files. |
-| **Browser** | `browser_navigate`, `browser_snapshot`, `browser_vision` | Interactive browser automation with text and vision support. |
+| **Browser** | `browser_exec`, `browser_cdp`, `browser_dialog`, `browser_vault` | Browser automation: `browser_exec` drives Chromium with Python over CDP (screenshots included). The Camofox browser is a separate catalog plugin (`hermes plugins install camofox`). |
 | **Media** | `vision_analyze`, `image_generate`, `text_to_speech` | Multimodal analysis and generation. |
 | **Agent orchestration** | `todo`, `clarify`, `execute_code`, `delegate_task` | Planning, clarification, code execution, and subagent delegation. |
 | **Memory & recall** | `memory`, `session_search` | Persistent memory and session search. |
@@ -262,7 +262,9 @@ This applies where a completion can reach the agent: the interactive CLI (includ
 `hermes chat -q`), the TUI and desktop app, and messaging chats. Non-interactive `hermes chat -q`,
 one-shot `hermes -z`, cron jobs, Kanban workers, stateless API requests and delegated subagents keep the
 previous behaviour because they cannot receive a later completion, as does any profile with
-`display.background_process_notifications: off` (completions never start an agent turn there). Checking
+`display.background_process_notifications: off` (automatic wait-promotion stays disabled there).
+An explicitly requested `notify_on_complete=true` still wakes the messaging gateway agent under
+`off`, without a separate chat receipt; CLI, TUI and Desktop keep plain polling under `off`. Checking
 a process whose completion goes to someone else (another session's process, or a subagent's process
 that was not handed off) also stays plain polling. Admin-managed settings and `${VAR}` values count.
 To keep plain polling everywhere, set:

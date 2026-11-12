@@ -6,6 +6,7 @@ latest``, ``chat -c --output-format stream-json`` and ``chat -c --safe-mode`` (a
 through ``gateway_chat._resume_latest``) reported "No previous CLI session" for every session
 the gateway had created.
 """
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import json
 from types import SimpleNamespace
 
@@ -32,7 +33,7 @@ def _owner(home, monkeypatch):
                              _handle_message=None, _peek_session_state=lambda key: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
+                                 epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
     runner.session_authority = authority
     return store, authority, AuthorityConnection(authority, object(), {'user_id': 'human'})
 

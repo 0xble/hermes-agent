@@ -10,6 +10,8 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from gateway.run_bootstrap import _start_gateway_make_shutdown_signal_handler
+
 from gateway import restart_loop_guard as guard
 from gateway.run_startup import GatewayStartupMixin
 
@@ -47,7 +49,7 @@ async def test_planned_signal_exit_exempts_next_boot_once(tmp_path, monkeypatch)
         return task
 
     monkeypatch.setattr(run.asyncio, "create_task", record_task)
-    run._start_gateway_make_shutdown_signal_handler(predecessor, signal_initiated)(signal.SIGTERM)
+    _start_gateway_make_shutdown_signal_handler(predecessor, signal_initiated)(signal.SIGTERM)
     await asyncio.gather(*created)
     predecessor.stop.assert_awaited_once_with(restart=True, service_restart=True)
     assert signal_initiated == [False]

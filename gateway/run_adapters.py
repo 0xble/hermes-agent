@@ -29,6 +29,7 @@ from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.helpers import carry_inbound_dedup, hand_over_held_inbound
 from gateway.restart import is_global_startup_conflict
 from gateway.run_shutdown import _log_suppressed
+from gateway.run_adapters_scope import _UnresolvedProfileHome
 from gateway.session import SessionSource
 from hermes_cli.observability.shared_metrics_gateway import record_platform_connect, record_platform_disconnect
 from pathlib import Path
@@ -51,17 +52,6 @@ def _adapter_unavailable_message(platform: Platform, *, retrying: bool = True) -
         f"No adapter available for enabled {platform.value}; check the plugin, dependencies, and credentials."
     )
     return f"{message} Retrying in the background." if retrying else message
-
-
-class _UnresolvedProfileHome:
-    """A NAMED routed profile whose home does not resolve — never the same thing as ``None``
-    ("this body is the launch profile's own work"). Overloading ``None`` for both let an inbound
-    message on a secondary's bot run with the LAUNCH profile's ``.env`` and frozen env."""
-
-    __slots__ = ()
-
-    def __repr__(self) -> str:  # log/diagnostic readability
-        return "<unresolved profile home>"
 
 
 UNRESOLVED_PROFILE_HOME = _UnresolvedProfileHome()
@@ -453,6 +443,8 @@ class GatewayAdapterLifecycleMixin:
                     adapter.platform.value,
                 )
                 self._ensure_reconnect_watcher_running()
+                return
+            if self._park_last_fatal_platform(adapter):
                 return
             self._exit_reason = adapter.fatal_error_message or "All messaging adapters disconnected"
             if adapter.fatal_error_retryable:
@@ -1477,6 +1469,12 @@ class GatewayAdapterLifecycleMixin:
                 owner_origin=owner_origin, incoming_origin=incoming_origin,
             ) or self._refuse_duplicate_claim(listener_claim, claimed, profile_name, platform, "listener"):
                 continue
+            # The profile owns this bot from here on, connected or not: cron and the delivery drain read
+            # ownership here from another thread, never from the live map a fatal error rewrites.
+            bot_platforms = getattr(self, "_profile_bot_platforms", None)
+            if bot_platforms is None:
+                bot_platforms = self._profile_bot_platforms = {}
+            bot_platforms.setdefault(profile_name, set()).add(platform)
             self._configure_profile_adapter(adapter, profile_name, platform)
             try:
                 with _profile_runtime_scope(profile_home, hydrate_secrets=False):

@@ -30,7 +30,7 @@ async def test_armed_roster_error_keeps_due_clock_and_delivers_unknown_status(fi
     event = f.authority.admit_automation.await_args.args[1]
     assert await run_checkins.prepare_checkin(f.runner, event, f.entry, start=True)
     assert "unknown" in event.text.lower() and "roster" in event.text.lower()
-    result = await run_checkins.silence_fallback(f.runner, event, f.entry, {"final_response": "NO_REPLY"})
+    result = await run_checkins.silence_fallback(f.runner, event, f.entry, {"final_response": "NO_REPLY", "completed": True, "failed": False})
     assert "unknown" in result["final_response"].lower()
 
 

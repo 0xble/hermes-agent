@@ -1,6 +1,7 @@
 """Per-topic privacy switches share the gateway's model routing and turn boundary."""
 from copy import deepcopy
 import asyncio
+import logging
 
 
 class GatewayIncognitoCommandsMixin:
@@ -102,7 +103,7 @@ class GatewayIncognitoCommandsMixin:
             if getattr(getattr(self, "config", None), "multiplex_profiles", False):
                 profile_home = self._resolve_profile_home_for_source(event.source)
             ctx = self._model_switch_context(event.source, key, profile_home=profile_home, persist_global=False)
-            result, error = await self._perform_model_switch(ctx, request, None, event.source)
+            result, error = await self._perform_model_switch(ctx, request, "", event.source)
             if error is not None:
                 return self._incognito_reply(entry, error)
             override = {
@@ -127,7 +128,9 @@ class GatewayIncognitoCommandsMixin:
             self._session_model_overrides[key] = override
             self._session_state(key).conversation.model_override_scope = "session"
             self._session_state(key).conversation.model_role = None
-        except Exception:
+        except Exception as exc:  # health: allow BLE001 -- any route failure keeps privacy on with the current model; its class is logged
+            from agent.incognito import log_private_failure
+            log_private_failure(logging.getLogger(__name__), exc, operation="model route", session_id=entry.session_id)
             return self._incognito_reply(entry, "Could not resolve the configured model route.")
         return self._incognito_reply(entry)
 

@@ -11,7 +11,7 @@ from gateway.session_controls import AuthorityConnection
 async def test_forwarded_identity_survives_reconnect_without_policy_override(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway import run
     from gateway.session_policy import build_policy
     from hermes_state_runtime import RuntimeStoreError
@@ -66,7 +66,7 @@ async def test_forwarded_identity_survives_reconnect_without_policy_override(tmp
 async def test_forwarding_does_not_merge_lossy_context_or_peer_identity(tmp_path, monkeypatch):
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway import run
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
@@ -118,7 +118,7 @@ async def test_forwarded_turns_are_authored_by_the_peer_for_memory_attribution(t
     bot author of every forwarded turn, not the local principal that hosts the session."""
     from gateway.config import GatewayConfig
     from gateway.session import SessionStore
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_a2a import forward_author
     from gateway.session_ingress import row_turn_author
     from agent.turn_author import a2a_key

@@ -1,4 +1,8 @@
-"""Versioned loop revisions; authority policy is unchanged by snapshot/CAS settlement."""
+"""Versioned loop revisions; authority policy is unchanged by snapshot/CAS settlement.
+
+With ``loops.autonomy`` on, the agent may revise any field or replace its loop without a user
+quote. The min-interval and self-paced floors and the ``loops.max_ticks`` backstop still apply.
+"""
 
 from __future__ import annotations
 
@@ -97,6 +101,7 @@ class LoopRevisionsMixin:
         user_messages: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Apply a versioned, authority-checked edit to the existing loop."""
+        from hermes_cli.goals_autonomy import loop_autonomy_enabled
         from hermes_cli.loops import min_interval_seconds, self_paced_floor_seconds
         state = self._state
         version = state.version if state is not None else 1
@@ -178,8 +183,9 @@ class LoopRevisionsMixin:
             or faster
             or raising_times
         )
+        autonomous = actor == "agent" and loop_autonomy_enabled()
         quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=needs_authority
+            state, user_quote, user_messages, required=needs_authority and not autonomous
         )
         if quote_error:
             return self._revision_result(
@@ -197,6 +203,8 @@ class LoopRevisionsMixin:
             "before": {key: before[key] for key in changed},
             "after": {key: after[key] for key in changed},
         }
+        if autonomous:
+            revision["authority"] = "autonomy"
         if clamped_from is not None:
             revision["clamped"] = {
                 "interval_seconds": clamped_from,
@@ -255,6 +263,7 @@ class LoopRevisionsMixin:
         user_messages: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """Replace the loop definition while preserving its revision history and route."""
+        from hermes_cli.goals_autonomy import loop_autonomy_enabled
         from hermes_cli.loops import max_ticks_default, min_interval_seconds, self_paced_floor_seconds
         state = self._state
         version = state.version if state is not None else 1
@@ -275,8 +284,9 @@ class LoopRevisionsMixin:
                 ok=False, revision=None, version=state.version,
                 error_code="no_change", error="replacement prompt is empty",
             )
+        autonomous = loop_autonomy_enabled()
         quote, quote_error, quote_detail = self._revision_quote(
-            state, user_quote, user_messages, required=True
+            state, user_quote, user_messages, required=not autonomous
         )
         if quote_error:
             return self._revision_result(
@@ -288,6 +298,13 @@ class LoopRevisionsMixin:
         interval = 0.0 if self_paced else float(max(int(interval_seconds), min_interval_seconds()))
         new_times = max(0, int(times or 0))
         new_until = (until or "").strip()
+        # Without the user's words a replacement is the same loop under new orders, so the
+        # tick budget keeps counting and the cadence floor still holds from the last tick. The
+        # requested run count means that many more runs.
+        carry = not quote
+        carried_ticks = state.ticks_fired if carry else 0
+        if carry and new_times:
+            new_times += carried_ticks
         old_snapshot = {
             "prompt": state.prompt,
             "mode": state.mode,
@@ -304,7 +321,7 @@ class LoopRevisionsMixin:
             "current_delay": float(self_paced_floor_seconds()) if self_paced else interval,
             "times": new_times,
             "until": new_until,
-            "ticks_fired": 0,
+            "ticks_fired": carried_ticks,
         }
         revision = {
             "at": now,
@@ -316,8 +333,11 @@ class LoopRevisionsMixin:
             "before": old_snapshot,
             "after": new_snapshot,
         }
+        if autonomous:
+            revision["authority"] = "autonomy"
         old_route = dict(state.route)
-        # Resume is a user-only control: a replaced paused loop stays paused (with its reason) until /loop resume.
+        # A replaced paused loop stays paused with its reason. Only /loop resume, or an autonomous
+        # resume of the agent's own pause, re-arms it.
         was_paused = state.status == "paused"
         state.prompt = prompt
         state.status = "paused" if was_paused else "active"
@@ -327,10 +347,11 @@ class LoopRevisionsMixin:
         state.times = new_times
         state.until = new_until
         state.max_ticks = max_ticks_default()
-        state.ticks_fired = 0
+        state.ticks_fired = carried_ticks
         state.created_at = now
-        state.last_fired_at = 0.0
-        state.next_due_at = now
+        state.last_fired_at = state.last_fired_at if carry else 0.0
+        floor = interval if not self_paced else float(self_paced_floor_seconds())
+        state.next_due_at = max(now, state.last_fired_at + floor) if state.last_fired_at else now
         state.awaiting_response = False
         state.last_response_digest = ""
         state.backoff_level = 0

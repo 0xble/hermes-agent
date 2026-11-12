@@ -1,4 +1,5 @@
 """Native deletion retires routing and keeps only exact authorized retries."""
+from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import asyncio
 import json
 import sqlite3
@@ -66,7 +67,7 @@ def test_route_retirement_rolls_back_with_receipt_and_rejects_stale_mirror(tmp_p
         if db.get_session(sid) is None:
             db.create_session(sid, source='telegram')
         serialized = json.dumps(entry.to_dict())
-        epoch = rt.begin_runtime_epoch(db, instance_id='owner')
+        epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         args = dict(epoch=epoch, principal_id='human', session_id=sid, request_id='delete',
                     expected_revision=0, expected_generation=0, operation='delete', payload={})
         db._execute_write(lambda conn: conn.execute("CREATE TRIGGER reject_receipt BEFORE INSERT ON state_meta WHEN NEW.key LIKE 'gateway.mutation.v1.%' BEGIN SELECT RAISE(ABORT,'receipt unavailable'); END"))

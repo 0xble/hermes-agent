@@ -124,7 +124,11 @@ def main():
                 "-c",
                 "import os, pathlib, signal, time; "
                 "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
-                "pathlib.Path(os.environ['MOCK_LSP_CHILD_PID']).write_text(str(os.getpid())); "
+                # Existence is the readiness signal: publish only a closed, complete PID file.
+                "p = pathlib.Path(os.environ['MOCK_LSP_CHILD_PID']); "
+                "pending = p.with_suffix('.tmp'); "
+                "pending.write_text(str(os.getpid()), encoding='utf-8'); "
+                "pending.replace(p); "
                 "time.sleep(60)",
             ],
             env=os.environ,
