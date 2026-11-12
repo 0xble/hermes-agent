@@ -477,7 +477,7 @@ def test_compression_activity_heartbeat_nonfinite_interval_falls_back(tmp_path: 
 
 
 def test_compression_heartbeat_stop_persists_completed_over_in_progress(
-    tmp_path: Path,
+    tmp_path: Path, monkeypatch
 ) -> None:
     """/compress is outside run_conversation, so turn-end clear never runs.
 
@@ -487,6 +487,12 @@ def test_compression_heartbeat_stop_persists_completed_over_in_progress(
     """
     from agent.conversation_compression import _CompressionActivityHeartbeat
     from agent.session_activity import ActivityProvenance
+
+    # This line's rate limit treats 0.0 as "persisted at boot", so on a host up
+    # under 60s (fresh CI VMs) the reset stamp is skipped. Pin uptime past the
+    # window; the never-persisted sentinel fix (84b944ef) is not on this base.
+    real_monotonic = time.monotonic
+    monkeypatch.setattr(time, "monotonic", lambda: real_monotonic() + 3600.0)
 
     db = SessionDB(db_path=tmp_path / "state.db")
     session_id = "HEARTBEAT_PERSIST_COMPLETED_TEST"

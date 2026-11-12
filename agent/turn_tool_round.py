@@ -169,6 +169,8 @@ def run_tool_round(
             # any tool calls it emits are discarded, never dispatched into another round.
             _turn_exit_reason = "tool_cap_answer"
             try:
+                # Prior tool-round commentary is not evidence that this final answer reached chat display.
+                agent._reset_stream_delivery_tracking()
                 final_response = agent._handle_max_iterations(messages, api_call_count, tool_cap=decision)
             except InterruptedError:
                 interrupted = True
@@ -179,13 +181,13 @@ def run_tool_round(
             final_response = agent._toolguard_controlled_halt_response(decision)
             agent._emit_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
             append_message(messages, {"role": "assistant", "content": final_response})
-        # Emit the halt so it isn't mistaken for a crash; the stream callback is still
-        # alive, so SSE/TUI clients see the explanation.
+        # Emit the halt so it isn't mistaken for a crash; stream only to chat display.
         if final_response:
             agent._safe_print(f"\n{final_response}\n")
-            if agent.stream_delta_callback:
+            if agent.stream_delta_callback and not getattr(agent, "_hold_stream", False):
                 with suppress(Exception):
-                    agent.stream_delta_callback(final_response)
+                    if not agent._interim_content_fully_streamed(final_response):
+                        agent.stream_delta_callback(final_response)
                     agent.stream_delta_callback(None)
         return _verdict("break")
 
