@@ -1317,10 +1317,11 @@ async def test_blocking_outbound_stamp_cannot_strand_a_delivered_ledger():
         "_outbound_stamp_tasks": set(),
     })()
     event = _telegram_event()
+    event._transcript_message_uid = "row-1"  # type: ignore[attr-defined]
     key = "agent:main:telegram:dm:2027045491:113596"
     try:
         await asyncio.wait_for(adapter.send_final_ledgered(
-            event, key, "landed text", {"_transcript_message_uid": "row-1"}, reply_to=None,
+            event, key, "landed text", {}, reply_to=None,
         ), timeout=2)
     finally:
         gate.set()
