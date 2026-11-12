@@ -9,8 +9,6 @@ import logging
 import threading
 import time
 import weakref
-
-import hermes_loop_guard
 from typing import Any, Dict, List, Optional, Tuple
 
 # caplog tests pin the "hermes_state" logger name.
@@ -155,11 +153,6 @@ class SessionUsageMixin:
         # Lock-free fast path: reads queue-then-busy (see ordering notes below).
         if not self._token_queue and not self._token_writer_busy:
             return True
-        # The writer commits under the state.db write lock, so waiting for it here would park the
-        # gateway event loop behind every queued SQLite writer. Loop callers read ownership and
-        # lineage, not exact totals, so they take the documented stale-totals result instead.
-        if hermes_loop_guard.on_loop_thread():
-            return False
         batch = None
         with self._token_queue_cond:
             deadline = time.monotonic() + timeout

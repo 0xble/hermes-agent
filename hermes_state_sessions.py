@@ -14,6 +14,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 from agent.session_activity import (
     ActivityProvenance, bound_activity_description, normalize_activity_provenance,
 )
+import hermes_loop_guard
 from hermes_state_errors import SessionActiveWriteGuardError
 from hermes_state_common import (
     _LISTABLE_CHILD_SQL, _RECOVERABLE_END_REASONS,
@@ -851,7 +852,10 @@ class SessionSessionsMixin:
 
         # Recall metadata can lag queued usage. Draining it would wait on the writer
         # once per ancestor and defeat the reader-only scope before any SELECT runs.
-        if current_search(self) is None:
+        # The token writer commits under the state.db write lock, so draining it on the gateway event
+        # loop parks the loop behind every queued writer. Loop callers read ownership, lineage and
+        # titles, never token totals (usage reads go through AsyncSessionDB's worker threads).
+        if current_search(self) is None and not hermes_loop_guard.on_loop_thread():
             self.flush_token_counts()
         row = self._read_one(
             "SELECT s.*, COALESCE(sp.prompt, s.system_prompt) AS _system_prompt_resolved, "
