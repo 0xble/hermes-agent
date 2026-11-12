@@ -77,7 +77,9 @@ def rewrite_references(value: Any, aliases: dict, changes: list[str], path: str 
 
 def _migrate_aliases(cfg: dict, changes: list[str]) -> dict:
     presets = cfg.pop("model_presets", {}) or {}
-    aliases = cfg.setdefault("model_aliases", {})
+    # Only attach model_aliases once a route lands in it, so a config with nothing to retire is never rewritten.
+    aliases = cfg.get("model_aliases")
+    aliases = {} if aliases is None else aliases
     if not isinstance(aliases, dict) or not isinstance(presets, dict):
         raise ValueError("model_aliases and the retiring model_presets must be mappings")
     for name, entry in presets.items():
@@ -128,6 +130,8 @@ def migrate_document(config: dict) -> tuple[dict, list[str]]:
     if retired:
         from hermes_cli.config_migrations_delegation_roles import install_role_routes
         install_role_routes(cfg, aliases, changes)
+    if aliases:
+        cfg["model_aliases"] = aliases
     settings = delegation.get("backends", {}).get("model_map", {})
     for option in settings.get("options", []):
         alias = aliases.get(option.get("model"))
