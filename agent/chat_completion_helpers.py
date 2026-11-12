@@ -2533,7 +2533,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
     """Compatibility facade for the extracted per-turn cleanup implementation."""
     from agent.chat_completion_helpers_cleanup import cleanup_task_resources as _cleanup
     _cleanup(
-        agent, task_id, persistent_env_check=is_persistent_env, run_agent_module=_ra(), log=logger
+        agent, task_id, persistent_env_check=is_persistent_env, run_agent_module=_ra, log=logger
     )
 
 
@@ -2999,8 +2999,8 @@ class _StreamingCall(StreamingWaitMonitor):
         self.deltas_were_sent["yes"] = True
 
     def _visible_text_delivered(self) -> bool:
-        """True when visible text reached any consumer (display-recorded text or TTS acceptance)."""
-        return bool(getattr(self.agent, "_stream_any_consumer_accepted_visible_text", False) or (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
+        """True when visible text reached any consumer (display, TTS, or relay)."""
+        return bool((getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
 
     def _emit_reasoning(self, text: str) -> None:
         self._fire_first_delta()
@@ -3016,7 +3016,7 @@ class _StreamingCall(StreamingWaitMonitor):
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
         if self.agent.stream_delta_callback and not getattr(self.agent, "_hold_stream", False):
-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text), self.agent._record_display_streamed_assistant_text(text)))
 
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()

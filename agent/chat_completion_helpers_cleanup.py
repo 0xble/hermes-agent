@@ -28,9 +28,12 @@ def cleanup_task_resources(
         except Exception:
             return bool(os.environ.get("AGENT_BROWSER_HEADED"))
 
+    def _runtime() -> Any:
+        return run_agent_module() if callable(run_agent_module) else run_agent_module
+
     for label, skip, skip_what, cleanup in (
-        ("VM", persistent_env_check, "cleanup_vm for persistent env", lambda: run_agent_module.cleanup_vm(task_id)),
-        ("browser", lambda _tid: _headed(), "cleanup_browser for headed session", lambda: run_agent_module.cleanup_browser(task_id)),
+        ("VM", persistent_env_check, "cleanup_vm for persistent env", lambda: _runtime().cleanup_vm(task_id)),
+        ("browser", lambda _tid: _headed(), "cleanup_browser for headed session", lambda: _runtime().cleanup_browser(task_id)),
     ):
         try:
             if skip(task_id):

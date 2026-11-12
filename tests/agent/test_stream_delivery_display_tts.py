@@ -40,8 +40,24 @@ def test_tts_only_visible_acceptance_clears_breaker_but_not_display_tracking(mon
     resets = _emit_text(_streaming_call(agent), "answer", monkeypatch)
 
     assert resets == [agent]
-    assert agent._stream_any_consumer_accepted_visible_text is True
+    assert agent._current_streamed_assistant_text == "answer"
+    assert agent._display_streamed_assistant_text == ""
     assert agent._interim_content_fully_streamed("answer") is False
+
+
+def test_tts_only_text_is_retained_for_partial_stream_stub(monkeypatch):
+    agent = _Agent()
+    agent.stream_delta_callback = None
+    agent._stream_callback = lambda _text: None
+    call = _streaming_call(agent)
+    call.result = {"partial_tool_names": []}
+    call._partial_tool_accumulator = None
+    _emit_text(call, "answer", monkeypatch)
+
+    stub = call._partial_stream_stub(RuntimeError("stream ended"))
+
+    assert stub.choices[0].message.content == "answer"
+    assert agent._current_streamed_assistant_text == "answer"
 
 
 def test_no_consumer_acceptance_does_not_clear_breaker(monkeypatch):
@@ -50,7 +66,7 @@ def test_no_consumer_acceptance_does_not_clear_breaker(monkeypatch):
     resets = _emit_text(_streaming_call(agent), "answer", monkeypatch)
 
     assert resets == []
-    assert getattr(agent, "_stream_any_consumer_accepted_visible_text", False) is False
+    assert agent._current_streamed_assistant_text == ""
 
 
 def test_display_rejection_does_not_count_tts_success_as_chat_delivery():
