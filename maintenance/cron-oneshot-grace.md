@@ -9,14 +9,17 @@ backstops, or the `max_catch_up_lateness_seconds` interaction with those paths.
 ## Required behavior
 
 - One-shot catch-up uses `max(120, max_catch_up_lateness_seconds)` when the
-  field is set, and 120 seconds when it is absent. A field value of zero cannot
-  tighten the one-shot safety floor. The same allowance must be used by due
-  scan retirement, scheduler-stall continuity, outage coverage, missing-slot
-  recovery and the provider misfire backstop.
+  field is set, and 120 seconds when it is absent or invalid. A field value of
+  zero cannot tighten the one-shot safety floor. The same allowance must be
+  used by due scan retirement, scheduler-stall continuity, outage coverage and
+  the provider misfire backstop.
 - A one-shot beyond its allowance is held with its payload and disabled; it is
   never sent or routed through `missed_windows.claim_slot`. The missed-run
   diagnostic names the actual allowance used. Create/update/resume rejection
   of an already-past one-shot remains the fixed 120-second scheduling guard.
+- Invalid, boolean, non-finite, and negative field values return 120 and do
+  not raise. `grace_minutes` is not read or aliased. Create, update, resume,
+  and rearm rejection stay on the fixed 120-second guard.
 - Recurring `cron` and `interval` expiration continues to use
   `max_catch_up_lateness_seconds` as its own policy and is not widened by this
   unit.
