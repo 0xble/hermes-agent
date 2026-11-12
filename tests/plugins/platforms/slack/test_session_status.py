@@ -14,6 +14,16 @@ def adapter(monkeypatch):
     return slack_fixture.__wrapped__()
 
 
+def test_typing_owner_scope_includes_slack_workspace(adapter):
+    """Slack Connect workspaces must not share a channel/thread owner."""
+    first = {"thread_id": "1700.0001", "slack_team_id": "T1"}
+    second = {"thread_id": "1700.0001", "slack_team_id": "T2"}
+
+    assert adapter._typing_scope_key("C1", first) == ("T1", "C1", "1700.0001")
+    assert adapter._typing_scope_key("C1", second) == ("T2", "C1", "1700.0001")
+    assert adapter._typing_scope_key("C1", first) != adapter._typing_scope_key("C1", second)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failed_status", ["processing", "active"])
 async def test_native_failure_preserves_legacy_status_and_clear_retry(adapter, caplog, failed_status):

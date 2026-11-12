@@ -12,6 +12,21 @@ logger = logging.getLogger(__name__)
 
 
 class SlackThreadStatusMixin:
+    def _typing_scope_key(self, chat_id, metadata=None):
+        """Qualify thread surfaces by workspace, matching ``_active_status_threads``.
+
+        Slack Connect can expose the same channel/thread IDs in several workspaces.
+        Chat-wide keys stay unqualified so metadata-free pauses keep covering the chat.
+        """
+        typing_scope_key = getattr(super(), "_typing_scope_key")
+        key = typing_scope_key(chat_id, metadata)
+        if not isinstance(key, tuple):
+            return key
+        metadata_team_id = getattr(self, "_metadata_team_id")
+        channel_team = getattr(self, "_channel_team", {})
+        team_id = metadata_team_id(metadata) or channel_team.get(str(chat_id), "")
+        return (str(team_id), *key) if team_id else key
+
     def _status_entry(self, chat_id, team_id, thread_ts, owner):
         key = self._workspace_thread_key(team_id, chat_id, str(thread_ts))
         previous = self._active_status_threads.get(key)
