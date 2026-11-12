@@ -979,7 +979,7 @@ class AIAgent(
         # on a closed delegate child they were the only remaining owners, pinning its history in the parent heap.
         self._session_messages = []
         self._db_flush_scan_prefix = None
-        self._streamed_assistant_text_parts = []
+        self._streamed_assistant_text_parts = self._display_streamed_assistant_text_parts = []
         if isinstance(session_messages, list):
             # The token-estimate memo pins message strings; a closed conversation's can never hit again. The
             # system prompt reaches the memo only through api_messages, never through the history, and a
