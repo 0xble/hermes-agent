@@ -698,8 +698,7 @@ def _get_session(task_id: Optional[str], account: Optional[str] = None) -> Dict[
                 _active_identity_lookups[task_id] = remaining
             else:
                 _active_identity_lookups.pop(task_id, None)
-                if task_id not in _sessions:
-                    _task_release_epochs.pop(task_id, None)
+                _task_release_epochs.pop(task_id, None)
 
 
 def _ensure_tab(task_id: Optional[str], url: Optional[str] = None, account: Optional[str] = None,
