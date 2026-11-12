@@ -28,7 +28,10 @@ def plugin_data_dir(name: str) -> Path:
     """Return (and create) ``<hermes home>/plugin-data/<name>/``; resolves ``get_hermes_home()`` on
     every call so it follows the active profile — don't cache across profile switches."""
     from hermes_constants import get_hermes_home
-    root = get_hermes_home() / "plugin-data" / _validate_name(name)
+    from agent.incognito_private_dir import private_path_for_current_session
+    private_root = private_path_for_current_session()
+    root = (private_root / "plugin-data" if private_root is not None
+            else get_hermes_home() / "plugin-data") / _validate_name(name)
     root.mkdir(parents=True, exist_ok=True)
     return root
 

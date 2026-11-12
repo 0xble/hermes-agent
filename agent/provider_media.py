@@ -29,9 +29,12 @@ _MAX_SAVE_URL_REDIRECTS = 5
 
 
 def cache_dir(kind: str) -> Path:
-    """Return ``$HERMES_HOME/cache/<kind>/``, creating parents as needed."""
+    """Return the active private cache for generated media, or the normal Hermes cache."""
+    from agent.incognito_private_dir import private_path_for_current_session
     from hermes_constants import get_hermes_home
-    path = get_hermes_home() / "cache" / kind
+    private_root = private_path_for_current_session()
+    path = ((private_root / "cache" / kind) if private_root is not None
+            else get_hermes_home() / "cache" / kind)
     path.mkdir(parents=True, exist_ok=True)
     return path
 

@@ -3052,7 +3052,23 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             # extraction, instead of promoting a possibly partial block to its own message.
             with suppress(Exception):
                 event._copy_blocks_inline_only = True
-        return response
+        return self._prepend_incognito_restart_notice(session_entry, response)
+
+    def _prepend_incognito_restart_notice(self, session_entry, response):
+        """One visible line after a restart dropped the private RAM tail."""
+        if not isinstance(response, str) or not response.strip():
+            return response
+        from gateway.response_filters import is_intentional_silence_response
+        if is_intentional_silence_response(response):
+            return response
+        session_key = getattr(session_entry, "session_key", None)
+        store = getattr(self, "session_store", None)
+        mark = getattr(store, "mark_incognito_restart_notice_sent", None)
+        if not session_key or not callable(mark) or mark(session_key) is not True:
+            return response
+        notice = "Hermes restarted, so the private messages before this were dropped. Incognito is still on."
+        body = response or ""
+        return notice if not body else f"{notice}\n{body}"
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
     # sign-in, `{relogin}` the profile-aware host equivalent, filled from the turn's agent provider).

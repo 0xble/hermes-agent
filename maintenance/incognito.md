@@ -67,8 +67,21 @@ not only the command reply.
 - Intake policy belongs to the receiving adapter. Observed groups whose command
   and conversation keys differ are refused, rather than changing actor identity
   or claiming privacy on only one of the lanes.
-- Media without an existing RAM-only path is refused before download. A temporary
-  file followed by deletion is not an admissible implementation.
+- Media without a persistent store may use the interval's private directory, which is
+  deleted on `/incognito off` and `/new`; no private artifact may outlive that interval.
+  The default parent is outside `HERMES_HOME`, in the account cache root and scoped to the
+  process Hermes home (`~/Library/Caches/Hermes/incognito/<home-hash>/` on macOS,
+  `$XDG_CACHE_HOME/Hermes/incognito/<home-hash>/` elsewhere), because the startup sweep
+  removes everything under the parent and must never reach another home's live interval.
+  `incognito.private_dir` may override that parent (for example, to a RAM-backed volume)
+  and must not be shared between Hermes homes.
+  Resolver identity is `agent.incognito_private_dir`: a bound public session is never
+  redirected into another topic's directory. A thread with no bound identity, while any
+  private interval is active, uses a shared `unattributed` disposable directory under the
+  same parent, removed when the last interval ends and by the startup sweep. Durable
+  plugin data redirects only on a positive private identity. Cleanup that cannot delete
+  a directory records a content-free failure through `log_private_failure` and does not
+  fail `/incognito off`; the startup sweep reports how many directories it removed.
 - Picker dispatch and ingress share 1 callback-family registry. Only exact chat
   and sent-message IDs may resolve existing RAM prompt state and its session lane.
   Stale buttons cannot run or consume a newer prompt. Unmatched pickers remain

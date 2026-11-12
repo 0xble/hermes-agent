@@ -120,6 +120,8 @@ async def promote(runner) -> dict[str, Any]:
         return {"promoted": False, "refused": "not_ready"}
 
     # The standby opened no shared store; take ownership before any adapter can deliver a turn.
+    from agent.incognito_private_dir import sweep_private_dirs
+    sweep_private_dirs()
     _promoted = True
     try:
         return await _promote(runner)

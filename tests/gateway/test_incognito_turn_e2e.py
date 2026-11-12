@@ -245,6 +245,10 @@ async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify
     assert summaries and all(summaries)
     # The cache re-baseline keeps the resolver's agent across private turns.
     assert agent is not None and agent.incognito is True and runner._cached_agent_for(key) is agent
+    # Private compaction stays on one session id, so the interval keeps one directory to delete on exit.
+    from agent import incognito_private_dir as private_dirs
+    assert agent.session_id == sid and store.lookup_by_session_key(key).session_id == sid
+    assert len(list(private_dirs._configured_root().glob(private_dirs.PRIVATE_DIR_PREFIX + "*"))) == 1
     assert store.lookup_by_session_key(key).last_prompt_tokens > 0
     records = [record.getMessage() for record in caplog.records]
     assert not any(canary in text for text in records)

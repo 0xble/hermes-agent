@@ -1,0 +1,145 @@
+"""A private interval never captures another session's disposable or durable files."""
+from pathlib import Path
+
+import pytest
+
+from agent.incognito import incognito_scope, register_session
+from agent import incognito_private_dir as private_dirs
+from hermes_constants import apply_scratch_tmp_env, get_hermes_dir
+from plugins.plugin_storage import plugin_data_dir
+
+_default_root = private_dirs._configured_root  # captured before any fixture replaces it
+
+
+@pytest.fixture(autouse=True)
+def isolated_paths(tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(private_dirs, "_configured_root", lambda: tmp_path / "private")
+    yield home
+    for identity in ("private-a", "private-b"):
+        register_session(identity, False)
+        private_dirs.discard_private_dir(identity)
+    private_dirs.sweep_private_dirs()
+
+
+def test_default_parent_is_scoped_to_one_hermes_home(tmp_path, monkeypatch):
+    """One home's startup sweep must never reach another home's live interval."""
+    parents = []
+    for name in ("home-a", "home-b", "home-a"):
+        home = tmp_path / name
+        home.mkdir(exist_ok=True)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        parent = _default_root()
+        assert home not in parent.parents and parent != home
+        parents.append(parent)
+    assert parents[0] == parents[2] != parents[1]
+    assert parents[1] not in parents[0].parents and parents[0] not in parents[1].parents
+
+
+def test_unparseable_config_uses_default_parent(tmp_path, monkeypatch):
+    home = tmp_path / "broken-home"
+    home.mkdir()
+    (home / "config.yaml").write_text("incognito: [broken\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(private_dirs, "_configured_root", _default_root)
+    assert private_dirs._configured_root() == _default_root()
+
+
+def test_private_subprocess_tmpdir_overrides_launchd_tmp(tmp_path, isolated_paths):
+    register_session("private-a")
+    private_env = {"TMPDIR": "/var/folders/x", "HERMES_HOME": str(isolated_paths)}
+    with incognito_scope(True, "private-a"):
+        assert apply_scratch_tmp_env(private_env) is True
+        private_root = private_dirs.private_path_for_current_session()
+        assert private_root is not None
+        assert Path(private_env["TMPDIR"]).is_relative_to(private_root / "cache" / "scratch")
+
+    public_env = {"TMPDIR": "/var/folders/x", "HERMES_HOME": str(isolated_paths)}
+    with incognito_scope(False, "public-b"):
+        assert apply_scratch_tmp_env(public_env) is False
+    assert public_env["TMPDIR"] == "/var/folders/x"
+
+
+def test_public_voice_cache_and_plugin_data_survive_private_off(isolated_paths):
+    register_session("private-a")
+    with incognito_scope(True, "private-a"):
+        private_root = private_dirs.private_path_for_current_session()
+        assert private_root is not None
+        private_file = get_hermes_dir("cache/audio", "audio_cache") / "private.ogg"
+        private_file.parent.mkdir(parents=True, exist_ok=True)
+        private_file.write_bytes(b"private")
+    with incognito_scope(False, "public-b"):
+        public_audio = get_hermes_dir("cache/audio", "audio_cache") / "public.ogg"
+        public_audio.parent.mkdir(parents=True, exist_ok=True)
+        public_audio.write_bytes(b"public voice")
+        public_data = plugin_data_dir("public-test") / "data.txt"
+        public_data.write_text("public plugin")
+        assert not public_audio.is_relative_to(private_root)
+        assert public_data.is_relative_to(isolated_paths / "plugin-data")
+    register_session("private-a", False)
+    private_dirs.discard_private_dir("private-a")
+    assert not private_root.exists()
+    assert public_audio.read_bytes() == b"public voice"
+    assert public_data.read_text() == "public plugin"
+
+
+def test_two_private_topics_have_separate_directories():
+    register_session("private-a")
+    register_session("private-b")
+    paths = []
+    for identity in ("private-a", "private-b"):
+        with incognito_scope(True, identity):
+            paths.append(private_dirs.private_path_for_current_session())
+    assert paths[0] != paths[1]
+    assert all(path.is_dir() for path in paths)
+
+
+def test_unattributed_backstop_is_not_a_topic_directory(monkeypatch):
+    from agent import incognito
+    monkeypatch.setattr(incognito, "_sessions", set())
+    register_session("private-a")
+    with incognito_scope(True, "private-a"):
+        private_root = private_dirs.private_path_for_current_session()
+    with incognito_scope(False, "public-b"):
+        assert private_dirs.disposable_path_for_current_session() is None
+    backstop = private_dirs.disposable_path_for_current_session()
+    assert backstop is not None and backstop.name == "unattributed"
+    assert private_root not in backstop.parents
+    register_session("private-a", False)
+    private_dirs.discard_private_dir("private-a")
+    assert not backstop.exists()
+
+
+def test_cleanup_failure_is_logged_without_raising(caplog, monkeypatch):
+    register_session("private-a")
+    with incognito_scope(True, "private-a"):
+        private_root = private_dirs.private_path_for_current_session()
+    assert private_root is not None
+
+    def refuse(path):
+        raise OSError("cleanup refused")
+
+    monkeypatch.setattr(private_dirs.shutil, "rmtree", refuse)
+    with caplog.at_level("ERROR"):
+        private_dirs.discard_private_dir("private-a")
+    register_session("private-a", False)
+    assert any("private cleanup" in record.message for record in caplog.records)
+    private_dirs._remove(private_root)
+
+
+def test_last_interval_exit_removes_a_directory_no_session_owns():
+    """A directory left bound to an identity that is no longer private must not outlive the last interval."""
+    register_session("private-a")
+    with incognito_scope(True, "private-a"):
+        private_root = private_dirs.private_path_for_current_session()
+    stray = private_dirs._new_dir()
+    private_dirs.bind_private_session("no-longer-private", stray)
+    leftover = stray / "cache" / "audio" / "stray.ogg"
+    leftover.parent.mkdir(parents=True)
+    leftover.write_bytes(b"stray-private")
+    register_session("private-a", False)
+    private_dirs.discard_private_dir("private-a")
+    assert not private_root.exists()
+    assert not stray.exists()

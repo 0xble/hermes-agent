@@ -33,7 +33,7 @@ from agent.ssl_verify import platform_ssl_context
 from gateway.outbox import durable_control, durable_egress
 from plugins.platforms.telegram.callback_routing import matching_picker_state, picker_callback
 from plugins.platforms.telegram.private_ingress import (
-    PRIVATE_ATTACHMENT_NOTE, private_application_class, private_telegram_ingress, refuse_private_attachment,
+    private_application_class, private_telegram_ingress,
 )
 from plugins.platforms.telegram.flood_guard import FloodRefusal, call_with_flood_guard
 from plugins.platforms.telegram import flood_state
@@ -7918,9 +7918,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         source, filename, mime, kind = self._observed_media_source(msg)
         if source is None:
             return "none", None
-        from agent.incognito import is_incognito
-        if is_incognito():
-            return "private", None
         file_size = getattr(source, "file_size", None)
         if not (0 < self._int_or_zero(file_size) <= getattr(self, "_max_doc_bytes", 20 * 1024 * 1024)):
             return "oversized", file_size
@@ -7940,9 +7937,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         """Cache an unmentioned group attachment and annotate the observed text; oversized or unsupported
         attachments are noted in the transcript without downloading."""
         status, cached = await self._download_observed_media(msg, "observed group media")
-        if status == "private":
-            event.text = self._append_observed_note(event.text, PRIVATE_ATTACHMENT_NOTE)
-            return
         if status == "oversized":
             limit_mb = getattr(self, "_max_doc_bytes", 20 * 1024 * 1024) // (1024 * 1024)
             event.text = self._append_observed_note(
@@ -7972,9 +7966,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         if reply_msg is None:
             return
         status, cached = await self._download_observed_media(reply_msg, "replied-to media")
-        if status == "private":
-            event.text = self._append_observed_note(event.text, PRIVATE_ATTACHMENT_NOTE)
-            return
         if status == "ok":
             self._attach_cached(
                 event, cached, f"[Replied-to {cached.kind} '{cached.display_name}' saved at: {cached.path}]",
@@ -8604,9 +8595,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
         if msg.caption:
             from plugins.platforms.telegram.telegram_context import group_trigger_text
             event.text = group_trigger_text(self, msg, expand_link_entities(msg))
-        if refuse_private_attachment(event):
-            await self.handle_message(self._apply_telegram_group_observe_attribution(event))
-            return
         # Stickers: _handle_sticker overwrites event.text with its vision description, so observe attribution must run after it.
         if msg.sticker:
             await self._handle_sticker(msg, event)

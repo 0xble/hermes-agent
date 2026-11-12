@@ -284,9 +284,11 @@ def build_auto_tts_output_path(platform) -> str:
     backends like Edge TTS. Everything else keeps the MP3 default. See #36685, #57049.
     """
     from tools.tts_tool import OPUS_VOICE_PLATFORMS
+    from agent.incognito_private_dir import private_path_for_current_session
     ext = "ogg" if _platform_name(platform) in OPUS_VOICE_PLATFORMS else "mp3"
-    audio_path = os.path.join(
-        tempfile.gettempdir(), "hermes_voice", f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
+    private_root = private_path_for_current_session()
+    temp_root = private_root if private_root is not None else Path(tempfile.gettempdir())
+    audio_path = str(temp_root / "hermes_voice" / f"tts_reply_{uuid.uuid4().hex[:12]}.{ext}")
     os.makedirs(os.path.dirname(audio_path), exist_ok=True)
     return audio_path
 
@@ -2971,7 +2973,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             finally:
                 admission.release()
         try:
-            threading.Thread(target=_worker, name="media-history-lookup", daemon=True).start()
+            from agent.memory_provider import spawn_context_thread
+            spawn_context_thread(_worker, name="media-history-lookup", daemon=True).start()
         except Exception:
             # start() failed (thread exhaustion): the worker never ran, so release the permit here.
             admission.release()

@@ -41,10 +41,13 @@ Hindsight reads require a server with no-store read support. Hermes checks that
 capability before sending a private query and requires an explicit no-store
 acknowledgment. An unsupported server makes the read unavailable, not public.
 
-Telegram attachments that require a disk cache are refused before download while
-incognito is on. Text and captions still work. In observe-enabled groups, incognito
-is refused if commands and ordinary conversation route to different sessions. Use
-a DM or a shared topic in that case.
+Telegram attachments are admitted into the interval's private directory while
+incognito is on, then the directory is deleted at `/incognito off` or `/new`. Text,
+caption, voice and other supported media therefore work without leaving private files
+behind. The default private-directory parent is outside `HERMES_HOME`, under the account
+cache root (`~/Library/Caches/Hermes/incognito/` on macOS) in a folder specific to this
+Hermes home. Set `incognito.private_dir` to override it, with a different path for each
+Hermes home.
 
 Optionally choose a private model using the same model-route syntax as `/model`:
 

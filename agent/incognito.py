@@ -110,6 +110,11 @@ def is_registered(session_id: str | None) -> bool:
         return isinstance(session_id, str) and session_id in _sessions
 
 
+def current_session_id() -> str | None:
+    """Return the named session bound to this call, if any."""
+    return _session_id.get()
+
+
 def any_incognito_sessions() -> bool:
     """Protect unattributable ingress without guessing which private topic owns it."""
     with _lock:
@@ -261,7 +266,8 @@ def failure_class(exc: BaseException) -> str:
 
 
 def log_private_failure(logger: logging.Logger, exc: BaseException | None = None, *,
-                        operation: str, reason: str | None = None, session_id: str | None = None) -> None:
+                        operation: str, reason: str | None = None, session_id: str | None = None,
+                        force: bool = False) -> None:
     """Record a content-free failure class when a private turn fails. Public turns are a no-op.
 
     The privacy filter redacts every record a private scope creates, so this one is
@@ -271,7 +277,7 @@ def log_private_failure(logger: logging.Logger, exc: BaseException | None = None
     """
     import re
     try:
-        if not (is_incognito() or is_incognito(session_id)):
+        if not force and not (is_incognito() or is_incognito(session_id)):
             return
         parts = []
         if exc is not None:
