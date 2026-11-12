@@ -965,6 +965,23 @@ def test_non_outage_probe_error_releases_without_escalating():
     assert released["backoff_count"] == entry["backoff_count"]
 
 
+def test_interrupt_releases_probe_without_escalating():
+    from agent.turn_api_call import handle_api_interrupt
+    agent = SimpleNamespace(
+        _shared_primary_probe_token="probe-token", thinking_callback=None,
+        _has_pending_redirect=lambda: True,
+        clear_interrupt=lambda preserve_redirect: True,
+    )
+    retry = SimpleNamespace()
+    with patch("agent.shared_primary_probe_runtime.release_primary_probe") as release:
+        verdict = handle_api_interrupt(
+            agent, _retry=retry, thinking_spinner=None, messages=[], conversation_history=[],
+            api_start_time=time.time(), interrupted=False, final_response=None,
+        )
+    assert verdict.action == "break"
+    release.assert_called_once_with(agent, "probe-token")
+
+
 def test_adoption_claim_race_rechecks_the_surviving_record():
     from agent import shared_primary_cooldown_runtime as shared_runtime
     record = {**spc.arm_cooldown(_ROUTE, reason="rate_limit"), "state": "expired", "reset_at": time.time() - 1}

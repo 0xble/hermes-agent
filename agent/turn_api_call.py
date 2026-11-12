@@ -193,6 +193,10 @@ def handle_api_interrupt(
     from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
+    token = getattr(agent, "_shared_primary_probe_token", None)
+    if token:
+        from agent.shared_primary_probe_runtime import release_primary_probe
+        release_primary_probe(agent, token)
     # redirect() cancelled only this request: keep the correction queued, clear the
     # cancellation bit, let the outer loop rebuild. Never materialize incomplete
     # signed/encrypted reasoning items.
