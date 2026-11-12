@@ -21,9 +21,21 @@ import pytest
 from tools import async_delegation as ad
 from tools.process_registry import process_registry
 from tools.process_registry_notifications import format_process_notification
+from tests.tools.async_delegation_test_helpers import wait_for_queued
 
 
 _PENDING_EVENTS = []
+
+
+def _completion_queue_empty(): return not _PENDING_EVENTS and process_registry.completion_queue.empty()
+def _next_event():
+    if _PENDING_EVENTS: return _PENDING_EVENTS.pop(0)
+    return _next_queue_event()
+
+
+def _next_queue_event():
+    try: return process_registry.completion_queue.get_nowait()
+    except queue.Empty: return None
 
 
 @pytest.fixture(autouse=True)
@@ -46,8 +58,8 @@ def _clean_state():
 def _drain_one(timeout=5.0):
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
-        if not process_registry.completion_queue.empty():
-            return process_registry.completion_queue.get_nowait()
+        event = _next_event()
+        if event is not None: return event
         time.sleep(0.02)
     return None
 
@@ -59,25 +71,13 @@ def _drain_for(delegation_id, timeout=5.0):
         for index, evt in enumerate(_PENDING_EVENTS):
             if evt.get("delegation_id") == delegation_id:
                 return _PENDING_EVENTS.pop(index)
-        if not process_registry.completion_queue.empty():
-            evt = process_registry.completion_queue.get_nowait()
-            if evt.get("delegation_id") == delegation_id:
-                return evt
-            _PENDING_EVENTS.append(evt)
-            continue
-        time.sleep(0.02)
+        evt = _next_queue_event()
+        if evt is None:
+            time.sleep(0.02)
+        elif evt.get("delegation_id") == delegation_id:
+            return evt
+        else: _PENDING_EVENTS.append(evt)
     return None
-
-
-def _wait_for_queued(delegation_id, timeout=5.0):
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        item = next((item for item in ad.list_async_delegations()
-                     if item["delegation_id"] == delegation_id), None)
-        if item is not None and item["status"] == "queued":
-            return
-        time.sleep(0.01)
-    pytest.fail(f"delegation {delegation_id} did not remain queued")
 
 
 def test_schema_init_preserves_shared_state_db_journal_mode(tmp_path):
@@ -996,7 +996,7 @@ def test_queued_admission_does_not_submit_when_ledger_write_raises(monkeypatch):
     release.set()
     assert _drain_for(first["delegation_id"]) is not None
     assert not started.is_set()
-    _wait_for_queued(queued["delegation_id"])
+    wait_for_queued(ad, queued["delegation_id"])
     with ad._DB_LOCK, ad._transaction() as conn:
         assert conn.execute(
             "SELECT state FROM async_delegations WHERE delegation_id=?", (queued["delegation_id"],)
@@ -1041,7 +1041,7 @@ def test_queued_admission_does_not_submit_when_ledger_write_changes_zero_rows(mo
     release.set()
     assert _drain_for(first["delegation_id"]) is not None
     assert not started.is_set()
-    _wait_for_queued(queued["delegation_id"])
+    wait_for_queued(ad, queued["delegation_id"])
     with ad._DB_LOCK, ad._transaction() as conn:
         assert conn.execute(
             "SELECT state FROM async_delegations WHERE delegation_id=?", (queued["delegation_id"],)
@@ -1158,7 +1158,7 @@ def test_progressing_runner_is_never_stalled(monkeypatch):
     # Run well past the (shrunk) idle threshold — several monitor sweeps.
     time.sleep(0.6)
     assert ad.active_count() == 1
-    assert process_registry.completion_queue.empty()
+    assert _completion_queue_empty()
 
     gate.set()
     evt = _drain_for(res["delegation_id"], timeout=5.0)
@@ -1236,7 +1236,7 @@ def test_streaming_child_counts_as_alive(monkeypatch):
 
     time.sleep(0.6)  # several sweeps past the shrunk idle threshold
     assert ad.active_count() == 1
-    assert process_registry.completion_queue.empty()
+    assert _completion_queue_empty()
 
     gate.set()
     evt = _drain_for(res["delegation_id"], timeout=5.0)
@@ -1325,7 +1325,7 @@ def test_in_tool_stall_uses_higher_threshold(monkeypatch):
 
     time.sleep(0.5)  # far past idle threshold, well under in-tool threshold
     assert ad.active_count() == 1
-    assert process_registry.completion_queue.empty()
+    assert _completion_queue_empty()
 
     gate.set()
     evt = _drain_for(res["delegation_id"], timeout=5.0)
@@ -1497,7 +1497,7 @@ def test_delegate_task_background_routes_async_and_does_not_block(monkeypatch):
     assert parsed["delegation_id"].startswith("deleg_")
     # Non-blocking invariant: delegate_task returned while the child is STILL
     # blocked on the closed gate, so no completion event exists yet.
-    assert process_registry.completion_queue.empty()
+    assert _completion_queue_empty()
     assert ad.active_count() == 1  # one background batch unit, not finished
 
     gate.set()

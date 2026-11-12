@@ -10,7 +10,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Any
@@ -565,15 +565,26 @@ class SharedMetricsStore:
         # WAL is a property of the store, not the schema transaction. Enabling it
         # after the transaction preserves the normal busy wait for an existing
         # writer while making subsequent short writes multi-process safe.
-        with open_db(
-            self.database_path,
-            db_label="shared-metrics",
-            busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS,
-            wal=True,
-            wal_lock_retries=3,
-            row_factory=sqlite3.Row,
-        ):
-            pass
+        try:
+            with closing(
+                open_db(
+                    self.database_path,
+                    db_label="shared-metrics",
+                    busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS,
+                    wal=True,
+                    wal_lock_retries=3,
+                    row_factory=sqlite3.Row,
+                )
+            ):
+                pass
+        except sqlite3.OperationalError as exc:
+            if str(exc).lower() != "database is locked":
+                raise
+            logger.info(
+                "Unable to switch shared-metrics store to WAL while it is busy; "
+                "leaving its current journal mode for a later construction"
+            )
+
 
     def _install_id(self, connection: sqlite3.Connection) -> str:
         query = "SELECT value FROM telemetry_state WHERE key = 'install_id'"
