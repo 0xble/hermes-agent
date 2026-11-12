@@ -237,6 +237,7 @@ class RuntimeDeliveryRecoveryMixin:
             if started < cutoff:
                 continue
             from gateway.checkin_delivery import permits_recovery
+            text = None
             try:
                 text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
                                               started, origin)
@@ -245,8 +246,11 @@ class RuntimeDeliveryRecoveryMixin:
                 if text and not await permits_recovery(self, key, token):
                     text = ""
             except (OSError, sqlite3.Error):
-                logger.warning("Crash-left delivery policy unreadable for %s; retaining turn marker", key, exc_info=True)
-                continue
+                # A saved final reply is still owed. Falling back to the base recovery path
+                # clears the marker and ledgers it, so startup cannot turn it into a fresh resume.
+                logger.warning("Crash-left delivery policy unreadable for %s; ledgering saved reply", key, exc_info=True)
+                if text is None:
+                    continue
             if text:
                 for ref, content in await asyncio.to_thread(
                         self._crash_left_parts, key, token, text, started, origin):

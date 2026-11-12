@@ -1,11 +1,23 @@
 """Supervisor delivery provenance on the existing transcript and transport payloads."""
 from __future__ import annotations
 
+import hashlib
 import json
 
 from hermes_cli.checkins import CheckinConfig, DISPLAY_KIND
 
 DISARMED = "supervisor_checkin_disarmed"
+
+
+def _opaque_checkin_turn_id(token):
+    """Persist a non-reversible transcript identifier for the private active-turn token."""
+    return hashlib.sha256(f"hermes-checkin:{token}".encode()).hexdigest()
+
+
+def _checkin_turn_ids(token):
+    """Return the current opaque id and the pre-#1202 raw token for recovery compatibility."""
+    opaque = _opaque_checkin_turn_id(token)
+    return opaque, token
 
 
 def transcript_metadata(event):
@@ -14,7 +26,7 @@ def transcript_metadata(event):
     token = getattr(event, "_gateway_active_turn_token", None)
     if not tick or not token:
         return {}
-    metadata = {"checkin_turn_id": token, "checkin_root": tick[0]}
+    metadata = {"checkin_turn_id": _opaque_checkin_turn_id(token), "checkin_root": tick[0]}
     if hasattr(event, "_checkin_pending_root"):
         metadata["checkin_pending_root"] = event._checkin_pending_root
     return metadata
@@ -47,13 +59,15 @@ def retain_policy(manager, event, root):
         from gateway.run_checkins import descriptor
         lineage = list(dict.fromkeys([*manager.lineage, descriptor(event)[0]]))
         placeholders = ",".join("?" for _ in lineage)
+        opaque, legacy = _checkin_turn_ids(token)
         row = conn.execute(
             f"SELECT id, display_metadata FROM messages WHERE session_id IN ({placeholders}) "
             "AND role='user' AND display_kind=? AND json_valid(display_metadata) "
-            "AND json_extract(display_metadata, '$.checkin_turn_id')=? ORDER BY id DESC LIMIT 1",
-            (*lineage, DISPLAY_KIND, token)).fetchone()
+            "AND json_extract(display_metadata, '$.checkin_turn_id') IN (?, ?) ORDER BY id DESC LIMIT 1",
+            (*lineage, DISPLAY_KIND, opaque, legacy)).fetchone()
         if row is not None:
-            metadata = {**json.loads(row[1]), "checkin_pending_root": root}
+            metadata = {**json.loads(row[1]), "checkin_turn_id": opaque,
+                        "checkin_pending_root": root}
             conn.execute("UPDATE messages SET display_metadata=? WHERE id=?", (json.dumps(metadata), row[0]))
     manager.db._execute_write(write)
 
@@ -64,20 +78,24 @@ def pending_root(runner, route, token):
     store = getattr(runner, "session_store", None)
     if not callable(getattr(store, "_db_for_key", None)):
         return None
-    db = store._db_for_key(route)
+    try:
+        db = store._db_for_key(route)
+    except OSError:
+        return None
     if db is None:
-        raise OSError("Supervisor provenance store is unavailable")
+        return None
     entry = store.lookup_by_session_key(route)
     lineage = db.get_compression_lineage(entry.session_id) if entry is not None else []
     placeholders = ",".join("?" for _ in lineage) or "NULL"
     # The token is unique to this exact turn. Do not look only in the current route's
     # lineage: a reset may have moved it while the original delivery was pending.
+    opaque, legacy = _checkin_turn_ids(token)
     rows = db._read_all(
         "SELECT display_metadata FROM messages WHERE session_id IN "
         f"(SELECT id FROM sessions WHERE session_key=? OR id IN ({placeholders})) "
         "AND role='user' AND display_kind=? AND json_valid(display_metadata) "
-        "AND json_extract(display_metadata, '$.checkin_turn_id')=? ORDER BY id DESC LIMIT 1",
-        (route, *lineage, DISPLAY_KIND, token))
+        "AND json_extract(display_metadata, '$.checkin_turn_id') IN (?, ?) ORDER BY id DESC LIMIT 1",
+        (route, *lineage, DISPLAY_KIND, opaque, legacy))
     if not rows:
         return None
     metadata = json.loads(rows[0][0])

@@ -8,7 +8,7 @@ from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.session_results import execution_result
 from hermes_cli.checkins import CheckinConfig, CheckinManager
-from tests.gateway.test_supervisor_checkins import fixture as fixture
+from tests.gateway.test_supervisor_checkins import fixture as fixture  # noqa: PLC0414 -- fixture parameter intentionally shadows the imported pytest fixture
 
 
 @pytest.mark.asyncio
@@ -184,3 +184,20 @@ async def test_supervisor_preserves_written_advisory_and_handoff_status(fixture,
     for work in (list(f.work), []):
         f.work[:] = work
         assert await run_checkins.silence_fallback(f.runner, event, f.entry, result) is result
+
+
+@pytest.mark.asyncio
+async def test_storage_failure_uses_checkin_fallback_and_keeps_result_shape(request, monkeypatch):
+    f = request.getfixturevalue("fixture")
+    event = MessageEvent(text="tick", source=f.source, internal=True,
+                         metadata={"checkin": ["owner", 1300], "display_kind": "supervisor_checkin"})
+    event._checkin_fallback = "Roster storage is unavailable. Supervision will retry."
+    result = {"completed": False, "final_response": "", "failed": True}
+    monkeypatch.setattr("gateway.checkin_delivery.retain_policy",
+                        lambda *args: (_ for _ in ()).throw(OSError("busy")))
+
+    recovered = await run_checkins.silence_fallback(f.runner, event, f.entry, result)
+
+    assert recovered["final_response"] == event._checkin_fallback
+    assert recovered["delivery_text"] == event._checkin_fallback
+    assert recovered["already_sent"] is False
