@@ -575,8 +575,11 @@ def _settle_probe(
             entry["state"] = "active"
             entry["backoff_count"] = count
             backoff_reset = now + min(60 * (2 ** max(0, count - 1)), _MAX_BACKOFF_SECONDS)
-            provider_reset = _plausible_reset(reset_at, now)
-            if provider_reset is not None and provider_reset > backoff_reset:
+            from agent.fallback_cooldown import _provider_reset_epoch
+            provider_reset = _provider_reset_epoch(reset_at)
+            if (provider_reset is not None
+                    and provider_reset <= now + _MAX_PROVIDER_RESET_SECONDS
+                    and provider_reset > backoff_reset):
                 entry["reset_at"] = provider_reset
                 entry["source"] = "provider_reset"
             else:

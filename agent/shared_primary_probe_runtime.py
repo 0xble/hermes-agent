@@ -18,7 +18,9 @@ def _configured_base_url(provider, model) -> str:
     model_cfg = config.get("model") if isinstance(config, dict) else None
     if isinstance(model_cfg, dict):
         configured_provider = str(model_cfg.get("provider") or "").strip().lower()
-        if configured_provider == wanted and model_cfg.get("base_url"):
+        configured_model = str(model_cfg.get("model") or "").strip()
+        if (configured_provider == wanted and configured_model == target_model
+                and model_cfg.get("base_url")):
             return str(model_cfg["base_url"]).strip()
     providers = config.get("providers") if isinstance(config, dict) else None
     if isinstance(providers, dict):
@@ -84,8 +86,10 @@ def claim_primary_probe(agent, shared_state: str):
 def release_primary_probe(agent, token) -> None:
     if not token:
         return
-    with contextlib.suppress(Exception):
+    try:
         from agent.shared_primary_cooldown import _release_probe, route_from_record
         record = agent._shared_primary_cooldown_record
         _release_probe(route_from_record(record), str(record.get("outage_id") or ""), token)
+    except Exception:
+        logger.debug("Could not release primary cooldown probe", exc_info=True)
     agent._shared_primary_probe_token = None
