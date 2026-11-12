@@ -82,6 +82,13 @@ def _claim_outcome(kind: ProbeClaimKind, *, token: str | None = None,
     return ProbeClaimOutcome(kind=kind, token=token, record=dict(record) if isinstance(record, dict) else None)
 
 
+def _probe_token_value(value: Any) -> str:
+    """Extract the lease token without turning a typed no-token outcome into a token."""
+    if isinstance(value, ProbeClaimOutcome):
+        return value.token or ""
+    return str(value or "")
+
+
 def _state_path() -> Path:
     return get_hermes_home() / "state" / "model_cooldowns.json"
 
@@ -601,7 +608,7 @@ def _settle_probe(
     still the floor, but a later valid reset hint wins.
     """
     if isinstance(token, ProbeClaimOutcome):
-        token = token.token or ""
+        token = _probe_token_value(token)
     now = time.time()
     route = canonical_route(route)
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
@@ -658,7 +665,7 @@ def _settle_probe(
 def _release_probe(route: tuple[str, str, str], outage_id: str, token: str) -> bool:
     """Release a probe lease when restoration never reached a request."""
     if isinstance(token, ProbeClaimOutcome):
-        token = token.token or ""
+        token = _probe_token_value(token)
     route = canonical_route(route)
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
     try:
@@ -707,7 +714,7 @@ def settle_primary_probe_on_exit(agent, *, reason=None, reset_at=None) -> bool:
     shared breaker. Only explicit interrupt/cancel exits release the lease without changing backoff.
     """
     raw_token = getattr(agent, "_shared_primary_probe_token", "")
-    token = raw_token.token if isinstance(raw_token, ProbeClaimOutcome) else str(raw_token or "")
+    token = _probe_token_value(raw_token)
     record = getattr(agent, "_shared_primary_cooldown_record", None)
     if not token or not isinstance(record, dict):
         return False
@@ -849,7 +856,7 @@ def complete_primary_recovery(agent) -> bool:
     if live_route_from_agent(agent) != route:
         return False
     outage_id = str(record.get("outage_id") or "")
-    probe_token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
+    probe_token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))
     if not outage_id:
         return False
     if probe_token:

@@ -134,7 +134,8 @@ def _arm_rate_limit_cooldown(
                      or str(existing.get("outage_id") or "") != str(agent._shared_primary_probe_failed_outage_id))):
             agent._shared_primary_probe_failed_outage_id = None
         owner = str(existing.get("probe_owner") or "") if isinstance(existing, dict) else ""
-        token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
+        from agent.shared_primary_cooldown import _probe_token_value
+        token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))
         if owner and owner != token:
             logger.info("Ignoring stale primary failure while another probe owns the lease")
             return None
