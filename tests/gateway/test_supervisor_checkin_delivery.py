@@ -1,9 +1,11 @@
 """Execution attempts never masquerade as acknowledged supervisor output."""
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
 from gateway import run_checkins
+from gateway.checkin_delivery import delivery_metadata, fence_local_settlement, permits_metadata
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.session_results import execution_result
@@ -201,3 +203,61 @@ async def test_storage_failure_uses_checkin_fallback_and_keeps_result_shape(requ
     assert recovered["final_response"] == event._checkin_fallback
     assert recovered["delivery_text"] == event._checkin_fallback
     assert recovered["already_sent"] is False
+
+
+@pytest.mark.asyncio
+async def test_retention_failure_restores_scope_for_result_and_live_fence(fixture, monkeypatch):
+    f = fixture
+    f.work.clear()
+    event = MessageEvent(text="tick", source=f.source, internal=True,
+                         metadata={"checkin": ["owner", 1300], "display_kind": "supervisor_checkin"})
+    event._gateway_active_turn_token = "turn-token"
+    result = {"completed": True, "final_response": "NO_REPLY", "failed": False}
+    captured = {"result": dict(result)}
+    token = execution_result.set(captured)
+
+    def fail_write(_write):
+        raise OSError("busy")
+
+    monkeypatch.setattr(f.db, "_execute_write", fail_write)
+    try:
+        recovered = await run_checkins.silence_fallback(f.runner, event, f.entry, result)
+        assert event._checkin_pending_root == "owner"
+        assert captured["result"]["checkin_pending_root"] == "owner"
+        assert recovered["checkin_pending_root"] == "owner"
+
+        monkeypatch.setattr(CheckinConfig, "load", classmethod(
+            lambda cls: CheckinConfig(only_roots=("other",))))
+        metadata = delivery_metadata(event, {})
+        assert metadata["_checkin_scope"]["root"] == "owner"
+        assert not await permits_metadata(f.runner, metadata)
+        f.authority.runner = f.runner
+        live = type("Live", (), {"source": f.source})()
+        fenced = await fence_local_settlement(
+            f.authority, live, {"payload": {"local_automation_v1": {"display_kind": "supervisor_checkin"}}},
+            "pending", captured)
+        assert fenced == ""
+    finally:
+        execution_result.reset(token)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["raise", "none"])
+async def test_unavailable_db_holds_known_supervisor_but_allows_ordinary(fixture, failure):
+    f = fixture
+    from gateway.delivery_recovery import _recover_obligation_policy
+
+    def unavailable(_route):
+        if failure != "none":
+            raise OSError("transient open failure")
+
+    f.runner.session_store._db_for_key = unavailable
+    f.runner._release_runtime_claim_quiet = AsyncMock()
+    blocked = {}
+    supervisor = {"session_key": f.entry.session_key, "resume_turn_id": "token",
+                  "obligation_id": "supervisor", "last_error": "send_path_degraded",
+                  "supervisor_checkin": True}
+    ordinary = {**supervisor, "obligation_id": "ordinary", "supervisor_checkin": False}
+
+    assert await _recover_obligation_policy(f.runner, supervisor, "chat", blocked) is None
+    assert "chat" in blocked
+    assert await _recover_obligation_policy(f.runner, ordinary, "other-chat", {}) == {}
