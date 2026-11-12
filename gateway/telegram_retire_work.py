@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from dataclasses import replace
 from hermes_platform.resolver import locate_command
@@ -67,7 +68,7 @@ class WorkInProgress(RuntimeError):
 
 def open_control(raw):
     """Use the inventory's terminal semantics for successor admission too."""
-    return raw is not None and json.loads(raw).get("status") not in {"cleared", "done", "completed", "stopped"}
+    return raw is not None and json.loads(raw).get("status") not in {"cleared", "done", "completed", "stopped", "cancelled"}
 
 
 async def inventory(runner, source, state) -> list[dict]:
@@ -575,11 +576,65 @@ async def settle_handoffs(runner, source, state):
             await save(runner, source, state)
 
 
+async def reconcile_controls(runner, source, state, items):
+    """A selected delete retires session controls, never claims or other obligations."""
+    if not state.get("reason") or state.get("target"):
+        return items
+    from gateway.telegram_retire import RetirementSuperseded, state_key
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+
+    controls = [item for item in items if item["kind"] in {"goal", "loop"}
+                and item["id"] not in state["handoffs"] and not state.get("owners", {}).get(item["id"])]
+    if not controls:
+        return items
+    db = runner._session_db._db
+
+    def cancel(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (state_key(source),)).fetchone()
+        stored = json.loads(row[0]) if row else None
+        if (not stored or stored["generation"] != state["generation"]
+                or stored["phase"] not in {"pending", "waiting", "failed"}
+                or stored.get("target") or stored.get("owners", {}) != state.get("owners", {})
+                or stored.get("reason") != state.get("reason")):
+            raise RetirementSuperseded
+        receipts = stored.setdefault("cancelled_controls", {})
+        for item in controls:
+            kind = item["kind"]
+            key = f"{kind}:{state['session_id']}"
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            before = row[0] if row else None
+            if before is None or not open_control(before):
+                continue
+            record = json.loads(before)
+            if _handoff_definition(record) != _handoff_definition(item["record"]):
+                raise RuntimeError(f"Cannot cancel {kind}: its definition changed during retirement")
+            if kind == "loop" and record.get("awaiting_response"):
+                raise WorkInProgress("The loop's execution must settle before its topic retires.")
+            manager = (GoalManager if kind == "goal" else LoopManager)(state["session_id"], cursor=conn)
+            manager.clear()
+            after = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()[0]
+            if open_control(after):
+                raise RuntimeError(f"Retirement {kind} cancellation did not read back")
+            receipts[kind] = {"before": before, "after": after, "generation": state["generation"],
+                              "reason": state["reason"], "action": "clear"}
+        db.set_meta(state_key(source), json.dumps(stored), cursor=conn)
+        return receipts
+
+    state["cancelled_controls"] = await asyncio.to_thread(db._execute_write, cancel)
+    for kind in state["cancelled_controls"]:
+        logging.getLogger(__name__).info("Topic retirement %s cleared %s for session %s: selected topic deletion",
+                                        state["generation"], kind, state["session_id"])
+    # Cancellation cannot turn a failed or incomplete inventory into permission to delete.
+    return await inventory(runner, source, state)
+
+
 async def prepare(runner, source, state):
     from gateway.telegram_retire_prepare import queue_preparation
     await settle_handoffs(runner, source, state)
     try:
         items = await inventory(runner, source, state)
+        items = await reconcile_controls(runner, source, state, items)
     except WorkInProgress as exc:
         return await queue_preparation(runner, source, state, [], busy=str(exc))
     if not state.get("reason") or (state.get("target") and not state.get("context")):
