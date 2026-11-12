@@ -166,3 +166,85 @@ async def test_streamed_turn_stamps_the_surviving_reply_id(tmp_path):
         (older["message_uid"], None, 1),
         (current["message_uid"], "stream-last", 1),
     ]
+
+
+def _real_store(tmp_path, monkeypatch):
+    import hermes_state
+    from gateway.config import GatewayConfig
+    from gateway.session import AsyncSessionStore, SessionStore
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    return AsyncSessionStore(SessionStore(sessions_dir=tmp_path, config=GatewayConfig()))
+
+
+@pytest.mark.asyncio
+async def test_gateway_written_assistant_row_keeps_the_uid_delivery_stamps(tmp_path, monkeypatch):
+    store = _real_store(tmp_path, monkeypatch)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm")
+    entry = await store.get_or_create_session(source)
+    runner = GatewayTurnMixin.__new__(GatewayTurnMixin)
+    runner._session_db = None
+    runner.async_session_store = store
+    runner._hmwa_store_turn_prompt_tokens = AsyncMock()
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    event = MessageEvent(text="hello", message_type=MessageType.TEXT, message_id="in-db", source=source)
+    prepared = SimpleNamespace(
+        history=[], persist_user_message="hello", persist_user_timestamp=None,
+        persist_user_display_kind=None, persistence_owner=None, hygiene_adoption_epoch=0,
+        message_text="hello",
+    )
+    agent_messages = [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "stored answer"},
+    ]
+    agent_result = {"agent_persisted": False, "history_offset": 0, "last_prompt_tokens": 0}
+    await runner._hmwa_persist_turn_transcript(
+        event=event, source=source, session_entry=entry, session_key=entry.session_key,
+        agent_result=agent_result, agent_messages=agent_messages, prepared=prepared,
+        response="stored answer", agent_failed_early=False, hidden_reasoning_incomplete=False,
+        is_context_overflow_failure=False,
+    )
+    stamped = await store.record_outbound_platform_message(entry.session_key, "reply-db", "", event._transcript_message_uid)
+    rows = store._store._db.get_messages(entry.session_id)
+    assistant = [row for row in rows if row["role"] == "assistant"]
+    assert stamped is True
+    assert len(assistant) == 1
+    assert assistant[0]["message_uid"] == event._transcript_message_uid
+    assert assistant[0]["platform_message_id"] == "reply-db"
+
+
+@pytest.mark.asyncio
+async def test_proxy_turn_writes_the_uid_delivery_already_named(tmp_path, monkeypatch):
+    store = _real_store(tmp_path, monkeypatch)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm")
+    entry = await store.get_or_create_session(source)
+    runner = GatewayTurnMixin.__new__(GatewayTurnMixin)
+    runner._session_db = object()
+    runner.async_session_store = store
+    runner._hmwa_store_turn_prompt_tokens = AsyncMock()
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    event = MessageEvent(text="hello", message_type=MessageType.TEXT, message_id="in-proxy", source=source)
+    prepared = SimpleNamespace(
+        history=[{"role": "user", "content": "prior"}], persist_user_message="hello",
+        persist_user_timestamp=None, persist_user_display_kind=None, persistence_owner=None,
+        hygiene_adoption_epoch=0, message_text="hello",
+    )
+    proxy_assistant = {"role": "assistant", "content": "proxy answer"}
+    agent_result = {
+        "agent_persisted": True, "_gateway_user_turn_persisted": True, "history_offset": 0,
+        "last_prompt_tokens": 0, "messages": [{"role": "user", "content": "hello"}, proxy_assistant],
+    }
+    from gateway.outbound_reply import queued_reply_metadata
+    metadata = queued_reply_metadata({"thread_id": "7"}, agent_result)
+    await runner._hmwa_persist_turn_transcript(
+        event=event, source=source, session_entry=entry, session_key=entry.session_key,
+        agent_result=agent_result, agent_messages=agent_result["messages"], prepared=prepared,
+        response="proxy answer", agent_failed_early=False, hidden_reasoning_incomplete=False,
+        is_context_overflow_failure=False,
+    )
+    named = metadata["_transcript_message_uid"]
+    stamped = await store.record_outbound_platform_message(entry.session_key, "reply-proxy", "", named)
+    rows = [row for row in store._store._db.get_messages(entry.session_id) if row["role"] == "assistant"]
+    assert stamped is True
+    assert rows[0]["message_uid"] == named == event._transcript_message_uid
+    assert rows[0]["platform_message_id"] == "reply-proxy"

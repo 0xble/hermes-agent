@@ -88,6 +88,14 @@ def transcript_append_kwargs(session_id: str, message: dict[str, Any], *, fallba
         "display_kind": message.get("display_kind"),
         "display_metadata": message.get("display_metadata"),
     }
+    # Identity the caller already stamped. Omitting it makes append_message mint a
+    # new uid, so delivery later cannot find the row it named. Only a non-empty
+    # string is forwarded: append_message treats anything else as absent and mints.
+    # idx_messages_session_uid is not unique, so a second append of the same dict
+    # (a spool replay after a committed write) is another physical row, not an error.
+    uid = message.get("message_uid")
+    if isinstance(uid, str) and uid:
+        kwargs["message_uid"] = uid
     for key in _BOUND_TEXT_KEYS:
         kwargs[key] = _bindable_text(kwargs[key])
     return kwargs

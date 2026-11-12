@@ -2885,6 +2885,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                         await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                     if response:
                         assistant_row = {"role": "assistant", "content": response, "timestamp": ts}
+                        queued_uid = agent_result.get("_queued_reply_uid")
+                        if isinstance(queued_uid, str) and queued_uid:
+                            assistant_row["message_uid"] = queued_uid
                         from agent.message_metadata import stamp_message_uid
                         event._transcript_message_uid = stamp_message_uid(assistant_row)
                         await store.append_to_transcript(sid, assistant_row, skip_db=agent_persisted)
@@ -2908,6 +2911,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                         ):
                             entry["message_id"] = str(event.message_id)
                             _user_msg_id_attached = True
+                        from gateway.outbound_reply import stamp_gateway_assistant_entry
+                        stamp_gateway_assistant_entry(entry, event)
                         await store.append_to_transcript(sid, entry, skip_db=agent_persisted)
 
         # The agent persists token counts/model itself; keep only last_prompt_tokens for hygiene.
@@ -5085,9 +5090,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 session_key or "?",
             )
             try:
+                from gateway.outbound_reply import queued_reply_metadata
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
-                    metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                    metadata=queued_reply_metadata(turn_ctx._status_thread_metadata, result),
+                    event_message_id=turn_ctx.event_message_id,
                     text_already_delivered=_already_streamed,
                     deliver_media=_deliver_media, stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on

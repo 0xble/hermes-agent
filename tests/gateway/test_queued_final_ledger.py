@@ -124,6 +124,42 @@ async def test_a_delivered_queued_final_is_recorded_and_marked_delivered():
 
 
 @pytest.mark.asyncio
+async def test_queued_lane_final_stamps_the_assistant_row_persistence_chose(tmp_path, monkeypatch):
+    import asyncio
+
+    import hermes_state
+    from gateway.config import GatewayConfig, Platform
+    from gateway.session import SessionSource, SessionStore
+    from gateway.turn_context import TurnContext
+
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", tmp_path / "state.db")
+    store = SessionStore(sessions_dir=tmp_path, config=GatewayConfig())
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id=CHAT, chat_type="dm")
+    entry = store.get_or_create_session(source)
+    assistant = {"role": "assistant", "content": TEXT, "message_uid": "uid-queued"}
+    store.append_to_transcript(entry.session_id, assistant)
+    adapter = _telegram_adapter()
+    adapter._session_store = store
+    runner = _runner()
+    runner.adapters = {Platform.TELEGRAM: adapter}
+    turn_ctx = TurnContext(
+        source=source, session_key=entry.session_key, event_message_id=INBOUND_ID,
+        inbound_message_id=INBOUND_ID, _status_thread_metadata={"thread_id": "built-too-early"},
+    )
+    delivered = await runner._run_agent_deliver_first_response(
+        turn_ctx, adapter, {"final_response": TEXT, "messages": [assistant]},
+        {"messages": [assistant]}, None,
+    )
+    tasks = list(getattr(store, "_outbound_stamp_tasks", ()))
+    if tasks:
+        await asyncio.wait(tasks, timeout=2)
+    rows = [row for row in store._db.get_messages(entry.session_id) if row["role"] == "assistant"]
+    assert delivered is True
+    assert rows[0]["message_uid"] == "uid-queued"
+    assert rows[0]["platform_message_id"] == "900"
+
+
+@pytest.mark.asyncio
 async def test_forum_topic_turns_are_identified_by_their_inbound_id_not_the_reply_anchor():
     """Telegram forum topics route by topic metadata and never reply, so the anchor is None for
     every message in the topic. Two turns answering with the same text must still get two rows,

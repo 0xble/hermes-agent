@@ -5067,13 +5067,17 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         outbound_stamp = None
         try:
             from gateway.reply_latency import delivery_scope, record_final_reply
+            from gateway.outbound_reply import reply_uid_for_final
             receipt = getattr(event, "_terminal_reply_latency_receipt",
                               getattr(event, "_reply_latency_receipt", None))
             with delivery_scope(receipt, "text_send"):
                 result = await delivery_adapter._send_with_retry(
                     chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
             record_final_reply(receipt, text_content, result)
-            reply_uid = None if (metadata or {}).get("copy_block") else (metadata or {}).get("_transcript_message_uid")
+            # Persistence may have chosen the row after this metadata was built.
+            # Refresh from the event the same way handle_message does, and keep a
+            # uid the queued lane already placed on metadata.
+            reply_uid = reply_uid_for_final(event, metadata)
             if result.success and result.message_id and reply_uid:
                 outbound_stamp = (session_key, str(result.message_id), str(reply_uid))
         finally:
