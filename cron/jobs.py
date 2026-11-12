@@ -119,6 +119,22 @@ OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
+def oneshot_grace_seconds(job: dict[str, Any] | None) -> float:
+    """Return a one-shot catch-up allowance without weakening the 120s floor.
+
+    Invalid persisted values fail closed to the historical allowance rather than
+    interrupting a due scan. Recurring jobs retain their own strict field rules.
+    """
+    try:
+        extra = normalize_max_catch_up_lateness(
+            (job or {}).get("max_catch_up_lateness_seconds"))
+    except (TypeError, ValueError, OverflowError):
+        return float(ONESHOT_GRACE_SECONDS)
+    if extra is None:
+        return float(ONESHOT_GRACE_SECONDS)
+    return max(float(ONESHOT_GRACE_SECONDS), extra)
+
+
 @dataclass(frozen=True)
 class _CronStorePaths:
     cron_dir: Path
@@ -3254,7 +3270,7 @@ def _recover_missing_next_run(job: dict[str, Any], scan: _DueScan) -> Optional[s
     # Restore the slot, not eligibility: the normal occurrence/grace gates below
     # must hold never-started misses and retire spent dispatches, including old arms.
     run_at = _parse_aware(schedule.get("run_at")) if kind == "once" else None
-    recovered_next = schedule["run_at"] if run_at is not None else None
+    recovered_next = schedule.get("run_at") if run_at is not None else None
     recovery_kind = "one-shot" if recovered_next else None
     if not recovered_next and kind in {"cron", "interval"}:
         recovered_next = compute_next_run(schedule, scan.now.isoformat(), job.get("timezone"))

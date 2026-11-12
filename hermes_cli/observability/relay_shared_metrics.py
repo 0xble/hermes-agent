@@ -259,6 +259,9 @@ class _Runtime:
         # coalescing concurrent finish hooks into one worker.
         self._flush_lock = threading.RLock()
         self._flush_pending = False
+        self._flush_shutdown = False
+        self._flush_shutdown_pending = False
+        self._flush_shutdown_complete = threading.Event()
         self._flush_thread: threading.Thread | None = None
         self._snapshot_checked_ns: int | None = None
         self._subscriber_name = f"{SUBSCRIBER_NAME}.{self.host.runtime_id}"
@@ -641,6 +644,14 @@ class _Runtime:
             self._close_and_export()
 
     def _close_and_export(self) -> None:
+        from .shared_metrics_process import EXIT_FLUSH_TIMEOUT_S
+
+        with self._flush_lock:
+            closing = self._flush_shutdown
+            self._flush_shutdown = True
+        if closing:
+            self._flush_shutdown_complete.wait(EXIT_FLUSH_TIMEOUT_S)
+            return
         with self._sessions_lock:
             self._active = False
             session_ids = list(self._sessions)
@@ -651,10 +662,31 @@ class _Runtime:
         for session_id in unseen:
             self._safe(self._close_unseen_segment, session_id)
         if not self._registered:
+            self._flush_shutdown_complete.set()
             return
+        with self._flush_lock:
+            thread = self._flush_thread
+        if thread is not None:
+            if thread is not threading.current_thread():
+                try:
+                    thread.join(EXIT_FLUSH_TIMEOUT_S)
+                except RuntimeError:
+                    # Python can refuse daemon joins during late interpreter finalization.
+                    logger.debug("Shared-metrics export thread join failed", exc_info=True)
+            with self._flush_lock:
+                if self._flush_thread is thread and thread.is_alive():
+                    # A native barrier cannot be interrupted. Let its owner do the final
+                    # flush and cleanup rather than race a second export or discard rows.
+                    self._flush_pending = self._flush_shutdown_pending = True
+                    logger.warning("Shared-metrics export still running at shutdown; final flush remains queued")
+                    return
         self._flush_and_export("Hermes shared-metrics shutdown flush failed")
+        self._finish_export_shutdown()
+
+    def _finish_export_shutdown(self) -> None:
         self._deregister()
         self._release()
+        self._flush_shutdown_complete.set()
 
     @contextlib.contextmanager
     def _owner_scope(self) -> Iterator[None]:
@@ -754,6 +786,8 @@ class _Runtime:
         from agent.memory_provider import spawn_context_thread
 
         with self._flush_lock:
+            if self._flush_shutdown:
+                return
             self._flush_pending = True
             if self._flush_thread is not None:
                 return
@@ -772,9 +806,12 @@ class _Runtime:
                     # Cleared under the lock that schedulers check: a trigger can never land on a
                     # worker that has already decided to exit.
                     self._flush_thread = None
-                    return
+                    shutdown = self._flush_shutdown_pending
+                    break
                 self._flush_pending = False
             self._flush_and_export(failure_message)
+        if shutdown:
+            self._finish_export_shutdown()
 
     def _flush_and_export(self, failure_message: str) -> None:
         """Flush the Relay subscriber, then export under this profile's scope (its send consent,
