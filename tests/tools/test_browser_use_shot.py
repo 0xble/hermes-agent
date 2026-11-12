@@ -75,6 +75,10 @@ def run_exec(monkeypatch, tmp_path):
     monkeypatch.delenv("BU_AUTOSPAWN", raising=False)
     monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
     monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override_raw", lambda: "")
+    # The fork routes browser_exec through the browser tools' session layer (browser_tool_*),
+    # so the shared state the tools use is what browser_exec must see as well.
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override_raw", lambda: "")
     monkeypatch.setattr(bu_cli, "_attach_vault_supervisor", lambda env, task_id: None)
     monkeypatch.setattr(bu_cli, "_exec_route_is_sidecar", {}, raising=False)
     monkeypatch.setattr(bu_cli, "_driven_daemons", {})
@@ -90,14 +94,24 @@ def run_exec(monkeypatch, tmp_path):
     def run(activate_works: bool, cloud: bool = False, code: str = "print(capture_screenshot({shot!r}))",
             autospawn_daemon_kind: str = ""):
         monkeypatch.setattr(bs_cloud, "get_cloud_provider", (lambda: object()) if cloud else (lambda: None))
+        monkeypatch.setattr("tools.browser_tool_cloud._get_cloud_provider",
+                            (lambda: object()) if cloud else (lambda: None))
         if autospawn_daemon_kind:  # direct-API Browser Use config: the harness picks its own browser
             monkeypatch.setattr(bs_cloud, "get_cloud_provider", lambda: SimpleNamespace(name="browser-use"))
+            monkeypatch.setattr("tools.browser_tool_cloud._get_cloud_provider",
+                                lambda: SimpleNamespace(name="browser-use"))
             monkeypatch.setattr(bu_cli, "_use_gateway", lambda cfg: False)
             monkeypatch.setattr(bu_cli, "_browser_use_api_key_set", lambda: True)
         monkeypatch.setenv("FAKE_DAEMON_KIND", autospawn_daemon_kind)
-        monkeypatch.setattr(bs, "get_session_info",
-                            lambda key: {"cdp_url": f"ws://127.0.0.1:47000/devtools/browser/{key}",
-                                         "features": {} if cloud else {"local": True}})
+        def session_info(key):
+            return {"cdp_url": f"ws://127.0.0.1:47000/devtools/browser/{key}",
+                    "features": {} if cloud else {"local": True}}
+        monkeypatch.setattr(bs, "get_session_info", session_info)
+        monkeypatch.setattr("tools.browser_tool_session._get_session_info", session_info)
+        # Main's local route asks agent-browser for the packaged Chromium (_run_browser_command).
+        monkeypatch.setattr("tools.browser_tool_session._run_browser_command",
+                            lambda key, *_a, **_kw: {"success": True, "data": {
+                                "cdpUrl": f"ws://127.0.0.1:47000/devtools/browser/{key}"}})
         monkeypatch.setenv("FAKE_CDP_LOG", str(log))
         monkeypatch.setenv("FAKE_ACTIVATE_WORKS", "1" if activate_works else "0")
         shot = tmp_path / "shot.png"

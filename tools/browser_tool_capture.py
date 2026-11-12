@@ -156,4 +156,4 @@ class BrowserOutputCapture:
 
 def collect(proc: subprocess.Popen) -> tuple[str, str]:
     """Collect once, after CLI exit/timeout, while daemon handles remain drainable."""
-    return proc._hermes_browser_capture.take()
+    return getattr(proc, "_hermes_browser_capture").take()

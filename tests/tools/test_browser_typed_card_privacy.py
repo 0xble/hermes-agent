@@ -182,9 +182,7 @@ if os.fork()==0:
     try:
         print('daemon alive '+value,flush=True)
         print(value,file=sys.stderr,flush=True)
-        pending=ack.with_suffix('.tmp')
-        pending.write_text('survived')
-        os.replace(pending,ack)
+        ack.write_text('survived')
     finally:
         os._exit(0)
 if sys.argv[3]=='timeout':
@@ -224,7 +222,7 @@ raise SystemExit(1 if sys.argv[4]=='stderr-error' else 0)
         from tests.waiting import wait_until
         assert wait_until(ack.exists, timeout=3)
         assert ack.read_text() == "survived"  # no SIGPIPE into the resident daemon
-        capture = processes[0]._hermes_browser_capture
+        capture = getattr(processes[0], "_hermes_browser_capture")
         wait_until(lambda: all(not output.thread.is_alive() for output in capture.outputs),
                    timeout=3, what="daemon EOF collector cleanup")
         assert all(output.stream.closed and not output.buffer for output in capture.outputs)
@@ -304,7 +302,7 @@ def test_oversize_transport_failure_clears_both_memory_buffers(tmp_path):
         wait_for_cli(proc, 10)
         with pytest.raises(RuntimeError, match="in-memory capture limit"):
             session._read_command_output(proc)
-        assert all(not output.buffer for output in proc._hermes_browser_capture.outputs)
+        assert all(not output.buffer for output in getattr(proc, "_hermes_browser_capture").outputs)
         assert not list(tmp_path.glob("_std*"))
     finally:
         if proc.poll() is None:

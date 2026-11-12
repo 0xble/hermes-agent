@@ -27,7 +27,7 @@ def test_harness_runs_on_an_interpreter_without_its_own_site_packages(monkeypatc
 
 @pytest.mark.platforms("posix", "windows")
 def test_browser_exec_child_environment(tmp_path, monkeypatch):
-    from tools import browser_session, browser_supervisor
+    from tools import browser_tool_session, browser_supervisor
 
     probe = tmp_path / "probe.py"
     # The child's view goes to a file: browser_exec output is redacted, so an env dump on stdout
@@ -40,14 +40,14 @@ def test_browser_exec_child_environment(tmp_path, monkeypatch):
                      encoding="utf-8")
     monkeypatch.setattr(bu, "_find_cli", lambda: [sys.executable, str(probe)])
     monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {"browser": {"backend": "browser-use"}})
-    monkeypatch.setattr("tools.browser_session_cdp.get_cdp_override", lambda: "")
-    monkeypatch.setattr("tools.browser_session_cdp.resolve_cdp_override", lambda url: url)
-    monkeypatch.setattr("tools.browser_session_cloud.get_cloud_provider", lambda: None)
-    monkeypatch.setattr("tools.browser_lightpanda.using_lightpanda_engine", lambda: False)
-    def local_browser(key):
-        assert key == "bu-named-research"
-        return {"cdp_url": "ws://127.0.0.1:47000/private", "features": {"local": True}}
-    monkeypatch.setattr(browser_session, "get_session_info", local_browser)
+    monkeypatch.setattr("tools.browser_tool_cdp._get_cdp_override", lambda: "")
+    monkeypatch.setattr("tools.browser_tool_cdp._resolve_cdp_override", lambda url: url)
+    monkeypatch.setattr("tools.browser_tool_cloud._get_cloud_provider", lambda: None)
+    monkeypatch.setattr("tools.browser_tool_lightpanda_fallback._using_lightpanda_engine", lambda: False)
+    def local_browser(task_id, command, args, **kwargs):
+        assert (task_id, command, args) == ("bu-named-research", "get", ["cdp-url"])
+        return {"success": True, "data": {"cdpUrl": "ws://127.0.0.1:47000/private"}}
+    monkeypatch.setattr(browser_tool_session, "_run_browser_command", local_browser)
     attached = []
     monkeypatch.setattr(browser_supervisor.SUPERVISOR_REGISTRY, "get_or_start",
                         lambda task_id, cdp_url, **kw: attached.append((task_id, cdp_url)))
