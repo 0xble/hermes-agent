@@ -8,6 +8,7 @@ off ``processing`` (https://docs.slack.dev/reference/events/agent_session_stoppe
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from typing import Any, Optional
 
@@ -26,18 +27,14 @@ async def handle_agent_session_stopped(adapter: Any, event: dict, body: Optional
     if adapter._slash_channel_gated(channel_id) or adapter._early_reject_unauthorized(
             user_id, channel_id, channel_id.startswith("D"), thread_id=thread_ts):
         return
+    metadata = {"thread_id": thread_ts, "slack_team_id": team_id}
+    owner = getattr(adapter, "_typing_refresh_owners", {}).get(adapter._typing_scope_key(channel_id, metadata))
     # A typed /stop in the same thread: same session key and command handling.
     await adapter._handle_slash_command({
         "command": "/stop", "text": "", "user_id": user_id, "channel_id": channel_id,
         "team_id": team_id, "thread_ts": thread_ts})
     logger.info("[Slack] agent_session_stopped channel=%s thread=%s team=%s outcome=stop_dispatched",
                 channel_id, thread_ts, team_id)
-    await adapter.stop_typing(channel_id, {"thread_id": thread_ts, "slack_team_id": team_id})
-    # The legacy "" clear is not an Agent Sessions status; "active" is the documented exit.
-    client = adapter._get_client(channel_id, team_id=team_id or None)
-    if getattr(type(client), "agents_sessions_setStatus", None) is None:  # slack-sdk < 3.44
-        return
-    try:
-        await client.agents_sessions_setStatus(channel_id=channel_id, thread_ts=thread_ts, status="active")
-    except Exception:  # best effort: the /stop itself already landed
-        logger.debug("[Slack] agents.sessions.setStatus active after native stop failed", exc_info=True)
+    # Dispatch can admit a successor. Its processing session no longer belongs to this stop.
+    if not adapter._typing_owner_retired(channel_id, metadata, owner or asyncio.current_task()):
+        await adapter.stop_typing(channel_id, metadata)
