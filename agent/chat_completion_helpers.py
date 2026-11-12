@@ -2993,7 +2993,7 @@ class _StreamingCall(StreamingWaitMonitor):
     def _emit_text(self, text: str) -> None:
         self._fire_first_delta()
         self.agent._fire_stream_delta(text)
-        self.deltas_were_sent["yes"] = True
+        _reset_stale_streak(self.agent); self.deltas_were_sent["yes"] = True
 
     def _visible_text_delivered(self) -> bool:
         """True when visible assistant text actually reached a stream consumer this attempt
