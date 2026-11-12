@@ -53,7 +53,7 @@ def _hermes_dirs() -> list[Path]:
     """
     if _named_remote():
         from tools.file_backend_state import remote_home
-        return [Path(remote_home()) / ".hermes"]
+        return [Path(_realpath(Path(remote_home()) / ".hermes"))]
     return list(dict.fromkeys(_resolve_each((_hermes_home_path(), _hermes_root_path()))))
 
 
@@ -299,7 +299,8 @@ def _classify_write_denial(path: str, *, entry: bool = False) -> Optional[str]:
     denial = _classify_resolved_write_denial(homes, resolved)
     if denial or not entry:
         return denial
-    parent, leaf = split_entry(os.path.expanduser(str(path)))
+    # A named node expands ``~`` in its own home during resolution, never the controller's.
+    parent, leaf = split_entry(str(path) if _named_remote() else os.path.expanduser(str(path)))
     entry_path = os.path.join(_realpath(parent or "."), leaf)
     return _classify_resolved_write_denial(homes, entry_path)
 

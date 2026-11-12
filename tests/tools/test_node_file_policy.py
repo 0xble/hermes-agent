@@ -29,6 +29,27 @@ def test_target_credential_symlink_is_denied_but_config_needs_approval(peers):
     assert result.get("approval"), result
 
 
+def test_remote_entry_guard_expands_tilde_on_selected_node(peers):
+    roots, *_ = peers
+    home = roots["macstudio"] / "home"
+    (home / ".ssh").mkdir()
+    outside = roots["macstudio"] / "outside.txt"
+    outside.write_text("not a credential")
+    (home / ".ssh" / "linked").symlink_to(outside)
+
+    from agent.file_safety import get_write_denied_error
+    from tools.node_execution import node_handler
+
+    @node_handler
+    def classify(args, **kwargs):
+        return json.dumps({
+            "error": get_write_denied_error("~/.ssh/linked", verb="Delete", entry=True),
+        })
+
+    result = json.loads(classify({"node": "macstudio"}, task_id="raw-owner", session_id="chat"))
+    assert "denied" in result["error"].lower(), result
+
+
 def test_system_policy_anchors_resolve_on_the_selected_target(peers):
     from agent.file_safety import get_write_denied_error
     from tools.node_execution import node_handler

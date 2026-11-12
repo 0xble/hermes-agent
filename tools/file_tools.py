@@ -601,7 +601,7 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     from tools.file_tools_read_tracking import _backend_mtime
     try:
         read_mtime = _backend_mtime(resolved_str)
-    except OSError:
+    except (OSError, RuntimeError):
         read_mtime = None
     with _read_tracker_lock:
         task_data["dedup_hits"].pop(dedup_key, None)

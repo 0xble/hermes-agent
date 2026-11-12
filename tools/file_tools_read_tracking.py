@@ -266,7 +266,7 @@ def _update_read_timestamp(filepath: str, task_id: str, *, resolved: str | None 
     _invalidate_dedup_for_path(filepath, task_id, resolved=resolved)
     try:
         current_mtime = _backend_mtime(resolved)
-    except OSError:
+    except (OSError, RuntimeError):
         return
     with _read_tracker_lock:
         task_data = _read_tracker.get(tracking_key(task_id))
@@ -427,7 +427,7 @@ def _read_mtime_drifted(filepath: str, task_id: str) -> bool:
         return False
     try:
         return _backend_mtime(resolved) != read_mtime
-    except OSError:
+    except (OSError, RuntimeError):
         return False
 
 

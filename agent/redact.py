@@ -1230,12 +1230,13 @@ def _is_under_hermes_home(path: str) -> bool:
 
     try:
         target = os.path.normcase(_realpath(path if _named_remote() else os.path.expanduser(path)))
-    except (OSError, ValueError):
+        homes = _hermes_dirs()
+    except (OSError, RuntimeError, ValueError):
         return False
-    for home in _hermes_dirs():
+    for home in homes:
         try:
             base = os.path.normcase(_realpath(str(home)))
-        except (OSError, ValueError):
+        except (OSError, RuntimeError, ValueError):
             continue
         if target == base or target.startswith(base + os.sep):
             return True
