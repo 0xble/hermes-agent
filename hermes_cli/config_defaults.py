@@ -2078,16 +2078,16 @@ DEFAULT_CONFIG = {
         # (sys.executable): max isolation, project deps/relative paths won't work. Env scrubbing
         # (*_API_KEY, *_TOKEN, *_SECRET, ...) and the tool whitelist apply in both modes.
         "mode": "project",
-        # Session kernels are always on locally (`kernel_mode` is ignored) and remotely
-        # (tools/code_kernel_remote.py; a backend that cannot spawn a kernel fails open to
-        # per-call). One kernel per (session owner, mode, interpreter, cwd, tool-set) keeps state
-        # across calls and turns; subagents get their own. Kernels die with the session, after
-        # kernel_idle_timeout idle seconds, or by LRU eviction past max_session_kernels. A
-        # timed-out/interrupted cell kills the kernel; env is frozen at spawn (reset=true after
-        # changing passthrough). Tool RPC authority (approval, session, allow-list, call budget) is
-        # rebound per cell — that runtime boundary is the cross-cell enforcement.
+        # Kernels are always on locally/remotely (`kernel_mode` ignored); unsupported backends
+        # fall back per-call. One per (owner, mode, interpreter, cwd, tool-set); subagents own theirs.
+        # Session end, idle timeout, LRU eviction, timeout/interrupt or memory ceiling retire kernels.
+        # Env freezes at spawn (reset=true to refresh); tool RPC authority is rebound per cell.
         "kernel_idle_timeout": 1800,
         "max_session_kernels": 4,
+        # Local kernel + descendant footprint, sampled every second during cells. MiB;
+        # positive values only (invalid/nonpositive retains 8192). Linux also applies
+        # per-process RLIMIT_AS/DATA at spawn; macOS uses physical footprint + RSS.
+        "kernel_memory_limit_mb": 8192,
     },
     # Tool Search replaces deferred tools in the model-facing array with the
     # tool_search / tool_describe / tool_call bridges and surfaces them on demand.
