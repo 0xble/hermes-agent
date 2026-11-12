@@ -481,7 +481,8 @@ _FLOOD = ('relay failed: {"error":{"code":"telegram","message":"telegram: exit s
 
 def test_transient_delay_reads_flood_wait_and_ignores_permanent_errors():
     assert retire._transient_delay(RuntimeError(_FLOOD)) == 18
-    assert retire._transient_delay(asyncio.TimeoutError()) == 30
+    assert retire._transient_delay(TimeoutError()) == 30
+    assert retire._transient_delay(RuntimeError("tasks: EMAXCONNSESSION: connection limit")) == 30
     assert retire._transient_delay(RuntimeError("Missing exact-topic confirmed closing receipt")) is None
 
 

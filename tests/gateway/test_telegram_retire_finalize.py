@@ -196,6 +196,39 @@ async def test_waiting_absent_topic_finalizes_without_closing(runtime, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_pool_exhaustion_defers_cancelled_goal_before_absent_finalization(runtime, monkeypatch, caplog):
+    r = runtime
+    r.state["phase"] = "pending"
+    r.db.set_meta(f"goal:{r.entry.session_id}", json.dumps({"status": "cancelled", "goal": "Cancelled goal"}))
+    inventory = AsyncMock(side_effect=[RuntimeError("tasks: EMAXCONNSESSION: connection limit"), []])
+    monkeypatch.setattr(work, "inventory", inventory)
+    retries = []
+    monkeypatch.setattr(retire, "_schedule_retry", lambda _runner, _source, delay: retries.append(delay))
+    await retire.save(r.runner, r.source, r.state)
+
+    with caplog.at_level("INFO", logger=retire.logger.name):
+        await retire.advance(r.runner, r.source)
+
+    pending = await retire.load(r.runner, r.source)
+    assert pending["phase"] == "pending" and pending["transient_retries"] == 1
+    assert retries == [30]
+    assert "transient error" in caplog.text
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) == r.entry.session_id
+
+    await retire.advance(r.runner, r.source)
+    final = await retire.load(r.runner, r.source)
+    assert final["phase"] == "done"
+    assert inventory.await_count == 2
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is None
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) is None
+    assert json.loads(r.db.get_meta(f"goal:{r.entry.session_id}"))["status"] == "cancelled"
+
+    await retire.advance(r.runner, r.source)
+    assert await retire.load(r.runner, r.source) == final
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("block", ["inventory", "merge", "handoff"])
 async def test_waiting_absent_topic_keeps_unsettled_work(runtime, monkeypatch, block):
     r = runtime
