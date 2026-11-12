@@ -186,8 +186,15 @@ class World:
         """
         seed = self.root / "retained-clone"
         mark = self.srv.mark()
+        # A full clone has no filter to constrain the pack. Reuse the fixture's complete bare
+        # object store as a local reference cache so a large history cannot turn this shape check
+        # into a network-sized download. ``--dissociate`` is intentionally not used: the bare
+        # store is owned by this world and remains alive until the retained clone is installed.
+        clone_args = [*args]
+        if not args:
+            clone_args += ["--reference-if-able", str(self.bare)]
         cp = subprocess.run(
-            ["git", "clone", "-q", *args, "--branch", "main", I.OFFICIAL_HTTPS, str(seed)],
+            ["git", "clone", "-q", *clone_args, "--branch", "main", I.OFFICIAL_HTTPS, str(seed)],
             env=self.git_env(), capture_output=True, text=True,
             timeout=self.cache.remaining(120) if self.cache is not None else 120, check=False,
         )
