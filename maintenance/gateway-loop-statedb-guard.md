@@ -95,6 +95,13 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.
+- A loop stall can fail the Telegram heartbeat probe, so the adapter goes fatal and leaves
+  `runner.adapters` until the reconnect watcher installs its replacement (2026-11-12 15:27 PT:
+  back about 2 s later). An admitted native turn whose claim already passed preflight and whose
+  adapter slot is empty at execution awaits (`await_reconnecting_adapter`, `asyncio.sleep` in 0.25 s
+  steps) up to `ADAPTER_RECONNECT_WAIT_S` (30 s) for the slot to refill, then restores and runs.
+  Only an empty slot waits, and draining or retirement stops the wait. `_binding` still decides
+  every identity check, and a slot still empty at the bound fails `not_found` as before.
 
 ## Active replay access path
 
@@ -215,7 +222,9 @@ tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, 
 `cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound), and the 2026-10-25 sweep
 in `gateway/run_turn.py`, `gateway/run_config_loaders.py`, `gateway/slash_commands_status.py`,
 `gateway/delivery.py`, `gateway/telegram_retire*.py`, `gateway/telegram_topic_sessions.py` and
-the Telegram and Slack adapters. Proof surface:
+the Telegram and Slack adapters, and `gateway/session_ingress.py` with
+`gateway/session_ingress_context.py` (admitted-turn adapter reconnect wait). Proof surface:
+`tests/gateway/test_admission_adapter_reconnect_wait.py`,
 `tests/gateway/test_startup_resume_admission.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
