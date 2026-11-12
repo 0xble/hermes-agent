@@ -114,6 +114,9 @@ def handle_api_error(
             "during API call #%d (%s)",
             agent.log_prefix, api_call_count, api_error,
         )
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(agent, reason="shutdown", reset_at=None)
         _shutdown_summary = "Turn abandoned: the process was shutting down before the model call could complete."
         return _verdict("return", {
             "final_response": _shutdown_summary, "messages": messages, "api_calls": api_call_count,
@@ -130,9 +133,6 @@ def handle_api_error(
         base_url=str(getattr(agent, "base_url", "") or ""),
         api_key=getattr(agent, "api_key", None),
     )
-    with contextlib.suppress(Exception):
-        from agent.shared_primary_cooldown import _fail_agent_probe
-        _fail_agent_probe(agent, classified.reason, error_context.get("reset_at") if isinstance(error_context, dict) else None)
     logger.debug(
         "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
         classified.reason.value, classified.status_code,
@@ -170,8 +170,14 @@ def handle_api_error(
         # Preserve a pending redirect: the user is steering, not stopping — rebuild the
         # turn from the correction instead of aborting.
         if agent.clear_interrupt(preserve_redirect=True):
+            with contextlib.suppress(Exception):
+                from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+                settle_primary_probe_on_exit(agent, reason="interrupt")
             _retry.restart_with_redirected_messages = True
             return _verdict("break")
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(agent, reason="interrupt")
         return _verdict("return", abort_turn_on_interrupt(
             agent, messages, conversation_history, api_call_count,
             abort_message="Interrupt detected during error handling, aborting retries.",
@@ -302,6 +308,14 @@ def settle_unrecovered_error(
             compression_attempts=compression_attempts, result=result,
         )
 
+    def _settle_primary_exit() -> None:
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(
+                agent, reason=classified.reason,
+                reset_at=error_context.get("reset_at") if isinstance(error_context, dict) else None,
+            )
+
     # ``FailoverReason.billing`` (402) is deliberately NOT excluded: pool rotation and
     # eager fallback already gave up, so retrying only burns paid requests on a depleted
     # balance. Mirrors 401/403.
@@ -378,6 +392,7 @@ def settle_unrecovered_error(
                 retry_count = compression_attempts = 0
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
+        _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", nonretryable_client_error_result(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
@@ -440,7 +455,10 @@ def settle_unrecovered_error(
         if _ladder is not None:
             if _ladder["action"] == "continue":
                 retry_count = 0
+            elif _ladder["action"] == "return":
+                _settle_primary_exit()
             return _verdict(_ladder["action"], _ladder.get("result"))
+        _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", max_retries_exhausted_result(
             agent, api_error, classified, attempts=attempts_made, is_rate_limited=is_rate_limited,

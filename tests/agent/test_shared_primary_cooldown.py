@@ -1022,14 +1022,14 @@ def test_claim_probe_distinguishes_tombstone_from_owned_probe():
         spc._write_state(path, state)
     first = spc.claim_probe(_ROUTE, entry["outage_id"])
     assert first
-    assert spc.claim_probe(_ROUTE, entry["outage_id"]) is False
+    assert spc.claim_probe(_ROUTE, entry["outage_id"]).kind is spc.ProbeClaimKind.OWNED_ELSEWHERE
     with spc._locked_state() as (path, state):
         row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
         row["state"] = "tombstone"
         row.pop("probe_owner", None)
         row.pop("probe_until", None)
         spc._write_state(path, state)
-    assert spc.claim_probe(_ROUTE, entry["outage_id"]) is None
+    assert spc.claim_probe(_ROUTE, entry["outage_id"]).kind is spc.ProbeClaimKind.CLEARED
 
 
 def test_builtin_fallback_lookup_uses_provider_default_base_url():
@@ -1163,7 +1163,7 @@ def test_adoption_claim_race_rechecks_the_surviving_record():
     agent = SimpleNamespace(_fallback_chain=[{"provider": "openai", "model": "fallback"}],
                             provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])
     current = {**record, "outage_id": "new-outage"}
-    with patch("agent.shared_primary_cooldown.claim_probe", return_value=None), \
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=spc.ProbeClaimOutcome(spc.ProbeClaimKind.REPLACED, record=current)), \
          patch("agent.chat_completion_helpers.try_activate_fallback", return_value=True) as activate:
         # The first read is the adoption snapshot, the second is the race re-read.
         with patch("agent.shared_primary_cooldown.read_cooldown", side_effect=[record, current]):
@@ -1191,12 +1191,104 @@ def test_primary_probe_distinguishes_cleared_state_from_owned_probe():
 
     record = {"provider": _ROUTE[0], "base_url": _ROUTE[1], "model": _ROUTE[2], "outage_id": "outage"}
     agent = SimpleNamespace(_shared_primary_cooldown_record=record, _shared_primary_probe_token="old-token")
-    with patch("agent.shared_primary_cooldown.claim_probe", return_value=False):
-        assert claim_primary_probe(agent, "expired") is False
-    with patch("agent.shared_primary_cooldown.claim_probe", return_value=None):
-        assert claim_primary_probe(agent, "expired") is None
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=spc.ProbeClaimOutcome(spc.ProbeClaimKind.OWNED_ELSEWHERE)):
+        assert claim_primary_probe(agent, "expired").kind is spc.ProbeClaimKind.OWNED_ELSEWHERE
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=spc.ProbeClaimOutcome(spc.ProbeClaimKind.CLEARED)):
+        assert claim_primary_probe(agent, "expired").kind is spc.ProbeClaimKind.CLEARED
     assert agent._shared_primary_cooldown_record is None
     assert agent._shared_primary_probe_token is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "allows_primary"),
+    [
+        (spc.ProbeClaimKind.CLAIMED, True),
+        (spc.ProbeClaimKind.OWNED_ELSEWHERE, False),
+        (spc.ProbeClaimKind.STILL_COOLING, False),
+        (spc.ProbeClaimKind.REPLACED, False),
+        (spc.ProbeClaimKind.CLEARED, True),
+        (spc.ProbeClaimKind.UNAVAILABLE, False),
+    ],
+)
+def test_restore_primary_runtime_handles_every_probe_outcome(kind, allows_primary):
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)
+    agent._rate_limited_until = 0
+    agent._fallback_activated = True
+    agent._provider_fallback_active = True
+    _age_record(spc.route_from_agent(agent), reset_ago=1, window=60)
+    outcome = spc.ProbeClaimOutcome(
+        kind, token="probe-token" if kind is spc.ProbeClaimKind.CLAIMED else None,
+        record=agent._shared_primary_cooldown_record if kind is spc.ProbeClaimKind.REPLACED else None,
+    )
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=outcome), \
+         patch("agent.route_binding.reinstall_primary_runtime"), \
+         patch("agent.fallback_notice.finish_fallback_restore"):
+        restored = agent._restore_primary_runtime()
+    assert restored is allows_primary
+
+
+def test_claim_probe_reports_still_cooling_and_unavailable_explicitly():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=time.time() + 3600)
+    assert spc.claim_probe(_ROUTE, entry["outage_id"]).kind is spc.ProbeClaimKind.STILL_COOLING
+    with patch("agent.shared_primary_cooldown._locked_state", side_effect=OSError("unreadable")):
+        outcome = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert outcome.kind is spc.ProbeClaimKind.UNAVAILABLE
+
+
+def test_same_primary_recovery_keeps_probe_lease_and_settles_once():
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    claimed = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(
+        provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2], _primary_runtime=None,
+        _shared_primary_cooldown_record=entry, _shared_primary_probe_token=claimed.token,
+        _fallback_activated=False,
+    )
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) == 0
+    assert spc.claim_probe(_ROUTE, entry["outage_id"]).kind is spc.ProbeClaimKind.OWNED_ELSEWHERE
+    assert spc.settle_primary_probe_on_exit(agent, reason="success")
+    assert spc.settle_primary_probe_on_exit(agent, reason="success") is False
+    assert spc.read_cooldown(_ROUTE) is None
+
+
+def test_429_after_credential_rotation_does_not_double_shared_backoff():
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    claimed = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(
+        _shared_primary_cooldown_record=entry, _shared_primary_probe_token=claimed.token,
+        _fallback_activated=False,
+    )
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) == 0
+    assert spc.settle_primary_probe_on_exit(agent, reason=FailoverReason.rate_limit)
+    failed = spc.read_cooldown(_ROUTE)
+    assert failed["backoff_count"] == entry["backoff_count"] + 1
+    assert spc.settle_primary_probe_on_exit(agent, reason=FailoverReason.rate_limit) is False
+    assert spc.read_cooldown(_ROUTE)["backoff_count"] == failed["backoff_count"]
+
+
+def test_context_overflow_compression_retry_keeps_probe_lease_from_second_agent():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    first = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert first.kind is spc.ProbeClaimKind.CLAIMED
+    second = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert second.kind is spc.ProbeClaimKind.OWNED_ELSEWHERE
+    assert spc._release_probe(_ROUTE, entry["outage_id"], first.token)
 
 
 def test_each_transport_attempt_refreshes_tombstone_timestamp(monkeypatch):

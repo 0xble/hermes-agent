@@ -2241,6 +2241,9 @@ def try_activate_fallback(
         cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
+            if getattr(agent, "_shared_primary_probe_token", None):
+                from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+                settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)
             return _fallback_chain_exhausted(agent, reason, cooldown_armed=cooldown_seconds is not None)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
@@ -2263,6 +2266,9 @@ def try_activate_fallback(
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
+            if getattr(agent, "_shared_primary_probe_token", None):
+                from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+                settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)
             buffer_fallback_route_notice(
                 agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds)
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate

@@ -71,29 +71,47 @@ def fallback_route_is_active(provider, base_url, model) -> bool:
 
 
 def claim_primary_probe(agent, shared_state: str):
+    from agent.shared_primary_cooldown import ProbeClaimKind, ProbeClaimOutcome
     if shared_state != "expired" or not isinstance(getattr(agent, "_shared_primary_cooldown_record", None), dict):
-        return None
+        return ProbeClaimOutcome(ProbeClaimKind.CLEARED)
     from agent.shared_primary_cooldown import claim_probe, route_from_record
     record = agent._shared_primary_cooldown_record
-    token = claim_probe(route_from_record(record), str(record.get("outage_id") or ""))
-    if token is False:
-        logger.info("Primary cooldown probe already owned elsewhere; staying on fallback")
-        return False
-    if token is None:
+    try:
+        outcome = claim_probe(route_from_record(record), str(record.get("outage_id") or ""))
+    except OSError:
+        logger.warning("Primary cooldown probe state is unavailable; staying on fallback")
+        outcome = ProbeClaimOutcome(ProbeClaimKind.UNAVAILABLE)
+    if not isinstance(outcome, ProbeClaimOutcome):
+        logger.warning("Primary cooldown probe returned an invalid outcome; staying on fallback")
+        outcome = ProbeClaimOutcome(ProbeClaimKind.UNAVAILABLE)
+    if outcome.kind == ProbeClaimKind.CLAIMED:
+        agent._shared_primary_probe_token = outcome.token
+        return outcome
+    if outcome.kind in (ProbeClaimKind.OWNED_ELSEWHERE, ProbeClaimKind.STILL_COOLING,
+                        ProbeClaimKind.REPLACED, ProbeClaimKind.UNAVAILABLE):
+        if outcome.kind == ProbeClaimKind.REPLACED and isinstance(outcome.record, dict):
+            agent._shared_primary_cooldown_record = outcome.record
+        logger.info("Primary cooldown probe unavailable (%s); staying on fallback", outcome.kind.value)
+        agent._shared_primary_probe_token = None
+        return outcome
+    if outcome.kind == ProbeClaimKind.CLEARED:
         agent._shared_primary_cooldown_record = None
         agent._shared_primary_probe_token = None
-        return None
-    agent._shared_primary_probe_token = token
-    return token
+        return outcome
+    raise AssertionError(f"unhandled probe claim outcome: {outcome.kind!r}")
+
+
+def probe_claim_allows_primary(outcome) -> bool:
+    from agent.shared_primary_cooldown import ProbeClaimKind
+    return outcome.kind in (ProbeClaimKind.CLAIMED, ProbeClaimKind.CLEARED)
 
 
 def release_primary_probe(agent, token) -> None:
     if not token:
         return
     try:
-        from agent.shared_primary_cooldown import _release_probe, route_from_record
-        record = agent._shared_primary_cooldown_record
-        _release_probe(route_from_record(record), str(record.get("outage_id") or ""), token)
+        from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+        settle_primary_probe_on_exit(agent, reason="release")
     except Exception:
         logger.debug("Could not release primary cooldown probe", exc_info=True)
     agent._shared_primary_probe_token = None
