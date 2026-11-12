@@ -6,10 +6,16 @@
 
 The 24-hour scratch prune must not make an irreversible delete. After process and worktree
 reaping, an expired top-level entry is moved with same-volume `os.rename` into
-`<home>/cache/.scratch-trash/<UTC-date>/<relative path>`. A JSONL manifest line records the
-original path, apparent tree size, source mtime, prune timestamp, and holding path. A later pass
-purges held entries older than seven days. Holding-dir cleanup is no-follow: symlinks and
-junctions are unlinked as links and never traversed.
+`<home>/cache/.scratch-trash/<UTC-date>/entries/<relative path>`. A JSONL manifest at
+`<UTC-date>/manifest.jsonl` records the original path, apparent tree size, source mtime, prune
+timestamp, and holding path. Entries live under `entries/` so no scratch entry name can collide
+with the manifest. A later pass purges held entries older than seven days and appends a `purged`
+record; it never rewrites or deletes the manifest. A failed manifest read leaves both the
+manifest and that day's held entries untouched. Manifests remain as append-only audit history even
+after all their entries are purged. Holding-dir cleanup uses an explicit bottom-up stack (Python
+3.11's `os.walk` is recursive) and `lstat` before traversing each directory: symlinks and junctions
+are unlinked as links and never traversed. A held subtree that cannot be removed is tracked with
+the existing stuck-entry state outside `entries/` and is not retried every pass.
 
 Existing `.keep` and transitive `input-pins.json` retention is unchanged. Enabled cron jobs are
 also scanned using the Fleet generator's PR #691 field set and token matcher (`prompt`, `script`,
@@ -33,7 +39,14 @@ Contract tests: `tests/test_scratch_dir.py::test_prune_moves_expired_entry_to_re
   `tests/test_scratch_dir.py::test_prune_purges_holding_entries_after_seven_days`
   `tests/test_scratch_dir.py::test_prune_keeps_enabled_job_references_but_not_disabled_jobs`
   `tests/test_scratch_dir.py::test_prune_moves_symlink_without_following_target`
+  `tests/test_scratch_dir.py::test_entry_named_manifest_is_held_intact_and_restorable`
+  `tests/test_scratch_dir.py::test_failed_manifest_read_does_not_delete_manifest`
+  `tests/test_scratch_dir.py::test_purge_preserves_a_hold_appended_after_manifest_read`
+  `tests/test_scratch_dir.py::test_purge_held_tree_does_not_follow_directory_links`
   `tests/test_scratch_prune_undeletable.py::test_undeletable_or_unreadable_entry_is_moved_without_walking_contents`
+  `tests/test_scratch_prune_undeletable.py::test_unreadable_held_subtree_is_tracked_without_aborting_pass`
+  `tests/test_scratch_prune_undeletable.py::test_deep_held_tree_is_removed_without_recursion_error`
+  `tests/test_scratch_prune_undeletable.py::test_recursion_error_during_held_removal_does_not_abort_pass`
 
 ## Retirement
 
