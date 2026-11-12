@@ -1,7 +1,8 @@
 """A failed home probe is retryable in the cached backend (regression for #913)."""
 import subprocess
 
-from tests.tools.test_named_node_execution import call, peers  # noqa: F401
+pytest_plugins = ("tests.tools.test_named_node_execution",)
+from tests.tools.test_named_node_execution import call, peers as _peers
 from tools.environments.ssh import SSHEnvironment
 from tools import terminal_tool as tt
 

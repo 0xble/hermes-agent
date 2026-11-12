@@ -68,7 +68,7 @@ class _SSHDriverSession(_CuaDriverSession):
             if _is_ended_session_result(result):
                 raise RuntimeError("Remote driver session ended. Capture again before input")
             return result
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- an SSH/MCP transport failure has an unknown remote outcome and must tombstone the session
             self.broken = True
             self._notify_transport_reset()
             with self._lock:

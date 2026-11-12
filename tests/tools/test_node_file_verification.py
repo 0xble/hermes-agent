@@ -1,5 +1,6 @@
 """Portable selected-node write readback, without GNU tools (regression for #913)."""
-from tests.tools.test_named_node_execution import call, peers  # noqa: F401
+pytest_plugins = ("tests.tools.test_named_node_execution",)
+from tests.tools.test_named_node_execution import call, peers as _peers
 from tools.file_operations import ShellFileOperations, ExecuteResult
 
 import pytest

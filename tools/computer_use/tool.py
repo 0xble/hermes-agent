@@ -377,7 +377,7 @@ def _handle_computer_use(args: dict[str, Any], **kwargs) -> Any:
     call = contextlib.ExitStack()
     try:
         backend = call.enter_context(_backend_for_call(session_id))
-    except Exception as e:
+    except Exception as e:  # health: allow BLE001 -- backend startup spans plugin, driver, and SSH boundaries; NodeUnavailable is extracted below
         from tools.computer_use.node_doctor import NodeUnavailable
         if isinstance(e, NodeUnavailable):
             return json.dumps(e.report)

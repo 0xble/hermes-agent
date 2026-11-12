@@ -77,7 +77,7 @@ def _cu_doctor(args) -> None:
     from tools.nodes import resolve_node
     try:
         node = resolve_node(getattr(args, "node", None))
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- doctor must report every registry/config failure instead of crashing the CLI
         import json
         print(json.dumps({"ok": False, "node": getattr(args, "node", None), "error": str(exc)}))
         sys.exit(1)

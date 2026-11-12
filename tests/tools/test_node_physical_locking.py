@@ -4,7 +4,8 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-from tests.tools.test_named_node_execution import call, peers  # noqa: F401
+pytest_plugins = ("tests.tools.test_named_node_execution",)
+from tests.tools.test_named_node_execution import call, peers as _peers
 from tools.file_operations import ShellFileOperations
 
 pytestmark = pytest.mark.platforms("posix")
@@ -88,7 +89,7 @@ def test_connection_aliases_share_locks_but_other_nodes_do_not(peers):
     from tools.nodes import Node
     from tools import file_state
 
-    _, path, *_, home = peers
+    _, path, *_, _home = peers
     nodes = [Node("original", "same-ssh", "macos"), Node("renamed", "same-ssh", "macos"),
              Node("other", "different-ssh", "macos")]
     entered, release = threading.Event(), threading.Event()

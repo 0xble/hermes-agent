@@ -26,7 +26,7 @@ class CuaDriverProvider(ComputerUseProvider):
             nodes, _ = load_nodes()
             if nodes:
                 return True  # Controller OS and local driver do not determine a node's availability.
-        except Exception:
+        except Exception:  # health: allow BLE001 -- fail open so a broken registry is diagnosed by the tool, not hidden as unavailable
             return True  # Keep the tool exposed so a bad registry fails visibly, never locally.
         if sys.platform not in ("darwin", "win32", "linux"):
             return False
