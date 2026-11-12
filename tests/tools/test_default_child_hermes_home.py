@@ -39,6 +39,7 @@ def _cron_worker_env(monkeypatch, home: Path) -> dict[str, str]:
 
 def _child_resolved_home(env: dict[str, str]) -> Path:
     child_env = dict(os.environ)
+    child_env.pop("HERMES_HOME", None)
     child_env.update(env)
     child_env["PYTHONPATH"] = str(_ROOT)
     result = subprocess.run(
