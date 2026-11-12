@@ -54,6 +54,10 @@ from hermes_cli.goals_autonomy import (
 )
 from hermes_cli.goals_status import GoalStatusMixin
 from hermes_cli.goals_peers import GoalPeersMixin, parse_pending_peers, validate_peer_completion
+from hermes_cli.goals_authoring_refs import (
+    _goal_authoring_is_labeled_reference, _goal_authoring_is_ordinal_hash,
+    _goal_authoring_is_ordinary_identifier, _goal_authoring_text_is_path,
+)
 from hermes_cli.lifecycle_snapshot import snapshot_control
 from hermes_time import safe_strftime
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
@@ -250,31 +254,6 @@ def _goal_authoring_values(goal: Any, contract: Any) -> dict[str, str]:
     }}
 
 
-def _goal_authoring_text_is_path(text: str, start: int, end: int) -> bool:
-    """Do not call a plan/file path a stale identifier merely because it has digits."""
-    token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
-    token_end_candidates = [index for index in (text.find(" ", end), text.find("\n", end), text.find("\t", end)) if index >= 0]
-    token_end = min(token_end_candidates, default=len(text))
-    token = text[token_start:token_end].strip(".,;:!?()[]{}<>\"'")
-    # owner/repo#N is a PR/issue reference, not a file path, even though it has a slash.
-    if re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", token):
-        return False
-    return "/" in token or "\\" in token or bool(
-        re.search(r"\.(?:md|markdown|txt|yaml|yml|json|toml)\b", token, re.IGNORECASE)
-    )
-
-
-def _goal_authoring_is_ordinal_hash(text: str, start: int) -> bool:
-    """Allow ordinal rankings such as ``Ranked #1`` while rejecting bare receipts."""
-    return bool(re.search(r"(?i)\b(?:ranked|top)\s*$", text[max(0, start - 24):start]))
-
-
-def _goal_authoring_is_ordinary_identifier(text: str, start: int, end: int) -> bool:
-    """Allow human identifiers such as ``cafe5678`` when clearly naming a table."""
-    context = text[max(0, start - 32):min(len(text), end + 32)]
-    return bool(re.search(r"(?i)\b(?:table|column|record|dataset)\b", context))
-
-
 def goal_authoring_findings(
     goal: Any,
     contract: Any = None,
@@ -332,7 +311,7 @@ def goal_authoring_findings(
             token = match.group(1)
             if not (any(char.isdigit() for char in token) and any(char in "abcdef" for char in token)):
                 continue
-            if _goal_authoring_text_is_path(value, match.start(), match.end()) or _goal_authoring_is_ordinary_identifier(value, match.start(), match.end()):
+            if _goal_authoring_text_is_path(value, match.start(), match.end()) or _goal_authoring_is_labeled_reference(value, match.start()) or _goal_authoring_is_ordinary_identifier(value, match.start(), match.end()):
                 continue
             findings.append(GoalAuthoringFinding(
                 "stale_identifier", field_name,
@@ -374,17 +353,21 @@ def goal_authoring_findings(
 
     verification = values["verification"] if "verification" in checked else ""
     if verification:
-        checklist = bool(_GOAL_AUTHORING_BULLET_RE.search(verification) or
-                          _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification) or
-                          re.search(r"(?i)\b(?:step|item|check)\s*\d+", verification))
+        checklist_span = ""
+        m = (_GOAL_AUTHORING_BULLET_RE.search(verification) or _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification)
+             or re.search(r"(?i)\b(?:step|item|check)\s*\d+", verification))
+        if m:
+            checklist_span = verification[m.start():m.start() + 60].strip()
         separators = len(re.findall(r"[,;]", verification))
-        if separators >= 3 and re.search(r"(?i)\b(?:and|or)\b", verification) and _GOAL_AUTHORING_RECEIPT_RE.search(verification):
-            checklist = True
-        if checklist:
+        if (not checklist_span and separators >= 3 and re.search(r"(?i)\b(?:and|or)\b", verification)
+                and _GOAL_AUTHORING_RECEIPT_RE.search(verification)):
+            checklist_span = f"{separators + 1} separated items: {verification[:60].strip()}"
+        if checklist_span:
             findings.append(GoalAuthoringFinding(
                 "verification_checklist", "verification",
-                "is a step/receipt checklist rather than one live end-state outcome",
-                "state one observable result and put per-step checks in the plan file",
+                f"is a step/receipt checklist ({checklist_span!r}) rather than one live end-state outcome",
+                "replace the list with one observable end state (for example 'X and Y are consistent'), "
+                "and put the per-item checks in the plan file",
             ))
     return findings
 

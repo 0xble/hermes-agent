@@ -377,6 +377,11 @@ class ToolCallGuardrailController:
     def halt_decision(self) -> ToolGuardrailDecision | None:
         return self._halt_decision
 
+    def clear_halt_decision(self, decision: ToolGuardrailDecision | None = None) -> None:
+        """Acknowledge a handled halt without resetting the other per-turn detectors."""
+        if decision is None or self._halt_decision is decision:
+            self._halt_decision = None
+
     def _decide(
         self, action: str, code: str, tool_name: str, count: int, signature: ToolCallSignature,
         *, message: str | None = None, **fmt: Any,
@@ -620,19 +625,21 @@ def _tool_failure_recovery_hint(tool_name: str, count: int) -> str:
     """Action-oriented guidance for recovering from repeated tool failures."""
     common = (
         f"{tool_name} has failed {count} times this turn. This looks like a loop. "
-        "Do not switch to text-only replies; keep using tools, but diagnose before retrying. "
-        "First inspect the latest error/output and verify your assumptions. "
+        "Inspect the latest error/output and fix the specific finding before retrying, "
+        "or change strategy/use another tool. "
     )
     if tool_name == "terminal":
         return common + (
             "For terminal failures, run a small diagnostic such as `pwd && ls -la` "
-            "in the same tool, then try an absolute path, a simpler command, a different "
-            "working directory, or a different tool such as read_file/write_file/patch."
+            "in the same tool, then fix the specific finding or change strategy: try an "
+            "absolute path, a simpler command, a different working directory, or a different "
+            "tool such as read_file/write_file/patch."
         )
     return common + (
-        "Try different arguments, a narrower query/path, an absolute path when relevant, "
-        "or a different tool that can make progress. If the blocker is external, report "
-        "the blocker after one diagnostic attempt instead of repeating the same failing path."
+        "If the error is a validation rejection, fix the exact finding it names rather than "
+        "resubmitting reworded input; otherwise change strategy: a narrower query/path, an absolute "
+        "path when relevant, or a different tool that can make progress. If the blocker is external, "
+        "report the blocker after one diagnostic attempt instead of repeating the same failing path."
     )
 
 
