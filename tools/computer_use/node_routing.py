@@ -75,5 +75,5 @@ def handle_on_node(args, handler, **kwargs):
             raise NodeError("Named nodes require computer_use.backend: cua")
         with node_scope(node):
             return _tag(handler(args, **kwargs), target)
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- node routing reports every resolution, policy, and handler failure as node_unavailable
         return json.dumps({"ok": False, "node": target, "error": str(exc), "code": "node_unavailable"})

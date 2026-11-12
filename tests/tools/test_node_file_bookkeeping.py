@@ -6,7 +6,8 @@ import sys
 
 import pytest
 
-from tests.tools.test_named_node_execution import call, peers  # noqa: F401
+pytest_plugins = ("tests.tools.test_named_node_execution",)
+from tests.tools.test_named_node_execution import call, peers as _peers
 from tools.environments import ssh
 from tools.file_operations import ShellFileOperations
 

@@ -6,8 +6,9 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.agent.test_run_agent import agent  # noqa: F401
-from tests.tools.test_named_node_execution import call, peers  # noqa: F401
+pytest_plugins = ("tests.agent.test_run_agent", "tests.tools.test_named_node_execution")
+from tests.agent.test_run_agent import agent as _agent
+from tests.tools.test_named_node_execution import call, peers as _peers
 from tools.budget_config import BudgetConfig
 from tools.tool_result_storage import extract_persisted_path
 

@@ -350,7 +350,7 @@ class SSHProcessMixin:
                                            source=session._ssh_kill_source)
                 if record.get("state") not in {"running", "exited"}:
                     raise RuntimeError("Remote supervisor/receipt unavailable; stop is unconfirmed")
-            except Exception as exc:
+            except Exception as exc:  # health: allow BLE001 -- stop is unconfirmed when the remote supervisor or SSH transport fails
                 session.remote_error = str(exc)
                 return False
             remaining = max(0.0, deadline - time.monotonic())
@@ -424,72 +424,98 @@ class SSHProcessMixin:
 
 def handle_process(args, **kw):
     from tools import process_registry as source
-    from tools.nodes import NodeError, resolve_node
-    from tools.registry import tool_error
-    from tools.process_registry_wait_policy import apply_wait_poll_policy
+    from tools.nodes import NodeError
 
     action = args.get("action", "")
     session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
     node = None
     session = None
     try:
-        # An omitted node must not resolve today's configured default. The
-        # original connection is part of the handle, including after recovery.
-        if "node" in args:
-            from tools.terminal_scope import enforce_no_refusal, TerminalPolicyUnavailable
-            try:
-                enforce_no_refusal()
-            except TerminalPolicyUnavailable as exc:
-                raise NodeError(str(exc)) from exc
-            if not isinstance(args["node"], str) or not args["node"]:
-                raise NodeError("node must be a nonempty configured name")
-            node = resolve_node(args["node"])
-        if action not in {*source._SESSION_ACTIONS, "list", "handoff"}:
-            raise NodeError(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+        node = _resolve_process_node(args)
         if action == "list":
-            result = source._list_processes(kw.get("task_id"), **({"node": node} if node is not None else {}))
-            if node is not None:
-                result["processes"] = [item for item in result["processes"]
-                                       if item.get("node") == node.name and item.get("ssh") == node.ssh]
-                result.update(node=node.name, ssh=node.ssh)
-            return json.dumps(result, ensure_ascii=False)
-        if not session_id:
-            raise NodeError(f"session_id is required for {action}")
-        session = source.process_registry._lookup_session(session_id)
-        if session is not None and session.ssh_binding is not None:
-            from hermes_constants import get_hermes_home
-            if session.ssh_binding.profile_home != str(get_hermes_home()):
-                raise NodeError("Process handle belongs to a different profile")
-            from tools.terminal_scope import enforce_no_refusal, TerminalPolicyUnavailable
-            try:
-                enforce_no_refusal()
-            except TerminalPolicyUnavailable as exc:
-                raise NodeError(str(exc)) from exc
-        if node is not None and session is not None:
-            binding = session.ssh_binding
-            if binding is None or (binding.node_name, binding.ssh, binding.platform) != (node.name, node.ssh, node.platform):
-                raise NodeError("Explicit node conflicts with the process handle's original node/SSH identity")
-        try:
-            if action == "handoff":
-                result = source._handoff_process(session_id, args, kw.get("task_id"))
-            elif action in source._SESSION_ACTIONS:
-                handler, redact = source._SESSION_ACTIONS[action]
-                result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
-                if redact:
-                    result = source._redact_process_result(result)
-            else:
-                return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
-        finally:
-            if session is not None and session.ssh_binding is not None:
-                from tools.node_execution import record_result_environment, UnavailableResultEnvironment
-                from tools.nodes import Node
-                binding = session.ssh_binding
-                # Capturing an archive owner must not connect before an action
-                # can report cached state or an unknown remote outcome.
-                record_result_environment(session.env_ref or UnavailableResultEnvironment(
-                    Node(binding.node_name, binding.ssh, binding.platform)))
+            result = _list_processes(source, node, kw.get("task_id"))
+        else:
+            session = _lookup_process_session(source, action, session_id, node)
+            result = _dispatch_process_action(source, action, session_id, args, kw, session)
     except NodeError as exc:
         result = {"status": "error", "error": str(exc)}
+        if session is None and session_id:
+            session = source.process_registry._lookup_session(session_id)
+    return _annotate_process_result(args, result, node, session)
+
+
+def _resolve_process_node(args):
+    from tools.nodes import NodeError, resolve_node
+
+    # An omitted node must not resolve today's configured default. The
+    # original connection is part of the handle, including after recovery.
+    if "node" not in args:
+        return None
+    from tools.terminal_scope import enforce_no_refusal, TerminalPolicyUnavailable
+    try:
+        enforce_no_refusal()
+    except TerminalPolicyUnavailable as exc:
+        raise NodeError(str(exc)) from exc
+    if not isinstance(args["node"], str) or not args["node"]:
+        raise NodeError("node must be a nonempty configured name")
+    return resolve_node(args["node"])
+
+
+def _lookup_process_session(source, action, session_id, node):
+    from tools.nodes import NodeError
+
+    if action not in {*source._SESSION_ACTIONS, "handoff"}:
+        raise NodeError(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+    if not session_id:
+        raise NodeError(f"session_id is required for {action}")
+    session = source.process_registry._lookup_session(session_id)
+    if session is not None and session.ssh_binding is not None:
+        from hermes_constants import get_hermes_home
+        if session.ssh_binding.profile_home != str(get_hermes_home()):
+            raise NodeError("Process handle belongs to a different profile")
+        from tools.terminal_scope import enforce_no_refusal, TerminalPolicyUnavailable
+        try:
+            enforce_no_refusal()
+        except TerminalPolicyUnavailable as exc:
+            raise NodeError(str(exc)) from exc
+    if node is not None and session is not None:
+        binding = session.ssh_binding
+        if binding is None or (binding.node_name, binding.ssh, binding.platform) != (node.name, node.ssh, node.platform):
+            raise NodeError("Explicit node conflicts with the process handle's original node/SSH identity")
+    return session
+
+
+def _list_processes(source, node, task_id):
+    result = source._list_processes(task_id, **({"node": node} if node is not None else {}))
+    if node is not None:
+        result["processes"] = [item for item in result["processes"]
+                               if item.get("node") == node.name and item.get("ssh") == node.ssh]
+        result.update(node=node.name, ssh=node.ssh)
+    return result
+
+
+def _dispatch_process_action(source, action, session_id, args, kw, session):
+    from tools.registry import tool_error
+    from tools.process_registry_wait_policy import apply_wait_poll_policy
+
+    try:
+        if action == "handoff":
+            return source._handoff_process(session_id, args, kw.get("task_id"))
+        handler, redact = source._SESSION_ACTIONS[action]
+        result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
+        return source._redact_process_result(result) if redact else result
+    finally:
+        if session is not None and session.ssh_binding is not None:
+            from tools.node_execution import record_result_environment, UnavailableResultEnvironment
+            from tools.nodes import Node
+            binding = session.ssh_binding
+            # Capturing an archive owner must not connect before an action
+            # can report cached state or an unknown remote outcome.
+            record_result_environment(session.env_ref or UnavailableResultEnvironment(
+                Node(binding.node_name, binding.ssh, binding.platform)))
+
+
+def _annotate_process_result(args, result, node, session):
     if node is not None:
         result.update(node=node.name, ssh=node.ssh)
     if session is not None:

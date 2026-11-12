@@ -865,7 +865,7 @@ def _post_edit_bookkeeping(result_dict: dict, task_id: str):
     """
     try:
         yield
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- post-commit metadata refresh is optional and must not undo the committed write
         from tools.node_execution import tracking_key
         with _read_tracker_lock:
             _read_tracker.pop(tracking_key(task_id), None)
