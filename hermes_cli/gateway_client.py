@@ -251,7 +251,17 @@ class GatewayClient:
 def private_control_query(home: Path, request: bytes, timeout: float = 5) -> bytes:
     """Send one request line to *home*'s gateway control socket as this OS user; the raw answer.
 
-    The socket authenticates the peer (same user only), which is what lets a private verb answer."""
+    The socket authenticates the peer (same user only), which is what lets a private verb answer.
+    A socket timeout is a gateway handshake failure, not a bare ``TimeoutError: timed out``.
+    """
+    try:
+        return _private_control_query(home, request, timeout)
+    except TimeoutError as exc:
+        from cron.dependency_timeout import name_gateway_handshake_timeout
+        raise name_gateway_handshake_timeout(exc) from exc
+
+
+def _private_control_query(home: Path, request: bytes, timeout: float) -> bytes:
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
         return query_runtime_control(home, request, timeout)
