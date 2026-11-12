@@ -30,6 +30,8 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
             agent._shared_primary_cooldown_record = record
             return False
         if record is None:
+            agent._shared_primary_cooldown_record = None
+            agent._shared_primary_probe_token = None
             return False
         if not is_active(record):
             agent._shared_primary_cooldown_record = record

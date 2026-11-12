@@ -76,9 +76,13 @@ def claim_primary_probe(agent, shared_state: str):
     from agent.shared_primary_cooldown import claim_probe, route_from_record
     record = agent._shared_primary_cooldown_record
     token = claim_probe(route_from_record(record), str(record.get("outage_id") or ""))
-    if not token:
+    if token is False:
         logger.info("Primary cooldown probe already owned elsewhere; staying on fallback")
         return False
+    if token is None:
+        agent._shared_primary_cooldown_record = None
+        agent._shared_primary_probe_token = None
+        return None
     agent._shared_primary_probe_token = token
     return token
 

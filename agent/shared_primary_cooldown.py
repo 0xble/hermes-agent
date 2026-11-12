@@ -352,7 +352,12 @@ def arm_cooldown(
 ) -> dict[str, Any] | None:
     """Create or re-arm a route outage and return its durable record."""
     now = time.time()
-    requested_reset = (_plausible_reset(reset_at, now) or 0.0) if reset_at is not None else 0.0
+    # All callers may receive provider hints in epoch seconds, epoch milliseconds, or ISO-8601
+    # form. Normalize at the durable boundary so a new caller cannot silently fall back to 60 s.
+    from agent.fallback_cooldown import _provider_reset_epoch
+    normalized_reset = _provider_reset_epoch(reset_at) if reset_at is not None else None
+    requested_reset = _plausible_reset(normalized_reset, now) if normalized_reset is not None else None
+    requested_reset = requested_reset or 0.0
     if requested_reset <= now:
         requested_reset = 0.0
     route = canonical_route(route)
@@ -423,6 +428,10 @@ def arm_cooldown(
                 "outage_id": outage_id,
                 "recorded_at": now,
             }
+            if same_outage:
+                for field in ("merged_outage_ids", "probe_owner", "probe_until", "state"):
+                    if field in old:
+                        entry[field] = old[field]
             if prior_ids:
                 entry["failure_request_ids"] = sorted(prior_ids)[-16:]
             if same_outage and old.get("notice_fallback"):
@@ -505,7 +514,11 @@ def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> str | boo
             changed = _merge_duplicate_routes(state)
             changed = _prune_stale(state, now) or changed
             entry = state["routes"].get(key)
-            if not isinstance(entry, dict) or str(entry.get("outage_id")) != str(outage_id):
+            accepted_ids = {
+                str(entry.get("outage_id") or ""),
+                *(str(value) for value in entry.get("merged_outage_ids") or ()),
+            } if isinstance(entry, dict) else set()
+            if not isinstance(entry, dict) or str(outage_id) not in accepted_ids:
                 if changed:
                     _write_state(path, state)
                 return None
