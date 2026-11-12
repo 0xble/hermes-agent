@@ -332,6 +332,8 @@ class GatewayTurnPrepareMixin:
         from gateway.run_heartbeat_acceptance import resolve_heartbeat_owner
         if not await resolve_heartbeat_owner(self, event, session_entry):
             return
+        from gateway.meeting_lane import apply_reasoning_default
+        await apply_reasoning_default(self, event, session_key)
         return source, session_entry, session_key
 
     async def _hmwa_heal_telegram_topic_binding(self, source, session_entry, session_key):

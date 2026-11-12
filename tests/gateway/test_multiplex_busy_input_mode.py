@@ -47,7 +47,7 @@ def _runner(*, default_mode: str = "interrupt") -> GatewayRunner:
     runner.hooks.emit = AsyncMock()
     runner.pairing_store = MagicMock()
     runner.pairing_store.is_approved.return_value = True
-    runner._is_user_authorized = lambda source: True
+    runner._is_user_authorized = lambda source, **_kwargs: True
     runner._session_has_compression_in_flight = AsyncMock(return_value=False)
     return runner
 
@@ -576,3 +576,93 @@ async def test_secondary_human_delay_follows_profile_config_not_process_env(tmp_
     # A fresh adapter is off until the runner installs a range; env is never consulted.
     fresh = _adapter()
     assert fresh._human_delay_range_ms is None and fresh._get_human_delay() == 0.0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["adapter", "priority", "durable", "replay"])
+@pytest.mark.parametrize("binding,title,steered", [
+    (None, "live meeting", False),
+    ("research", "meeting", False),
+    ("meetings", "anything", True),
+    (["research", "meetings"], "unrelated title", True),
+    (["meetings-notes"], "meeting", False),
+])
+async def test_meeting_binding_controls_every_busy_boundary(
+    tmp_path, monkeypatch, boundary, binding, title, steered,
+):
+    """Only the explicit skill binding changes policy; a steer never also enters FIFO."""
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    runner = _runner(default_mode="queue")
+    adapter = await _load_profile_snapshot(runner, tmp_path / "research", "queue")
+    event = _event(profile="research")
+    event.source.thread_id = "topic-1"
+    event.source.chat_topic = title
+    event.auto_skill = binding
+    if boundary == "replay":  # exercise the real native FIFO codec on a standalone gateway
+        runner.config.multiplex_profiles = False
+        event.source.profile = None
+        runner.adapters[Platform.TELEGRAM] = adapter
+    key = runner._session_key_for_source(event.source)
+    agent = MagicMock()
+    agent._active_children = []
+    agent.steer.return_value = True
+    runner._session_state(key).turn.agent = agent
+    runner._session_state(key).turn.event = _event(profile="research")
+    if boundary == "adapter":
+        handled = await runner._handle_active_session_busy_message(event, key)
+        if not handled:
+            runner._queue_or_replace_pending_event(key, event)
+    elif boundary == "priority":
+        await runner._handle_message(event)
+    else:
+        if boundary == "replay":
+            from gateway.session_envelope import restore_native, snapshot_native
+            from gateway.session import SessionStore
+            store = SessionStore(sessions_dir=tmp_path / "sessions", config=runner.config)
+            runner.session_store = store
+            store.get_or_create_session(event.source)
+            event = restore_native(snapshot_native(runner, event), runner)
+            assert event.auto_skill == binding
+            key = runner._session_key_for_source(event.source)
+        authority = SimpleNamespace()
+        monkeypatch.setattr("gateway.session_authorities.active_authority", lambda _runner: authority)
+        runner._hm_post_admission_consume = AsyncMock(return_value=(False, None))
+        admitted = AsyncMock(return_value=None)
+        monkeypatch.setattr("gateway.session_ingress.admit_message", admitted)
+        assert (await runner._hm_authority_admission(event, event.source, key, False))[0]
+        assert admitted.await_count == (0 if steered else 1)
+        if boundary == "replay" and steered:
+            medium = {"enabled": True, "effort": "medium"}
+            assert runner.session_store.get_reasoning_override(key) == medium
+            assert agent.reasoning_config == medium
+    assert agent.steer.call_count == int(steered)
+    agent.interrupt.assert_not_called()
+    if steered:
+        assert key not in adapter._pending_messages
+        assert not runner._queued_events.get(key)
+    elif boundary not in ("durable", "replay"):
+        assert adapter._pending_messages[key] is event
+    assert runner._effective_busy_input_mode(event.source) == "queue"
+
+
+@pytest.mark.asyncio
+async def test_removing_meeting_binding_restores_queue(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "0")
+    runner = _runner(default_mode="queue")
+    adapter = await _load_profile_snapshot(runner, tmp_path / "research", "queue")
+    event = _event(profile="research")
+    event.source.thread_id = "topic-1"
+    key = runner._session_key_for_source(event.source)
+    agent = MagicMock()
+    agent.steer.return_value = True
+    runner._running_agents[key] = agent
+    event.auto_skill = "meetings"
+    await runner._handle_message(event)
+    assert agent.steer.call_count == 1
+    event.auto_skill = None
+    await runner._handle_message(event)
+    assert agent.steer.call_count == 1
+    assert adapter._pending_messages[key] is event
