@@ -1,8 +1,6 @@
-"""Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner.
-
-Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
-``gateway.run`` internals are imported lazily inside method bodies (import cycle),
-so ``patch("gateway.run.X")`` keeps intercepting them at call time.
+"""Stop/drain/restart, scale-to-zero and active-work accounting for GatewayRunner.
+Split from ``gateway/run.py`` and bound via the MRO; lazy imports of its internals
+avoid cycles and preserve ``patch("gateway.run.X")`` interception at call time.
 """
 
 from __future__ import annotations
@@ -34,6 +32,7 @@ from gateway.restart import (
 from gateway.run_common import _UNSET
 from agent.async_utils import cancel_task_with_grace
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
+from gateway.run_shutdown_incognito import cleanup_incognito_private_dirs
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.run_shutdown_deadlines import GatewayShutdownDeadlinesMixin, bounded_stop_requested
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay, session_store_lock_snapshot
@@ -3011,11 +3010,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         """Clean-shutdown marker, restart markers, terminal runtime status; process bootstrap
         releases PID/lock ownership after the writer drain."""
         from gateway.run import _hermes_home, _shutdown_gateway_health_export
-        with suppress(Exception):
-            from agent.incognito_private_dir import discard_owned_private_dirs
-            removed = discard_owned_private_dirs()
-            if removed:
-                logger.info("Incognito shutdown cleanup removed %d private directories", removed)
+        cleanup_incognito_private_dirs()
         if getattr(self, "_startup_cleanup_only", False):  # start never ran: keep startup_failed + crash markers
             return _shutdown_gateway_health_export(self)
         if not getattr(self, "_client_owned", False):  # Only a daemon recovered prior receipts/counters.
