@@ -111,11 +111,21 @@ def test_forced_termination_recovers_checkpoint_before_request_finishes(tmp_path
                                   hashlib.sha256(payload).hexdigest()],
                                  cwd=Path(__file__).resolve().parents[2],
                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        retained = 0
+
+        def checkpoint_covers_received():
+            nonlocal retained
+            if side.is_file():
+                saved = json.loads(side.read_text(encoding="utf-8-sig"))
+                retained = sum(end - start for start, end in saved["ranges"])
+            return retained >= checkpoint
+
         try:
             assert waiting.wait(10), "child never received model data"
-            assert wait_until(side.is_file, timeout=10), "no checkpoint during an unfinished request"
-            saved = json.loads(side.read_text(encoding="utf-8-sig"))
-            retained = sum(end - start for start, end in saved["ranges"])
+            assert wait_until(checkpoint_covers_received, timeout=10), "no checkpoint during an unfinished request"
+            assert not release.is_set()
+            # The first checkpoint may precede socket drain. All received bytes
+            # must become durable while the request is still unfinished.
             assert retained >= checkpoint
         finally:
             child.kill()
