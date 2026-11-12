@@ -1187,7 +1187,7 @@ CRONJOB_SCHEMA = {
                     {"type": "number", "minimum": 0},
                     {"type": "string", "enum": [""]},
                 ],
-                "description": "For create/update: maximum scheduled catch-up lateness in finite nonnegative seconds. 0 allows no lateness; unset means legacy unlimited catch-up. Omit or null leaves an existing value unchanged; pass '' to clear it back to unlimited."
+                "description": "For create/update: finite nonnegative catch-up limit in seconds. Recurring: strict deadline; 0 allows no lateness and unset is unlimited. One-shot: widens the catch-up window to max(120, value); 0 keeps 120. Omit or null leaves an existing value unchanged; pass '' to clear it."
             },
             "action": {
                 "type": "string",

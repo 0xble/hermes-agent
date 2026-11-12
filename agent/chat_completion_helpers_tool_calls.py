@@ -28,6 +28,10 @@ class _ToolCallAccumulator:
             self.acc[idx]["function"]["arguments"] = "".join(parts)
         return self.acc
 
+    def argument_chars(self) -> int:
+        """Return the streamed argument size without building a second accumulator."""
+        return sum(len(part) for parts in self._argument_parts.values() for part in parts)
+
     def _starts_new_call(self, tc_delta, slot: int) -> bool:
         """Whether a fresh id at a reused raw index opens a new call (Ollama parallel batch) or
         continues the current one. LM Studio and Kimi send a fresh id on every argument fragment

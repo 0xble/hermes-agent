@@ -20,7 +20,7 @@ from agent.codex_responses_adapter import _summarize_user_message_for_log
 from agent.fast_mode import begin_turn as begin_fast_mode_turn
 from agent.message_metadata import append_message, without_persistence_fields
 from agent.message_sanitization import _repair_tool_call_arguments, _sanitize_surrogates
-from agent.model_metadata import MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
+from agent.model_metadata import CHARS_PER_TOKEN, MINIMUM_CONTEXT_LENGTH, _estimate_tools_tokens_rough
 from agent.process_bootstrap import _install_safe_stdio
 from agent.prompt_builder import RUNTIME_ENVIRONMENT_END, RUNTIME_ENVIRONMENT_HEADING
 from agent.prompt_caching import (
@@ -992,23 +992,23 @@ _LEGACY_LENGTH_CONTINUATION_NETWORK_STUB = (
     "[System: The previous response was cut off by a network error mid-stream. Continue exactly "
     "where you left off. Do not restart or repeat prior text. Finish the answer directly.]"
 )
-# The dropped-tools variant interpolates tool names; matched by prefix.
 _LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX = "[System: Your previous tool call "
-
-
-def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[list[str]] = None) -> str:
+_DROPPED_TOOL_ARGUMENTS_LARGE_THRESHOLD_CHARS = 8_000 * CHARS_PER_TOKEN
+def _get_continuation_prompt(is_partial_stub: bool, dropped_tools: Optional[list[str]] = None,
+    dropped_tool_argument_chars: int = 0, dropped_tool_continuation_count: int = 0) -> str:
     if is_partial_stub and dropped_tools:
         tool_list = ", ".join(dropped_tools[:3])
+        if (dropped_tool_argument_chars > _DROPPED_TOOL_ARGUMENTS_LARGE_THRESHOLD_CHARS
+                or dropped_tool_continuation_count >= 2):
+            return (f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was too large and the stream "
+                "timed out before it could be delivered. Do NOT retry the same tool call with the same "
+                "large content. Break the content into multiple smaller tool calls under ~8K tokens. "
+                "The cut was a transport interruption, not a capability change — your tools remain fully available.]")
         return (
-            f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was too large and "
-            "the stream timed out before it could be delivered. Do NOT retry the same tool call "
-            "with the same large content. Instead, break the content into multiple smaller tool "
-            "calls (e.g. use multiple patch calls or write smaller files). Each tool call's "
-            "arguments must be under ~8K tokens to avoid stream timeouts. The cut was a transport "
-            "interruption, not a capability change — your tools remain fully available.]"
-        )
+            f"{_LENGTH_CONTINUATION_DROPPED_TOOLS_PREFIX}({tool_list}) was cut off by a transport interruption "
+            "before it could be delivered. Re-issue the same tool call unchanged. The action was not "
+            "executed. The cut was not a capability change — your tools remain fully available.]")
     return _LENGTH_CONTINUATION_NETWORK_STUB if is_partial_stub else _LENGTH_CONTINUATION_OUTPUT_LIMIT
-
 
 # Codex/Responses turns that returned only internal reasoning: a bare retry would be
 # byte-identical, so the model repeats it.

@@ -157,7 +157,138 @@ async def test_absence_without_closing_receipt_has_truthful_disposition(runtime)
     assert final["disposition"]["thread_id"] == r.source.thread_id
     assert final["disposition"]["chat_id"] == r.source.chat_id
     assert final["disposition"]["generation"] == r.state["generation"]
+    assert final["disposition"]["phase_at_finalization"] == "failed"
     assert final["error"] == "closing failed"
+    r.adapter.send.assert_not_awaited()
+    r.bot.send_message.assert_not_awaited()
+    r.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["pending", "waiting"])
+async def test_waiting_absent_topic_finalizes_without_closing(runtime, monkeypatch, phase):
+    r = runtime
+    r.state["phase"] = phase
+    prepare = AsyncMock(return_value=False)
+    monkeypatch.setattr(work, "prepare", prepare)
+    await retire.save(r.runner, r.source, r.state)
+    before = r.db.get_messages(r.entry.session_id)
+
+    await retire.advance(r.runner, r.source)
+
+    final = await retire.load(r.runner, r.source)
+    assert final["phase"] == "done"
+    assert final["disposition"]["status"] == "absent_at_finalization"
+    assert final["disposition"]["phase_at_finalization"] == phase
+    assert final["disposition"]["generation"] == r.state["generation"]
+    assert final["disposition"]["chat_id"] == r.source.chat_id
+    assert final["disposition"]["thread_id"] == r.source.thread_id
+    assert final["disposition"]["observed_at"] > 0
+    assert not final.get("closing_attempt") and not final.get("closing_receipt")
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is None
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) is None
+    assert r.db.get_session(r.entry.session_id)["session_key"] is None
+    assert r.db.get_messages(r.entry.session_id) == before
+    prepare.assert_not_awaited()
+    r.adapter.send.assert_not_awaited()
+    r.bot.send_message.assert_not_awaited()
+    r.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pool_exhaustion_defers_cancelled_goal_before_absent_finalization(runtime, monkeypatch, caplog):
+    r = runtime
+    r.state["phase"] = "pending"
+    r.db.set_meta(f"goal:{r.entry.session_id}", json.dumps({"status": "cancelled", "goal": "Cancelled goal"}))
+    inventory = AsyncMock(side_effect=[RuntimeError("tasks: EMAXCONNSESSION: connection limit"), []])
+    monkeypatch.setattr(work, "inventory", inventory)
+    retries = []
+    monkeypatch.setattr(retire, "_schedule_retry", lambda _runner, _source, delay: retries.append(delay))
+    await retire.save(r.runner, r.source, r.state)
+
+    with caplog.at_level("INFO", logger=retire.logger.name):
+        await retire.advance(r.runner, r.source)
+
+    pending = await retire.load(r.runner, r.source)
+    assert pending["phase"] == "pending" and pending["transient_retries"] == 1
+    assert retries == [30]
+    assert "transient error" in caplog.text
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) == r.entry.session_id
+
+    await retire.advance(r.runner, r.source)
+    final = await retire.load(r.runner, r.source)
+    assert final["phase"] == "done"
+    assert inventory.await_count == 2
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is None
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) is None
+    assert json.loads(r.db.get_meta(f"goal:{r.entry.session_id}"))["status"] == "cancelled"
+
+    await retire.advance(r.runner, r.source)
+    assert await retire.load(r.runner, r.source) == final
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("block", ["inventory", "merge", "handoff"])
+async def test_waiting_absent_topic_keeps_unsettled_work(runtime, monkeypatch, block):
+    r = runtime
+    r.state["phase"] = "waiting"
+    prepare = AsyncMock(return_value=False)
+    monkeypatch.setattr(work, "prepare", prepare)
+    if block == "inventory":
+        monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[{"id": "goal", "kind": "goal"}]))
+    elif block == "merge":
+        r.state["target"] = "Successor"
+    else:
+        monkeypatch.setattr(work, "settle_handoffs", AsyncMock(side_effect=work.HandoffPending("Not delivered")))
+    await retire.save(r.runner, r.source, r.state)
+
+    await retire.advance(r.runner, r.source)
+
+    assert await retire.load(r.runner, r.source) == r.state
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) == r.entry.session_id
+    prepare.assert_not_awaited()
+    r.adapter.send.assert_not_awaited()
+    r.bot.send_message.assert_not_awaited()
+    r.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("probe", ["present", "outage"])
+async def test_waiting_unconfirmed_absence_still_prepares(runtime, monkeypatch, probe):
+    r = runtime
+    r.state["phase"] = "waiting"
+    lookup = AsyncMock(return_value=[{"id": "17"}])
+    if probe == "outage":
+        lookup.side_effect = RuntimeError("network outage")
+    monkeypatch.setattr(work, "cli", lookup)
+    prepare = AsyncMock(return_value=False)
+    monkeypatch.setattr(work, "prepare", prepare)
+    await retire.save(r.runner, r.source, r.state)
+
+    await retire.advance(r.runner, r.source)
+
+    prepare.assert_awaited_once_with(r.runner, r.source, r.state)
+    assert await retire.load(r.runner, r.source) == r.state
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) == r.entry.session_id
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("closing", ["closing_attempt", "closing_receipt"])
+async def test_waiting_closing_evidence_skips_passive_finalization(runtime, monkeypatch, closing):
+    r = runtime
+    r.state.update(phase="waiting", **{closing: {"message_id": "10"} if closing == "closing_receipt" else 1.0})
+    prepare = AsyncMock(return_value=False)
+    monkeypatch.setattr(work, "prepare", prepare)
+    await retire.save(r.runner, r.source, r.state)
+
+    await retire.advance(r.runner, r.source)
+
+    work.cli.assert_not_awaited()
+    prepare.assert_awaited_once_with(r.runner, r.source, r.state)
+    assert await retire.load(r.runner, r.source) == r.state
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) == r.entry.session_id
     r.adapter.send.assert_not_awaited()
     r.bot.send_message.assert_not_awaited()
     r.bot.delete_forum_topic.assert_not_awaited()

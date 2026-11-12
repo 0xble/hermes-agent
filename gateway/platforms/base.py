@@ -4853,6 +4853,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             _copy_index = (metadata or {}).get("copy_block_index") if (metadata or {}).get("copy_block") else None
             if _copy_index is not None:
                 _ledger_message_ref = f"{_ledger_message_ref}#copy{_copy_index}"
+            from gateway.checkin_delivery import is_supervisor_checkin
             obligation_id = compute_obligation_id(
                 session_key, str(_ledger_message_ref or ""), text_content)
             from gateway.copy_blocks import wrap_copy_block
@@ -4866,7 +4867,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 content=ledger_content,
                 adapter_profile=getattr(delivery_adapter, "_owner_profile", None),
                 resume_marker=getattr(event, "_restart_note_expected_marker", None),
-                resume_turn_id=getattr(event, "_gateway_active_turn_token", None))
+                resume_turn_id=getattr(event, "_gateway_active_turn_token", None),
+                supervisor_checkin=is_supervisor_checkin(event, metadata))
             await asyncio.to_thread(mark_attempting, obligation_id)
             return obligation_id
         except Exception:

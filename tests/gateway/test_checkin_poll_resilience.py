@@ -127,3 +127,61 @@ async def test_transient_config_failure_pauses_without_resetting_armed_attempt(f
     await run_checkins.poll_checkins(f.runner)
     assert f.manager.state is None
     assert f.entry.session_key not in f.runner._checkin_watch
+
+
+@pytest.mark.asyncio
+async def test_non_oserror_in_one_profile_does_not_abort_other_profile(tmp_path, monkeypatch):
+    homes = {name: tmp_path / name for name in ("bad", "good")}
+    for home in homes.values():
+        home.mkdir()
+        atomic_config_replace(home / "config.yaml", {"checkins": {}})
+    entries = []
+    for name in homes:
+        source = SessionSource(platform=Platform.TELEGRAM, chat_id=name, profile=name)
+        entries.append(SimpleNamespace(session_key=f"route-{name}", session_id=f"session-{name}",
+                                       suspended=False, origin=source))
+    runner = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=True),
+                             session_store=SimpleNamespace(list_sessions=lambda: entries),
+                             _run_in_executor_with_context=asyncio.to_thread,
+                             _restored_source=lambda entry: entry.origin,
+                             _resolve_profile_home_for_source=lambda source: homes[source.profile],
+                             _checkin_seen={})
+    runner._profile_scope_key_for_source = GatewayTurnMixin._profile_scope_key_for_source.__get__(runner)
+    reconciled = []
+
+    @asynccontextmanager
+    async def scope(source):
+        if source.profile == "bad":
+            raise RuntimeError("profile scope failed")
+        with _profile_runtime_scope(homes[source.profile], hydrate_secrets=False):
+            yield
+
+    async def reconcile(*args, **kwargs):
+        reconciled.append(args[2])
+
+    runner._async_profile_scope_for_source = scope
+    monkeypatch.setattr(run_checkins, "reconcile_turn", reconcile)
+
+    await run_checkins.poll_checkins(runner)
+
+    assert reconciled == ["route-good"]
+
+@pytest.mark.asyncio
+async def test_reconcile_failure_is_retried_on_next_tick(fixture, monkeypatch):
+    f = fixture
+    calls = 0
+
+    async def reconcile(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient reconcile failure")
+        return True
+
+    monkeypatch.setattr(run_checkins, "reconcile_turn", reconcile)
+    await run_checkins.poll_checkins(f.runner)
+    assert calls == 1
+    assert not f.runner._checkin_seen
+    await run_checkins.poll_checkins(f.runner)
+    assert calls == 2
+    assert f.runner._checkin_seen == {(f.entry.session_key, f.entry.session_id): CheckinConfig()}

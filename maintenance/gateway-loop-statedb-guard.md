@@ -44,6 +44,18 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   only a live session's in-memory view, never get-or-creates one from a worker thread. A role hold
   with attended routing off takes the same off-loop resolution snapshot. The Slack DM seed (`_seed_dm_session`, and the `_adopt_legacy_slack_entry`
   and compression-tip reads under it) belongs to PR #814 (`slack-seed-off-loop`).
+- 2026-11-11 sweep (three exit-75 liveness kills, 03:30–03:48 PT; in every dump the loop thread was
+  waiting on the session-store lock, holder not captured because faulthandler stops at 100
+  threads): the native FIFO claim's route check (`check_native_route` /
+  `check_automation_route` / `_owner`), the native snapshot (`_snapshot_native_async`), cron
+  `recover`/delivery local restores (`restore_local_session_async`), session-title lookups and
+  the model-override rehydrate now run on a dedicated bounded `session-store` executor
+  (`gateway/session_store_async.py`, 4 workers) so a long holder parks those workers instead of
+  the default executor or the loop. Results are immutable; the claim still re-reads the exact
+  head after the await. The liveness and shutdown watchdog dumps print each served store's
+  `SessionStore._lock.owner_snapshot()` (thread, held age, count, callsites) without taking the
+  lock, so the next stall names its holder. Moving DB and file I/O out of store-locked sections
+  (`session_persistence._ensure_loaded_locked`, whole-index saves) is the follow-up.
 - The pre-open deleted-WAL holder scan (host-wide libproc on macOS, already bounded at 5 s
   fail-open by upstream `233434b41447`; a cold scan took 77 s on the loaded host) reuses a
   clean verdict for 10 s while both sidecars keep their identity, never while one is missing,

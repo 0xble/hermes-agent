@@ -178,11 +178,12 @@ def test_elapsed_timed_wait_lifts_without_a_note(hermes_home):
 def test_fresh_notify_completion_defers_to_its_own_turn(hermes_home, monkeypatch):
     """A process that exited normally in THIS gateway still has its completion notice queued; the idle
     wake must not race a duplicate continuation ahead of it."""
-    from tools.process_registry import process_registry
+    from tools.process_registry import ProcessSession, process_registry
 
     proc = "proc_fresh000000"
-    finished = SimpleNamespace(id=proc, exited=True, exit_code=0, completion_reason="exited",
-                               termination_source="", notify_on_complete=True, exited_at=time.time())
+    finished = ProcessSession(id=proc, command="completed fixture", exited=True, exit_code=0,
+                              completion_reason="exited", termination_source="",
+                              notify_on_complete=True, exited_at=time.time())
     monkeypatch.setitem(process_registry._finished, proc, finished)
     mgr = _park_on_session("s-fresh", proc)
     assert mgr.lifted_barrier_prompt() is None
