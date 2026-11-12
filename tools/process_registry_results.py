@@ -41,7 +41,7 @@ def _acquire_result_lock(deadline: float | None) -> bool:
 _RESULT_FIELDS = (
     "id", "command", "cwd", "task_id", "owner_task_id", "session_key",
     "parent_session_id", "started_at", "exit_code", "completion_reason",
-    "termination_source", "notify_on_complete",
+    "termination_source", "notify_on_complete", "ssh_binding", "pid_scope",
 )
 
 
@@ -130,10 +130,12 @@ def _result_paths(*, deadline: float | None = None):
 
 def _completed_result_snapshot(session) -> dict:
     from tools.process_registry import MAX_OUTPUT_CHARS
+    from tools.process_registry_ssh import binding_record
 
     with session._lock:
         return {
             **{key: getattr(session, key) for key in _RESULT_FIELDS},
+            "ssh_binding": binding_record(session.ssh_binding),
             "output": session.output_buffer[-MAX_OUTPUT_CHARS:],
             _CUT_RECEIPT_FIELD: bool(getattr(session, "_cut_receipt", False)),
         }
@@ -221,8 +223,10 @@ def save_cut_pending_result(
         assert_named_profile_home_live(directory)
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Snapshot before taking the result lock: the two locks are never nested.
+        from tools.process_registry_ssh import binding_record
         with session._lock:
             record = {key: getattr(session, key) for key in _RESULT_FIELDS}
+            record["ssh_binding"] = binding_record(session.ssh_binding)
             record["output"] = session.output_buffer[-MAX_OUTPUT_CHARS:] if include_output else ""
         record["completion_reason"] = "cut_pending"
         record["termination_source"] = source
@@ -303,8 +307,11 @@ def load_completed_results(prefix: str = "") -> dict:
                 continue
             if not _owns_result(owner, record.get("parent_session_id")):
                 continue
+            from tools.process_registry_ssh import restore_binding
+            fields = {key: record[key] for key in _RESULT_FIELDS if key in record}
+            fields["ssh_binding"] = restore_binding(record.get("ssh_binding"))
             session = ProcessSession(
-                **{key: record[key] for key in _RESULT_FIELDS},
+                **fields,
                 exited=True, output_buffer=record["output"],
             )
             session._completion_event.set()
