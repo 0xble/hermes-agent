@@ -1365,6 +1365,8 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
 
 def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "broken-model"
     plugin.mkdir(parents=True)
@@ -1379,6 +1381,8 @@ def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path, 
 
 def test_candidate_smoke_cannot_pass_via_inherited_stale_pythonpath(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "broken"
     plugin.mkdir(parents=True)
@@ -1666,6 +1670,8 @@ def test_pre_s2_revision_fails_with_clear_message(tmp_path):
 
 def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "candidate-test"
     plugin.mkdir(parents=True)
@@ -1685,6 +1691,8 @@ def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profil
 
 def test_candidate_import_smoke_accepts_enabled_portable_plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "portable-test"
     plugin.mkdir(parents=True)
@@ -1700,6 +1708,8 @@ def test_candidate_import_smoke_accepts_enabled_portable_plugin(tmp_path, monkey
 
 def test_candidate_import_smoke_accepts_enabled_manifest_only_language_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "language-pack"
     (plugin / "locales").mkdir(parents=True)
@@ -1715,6 +1725,8 @@ def test_candidate_import_smoke_accepts_enabled_manifest_only_language_pack(tmp_
 
 def test_candidate_import_smoke_rejects_enabled_portable_plugin_load_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "portable-test"
     plugin.mkdir(parents=True)
@@ -1732,6 +1744,8 @@ def test_candidate_import_smoke_rejects_enabled_portable_plugin_load_failure(tmp
 
 def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "portable-test"
     plugin.mkdir(parents=True)
@@ -1750,6 +1764,8 @@ def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_pat
 
 def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "language-pack"
     (plugin / "locales").mkdir(parents=True)
