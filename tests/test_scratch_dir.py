@@ -1,6 +1,7 @@
 """Scratch dir contract: TMPDIR/TMP/TEMP follow HERMES_HOME/cache/scratch unless the user set them."""
 
 import contextlib
+import json
 import os
 import shlex
 import shutil
@@ -425,23 +426,24 @@ def test_prune_records_removals_and_kills_in_scratch_prune_log(tmp_path: Path) -
     import subprocess
 
     scratch = get_scratch_dir(tmp_path, prune=False)
-    gone, stuck = scratch / "idle-lane", scratch / "stuck-lane"
+    gone, stuck_entry = scratch / "idle-lane", scratch / "stuck-lane"
     ancient = time.time() - 30 * 3600
-    for entry in (gone, stuck):
+    for entry in (gone, stuck_entry):
         entry.mkdir()
         (entry / "out.md").write_text("deliverable", encoding="utf-8")
         for path in (entry / "out.md", entry):
             os.utime(path, (ancient, ancient))
     worker = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"], cwd=str(gone),
                               stdin=subprocess.DEVNULL)
-    real_rmtree = shutil.rmtree
+    real_rename = os.rename
 
-    def rmtree(path: str | os.PathLike[str], *args: object, **kwargs: object) -> None:
-        if os.path.realpath(path) != os.path.realpath(stuck):
-            real_rmtree(path, *args, **kwargs)
+    def rename(src, dst, *args, **kwargs):
+        if os.path.basename(os.fspath(src)) == stuck_entry.name:
+            return None
+        return real_rename(src, dst, *args, **kwargs)
 
     try:
-        with patch("hermes_constants_scratch.shutil.rmtree", rmtree):
+        with patch("hermes_constants_scratch.os.rename", rename):
             assert prune_scratch_dir(scratch) == 1
         assert worker.wait(timeout=10) is not None
     finally:
@@ -451,7 +453,7 @@ def test_prune_records_removals_and_kills_in_scratch_prune_log(tmp_path: Path) -
     log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8-sig")
     assert f"removed {str(gone)!r} (" in log
     assert f"sent TERM pid={worker.pid} " in log
-    assert f"could not fully remove {str(stuck)!r}" in log and f"removed {str(stuck)!r}" not in log
+    assert f"could not fully remove {str(stuck_entry)!r}" in log and f"removed {str(stuck_entry)!r}" not in log
 
 
 @pytest.mark.platforms("linux")  # macOS and Windows filesystems reject non-UTF-8 names
@@ -694,29 +696,17 @@ def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path: Path) 
         os.utime(path, (ancient, ancient))
     log_file = tmp_path / "logs" / "scratch-prune.log"
 
-    deny = {"lstat": False}
-
-    def rmtree_leaves_residue(path, *args, **kwargs):
-        # rmtree(ignore_errors=True) is allowed to leave the directory in place.
-        deny["lstat"] = True
-
-    real_lstat = os.lstat
-
-    def lstat(path, *args, **kwargs):
-        # Only the post-removal visibility check fails; everything else stat()s.
-        if deny["lstat"] and os.path.abspath(os.fspath(path)) == os.path.abspath(entry):
-            raise PermissionError("post-rmtree visibility denied")
-        return real_lstat(path, *args, **kwargs)
+    def rename(src, dst, *args, **kwargs):
+        return None
 
     with patch("hermes_constants_scratch.reap_processes_rooted_in", lambda *a, **k: 0), \
-         patch("hermes_constants_scratch.shutil.rmtree", rmtree_leaves_residue), \
-         patch("hermes_constants_scratch.os.lstat", lstat):
-        assert prune_scratch_dir(scratch) == 0  # unknown, not removed
+         patch("hermes_constants_scratch.os.rename", rename):
+        assert prune_scratch_dir(scratch) == 0  # rename did not move it
     assert entry.exists() and payload.read_text(encoding="utf-8-sig") == "still here"
     log = log_file.read_text(encoding="utf-8-sig")
     assert f"removed {str(entry)!r} (" not in log, log
-    assert "could not confirm removal" in log, log
-    assert "could not fully remove" not in log, log
+    assert "could not fully remove" in log, log
+    assert "could not confirm removal" not in log, log
 
 
 @pytest.mark.platforms("posix")
@@ -1059,3 +1049,75 @@ def test_prune_keeps_the_entry_a_linked_declaration_file_points_into(tmp_path):
     assert prune_scratch_dir(scratch) == 1
     assert (owner / "input-pins.json").exists() and (data / "f").exists()
     assert not control.exists()
+
+
+def test_prune_moves_expired_entry_to_restorable_holding_dir(tmp_path):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "restore-me"
+    entry.mkdir()
+    payload = entry / "result.txt"
+    payload.write_text("restore this", encoding="utf-8")
+    _age_tree(entry)
+    size = payload.stat().st_size + entry.stat().st_size
+
+    assert prune_scratch_dir(scratch) == 1
+    assert not entry.exists()
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/restore-me"))
+    assert held.is_dir() and (held / "result.txt").read_text(encoding="utf-8") == "restore this"
+    manifest = next(held.parent.glob("manifest.jsonl"))
+    record = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+    assert record["original"] == str(entry)
+    assert record["size"] == size
+    assert record["mtime"] is not None and record["pruned_at"].endswith("Z")
+    held.rename(entry)
+    assert (entry / "result.txt").read_text(encoding="utf-8") == "restore this"
+
+
+def test_prune_purges_holding_entries_after_seven_days(tmp_path, monkeypatch):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "old-hold"
+    entry.mkdir()
+    (entry / "x").write_text("x", encoding="utf-8")
+    _age_tree(entry)
+    now = time.time()
+    assert prune_scratch_dir(scratch) == 1
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/old-hold"))
+    monkeypatch.setattr("hermes_constants_scratch.time.time", lambda: now + 8 * 24 * 3600)
+    assert prune_scratch_dir(scratch) == 0
+    assert not held.exists()
+
+
+def test_prune_keeps_enabled_job_references_but_not_disabled_jobs(tmp_path):
+    import json
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    referenced, disabled, free = (scratch / name for name in ("referenced", "disabled", "free"))
+    for entry in (referenced, disabled, free):
+        entry.mkdir()
+        (entry / "x").write_text("x", encoding="utf-8")
+        _age_tree(entry)
+    jobs = tmp_path / "cron" / "jobs.json"
+    jobs.parent.mkdir()
+    jobs.write_text(json.dumps({"jobs": [
+        {"id": "on", "enabled": True, "prompt": f"read {referenced / 'x'}"},
+        {"id": "off", "enabled": False, "prompt": f"read {disabled / 'x'}"},
+    ]}), encoding="utf-8")
+
+    assert prune_scratch_dir(scratch) == 2
+    assert referenced.exists()
+    assert not disabled.exists() and not free.exists()
+
+
+def test_prune_moves_symlink_without_following_target(tmp_path):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "keep.txt"
+    target.write_text("do not touch", encoding="utf-8")
+    link = scratch / "link"
+    link.symlink_to(target)
+    os.utime(link, (time.time() - 30 * 3600, time.time() - 30 * 3600), follow_symlinks=False)
+
+    assert prune_scratch_dir(scratch) == 1
+    assert target.read_text(encoding="utf-8") == "do not touch"
+    assert not link.exists() and list((tmp_path / "cache" / ".scratch-trash").glob("*/link"))
