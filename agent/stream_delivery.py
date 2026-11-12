@@ -69,7 +69,7 @@ class StreamDeliveryMixin:
             return False
         display_delivered = self._call_quietly(getattr(self, "stream_delta_callback", None), text)
         tts_delivered = self._call_quietly(getattr(self, "_stream_callback", None), text)
-        if isinstance(text, str) and text.strip() and (display_delivered or tts_delivered):
+        if isinstance(text, str) and text and (display_delivered or tts_delivered):
             self._record_streamed_assistant_text(text)
             if display_delivered:
                 self._record_display_streamed_assistant_text(text)
