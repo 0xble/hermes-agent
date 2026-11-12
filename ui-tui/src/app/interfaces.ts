@@ -605,7 +605,7 @@ export interface SlashHandlerContext {
     appendPaste: ComposerActions['appendPaste']
     appendText: ComposerActions['appendText']
     attachImagePaths: ComposerActions['attachImagePaths']
-    enqueue: (text: string, display?: string, moaToken?: string) => void
+    enqueue: ComposerActions['enqueue']
     hasSelection: boolean
     openEditor: () => Promise<void>
     queueRef: MutableRefObject<QueueItem[]>

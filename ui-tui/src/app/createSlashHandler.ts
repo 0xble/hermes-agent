@@ -192,7 +192,13 @@ export function createSlashHandler(ctx: SlashHandlerContext): SlashHandler {
           // The gateway has already associated the pending MoA state with this
           // prompt. Keep the prompt in the Ink queue so steer/interrupt modes
           // cannot inject it into the still-running turn.
-          return moaToken ? ctx.composer.enqueue(message, shown, moaToken) : ctx.composer.enqueue(message, shown)
+          if (moaToken) {
+            ctx.composer.enqueue(message, shown, moaToken)
+          } else {
+            ctx.composer.enqueue(message, shown)
+          }
+
+          return
         }
         if (submission) {
           return send(message, true, shown || undefined, submission.expand, { attachments: submission.attachments })
