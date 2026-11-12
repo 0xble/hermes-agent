@@ -2976,13 +2976,14 @@ class _StreamingCall(StreamingWaitMonitor):
     def _emit_text(self, text: str) -> None:
         self._fire_first_delta()
         self.agent._fire_stream_delta(text)
-        _reset_stale_streak(self.agent); self.deltas_were_sent["yes"] = True
+        # Only accepted visible text clears the breaker; TTS counts, display tracking stays separate.
+        if self._visible_text_delivered():
+            _reset_stale_streak(self.agent)
+        self.deltas_were_sent["yes"] = True
 
     def _visible_text_delivered(self) -> bool:
-        """True when visible assistant text actually reached a stream consumer this attempt
-        (``_fire_stream_delta`` records only scrubbed, delivered text; ``deltas_were_sent``
-        flips on any content delta, including whitespace/think-only ones nobody saw)."""
-        return bool((getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
+        """True when visible text reached any consumer; display replay uses the separate streamed-text signal."""
+        return bool(getattr(self.agent, "_stream_any_consumer_accepted_visible_text", False))
 
     def _emit_reasoning(self, text: str) -> None:
         self._fire_first_delta()
@@ -4060,7 +4061,8 @@ class _StreamingCall(StreamingWaitMonitor):
             _partial_text = (_partial_text or "") + _warn
             if self.agent._warning_presentation_enabled():
                 self._quiet(self.agent._fire_stream_delta, _warn)
-        _reset_stale_streak(self.agent)  # deltas fired => provider responsive: clear the breaker
+        if self._visible_text_delivered():
+            _reset_stale_streak(self.agent)  # a consumer accepted visible text
         # #106260: continuing after a context-overflow error re-sends a larger request into the
         # same overflow. Return an EMPTY stub marked terminal so the loop ends the turn instead.
         # Scope is context_overflow ONLY: payload_too_large (413) has its own byte-scored recovery

@@ -2,6 +2,7 @@
 
 from typing import Any, Callable
 
+from agent import chat_completion_helpers as helpers
 from agent.stream_delivery import StreamDeliveryMixin
 
 
@@ -13,6 +14,43 @@ class _Agent(StreamDeliveryMixin):
     @staticmethod
     def _strip_think_blocks(text: str) -> str:
         return text
+
+
+def _emit_text(call, text: str, monkeypatch):
+    resets = []
+    monkeypatch.setattr(helpers, "_reset_stale_streak", lambda agent: resets.append(agent))
+    call._emit_text(text)
+    return resets
+
+
+def _streaming_call(agent):
+    call = object.__new__(helpers._StreamingCall)
+    call.agent = agent
+    call.first_delta_fired = {"done": False}
+    call.on_first_delta = None
+    call.deltas_were_sent = {"yes": False}
+    return call
+
+
+def test_tts_only_visible_acceptance_clears_breaker_but_not_display_tracking(monkeypatch):
+    agent = _Agent()
+    agent.stream_delta_callback = lambda _text: (_ for _ in ()).throw(RuntimeError("display rejected"))
+    agent._stream_callback = lambda _text: None
+
+    resets = _emit_text(_streaming_call(agent), "answer", monkeypatch)
+
+    assert resets == [agent]
+    assert agent._stream_any_consumer_accepted_visible_text is True
+    assert agent._interim_content_fully_streamed("answer") is False
+
+
+def test_no_consumer_acceptance_does_not_clear_breaker(monkeypatch):
+    agent = _Agent()
+
+    resets = _emit_text(_streaming_call(agent), "answer", monkeypatch)
+
+    assert resets == []
+    assert getattr(agent, "_stream_any_consumer_accepted_visible_text", False) is False
 
 
 def test_display_rejection_does_not_count_tts_success_as_chat_delivery():

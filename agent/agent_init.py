@@ -537,7 +537,7 @@ _STREAM_STATE: dict[str, Any] = {
     # per-delta regexes (both tags must be in one string).
     "_stream_context_scrubber": StreamingContextScrubber,
     "_stream_think_scrubber": StreamingThinkScrubber,
-    "_current_streamed_assistant_text": "",  # so a later completed interim isn't re-sent
+    "_current_streamed_assistant_text": "", "_stream_any_consumer_accepted_visible_text": False,  # display replay stays above
     "_delivered_interim_texts": set,  # interims this user turn (spans Codex continuations)
     # Single-writer guard for the delta sink: each attempt claims a monotonic writer token and
     # the sink drops chunks from threads holding a stale one, so a superseded stream can't

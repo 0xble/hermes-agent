@@ -64,12 +64,16 @@ class StreamDeliveryMixin:
 
         Audio delivery is a separate side effect. It must not count as chat-display
         delivery, because streamed-text tracking controls whether a later final-answer
-        fallback replays text to the chat surface.
+        fallback replays text to the chat surface. Liveness uses the separate
+        ``_stream_any_consumer_accepted_visible_text`` signal, which records success
+        from either consumer without changing display-only replay tracking.
         """
         if getattr(self, "_hold_stream", False):
             return False
         display_delivered = self._call_quietly(getattr(self, "stream_delta_callback", None), text)
-        self._call_quietly(getattr(self, "_stream_callback", None), text)
+        tts_delivered = self._call_quietly(getattr(self, "_stream_callback", None), text)
+        if isinstance(text, str) and text.strip() and (display_delivered or tts_delivered):
+            self._stream_any_consumer_accepted_visible_text = True
         return display_delivered
 
     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
@@ -116,6 +120,9 @@ class StreamDeliveryMixin:
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
         self._current_streamed_assistant_text = ""
+        # Liveness follows visible text accepted by either stream consumer, while
+        # ``_current_streamed_assistant_text`` remains display-only for replay/dedup.
+        self._stream_any_consumer_accepted_visible_text = False
 
     @property
     def _current_streamed_assistant_text(self) -> str:
