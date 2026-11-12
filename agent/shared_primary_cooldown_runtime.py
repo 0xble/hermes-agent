@@ -9,7 +9,7 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
     """Start a fresh agent on the configured fallback when another process armed the primary route."""
     if not getattr(agent, "_fallback_chain", None):
         return False  # nothing to adopt onto; skip the state-file lock on every turn
-    from agent.shared_primary_cooldown import is_active, read_cooldown, route_from_agent
+    from agent.shared_primary_cooldown import is_active, read_cooldown, route_from_agent, _probe_token_value
     try:
         record = read_cooldown(route_from_agent(agent))
     except OSError:
@@ -26,7 +26,7 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
     try:
         if (isinstance(record, dict)
                 and str(record.get("probe_owner") or "")
-                and str(record.get("probe_owner") or "") == str(getattr(agent, "_shared_primary_probe_token", "") or "")):
+                and str(record.get("probe_owner") or "") == _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))):
             agent._shared_primary_cooldown_record = record
             return False
         if record is None:

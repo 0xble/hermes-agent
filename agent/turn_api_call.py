@@ -193,7 +193,8 @@ def handle_api_interrupt(
     from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
-    token = getattr(agent, "_shared_primary_probe_token", None)
+    from agent.shared_primary_cooldown import _probe_token_value
+    token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", None))
     if token:
         from agent.shared_primary_probe_runtime import release_primary_probe
         release_primary_probe(agent, token)
