@@ -59,7 +59,9 @@ _PROBE = textwrap.dedent("""
             out["rebind"] = int((await asyncio.wait_for(reader.readline(), 10)).split()[1])
             writer.close()
             out["before_http"] = "hermes_cli.web_server" in sys.modules
-            async with httpx.AsyncClient(base_url=handle.api_origin, trust_env=False) as client:
+            # Dashboard import is intentionally lazy and can exceed HTTPX's 5 s default on a cold
+            # checkout. The enclosing probe has a 120 s bound, which is the contract under test.
+            async with httpx.AsyncClient(base_url=handle.api_origin, trust_env=False, timeout=None) as client:
                 out["status"] = (await client.get("/api/status")).status_code
                 out["rebind_http"] = (await client.get("/api/status", headers={"Host": "attacker.invalid"})).status_code
             out["after_http"] = "hermes_cli.web_server" in sys.modules
@@ -79,9 +81,11 @@ _PROBE = textwrap.dedent("""
 def test_session_listener_serves_native_ws_before_importing_the_dashboard(tmp_path):
     home = tmp_path / ".hermes"
     home.mkdir()
-    env = {k: v for k, v in os.environ.items() if k in {"PATH", "LANG", "TZ", "HERMES_RUNTIME_DIR", "TMPDIR"}}
+    interpreter_bin = str(Path(sys.executable).resolve().parent)
+    env = {k: v for k, v in os.environ.items() if k in {"LANG", "TZ", "HERMES_RUNTIME_DIR", "TMPDIR"}}
+    env["PATH"] = f"{interpreter_bin}:/usr/bin:/bin"
     env.update(HOME=str(tmp_path), HERMES_HOME=str(home), PYTHONPATH=str(REPO))
-    proc = subprocess.run([sys.executable, "-c", _PROBE, str(home)], cwd=str(REPO), env=env,
+    proc = subprocess.run([sys.executable, "-c", _PROBE, str(home)], cwd=str(tmp_path), env=env,
                           capture_output=True, text=True, timeout=120, check=False)
     lines = [ln for ln in (proc.stdout + proc.stderr).splitlines() if ln.startswith("RESULT ")]
     assert proc.returncode == 0 and lines, proc.stderr[-3000:]

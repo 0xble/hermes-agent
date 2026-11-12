@@ -12,6 +12,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -290,9 +291,16 @@ def remote_home(tmp_path):
     return home, hermes
 
 
+def _remote_env(home: Path) -> dict[str, str]:
+    """Use the test interpreter's tools, never a developer shim from the parent PATH."""
+    interpreter_bin = str(Path(sys.executable).resolve().parent)
+    return {"PATH": f"{interpreter_bin}:/usr/bin:/bin", "HOME": str(home)}
+
+
 def _run_remote(shell: str, command: str, home: Path) -> subprocess.CompletedProcess:
-    env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(home)}
-    return subprocess.run([shell, "-c", command], env=env, capture_output=True, text=True, timeout=30, check=False)
+    env = _remote_env(home)
+    return subprocess.run([shell, "-c", command], cwd=str(home), env=env, capture_output=True, text=True,
+                          timeout=30, check=False)
 
 
 def _kill(pid: int) -> None:
@@ -322,7 +330,7 @@ def test_spawn_command_detaches_serve_and_publishes_its_pid(shell, remote_home):
         lock = parse_lockfile(lock_file.read_text(), OID)
         assert isinstance(lock, dict) and lock["pid"] == pid and lock["profile"] == "work"
         argv_file = home / "argv"
-        wait_until(argv_file.exists, timeout=10)
+        wait_until(lambda: argv_file.exists() and argv_file.read_text().strip(), timeout=10)
         argv = argv_file.read_text().splitlines()
         assert argv[:2] == ["--profile", "work"]
         assert argv[2:9] == ["serve", "--isolated", "--host", "127.0.0.1", "--port", "0", "--ssh-session-token-file"]
@@ -346,8 +354,9 @@ class _LocalShell:
         self.home = home
 
     def exec(self, remote_command: str, *, timeout_s=None, stdin_data=None) -> str:
-        env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"), "HOME": str(self.home)}
-        return subprocess.run(["sh", "-c", remote_command], env=env, input=stdin_data, capture_output=True,
+        env = _remote_env(self.home)
+        return subprocess.run(["sh", "-c", remote_command], cwd=str(self.home), env=env, input=stdin_data,
+                              capture_output=True,
                               text=True, timeout=30, check=True).stdout
 
 
