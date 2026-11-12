@@ -2058,8 +2058,9 @@ def create_job(
     source run FIRST each tick; unchanged output suppresses the agent run (mutually exclusive,
     incompatible with ``no_agent``). reasoning_effort: per-job pin; capability NOT validated.
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
-    (a venv can be rebuilt or moved after creation). max_catch_up_lateness_seconds: recurring
-    occurrence expiration deadline; unset is unlimited, 0 permits no lateness."""
+    (a venv can be rebuilt or moved after creation). max_catch_up_lateness_seconds:
+    recurring occurrence deadline (unset is unlimited, 0 permits no lateness); for a
+    one-shot it widens catch-up to max(120s, value), and 0 keeps 120s."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     job_timezone = normalize_job_timezone(job_timezone)
@@ -2832,6 +2833,8 @@ def _write_retired_oneshot_diagnostic(
         # A consumed, unfinished dispatch may already have side effects.
         _write_wedged_oneshot_diagnostic(job)
         return
+    seconds = oneshot_grace_seconds(job)
+    grace = int(seconds) if seconds.is_integer() else seconds
     reason = "dispatch limit reached" if dispatch_limit else "run time outside grace window"
     _write_oneshot_diagnostic(
         job,
@@ -2839,7 +2842,7 @@ def _write_retired_oneshot_diagnostic(
         f"- job id: {job.get('id')}\n"
         f"- name: {job.get('name')}\n"
         f"- scheduled run time: {next_run}\n"
-        f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
+        f"- grace window: {grace}s\n"
         f"- removed at: {_hermes_now().isoformat()}\n\n"
         f"This one-shot was removed without running: {reason}. "
         "A re-armed record may have consumed its dispatch budget on a prior run. "

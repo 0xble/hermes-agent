@@ -119,8 +119,10 @@ Recurring jobs can opt into `max_catch_up_lateness_seconds`, a finite,
 nonnegative number of elapsed seconds after their scheduled occurrence. Unset
 or null retains the historical unlimited/coalesced catch-up behavior; `0` is
 strict zero lateness, and equality remains eligible. This is an expiration
-policy, not the recurring backlog grace or the one-shot grace. Manual Run now
-is not a delayed scheduled occurrence. One-shot behavior is unchanged.
+policy, not the recurring backlog grace or the one-shot allowance. Manual Run now
+is not a delayed scheduled occurrence. One-shot catch-up allowance is owned by
+[Cron one-shot grace](cron-oneshot-grace.md); do not treat this recurring deadline
+as that allowance.
 
 Enforce expiration before catch-up rewrites the original due slot, on external
 provider admission, and again at executor/detached-worker entry. Compare UTC
@@ -161,8 +163,9 @@ failure-routing contract rather than introducing a transport.
 
 ## Missed One-Shots
 
-Retain the 120-second grace for ordinary catch-up. Persist each profile's actual
-scan-start instant in `ticker_due_scan` after evaluating that scan, separately
+Ordinary catch-up uses the per-job one-shot allowance in
+[Cron one-shot grace](cron-oneshot-grace.md), not a duplicated 120-second rule.
+Persist each profile's actual scan-start instant in `ticker_due_scan` after evaluating that scan, separately
 from the provider's tick-completion heartbeat. The marker contains epoch, PID,
 and process nonce; only this process's previous scan at/before the job's grace
 deadline proves continuity. Heartbeats refreshed after another profile stalls
