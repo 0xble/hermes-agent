@@ -1,8 +1,8 @@
 """Exact assistant-row identity for a delivered final.
 
-Queued-lane metadata is built before persistence chooses the assistant row.
-The normal final refreshes from the event after that choice; this module is
-the same refresh for a send that still holds the earlier metadata.
+The assistant-row UID stays on the gateway event (or an explicit queued-lane
+argument) until the ledgered send stamps it. Adapter metadata remains public
+routing state only.
 """
 
 from __future__ import annotations
@@ -39,19 +39,13 @@ def assistant_reply_uid(messages: Any) -> str | None:
 
 
 def queued_reply_metadata(metadata: dict | None, result: Any) -> dict | None:
-    """Queued-lane metadata refreshed after the assistant row is knowable.
+    """Return queued-lane routing metadata after persistence has chosen the row.
 
-    The lane sends with turn metadata built before persistence copies the uid
-    onto the event. Bind the uid to the result first so proxy and fallback rows
-    use the same identity when the gateway writes them.
+    The row UID is carried separately by the queued delivery event. Keeping it
+    out of this public metadata prevents any adapter method from observing it.
     """
-    uid = ensure_reply_uid(result)
-    if not uid:
-        return refresh_reply_metadata(metadata, messages=result.get("messages") if isinstance(result, dict) else None)
-    return refresh_reply_metadata(
-        {**(metadata or {}), "_transcript_message_uid": uid},
-        messages=result.get("messages") if isinstance(result, dict) else None,
-    )
+    ensure_reply_uid(result)
+    return metadata
 
 
 def ensure_reply_uid(result: Any) -> str | None:
@@ -79,42 +73,17 @@ def ensure_reply_uid(result: Any) -> str | None:
 
 
 def refresh_reply_metadata(metadata: dict | None, event: Any = None, messages: Any = None) -> dict | None:
-    """Metadata for a final send, including the transcript uid when one is known.
+    """Compatibility helper returning public routing metadata unchanged.
 
-    Copy blocks stay unstamped. An event uid (persistence already chose the row)
-    wins over a uid already on metadata; otherwise the last assistant uid on the
-    turn's messages is used. Metadata built before that choice is what the
-    queued lane holds.
+    Identity is deliberately not refreshed into adapter metadata. ``event`` and
+    ``messages`` remain accepted for callers from older integrations.
     """
-    if (metadata or {}).get("copy_block"):
-        return metadata
-    uid = getattr(event, "_transcript_message_uid", None) if event is not None else None
-    if not (isinstance(uid, str) and uid):
-        uid = (metadata or {}).get("_transcript_message_uid")
-    if not (isinstance(uid, str) and uid):
-        uid = assistant_reply_uid(messages)
-    if not (isinstance(uid, str) and uid) or (metadata or {}).get("_transcript_message_uid") == uid:
-        return metadata
-    return {**(metadata or {}), "_transcript_message_uid": str(uid)}
+    return metadata
 
 
 def reply_uid_for_final(event: Any, metadata: dict | None) -> str | None:
-    """The assistant uid a final send should stamp, or None for a copy block."""
-    refreshed = refresh_reply_metadata(metadata, event=event)
-    if (refreshed or {}).get("copy_block"):
+    """The assistant UID a final send should stamp, or None for a copy block."""
+    if (metadata or {}).get("copy_block"):
         return None
-    uid = (refreshed or {}).get("_transcript_message_uid")
+    uid = getattr(event, "_transcript_message_uid", None)
     return str(uid) if isinstance(uid, str) and uid else None
-
-
-def adapter_send_metadata(metadata: dict | None) -> dict | None:
-    """Public adapter metadata, without the gateway-internal transcript UID.
-
-    The UID names the assistant row the stamp writes after a successful send.
-    Adapters and public metadata assertions must not see it. None stays None
-    so callers that distinguish absent metadata from an empty dict stay exact.
-    """
-    if not isinstance(metadata, dict) or "_transcript_message_uid" not in metadata:
-        return metadata
-    public = {key: value for key, value in metadata.items() if key != "_transcript_message_uid"}
-    return public or None

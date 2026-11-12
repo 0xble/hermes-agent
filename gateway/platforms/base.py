@@ -29,7 +29,7 @@ from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _sh
 from gateway.copy_blocks import (
     restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
-from gateway.outbound_reply import adapter_send_metadata
+from gateway.outbound_reply import reply_uid_for_final
 from gateway.platforms.reaction_lifecycle import reaction_operation
 
 logger = logging.getLogger(__name__)
@@ -160,17 +160,9 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 
 def _thread_metadata_for_event(event) -> dict | None:
-    """``_thread_metadata_for_source`` for an event, anchored on its reply id.
-
-    The transcript UID is added only after persistence chooses the exact assistant row;
-    callers that construct metadata before the handler refresh it before delivery.
-    """
+    """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
     from gateway.checkin_delivery import delivery_metadata
-    metadata = delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
-    uid = getattr(event, "_transcript_message_uid", None)
-    if uid:
-        metadata = {**(metadata or {}), "_transcript_message_uid": str(uid)}
-    return metadata
+    return delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
 
 
 def _schedule_outbound_platform_stamp(store, session_key: str, platform_message_id: str, message_uid: str | None) -> None:
@@ -3312,7 +3304,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         the turn-level delivery tracker records; every override must return the same
         aggregate, or a media-only turn on that platform reports FAILURE (#106153)."""
         delivered = False
-        public_metadata = adapter_send_metadata(metadata)
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -3327,7 +3318,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 else:
                     sender, url_kw = self.send_image, {"image_url": image_url}
                 img_result = await sender(
-                    chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=public_metadata)
+                    chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=metadata)
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                 else:
@@ -3415,7 +3406,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if not self.warning_notifications_enabled(logical_platform, chat_id=chat_id, metadata=metadata):
             return None
         return await self.send(
-            chat_id, content, reply_to=reply_to, metadata=adapter_send_metadata(metadata))
+            chat_id, content, reply_to=reply_to, metadata=metadata)
 
     async def emit_media_warning(
         self, chat_id: str, notice: str, *, caption=None, reply_to=None, metadata=None,
@@ -3433,7 +3424,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if result is not None:
             return result
         if caption:
-            await self.send(chat_id, caption, reply_to=reply_to, metadata=adapter_send_metadata(metadata))
+            await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
         return SendResult(success=False, error=notice)
 
     def warning_text(self, visible: str, hidden: Optional[str] = "", *, logical_platform=None, chat_id=None, metadata=None) -> Optional[str]:
@@ -4092,11 +4083,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
-        public_metadata = adapter_send_metadata(metadata)
-
         async def _send(text: str) -> SendResult:
             return await self.send(
-                chat_id=chat_id, content=text, reply_to=reply_to, metadata=public_metadata)
+                chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
         async def _send_again(previous: SendResult) -> Optional[SendResult]:
             """Retry: the whole payload normally; only the undelivered remainder after a partial split
@@ -4105,7 +4094,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             if not self._is_partial_delivery(previous):
                 return await _send(content)
             return await self._resume_partial_send(
-                chat_id, previous, reply_to=reply_to, metadata=public_metadata)
+                chat_id, previous, reply_to=reply_to, metadata=metadata)
 
         result = await _send(content)
         if result.success or self._send_held(result) or self._send_retry_is_final(result):
@@ -4853,16 +4842,27 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
 
     async def _play_tts_file(
         self, event: MessageEvent, text_content: str, tts_path: str, first: bool,
-        metadata: dict[str, Any], record_delivery: Callable) -> bool:
+        metadata: dict[str, Any], record_delivery: Callable, session_key: Optional[str] = None) -> bool:
         """Play one synthesized TTS file. Returns True when the ORIGINAL reply text rode
         along as a Telegram caption (first file, ≤1024 chars) so the text send is skipped."""
         caption = None
         if first and self.platform == Platform.TELEGRAM and text_content and text_content[:1024] == text_content:
             caption = text_content
+        obligation_id = None
+        if caption and session_key:
+            obligation_id = await self._record_delivery_obligation(
+                event, session_key, text_content, self, False, metadata=metadata)
         tts_result = await self.play_tts(
             chat_id=event.source.chat_id, audio_path=tts_path, caption=caption, metadata=metadata)
+        if obligation_id is not None:
+            await self._finalize_delivery_obligation(obligation_id, tts_result, event, self)
         record_delivery(tts_result)
-        return bool(caption and getattr(tts_result, "success", False))
+        caption_delivered = bool(caption and getattr(tts_result, "success", False))
+        if caption_delivered and session_key and getattr(tts_result, "message_id", None):
+            _schedule_outbound_platform_stamp(
+                getattr(self, "_session_store", None), session_key,
+                str(tts_result.message_id), getattr(event, "_transcript_message_uid", None))
+        return caption_delivered
 
     def _outbox_covers_final(self, event: MessageEvent, delivery_adapter: "BasePlatformAdapter") -> bool:
         """Whether the durable outbox, not the ledger, owns this final's crash recovery."""
@@ -4987,7 +4987,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS."""
         from urllib.parse import quote as _quote
 
-        adapter_meta = adapter_send_metadata(metadata) or {}
+        adapter_meta = metadata or {}
 
         def _as_image(path: str) -> bool:
             return Path(path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments
@@ -5040,7 +5040,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         try:
             result = await self.send_multiple_images(
                 chat_id=event.source.chat_id, images=images,
-                metadata=adapter_send_metadata(metadata), human_delay=human_delay)
+                metadata=metadata, human_delay=human_delay)
         except Exception as batch_err:
             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
             record_delivery(SendResult(success=False, error=str(batch_err)))
@@ -5526,7 +5526,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     try:
                         _tts_caption_delivered |= await self._play_tts_file(
                             event, text_content, _tts_path, _tts_index == 0, _final_thread_metadata,
-                            _record_delivery)
+                            _record_delivery, session_key)
                     finally:
                         with contextlib.suppress(OSError):
                             os.remove(_tts_path)

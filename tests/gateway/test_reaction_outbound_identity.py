@@ -236,14 +236,14 @@ async def test_proxy_turn_writes_the_uid_delivery_already_named(tmp_path, monkey
         "last_prompt_tokens": 0, "messages": [{"role": "user", "content": "hello"}, proxy_assistant],
     }
     from gateway.outbound_reply import queued_reply_metadata
-    metadata = queued_reply_metadata({"thread_id": "7"}, agent_result)
+    queued_reply_metadata({"thread_id": "7"}, agent_result)
     await runner._hmwa_persist_turn_transcript(
         event=event, source=source, session_entry=entry, session_key=entry.session_key,
         agent_result=agent_result, agent_messages=agent_result["messages"], prepared=prepared,
         response="proxy answer", agent_failed_early=False, hidden_reasoning_incomplete=False,
         is_context_overflow_failure=False,
     )
-    named = metadata["_transcript_message_uid"]
+    named = event._transcript_message_uid
     stamped = await store.record_outbound_platform_message(entry.session_key, "reply-proxy", "", named)
     rows = [row for row in store._store._db.get_messages(entry.session_id) if row["role"] == "assistant"]
     assert stamped is True
@@ -307,9 +307,9 @@ async def test_multi_assistant_gateway_turn_stamps_the_visible_final_row(tmp_pat
 
 
 @pytest.mark.asyncio
-async def test_adapter_boundary_strips_the_transcript_uid_and_still_stamps_it(tmp_path, monkeypatch):
-    """Queued media and the send retry see public metadata; the stamp still names the row."""
-    from gateway.outbound_reply import adapter_send_metadata, queued_reply_metadata
+async def test_queued_media_keeps_uid_out_of_adapter_metadata(tmp_path, monkeypatch):
+    """Queued media sees public metadata; the stamp still names the row."""
+    from gateway.outbound_reply import queued_reply_metadata
     from gateway.run import GatewayRunner
 
     store = _real_store(tmp_path, monkeypatch)
@@ -343,11 +343,11 @@ async def test_adapter_boundary_strips_the_transcript_uid_and_still_stamps_it(tm
         text="hello", message_type=MessageType.TEXT, message_id="in-media", source=source)
     event._transcript_message_uid = "uid-media"  # type: ignore[attr-defined]
     metadata = queued_reply_metadata({"thread_id": "discord-thread"}, {"messages": [assistant]})
-    assert metadata is not None and metadata["_transcript_message_uid"] == "uid-media"
+    assert metadata == {"thread_id": "discord-thread"}
 
     delivered = await runner._deliver_queued_first_response(
         f"first response\nMEDIA:{media_path}", source=source, adapter=adapter, metadata=metadata,
-        event_message_id="in-media", text_already_delivered=False, deliver_media=True,
+        event_message_id="in-media", transcript_message_uid=event._transcript_message_uid,
         session_key=entry.session_key, inbound_message_id="in-media")
     tasks = list(getattr(store, "_outbound_stamp_tasks", ()))
     if tasks:
@@ -364,14 +364,11 @@ async def test_adapter_boundary_strips_the_transcript_uid_and_still_stamps_it(tm
     assert all("_transcript_message_uid" not in (item[1] or {}) for item in adapter.sent)
     assert rows[0]["message_uid"] == "uid-media"
     assert rows[0]["platform_message_id"] == "reply-1"
-    assert adapter_send_metadata(None) is None
-    assert adapter_send_metadata({"thread_id": "7"}) == {"thread_id": "7"}
-    assert adapter_send_metadata({"_transcript_message_uid": "only"}) is None
 
 
 @pytest.mark.asyncio
-async def test_attachment_image_batch_strips_the_transcript_uid():
-    """Normal attachment delivery, not only queued media, keeps routing keys and drops the UID."""
+async def test_attachment_image_batch_keeps_uid_out_of_adapter_metadata():
+    """Normal attachment delivery keeps routing keys and never carries row identity."""
     from gateway.platforms.base import _ExtractedResponse
 
     class _BatchAdapter(_Adapter):
@@ -388,7 +385,8 @@ async def test_attachment_image_batch_strips_the_transcript_uid():
     adapter.gateway_runner = None
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", thread_id="topic-9")
     event = MessageEvent(text="photo", message_type=MessageType.TEXT, message_id="in-attach", source=source)
-    metadata = {"thread_id": "topic-9", "notify": True, "_transcript_message_uid": "uid-final"}
+    event._transcript_message_uid = "uid-final"  # type: ignore[attr-defined]
+    metadata = {"thread_id": "topic-9", "notify": True}
     recorded = []
     extracted = _ExtractedResponse(
         text_content="", images=[("https://cdn.example/photo.png", "photo")],
@@ -405,3 +403,37 @@ async def test_attachment_image_batch_strips_the_transcript_uid():
     }]
     assert recorded[0].success is True
     assert recorded[0].message_id == "img-attach"
+
+
+@pytest.mark.asyncio
+async def test_tts_caption_only_reply_stamps_caption_message_id(tmp_path):
+    class _StampStore:
+        def __init__(self):
+            self.calls = []
+            self._outbound_stamp_tasks = set()
+
+        def record_outbound_platform_message(self, *args):
+            self.calls.append(args)
+            return True
+
+    adapter = _Adapter(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+    adapter._session_store = _StampStore()
+    adapter._record_delivery_obligation = AsyncMock(return_value=None)
+
+    async def play_tts(**kwargs):
+        assert kwargs["metadata"] == {"thread_id": "topic"}
+        assert kwargs["caption"] == "visible reply"
+        return SendResult(success=True, message_id="caption-1")
+
+    adapter.play_tts = play_tts  # type: ignore[method-assign]
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", thread_id="topic")
+    event = MessageEvent(text="voice", message_type=MessageType.VOICE, message_id="in", source=source)
+    event._transcript_message_uid = "uid-caption"  # type: ignore[attr-defined]
+    delivered = await adapter._play_tts_file(
+        event, "visible reply", str(tmp_path / "reply.ogg"), True, {"thread_id": "topic"},
+        lambda _result: None, "session-1")
+    tasks = list(adapter._session_store._outbound_stamp_tasks)
+    if tasks:
+        await asyncio.gather(*tasks)
+    assert delivered is True
+    assert adapter._session_store.calls == [("session-1", "caption-1", "", "uid-caption")]

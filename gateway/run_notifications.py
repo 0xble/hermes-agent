@@ -488,13 +488,12 @@ class GatewayNotificationsMixin(
                 ext = Path(media_path).suffix.lower()
                 return ext in _IMAGE_EXTS and not is_voice and not force_document_attachments
 
-            from gateway.outbound_reply import adapter_send_metadata
             image_paths = [p for p, v in media_files if _is_photo(p, v)]
             non_image_media = [(p, v) for p, v in media_files if not _is_photo(p, v)]
             # Local images and URL images go out in one batch so a platform that bundles native
             # multi-attachment sends (Signal) still gets a single call. ``[[as_document]]`` only
             # applies to local files: a URL has no file to hand to send_document.
-            adapter_meta = adapter_send_metadata(_thread_meta)
+            adapter_meta = _thread_meta or {}
             if image_paths or url_images:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
@@ -526,6 +525,7 @@ class GatewayNotificationsMixin(
     async def _deliver_queued_first_response(
         self, response: str, source: SessionSource, adapter,
         metadata: Optional[dict[str, Any]] = None, event_message_id: Optional[str] = None,
+        transcript_message_uid: Optional[str] = None,
         text_already_delivered: bool = False, deliver_media: bool = True, stream_consumer=None,
         session_key: Optional[str] = None, inbound_message_id: Optional[str] = None,
     ) -> bool:
@@ -588,8 +588,8 @@ class GatewayNotificationsMixin(
                         logger.debug("Queued-lane reconcile edit failed (%s); falling back to send.", _qe)
                 if not _reconciled:
                     _sent = await self._send_queued_final_text(
-                        adapter, source, text_content, metadata, event_message_id, session_key,
-                        inbound_message_id)
+                        adapter, source, text_content, metadata, event_message_id, transcript_message_uid,
+                        session_key, inbound_message_id)
                     if not getattr(_sent, "success", False):
                         # The text never landed. Report it undelivered and skip the attachments too:
                         # the caller's normal completion send replays the whole response (text and
@@ -631,7 +631,7 @@ class GatewayNotificationsMixin(
                 copy_metadata["copy_block_index"] = copy_block_index
                 copy_metadata["plain"] = True
                 _sent = await self._send_queued_final_text(
-                    adapter, source, copy_block, copy_metadata, event_message_id, session_key, inbound_message_id)
+                    adapter, source, copy_block, copy_metadata, event_message_id, None, session_key, inbound_message_id)
                 if not getattr(_sent, "success", False):
                     logger.warning("Queued-lane copy block send failed to %s: %s", source.chat_id,
                                    getattr(_sent, "error", None) or "no result")
@@ -666,7 +666,7 @@ class GatewayNotificationsMixin(
 
     async def _send_queued_final_text(
         self, adapter, source: SessionSource, text_content: str, metadata: Optional[dict[str, Any]],
-        event_message_id: Optional[str], session_key: Optional[str],
+        event_message_id: Optional[str], transcript_message_uid: Optional[str], session_key: Optional[str],
         inbound_message_id: Optional[str] = None,
     ):
         """Send a queued-lane final through the same ledger bracket as the normal final
@@ -678,9 +678,12 @@ class GatewayNotificationsMixin(
         inbound id the ledger falls back to the event's own (empty) message id. Adapters without
         the base contract and sends without a session key keep the plain send."""
         if session_key and isinstance(adapter, BasePlatformAdapter):
+            queued_event = MessageEvent(
+                text="", source=source, ledger_message_id=inbound_message_id)
+            if transcript_message_uid:
+                queued_event._transcript_message_uid = str(transcript_message_uid)  # type: ignore[attr-defined]
             result, _ = await adapter.send_final_ledgered(
-                MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
-                session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
+                queued_event, session_key, text_content, _mark_notify_metadata(metadata), reply_to=event_message_id)
         else:
             result = await adapter.send(source.chat_id, text_content, metadata=metadata)
         from gateway.reply_latency import current_receipt, record_final_reply
