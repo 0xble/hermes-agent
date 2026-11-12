@@ -2560,10 +2560,13 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             ),
             level=logging.WARNING,
         ))
-        # Use the same roughly three-second shutdown budget for the interrupted-cron mark on
-        # restart and non-restart stops. A zero wait can drop marked IDs when the fire fence is held.
-        _restart_deadline = time.monotonic() + self._restart_shutdown_bound()
+        # The cron mark gets a bounded wait even after agents exhaust their grace. Bounded
+        # stops reserve a sweep slice so a held fire fence cannot consume the tool-kill budget.
+        _shutdown_bound = self._restart_shutdown_bound()
+        _restart_deadline = time.monotonic() + _shutdown_bound
         _mark_deadline = _restart_deadline
+        if bounded_stop_requested(self):
+            _mark_deadline -= min(0.5, _shutdown_bound / 2)
         _mark_done, _pending = await asyncio.wait(
             {_mark_task}, timeout=max(0.0, _mark_deadline - time.monotonic())
         )

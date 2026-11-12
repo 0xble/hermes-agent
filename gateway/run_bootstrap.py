@@ -738,15 +738,17 @@ def _record_process_exit_state(runner) -> None:
     restart_requested = bool(getattr(runner, "_restart_requested", False))
     signal_shutdown = bool(getattr(runner, "_signal_initiated_shutdown", False))
     planned_signal_stop = bool(runner is not None and bounded_stop_requested(runner)) and not signal_shutdown
-    shutdown_event = getattr(runner, "_shutdown_event", None)
-    explicit_stop = bool(shutdown_event is not None and shutdown_event.is_set()) and not signal_shutdown
+    # stop() sets _shutdown_event even for exception cleanup, so it is not stop intent.
+    explicit_stop = bool(getattr(runner, "_exit_cleanly", False)) and not signal_shutdown
     process_exit_state.update(
         shutdown_requested=restart_requested or planned_signal_stop or explicit_stop,
         exit_code=(getattr(runner, "exit_code", None) if runner is not None else None),
     )
     if restart_requested and process_exit_state["exit_code"] is None:
         from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
-        process_exit_state["exit_code"] = GATEWAY_SERVICE_RESTART_EXIT_CODE
+        process_exit_state["exit_code"] = (
+            GATEWAY_SERVICE_RESTART_EXIT_CODE if getattr(runner, "_restart_via_service", False) else 0
+        )
 
 
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,

@@ -42,16 +42,21 @@ def test_cancelled_process_exit_uses_recorded_shutdown_request(
     assert observed == [requested_code if shutdown_requested else 1]
 
 
-def test_cancelled_process_exit_reads_runner_shutdown_flags(monkeypatch):
+@pytest.mark.parametrize(
+    ("service_restart", "expected_code"), [(False, 0), (True, 75)],
+    ids=["detached-or-in-place", "service"],
+)
+def test_cancelled_process_exit_reads_runner_shutdown_flags(monkeypatch, service_restart, expected_code):
     from gateway.run_bootstrap import _record_process_exit_state
     from gateway.run_process_exit import run_gateway_process
 
     async def start_gateway():
         runner = SimpleNamespace(
             _restart_requested=True,
+            _restart_via_service=service_restart,
             _signal_initiated_shutdown=False,
             _shutdown_event=asyncio.Event(),
-            exit_code=75,
+            exit_code=None,
         )
         _record_process_exit_state(runner)
         raise asyncio.CancelledError()
@@ -60,7 +65,7 @@ def test_cancelled_process_exit_reads_runner_shutdown_flags(monkeypatch):
     monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", observed.append)
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(run_gateway_process(start_gateway))
-    assert observed == [75]
+    assert observed == [expected_code]
 
 
 def test_main_terminates_via_os_exit_not_systemexit(monkeypatch):

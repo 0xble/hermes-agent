@@ -18,7 +18,7 @@ def current_process_exit_state() -> dict | None:
     return _PROCESS_EXIT_STATE.get()
 
 
-async def run_gateway_process(start_gateway, *args, before_exit=None, shutdown_requested=None, **kwargs):
+async def run_gateway_process(start_gateway, *args, before_exit=None, **kwargs):
     """Await the entire durable teardown, then use the existing hard-exit path.
 
     asyncio.run() closes its default executor AFTER the main coroutine returns.
@@ -46,10 +46,7 @@ async def run_gateway_process(start_gateway, *args, before_exit=None, shutdown_r
             # Otherwise launchd must see a failure and relaunch the gateway.
             error = exc
             state = current_process_exit_state() or {}
-            requested = bool(
-                shutdown_requested() if callable(shutdown_requested)
-                else state.get("shutdown_requested")
-            )
+            requested = bool(state.get("shutdown_requested"))
             requested_code = state.get("exit_code")
             code = requested_code if requested and isinstance(requested_code, int) else int(not requested)
         except Exception as exc:  # health: allow BLE001 -- preserve ordinary gateway failure after diagnostics
