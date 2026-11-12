@@ -15,7 +15,7 @@ from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Any
 
-from hermes_cli.sqlite_util import add_column_if_missing, write_txn
+from hermes_cli.sqlite_util import add_column_if_missing, open_db, write_txn
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -562,6 +562,18 @@ class SharedMetricsStore:
                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (_STORE_SCHEMA_VERSION,),
             )
+        # WAL is a property of the store, not the schema transaction. Enabling it
+        # after the transaction preserves the normal busy wait for an existing
+        # writer while making subsequent short writes multi-process safe.
+        with open_db(
+            self.database_path,
+            db_label="shared-metrics",
+            busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS,
+            wal=True,
+            wal_lock_retries=3,
+            row_factory=sqlite3.Row,
+        ):
+            pass
 
     def _install_id(self, connection: sqlite3.Connection) -> str:
         query = "SELECT value FROM telemetry_state WHERE key = 'install_id'"
