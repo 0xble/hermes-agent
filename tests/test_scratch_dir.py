@@ -1062,9 +1062,9 @@ def test_prune_moves_expired_entry_to_restorable_holding_dir(tmp_path):
 
     assert prune_scratch_dir(scratch) == 1
     assert not entry.exists()
-    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/restore-me"))
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/restore-me"))
     assert held.is_dir() and (held / "result.txt").read_text(encoding="utf-8") == "restore this"
-    manifest = next(held.parent.glob("manifest.jsonl"))
+    manifest = held.parent.parent / "manifest.jsonl"
     record = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
     assert record["original"] == str(entry)
     assert record["size"] == size
@@ -1081,10 +1081,15 @@ def test_prune_purges_holding_entries_after_seven_days(tmp_path, monkeypatch):
     _age_tree(entry)
     now = time.time()
     assert prune_scratch_dir(scratch) == 1
-    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/old-hold"))
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/old-hold"))
+    manifest = held.parent.parent / "manifest.jsonl"
+    original_manifest = manifest.read_text(encoding="utf-8")
     monkeypatch.setattr("hermes_constants_scratch.time.time", lambda: now + 8 * 24 * 3600)
     assert prune_scratch_dir(scratch) == 0
     assert not held.exists()
+    manifest_lines = manifest.read_text(encoding="utf-8").splitlines()
+    assert manifest_lines[0] == original_manifest.rstrip("\n")
+    assert json.loads(manifest_lines[-1])["purged"]
 
 
 def test_prune_keeps_enabled_job_references_but_not_disabled_jobs(tmp_path):
@@ -1120,4 +1125,104 @@ def test_prune_moves_symlink_without_following_target(tmp_path):
 
     assert prune_scratch_dir(scratch) == 1
     assert target.read_text(encoding="utf-8") == "do not touch"
-    assert not link.exists() and list((tmp_path / "cache" / ".scratch-trash").glob("*/link"))
+    assert not link.exists() and list((tmp_path / "cache" / ".scratch-trash").glob("*/entries/link"))
+
+
+def test_entry_named_manifest_is_held_intact_and_restorable(tmp_path):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "manifest.jsonl"
+    entry.write_text("original entry\n", encoding="utf-8")
+    os.utime(entry, (time.time() - 30 * 3600, time.time() - 30 * 3600))
+
+    assert prune_scratch_dir(scratch) == 1
+    held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/manifest.jsonl"))
+    manifest = held.parent.parent / "manifest.jsonl"
+    assert held.read_text(encoding="utf-8") == "original entry\n"
+    assert manifest.is_file() and manifest != held
+    record = json.loads(manifest.read_text(encoding="utf-8").splitlines()[0])
+    assert record["original"] == str(entry) and record["held"] == str(held)
+    held.rename(entry)
+    assert entry.read_text(encoding="utf-8") == "original entry\n"
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, entry.stat().st_size, now)
+    assert held is not None
+    assert retention.purge_expired_holds(scratch, now + 8 * 24 * 3600, retention.logger) == 1
+    assert not held.exists()
+    assert manifest.is_file()
+
+
+@pytest.mark.platforms("posix")
+def test_purge_held_tree_does_not_follow_directory_links(tmp_path):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    target = tmp_path / "outside"
+    target.mkdir()
+    (target / "keep").write_text("not held", encoding="utf-8")
+    entry = scratch / "links"
+    entry.mkdir()
+    (entry / "outside").symlink_to(target, target_is_directory=True)
+    (entry / "broken").symlink_to(tmp_path / "absent", target_is_directory=True)
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, 0, now)
+    assert held is not None
+
+    assert retention.purge_expired_holds(scratch, now + 8 * 24 * 3600, retention.logger) == 1
+    assert not held.exists()
+    assert (target / "keep").read_text(encoding="utf-8") == "not held"
+
+
+def test_failed_manifest_read_does_not_delete_manifest(tmp_path, monkeypatch):
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = scratch / "kept-record"
+    entry.write_text("x", encoding="utf-8")
+    os.utime(entry, (time.time() - 30 * 3600, time.time() - 30 * 3600))
+    now = time.time()
+    assert prune_scratch_dir(scratch) == 1
+    manifest = next((tmp_path / "cache" / ".scratch-trash").glob("*/manifest.jsonl"))
+    held = manifest.parent / "entries" / "kept-record"
+    original = manifest.read_text(encoding="utf-8")
+    real_read_text = Path.read_text
+
+    def fail_manifest(self, *args, **kwargs):
+        if self == manifest:
+            raise OSError("manifest unreadable")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", fail_manifest)
+    monkeypatch.setattr("hermes_constants_scratch.time.time", lambda: now + 8 * 24 * 3600)
+    assert prune_scratch_dir(scratch) == 0
+    monkeypatch.undo()
+    assert manifest.read_text(encoding="utf-8") == original
+    assert held.read_text(encoding="utf-8") == "x"
+
+
+def test_purge_preserves_a_hold_appended_after_manifest_read(tmp_path, monkeypatch):
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    old = scratch / "old"
+    old.write_text("old", encoding="utf-8")
+    now = 20_000 * 24 * 3600 + 12 * 3600  # fixed UTC noon, so the second hold stays in this day
+    held = retention.hold_expired_entry(old, scratch, 3, now)
+    manifest = held.parent.parent / "manifest.jsonl"
+    original = manifest.read_bytes()
+    real_remove = retention._remove_nofollow
+    fresh_held = []
+
+    def append_during_purge(path):
+        fresh = scratch / "fresh"
+        fresh.write_text("fresh", encoding="utf-8")
+        # Same day namespace, but this hold is less than seven days old at the purge timestamp.
+        fresh_held.append(retention.hold_expired_entry(fresh, scratch, 5, now + 3600))
+        return real_remove(path)
+
+    monkeypatch.setattr(retention, "_remove_nofollow", append_during_purge)
+    assert retention.purge_expired_holds(scratch, now + 7 * 24 * 3600 + 1, retention.logger) == 1
+    assert fresh_held[0].read_text(encoding="utf-8") == "fresh"
+    assert manifest.read_bytes().startswith(original)
+    records = [json.loads(line) for line in manifest.read_text(encoding="utf-8").splitlines()]
+    assert any(record.get("held") == str(fresh_held[0]) for record in records)
+    assert records[-1]["held"] == str(held) and records[-1]["purged"]
