@@ -173,14 +173,16 @@ def prune_sql(conn, *, write=False):
     budget.check()
     deadline = min(budget.deadline, time.monotonic() + transaction_seconds(budget)) if write else budget.deadline
     previous = conn.execute("PRAGMA busy_timeout").fetchone()[0]
-    # Do not queue maintenance behind a foreground writer for the ordinary 1s busy timeout.
-    conn.execute("PRAGMA busy_timeout=0")
+    # Do not queue a maintenance write behind a foreground writer. Reads retain
+    # the normal busy wait, including in rollback-journal mode.
+    if write:
+        conn.execute("PRAGMA busy_timeout=0")
     conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
     try:
         yield
     except sqlite3.OperationalError as exc:
         from hermes_state_errors import is_sqlite_lock_error
-        if is_sqlite_lock_error(exc):
+        if write and is_sqlite_lock_error(exc):
             raise PruneWriteContended("session prune yielded to a foreground SQLite writer") from exc
         if time.monotonic() >= deadline or "interrupted" in str(exc).lower():
             raise PruneBudgetExpired("session prune SQL interrupted at its budget") from exc

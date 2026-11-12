@@ -143,14 +143,26 @@ def _finish_delete(db, sid, key, value):
     while True:
         check_prune_budget()
         page = [None, 0]
+
+        def load_page():
+            if page[0] is None:
+                page[:] = _page_ids(db, sid, max_rows=pacer.size)
+            return page
+
         def attempt():
-            page[:] = _page_ids(db, sid, max_rows=pacer.size)
+            load_page()
             return db._execute_write(lambda conn: _delete_page(conn, sid, page[0], key, value),
                                      session_id=sid, input_rows=len(page[0]))
+
         def shrink():
-            return pacer.shrink(len(page[0])) if len(page[0]) > 1 else False
+            selected = page[0] or []
+            changed = pacer.shrink(len(selected)) if len(selected) > 1 else False
+            if changed:
+                page[:] = [None, 0]
+            return changed
+
         def seconds():
-            selected, size = _page_ids(db, sid, max_rows=pacer.size)
+            selected, size = load_page()
             if len(selected) != 1:
                 return 0
             if cleanup.get("attempts"):

@@ -373,7 +373,7 @@ class SessionMaintenanceMixin:
         from hermes_cli.maintenance_window import deletion_window_open
         if within_deletion_window and not deletion_window_open():
             raise DeletionWindowClosedError("session prune refused: maintenance.deletion_window is closed")
-        from hermes_state_prune_budget import PruneBudget, PruneBudgetExpired, prune_budget
+        from hermes_state_prune_budget import PruneBudget, PruneBudgetExpired, PruneWriteContended, prune_budget
         from hermes_state_transactions import finish_prune_maintenance
         removed_ids = []
         budget = PruneBudget(within_deletion_window, max_seconds, db_path=self.db_path)
@@ -386,6 +386,11 @@ class SessionMaintenanceMixin:
         except PruneBudgetExpired as exc:
             logger.info("%s", exc)
             return len(removed_ids)
+        except PruneWriteContended as exc:
+            # A read or a write outside the retry runner can still observe a
+            # foreground writer. The next maintenance pass can resume safely.
+            logger.info("%s", exc)
+            return len(removed_ids)
         finally:
             if deleted_ids is not None:
                 deleted_ids.extend(removed_ids)
@@ -393,6 +398,7 @@ class SessionMaintenanceMixin:
     def _prune_sessions_pass(self, older_than_days, source, sessions_dir, exclude_active_write_guards,
                              deleted_ids, within_deletion_window, filters) -> int:
         from hermes_cli.maintenance_window import deletion_window_open
+        from hermes_state_prune_budget import run_prune_write
         finish_pending_deletes(self)
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
         # Select outside the write transaction.  The old implementation selected and deleted every
@@ -408,7 +414,21 @@ class SessionMaintenanceMixin:
         # Tombstones are retained on a separate retry horizon from transcript retention.  A
         # prune pass must advance that horizon even when no session row matches its age window.
         from hermes_state_mutation_retirement import prune_retired_tombstones
-        self._execute_write(lambda conn: prune_retired_tombstones(conn))
+        tombstone_pacer = PrunePacer(max_size=100)
+        tombstone_limit = [tombstone_pacer.size]
+
+        def prune_tombstones():
+            return self._execute_write(
+                lambda conn: prune_retired_tombstones(conn, limit=tombstone_limit[0]), skip_result=0,
+            )
+
+        def shrink_tombstones():
+            changed = tombstone_pacer.shrink()
+            tombstone_limit[0] = tombstone_pacer.size
+            return changed
+
+        run_prune_write(prune_tombstones, shrink=shrink_tombstones,
+                        label="retired tombstones", skip_result=0)
         removed_count = 0
 
         # Keep each transaction small enough that message/FTS triggers release the WAL write lock
@@ -417,7 +437,6 @@ class SessionMaintenanceMixin:
         # batch by this one's measured hold and pauses at least that long.
         groups = self._prune_conversation_groups(candidate_ids)
         pacer, position, held = PrunePacer(max_size=25), 0, [0.0]
-        from hermes_state_prune_budget import run_prune_write
         while position < len(groups):
             if within_deletion_window and not deletion_window_open():
                 logger.info("session prune stopped: maintenance.deletion_window closed with %d candidate(s) "

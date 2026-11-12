@@ -411,14 +411,19 @@ RETRY_HORIZON_S = 7 * 86400  # exact-retry horizon: a retry within it gets the b
 _EXPIRED = "json_valid(value) AND json_extract(value, '$.retired_at') < ?"
 
 
-def _reclaim_expired(conn, prefix, cutoff):
+def _reclaim_expired(conn, prefix, cutoff, limit=None):
     """Drop the sweep (``expires``) markers under *prefix* retired before *cutoff*."""
-    conn.execute(f"DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED} AND json_extract(value, '$.expires') "
-                 "AND json_type(value, '$.cleanup') IS NULL",
-                 (prefix + '*', cutoff))
+    params = (prefix + '*', cutoff)
+    sql = (f"SELECT key FROM state_meta WHERE key GLOB ? AND {_EXPIRED} AND json_extract(value, '$.expires') "
+           "AND json_type(value, '$.cleanup') IS NULL")
+    if limit is not None:
+        sql += " LIMIT ?"
+        params += (limit,)
+    for (key,) in conn.execute(sql, params).fetchall():
+        conn.execute("DELETE FROM state_meta WHERE key=?", (key,))
 
 
-def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
+def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S, limit=None):
     """Reclaim deletion tombstones retired more than *older_than* seconds ago: the terminal admission
     with its identity pointer and compacted result, terminal workers and a sweep's (``expires``)
     retired-session marker or shared routing fence. A user delete's marker is the deletion fence itself and is never
@@ -429,14 +434,30 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S):
     prefixes = (ADMISSION_PREFIX, WORKER_PREFIX)
     now = time.time()
     for prefix in prefixes:
-        conn.execute("UPDATE state_meta SET value=json_set(value, '$.retired_at', ?) WHERE key GLOB ? "
-                     "AND json_valid(value) AND json_extract(value, '$.retired_at') IS NULL", (now, prefix + '*'))
+        params = (prefix + '*',)
+        sql = ("SELECT key FROM state_meta WHERE key GLOB ? AND json_valid(value) "
+               "AND json_extract(value, '$.retired_at') IS NULL")
+        if limit is not None:
+            sql += " LIMIT ?"
+            params += (limit,)
+        for (key,) in conn.execute(sql, params).fetchall():
+            conn.execute("UPDATE state_meta SET value=json_set(value, '$.retired_at', ?) WHERE key=?", (now, key))
     cutoff = now - older_than
-    for key, raw in conn.execute(f'SELECT key,value FROM state_meta WHERE key GLOB ? AND {_EXPIRED}',
-                                 (ADMISSION_PREFIX + '*', cutoff)).fetchall():
+    params = (ADMISSION_PREFIX + '*', cutoff)
+    sql = f'SELECT key,value FROM state_meta WHERE key GLOB ? AND {_EXPIRED}'
+    if limit is not None:
+        sql += " LIMIT ?"
+        params += (limit,)
+    for key, raw in conn.execute(sql, params).fetchall():
         row = json.loads(raw)
         conn.execute('DELETE FROM state_meta WHERE key IN (?,?,?)', (key, RESULT_PREFIX + row['admission_id'],
                      identity_key(row['principal_id'], row['target_session_id'], row['request_id'])))
-    conn.execute(f'DELETE FROM state_meta WHERE key GLOB ? AND {_EXPIRED}', (WORKER_PREFIX + '*', cutoff))
+    params = (WORKER_PREFIX + '*', cutoff)
+    sql = f'SELECT key FROM state_meta WHERE key GLOB ? AND {_EXPIRED}'
+    if limit is not None:
+        sql += " LIMIT ?"
+        params += (limit,)
+    for (key,) in conn.execute(sql, params).fetchall():
+        conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
     for prefix in (RETIRED_PREFIX, ROUTE_FENCE_PREFIX):
-        _reclaim_expired(conn, prefix, cutoff)
+        _reclaim_expired(conn, prefix, cutoff, limit=limit)

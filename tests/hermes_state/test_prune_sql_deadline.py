@@ -3,6 +3,8 @@ from contextlib import closing
 from datetime import datetime
 import time
 import sqlite3
+import subprocess
+import sys
 import threading
 
 import pytest
@@ -198,3 +200,35 @@ def test_prune_yields_to_foreground_writer_instead_of_waiting_for_it(tmp_path, l
         assert yielded_before_release
         assert (db.get_session("old") is None) == release_foreground
         assert db.get_meta("foreground") == "ok"
+
+
+_DELETE_HOLDER = """
+import sqlite3, sys, time
+conn = sqlite3.connect(sys.argv[1], isolation_level=None)
+conn.execute('BEGIN IMMEDIATE')
+print('held', flush=True)
+time.sleep(float(sys.argv[2]))
+conn.commit()
+conn.close()
+"""
+
+
+@pytest.mark.parametrize("max_seconds", [None, 3])
+def test_delete_mode_prune_waits_for_foreground_writer(tmp_path, monkeypatch, max_seconds):
+    """Rollback-journal reads retain SQLite's normal wait during a prune pass."""
+    home = tmp_path / "hermes-home"
+    home.mkdir()
+    (home / "config.yaml").write_text("database:\n  journal_mode: delete\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    db_path = home / "state.db"
+    with closing(SessionDB(db_path)) as db:
+        assert db._wal_active is False
+        _old_ended(db, "old")
+        holder = subprocess.Popen([sys.executable, "-c", _DELETE_HOLDER, str(db_path), "0.3"],
+                                  stdout=subprocess.PIPE, text=True)
+        try:
+            assert holder.stdout.readline().strip() == "held"
+            assert db.prune_sessions(older_than_days=90, max_seconds=max_seconds) == 1
+        finally:
+            assert holder.wait(timeout=10) == 0
+        assert db.get_session("old") is None

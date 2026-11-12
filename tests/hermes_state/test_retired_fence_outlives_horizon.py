@@ -99,3 +99,24 @@ def test_a_permanent_marker_an_earlier_release_wrote_for_a_swept_api_session_sta
         assert db.get_meta(RETIRED_PREFIX + "user-42") is not None
         with db._read_ctx() as conn:
             assert create_conflict(conn, "user-42") == ("session_deleted", "Session was deleted; its id cannot be reused")
+
+
+def test_expired_tombstone_backlog_drains_in_bounded_prune_passes(tmp_path):
+    """Expired terminal tombstones are reclaimed in bounded units across passes."""
+    import json
+    from hermes_state_terminal import WORKER_PREFIX
+
+    with SessionDB(tmp_path / "state.db") as db:
+        old = time.time() - 8 * 86400
+        db._execute_write(lambda conn: conn.executemany(
+            "INSERT INTO state_meta(key,value) VALUES(?,?)",
+            [(WORKER_PREFIX + str(i), json.dumps({"retired_at": old})) for i in range(250)],
+        ))
+        remaining = []
+        for _ in range(4):
+            db.prune_sessions(older_than_days=90)
+            remaining.append(db._read_one(
+                "SELECT count(*) FROM state_meta WHERE key GLOB ?", (WORKER_PREFIX + "*",)
+            )[0])
+        assert remaining[-1] == 0
+        assert remaining == sorted(remaining, reverse=True)
