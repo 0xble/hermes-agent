@@ -8,6 +8,7 @@ Service is never touched), use uniquely named dummy entries, and delete them in 
 
 from __future__ import annotations
 
+import os
 import uuid
 
 import pytest
@@ -22,6 +23,11 @@ _LOGIN = {"identifier_type": "email", "identifier": "ci@example.com", "password"
 @pytest.fixture
 def os_keychain():
     """The real backend keyring resolves to; skip where the host has none (not a failure)."""
+    # The module contract is "CI lanes only". The local portable gate also exports CI=true, so key on
+    # the hosted runner: on a developer Mac this would touch the user's login keychain and can block a
+    # background gate on a keychain prompt until the per-file timeout.
+    if os.environ.get("GITHUB_ACTIONS") != "true" and os.environ.get("HERMES_REAL_KEYCHAIN_TESTS") != "1":
+        pytest.skip("real OS keychain smoke runs on hosted CI lanes (HERMES_REAL_KEYCHAIN_TESTS=1 runs it locally)")
     try:
         kc.os_keyring()
     except kc.KeychainUnavailable as exc:
