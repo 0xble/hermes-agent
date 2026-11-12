@@ -171,3 +171,18 @@ def test_scrub_cache_generation_changes_when_a_vault_value_is_registered():
         assert secret not in memory_manager._scrub(text)
     finally:
         clear_vault_redaction_values()
+
+
+def test_surrogate_transcript_redaction_matches_legacy_and_syncs_without_raising():
+    from agent.redact import redact_for_egress
+
+    surrogate_text = b"caf\xe9".decode("utf-8", "surrogateescape")
+    content = f"{surrogate_text} and \ud800"
+    expected = redact_for_egress(content)
+
+    assert memory_manager._redact_for_provider(content) == expected
+
+    mgr, provider = _manager()
+    mgr.sync_all(content, content)
+    mgr.flush_pending(timeout=5.0)
+    assert provider.seen == [(expected, expected, None)]

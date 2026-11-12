@@ -125,27 +125,36 @@ def _scrub(text: str) -> str:
     ``security.redact_secrets`` is off (that setting governs local logs, not what leaves the agent)
     and fails closed."""
     global _SCRUB_CACHE_BYTES
-    key = (hermes_home_key(), redaction_generation(), text)
-    with _SCRUB_CACHE_LOCK:
-        cached = _SCRUB_CACHE.get(key)
-        if cached is not None:
-            _SCRUB_CACHE.move_to_end(key)
-            return cached
+
+    try:
+        key = (hermes_home_key(), redaction_generation(), text)
+        with _SCRUB_CACHE_LOCK:
+            cached = _SCRUB_CACHE.get(key)
+            if cached is not None:
+                _SCRUB_CACHE.move_to_end(key)
+                return cached
+    except Exception:  # health: allow BLE001 -- cache is best-effort and must never block provider egress
+        return redact_for_egress(text)
+
     scrubbed = redact_for_egress(text)
-    size = len(text.encode("utf-8")) + len(scrubbed.encode("utf-8"))
-    if size > _SCRUB_CACHE_MAX_BYTES:
-        return scrubbed
-    with _SCRUB_CACHE_LOCK:
-        previous = _SCRUB_CACHE.pop(key, None)
-        if previous is not None:
-            _SCRUB_CACHE_BYTES -= len(text.encode("utf-8")) + len(previous.encode("utf-8"))
-        _SCRUB_CACHE[key] = scrubbed
-        _SCRUB_CACHE_BYTES += size
-        while (len(_SCRUB_CACHE) > _SCRUB_CACHE_MAX_ENTRIES
-               or _SCRUB_CACHE_BYTES > _SCRUB_CACHE_MAX_BYTES):
-            old_key, old_value = _SCRUB_CACHE.popitem(last=False)
-            _SCRUB_CACHE_BYTES -= (len(old_key[2].encode("utf-8"))
-                                   + len(old_value.encode("utf-8")))
+    try:
+        # Character accounting is deliberately independent of text encoding. Transcripts can contain
+        # surrogateescape values and lone surrogates that strict UTF-8 rejects.
+        size = len(text) + len(scrubbed)
+        if size > _SCRUB_CACHE_MAX_BYTES:
+            return scrubbed
+        with _SCRUB_CACHE_LOCK:
+            previous = _SCRUB_CACHE.pop(key, None)
+            if previous is not None:
+                _SCRUB_CACHE_BYTES -= len(text) + len(previous)
+            _SCRUB_CACHE[key] = scrubbed
+            _SCRUB_CACHE_BYTES += size
+            while (len(_SCRUB_CACHE) > _SCRUB_CACHE_MAX_ENTRIES
+                   or _SCRUB_CACHE_BYTES > _SCRUB_CACHE_MAX_BYTES):
+                old_key, old_value = _SCRUB_CACHE.popitem(last=False)
+                _SCRUB_CACHE_BYTES -= len(old_key[2]) + len(old_value)
+    except Exception:  # health: allow BLE001 -- cache is best-effort and must never block provider egress
+        return redact_for_egress(text)
     return scrubbed
 
 
