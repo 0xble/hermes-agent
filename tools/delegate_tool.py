@@ -932,12 +932,16 @@ def oneshot_delegate_function(function: dict) -> dict:
 from tools.registry import registry, tool_error
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
-    """Background flag for the MODEL-facing dispatch path (registry fallback). Top-level delegations always run in the
-    background — the model does not choose — for single tasks and fan-out batches alike (one async unit, one
-    consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
-    within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
-    the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0
+    """Shared model routing: public top-level calls detach; private helpers and orchestrator
+    children join in-turn. Model-supplied background flags never override that policy.
+
+    Resolve privacy from both the parent and session registry: dispatch may arrive without
+    the turn's ContextVars. Direct callers retain their explicit background/refusal contract.
+    """
+    from agent.incognito import is_incognito
+    private = getattr(parent_agent, "incognito", False) is True or is_incognito(
+        getattr(parent_agent, "session_id", None))
+    return not private and not getattr(parent_agent, "_delegate_depth", 0) > 0
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 
