@@ -165,6 +165,7 @@ async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
     events: list = []
     runner, _loop_thread = _make_phase_runner(monkeypatch, events)
     runner._restart_requested = False
+    runner._stop_requested_by_signal = False
     runner._signal_initiated_shutdown = True
     runner._signal_interrupt_grace_timeout = 0.0
 
@@ -186,12 +187,12 @@ async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
     started = time.monotonic()
     operation = asyncio.create_task(runner._stop_interrupt_remaining_work(_make_ctx()))
     # Isolate the initial marker's bound from the ordinary unbounded tool sweep.
-    done, _pending = await asyncio.wait({operation}, timeout=3.0)
+    done, _pending = await asyncio.wait({operation}, timeout=3.5)
     elapsed = time.monotonic() - started
 
     try:
         assert operation in done
-        assert elapsed < 3.0
+        assert 3.0 <= elapsed < 3.5
         assert entered.wait(timeout=0.2)
         assert not finished.is_set()
     finally:

@@ -24,7 +24,8 @@ return. Embedded coroutine callers retain their existing lifecycle.
 The stop task carries `tools.environments.local.process_exit_cleanup` into its
 workers. Local cleanup unlinks its known snapshot/cwd files without scanning
 the shared temp directory for orphan atomic snapshots; ordinary session teardown
-still removes those immediately, and temp-cache housekeeping reclaims leftovers.
+still removes those immediately. The managed default terminal cache is pruned by
+housekeeping, while an explicitly configured `TMPDIR` remains caller-owned.
 Verify `tests/gateway/test_process_exit_after_stop.py`, gateway process-exit,
 bounded-adapter and shutdown-kill tests, plus `tests/tools/test_local_temp_dir.py`.
 

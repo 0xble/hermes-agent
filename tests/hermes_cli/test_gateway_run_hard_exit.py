@@ -44,7 +44,9 @@ def _prepare(monkeypatch):
     return gateway_cli
 
 
-@pytest.mark.parametrize("outcome", [True, False, SystemExit(78), KeyboardInterrupt(), asyncio.CancelledError()])
+@pytest.mark.parametrize(
+    "outcome", [True, False, SystemExit(78), KeyboardInterrupt(), asyncio.CancelledError(), RuntimeError("boom")]
+)
 def test_run_gateway_records_exit_before_hard_exit(monkeypatch, tmp_path, outcome):
     import json
     import gateway.run as gateway_run
@@ -72,10 +74,17 @@ def test_run_gateway_records_exit_before_hard_exit(monkeypatch, tmp_path, outcom
 
     monkeypatch.setattr(gateway_run, "start_gateway", start_gateway)
     monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", hard_exit)
-    with pytest.raises(_HardExitObserved) as excinfo:
-        gateway_cli.run_gateway()
-    expected_code = 78 if isinstance(outcome, SystemExit) else 1 if outcome is False else 0
-    assert excinfo.value.code == expected_code
+    if isinstance(outcome, RuntimeError):
+        with pytest.raises(RuntimeError, match="boom"):
+            gateway_cli.run_gateway()
+        expected_code = None
+        records = [json.loads(line) for line in (tmp_path / "logs" / "gateway-exit-diag.log").read_text().splitlines()]
+        observed.extend(records)
+    else:
+        with pytest.raises(_HardExitObserved) as excinfo:
+            gateway_cli.run_gateway()
+        expected_code = 78 if isinstance(outcome, SystemExit) else 1 if outcome is False or isinstance(outcome, asyncio.CancelledError) else 0
+        assert excinfo.value.code == expected_code
     tags = [record["tag"] for record in observed]
     if isinstance(outcome, SystemExit):
         assert "asyncio.run.SystemExit" in tags

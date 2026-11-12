@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -14,6 +15,52 @@ class _ExitCalled(Exception):
 
 def _raise_exit(code: int) -> None:
     raise _ExitCalled(code)
+
+
+@pytest.mark.parametrize(
+    ("shutdown_requested", "requested_code"),
+    [(False, None), (True, 0), (True, 75)],
+    ids=["stray-cancellation", "sigterm-shutdown", "restart"],
+)
+def test_cancelled_process_exit_uses_recorded_shutdown_request(
+    monkeypatch, shutdown_requested, requested_code
+):
+    from gateway.run_process_exit import current_process_exit_state, run_gateway_process
+
+    observed = []
+
+    async def start_gateway():
+        state = current_process_exit_state()
+        assert state is not None
+        state.update(shutdown_requested=shutdown_requested, exit_code=requested_code)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", observed.append)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_gateway_process(start_gateway))
+
+    assert observed == [requested_code if shutdown_requested else 1]
+
+
+def test_cancelled_process_exit_reads_runner_shutdown_flags(monkeypatch):
+    from gateway.run_bootstrap import _record_process_exit_state
+    from gateway.run_process_exit import run_gateway_process
+
+    async def start_gateway():
+        runner = SimpleNamespace(
+            _restart_requested=True,
+            _signal_initiated_shutdown=False,
+            _shutdown_event=asyncio.Event(),
+            exit_code=75,
+        )
+        _record_process_exit_state(runner)
+        raise asyncio.CancelledError()
+
+    observed = []
+    monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", observed.append)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_gateway_process(start_gateway))
+    assert observed == [75]
 
 
 def test_main_terminates_via_os_exit_not_systemexit(monkeypatch):

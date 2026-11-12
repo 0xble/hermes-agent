@@ -729,6 +729,26 @@ def _start_gateway_early_environment_probe() -> None:
         logger.debug("early environment probe did not start", exc_info=True)
 
 
+def _record_process_exit_state(runner) -> None:
+    from gateway.run_process_exit import current_process_exit_state
+    process_exit_state = current_process_exit_state()
+    if process_exit_state is None:
+        return
+    from gateway.run_shutdown_deadlines import bounded_stop_requested
+    restart_requested = bool(getattr(runner, "_restart_requested", False))
+    signal_shutdown = bool(getattr(runner, "_signal_initiated_shutdown", False))
+    planned_signal_stop = bool(runner is not None and bounded_stop_requested(runner)) and not signal_shutdown
+    shutdown_event = getattr(runner, "_shutdown_event", None)
+    explicit_stop = bool(shutdown_event is not None and shutdown_event.is_set()) and not signal_shutdown
+    process_exit_state.update(
+        shutdown_requested=restart_requested or planned_signal_stop or explicit_stop,
+        exit_code=(getattr(runner, "exit_code", None) if runner is not None else None),
+    )
+    if restart_requested and process_exit_state["exit_code"] is None:
+        from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+        process_exit_state["exit_code"] = GATEWAY_SERVICE_RESTART_EXIT_CODE
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
                         verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
                         client_owned: bool = False) -> bool:
@@ -943,6 +963,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return verdict
 
     finally:
+        _record_process_exit_state(runner)
         try:
             if runner is not None:
                 from gateway.run_runtime import drain_gateway_runtime
