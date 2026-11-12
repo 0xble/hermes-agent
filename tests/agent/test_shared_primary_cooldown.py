@@ -752,6 +752,19 @@ def test_probe_lease_expiry_allows_takeover_and_wall_clock_is_clamped(monkeypatc
     assert second and second != first
 
 
+def test_failed_probe_uses_the_same_backoff_formula_as_rearming():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert spc._settle_probe(_ROUTE, entry["outage_id"], token, success=False)
+    failed = spc.read_cooldown(_ROUTE)
+    assert failed["backoff_count"] == 2
+    assert 119 <= failed["reset_at"] - failed["recorded_at"] <= 121
+
+
 def test_stale_probe_owner_cannot_clear_or_escalate_newer_outage():
     entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
     with spc._locked_state() as (path, state):
@@ -796,6 +809,22 @@ def test_custom_alias_merges_only_when_owner_is_unambiguous(monkeypatch):
     assert merged["backoff_count"] == 3 and merged["notice_claimed"] is True
 
 
+def test_merged_loser_outage_can_still_settle_or_clear(monkeypatch):
+    monkeypatch.setattr(spc, "_custom_provider_for_url", lambda _url: "custom:proxy")
+    route = ("custom", _ROUTE[1], "merge-model")
+    now = time.time()
+    first = {**dict(provider="custom", base_url=_ROUTE[1], model=route[2], reset_at=now + 60,
+                      recorded_at=now, backoff_count=1, outage_id="loser", notice_claimed=False),
+             "reason": "rate_limit"}
+    second = {**first, "provider": "custom:proxy", "reset_at": now + 120,
+              "outage_id": "winner"}
+    path = spc._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "routes": {"old-a": first, "old-b": second}}))
+    assert spc.clear_if_current(route, "loser")
+    assert spc.read_cooldown(route) is None
+
+
 def test_reset_hint_precedence_and_malformed_values():
     from agent.error_classifier import _rate_limit_reset_seconds
     assert _rate_limit_reset_seconds("retry after 7s", {"resets_in_seconds": 30}, None) == 30
@@ -815,6 +844,39 @@ def test_fallback_route_gets_independent_breaker_without_clearing_primary():
     assert spc.read_cooldown(spc.route_from_agent(agent))["outage_id"] == primary["outage_id"]
     fallback = getattr(agent, "_shared_fallback_cooldown_record", None)
     assert fallback and fallback["reason"] == "rate_limit"
+
+
+def test_fallback_success_clears_only_the_live_fallback_breaker():
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)
+    primary_route = spc.route_from_agent(agent)
+    primary = spc.read_cooldown(primary_route)
+    agent._fallback_activated = True
+    agent._provider_fallback_active = True
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) is None
+    fallback_route = spc.live_route_from_agent(agent)
+    fallback = spc.read_cooldown(fallback_route)
+    assert fallback is not None
+    assert spc.complete_primary_recovery(agent)
+    assert spc.read_cooldown(fallback_route) is None
+    assert spc.read_cooldown(primary_route)["outage_id"] == primary["outage_id"]
+    fresh = spc.arm_cooldown(fallback_route, reason="rate_limit")
+    assert fresh["backoff_count"] == 1
+
+
+def test_healthy_fallback_is_not_skipped_after_success(monkeypatch):
+    from agent.chat_completion_helpers import _should_skip_fallback_candidate
+    route = ("custom:healthy", "https://healthy.invalid/v1", "healthy-model")
+    record = spc.arm_cooldown(route, reason="rate_limit")
+    agent = SimpleNamespace(provider=route[0], model=route[2], base_url=route[1],
+                            _fallback_activated=True, _shared_fallback_cooldown_record=record)
+    assert spc.complete_primary_recovery(agent)
+    entry = {"provider": route[0], "model": route[2], "base_url": route[1]}
+    monkeypatch.setattr("agent.chat_completion_helpers._candidate_pool_exhausted", lambda *_args: False)
+    monkeypatch.setattr("agent.chat_completion_helpers._fallback_entry_unavailable_without_network", lambda *_args: None)
+    monkeypatch.setattr("agent.backend_identity.should_skip_candidate", lambda *_args: False)
+    assert not _should_skip_fallback_candidate(agent, entry, (route[0], route[2]), route[0], route[2], set())
 
 
 def test_fresh_adopters_share_one_primary_probe_lease():
@@ -856,8 +918,10 @@ def test_probe_failure_flag_is_scoped_to_its_outage():
         _fallback_activated=False, _rate_limit_backoff_count=0, _fallback_episode_cooled=False,
     )
     assert spc._fail_agent_probe(agent)
+    agent._fallback_episode_cooled = False
     first = _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit)
     assert first is not None
+    assert agent._fallback_episode_cooled is True
     old_outage = agent._shared_primary_cooldown_record["outage_id"]
     spc.clear_if_current(_ROUTE, old_outage)
     agent._shared_primary_cooldown_record = None
@@ -879,11 +943,65 @@ def test_fallback_breaker_does_not_inherit_primary_backoff_count():
 
 def test_fallback_cooldown_lookup_uses_resolved_base_url():
     from agent.shared_primary_probe_runtime import fallback_route_is_active
-    with patch("hermes_cli.runtime_provider.resolve_runtime_provider",
-               return_value={"base_url": "https://resolved.invalid/v1"}) as resolve:
+    with patch("hermes_cli.config.load_config_readonly", return_value={
+        "providers": {"resolved": {"base_url": "https://resolved.invalid/v1"}},
+    }), patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+              side_effect=AssertionError("fallback cooldown lookup must not resolve credentials")):
         spc.arm_cooldown(("custom:resolved", "https://resolved.invalid/v1", "model"), reason="rate_limit")
         assert fallback_route_is_active("custom:resolved", None, "model")
-    resolve.assert_called_once()
+
+
+def test_non_outage_probe_error_releases_without_escalating():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(_shared_primary_cooldown_record=entry, _shared_primary_probe_token=token)
+    assert spc._fail_agent_probe(agent, FailoverReason.context_overflow)
+    released = spc.read_cooldown(_ROUTE)
+    assert released["state"] == "expired"
+    assert released["backoff_count"] == entry["backoff_count"]
+
+
+def test_adoption_claim_race_rechecks_the_surviving_record():
+    from agent import shared_primary_cooldown_runtime as shared_runtime
+    record = {**spc.arm_cooldown(_ROUTE, reason="rate_limit"), "state": "expired", "reset_at": time.time() - 1}
+    agent = SimpleNamespace(_fallback_chain=[{"provider": "openai", "model": "fallback"}],
+                            provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])
+    current = {**record, "outage_id": "new-outage"}
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=None), \
+         patch("agent.chat_completion_helpers.try_activate_fallback", return_value=True) as activate:
+        # The first read is the adoption snapshot, the second is the race re-read.
+        with patch("agent.shared_primary_cooldown.read_cooldown", side_effect=[record, current]):
+            assert shared_runtime._adopt_shared_primary_cooldown(agent)
+    assert activate.call_args.kwargs["_shared_cooldown_record"]["outage_id"] == "new-outage"
+
+
+def test_each_transport_attempt_refreshes_tombstone_timestamp(monkeypatch):
+    from agent.turn_api_call import perform_api_call
+    times = iter((10.0, 20.0))
+    monkeypatch.setattr("agent.turn_api_call.time.time", lambda: next(times))
+    attempts = []
+    agent = SimpleNamespace(
+        _interruptible_streaming_api_call=lambda _kwargs, on_first_delta: attempts.append(agent._current_api_request_started_at) or object(),
+        _interruptible_api_call=None, _get_transport=lambda: None, _is_codex_backend=lambda: False,
+        _has_stream_consumers=lambda: True, api_mode="chat_completions", base_url="https://primary.invalid/v1",
+        provider="custom", model="primary", session_id="s", platform="cli", _model_request_active=None,
+        thinking_callback=None, _pending_redirect_lock=None, _pending_redirect=False,
+        _has_pending_redirect=lambda: False,
+    )
+    with patch("agent.turn_api_call._should_stream", return_value=True), \
+         patch("hermes_cli.middleware.run_llm_execution_middleware",
+               side_effect=lambda _request, next_call, **_kwargs: (next_call(_request), next_call(_request))[1]):
+        perform_api_call(
+            agent, api_kwargs={}, _original_api_kwargs={}, _llm_middleware_trace=[],
+            _moa_prepared_request=None, _retry=SimpleNamespace(), thinking_spinner=None,
+            retry_count=0, api_call_count=1, api_request_id="r", effective_task_id="t",
+            turn_id="turn", interrupted=False,
+        )
+    assert attempts == [10.0, 20.0]
 
 
 def test_local_probe_release_does_not_escalate_backoff():
