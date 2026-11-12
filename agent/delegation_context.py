@@ -23,6 +23,7 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatc
 
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 DELEGATED_PARENT_SESSION_ENV = "HERMES_DELEGATED_PARENT_SESSION_ID"
+KANBAN_HOME_INJECTED_ENV = "HERMES_KANBAN_HOME_INJECTED"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
@@ -173,9 +174,7 @@ def _fenced_kanban_root() -> str:
 
 def is_injected_kanban_home() -> bool:
     """Whether a child home is the lineage fallback injected by ``scrub_kanban_env``."""
-    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-    marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "").strip()
-    return bool(override and marker and os.path.realpath(override) == os.path.realpath(marker))
+    return os.environ.get(KANBAN_HOME_INJECTED_ENV, "").strip() == "1"
 
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
@@ -188,27 +187,31 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     The marker's value is the fenced board ROOT, so the fence applies to the lineage's
     board and not to every Kanban DB the descendant touches: a child running a repro
     against a temp ``HERMES_HOME`` got a silently read-only board there. An inherited
-    path-valued marker is kept (a grandchild that moved HERMES_HOME must not re-fence
-    onto its scratch root and unfence the real one).
+    path-valued marker is kept unless the environment carries an operator-set board
+    override, which is the board the child actually resolves.
     """
     cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
     # Only the gateway mints ``kanban`` sessions: a descendant ``hermes chat`` sending it is refused.
     if cleaned.get("HERMES_SESSION_SOURCE") == "kanban":
         del cleaned["HERMES_SESSION_SOURCE"]
     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
-    if inherited and inherited != "1":
+    operator_home = str(env.get("HERMES_KANBAN_HOME") or "").strip()
+    injected_home = str(env.get(KANBAN_HOME_INJECTED_ENV) or "").strip() == "1"
+    if operator_home and not injected_home:
+        # An operator override is the board this child resolves, so it is also
+        # the board root the lineage fence must cover.
+        fenced_root = operator_home
+    elif inherited and inherited != "1":
         fenced_root = inherited
-    elif str(env.get("HERMES_KANBAN_HOME") or "").strip():
-        # An operator override already present in the parent is explicit.  Derive the
-        # lineage fence from HERMES_HOME without letting that override become its marker,
-        # so kanban_home() can distinguish the injected fallback from the operator value.
-        from hermes_constants import get_default_hermes_root
-        fenced_root = str(get_default_hermes_root(home=env.get("HERMES_HOME")))
     else:
         fenced_root = _fenced_kanban_root()
     cleaned[DELEGATED_CHILD_ENV_MARKER] = fenced_root
     if fenced_root != "1" and (inherited or _DELEGATED_CHILD_CONTEXT.get()):
-        cleaned.setdefault("HERMES_KANBAN_HOME", fenced_root)
+        if operator_home and not injected_home:
+            cleaned.pop(KANBAN_HOME_INJECTED_ENV, None)
+        else:
+            cleaned["HERMES_KANBAN_HOME"] = fenced_root
+            cleaned[KANBAN_HOME_INJECTED_ENV] = "1"
     parent_session_id = delegated_child_parent_session_id()
     if parent_session_id:
         cleaned[DELEGATED_PARENT_SESSION_ENV] = parent_session_id

@@ -111,7 +111,11 @@ def test_container_auto_profile_home_child_keeps_and_resolves_explicit_home(monk
 def test_delegated_child_explicit_kanban_home_overrides_lineage_fallback(
     tmp_path, monkeypatch
 ):
-    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, scrub_kanban_env
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER,
+        KANBAN_HOME_INJECTED_ENV,
+        scrub_kanban_env,
+    )
     from hermes_cli import kanban_db as kb
 
     lineage_root = tmp_path / "lineage"
@@ -127,7 +131,34 @@ def test_delegated_child_explicit_kanban_home_overrides_lineage_fallback(
     monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, child_env[DELEGATED_CHILD_ENV_MARKER])
 
     assert kb.kanban_home() == explicit_root
-    assert child_env[DELEGATED_CHILD_ENV_MARKER] != child_env["HERMES_KANBAN_HOME"]
+    assert child_env[DELEGATED_CHILD_ENV_MARKER] == child_env["HERMES_KANBAN_HOME"]
+    assert KANBAN_HOME_INJECTED_ENV not in child_env
+
+
+def test_delegated_child_marks_injected_kanban_home_fallback(tmp_path, monkeypatch):
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER,
+        KANBAN_HOME_INJECTED_ENV,
+        delegated_child_context,
+        is_injected_kanban_home,
+        scrub_kanban_env,
+    )
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.delenv("HERMES_KANBAN_HOME", raising=False)
+    monkeypatch.delenv(KANBAN_HOME_INJECTED_ENV, raising=False)
+
+    with delegated_child_context():
+        child_env = scrub_kanban_env(dict(os.environ))
+
+    assert child_env[KANBAN_HOME_INJECTED_ENV] == "1"
+    assert child_env[DELEGATED_CHILD_ENV_MARKER] == child_env["HERMES_KANBAN_HOME"]
+    monkeypatch.setenv("HERMES_KANBAN_HOME", child_env["HERMES_KANBAN_HOME"])
+    monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, child_env[DELEGATED_CHILD_ENV_MARKER])
+    monkeypatch.setenv(KANBAN_HOME_INJECTED_ENV, child_env[KANBAN_HOME_INJECTED_ENV])
+    assert is_injected_kanban_home()
 
 
 def test_named_profile_children_keep_their_home(monkeypatch, tmp_path):

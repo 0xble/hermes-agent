@@ -258,6 +258,62 @@ def test_delegate_child_kanban_cli_cannot_delete_parent_board(
     assert kb.board_dir("victim").is_dir()
 
 
+def test_delegate_child_explicit_kanban_home_is_fenced_and_cannot_delete_board(
+    monkeypatch,
+    tmp_path,
+):
+    explicit_root = tmp_path / "board-outside-hermes-root"
+    explicit_root.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(explicit_root))
+    kb, _tid, _workspace, _attachments_root = _make_running_kanban_task(
+        monkeypatch,
+        tmp_path,
+    )
+    kb.create_board("victim")
+    assert kb.kanban_home() == explicit_root
+
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER,
+        KANBAN_HOME_INJECTED_ENV,
+        delegated_child_context,
+        scrub_kanban_env,
+    )
+    from tools.environments.local import LocalEnvironment
+
+    with delegated_child_context():
+        child_env = scrub_kanban_env(dict(os.environ))
+    assert child_env["HERMES_KANBAN_HOME"] == str(explicit_root)
+    assert child_env[DELEGATED_CHILD_ENV_MARKER] == str(explicit_root)
+    assert KANBAN_HOME_INJECTED_ENV not in child_env
+
+    child_env.update({
+        "PYTHONPATH": str(_REPO_ROOT),
+        "HERMES_HOME": str(tmp_path / ".hermes"),
+    })
+    env = LocalEnvironment(cwd=str(tmp_path), timeout=15, env=child_env)
+    try:
+        code = (
+            "from hermes_cli import kanban, kanban_db; "
+            "from agent.delegation_context import kanban_path_is_fenced; "
+            "from pathlib import Path; "
+            "import argparse; "
+            "assert kanban_db.kanban_home().resolve() == Path("
+            f"{str(explicit_root)!r}).resolve(); "
+            f"assert kanban_path_is_fenced(Path({str(explicit_root)!r}) / 'kanban.db'); "
+            "p=argparse.ArgumentParser(); sub=p.add_subparsers(dest='cmd'); "
+            "kanban.build_parser(sub); "
+            "args=p.parse_args(['kanban','boards','rm','victim','--delete']); "
+            "raise SystemExit(kanban.kanban_command(args))"
+        )
+        result = env.execute(_python_with_repo_path(code), timeout=15)
+    finally:
+        env.cleanup()
+
+    assert result["returncode"] == 1
+    assert "delegate_task child contexts cannot mutate Kanban tasks" in result["output"]
+    assert kb.board_exists("victim")
+
+
 def test_delegate_child_attach_url_guard_leaves_no_row_or_file(monkeypatch, tmp_path):
     kb, tid, _workspace, attachments_root = _make_running_kanban_task(monkeypatch, tmp_path)
     from hermes_cli import kanban_db_connect as kbc
