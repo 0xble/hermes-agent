@@ -29,6 +29,11 @@ cover this field or one-shot eligibility, so this is a fork-only adaptation.
 
 ## Verify
 
+- The RED contracts in `tests/cron/test_oneshot_per_job_grace.py` cover the
+  119/120/121-second baseline, 300-second inclusive bound, continuity/outage
+  provenance, missing-slot recovery, provider catch-up, and recurring-policy
+  separation. Scheduling an already-past job stays rejected at 120 seconds.
+
 Run `tests/cron/test_oneshot_per_job_grace.py` and the existing one-shot grace,
 retirement, missed-window, provider and scheduler tests. Run ruff on touched
 Python files and the health check before delivery.
