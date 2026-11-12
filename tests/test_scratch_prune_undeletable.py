@@ -3,7 +3,9 @@
 import json
 import os
 import stat
+import sys
 import time
+from pathlib import Path
 
 import pytest
 
@@ -135,3 +137,95 @@ def test_fixed_expired_or_other_uid_entry_is_judged_again(tmp_path, monkeypatch)
         for path in (locked, other_locked):
             if path.exists():
                 path.chmod(0o700)
+
+
+def test_unreadable_held_subtree_is_tracked_without_aborting_pass(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    entry, ro = _undeletable_entry(root)
+    healthy = root / "healthy"
+    healthy.mkdir(parents=True)
+    (healthy / "x").write_text("x", encoding="utf-8")
+    for path in (healthy / "x", healthy):
+        os.utime(path, (OLD, OLD))
+    log_file = tmp_path / "logs" / "scratch-prune.log"
+    try:
+        assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 2
+        held_root = root.parent / ".scratch-trash"
+        held = next(held_root.glob("*/entries/lane"))
+        (held / "ro").chmod(0)
+        later = time.time() + 8 * 24 * 3600
+        monkeypatch.setattr(scratch.time, "time", lambda: later)
+        assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 0
+        assert held.exists()
+        assert not list(held_root.glob("*/entries/healthy"))
+        state = json.loads((held.parent.parent / ".prune_stuck.json").read_text(encoding="utf-8-sig"))
+        assert "lane" in state
+        lines = [line for line in _lines(log_file, held) if "cannot remove" in line]
+        assert len(lines) == 1
+        walked = _walk_spy(monkeypatch, held_root)
+        assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 0
+        assert not _walked(walked, held)
+        assert len([line for line in _lines(log_file, held) if "cannot remove" in line]) == 1
+    finally:
+        if ro.exists():
+            ro.chmod(0o700)
+        else:
+            held_ro = next((root.parent / ".scratch-trash").glob("*/entries/lane/ro"), None)
+            if held_ro is not None and held_ro.exists():
+                held_ro.chmod(0o700)
+
+
+def test_deep_held_tree_is_removed_without_recursion_error(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    entry = root / "deep"
+    current = entry
+    for _ in range(300):
+        current = current / "n"
+    current.mkdir(parents=True)
+    (current / "leaf").write_text("x", encoding="utf-8")
+    for path in entry.rglob("*"):
+        os.utime(path, (OLD, OLD), follow_symlinks=False)
+    os.utime(entry, (OLD, OLD))
+    log_file = tmp_path / "logs" / "scratch-prune.log"
+    assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 1
+    held = next((root.parent / ".scratch-trash").glob("*/entries/deep"))
+    later = time.time() + 8 * 24 * 3600
+    monkeypatch.setattr(scratch.time, "time", lambda: later)
+    limit = sys.getrecursionlimit()
+    try:
+        sys.setrecursionlimit(200)  # lower than the real tree depth, without exceeding macOS PATH_MAX
+        assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 0
+    finally:
+        sys.setrecursionlimit(limit)
+    assert not held.exists()
+
+
+def test_recursion_error_during_held_removal_does_not_abort_pass(tmp_path, monkeypatch):
+    root = tmp_path / "scratch"
+    deep = root / "deep"
+    sibling = root / "sibling"
+    for entry in (deep, sibling):
+        entry.mkdir(parents=True)
+        (entry / "x").write_text("x", encoding="utf-8")
+        os.utime(entry / "x", (OLD, OLD))
+        os.utime(entry, (OLD, OLD))
+    log_file = tmp_path / "logs" / "scratch-prune.log"
+    assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 2
+    held_root = root.parent / ".scratch-trash"
+    held_deep = next(held_root.glob("*/entries/deep"))
+    held_sibling = next(held_root.glob("*/entries/sibling"))
+    real_walk = scratch._walk_bottom_up_nofollow
+
+    def walk(path, *args, **kwargs):
+        if Path(path).name == "deep":
+            raise RecursionError("depth")
+        return real_walk(path, *args, **kwargs)
+
+    monkeypatch.setattr(scratch, "_walk_bottom_up_nofollow", walk)
+    later = time.time() + 8 * 24 * 3600
+    monkeypatch.setattr(scratch.time, "time", lambda: later)
+    assert scratch.prune_idle_entries(root, 24, frozenset(), log_file) == 0
+    assert held_deep.exists()
+    assert not held_sibling.exists()
+    state = json.loads((held_deep.parent.parent / ".prune_stuck.json").read_text(encoding="utf-8-sig"))
+    assert "deep" in state

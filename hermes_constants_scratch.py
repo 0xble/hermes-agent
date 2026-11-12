@@ -48,7 +48,8 @@ _INPUT_PINS = "input-pins.json"
 # Package fixtures under these trees are not user keep markers.
 _KEEP_SCAN_SKIP = frozenset({"node_modules", ".venv", "venv"})
 # Expired entries are renamed here, never unlinked. Sibling of ``cache/scratch``, so a later
-# scratch walk cannot see its own holding dir. Layout: ``<home>/cache/.scratch-trash/<UTC-date>/``.
+# scratch walk cannot see its own holding dir. Layout: ``<home>/cache/.scratch-trash/<UTC-date>/``;
+# entries live below ``entries`` so no user entry name can collide with the holding manifest.
 _TRASH_DIR_NAME = ".scratch-trash"
 _TRASH_HOLD_SECONDS = 7 * 24 * 3600
 _TRASH_MANIFEST = "manifest.jsonl"
@@ -700,7 +701,10 @@ def hold_expired_entry(entry: Path, scratch_root: Path, size: int, now: float) -
     day_dir = trash / day
     if not _ensure_real_dir(day_dir) or not _lexically_within(day_dir, trash):
         raise OSError(errno.EINVAL, "holding day dir is missing or a symlink")
-    dest = _unique_hold_dest(day_dir / rel)
+    entries_dir = day_dir / "entries"
+    if not _ensure_real_dir(entries_dir):
+        raise OSError(errno.EINVAL, "holding entries dir is missing or a symlink")
+    dest = _unique_hold_dest(entries_dir / rel)
     if not _lexically_within(dest, trash):
         raise OSError(errno.EINVAL, "holding destination escapes the holding dir")
     try:
@@ -736,35 +740,73 @@ def hold_expired_entry(entry: Path, scratch_root: Path, size: int, now: float) -
     return dest
 
 
-def _remove_nofollow(path: Path) -> None:
-    """Delete *path* without following a symlink or junction out of the holding dir."""
-    st = os.lstat(path)
-    if stat.S_ISLNK(st.st_mode) or _is_dir_link(path):
-        os.unlink(path)
-        return
-    if not stat.S_ISDIR(st.st_mode):
-        os.unlink(path)
-        return
-    with os.scandir(path) as it:
-        for child in it:
-            _remove_nofollow(Path(child.path))
-    os.rmdir(path)
+def _walk_bottom_up_nofollow(path: Path, onerror):
+    """An explicit stack also supports deep trees on Python 3.11 (whose os.walk recurses)."""
+    pending = [(path, False)]
+    while pending:
+        current, visited = pending.pop()
+        if visited:
+            yield current
+            continue
+        try:
+            current_st = os.lstat(current)
+            if stat.S_ISLNK(current_st.st_mode) or _is_dir_link(current) or not stat.S_ISDIR(current_st.st_mode):
+                yield current
+                continue
+            with os.scandir(current) as children:
+                child_paths = [Path(child.path) for child in children]
+        except OSError as exc:
+            onerror(exc)
+            continue
+        pending.append((current, True))
+        pending.extend((child, False) for child in child_paths)
 
 
-def _manifest_ages(day_dir: Path) -> dict[str, float]:
-    manifest = day_dir / _TRASH_MANIFEST
+def _remove_nofollow(path: Path) -> list[str]:
+    """Delete *path* iteratively without following links; return directories that blocked removal."""
+    blockers: list[str] = []
+
+    def failed(exc: BaseException, directory: Path) -> None:
+        if isinstance(exc, FileNotFoundError):
+            return
+        blocker = os.fspath(directory)
+        if blocker not in blockers:
+            blockers.append(blocker)
+
+    def remove_one(candidate: Path, parent: Path) -> None:
+        try:
+            st = os.lstat(candidate)
+            if stat.S_ISLNK(st.st_mode) or _is_dir_link(candidate) or not stat.S_ISDIR(st.st_mode):
+                os.unlink(candidate)
+            else:
+                os.rmdir(candidate)
+        except OSError as exc:
+            failed(exc, parent)
+
     try:
-        st = os.lstat(manifest)
-    except OSError:
-        return {}
-    if not stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode):
-        return {}
+        root_st = os.lstat(path)
+    except OSError as exc:
+        failed(exc, path.parent)
+        return blockers
+    if stat.S_ISLNK(root_st.st_mode) or _is_dir_link(path) or not stat.S_ISDIR(root_st.st_mode):
+        remove_one(path, path.parent)
+        return blockers
+
+    def onerror(exc: OSError) -> None:
+        failed(exc, Path(exc.filename) if exc.filename else path)
+
+    try:
+        for current in _walk_bottom_up_nofollow(path, onerror):
+            remove_one(current, current.parent)
+    except (OSError, RecursionError) as exc:
+        failed(exc, path)
+    remove_one(path, path.parent)
+    return blockers
+
+
+def _manifest_ages(text: str) -> dict[str, float]:
     ages: dict[str, float] = {}
-    try:
-        lines = manifest.read_text(encoding="utf-8-sig").splitlines()
-    except OSError:
-        return {}
-    for line in lines:
+    for line in text.splitlines():
         try:
             item = json.loads(line)
         except ValueError:
@@ -778,20 +820,8 @@ def _manifest_ages(day_dir: Path) -> dict[str, float]:
     return ages
 
 
-def _rewrite_manifest(day_dir: Path, kept: list[str]) -> None:
-    manifest = day_dir / _TRASH_MANIFEST
-    if not kept:
-        with contextlib.suppress(OSError):
-            if os.path.isfile(manifest) and not os.path.islink(manifest):
-                os.unlink(manifest)
-        return
-    tmp = day_dir / f".{_TRASH_MANIFEST}.tmp"
-    tmp.write_text("".join(kept), encoding="utf-8")
-    os.replace(tmp, manifest)
-
-
 def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -> int:  # health: allow CC -- explicit no-follow retention purge phases
-    """Delete holding-dir entries whose ``pruned_at`` is older than 7 days. Symlinks are unlinked."""
+    """Delete held entries older than 7 days; append purge records without rewriting the manifest."""
     trash = holding_dir(scratch_root)
     try:
         st = os.lstat(trash)
@@ -825,23 +855,31 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
             continue
         if not stat.S_ISDIR(child_st.st_mode):
             continue
-        ages = _manifest_ages(day_dir)
-        kept_lines: list[str] = []
         manifest = day_dir / _TRASH_MANIFEST
+        manifest_text: str | None = None
         try:
-            raw_lines = manifest.read_text(encoding="utf-8-sig").splitlines(keepends=True) if (
-                manifest.is_file() and not manifest.is_symlink()
-            ) else []
-        except OSError:
-            raw_lines = []
-        held_gone: set[str] = set()
-        try:
-            held_children = list(os.scandir(day_dir))
+            if manifest.is_file() and not manifest.is_symlink():
+                manifest_text = manifest.read_text(encoding="utf-8-sig")
+            else:
+                continue
         except OSError:
             continue
+        ages = _manifest_ages(manifest_text)
+        entries_dir = day_dir / "entries"
+        try:
+            entries_st = os.lstat(entries_dir)
+        except OSError:
+            continue
+        if stat.S_ISLNK(entries_st.st_mode) or not stat.S_ISDIR(entries_st.st_mode) or _is_dir_link(entries_dir):
+            continue
+        try:
+            held_children = list(os.scandir(entries_dir))
+        except OSError:
+            continue
+        skip_names = stuck.load_skips(entries_dir, state_dir=day_dir)
         for held in held_children:
             held_path = Path(held.path)
-            if held_path.name == _TRASH_MANIFEST or not _lexically_within(held_path, trash):
+            if held_path.name in skip_names or not _lexically_within(held_path, trash):
                 continue
             try:
                 held_st = held.stat(follow_symlinks=False)
@@ -851,32 +889,31 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
             age_from = pruned_at if pruned_at is not None else held_st.st_mtime
             if now - age_from <= _TRASH_HOLD_SECONDS:
                 continue
+            blockers = _remove_nofollow(held_path)
             try:
-                _remove_nofollow(held_path)
-            except OSError as exc:
-                audit.info("scratch prune: could not purge %r (%s)", os.fspath(held_path), exc)
+                os.lstat(held_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                blockers.append(os.fspath(held_path))
+            if blockers:
+                if stuck.tracking_supported():
+                    stuck.record(entries_dir, held_path, blockers, audit, state_dir=day_dir)
+                else:
+                    audit.info("scratch prune: could not purge %r (%s)", os.fspath(held_path), blockers[0])
                 continue
             purged += 1
-            held_gone.add(os.path.abspath(held_path))
-        for line in raw_lines:
             try:
-                item = json.loads(line)
-            except ValueError:
-                kept_lines.append(line if line.endswith("\n") else line + "\n")
-                continue
-            held = item.get("held") if isinstance(item, dict) else None
-            if isinstance(held, str) and os.path.abspath(held) in held_gone:
-                continue
-            kept_lines.append(line if line.endswith("\n") else line + "\n")
+                _append_manifest(manifest, {
+                    "held": os.fspath(held_path), "purged": _utc_stamp(now)[1],
+                })
+            except OSError:
+                pass
         try:
-            _rewrite_manifest(day_dir, kept_lines)
-        except OSError:
-            pass
-        try:
-            with os.scandir(day_dir) as day_entries:
+            with os.scandir(entries_dir) as day_entries:
                 empty = next(day_entries, None) is None
             if empty:
-                os.rmdir(day_dir)
+                os.rmdir(entries_dir)
         except OSError:
             pass
     if purged:
