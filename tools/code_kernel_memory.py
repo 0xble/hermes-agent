@@ -102,6 +102,7 @@ class KernelMemoryWatch:
 # (which can deadlock a threaded parent). macOS rlimits do not enforce this reliably.
 # Linux limits are per process; the host watchdog still bounds the whole tree.
 RUNNER_MEMORY_SOURCE = '''\
+_memory_rlimit_bytes = 0
 if sys.platform.startswith("linux"):
     import resource
     _memory_limit = int(sys.argv[1])
@@ -111,6 +112,7 @@ if sys.platform.startswith("linux"):
             _hard = _memory_limit if _hard == resource.RLIM_INFINITY else min(_hard, _memory_limit)
             _soft = _hard if _soft == resource.RLIM_INFINITY else min(_soft, _hard)
             resource.setrlimit(_kind, (_soft, _hard))
+            _memory_rlimit_bytes = min(_memory_rlimit_bytes or _soft, _soft)
         except (OSError, ValueError, OverflowError):
             print("kernel memory rlimit unavailable; host watchdog remains active", file=sys.stderr)
 '''

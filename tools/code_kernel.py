@@ -64,8 +64,16 @@ def run_cell(request, execution_count):
             exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
     except SystemExit as exc:
         status, trace = "exit", "SystemExit: " + repr(exc.code)
-    except BaseException:
+    except BaseException as exc:
         status, trace = "error", traceback.format_exc()
+        # Only local runners install this backstop; remote/unlimited MemoryError
+        # remains an ordinary cell error. A refused allocation need not retire the
+        # kernel: execution has already unwound, though earlier mutations persist.
+        if isinstance(exc, MemoryError) and globals().get("_memory_rlimit_bytes", 0):
+            ceiling_mb = _memory_rlimit_bytes / (1024 ** 2)
+            trace += ("\\nkernel exceeded memory ceiling %g MiB " % ceiling_mb
+                      + "(allocation refused by OS limit); kernel kept alive. "
+                      + "Earlier cell mutations may persist.\\n")
     stdout_text, stdout_clipped = _clip(out.getvalue())
     stderr_text, stderr_clipped = _clip(err.getvalue())
     return {

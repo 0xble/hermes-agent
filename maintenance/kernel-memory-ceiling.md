@@ -13,6 +13,9 @@
   footprint, and the ceiling. Descendants are discovered before the death pipe is
   closed. Linux children also install inherited-limit-preserving `RLIMIT_AS` and
   `RLIMIT_DATA` before user code, without unsafe threaded-parent `preexec_fn`.
+  A cell `MemoryError` with an active rlimit retains its traceback and names the
+  effective ceiling and OS allocation refusal. The kernel stays alive because the
+  failed allocation was refused and the cell has unwound; prior mutations persist.
 - **Source surfaces:** `tools/code_kernel.py`, `tools/code_kernel_memory.py`,
   `hermes_cli/config_defaults.py`, the code-execution user guide, and
   `tests/tools/test_code_kernel_memory.py`.
@@ -27,8 +30,10 @@
   tests/tools/test_code_kernel_lifetime.py tests/tools/test_code_kernel_remote.py
   tests/tools/test_code_kernel_memory.py tests/tui_gateway/test_session_finalize_reaps_kernels.py -q`.
   The new tests cover actual config loading, equality/below/above-budget behavior,
-  retirement logs and recovery, a bounded real 256 MiB process-tree allocation under
-  a 200 MiB ceiling, native macOS footprint sampling, and Linux-only rlimit policy.
+  retirement logs and recovery, bounded real 256 MiB allocations under a 200 MiB
+  ceiling, descendant teardown with the watchdog isolated from Linux rlimits,
+  native macOS footprint sampling, and deterministic active/unavailable rlimit
+  `MemoryError` reporting and state reuse.
 - **Limits/follow-ups:** Sampling is best-effort, not an OS-enforced aggregate
   reservation; bursts within one second can overshoot. Background allocation while
   idle, aggregate pressure across many kernels, remote kernels, standalone fallback,
