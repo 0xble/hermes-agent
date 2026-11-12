@@ -101,9 +101,10 @@ def test_a_permanent_marker_an_earlier_release_wrote_for_a_swept_api_session_sta
             assert create_conflict(conn, "user-42") == ("session_deleted", "Session was deleted; its id cannot be reused")
 
 
-def test_expired_tombstone_backlog_drains_in_bounded_prune_passes(tmp_path):
+def test_expired_tombstone_backlog_drains_in_bounded_prune_passes(tmp_path, monkeypatch):
     """Expired terminal tombstones are reclaimed in bounded units across passes."""
     import json
+    import hermes_state_prune_budget as budgets
     from hermes_state_terminal import WORKER_PREFIX
 
     with SessionDB(tmp_path / "state.db") as db:
@@ -112,6 +113,14 @@ def test_expired_tombstone_backlog_drains_in_bounded_prune_passes(tmp_path):
             "INSERT INTO state_meta(key,value) VALUES(?,?)",
             [(WORKER_PREFIX + str(i), json.dumps({"retired_at": old})) for i in range(250)],
         ))
+        held = []
+        real_check = budgets.check_prune_transaction
+
+        def check(seconds):
+            held.append(seconds)
+            return real_check(seconds)
+
+        monkeypatch.setattr(budgets, "check_prune_transaction", check)
         remaining = []
         for _ in range(4):
             db.prune_sessions(older_than_days=90)
@@ -120,3 +129,4 @@ def test_expired_tombstone_backlog_drains_in_bounded_prune_passes(tmp_path):
             )[0])
         assert remaining[-1] == 0
         assert remaining == sorted(remaining, reverse=True)
+        assert held and max(held) <= budgets.PruneBudget.MIN_UNIT_CEILING_SECONDS
