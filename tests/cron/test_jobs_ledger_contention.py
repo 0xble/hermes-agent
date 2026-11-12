@@ -105,6 +105,19 @@ def test_ledger_and_liveness_reads_are_outside_jobs_lock(store, monkeypatch, ope
     assert depths and all(depth == 0 for depth in depths), depths
 
 
+def test_jobs_lock_timeout_logs_live_holder_pid(store, monkeypatch, caplog):
+    holder_pid = os.getpid() + 1
+    lock_path = jobs._jobs_lock_file()
+    lock_path.write_text(f"{holder_pid}\n", encoding="utf-8")
+    monkeypatch.setattr(jobs.os, "kill", lambda _pid, _signal: None)
+    monkeypatch.setattr(jobs, "_JOBS_LOCK_TIMEOUT_SECONDS", 0)
+    monkeypatch.setattr(jobs, "_acquire_flock", lambda _fd, _timeout: False)
+    with caplog.at_level("ERROR", logger=jobs.logger.name):
+        with jobs._jobs_lock():
+            pass
+    assert f"holder pid={holder_pid}" in caplog.text
+
+
 def test_unrelated_edit_does_not_starve_due_job(store, monkeypatch):
     job, now = store
     sibling = dict(job, id="sibling", name="sibling", next_run_at=(now + timedelta(hours=1)).isoformat())

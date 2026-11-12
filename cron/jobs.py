@@ -304,6 +304,47 @@ def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
     return None
 
 
+def _jobs_lock_holder_hint(lock_path: Path) -> str:
+    """Return a live holder PID stamped in the lock file, when cheaply available."""
+    try:
+        token = lock_path.read_text(encoding="utf-8", errors="replace").split(maxsplit=1)[0]
+        pid = int(token)
+    except (OSError, ValueError, IndexError):
+        return ""
+    if pid <= 0 or pid == os.getpid():
+        return ""
+    if os.name == "posix":
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return ""
+        except OSError:
+            pass  # EPERM still proves that the PID exists.
+    return f"; holder pid={pid}"
+
+
+def _stamp_jobs_lock_holder_pid(lock_fd) -> None:
+    """Best-effort live-holder stamp for timeout diagnostics."""
+    try:
+        lock_fd.seek(0)
+        lock_fd.truncate(0)
+        lock_fd.write(f"{os.getpid()}\n")
+        lock_fd.flush()
+    except OSError:
+        pass
+
+
+def _clear_jobs_lock_holder_pid(lock_fd) -> None:
+    try:
+        lock_fd.seek(0)
+        lock_fd.truncate(0)
+        if msvcrt is not None:
+            lock_fd.write(" ")
+        lock_fd.flush()
+    except OSError:
+        pass
+
+
 def _release_flock(lock_fd) -> None:
     """Unlock (best effort) and close a lock file opened for ``_acquire_flock``."""
     try:
@@ -347,16 +388,20 @@ def _jobs_lock():
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
-                        "it. Proceeding with in-process locking only "
+                        "it%s. Proceeding with in-process locking only "
                         "so the scheduler stays alive (#60703).",
-                        _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file())
+                        _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file(),
+                        _jobs_lock_holder_hint(_jobs_lock_file()))
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
+                elif acquired is True:
+                    _stamp_jobs_lock_holder_pid(lock_fd)
             except OSError as e:
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
@@ -365,6 +410,7 @@ def _jobs_lock():
                 yield
             finally:
                 if lock_fd is not None:
+                    _clear_jobs_lock_holder_pid(lock_fd)
                     _release_flock(lock_fd)
         finally:
             _jobs_lock_state.depth = 0
