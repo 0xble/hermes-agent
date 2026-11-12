@@ -839,3 +839,80 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
+
+
+class TestSlackPlatformEventReaction:
+    @pytest.mark.asyncio
+    async def test_dm_and_channel_sources_and_bot_reactor(self):
+        adapter = _make_adapter()
+        seen = []
+
+        async def handler(event, source):
+            seen.append((event, source))
+
+        adapter.set_platform_event_handler(handler)
+        adapter._resolve_user_is_bot = AsyncMock(return_value=True)
+        with patch("hermes_cli.lifecycle.has_hook", return_value=True):
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U1",
+                "reaction": "thumbsup",
+                "channel_type": "im",
+                "item": {"type": "message", "channel": "D9", "ts": "1000.0", "thread_ts": "900.0"},
+                "item_user": "U_BOT",
+                "event_ts": "3000.0",
+            })
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U2",
+                "reaction": "eyes",
+                "item": {"type": "message", "channel": "C1", "ts": "2000.0", "thread_ts": "1500.0"},
+                "item_user": "U_OTHER",
+                "event_ts": "3001.0",
+            })
+
+        assert adapter._resolve_user_is_bot.await_count == 2
+        dm_event, dm_source = seen[0]
+        channel_event, channel_source = seen[1]
+        assert dm_event["payload"]["user_id"] == "U1"
+        assert dm_event["payload"]["is_bot"] is True
+        assert dm_event["payload"]["action"] == "added"
+        assert dm_event["payload"]["thread_id"] == "900.0"
+        assert dm_source.chat_type == "dm"
+        assert channel_source.chat_type == "group"
+        assert channel_event["payload"]["thread_id"] == "1500.0"
+        assert channel_event["payload"]["chat_id"] == "C1"
+
+    @pytest.mark.asyncio
+    async def test_skips_users_info_and_source_when_no_hook(self):
+        adapter = _make_adapter()
+        adapter.set_platform_event_handler(AsyncMock())
+        adapter._resolve_user_is_bot = AsyncMock(return_value=True)
+        adapter.build_source = MagicMock()
+        with patch("hermes_cli.lifecycle.has_hook", return_value=False):
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U1",
+                "reaction": "thumbsup",
+                "item": {"type": "message", "channel": "C1", "ts": "1000.0"},
+                "event_ts": "3000.0",
+            })
+        adapter._resolve_user_is_bot.assert_not_awaited()
+        adapter.build_source.assert_not_called()
+        adapter._platform_event_handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_reaction_is_dropped(self):
+        adapter = _make_adapter()
+        adapter.set_platform_event_handler(AsyncMock())
+        adapter._resolve_user_is_bot = AsyncMock()
+        with patch("hermes_cli.lifecycle.has_hook", return_value=True):
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U_BOT",
+                "reaction": "eyes",
+                "item": {"type": "message", "channel": "C1", "ts": "1000.0"},
+                "event_ts": "3000.0",
+            })
+        adapter._platform_event_handler.assert_not_awaited()
+        adapter._resolve_user_is_bot.assert_not_awaited()

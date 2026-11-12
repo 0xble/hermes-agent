@@ -3788,13 +3788,24 @@ class SlackAdapter(SlackThreadStatusMixin, SlackThreadTitlesMixin, BasePlatformA
                 logger.debug("[Slack] reaction hook forwarding failed", exc_info=True)
         # Publish the stable platform-event contract through the gateway-owned,
         # profile-bound handler. This remains independent of reaction_triggers: the
-        # latter controls agent routing, not observation hooks.
+        # latter controls agent routing, not observation hooks. Skip users.info and
+        # source construction when nothing is listening, matching Telegram.
         platform_event_handler = getattr(self, "_platform_event_handler", None)
-        if platform_event_handler is not None:
+        from hermes_cli.lifecycle import has_hook
+        if platform_event_handler is not None and has_hook("gateway_platform_event"):
             try:
                 reactor_is_bot = await self._resolve_user_is_bot(user_id, channel_id, team_id) if client else False
+                channel_type = str(event.get("channel_type") or "")
+                if not channel_type and str(channel_id).startswith("D"):
+                    channel_type = "im"
+                # Same dm/group split as the message path. Public channels are groups here;
+                # D-prefix and im/mpim are DMs so allow_from and DM policy apply.
+                chat_type = "dm" if channel_type in {"im", "mpim"} or str(channel_id).startswith("D") else "group"
+                thread_ts = str(item.get("thread_ts") or event.get("thread_ts") or "")
+                thread_id = thread_ts or (str(msg_ts) if chat_type == "dm" else None)
                 source = self.build_source(
-                    chat_id=str(channel_id), chat_type="channel", user_id=str(user_id),
+                    chat_id=str(channel_id), chat_type=chat_type, user_id=str(user_id),
+                    thread_id=thread_id or None,
                     scope_id=str(team_id) if team_id else None, message_id=str(msg_ts),
                     is_bot=bool(reactor_is_bot),
                 )
@@ -3806,7 +3817,7 @@ class SlackAdapter(SlackThreadStatusMixin, SlackThreadTitlesMixin, BasePlatformA
                         "item_user_id": str(event.get("item_user"))[:128]
                         if event.get("item_user") else None,
                         "chat_id": str(channel_id)[:128], "message_id": str(msg_ts)[:128],
-                        "thread_id": None, "team_id": str(team_id)[:128] if team_id else None,
+                        "thread_id": thread_id or None, "team_id": str(team_id)[:128] if team_id else None,
                         "event_ts": str(event.get("event_ts"))[:128]
                         if event.get("event_ts") else None,
                     },

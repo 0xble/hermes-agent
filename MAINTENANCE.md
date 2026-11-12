@@ -639,14 +639,14 @@ so unreviewed remembered resolutions cannot silently resolve a new release confl
 
 ## Active patch record: reaction outbound identity
 
-Fork-Patch: evidence.
+Fork-Patch: reaction-outbound-identity.
 
-- **Patch identity:** `evidence`.
+- **Patch identity:** `reaction-outbound-identity`.
 - **Load when:** changing outbound `platform_message_id` stamping, Slack reaction forwarding, or the gateway facade line-cap offsets that keep this patch under the code-health ratchet.
-- **Behavior:** A successful Telegram or Slack send stamps `platform_message_id` on the assistant row named by the delivery `message_uid` (newest content match only when a legacy caller has no row identity). Slack reactions enter the authorized platform-event seam with actor identity; the lifecycle reaction hook does not also dispatch the multiplex bus. `connect_adapter_with_timeout` and the adapter auth-check builder live in `gateway/run_adapters_connect.py` and `gateway/run_adapters_auth.py`; conversation-generation bumps live in `hermes_state_generation.py`. The facade methods remain the call sites.
-- **Source surfaces:** `gateway/run_adapters.py`, `gateway/run_adapters_connect.py`, `gateway/run_adapters_auth.py`, `hermes_state_messages.py`, `hermes_state_generation.py`.
-- **Focused regression:** `scripts/run_tests.sh tests/hermes_state/test_outbound_platform_message.py tests/gateway/test_multiplex_interactive_auth.py tests/gateway/test_restart_drain_recovery_dedup.py`.
-- **Rollback:** Revert the commits carrying `Fork-Patch: evidence`.
+- **Behavior:** A successful final reply stamps `platform_message_id` on the active assistant row named by that turn's `message_uid`. The stamp is adapter-generic and runs after ledger finalization, without awaiting the write inside the send bracket. Split sends store the last chunk id, the completed message a reaction targets. Copy blocks and other auxiliary sends do not overwrite it. Missing row identity does not content-match. Slack reactions enter the authorized platform-event seam with actor identity, DM/group chat type, and the item thread when the event already carries it; `users.info` and source construction are skipped when no `gateway_platform_event` hook is registered. `connect_adapter_with_timeout` and the adapter auth-check builder live in `gateway/run_adapters_connect.py` and `gateway/run_adapters_auth.py`; conversation-generation bumps live in `hermes_state_generation.py`. The facade methods remain the call sites.
+- **Source surfaces:** `gateway/platforms/base.py`, `gateway/run_turn.py`, `gateway/run_adapters.py`, `gateway/run_adapters_connect.py`, `gateway/run_adapters_auth.py`, `hermes_state_messages.py`, `hermes_state_generation.py`, `plugins/platforms/slack/adapter.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_state/test_outbound_platform_message.py tests/gateway/test_reaction_outbound_identity.py tests/gateway/test_delivery_ledger.py tests/gateway/test_slack_approval_buttons.py tests/gateway/test_multiplex_interactive_auth.py tests/gateway/test_restart_drain_recovery_dedup.py`.
+- **Rollback:** Revert the commits carrying `Fork-Patch: reaction-outbound-identity`.
 
 ## Eager plugin tools
 

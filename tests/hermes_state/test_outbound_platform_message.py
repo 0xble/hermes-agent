@@ -30,23 +30,39 @@ def test_message_uid_selects_the_exact_duplicate_reply(tmp_path):
     ]
 
 
-def test_legacy_content_match_is_newest_and_does_not_overwrite(tmp_path):
+def test_missing_message_uid_does_not_content_match(tmp_path):
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
         db.create_session("session", "telegram")
-        db.append_messages_batch("session", [
-            {"role": "assistant", "content": "same answer"},
-            {"role": "assistant", "content": "same answer"},
-        ])
+        db.append_messages_batch("session", [{"role": "assistant", "content": "same answer"}])
+        assert db.record_outbound_platform_message("session", "telegram-1", "same answer") is False
+    finally:
+        db.close()
 
-        assert db.record_outbound_platform_message("session", "telegram-latest", "same answer") is True
-        assert db.record_outbound_platform_message("session", "telegram-older", "same answer") is True
 
+def test_message_uid_ignores_inactive_compaction_copy(tmp_path):
+    db = SessionDB(db_path=tmp_path / "state.db")
+    try:
+        db.create_session("session", "telegram")
+        row = {"role": "assistant", "content": "same answer"}
+        db.append_messages_batch("session", [row])
+        uid = row["message_uid"]
+        db._conn.execute(  # type: ignore[union-attr]
+            "UPDATE messages SET active = 0 WHERE session_id = ? AND message_uid = ?",
+            ("session", uid),
+        )
+        db._conn.commit()  # type: ignore[union-attr]
+        active = {"role": "assistant", "content": "same answer", "message_uid": uid}
+        db.append_messages_batch("session", [active])
+
+        assert db.record_outbound_platform_message(
+            "session", "telegram-active", "different delivered text", message_uid=uid,
+        ) is True
         rows = db._conn.execute(  # type: ignore[union-attr]
-            "SELECT platform_message_id FROM messages WHERE session_id = ? ORDER BY id",
+            "SELECT active, platform_message_id FROM messages WHERE session_id = ? ORDER BY id",
             ("session",),
         ).fetchall()
     finally:
         db.close()
 
-    assert [row[0] for row in rows] == ["telegram-older", "telegram-latest"]
+    assert [tuple(row) for row in rows] == [(0, None), (1, "telegram-active")]

@@ -2884,10 +2884,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                     if not _proxy_user_row_persisted:
                         await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                     if response:
-                        await store.append_to_transcript(
-                            sid, {"role": "assistant", "content": response, "timestamp": ts},
-                            skip_db=agent_persisted,
-                        )
+                        assistant_row = {"role": "assistant", "content": response, "timestamp": ts}
+                        from agent.message_metadata import stamp_message_uid
+                        event._transcript_message_uid = stamp_message_uid(assistant_row)
+                        await store.append_to_transcript(sid, assistant_row, skip_db=agent_persisted)
                 else:
                     # Attach the inbound platform message_id to the first user entry so platform-level
                     # quote-resolution (e.g. Yuanbao) can find earlier @bot messages by original id.
@@ -3031,6 +3031,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 from gateway.stream_recovery import unmark_recovered_reply
                 event._streamed_final_response = unmark_recovered_reply(
                     str(agent_result.get("final_response") or ""), agent_result)
+            # The streamed body was already delivered; bind its actual visible message id to
+            # this turn's exact assistant row. For split streams this is the last chunk id.
+            delivered_id = agent_result.get("_delivered_platform_message_id")
+            reply_uid = getattr(event, "_transcript_message_uid", None)
+            if delivered_id and str(delivered_id) != "__no_edit__" and reply_uid:
+                from gateway.platforms.base import _schedule_outbound_platform_stamp
+                _schedule_outbound_platform_stamp(
+                    getattr(self, "session_store", None), session_key,
+                    str(delivered_id), str(reply_uid))
             return None
 
         if agent_result.get("interrupted") and response:
@@ -5538,6 +5547,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 "possible duplicate send (see wecom ack-timeout RCA).",
                 _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
             )
+        if isinstance(response, dict) and response.get("already_sent") and _sc is not None:
+            delivered_id = getattr(_sc, "message_id", None)
+            if delivered_id and str(delivered_id) != "__no_edit__":
+                # Last chunk of a split stream: the surviving message a reaction targets.
+                response["_delivered_platform_message_id"] = str(delivered_id)
 
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Register turn-local deletion, awaited after confirmed final delivery."""

@@ -1864,24 +1864,18 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
     ) -> bool:
         """Attach a successful transport send to its exact assistant transcript row.
 
-        ``message_uid`` is the normal path: delivery metadata carries the logical row
-        identity minted by transcript persistence, so identical replies cannot be
-        attached to the wrong turn. The content fallback exists only for legacy callers
-        that have no row identity; it deliberately remains newest-match scoped.
+        ``message_uid`` selects the active assistant row for that turn. Compaction keeps inactive
+        copies of the same uid; only ``active = 1`` is the row a later reaction must find. Callers
+        without a row identity do not stamp: matching delivered text can attach an older turn.
         """
+        if not message_uid:
+            return False
         def _write(conn):
-            if message_uid:
-                row = conn.execute(
-                    "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' "
-                    "AND message_uid = ? AND platform_message_id IS NULL LIMIT 1",
-                    (session_id, str(message_uid)),
-                ).fetchone()
-            else:
-                row = conn.execute(
-                    "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' "
-                    "AND content = ? AND platform_message_id IS NULL ORDER BY id DESC LIMIT 1",
-                    (session_id, content),
-                ).fetchone()
+            row = conn.execute(
+                "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' AND active = 1 "
+                "AND message_uid = ? AND platform_message_id IS NULL ORDER BY id DESC LIMIT 1",
+                (session_id, str(message_uid)),
+            ).fetchone()
             if row is None:
                 return False
             return bool(conn.execute(

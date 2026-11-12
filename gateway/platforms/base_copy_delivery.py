@@ -23,7 +23,7 @@ async def _send_copy_blocks(
                 "[%s] Copy block %d/%d inter-message start gap: %.3fs",
                 self.name, index, len(copy_blocks), send_started - previous_send_started)
         previous_send_started = send_started
-        copy_metadata = dict(metadata)
+        copy_metadata = {k: v for k, v in dict(metadata).items() if k != "_transcript_message_uid"}
         copy_metadata["copy_block"] = True
         copy_metadata["copy_block_index"] = index
         copy_metadata["plain"] = True

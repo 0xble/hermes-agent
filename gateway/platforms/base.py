@@ -159,9 +159,51 @@ def _thread_metadata_for_source(source, reply_to_message_id: str | None = None) 
 
 
 def _thread_metadata_for_event(event) -> dict | None:
-    """``_thread_metadata_for_source`` for an event, anchored on its reply id."""
+    """``_thread_metadata_for_source`` for an event, anchored on its reply id.
+
+    The transcript UID is added only after persistence chooses the exact assistant row;
+    callers that construct metadata before the handler refresh it before delivery.
+    """
     from gateway.checkin_delivery import delivery_metadata
-    return delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
+    metadata = delivery_metadata(event, _thread_metadata_for_source(event.source, _reply_anchor_for_event(event)))
+    uid = getattr(event, "_transcript_message_uid", None)
+    if uid:
+        metadata = {**(metadata or {}), "_transcript_message_uid": str(uid)}
+    return metadata
+
+
+def _schedule_outbound_platform_stamp(store, session_key: str, platform_message_id: str, message_uid: str | None) -> None:
+    """Stamp a delivered platform id after ledger settlement, without awaiting the DB write.
+
+    The exact assistant row is selected by ``message_uid``. For split sends ``message_id`` is the
+    last chunk, the completed reply users react to; auxiliary sends pass no transcript uid.
+    The stamp is independent of the delivering task: cancelling that task must not cancel the write.
+    """
+    record = getattr(store, "record_outbound_platform_message", None)
+    if not callable(record) or not session_key or not platform_message_id or not message_uid:
+        return
+
+    async def _run() -> None:
+        try:
+            await asyncio.to_thread(record, session_key, str(platform_message_id), "", str(message_uid))
+        except Exception:
+            logger.debug("outbound platform message id persistence failed", exc_info=True)
+
+    try:
+        loop = asyncio.get_running_loop()
+        task = loop.create_task(_run(), name="outbound-platform-stamp")
+    except RuntimeError:
+        return
+    tasks = getattr(store, "_outbound_stamp_tasks", None)
+    if not isinstance(tasks, set):
+        tasks = set()
+        try:
+            store._outbound_stamp_tasks = tasks
+        except (AttributeError, TypeError):
+            tasks = None
+    if tasks is not None:
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
 
 
 def _mark_notify_metadata(metadata: dict | None) -> dict:
@@ -5022,6 +5064,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         # transport produces no result and stays attempting.
         settlement = _PENDING_LEDGER_SETTLEMENT.set(
             (obligation_id, event, delivery_adapter) if obligation_id is not None else None)
+        outbound_stamp = None
         try:
             from gateway.reply_latency import delivery_scope, record_final_reply
             receipt = getattr(event, "_terminal_reply_latency_receipt",
@@ -5030,17 +5073,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 result = await delivery_adapter._send_with_retry(
                     chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
             record_final_reply(receipt, text_content, result)
-            if result.success and result.message_id:
-                store = getattr(self, "_session_store", None)
-                record = getattr(store, "record_outbound_platform_message", None)
-                if callable(record):
-                    try:
-                        await asyncio.to_thread(
-                            record, session_key, str(result.message_id), text_content,
-                            (metadata or {}).get("_transcript_message_uid"),
-                        )
-                    except Exception:
-                        logger.debug("outbound platform message id persistence failed", exc_info=True)
+            reply_uid = None if (metadata or {}).get("copy_block") else (metadata or {}).get("_transcript_message_uid")
+            if result.success and result.message_id and reply_uid:
+                outbound_stamp = (session_key, str(result.message_id), str(reply_uid))
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
         # Let records_delivery count the captured result before cancellation propagates,
@@ -5060,6 +5095,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             await on_refused(result, delivery_adapter)
         if obligation_id is not None:
             await self._finalize_delivery_obligation(obligation_id, result, event, delivery_adapter)
+        if outbound_stamp is not None:
+            _schedule_outbound_platform_stamp(getattr(self, "_session_store", None), *outbound_stamp)
         return result, delivery_adapter
 
     async def _release_turn_marker(self, event: MessageEvent) -> None:
@@ -5430,6 +5467,9 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._handle_compression_retries(event, session_key, interrupt_event)
+            # Transcript persistence selects the exact assistant row during the handler;
+            # refresh metadata before any final delivery is started.
+            _thread_metadata = _thread_metadata_for_event(event)
             if self._pending_messages.get(session_key) is event and getattr(event, "_drain_deferred", False):
                 return  # Shutdown owns the retained input, not a completed delivery.
             bind_event_turn(event)

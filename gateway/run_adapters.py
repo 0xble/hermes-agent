@@ -238,10 +238,6 @@ class GatewayAdapterLifecycleMixin:
         event_name = str(ctx.get("event_name") or "reaction:added")
         with _log_suppressed(logging.DEBUG, "[Gateway] reaction hook emit failed", exc_info=True):
             await self.hooks.emit(event_name, ctx)
-        # Slack adapters call the authorized platform-event handler directly; the
-        # handler's profile-bound authorization seam is the only plugin dispatch path.
-        # Do not invoke the lifecycle bus here: it bypasses source authorization and
-        # can leak an event across multiplexed profiles.
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup (retryable → background reconnect queue). Runs
