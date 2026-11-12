@@ -5030,6 +5030,17 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 result = await delivery_adapter._send_with_retry(
                     chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
             record_final_reply(receipt, text_content, result)
+            if result.success and result.message_id:
+                store = getattr(self, "_session_store", None)
+                record = getattr(store, "record_outbound_platform_message", None)
+                if callable(record):
+                    try:
+                        await asyncio.to_thread(
+                            record, session_key, str(result.message_id), text_content,
+                            (metadata or {}).get("_transcript_message_uid"),
+                        )
+                    except Exception:
+                        logger.debug("outbound platform message id persistence failed", exc_info=True)
         finally:
             _PENDING_LEDGER_SETTLEMENT.reset(settlement)
         # Let records_delivery count the captured result before cancellation propagates,

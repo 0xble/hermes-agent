@@ -2869,6 +2869,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 # counts session_meta entries stripped before the agent saw them.
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
+                # Preserve the logical row identity selected by the agent. Delivery uses
+                # this UID after the transport returns its platform id; matching reply text
+                # is not safe when two turns say the same thing.
+                for _msg in reversed(new_messages):
+                    if _msg.get("role") == "assistant" and _msg.get("message_uid"):
+                        event._transcript_message_uid = str(_msg["message_uid"])
+                        break
                 if not new_messages:
                     # Edge case: fall back to simple user/assistant rows. The recovered-reply
                     # marker labels delivery only; the transcript keeps the model's answer.

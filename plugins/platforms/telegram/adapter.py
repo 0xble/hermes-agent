@@ -3749,6 +3749,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
             return None
         emojis: list[str] = []
         custom_emoji_ids: list[str] = []
+        actor = getattr(mr, "user", None)
+        actor_chat = getattr(mr, "actor_chat", None)
+        actor = actor if getattr(actor, "id", None) is not None else actor_chat
+        actor_id = getattr(actor, "id", None) if actor is not None else None
+        actor_is_bot = bool(getattr(actor, "is_bot", False) is True) if actor is not None else False
         for r in new_reaction[:64]:
             emoji = getattr(r, "emoji", None)
             if isinstance(emoji, str) and emoji:
@@ -3761,7 +3766,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramRe
             "event_type": "reaction",
             "payload": {
                 "emojis": emojis, "custom_emoji_ids": custom_emoji_ids, "chat_id": str(chat_id)[:128],
-                "message_id": str(message_id)[:128], "thread_id": None},
+                "message_id": str(message_id)[:128], "thread_id": None,
+                "user_id": str(actor_id)[:128] if self._is_id_like(actor_id) else None,
+                "is_bot": actor_is_bot,
+            },
         }
 
     def _normalize_message_edited_event(self, update) -> Optional[dict[str, Any]]:

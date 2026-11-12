@@ -249,10 +249,14 @@ class GatewayAdapterLifecycleMixin:
             adapter._platform_lock_takeover_allowed = False
 
     async def _handle_reaction_event(self, ctx: dict[str, Any]) -> None:
-        """Fan a normalised reaction event out to the HookRegistry; errors never block the adapter."""
+        """Fan a normalized reaction event to plugin and built-in hook registries."""
         event_name = str(ctx.get("event_name") or "reaction:added")
         with _log_suppressed(logging.DEBUG, "[Gateway] reaction hook emit failed", exc_info=True):
             await self.hooks.emit(event_name, ctx)
+        # Slack adapters call the authorized platform-event handler directly; the
+        # handler's profile-bound authorization seam is the only plugin dispatch path.
+        # Do not invoke the lifecycle bus here: it bypasses source authorization and
+        # can leak an event across multiplexed profiles.
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup (retryable → background reconnect queue). Runs

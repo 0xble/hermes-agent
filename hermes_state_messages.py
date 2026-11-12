@@ -1874,6 +1874,38 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
             "THEN json_extract(display_metadata, '$.gateway_input_owner') END = ? LIMIT 1",
             (session_id, owner)) is not None
 
+    def record_outbound_platform_message(
+        self, session_id: str, platform_message_id: str, content: str,
+        message_uid: str | None = None,
+    ) -> bool:
+        """Attach a successful transport send to its exact assistant transcript row.
+
+        ``message_uid`` is the normal path: delivery metadata carries the logical row
+        identity minted by transcript persistence, so identical replies cannot be
+        attached to the wrong turn. The content fallback exists only for legacy callers
+        that have no row identity; it deliberately remains newest-match scoped.
+        """
+        def _write(conn):
+            if message_uid:
+                row = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' "
+                    "AND message_uid = ? AND platform_message_id IS NULL LIMIT 1",
+                    (session_id, str(message_uid)),
+                ).fetchone()
+            else:
+                row = conn.execute(
+                    "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' "
+                    "AND content = ? AND platform_message_id IS NULL ORDER BY id DESC LIMIT 1",
+                    (session_id, content),
+                ).fetchone()
+            if row is None:
+                return False
+            return bool(conn.execute(
+                "UPDATE messages SET platform_message_id = ? WHERE id = ?",
+                (str(platform_message_id), row[0]),
+            ).rowcount)
+        return self._execute_write(_write, session_id=session_id)
+
     def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
         """True when *platform_message_id* exists (partial-index probe; the gateway's transient-failure dedupe).
 

@@ -515,6 +515,20 @@ class SessionTranscriptMixin:
             self._dirty_transcripts.pop(session_id, None)
             self._transcript_append_failures.pop(session_id, None)
 
+    def record_outbound_platform_message(
+        self, session_key: str, platform_message_id: str, content: str,
+        message_uid: str | None = None,
+    ) -> bool:
+        """Record one delivered assistant reply in its owning profile database."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            session_id = getattr(entry, "session_id", None)
+        if not session_id:
+            return False
+        db = self._db_for_session_id(session_id)
+        return bool(db and db.record_outbound_platform_message(
+            session_id, platform_message_id, content, message_uid=message_uid))
+
     def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
         """Whether a message with this platform_message_id is persisted (False without a DB).
 

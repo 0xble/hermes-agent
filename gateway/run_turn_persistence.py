@@ -537,7 +537,11 @@ class GatewayTurnPersistenceMixin:
     def _event_thread_metadata(self, event, source):
         """Thread metadata for a send that replies to ``event`` on ``source``."""
         from gateway.checkin_delivery import delivery_metadata
-        return delivery_metadata(event, self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)))
+        metadata = delivery_metadata(event, self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)))
+        uid = getattr(event, "_transcript_message_uid", None)
+        if uid:
+            metadata = {**(metadata or {}), "_transcript_message_uid": str(uid)}
+        return metadata
 
     async def _deliver_turn_response_then_limit_offer(
         self, event, source, session_entry, session_key, run_generation,
