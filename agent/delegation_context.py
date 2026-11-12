@@ -173,8 +173,19 @@ def _fenced_kanban_root() -> str:
 
 
 def is_injected_kanban_home() -> bool:
-    """Whether a child home is the lineage fallback injected by ``scrub_kanban_env``."""
-    return os.environ.get(KANBAN_HOME_INJECTED_ENV, "").strip() == "1"
+    """Whether the current Kanban home still equals the injected lineage fallback."""
+    return _kanban_home_matches_injected(os.environ)
+
+
+def _kanban_home_matches_injected(env: Mapping[str, str]) -> bool:
+    override = str(env.get("HERMES_KANBAN_HOME") or "").strip()
+    injected = str(env.get(KANBAN_HOME_INJECTED_ENV) or "").strip()
+    if not override or not injected or injected == "1":
+        return False
+    try:
+        return os.path.realpath(override) == os.path.realpath(injected)
+    except OSError:
+        return override == injected
 
 
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
@@ -196,13 +207,11 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
         del cleaned["HERMES_SESSION_SOURCE"]
     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
     operator_home = str(env.get("HERMES_KANBAN_HOME") or "").strip()
-    injected_home = str(env.get(KANBAN_HOME_INJECTED_ENV) or "").strip() == "1"
-    if operator_home and not injected_home:
-        # An operator override is the board this child resolves, so it is also
-        # the board root the lineage fence must cover.
-        fenced_root = operator_home
-    elif inherited and inherited != "1":
+    injected_home = _kanban_home_matches_injected(env)
+    if inherited and inherited != "1":
         fenced_root = inherited
+    elif operator_home:
+        fenced_root = operator_home
     else:
         fenced_root = _fenced_kanban_root()
     cleaned[DELEGATED_CHILD_ENV_MARKER] = fenced_root
@@ -211,7 +220,7 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
             cleaned.pop(KANBAN_HOME_INJECTED_ENV, None)
         else:
             cleaned["HERMES_KANBAN_HOME"] = fenced_root
-            cleaned[KANBAN_HOME_INJECTED_ENV] = "1"
+            cleaned[KANBAN_HOME_INJECTED_ENV] = fenced_root
     parent_session_id = delegated_child_parent_session_id()
     if parent_session_id:
         cleaned[DELEGATED_PARENT_SESSION_ENV] = parent_session_id
@@ -254,11 +263,17 @@ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
     pinned = os.environ.get("HERMES_KANBAN_DB", "").strip()
     if pinned and target == Path(pinned).expanduser().resolve():
         return True
-    try:
-        target.relative_to(Path(marker).expanduser().resolve())
-    except ValueError:
-        return False
-    return True
+    roots = [marker]
+    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    if override and not _kanban_home_matches_injected(os.environ):
+        roots.append(override)
+    for root in roots:
+        try:
+            target.relative_to(Path(root).expanduser().resolve())
+        except ValueError:
+            continue
+        return True
+    return False
 
 
 @overload

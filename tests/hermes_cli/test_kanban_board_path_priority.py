@@ -176,6 +176,19 @@ def test_cli_board_flag_trumps_worker_env_pin_end_to_end(monkeypatch, tmp_path):
     )
 
 
+def test_changed_kanban_home_is_explicit_even_with_inherited_injection_marker(monkeypatch, tmp_path):
+    from agent.delegation_context import KANBAN_HOME_INJECTED_ENV
+
+    injected = tmp_path / "lineage-board"
+    changed = tmp_path / "scratch-board"
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(injected))
+    monkeypatch.setenv(KANBAN_HOME_INJECTED_ENV, str(injected))
+    assert kb.kanban_home() != injected
+
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(changed))
+    assert kb.kanban_home() == changed
+
+
 # ---------------------------------------------------------------------------
 # Fenced callers keep the pinned path (side-effect screen on PR#131913).
 #

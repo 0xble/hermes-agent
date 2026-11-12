@@ -20,6 +20,8 @@ The default-profile terminal, PTY, `execute_code` and persistent-shell snapshot 
 receive the live default `HERMES_HOME`. Named profiles, cron workers and remote backends keep their
 existing environment. Delegated children keep their Kanban lineage fence through
 `HERMES_KANBAN_HOME` as a fallback, and an explicit child `HERMES_HOME` resolves its own board.
+The `HERMES_KANBAN_HOME_INJECTED` marker carries the injected board path, so a later changed
+`HERMES_KANBAN_HOME` is explicit while the inherited lineage fence remains in place.
 
 On 2026-11-11 a Codex cleanup ran `rmtree($HERMES_HOME)` after scoping a scratch value to only
 pytest, and wiped the live `~/.hermes`.
