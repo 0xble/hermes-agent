@@ -70,8 +70,21 @@ def _remove(path: Path) -> None:
         log_private_failure(logger, exc, operation="private cleanup", reason="remove_failed", force=True)
 
 
-def sweep_private_dirs() -> int:
-    """Remove leftover private interval directories before accepting ingress."""
+def _owner_pid(path: Path) -> int | None:
+    """Read an interval's non-private owner marker, returning ``None`` when invalid."""
+    marker = path / ".owner"
+    try:
+        if marker.is_symlink() or not marker.is_file():
+            return None
+        value = marker.read_text(encoding="ascii").strip()
+        pid = int(value)
+        return pid if pid > 0 and str(pid) == value else None
+    except (OSError, UnicodeError, ValueError):
+        return None
+
+
+def sweep_private_dirs(*, skip_live_owners: bool = False) -> int:
+    """Remove private interval directories, optionally preserving another live process's."""
     roots = {_configured_root()}
     removed = 0
     for root in roots:
@@ -81,6 +94,12 @@ def sweep_private_dirs() -> int:
             continue
         for path in entries:
             if path.name.startswith(PRIVATE_DIR_PREFIX) or path.name == "unattributed":
+                if skip_live_owners and path.name != "unattributed":
+                    owner = _owner_pid(path)
+                    if owner is not None and owner != os.getpid():
+                        from gateway.status import _pid_exists
+                        if _pid_exists(owner):
+                            continue
                 before = path.exists() or path.is_symlink()
                 _remove(path)
                 if before and not (path.exists() or path.is_symlink()):
@@ -98,6 +117,12 @@ def _new_dir() -> Path:
     path.mkdir(mode=0o700)
     try:
         os.chmod(path, 0o700)
+    except OSError:
+        pass
+    owner = path / ".owner"
+    owner.write_text(f"{os.getpid()}\n", encoding="ascii")
+    try:
+        os.chmod(owner, 0o600)
     except OSError:
         pass
     return path
@@ -210,6 +235,33 @@ def discard_private_dir(session_id: str | None) -> None:
         for leftover in leftovers:
             _remove(leftover)
         _remove(root / "unattributed")
+
+
+def discard_owned_private_dirs() -> int:
+    """Dispose every interval owned by this process, including unmapped leftovers."""
+    pid = os.getpid()
+    with _lock:
+        owned = {
+            path: tuple(key for key, value in _session_dirs.items() if value == path)
+            for path in set(_session_dirs.values())
+            if _owner_pid(path) == pid
+        }
+    for keys in owned.values():
+        for key in keys:
+            discard_private_dir(key)
+    removed = 0
+    root = _configured_root()
+    try:
+        entries = list(root.iterdir())
+    except OSError:
+        entries = []
+    for path in entries:
+        if path.name.startswith(PRIVATE_DIR_PREFIX) and _owner_pid(path) == pid:
+            before = path.exists() or path.is_symlink()
+            _remove(path)
+            if before and not (path.exists() or path.is_symlink()):
+                removed += 1
+    return len(owned) + removed
 
 
 def private_path_for_current_session() -> Path | None:

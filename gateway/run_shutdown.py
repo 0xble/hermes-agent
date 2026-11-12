@@ -3011,6 +3011,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         """Clean-shutdown marker, restart markers, terminal runtime status; process bootstrap
         releases PID/lock ownership after the writer drain."""
         from gateway.run import _hermes_home, _shutdown_gateway_health_export
+        with suppress(Exception):
+            from agent.incognito_private_dir import discard_owned_private_dirs
+            removed = discard_owned_private_dirs()
+            if removed:
+                logger.info("Incognito shutdown cleanup removed %d private directories", removed)
         if getattr(self, "_startup_cleanup_only", False):  # start never ran: keep startup_failed + crash markers
             return _shutdown_gateway_health_export(self)
         if not getattr(self, "_client_owned", False):  # Only a daemon recovered prior receipts/counters.

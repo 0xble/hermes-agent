@@ -120,8 +120,13 @@ async def promote(runner) -> dict[str, Any]:
         return {"promoted": False, "refused": "not_ready"}
 
     # The old slot still serves in-flight private turns until it exits after promotion
-    # (gateway_handover waits for that exit only after this promote returns). The
-    # startup sweep in run_client_owned runs after that process is confirmed gone.
+    # (gateway_handover waits for that exit only after this promote returns). Keep
+    # its live interval while sweeping crashed-process leftovers; the old process
+    # removes its own intervals during clean shutdown.
+    from agent.incognito_private_dir import sweep_private_dirs
+    removed = sweep_private_dirs(skip_live_owners=True)
+    if removed:
+        logger.info("Incognito handover sweep removed %d private directories", removed)
     _promoted = True
     try:
         return await _promote(runner)

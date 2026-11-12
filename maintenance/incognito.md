@@ -72,6 +72,7 @@ not only the command reply.
   or claiming privacy on only one of the lanes.
 - Media without a persistent store may use the interval's private directory, which is
   deleted on `/incognito off` and `/new`; no private artifact may outlive that interval.
+  A SIGKILL of the outgoing zero-cut gateway can leave its interval until the next startup sweep.
   The default parent is outside `HERMES_HOME`, in the account cache root and scoped to the
   process Hermes home (`~/Library/Caches/Hermes/incognito/<home-hash>/` on macOS,
   `$XDG_CACHE_HOME/Hermes/incognito/<home-hash>/` elsewhere), because the startup sweep

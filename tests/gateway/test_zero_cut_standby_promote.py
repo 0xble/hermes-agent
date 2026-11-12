@@ -57,6 +57,26 @@ async def test_standby_boot_leaves_delegation_ledger_and_promotion_replays_it(mo
 
 
 @pytest.mark.asyncio
+async def test_promotion_sweeps_stale_private_dirs_without_live_owner_cleanup(monkeypatch):
+    from agent import incognito_private_dir
+    calls = []
+    monkeypatch.setattr(
+        incognito_private_dir, "sweep_private_dirs",
+        lambda **kwargs: calls.append(kwargs) or 0,
+    )
+    promoted = SimpleNamespace(
+        adapters={}, _standby_deferred={},
+        _start_prime_session_db_after_ready=lambda: asyncio.sleep(0),
+        _start_finish_wiring=lambda count: asyncio.sleep(0),
+        _start_spawn_background_watchers=lambda: None,
+    )
+    monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
+    zcs.mark_ready()
+    assert (await zcs.promote(promoted))["promoted"] is True
+    assert calls == [{"skip_live_owners": True}]
+
+
+@pytest.mark.asyncio
 async def test_slot_a_can_defer_and_promote(monkeypatch):
     gateway_slot.reset_gateway_slot_for_tests()
     zcs.reset_for_tests()

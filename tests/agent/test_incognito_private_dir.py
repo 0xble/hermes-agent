@@ -1,5 +1,6 @@
 """A private interval never captures another session's disposable or durable files."""
 from pathlib import Path
+import os
 
 import pytest
 
@@ -197,3 +198,36 @@ def test_last_interval_exit_removes_a_directory_no_session_owns():
     private_dirs.discard_private_dir("private-a")
     assert not private_root.exists()
     assert not stray.exists()
+
+
+def test_sweep_skip_live_owner_keeps_live_foreign_and_removes_stale(tmp_path, monkeypatch):
+    root = tmp_path / "private"
+    monkeypatch.setattr(private_dirs, "_configured_root", lambda: root)
+    live = private_dirs._new_dir()
+    (live / ".owner").write_text(f"{os.getppid()}\n", encoding="ascii")
+    dead = private_dirs._new_dir()
+    (dead / ".owner").write_text("999999999\n", encoding="ascii")
+    missing = private_dirs._new_dir()
+    (missing / ".owner").unlink()
+    (root / "unattributed").mkdir()
+    assert private_dirs.sweep_private_dirs(skip_live_owners=True) == 3
+    assert live.exists()
+    assert not dead.exists()
+    assert not missing.exists()
+    assert not (root / "unattributed").exists()
+    assert private_dirs.sweep_private_dirs() == 1
+    assert not live.exists()
+
+
+def test_new_dir_records_only_owner_pid():
+    interval = private_dirs._new_dir()
+    marker = interval / ".owner"
+    assert marker.read_text(encoding="ascii") == f"{os.getpid()}\n"
+    assert marker.stat().st_mode & 0o777 == 0o600
+
+
+def test_discard_owned_private_dirs_removes_unmapped_owned_interval():
+    interval = private_dirs._new_dir()
+    assert interval.exists()
+    assert private_dirs.discard_owned_private_dirs() == 1
+    assert not interval.exists()
