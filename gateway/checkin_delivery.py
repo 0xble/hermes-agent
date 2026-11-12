@@ -9,6 +9,18 @@ from hermes_cli.checkins import CheckinConfig, DISPLAY_KIND
 DISARMED = "supervisor_checkin_disarmed"
 
 
+def is_supervisor_checkin(event, metadata=None):
+    """Identify supervisor provenance without consulting the transcript database."""
+    event_metadata = getattr(event, "metadata", None)
+    return bool(
+        (getattr(event, "internal", False) and isinstance(event_metadata, dict)
+         and event_metadata.get("display_kind") == DISPLAY_KIND)
+        or (isinstance(metadata, dict) and (
+            metadata.get("display_kind") == DISPLAY_KIND
+            or metadata.get("_checkin_scope") is not None))
+    )
+
+
 def _opaque_checkin_turn_id(token):
     """Persist a non-reversible transcript identifier for the private active-turn token."""
     return hashlib.sha256(f"hermes-checkin:{token}".encode()).hexdigest()
@@ -72,17 +84,25 @@ def retain_policy(manager, event, root):
     manager.db._execute_write(write)
 
 
-def pending_root(runner, route, token):
+def pending_root(runner, route, token, *, known_supervisor=False):
     if not token:
+        if known_supervisor:
+            raise OSError("Supervisor provenance token is unavailable")
         return None
     store = getattr(runner, "session_store", None)
     if not callable(getattr(store, "_db_for_key", None)):
+        if known_supervisor:
+            raise OSError("Supervisor provenance store is unavailable")
         return None
     try:
         db = store._db_for_key(route)
     except OSError:
+        if known_supervisor:
+            raise
         return None
     if db is None:
+        if known_supervisor:
+            raise OSError("Supervisor provenance store is unavailable")
         return None
     entry = store.lookup_by_session_key(route)
     lineage = db.get_compression_lineage(entry.session_id) if entry is not None else []
@@ -130,10 +150,13 @@ async def permits_metadata(runner, metadata, *, retry_on_read_error=False):
         return False
 
 
-async def recovery_metadata(runner, route, token):
+async def recovery_metadata(runner, route, token, *, known_supervisor=False):
     if not token:
+        if known_supervisor:
+            raise OSError("Supervisor provenance token is unavailable")
         return {}
-    root = await runner._run_in_executor_with_context(lambda: pending_root(runner, route, token))
+    root = await runner._run_in_executor_with_context(
+        lambda: pending_root(runner, route, token, known_supervisor=known_supervisor))
     if root is None:
         return {}
     entry = await runner._run_in_executor_with_context(runner.session_store.lookup_by_session_key, route)
@@ -141,8 +164,12 @@ async def recovery_metadata(runner, route, token):
     return {"_checkin_scope": {"root": root, "source": source.to_dict() if source is not None else None}}
 
 
-async def permits_recovery(runner, route, token):
-    return await permits_metadata(runner, await recovery_metadata(runner, route, token), retry_on_read_error=True)
+async def permits_recovery(runner, route, token, *, known_supervisor=False):
+    return await permits_metadata(
+        runner,
+        await recovery_metadata(runner, route, token, known_supervisor=known_supervisor),
+        retry_on_read_error=True,
+    )
 
 
 def suppress_result(result):

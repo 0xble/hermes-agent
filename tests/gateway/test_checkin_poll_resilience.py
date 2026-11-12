@@ -165,3 +165,23 @@ async def test_non_oserror_in_one_profile_does_not_abort_other_profile(tmp_path,
     await run_checkins.poll_checkins(runner)
 
     assert reconciled == ["route-good"]
+
+@pytest.mark.asyncio
+async def test_reconcile_failure_is_retried_on_next_tick(fixture, monkeypatch):
+    f = fixture
+    calls = 0
+
+    async def reconcile(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("transient reconcile failure")
+        return True
+
+    monkeypatch.setattr(run_checkins, "reconcile_turn", reconcile)
+    await run_checkins.poll_checkins(f.runner)
+    assert calls == 1
+    assert not f.runner._checkin_seen
+    await run_checkins.poll_checkins(f.runner)
+    assert calls == 2
+    assert f.runner._checkin_seen == {(f.entry.session_key, f.entry.session_id): CheckinConfig()}
