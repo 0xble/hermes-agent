@@ -87,8 +87,52 @@ def test_allowlisted_user_api_post_is_human():
 
 
 def test_bot_markers_win_over_allowlist():
-    """Allowlisting a user never admits genuine bot posts, so the app's own
-    ``xoxb`` traffic (bot_id / subtype=bot_message) cannot loop back in."""
+    """Allowlisting a user never admits classic bot posts (``subtype=bot_message``), so an app's
+    own ``xoxb`` bot traffic cannot loop back in."""
     adapter = _make_adapter({"api_human_users": HUMAN_ID})
     assert adapter._event_declares_bot_sender(_api_post(subtype="bot_message")) is True
-    assert adapter._event_declares_bot_sender(_api_post(bot_id="B_stamp")) is True
+    assert adapter._event_declares_bot_sender(_api_post(user_profile={"is_bot": True})) is True
+    # A bot_id stamp on a non-allowlisted user is still a bot.
+    assert adapter._event_declares_bot_sender(_api_post(user="U_stranger", bot_id="B_stamp")) is True
+
+
+def test_allowlisted_user_token_post_with_bot_stamp_is_human():
+    """A ``chat.postMessage`` with an allowlisted person's ``xoxp-`` token through another app
+    arrives with that app's ``bot_id``/``bot_profile`` as well as ``app_id`` and the person's
+    ``user``. The author is the person, so it must not be dropped under ``allow_bots: none``."""
+    adapter = _make_adapter({"api_human_users": [HUMAN_ID]})
+    stamped = _api_post(bot_id="B_agent_app", bot_profile={"id": "B_agent_app", "name": "agent"})
+    assert adapter._event_declares_bot_sender(stamped) is False
+    assert adapter._event_declares_bot_sender(_api_post(bot_id="B_agent_app")) is False
+    assert adapter._event_declares_bot_sender(_api_post(bot_profile={"id": "B_agent_app"})) is False
+    # Without the allowlist the same event stays a bot post (allow_bots: none keeps dropping it).
+    assert _make_adapter()._event_declares_bot_sender(stamped) is True
+
+
+def test_own_bot_user_is_never_human_even_if_allowlisted():
+    """Echo-loop guard: the app's own bot user stays a bot even if misconfigured into the list."""
+    adapter = _make_adapter({"api_human_users": ["U_self", HUMAN_ID]})
+    adapter._bot_user_id = "U_self"
+    adapter._team_bot_user_ids = {"T1": "U_self", "T2": "U_self_t2"}
+    assert adapter._event_declares_bot_sender(_api_post(user="U_self", bot_id="B_self")) is True
+    adapter2 = _make_adapter({"api_human_users": ["U_self_t2"]})
+    adapter2._bot_user_id = "U_self"
+    adapter2._team_bot_user_ids = {"T2": "U_self_t2"}
+    assert adapter2._event_declares_bot_sender(_api_post(user="U_self_t2", bot_id="B_self")) is True
+
+
+@pytest.mark.asyncio
+async def test_drop_gate_admits_stamped_allowlisted_post_under_allow_bots_none():
+    adapter = _make_adapter({"api_human_users": [HUMAN_ID], "allow_bots": "none"})
+    adapter._bot_user_id = "U_self"
+    adapter._team_bot_user_ids = {}
+
+    adapter._resolve_user_is_bot = _false  # users.info: Brian's account is a person
+    stamped = _api_post(bot_id="B_agent_app", bot_profile={"id": "B_agent_app"})
+    assert await adapter._drop_bot_sender(stamped) is False
+    assert await adapter._drop_bot_sender(_api_post(user="U_stranger", bot_id="B_x")) is True
+    assert await adapter._drop_bot_sender(_api_post(subtype="bot_message", bot_id="B_x")) is True
+
+
+async def _false(*_a, **_k):
+    return False
