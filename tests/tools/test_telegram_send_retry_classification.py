@@ -65,9 +65,17 @@ def test_a_raw_socket_error_is_not_retried():
 
 
 def test_flood_control_still_honours_retry_after():
-    exc = NetworkError("Too Many Requests: retry after 7")
-    exc.retry_after = 7
-    assert senders._telegram_retry_delay(exc, 0) == 7.0
+    """A short ``retry_after`` is slept inline; one past the inline cap is a server penalty the
+    durable flood store enforces, so the send is final (fork ``telegram-chat-budget``)."""
+    from plugins.platforms.telegram.adapter import _FLOOD_INLINE_WAIT_CAP_SECS
+
+    short = NetworkError("Too Many Requests: retry after 3")
+    short.retry_after = 3
+    assert senders._telegram_retry_delay(short, 0) == 3.0
+    penalty = NetworkError("Too Many Requests: retry after 7")
+    penalty.retry_after = 7
+    assert 7 > _FLOOD_INLINE_WAIT_CAP_SECS
+    assert senders._telegram_retry_delay(penalty, 0) is None
 
 
 def test_a_connect_timeout_backs_off_because_nothing_was_sent():
