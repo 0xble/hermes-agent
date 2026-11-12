@@ -172,10 +172,14 @@ def test_slow_rollback_target_gets_its_own_startup_window(tmp_path, monkeypatch)
     """A rollback target still starting when the run deadline ends is not booted out."""
     home, plist, label, a, b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     from hermes_cli import gateway_launchd
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
+    # The old incarnation is absent; only the replacement exists after bootstrap. A constant PID
+    # can be a real process on macOS CI, which would trip the live-system guard during reap.
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid",
+                        lambda name, **_: 123 if "bootstrap" in calls else None)
     monkeypatch.setattr(guardian, "rollback", _failing_rollback(home, a))
     activations = _record_activations(monkeypatch, home)
     window = {"open": False}
+
     real_await = guardian._await_healthy
 
     def await_healthy(home_, label_, release, deadline):
@@ -190,13 +194,15 @@ def test_slow_rollback_target_gets_its_own_startup_window(tmp_path, monkeypatch)
     assert guardian.rollback_switch(home, plist, label, a, domain=f"gui/{os.getuid()}",
                                     deadline=guardian.time.monotonic() + 1) is True
     assert activations == [] and (home / "current").resolve() == a
+    assert calls.count("bootstrap") == calls.count("bootout") == 1
 
 
 @pytest.mark.platforms("macos")
 def test_running_but_unhealthy_target_is_not_replaced(tmp_path, monkeypatch):
     home, plist, label, a, b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     from hermes_cli import gateway_launchd
-    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda name, **_: 123)
+    monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid",
+                        lambda name, **_: 123 if "bootstrap" in calls else None)
     monkeypatch.setattr(guardian, "rollback", _failing_rollback(home, a))
     activations = _record_activations(monkeypatch, home)
     monkeypatch.setattr(guardian, "healthy", lambda home_, label_, release, *rest: release == b)
