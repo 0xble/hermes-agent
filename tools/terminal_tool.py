@@ -81,8 +81,8 @@ FOREGROUND_MAX_TIMEOUT = _safe_parse_import_env("TERMINAL_MAX_FOREGROUND_TIMEOUT
 
 # Interactive foreground heavy-work budget: hand the live shell to the background registry.
 # The helper waits without expiry, so FIFO age and earlier shell side effects survive.
-_FOREGROUND_HEAVY_SLOT_WAIT_CAP = 120
-_FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
+_FOREGROUND_SEMAPHORE_WAIT_CAP = 120
+_FOREGROUND_SEMAPHORE_WAIT_FLOOR = 10
 
 # The backend starts its relative timer after shell setup, then polls (up to 0.2s)
 # and tears down the process tree / drains output before the cell RPC can reply.
@@ -90,16 +90,16 @@ _FOREGROUND_HEAVY_SLOT_WAIT_FLOOR = 10
 _CRON_CELL_CLEANUP_MARGIN_S = 1.0
 
 
-def _foreground_heavy_slot_max_wait(effective_timeout: int) -> int:
-    """Bound foreground occupancy without cancelling heavy-slot admission."""
-    return min(_FOREGROUND_HEAVY_SLOT_WAIT_CAP, max(_FOREGROUND_HEAVY_SLOT_WAIT_FLOOR, effective_timeout // 3))
+def _foreground_semaphore_max_wait(effective_timeout: int) -> int:
+    """Bound foreground occupancy without cancelling semaphore admission."""
+    return min(_FOREGROUND_SEMAPHORE_WAIT_CAP, max(_FOREGROUND_SEMAPHORE_WAIT_FLOOR, effective_timeout // 3))
 
 
-def _heavy_slot_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
+def _semaphore_max_wait_for(*, background: bool, env_type: str, effective_timeout: int) -> Optional[int]:
     """Foreground local heavy calls hand off at this budget without expiring their ticket."""
     if background or env_type != "local" or bound_turn_origin() == "cron":
         return None
-    return _foreground_heavy_slot_max_wait(effective_timeout)
+    return _foreground_semaphore_max_wait(effective_timeout)
 
 
 # Disk usage warning threshold (in GB)
@@ -1010,8 +1010,8 @@ from tools.terminal_tool_guards import (
     _foreground_background_guidance, _safe_command_preview, _validate_workdir,
     gateway_lifecycle_block, self_repo_block, trailing_amp_background_command,
 )
-from tools.terminal_tool_background import _HEAVY_SLOT_YIELDED_NOTE, _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
-from tools.terminal_tool_heavy_slot import foreground_heavy_command, wrap_heavy_command
+from tools.terminal_tool_background import _SEMAPHORE_YIELDED_NOTE, _YIELDED_NOTE, spawn_background_process, yield_to_background_handler
+from tools.terminal_tool_semaphore import foreground_semaphore_command, wrap_semaphore_command
 from tools.terminal_tool_result import finalize_foreground_result
 
 
@@ -1408,7 +1408,7 @@ def _run_foreground(
 ) -> str:
     """Execute in the foreground with retry on transient errors, then finalize. ``metered``
     is False for Hermes' own control-plane commands (``_host_local``). ``execution_command``
-    is what the shell runs (the heavy-slot rewrite); metrics, exit-code notes, verification
+    is what the shell runs (the semaphore rewrite); metrics, exit-code notes, verification
     evidence and redaction keep describing the user's ``command``."""
     from hermes_cli.observability.shared_metrics_harness import record_terminal_outcome
     from tools.node_execution import current_execution
@@ -1482,12 +1482,12 @@ def _run_foreground(
             "output": result.get("output", ""), "exit_code": None, "error": None,
             "status": "yielded_to_background", "session_id": result["yielded_session_id"],
             "pid": result.get("pid"), "notify_on_complete": True,
-            "note": _HEAVY_SLOT_YIELDED_NOTE if result.get("yield_reason") == "heavy_slot_wait" else _YIELDED_NOTE,
+            "note": _SEMAPHORE_YIELDED_NOTE if result.get("yield_reason") == "semaphore_wait" else _YIELDED_NOTE,
         }, ensure_ascii=False)
     if (bound_turn_origin() == "cron" and result.get("hermes_timed_out")
             and yield_when is not None and yield_when()):
         result["output"] = result.get("output", "") + (
-            "\n[Heavy command not started: terminal timeout expired while waiting for heavy-slot admission]"
+            "\n[Heavy command not started: terminal timeout expired while waiting for semaphore admission]"
         )
     from agent.incognito import is_incognito
     if metered and not is_incognito(session_id):
@@ -1684,15 +1684,15 @@ def terminal_tool(
                 # caller could not have meant for a foreground call, and the two are exclusive anyway.
                 background, notify_on_complete, watch_patterns = True, True, None
             # Approval and pre-exec security checks above saw the user-supplied command; only the
-            # local execution is rewritten, putting heavy-slot in front of each recognized test or
-            # CI simple command. HEAVY_SLOT_HELD (a nested run) or HERMES_HEAVY_SLOT=off disables it.
+            # local execution is rewritten, putting semaphore in front of each recognized test or
+            # CI simple command. SEMAPHORE_HELD (a nested run) or HERMES_SEMAPHORE=off disables it.
             # Keep helper admission unbounded. The local wait loop yields the original
             # shell at the foreground budget only while admission is pending.
-            max_wait_seconds = _heavy_slot_max_wait_for(
+            max_wait_seconds = _semaphore_max_wait_for(
                 background=background, env_type=env_type, effective_timeout=plan.effective_timeout,
             )
             if background:
-                execution_command = wrap_heavy_command(
+                execution_command = wrap_semaphore_command(
                     command, env_type=env_type, environment=getattr(env, "env", None),
                 )
                 result = spawn_background_process(
@@ -1712,7 +1712,7 @@ def terminal_tool(
                     result = _with_promoted_note(result, plan.promoted_from_foreground_timeout)
                 return _metered(None if _host_local else plan, result)
 
-            with foreground_heavy_command(
+            with foreground_semaphore_command(
                 command, env_type=env_type, environment=getattr(env, "env", None),
             ) as (execution_command, waiting_for_admission):
                 return _metered(None if _host_local else plan, _run_foreground(
@@ -1763,7 +1763,7 @@ TERMINAL_SCHEMA = {
             },
             "timeout": {
                 "type": "integer",
-                "description": f"Max seconds (default 180, interactive foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Interactive calls above {FOREGROUND_MAX_TIMEOUT}s run as tracked background processes with notify_on_complete=true (the result says so; do not re-run them). Cron foreground calls wait inline for heavy-slot admission and completion until their timeout, bounded by the enclosing code cell deadline when present; they are not automatically backgrounded.",
+                "description": f"Max seconds (default 180, interactive foreground max {FOREGROUND_MAX_TIMEOUT}). Finishing early returns at once, so set it generously. Interactive calls above {FOREGROUND_MAX_TIMEOUT}s run as tracked background processes with notify_on_complete=true (the result says so; do not re-run them). Cron foreground calls wait inline for semaphore admission and completion until their timeout, bounded by the enclosing code cell deadline when present; they are not automatically backgrounded.",
                 "minimum": 1
             },
             "workdir": {

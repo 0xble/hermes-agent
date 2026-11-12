@@ -1,11 +1,11 @@
 """Machine-wide throttling for local test suites and CI gates.
 
-The host's ``heavy-slot`` executable owns the cross-process semaphore. Hermes only
+The host's ``semaphore`` executable owns the cross-process semaphore. Hermes only
 decides which simple commands inside a local terminal command are heavy and routes
 each of them through a small dispatcher function defined at the top of the command::
 
-    cd repo && pytest -q   ->   _hermes_heavy_slot() {...}
-                                cd repo && _hermes_heavy_slot 'hermes pytest' pytest -q
+    cd repo && pytest -q   ->   _hermes_semaphore() {...}
+                                cd repo && _hermes_semaphore 'hermes pytest' pytest -q
 
 The rest of the command still runs in the session shell, so ``cd``, exports,
 functions and background ``&`` behave exactly as before. The dispatcher sends an
@@ -14,13 +14,13 @@ external program through the helper and leaves a name the shell resolves itself
 Only the heavy process waits for and holds a slot.
 
 Not wrapped: non-local backends (Docker, SSH, Modal and other sandboxes),
-commands already inside a slot (``HEAVY_SLOT_HELD``), the opt-out
-``HERMES_HEAVY_SLOT=off``, hosts without the helper, text that only mentions a
+commands already inside a slot (``SEMAPHORE_HELD``), the opt-out
+``HERMES_SEMAPHORE=off``, hosts without the helper, text that only mentions a
 runner (``grep pytest``, quoted strings, comments, heredoc bodies), targeted
 runs of 1-10 explicit test files or unittest names with only single-run options
 (redirections such as ``2>&1 | tail`` do not count as arguments), dependency
 sync/installation, and type checks or lint runs, which hold a slot for seconds
-(see ``maintenance/terminal-heavy-slot.md``).
+(see ``maintenance/terminal-semaphore.md``).
 Foreground terminal commands leave admission unbounded and hand the live shell
 to the background registry at their foreground budget only while waiting for a
 slot. Already-admitted work keeps its foreground deadline. Queue age survives and
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 _OPT_OUT_VALUES = {"0", "off", "false", "no"}
 # One leading underscore: the session snapshot re-dump skips `_x` functions, so the
 # dispatcher is redefined by each rewritten command and never persists.
-_DISPATCH = "_hermes_heavy_slot"
+_DISPATCH = "_hermes_semaphore"
 _ASSIGNMENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
 # Words that put the NEXT word in command position and work with shell functions.
 _KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "{", "time"}
@@ -69,7 +69,7 @@ _MONOREPO_RUNNERS = {"turbo", "nx", "lerna"}
 _ENV_RUNNERS = {"uv", "poetry", "pipenv", "hatch", "pdm", "rye"}
 _EXEC_RUNNERS = {"npx", "bunx", "uvx", "pnpx"}
 _SUITE_RUNNERS = {"tox", "nox"}
-# Repository CI profiles that only run fast local checks (mirrors ~/.config/shell/heavy-slot.sh).
+# Repository CI profiles that only run fast local checks (mirrors ~/.config/shell/semaphore.sh).
 _LIGHT_CI_PROFILES = {"preflight", "install-hooks", "list", "-h", "--help"}
 _INFO_FLAGS = {"--version", "--help", "-h"}
 _WATCH_FLAGS = {"--watch", "--watch=true", "--watchAll", "--watchAll=true"}
@@ -95,11 +95,11 @@ _UNITTEST_FLAGS = {"-v", "-q", "-f", "-c", "-b", "--verbose", "--quiet", "--fail
 _REDIRECT = re.compile(r"^(?:\d+|\{[A-Za-z_][A-Za-z0-9_]*\})?(?:>>|>|<<<|<<-|<<|<>|<)(.*)$")
 
 
-def heavy_slot_enabled(environment: Mapping[str, str]) -> bool:
+def semaphore_enabled(environment: Mapping[str, str]) -> bool:
     """False inside an existing slot or when the operator opted out."""
-    if environment.get("HEAVY_SLOT_HELD"):
+    if environment.get("SEMAPHORE_HELD"):
         return False
-    return str(environment.get("HERMES_HEAVY_SLOT", "")).strip().lower() not in _OPT_OUT_VALUES
+    return str(environment.get("HERMES_SEMAPHORE", "")).strip().lower() not in _OPT_OUT_VALUES
 
 
 def _unquote(word: str) -> Optional[str]:
@@ -407,26 +407,26 @@ def _heavy_positions(command: str) -> list[tuple[int, str]]:
     return found
 
 
-def _heavy_slot_executable(environment: Mapping[str, str]) -> Optional[str]:
+def _semaphore_executable(environment: Mapping[str, str]) -> Optional[str]:
     """The host helper: the terminal's PATH first, then ``~/.local/bin`` (absent from minimal service PATHs)."""
     from hermes_platform.resolver.core import LookupContext, locate_command
 
-    found = locate_command("heavy-slot", LookupContext(path=environment.get("PATH")),
+    found = locate_command("semaphore", LookupContext(path=environment.get("PATH")),
                            known_dirs=(str(Path.home() / ".local" / "bin"),))
     return found.command[0] if found.command else None
 
 
-def wrap_heavy_command(
+def wrap_semaphore_command(
     command: str, *, env_type: str, environment: Optional[Mapping[str, str]] = None,
     max_wait_seconds: Optional[int] = None, admission_dir: Optional[str] = None,
 ) -> str:
-    """Prefix heavy local commands with ``heavy-slot`` and optionally bound its queue wait."""
+    """Prefix heavy local commands with ``semaphore`` and optionally bound its queue wait."""
     if env_type != "local" or not command:
         return command
     try:
         return _wrap_local(command, environment, max_wait_seconds=max_wait_seconds, admission_dir=admission_dir)
     except Exception:  # throttling is best-effort and must never break the terminal
-        logger.debug("heavy-slot wrapping failed; running the command unwrapped", exc_info=True)
+        logger.debug("semaphore wrapping failed; running the command unwrapped", exc_info=True)
         return command
 
 
@@ -437,12 +437,12 @@ def _wrap_local(
     effective = dict(os.environ)
     if environment:
         effective.update(environment)
-    if not heavy_slot_enabled(effective):
+    if not semaphore_enabled(effective):
         return command
     positions = _heavy_positions(command)
     if not positions:
         return command
-    executable = _heavy_slot_executable(effective)
+    executable = _semaphore_executable(effective)
     if executable is None:
         return command
     rewritten = command
@@ -452,7 +452,7 @@ def _wrap_local(
 
 
 @contextmanager
-def foreground_heavy_command(command: str, *, env_type: str, environment=None):
+def foreground_semaphore_command(command: str, *, env_type: str, environment=None):
     """Track only pending helper admission, not elapsed payload execution.
 
     The admitted payload removes its marker before exec. The directory lives
@@ -463,7 +463,7 @@ def foreground_heavy_command(command: str, *, env_type: str, environment=None):
         yield command, None
         return
     with tempfile.TemporaryDirectory(prefix="hermes-admission-") as directory:
-        rewritten = wrap_heavy_command(command, env_type=env_type, environment=environment,
+        rewritten = wrap_semaphore_command(command, env_type=env_type, environment=environment,
                                        admission_dir=directory)
         yield rewritten, lambda: any(Path(directory).iterdir())
 
@@ -482,7 +482,7 @@ def _dispatcher(executable: str, *, max_wait_seconds: Optional[int] = None,
     run_in_shell = '_hermes_hs_name=$1; shift; eval "$_hermes_hs_name \\"\\$@\\""'
     wait_env = ""
     if max_wait_seconds is not None:
-        wait_env = f"HEAVY_SLOT_MAX_WAIT={shlex.quote(str(max_wait_seconds))} "
+        wait_env = f"SEMAPHORE_MAX_WAIT={shlex.quote(str(max_wait_seconds))} "
     payload = '"$@"'
     track = ""
     if admission_dir is not None:

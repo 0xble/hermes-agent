@@ -111,7 +111,7 @@ scripts/run_tests.sh tests/tools/test_browser_vault_camofox_live.py
 Use a disposable `HOME`, `HERMES_HOME` and `HERMES_RUNTIME_DIR`, and seed that
 home's platform Camoufox cache from an installed engine before running. Ensure
 `node` on `PATH` is an installed executable, not a manager shim requiring the
-real home's trust/configuration. If `heavy-slot` uses `env python3`, put the
+real home's trust/configuration. If `semaphore` uses `env python3`, put the
 checkout interpreter's bin directory before manager shims too, so admission
 does not recompose `PATH` through a shim. The fixture does not use the shared
 service or its profiles. Missing opt-in paths still skip all seven cases.
