@@ -44,6 +44,16 @@ def record_external_worker_outcome(
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
             return True
+        if status == "failed" and str(execution.get("error") or "").startswith(
+            scheduler.DETACHED_HANDSHAKE_TIMEOUT_PREFIX
+        ):
+            scheduler.defer_unstarted_detached_handshake(
+                job,
+                str(execution_key),
+                str(execution["error"]),
+                finish=False,
+            )
+            return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit
         execution_error = execution.get("error")

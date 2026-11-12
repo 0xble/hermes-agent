@@ -20,6 +20,10 @@ PREFIX = 'cron-worker:'
 logger = logging.getLogger(__name__)
 
 
+class DetachedHandshakeTimeout(TimeoutError):
+    """The gateway handshake budget was exhausted before cron work started."""
+
+
 def detached_assignment(job_id, execution_id):
     from cron.executions import get_execution
     row = get_execution(execution_id) if execution_id else None
@@ -235,6 +239,18 @@ def _attach_worker(rpc, scope):
     from websockets.exceptions import ConnectionClosed
 
     ambiguous = False
+
+    def timeout_phase(exc):
+        current = exc
+        while current is not None:
+            text = str(current)
+            if text.startswith('gateway handshake timed out ('):
+                return text
+            if isinstance(current, TimeoutError) and text in ('', 'timed out'):
+                return 'gateway handshake timed out (connect)'
+            current = current.__cause__
+        return None
+
     for attempt in range(4):
         try:
             try:
@@ -250,6 +266,9 @@ def _attach_worker(rpc, scope):
                     'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
                 raise
             if attempt == 3:
+                phase = timeout_phase(exc)
+                if phase is not None:
+                    raise DetachedHandshakeTimeout(phase) from exc
                 raise
             ambiguous = True
             logger.warning('detached_cron_handshake_retry execution_id=%s session_id=%s '

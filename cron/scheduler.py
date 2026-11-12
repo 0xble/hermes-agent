@@ -3473,7 +3473,28 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
-def _run_one_job_body(
+DETACHED_HANDSHAKE_TIMEOUT_PREFIX = "gateway handshake timed out ("
+
+
+def defer_unstarted_detached_handshake(
+    job: dict, execution_id: str, error: str, *, finish: bool = True,
+) -> None:
+    """Release a pre-script attach failure so the due scan can reclaim the occurrence."""
+    from cron.jobs import clear_run_claim, note_fire_forward_failure
+    from cron.scheduler_control import release_unstarted_claim
+
+    release_unstarted_claim(job)
+    clear_run_claim(job['id'])
+    note_fire_forward_failure(job['id'], error)
+    if finish:
+        finish_execution(execution_id, success=False, error=error, delivery_outcome='deferred')
+    logger.warning(
+        "Job '%s': deferred before script start because the detached gateway handshake timed out",
+        job['id'],
+    )
+
+
+def _run_one_job_body(  # health: allow CC -- pre-script handshake deferral is a distinct fenced terminal path.
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
     transport_cancel: Optional[_CancelEventLike] = None,
@@ -3572,6 +3593,16 @@ def _run_one_job_body(
             return True
 
         success, error, agent_declared = _apply_agent_failure_marker(job, success, error, final_response)
+
+        if job.pop('_detached_handshake_deferred', False):
+            _teardown_deferred()
+            defer_unstarted_detached_handshake(
+                job,
+                execution_id,
+                job.pop('_detached_handshake_error', None) or error or
+                'gateway handshake timed out (unknown phase)',
+            )
+            return True
 
         if hard_wall_fence is not None:
             # The watchdog may terminalize the execution and kill a script while

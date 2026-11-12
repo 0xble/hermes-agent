@@ -140,9 +140,28 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 state = await call('recover', params)
                 if state['status'] != 'started':
                     continue
-                value = await asyncio.to_thread(run_detached, dict(state['job']), receipt, state, record, save,
-                    execution_id=request_id, extra_prompt=params['extra_prompt'], cancel_event=cancel_event)
-                job.update(record['worker_result']['job_flags'])
+                try:
+                    value = await asyncio.to_thread(
+                        run_detached,
+                        dict(state['job']),
+                        receipt,
+                        state,
+                        record,
+                        save,
+                        execution_id=request_id,
+                        extra_prompt=params['extra_prompt'],
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:
+                    from cron.detached_authority import DetachedHandshakeTimeout
+
+                    if not isinstance(exc, DetachedHandshakeTimeout):
+                        raise
+                    job['_detached_handshake_deferred'] = True
+                    job['_detached_handshake_error'] = str(exc)
+                    value = False, '', '', str(exc)
+                if record.get('worker_result') is not None:
+                    job.update(record['worker_result']['job_flags'])
                 return value
             if state.get('progress_at') not in (None, progress):
                 # The owner's agent is still working: refresh OUR ledger row (the owner's stamp is
