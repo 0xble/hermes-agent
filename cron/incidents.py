@@ -31,6 +31,14 @@ EXECUTIONS_FILE: Optional[Path] = None
 # and wants it silent. Only ``closed`` is terminal; a repeat of a resolved error re-opens it.
 INCIDENT_STATES = ("detected", "alerted", "resolved", "closed")
 _FAILURE_TYPE_ORDER = (
+    # A shared dependency outage is not the job's own timeout or an auth failure.
+    # Match it before those broader patterns so one proxy stall is one incident.
+    ("dependency_unavailable", (
+        r"\bmodel proxy\b.+\btimed out\b",
+        r"\bmodel proxy\b.+\bunavailable\b.+\b(?:503|auth_unavailable|overloaded)\b",
+        r"\bgateway handshake timed out\b",
+        r"\bsession relay timed out\b",
+    )),
     # Local argument rejection wins over incidental auth/delivery context in a report.
     ("config", (
         r"\b(?:invalid_key|invalid_title|invalid_brief|intent_required|self_relay)\b",
@@ -143,17 +151,27 @@ def _redact_error(error: str) -> str:
 
 
 def _error_signature(job_id: str, error: str, *, failure_type: Optional[str] = None) -> str:
-    """Dedup key: stable for same job + cause. Durations and scheduled instants vary per occurrence."""
+    """Dedup key: stable for same job + cause. Durations and scheduled instants vary per occurrence.
+
+    A dependency outage is one cause for every job waiting on it, so the job id is not part of
+    that signature. Other failures stay per-job.
+    """
     normalized = _DURATION_RE.sub("#s", _normalize_error(error))
     normalized = re.sub(
         r"\b\d{4}-\d{2}-\d{2}t\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:z|[+-]\d{2}:\d{2})\b",
         "<scheduled>", normalized,
     )[:_MAX_SIGNATURE_ERROR_CHARS]
-    namespace = b"script\0" if failure_type == "script" else b""
-    return hashlib.sha256(namespace + job_id.encode() + normalized.encode()).hexdigest()[:12]
+    if failure_type == "dependency_unavailable":
+        material = b"dependency\0" + normalized.encode()
+    else:
+        namespace = b"script\0" if failure_type == "script" else b""
+        material = namespace + job_id.encode() + normalized.encode()
+    return hashlib.sha256(material).hexdigest()[:12]
 
 
-def _incident_id(job_id: str, error_sig: str) -> str:
+def _incident_id(job_id: str, error_sig: str, *, failure_type: Optional[str] = None) -> str:
+    if failure_type == "dependency_unavailable":
+        return f"dep_{error_sig}"
     return f"{job_id[:6]}_{error_sig}"
 
 
@@ -178,11 +196,17 @@ def upsert_incident(
     closed, while a ``resolved`` one (job recovered, then broke the same way again) re-opens as
     ``detected`` so the operator is alerted once more. A changed error text mints a new incident."""
     job_id = str(job_id or "")
-    sig = _error_signature(job_id, error, failure_type=failure_type)
+    if failure_type is None:
+        failure_type = _classify_failure_type(error)
+    # Classify before signing so a dependency outage shares one id. Passing the
+    # classified type into the signature for other kinds would move existing ids.
+    signature_type = failure_type if failure_type == "dependency_unavailable" else None
+    if failure_type == "script":
+        signature_type = "script"
+    sig = _error_signature(job_id, error, failure_type=signature_type)
     stored_error = _redact_error(error)
-    incident_id = _incident_id(job_id, sig)
+    incident_id = _incident_id(job_id, sig, failure_type=failure_type)
     now = _hermes_now().isoformat()
-    failure_type = failure_type or _classify_failure_type(error)
     output_file = str(output_file) if output_file is not None else None
 
     with _transaction() as conn:
@@ -206,8 +230,8 @@ def upsert_incident(
                (id, job_id, error_sig, state, failure_type,
                 first_seen_at, last_seen_at, error, output_file)
                VALUES (?, ?, ?, 'detected', ?, ?, ?, ?, ?)""",
-            (incident_id, job_id, sig, failure_type, now, now,
-             stored_error, output_file),
+            (incident_id, "dependency" if failure_type == "dependency_unavailable" else job_id,
+             sig, failure_type, now, now, stored_error, output_file),
         )
         return incident_id, True
 

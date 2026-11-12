@@ -385,13 +385,19 @@ def _upsert_incident_for_failure(
     try:
         from cron.incidents import get_incident, upsert_incident
 
-        incident_id, _is_new = upsert_incident(
+        incident_id, is_new = upsert_incident(
             job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file,
             failure_type=("script" if job.get("_script_failed") else
                           scheduler_failure_copy.agent_failure_type(error) if agent_declared else None))
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
+        failure_type = incident.get("failure_type") if incident else None
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
+        # The first job to record a shared dependency outage pages. The rest of the
+        # same wave still see ``detected`` because the alert stamp happens after
+        # delivery, so a new row is the only once-per-outage signal.
+        if failure_type == "dependency_unavailable" and not is_new and state == "detected":
+            withheld = True
         return withheld, incident_id
     except Exception as exc:
         logger.debug(
@@ -2589,6 +2595,7 @@ def run_job(
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
     scope = _CronRunScope(job, job_id, execution_id)
+    _dependency_started = time.monotonic()
     try:
         scope.enter()
         # Gate scripts and monitors can acknowledge work. Acquire first so a store outage
@@ -2644,8 +2651,12 @@ def run_job(
     except (Exception, ConfigBackendUnavailable) as e:
         if isinstance(e, CronSessionStoreUnavailable):
             job["_session_store_unavailable"] = True
+        from cron.dependency_timeout import annotate_job_failure
+        named = annotate_job_failure(
+            e, base_url=getattr(agent, "base_url", None) or job.get("base_url"),
+            elapsed=time.monotonic() - _dependency_started)
         error_msg = _merge_script_failure(
-            (False, "", "", f"{type(e).__name__}: {e!s}"), script_error, job=job)[3]
+            (False, "", "", f"{type(named).__name__}: {named!s}"), script_error, job=job)[3]
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
