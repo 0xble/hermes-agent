@@ -171,7 +171,7 @@ async def operation(authority, name, params, actor=None):
             return {'status': 'missing', 'result': None}
         state = await operation(authority, 'status', {'session_id': sid, 'admission_id': row['admission_id']}, actor)
         from gateway.session_local_recovery import restore_local_session_async
-        await restore_local_session_async(authority, sid)
+        await restore_local_session_async(authority, sid, admission_gate=False)
         from gateway.config import Platform
         from gateway.session_local_recovery import local_adapter_map
         policy = local_adapter_map(authority)[Platform.LOCAL].policies[sid]

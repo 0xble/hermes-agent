@@ -113,14 +113,15 @@ async def test_check_native_route_yields_while_store_lock_is_held(monkeypatch):
 async def test_restore_local_session_yields_while_store_lock_is_held(monkeypatch):
     import gateway.session_local_recovery as recovery
     from gateway.config import Platform
+    from gateway.session_authority import SessionAuthority
 
     lock = threading.Lock()
     entered, release = threading.Event(), threading.Event()
     sid, live, prepared, adapter = "sid", object(), object(), object()
-    authority = SimpleNamespace(
-        sessions={sid: live},
-        _require_admission_open=lambda: None,
-    )
+    authority = object.__new__(SessionAuthority)
+    authority.sessions = {sid: live}
+    authority.retiring = False
+    authority.runner = SimpleNamespace(_draining=False)
 
     def restore_entry(*args, **kwargs):
         entered.set()
@@ -337,3 +338,39 @@ def test_liveness_dump_includes_session_store_owner_snapshot():
     detail = snapshot["session_store_locks"]["default"]
     assert detail["acquisition_count"] == 1
     assert detail["owner"]["thread_name"] == "store-writer"
+
+
+def test_shutdown_dump_includes_session_store_owner_snapshot(monkeypatch):
+    from gateway import run_shutdown
+    from gateway.run import GatewayRunner
+    from hermes_loop_guard import LoopGuardedLock
+
+    lock = LoopGuardedLock("session-store lock")
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def hold_lock():
+        with lock:
+            acquired.set()
+            release.wait()
+
+    holder = threading.Thread(target=hold_lock, name="shutdown-store-writer")
+    holder.start()
+    assert acquired.wait()
+    runner = SimpleNamespace(
+        _restart_requested=False, _draining=True, _running=True,
+        _running_agent_count=lambda: 0, _active_cron_job_count=lambda: 0,
+        _active_api_run_count=lambda: 0, _restart_drain_timeout=10.0,
+        _launchd_exit_timeout_s=None, session_store=SimpleNamespace(_lock=lock),
+    )
+    monkeypatch.setattr(run_shutdown, "effective_stop_drain_timeout", lambda _runner: 10.0)
+    monkeypatch.setattr(run_shutdown, "_effective_watchdog_leash", lambda _runner: 70.0)
+    try:
+        snapshot = GatewayRunner._shutdown_watchdog_snapshot(
+            runner, GatewayRunner._StopContext(deferred_count=lambda: 0))
+    finally:
+        release.set()
+        holder.join()
+
+    detail = snapshot["session_store_locks"]["default"]
+    assert detail["owner"]["thread_name"] == "shutdown-store-writer"

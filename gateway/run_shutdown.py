@@ -35,7 +35,7 @@ from gateway.run_common import _UNSET
 from agent.async_utils import cancel_task_with_grace
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
-from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay
+from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay, session_store_lock_snapshot
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -3113,7 +3113,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin):
             "effective_drain_timeout": effective_stop_drain_timeout(self),
             "launchd_exit_timeout_s": getattr(self, "_launchd_exit_timeout_s", None),
             "watchdog_delay_s": _effective_watchdog_leash(self),
-            "phase_elapsed_s": ctx.elapsed() if ctx.started_at is not None else None,
+            "phase_elapsed_s": ctx.elapsed() if ctx.started_at is not None else None, **session_store_lock_snapshot(self),
         }
 
     async def _stop_impl(self) -> None:

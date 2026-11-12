@@ -46,6 +46,40 @@ def test_cron_admission_uses_job_model_and_exact_retry(tmp_path, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_cron_recover_returns_receipt_during_real_drain(tmp_path, monkeypatch):
+    """Recovery observes an already admitted fire while shutdown drains; restoring its local
+    receipt must not be mistaken for a new admission."""
+    from cron import jobs
+    from gateway import run, session_cron
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    from gateway.session_authority import SessionAuthority
+    from hermes_state import SessionDB
+    from tests.fakes.runtime_owner import begin_runtime_epoch
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setattr(jobs, 'get_job', lambda jid: {'id': jid, 'prompt': 'p', 'model': 'm'})
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {}, 'platform_toolsets': {'cli': []}})
+    db = SessionDB(tmp_path / 'state.db')
+    runner = SimpleNamespace(_draining=False, session_store=SessionStore(tmp_path / 'sessions', GatewayConfig()),
+                             adapters={})
+    authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='test', db=db,
+                                 epoch=begin_runtime_epoch(db, instance_id='test'))
+    runner.session_authority = authority
+    monkeypatch.setattr(authority, '_schedule', lambda ref: None)
+    params = {'job_id': 'job', 'request_id': 'fire', 'extra_prompt': 'extra'}
+
+    try:
+        receipt = await session_cron.operation(authority, 'submit', params)
+        runner._draining = True
+        recovered = await session_cron.operation(authority, 'recover', params)
+    finally:
+        db.close()
+
+    assert recovered['session_id'] == receipt['session_id']
+    assert recovered['admission_id']
+
+@pytest.mark.asyncio
 async def test_cron_cancel_between_claim_and_execution_registration_stops_the_job(tmp_path, monkeypatch):
     """A started admission whose execute() has not registered its event yet still honours cancel."""
     from contextlib import nullcontext
