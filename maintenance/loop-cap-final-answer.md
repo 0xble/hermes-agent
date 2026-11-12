@@ -12,6 +12,8 @@ Chat-display delivery tracking follows only `stream_delta_callback`. A successfu
 
 `tests/agent/test_tool_guardrails.py` covers refusal without advancing the executed count. `tests/agent/test_tool_call_guardrail_runtime.py` covers both caps, exhausted and open iteration budgets, one completion, and discarded follow-up tool calls. `tests/agent/test_stream_delivery_display_tts.py` covers display rejection plus TTS success, display success plus TTS rejection, and paired success. Existing iteration-summary tests cover the non-cap completion.
 
+The implementation proof surface is `agent/turn_tool_round.py`, `agent/turn_tool_guardrails.py`, `agent/chat_completion_helpers.py`, and `agent/chat_completion_helpers_cleanup.py`; the latter two sibling modules retain facade import compatibility for existing callers.
+
 ## Upstream disposition and retirement
 
 Retire this record when released upstream gives both per-turn caps one bounded answer from collected results, never executes tools from that answer, and tracks chat display independently of audio delivery. Rollback is the commit carrying `Fork-Patch: loop-cap-final-answer`.
