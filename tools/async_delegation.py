@@ -1446,8 +1446,9 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 def active_count() -> int:
     """Number of live async delegation UNITS (one per completion message: a task group or an ungrouped task)."""
-    with _records_lock:
-        return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+    # Lock-free on purpose: the gateway loop calls this at every turn boundary, and writers hold
+    # _records_lock across state.db commits. list() copies the values in one C call under the GIL.
+    return sum(1 for r in list(_records.values()) if r.get("status") in _LIVE_STATES)
 
 
 def active_records() -> list[dict[str, Any]]:
