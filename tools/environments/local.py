@@ -1089,8 +1089,12 @@ class LocalEnvironment(BaseEnvironment):
         from hermes_constants import get_hermes_home_override
         if override := get_hermes_home_override():
             env["HERMES_HOME"] = override
-        if "HERMES_HOME" not in _strip_default_profile_home(env):
+        # Exclude the launch profile's default only while creating the initial snapshot.
+        # A later persistent-shell export is user state and must be written back.
+        if not self._snapshot_ready and "HERMES_HOME" not in _strip_default_profile_home(env):
             names.add("HERMES_HOME")
+        else:
+            names.discard("HERMES_HOME")
         return tuple(sorted(names))
 
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
