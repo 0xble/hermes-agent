@@ -323,10 +323,16 @@ def tool_refusal(name: str, args: dict) -> str | None:
         return None
     lower = name.lower()
     hindsight_write = "hindsight" in lower and not lower.endswith(("recall", "reflect"))
-    durable = name in {"skill_manage", "goal_set", "loop_set", "cronjob", "cron_create", "request_update", "request_restart"}
+    durable = name in {
+        "skill_manage", "goal_set", "loop_set", "cronjob", "cron_create", "cronjob_manage",
+        "request_update", "request_restart",
+    }
+    background_delegate = name == "delegate_task" and (
+        args.get("background") is True or args.get("survive_restart") is True
+    )
     memory_write = name == "memory" and args.get("action") not in {"read", "list", "view"}
     process = name in {"terminal", "process", "process_manage"} and (
-        args.get("persist_on_release") or args.get("survive_restart"))
-    if hindsight_write or durable or memory_write or process:
+        args.get("background") is True or args.get("persist_on_release") or args.get("survive_restart"))
+    if hindsight_write or durable or background_delegate or memory_write or process:
         return "This durable operation is unavailable in incognito mode."
     return None

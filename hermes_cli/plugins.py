@@ -496,7 +496,8 @@ class PluginContext(PluginCapabilityCtxMixin):
             name=name, toolset=toolset, schema=schema, handler=handler, check_fn=check_fn,
             requires_env=requires_env, is_async=is_async, description=description, emoji=emoji,
             override=override, scope=scope, eager=eager,
-            incognito_safe=self.manifest.incognito_safe is True,
+            incognito_safe=(not self.manifest.incognito_safe_declared
+                            or self.manifest.incognito_safe is True),
         )
         registered = registry.snapshot_registration(name, scope=scope)
         handle = None

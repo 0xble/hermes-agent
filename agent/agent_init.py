@@ -1103,7 +1103,9 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     _publish_session_id(agent.session_id)
     if agent.incognito:
         from agent.incognito import register_session
-        register_session(agent.session_id)
+        from agent.delegation_context import is_delegated_child_context
+        if not is_delegated_child_context():
+            register_session(agent.session_id)
 
     # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
     agent.logs_dir = get_hermes_home() / "sessions"

@@ -127,6 +127,7 @@ class SessionIncognitoMixin:
                 entry.__dict__.clear()
                 entry.__dict__.update(saved.__dict__)
                 self._lazy("_incognito_histories", dict).pop(entry.session_id, None)
+                self._lazy("_incognito_restarted_sessions", set).discard(session_key)
                 register_session(entry.session_id, False)
                 register_session(current_session_id, False)
                 register_session(session_key, False)

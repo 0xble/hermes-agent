@@ -77,6 +77,34 @@ class TestSessionStatePersistence(unittest.TestCase):
         self.assertEqual(second["kernel"]["reused"], True)
         self.assertEqual(second["kernel"]["execution_count"], 2)
 
+    def test_private_session_persists_state_and_keeps_kernel_artifacts_in_interval(self, tmp_path):
+        from agent.incognito import incognito_scope, register_session
+        from agent.incognito_private_dir import bind_private_session, discard_private_dir
+
+        sid = "private-kernel-session"
+        interval = tmp_path / "interval"
+        interval.mkdir()
+        register_session(sid, True)
+        bind_private_session(sid, interval)
+        try:
+            with _kernel_config(), incognito_scope(session_id=sid):
+                first = _run("import os, tempfile; x = 41; print(os.environ['TMPDIR']); print(tempfile.mkstemp()[1])")
+                second = _run("print(x + 1)")
+            self.assertEqual(first["status"], "success", first)
+            self.assertEqual(second["status"], "success", second)
+            self.assertIn("42", second["output"])
+            self.assertTrue(second["kernel"]["reused"])
+            kernel = next(iter(_KERNELS.values()))
+            self.assertTrue(Path(kernel.tmpdir).is_relative_to(interval))
+            self.assertTrue(Path(first["output"].splitlines()[-1]).is_relative_to(interval))
+            self.assertTrue(Path(kernel.sock_path).is_relative_to(interval))
+            self.assertTrue(all(path.is_relative_to(interval) for path in interval.rglob("*")))
+        finally:
+            shutdown_all_kernels()
+            register_session(sid, False)
+            discard_private_dir(sid)
+        self.assertFalse(interval.exists())
+
     def test_reset_discards_state(self):
         with _kernel_config():
             _run("x = 41")

@@ -272,6 +272,82 @@ async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify
     assert not is_incognito(sid)
 
 
+@pytest.mark.asyncio
+async def test_foreground_delegate_returns_private_child_result_and_reuses_interval(private_route, monkeypatch):
+    """The real delegate callback runs a foreground child inside its parent's private interval."""
+    from agent import incognito_private_dir as private_dirs
+    from agent.incognito import is_incognito
+    from tools.delegate_tool import delegate_task
+
+    runner, _store, entry, _config, event, db = private_route
+    provider = _ProviderBoundary()
+    monkeypatch.setattr("agent.process_bootstrap.OpenAI", provider)
+    monkeypatch.setattr("tools.delegate_tool._get_max_spawn_depth", lambda: 2)
+    started(runner, db)
+    key = entry.session_key
+    assert "private-model" in await incognito(runner, event, "/incognito on")
+    parent_path = private_dirs.private_dir_for_session(entry.session_id, create=False)
+    assert parent_path is not None and is_incognito(entry.session_id)
+
+    try:
+        # Resolve a production-built parent, then use the same callback path that an orchestrator child uses.
+        provider.replies = ["parent ready"]
+        runner._session_state(key).persistent.run_generation = 1
+        incoming = event("prime private parent")
+        with event_scope(runner, incoming):
+            assert await runner._handle_message_with_agent(
+                incoming, incoming.source, key, 1
+            ) == "parent ready"
+        parent = runner._cached_agent_for(key)
+        assert parent is not None and parent.incognito is True
+
+        bound, resolved, released = [], [], []
+        real_bind = private_dirs.bind_private_session
+        real_private = private_dirs.private_dir_for_session
+        real_release = private_dirs.release_private_session
+
+        def record_bind(session_id, path):
+            bound.append((session_id, path))
+            return real_bind(session_id, path)
+
+        def record_private(session_id, *, create=True):
+            path = real_private(session_id, create=create)
+            if session_id != parent.session_id and path is not None:
+                resolved.append((session_id, path))
+            return path
+
+        def record_release(session_id):
+            if session_id != parent.session_id:
+                released.append(session_id)
+            return real_release(session_id)
+
+        monkeypatch.setattr(private_dirs, "bind_private_session", record_bind)
+        monkeypatch.setattr(private_dirs, "private_dir_for_session", record_private)
+        monkeypatch.setattr(private_dirs, "release_private_session", record_release)
+        parent._delegate_depth = 1  # A child/orchestrator callback is the foreground route.
+        provider.replies = ["CHILD RESULT"]
+        result = json.loads(parent._dispatch_delegate_task({"goal": "return the child result"}))
+        assert result.get("results", [{}])[0].get("summary") == "CHILD RESULT", result
+
+        assert bound and bound[-1][0] != parent.session_id
+        child_session_id, child_path = bound[-1]
+        assert child_path == parent_path
+        assert (child_session_id, parent_path) in resolved
+        assert released and released[-1] == child_session_id
+
+        refused = json.loads(delegate_task(
+            goal="must not become durable", background=True, parent_agent=parent,
+        ))
+        assert "durable async delegation" in refused["error"].lower()
+    finally:
+        if entry.incognito:
+            await incognito(runner, event, "/incognito off")
+
+    assert not parent_path.exists()
+    assert private_dirs.private_dir_for_session(child_session_id, create=False) is None
+    assert not list(private_dirs._configured_root().glob(private_dirs.PRIVATE_DIR_PREFIX + "*"))
+
+
 def test_failure_class_keeps_only_source_code_names():
     """A dynamically built type or code object can carry arbitrary text in its names."""
     from agent.incognito import failure_class

@@ -96,7 +96,7 @@ def test_two_private_topics_have_separate_directories():
     assert all(path.is_dir() for path in paths)
 
 
-def test_unattributed_backstop_is_not_a_topic_directory(monkeypatch):
+def test_unattributed_public_work_does_not_share_private_cleanup(monkeypatch):
     from agent import incognito
     monkeypatch.setattr(incognito, "_sessions", set())
     register_session("private-a")
@@ -104,12 +104,38 @@ def test_unattributed_backstop_is_not_a_topic_directory(monkeypatch):
         private_root = private_dirs.private_path_for_current_session()
     with incognito_scope(False, "public-b"):
         assert private_dirs.disposable_path_for_current_session() is None
-    backstop = private_dirs.disposable_path_for_current_session()
-    assert backstop is not None and backstop.name == "unattributed"
-    assert private_root not in backstop.parents
+    public_file = private_dirs.disposable_path_for_current_session()
+    assert public_file is None
     register_session("private-a", False)
     private_dirs.discard_private_dir("private-a")
-    assert not backstop.exists()
+    assert private_root is not None and not private_root.exists()
+
+
+def test_private_delegated_child_uses_parent_interval():
+    from agent import incognito
+    from agent.delegation_context import delegated_child_context
+
+    register_session("private-a")
+    with incognito_scope(True, "private-a"):
+        parent_root = private_dirs.private_path_for_current_session()
+    assert parent_root is not None
+    with delegated_child_context("child-session", parent_session_id="private-a"):
+        with incognito_scope(True, "child-session"):
+            child_root = private_dirs.private_dir_for_session("child-session")
+            assert child_root == parent_root
+            assert not incognito.is_registered("child-session")
+            child_env = {"TMPDIR": "/tmp/public", "HERMES_HOME": str(parent_root)}
+            assert apply_scratch_tmp_env(child_env)
+            child_file = Path(child_env["TMPDIR"]) / "child.txt"
+            child_file.write_text("private child")
+    register_session("child-session", False)
+    private_dirs.release_private_session("child-session")
+    assert child_file.exists()
+    register_session("private-a", False)
+    private_dirs.discard_private_dir("private-a")
+    assert not parent_root.exists()
+    with incognito_scope(False, "public-after"):
+        assert private_dirs.disposable_path_for_current_session() is None
 
 
 def test_cleanup_failure_is_logged_without_raising(caplog, monkeypatch):

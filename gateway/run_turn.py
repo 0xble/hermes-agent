@@ -3011,6 +3011,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 from gateway.copy_blocks import strip_copy_blocks
                 media_delivered = bool(await self._deliver_media_from_response(
                     strip_copy_blocks(response), event, adapter))
+            response = self._prepend_incognito_restart_notice(session_entry, response)
+            if response != agent_result.get("final_response") and adapter:
+                notice = response.split("\n", 1)[0]
+                try:
+                    await adapter.send(source.chat_id, notice, metadata=self._event_thread_metadata(event, source))
+                except Exception as _e:
+                    logger.debug("streamed incognito restart notice send failed: %s", _e)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter:
                 try:
@@ -3035,7 +3042,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
             with suppress(Exception):
                 from gateway.stream_recovery import unmark_recovered_reply
                 event._streamed_final_response = unmark_recovered_reply(
-                    str(agent_result.get("final_response") or ""), agent_result)
+                    str(response or ""), agent_result)
             # The streamed body was already delivered; bind its actual visible message id to
             # this turn's exact assistant row. For split streams this is the last chunk id.
             delivered_id = agent_result.get("_delivered_platform_message_id")

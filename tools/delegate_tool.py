@@ -338,6 +338,11 @@ def _build_child_agent(
             effective_requested_provider=rt.get("requested_provider"),
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if private:
+        with _quiet("Failed to bind child to parent private interval: %s"):
+            from agent.incognito_private_dir import bind_private_session, private_dir_for_session
+            parent_private_dir = private_dir_for_session(parent_sid)
+            bind_private_session(getattr(child, "session_id", None), parent_private_dir)
     # An inherited explicit pick stays explicit, so an orchestrator's own children keep it too.
     if profile_home is None and explicit_parent_reasoning(parent_agent) is not None:
         rc = child.reasoning_config

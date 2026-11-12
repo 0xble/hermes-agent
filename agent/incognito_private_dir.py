@@ -104,12 +104,22 @@ def _new_dir() -> Path:
 
 
 def private_dir_for_session(session_id: str | None, *, create: bool = True) -> Path | None:
-    """Return the interval directory for a registered private session."""
+    """Return the interval directory for a registered private session.
+
+    Delegated children resolve through their live parent interval rather than
+    creating a second registered directory.
+    """
     if not isinstance(session_id, str) or not session_id:
         return None
     from agent.incognito import is_registered
     if not is_registered(session_id):
-        return None
+        from agent.delegation_context import delegated_child_parent_session_id, is_delegated_child_context
+        if not is_delegated_child_context():
+            return None
+        parent_id = delegated_child_parent_session_id()
+        if not parent_id or not is_registered(parent_id):
+            return None
+        session_id = parent_id
     with _lock:
         path = _session_dirs.get(session_id)
         if path is None or not path.exists():
@@ -120,11 +130,49 @@ def private_dir_for_session(session_id: str | None, *, create: bool = True) -> P
         return path
 
 
+def private_subdir_for_current_session(relative: str = "") -> Path | None:
+    """Return an owner-only child of the active private interval, or ``None`` when public.
+
+    The caller must be inside a named private session; refusing to invent an identity keeps
+    concurrent sessions from sharing artifacts.
+    """
+    from agent.incognito import current_session_id, is_incognito
+    if not is_incognito():
+        return None
+    session_id = current_session_id()
+    if not session_id:
+        return None
+    root = private_dir_for_session(session_id)
+    if root is None:
+        return None
+    path = root / relative if relative else root
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def bind_private_session(session_id: str | None, path: Path | None) -> None:
     """Bind a routing key alias to an existing interval directory."""
-    if isinstance(session_id, str) and session_id and path is not None:
-        with _lock:
-            _session_dirs[session_id] = path
+    if not isinstance(session_id, str) or not session_id or path is None:
+        return
+    orphan = None
+    with _lock:
+        previous = _session_dirs.get(session_id)
+        _session_dirs[session_id] = path
+        if previous is not None and previous != path and previous not in _session_dirs.values():
+            orphan = previous
+    if orphan is not None:
+        _remove(orphan)
+
+
+def release_private_session(session_id: str | None) -> None:
+    """Release a child alias without deleting its parent interval directory."""
+    if not isinstance(session_id, str) or not session_id:
+        return
+    with _lock:
+        path = _session_dirs.pop(session_id, None)
+        still_bound = path is not None and path in _session_dirs.values()
+    if path is not None and not still_bound:
+        _remove(path)
 
 
 def discard_private_dir(session_id: str | None) -> None:
@@ -137,6 +185,12 @@ def discard_private_dir(session_id: str | None) -> None:
         for key in aliases:
             _session_dirs.pop(key, None)
     from agent.incognito import any_incognito_sessions, register_session
+    # Dispose private execute_code kernels before removing their staging/RPC directory.
+    try:
+        from tools.code_kernel import shutdown_kernels_for_owner
+        shutdown_kernels_for_owner(session_id)
+    except Exception:
+        logger.debug("Could not dispose private kernels during interval cleanup", exc_info=True)
     for key in aliases:
         register_session(key, False)
     root = path.parent if path is not None else _configured_root()
@@ -160,20 +214,13 @@ def private_path_for_current_session() -> Path | None:
 
 
 def disposable_path_for_current_session() -> Path | None:
-    """Resolve disposable storage for a private identity, or an unattributed backstop."""
-    path = private_path_for_current_session()
-    if path is not None:
-        return path
-    from agent.incognito import any_incognito_sessions, current_session_id
-    if current_session_id() is not None or not any_incognito_sessions():
-        return None
-    with _lock:
-        paths = set(_session_dirs.values())
-    if not paths:
-        return None
-    root = next(iter(paths)).parent / "unattributed"
-    root.mkdir(parents=True, exist_ok=True)
-    return root
+    """Resolve disposable storage for a named private session only.
+
+    An unnamed call is not a public thread. It also must not share the
+    unattributed directory, because parent off deletes that directory and would
+    remove files the public thread did not own.
+    """
+    return private_path_for_current_session()
 
 
 def private_subdir_for_current_session(relative: str) -> Path | None:

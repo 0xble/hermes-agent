@@ -400,6 +400,9 @@ class PluginManifest:
     # ``{endonym, rtl}`` from the mapping form of a ``provides_locales`` entry.
     # Conversation content reaches callbacks only with an explicit YAML boolean opt-in.
     incognito_safe: bool = False
+    # Distinguish an omitted declaration (tool callbacks are private-safe by default) from
+    # an explicit false declaration, which remains fail-closed.
+    incognito_safe_declared: bool = False
     provides_locales: list[str] = field(default_factory=list)
     locale_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
 
@@ -553,6 +556,7 @@ def parse_manifest_file(
         provides_locales, locale_metadata = parse_provides_locales(data.get("provides_locales"), key)
         return PluginManifest(
             name=name, version=str(data.get("version", "")), incognito_safe=data.get("incognito_safe") is True,
+            incognito_safe_declared="incognito_safe" in data,
             description=data.get("description", ""), author=_display_author(data.get("author", "")),
             requires_env=data.get("requires_env", []),
             provides_tools=data.get("provides_tools", []),

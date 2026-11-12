@@ -714,7 +714,9 @@ def _bind_rpc_socket(kernel: SessionKernel) -> str:
         rpc_endpoint = f"tcp://{host}:{port}"
     else:
         from hermes_constants import socket_safe_tmpdir
-        sock_tmpdir = socket_safe_tmpdir()
+        from agent.incognito_private_dir import private_subdir_for_current_session
+        private_root = private_subdir_for_current_session("rpc")
+        sock_tmpdir = str(private_root) if private_root is not None else socket_safe_tmpdir()
         rpc_endpoint = kernel.sock_path = os.path.join(sock_tmpdir, f"hermes_rpc_{uuid.uuid4().hex}.sock")
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(kernel.sock_path)
@@ -772,7 +774,10 @@ def _spawn_locked(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     kernel.ensure_open()
     kernel.current_task = task_id
     kernel.current_caller = _current_caller(task_id)
-    kernel.tmpdir = tempfile.mkdtemp(prefix="hermes_kernel_")
+    from agent.incognito_private_dir import private_subdir_for_current_session
+    private_root = private_subdir_for_current_session("kernel")
+    kernel.tmpdir = (tempfile.mkdtemp(prefix="hermes_kernel_", dir=str(private_root))
+                     if private_root is not None else tempfile.mkdtemp(prefix="hermes_kernel_"))
     kernel.rpc_token = secrets.token_urlsafe(32)
     kernel.sentinel = "@@HERMES-KERNEL-" + secrets.token_urlsafe(16) + "@@"
     rpc_endpoint = _bind_rpc_socket(kernel)
@@ -781,6 +786,10 @@ def _spawn_locked(kernel: SessionKernel, *, child_python: str, child_cwd: str,
         Path(kernel.tmpdir, name).write_text(src, encoding="utf-8")
     child_env = _build_child_env(rpc_endpoint=rpc_endpoint, rpc_token=kernel.rpc_token,
                                  tmpdir=kernel.tmpdir, child_python=child_python)
+    if private_root is not None:
+        # User code and subprocesses inherit the interval-scoped scratch directory.
+        for key in ("TMPDIR", "TMP", "TEMP"):
+            child_env[key] = kernel.tmpdir
     child_env["HERMES_KERNEL_SENTINEL"] = kernel.sentinel
     # Full clipped stdout spills to the kernel's tmpdir so the agent can read_file the middle.
     child_env["HERMES_KERNEL_SPILL_DIR"] = kernel.tmpdir

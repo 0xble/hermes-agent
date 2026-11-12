@@ -965,17 +965,20 @@ class ToolRegistry:
             from agent.incognito import is_incognito
             if is_incognito(kwargs.get("session_id")):
                 return tool_error("This plugin tool is unavailable in incognito mode.")
+        from agent.incognito import incognito_scope, is_incognito
         try:
-            # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
-            # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
-            # plugin handler is not broken by every field the dispatcher injects (#68318).
-            kwargs = _kwargs_accepted_by(entry.handler, kwargs)
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
+            private_session = kwargs.get("session_id")
+            with incognito_scope(enabled=is_incognito(private_session), session_id=private_session):
+                # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
+                # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
+                # plugin handler is not broken by every field the dispatcher injects (#68318).
+                kwargs = _kwargs_accepted_by(entry.handler, kwargs)
+                if entry.is_async:
+                    from model_tools import _run_async
+                    result = _run_async(entry.handler(args, **kwargs))
+                else:
+                    result = entry.handler(args, **kwargs)
+                return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
             logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
