@@ -36,7 +36,7 @@ from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
-from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin
+from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 
 # Log-record parity with the origin module.
@@ -221,17 +221,6 @@ def _mark_internal_notification(text: str) -> str:
     if any(text.endswith(footer) for footer in _INTERNAL_NOTIFICATION_FOOTERS):
         return text
     return text + "\n\n" + INTERNAL_NOTIFICATION_FOOTER
-
-
-def _raw_process_event_session_id(evt: dict) -> str:
-    """Recognize API routes, not malformed structured or partial messaging routes."""
-    session_key = str(evt.get("session_key") or "").strip()
-    platform = str(evt.get("platform") or "").strip().lower()
-    if session_key.startswith("agent:") or platform not in {"", "api_server"}:
-        return ""
-    if not platform and any(evt.get(field) for field in ("chat_id", "chat_type", "thread_id")):
-        return ""
-    return str(evt.get("origin_session_id") or session_key or "").strip()
 
 
 def _media_send_succeeded(result) -> bool:

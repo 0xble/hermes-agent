@@ -12,6 +12,17 @@ from gateway.session import SessionSource
 logger = logging.getLogger("gateway.run")
 
 
+def _raw_process_event_session_id(evt: dict) -> str:
+    """Recognize API routes, not malformed structured or partial messaging routes."""
+    session_key = str(evt.get("session_key") or "").strip()
+    platform = str(evt.get("platform") or "").strip().lower()
+    if session_key.startswith("agent:") or platform not in {"", "api_server"}:
+        return ""
+    if not platform and any(evt.get(field) for field in ("chat_id", "chat_type", "thread_id")):
+        return ""
+    return str(evt.get("origin_session_id") or session_key or "").strip()
+
+
 class GatewayProcessEventSourcesMixin:
     def _build_process_event_source(self, evt: dict):
         """Bound failed recovery work without discarding a process or its completion."""
@@ -44,7 +55,6 @@ class GatewayProcessEventSourcesMixin:
         Prefer the persisted session-store origin; the active foreground event causes cross-topic bleed.
         """
         from gateway.run import _parse_session_key
-        from gateway.run_notifications import _raw_process_event_session_id
         session_key = str(evt.get("session_key") or "").strip()
         event_profile = str(evt.get("profile") or "").strip() or None
 

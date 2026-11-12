@@ -277,7 +277,7 @@ async def test_adapter_boundary_strips_the_transcript_uid_and_still_stamps_it(tm
             return SendResult(success=True, message_id="img-1")
 
     adapter = _MediaAdapter(PlatformConfig(enabled=True, token="***"), Platform.DISCORD)
-    adapter._session_store = store
+    adapter._session_store = store._store
     adapter._owner_profile = None
     adapter.gateway_runner = None
     runner = object.__new__(GatewayRunner)
