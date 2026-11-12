@@ -232,8 +232,12 @@ def _apply_additive_schema(path: Path, budget: _Budget | None = None) -> None:
     budget.check()
     with closing(connect_tracked(path, tracking_path=path, timeout=budget.busy_timeout(),
                                  isolation_level=None)) as conn:
-        _reapply_durability_barriers(conn)
         budget.arm(conn)
+        _reapply_durability_barriers(conn)
+        # The durability PRAGMAs are best-effort on macOS and may themselves parse the schema.
+        # Check the same deadline before opening the write transaction; otherwise a short browse
+        # can hold the profile lock beyond its advertised budget before DDL even begins.
+        budget.check()
         conn.execute('BEGIN IMMEDIATE')
         try:
             cursor = conn.cursor()
