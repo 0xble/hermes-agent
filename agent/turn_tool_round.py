@@ -16,6 +16,7 @@ from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id, normalize_provider_tool_call_ids
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
+from agent.turn_tool_guardrails import handle_tool_cap_answer
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -231,28 +232,10 @@ def run_tool_round(
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
         if decision.code in {"loop_web_search_cap", "loop_subagent_cap"}:
-            # Every refused call already has a synthetic tool result. Allow one bounded
-            # answer from the collected results, but never run tools returned by it.
-            _turn_exit_reason = "tool_cap_answer"
-            try:
-                # This completion bypasses the normal request lifecycle. Prior tool-round
-                # commentary is not evidence that this final answer reached chat display.
-                agent._reset_stream_delivery_tracking()
-                final_response = agent._handle_max_iterations(messages, api_call_count, tool_cap=decision)
-            except InterruptedError:
-                from agent.interrupt_control import interrupted_during_api_call_reason
-                interrupted = True
-                _turn_exit_reason = interrupted_during_api_call_reason(agent)
-                final_response = ""
-            # A cap completion may already have reached display through its stream.
-            # Replay only when chat display did not accept the complete answer.
-            if final_response:
-                agent._safe_print(f"\n{final_response}\n")
-                if agent.stream_delta_callback and not getattr(agent, "_hold_stream", False):
-                    with suppress(Exception):
-                        if not agent._interim_content_fully_streamed(final_response):
-                            agent.stream_delta_callback(final_response)
-                        agent.stream_delta_callback(None)
+            cap_verdict = handle_tool_cap_answer(agent, messages, api_call_count, decision)
+            final_response = cap_verdict.final_response
+            interrupted = cap_verdict.interrupted
+            _turn_exit_reason = cap_verdict.turn_exit_reason
             return _verdict("break")
         halt_reply = _end_turn_on_guardrail_halt(agent, messages)
         if halt_reply is not None:
