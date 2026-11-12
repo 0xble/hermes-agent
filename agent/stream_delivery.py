@@ -60,12 +60,17 @@ class StreamDeliveryMixin:
             return False
 
     def _deliver_to_stream_callbacks(self, text: str) -> bool:
-        """Send ``text`` to the display + TTS delta callbacks; True if at least one accepted it.
-        Nothing leaves while a ``hold_stream`` plugin holds this turn's reply (``_hold_stream``)."""
+        """Send text to display and TTS; return only whether display accepted it.
+
+        Audio delivery is a separate side effect. It must not count as chat-display
+        delivery, because streamed-text tracking controls whether a later final-answer
+        fallback replays text to the chat surface.
+        """
         if getattr(self, "_hold_stream", False):
             return False
-        results = [self._call_quietly(cb, text) for cb in (self.stream_delta_callback, self._stream_callback)]
-        return any(results)
+        display_delivered = self._call_quietly(getattr(self, "stream_delta_callback", None), text)
+        self._call_quietly(getattr(self, "_stream_callback", None), text)
+        return display_delivered
 
     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
