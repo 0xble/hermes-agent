@@ -637,6 +637,17 @@ so unreviewed remembered resolutions cannot silently resolve a new release confl
 - **Retirement:** Remove when the maintained upstream update path preserves live `origin/main` commits and unmerged installed candidates with equivalent carry-forward, conflict, receipt, override, and orphan-rescue coverage.
 - **Rollback:** Revert the commits carrying `Fork-Patch: update-main-drop-guard`.
 
+## Active patch record: reaction outbound identity
+
+Fork-Patch: evidence.
+
+- **Patch identity:** `evidence`.
+- **Load when:** changing outbound `platform_message_id` stamping, Slack reaction forwarding, or the gateway facade line-cap offsets that keep this patch under the code-health ratchet.
+- **Behavior:** A successful Telegram or Slack send stamps `platform_message_id` on the assistant row named by the delivery `message_uid` (newest content match only when a legacy caller has no row identity). Slack reactions enter the authorized platform-event seam with actor identity; the lifecycle reaction hook does not also dispatch the multiplex bus. `connect_adapter_with_timeout` and the adapter auth-check builder live in `gateway/run_adapters_connect.py` and `gateway/run_adapters_auth.py`; conversation-generation bumps live in `hermes_state_generation.py`. The facade methods remain the call sites.
+- **Source surfaces:** `gateway/run_adapters.py`, `gateway/run_adapters_connect.py`, `gateway/run_adapters_auth.py`, `hermes_state_messages.py`, `hermes_state_generation.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_state/test_outbound_platform_message.py tests/gateway/test_multiplex_interactive_auth.py tests/gateway/test_restart_drain_recovery_dedup.py`.
+- **Rollback:** Revert the commits carrying `Fork-Patch: evidence`.
+
 ## Eager plugin tools
 
 Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).

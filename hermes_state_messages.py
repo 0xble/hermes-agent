@@ -66,13 +66,6 @@ _MESSAGE_WRITE_COLUMNS = tuple(
     re.findall(r"\w+", _INSERT_MESSAGE_SQL.split("(", 1)[1].split(")", 1)[0])
 )
 _MESSAGE_SCHEMA_KEYS = frozenset(_MESSAGE_WRITE_COLUMNS) | {"id", "compacted", "display_order"}
-_BUMP_GENERATION_SQL = """
-            INSERT INTO conversation_generations (source, session_key, generation)
-            VALUES (?, ?, 1)
-            ON CONFLICT(source, session_key) DO UPDATE
-                SET generation = conversation_generations.generation + 1
-            """
-
 _TURN_LEASE_ROW_SQL = "SELECT holder, expires_at FROM session_turn_leases WHERE conversation_id = ?"
 _DELETE_COMPRESSION_LOCK_SQL = "DELETE FROM compression_locks WHERE session_id = ? AND holder = ?"
 _DISPLAY_ACTIVE_CLAUSE = " AND (active = 1 OR compacted = 1)"
@@ -145,17 +138,8 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
     """Message append/replace/rewind, reactions, resume conversations, replay dedupe (detached results: the base)."""
 
     def _bump_conversation_generation(self, conn, session_id: str, end_reason: str) -> None:
-        """Advance the peer's conversation generation past a boundary, in the txn that writes it. Only
-        ``_RESET_END_REASONS`` count (compression continues one conversation). Never derived from session
-        rows (deletes/prunes could re-emit a retired affinity identity); it only ever increments."""
-        if end_reason not in _RESET_END_REASONS:
-            return
-        row = conn.execute("SELECT source, session_key FROM sessions WHERE id = ?", (session_id,)).fetchone()
-        if row is None:
-            return
-        source, session_key = (str(row[k] or "").strip() for k in ("source", "session_key"))
-        if source and session_key:
-            conn.execute(_BUMP_GENERATION_SQL, (source, session_key))
+        from hermes_state_generation import bump_conversation_generation
+        bump_conversation_generation(self, conn, session_id, end_reason)
 
     @classmethod
     def _encode_content(cls, content: Any) -> Any:
