@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
+from urllib.parse import quote
 
 import pytest
 
@@ -248,3 +249,66 @@ async def test_proxy_turn_writes_the_uid_delivery_already_named(tmp_path, monkey
     assert stamped is True
     assert rows[0]["message_uid"] == named == event._transcript_message_uid
     assert rows[0]["platform_message_id"] == "reply-proxy"
+
+
+@pytest.mark.asyncio
+async def test_adapter_boundary_strips_the_transcript_uid_and_still_stamps_it(tmp_path, monkeypatch):
+    """Queued media and the send retry see public metadata; the stamp still names the row."""
+    from gateway.outbound_reply import adapter_send_metadata, queued_reply_metadata
+    from gateway.run import GatewayRunner
+
+    store = _real_store(tmp_path, monkeypatch)
+    source = SessionSource(
+        platform=Platform.DISCORD, chat_id="discord-thread", chat_type="group", thread_id="discord-thread")
+    entry = await store.get_or_create_session(source)
+    assistant = {"role": "assistant", "content": "first response", "message_uid": "uid-media"}
+    await store.append_to_transcript(entry.session_id, assistant)
+    media_path = tmp_path / "queued-first-response.png"
+    media_path.write_bytes(b"not-a-real-png-but-a-real-file")
+
+    class _MediaAdapter(_Adapter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.sent: list = []
+            self.image_batches: list = []
+
+        async def send_multiple_images(self, chat_id, images, metadata=None, human_delay=0.0):
+            self.image_batches.append({"chat_id": chat_id, "images": images, "metadata": metadata})
+            return SendResult(success=True, message_id="img-1")
+
+    adapter = _MediaAdapter(PlatformConfig(enabled=True, token="***"), Platform.DISCORD)
+    adapter._session_store = store
+    adapter._owner_profile = None
+    adapter.gateway_runner = None
+    runner = object.__new__(GatewayRunner)
+    runner.adapters = {Platform.DISCORD: adapter}
+    runner._delivery_adapter_for = lambda source: adapter  # type: ignore[method-assign]
+    runner.session_store = store._store  # type: ignore[assignment]
+    event = MessageEvent(
+        text="hello", message_type=MessageType.TEXT, message_id="in-media", source=source)
+    event._transcript_message_uid = "uid-media"  # type: ignore[attr-defined]
+    metadata = queued_reply_metadata({"thread_id": "discord-thread"}, {"messages": [assistant]})
+    assert metadata is not None and metadata["_transcript_message_uid"] == "uid-media"
+
+    delivered = await runner._deliver_queued_first_response(
+        f"first response\nMEDIA:{media_path}", source=source, adapter=adapter, metadata=metadata,
+        event_message_id="in-media", text_already_delivered=False, deliver_media=True,
+        session_key=entry.session_key, inbound_message_id="in-media")
+    tasks = list(getattr(store, "_outbound_stamp_tasks", ()))
+    if tasks:
+        await asyncio.wait(tasks, timeout=2)
+
+    rows = [row for row in store._store._db.get_messages(entry.session_id) if row["role"] == "assistant"]
+    assert delivered is True
+    assert adapter.sent[0][1] == {"thread_id": "discord-thread", "notify": True}
+    assert adapter.image_batches == [{
+        "chat_id": "discord-thread",
+        "images": [(f"file://{quote(str(media_path))}", "")],
+        "metadata": {"thread_id": "discord-thread"},
+    }]
+    assert all("_transcript_message_uid" not in (item[1] or {}) for item in adapter.sent)
+    assert rows[0]["message_uid"] == "uid-media"
+    assert rows[0]["platform_message_id"] == "reply-1"
+    assert adapter_send_metadata(None) is None
+    assert adapter_send_metadata({"thread_id": "7"}) == {"thread_id": "7"}
+    assert adapter_send_metadata({"_transcript_message_uid": "only"}) is None

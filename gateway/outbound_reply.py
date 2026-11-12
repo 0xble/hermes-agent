@@ -99,3 +99,16 @@ def reply_uid_for_final(event: Any, metadata: dict | None) -> str | None:
         return None
     uid = (refreshed or {}).get("_transcript_message_uid")
     return str(uid) if isinstance(uid, str) and uid else None
+
+
+def adapter_send_metadata(metadata: dict | None) -> dict | None:
+    """Public adapter metadata, without the gateway-internal transcript UID.
+
+    The UID names the assistant row the stamp writes after a successful send.
+    Adapters and public metadata assertions must not see it. None stays None
+    so callers that distinguish absent metadata from an empty dict stay exact.
+    """
+    if not isinstance(metadata, dict) or "_transcript_message_uid" not in metadata:
+        return metadata
+    public = {key: value for key, value in metadata.items() if key != "_transcript_message_uid"}
+    return public or None

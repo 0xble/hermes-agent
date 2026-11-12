@@ -499,16 +499,19 @@ class GatewayNotificationsMixin(
                 ext = Path(media_path).suffix.lower()
                 return ext in _IMAGE_EXTS and not is_voice and not force_document_attachments
 
+            from gateway.outbound_reply import adapter_send_metadata
             image_paths = [p for p, v in media_files if _is_photo(p, v)]
             non_image_media = [(p, v) for p, v in media_files if not _is_photo(p, v)]
             # Local images and URL images go out in one batch so a platform that bundles native
             # multi-attachment sends (Signal) still gets a single call. ``[[as_document]]`` only
             # applies to local files: a URL has no file to hand to send_document.
+            adapter_meta = adapter_send_metadata(_thread_meta)
             if image_paths or url_images:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
                     images.extend(url_images)
-                    _res = await adapter.send_multiple_images(chat_id=chat_id, images=images, metadata=_thread_meta)
+                    _res = await adapter.send_multiple_images(
+                        chat_id=chat_id, images=images, metadata=adapter_meta)
                     delivered_any = delivered_any or _media_send_succeeded(_res)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
@@ -517,14 +520,14 @@ class GatewayNotificationsMixin(
                     ext = Path(media_path).suffix.lower()
                     if should_send_media_as_audio(event.source.platform, ext, is_voice=is_voice):
                         _res = await adapter.send_voice(
-                            chat_id=chat_id, audio_path=media_path, metadata=_thread_meta, is_voice=is_voice,
+                            chat_id=chat_id, audio_path=media_path, metadata=adapter_meta, is_voice=is_voice,
                         )
                         delivered_any = delivered_any or _media_send_succeeded(_res)
                     elif ext in _VIDEO_EXTS:
-                        _res = await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=_thread_meta)
+                        _res = await adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=adapter_meta)
                         delivered_any = delivered_any or _media_send_succeeded(_res)
                     else:
-                        _res = await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=_thread_meta)
+                        _res = await adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=adapter_meta)
                         delivered_any = delivered_any or _media_send_succeeded(_res)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)

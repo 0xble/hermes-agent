@@ -29,6 +29,7 @@ from agent.proxy_bypass import first_proxy_env_value, should_bypass_proxy as _sh
 from gateway.copy_blocks import (
     restore_inline_copy_bodies, split_copy_blocks_protected, strip_copy_blocks)
 
+from gateway.outbound_reply import adapter_send_metadata
 from gateway.platforms.reaction_lifecycle import reaction_operation
 
 logger = logging.getLogger(__name__)
@@ -3311,6 +3312,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         the turn-level delivery tracker records; every override must return the same
         aggregate, or a media-only turn on that platform reports FAILURE (#106153)."""
         delivered = False
+        public_metadata = adapter_send_metadata(metadata)
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
@@ -3325,7 +3327,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 else:
                     sender, url_kw = self.send_image, {"image_url": image_url}
                 img_result = await sender(
-                    chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=metadata)
+                    chat_id=chat_id, **url_kw, caption=alt_text or None, metadata=public_metadata)
                 if not img_result.success:
                     logger.error("[%s] Failed to send image: %s", self.name, img_result.error)
                 else:
@@ -3408,10 +3410,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         None means suppressed, NOT successfully sent. Transport receipts/exceptions
         pass through unchanged; logs and producer state belong outside this boundary.
         Existing routing/stream metadata is preserved, never inferred from text.
+        The transcript UID is gateway-internal and is stripped before the send.
         """
         if not self.warning_notifications_enabled(logical_platform, chat_id=chat_id, metadata=metadata):
             return None
-        return await self.send(chat_id, content, reply_to=reply_to, metadata=metadata)
+        return await self.send(
+            chat_id, content, reply_to=reply_to, metadata=adapter_send_metadata(metadata))
 
     async def emit_media_warning(
         self, chat_id: str, notice: str, *, caption=None, reply_to=None, metadata=None,
@@ -3429,7 +3433,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if result is not None:
             return result
         if caption:
-            await self.send(chat_id, caption, reply_to=reply_to, metadata=metadata)
+            await self.send(chat_id, caption, reply_to=reply_to, metadata=adapter_send_metadata(metadata))
         return SendResult(success=False, error=notice)
 
     def warning_text(self, visible: str, hidden: Optional[str] = "", *, logical_platform=None, chat_id=None, metadata=None) -> Optional[str]:
@@ -4088,8 +4092,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         max_retries: int = 2, base_delay: float = 2.0) -> SendResult:
         """Send with exponential-backoff retry on transient network errors; permanent
         failures fall back to a plain-text send, exhausted retries notify the user."""
+        public_metadata = adapter_send_metadata(metadata)
+
         async def _send(text: str) -> SendResult:
-            return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
+            return await self.send(
+                chat_id=chat_id, content=text, reply_to=reply_to, metadata=public_metadata)
 
         async def _send_again(previous: SendResult) -> Optional[SendResult]:
             """Retry: the whole payload normally; only the undelivered remainder after a partial split
@@ -4097,7 +4104,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             caller then keeps the partial failure rather than re-sending the already-visible head."""
             if not self._is_partial_delivery(previous):
                 return await _send(content)
-            return await self._resume_partial_send(chat_id, previous, reply_to=reply_to, metadata=metadata)
+            return await self._resume_partial_send(
+                chat_id, previous, reply_to=reply_to, metadata=public_metadata)
 
         result = await _send(content)
         if result.success or self._send_held(result) or self._send_retry_is_final(result):
@@ -4979,13 +4987,15 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         reported. Each send feeds ``record_delivery`` so media-only turns report SUCCESS."""
         from urllib.parse import quote as _quote
 
+        adapter_meta = adapter_send_metadata(metadata) or {}
+
         def _as_image(path: str) -> bool:
             return Path(path).suffix.lower() in _IMAGE_EXTS and not force_document_attachments
         _image_paths = [p for p, is_voice in media_files if not is_voice and _as_image(p)]
         _image_paths += [p for p in local_files if _as_image(p)]
         if _image_paths:
             await self._send_image_batch(
-                event, [(f"file://{_quote(p)}", "") for p in _image_paths], metadata, human_delay,
+                event, [(f"file://{_quote(p)}", "") for p in _image_paths], adapter_meta, human_delay,
                 record_delivery)
         chat_id = event.source.chat_id
 
@@ -4994,17 +5004,17 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             do."""
             ext = Path(path).suffix.lower()
             if media_tag and should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=metadata, is_voice=is_voice)
+                result = await self.send_voice(chat_id=chat_id, audio_path=path, metadata=adapter_meta, is_voice=is_voice)
             elif ext in _VIDEO_EXTS:
                 if media_tag:
                     logger.info("[%s] Sending video attachment (%s) to %s", self.name, ext, chat_id)
-                result = await self.send_video(chat_id=chat_id, video_path=path, metadata=metadata)
+                result = await self.send_video(chat_id=chat_id, video_path=path, metadata=adapter_meta)
             else:
-                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=metadata)
+                result = await self.send_document(chat_id=chat_id, file_path=path, metadata=adapter_meta)
             if not result.success:
                 logger.warning("[%s] Failed to send %s (%s): %s", self.name,
                                "media" if media_tag else "local file", ext, result.error)
-                await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=metadata)
+                await self._notify_media_delivery_failure(chat_id, path, is_voice=is_voice, metadata=adapter_meta)
             return result
         queue = [(p, v, True) for p, v in media_files if v or not _as_image(p)]
         if queue:
