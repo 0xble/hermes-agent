@@ -129,3 +129,18 @@ def test_display_and_tts_success_records_chat_delivery():
 
     assert displayed == spoken == ["answer"]
     assert agent._interim_content_fully_streamed("answer") is True
+
+
+def test_whitespace_delta_stays_in_display_tracking():
+    displayed = []
+    agent = _Agent()
+    agent.stream_delta_callback = displayed.append
+    agent._stream_callback = lambda _text: None
+
+    for chunk in ("Para one.", "\n\n", "Para two."):
+        agent._fire_stream_delta(chunk)
+
+    assert displayed == ["Para one.", "\n\n", "Para two."]
+    assert agent._current_streamed_assistant_text == "Para one.\n\nPara two."
+    assert agent._display_streamed_assistant_text == agent._current_streamed_assistant_text
+    assert agent._interim_content_fully_streamed("Para one.\n\nPara two.") is True
