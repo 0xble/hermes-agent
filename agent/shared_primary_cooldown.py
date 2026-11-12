@@ -725,7 +725,7 @@ def complete_primary_recovery(agent) -> bool:
 
     Request wrappers call this after every successful response, so it must prove the response
     came from the cooled primary: the agent's LIVE route (not its ``_primary_runtime`` snapshot)
-    Primary recovery requires the live route to equal the primary record. A successful fallback
+    must equal the primary record. A successful fallback
     response separately clears only that fallback route's own breaker. Silent alias retries
     consume their recovery without a notice and retire that provenance.
     """
