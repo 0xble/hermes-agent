@@ -2982,8 +2982,8 @@ class _StreamingCall(StreamingWaitMonitor):
         self.deltas_were_sent["yes"] = True
 
     def _visible_text_delivered(self) -> bool:
-        """True when visible text reached any consumer; display replay uses the separate streamed-text signal."""
-        return bool(getattr(self.agent, "_stream_any_consumer_accepted_visible_text", False))
+        """True when visible text reached any consumer (display-recorded text or TTS acceptance)."""
+        return bool(getattr(self.agent, "_stream_any_consumer_accepted_visible_text", False) or (getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
 
     def _emit_reasoning(self, text: str) -> None:
         self._fire_first_delta()
