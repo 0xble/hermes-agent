@@ -89,6 +89,15 @@ def prune_budget(budget):
         _CURRENT.reset(token)
 
 
+@contextmanager
+def without_prune_budget():
+    token = _CURRENT.set(None)
+    try:
+        yield
+    finally:
+        _CURRENT.reset(token)
+
+
 def current_budget():
     return _CURRENT.get()
 

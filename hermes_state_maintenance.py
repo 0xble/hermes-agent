@@ -413,22 +413,31 @@ class SessionMaintenanceMixin:
         candidate_ids = [str(row["id"]) for row in candidate_rows]
         # Tombstones are retained on a separate retry horizon from transcript retention.  A
         # prune pass must advance that horizon even when no session row matches its age window.
-        from hermes_state_mutation_retirement import prune_retired_tombstones
+        from hermes_state_mutation_retirement import (
+            RETIRED_PREFIX, ROUTE_FENCE_PREFIX, prune_retired_tombstones,
+        )
+        from hermes_state_terminal import ADMISSION_PREFIX, WORKER_PREFIX
         tombstone_pacer = PrunePacer(max_size=100)
-        tombstone_limit = [tombstone_pacer.size]
+        tombstone_prefixes = (ADMISSION_PREFIX, WORKER_PREFIX, RETIRED_PREFIX, ROUTE_FENCE_PREFIX)
+        while True:
+            unit_limit = [tombstone_pacer.size]
 
-        def prune_tombstones():
-            return self._execute_write(
-                lambda conn: prune_retired_tombstones(conn, limit=tombstone_limit[0]), skip_result=0,
-            )
+            def prune_tombstones():
+                return self._execute_write(
+                    lambda conn: prune_retired_tombstones(conn, limit=unit_limit[0]), skip_result={},
+                )
 
-        def shrink_tombstones():
-            changed = tombstone_pacer.shrink()
-            tombstone_limit[0] = tombstone_pacer.size
-            return changed
+            def shrink_tombstones():
+                changed = tombstone_pacer.shrink()
+                unit_limit[0] = tombstone_pacer.size
+                return changed
 
-        run_prune_write(prune_tombstones, shrink=shrink_tombstones,
-                        label="retired tombstones", skip_result=0)
+            started = time.monotonic()
+            reclaimed = run_prune_write(prune_tombstones, shrink=shrink_tombstones,
+                                        label="retired tombstones", skip_result={}) or {}
+            if not reclaimed or all(reclaimed.get(prefix, 0) < unit_limit[0] for prefix in tombstone_prefixes):
+                break
+            tombstone_pacer.pause(time.monotonic() - started)
         removed_count = 0
 
         # Keep each transaction small enough that message/FTS triggers release the WAL write lock
@@ -506,7 +515,8 @@ class SessionMaintenanceMixin:
 
             def defer():
                 from hermes_state_deletion import defer_retirement
-                return defer_retirement(self, lambda conn: _select(conn, requested), sessions_dir)
+                return defer_retirement(self, lambda conn: _select(conn, requested), sessions_dir,
+                                        label=lambda: requested or groups[batch_start])
 
             batch_removed = run_prune_write(attempt, shrink=shrink, defer=defer,
                                              label=lambda: requested or groups[batch_start]) or []

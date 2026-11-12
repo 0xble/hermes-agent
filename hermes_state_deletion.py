@@ -205,16 +205,19 @@ def _record_expiry(conn, key, value):
         "WHERE key=? AND value=?", (time.time(), key, value))
 
 
-def defer_retirement(db, select, sessions_dir):
+def defer_retirement(db, select, sessions_dir, *, label="deferred retirement"):
     """Fence an eligible minimum group while leaving expensive receipt work resumable.
 
     Recheck eligibility and guards in the same transaction as the fence. No new
     admission can then race the deferred receipt retirement on the next pass.
     """
     from hermes_state_mutation_retirement import RETIRED_PREFIX, _mark_retired, prunable_ids
-    from hermes_state_prune_budget import current_budget
+    from hermes_state_prune_budget import PruneBudgetExpired, current_budget
+    attempted = []
+
     def stage(conn):
         ids, derived = prunable_ids(conn, select(conn))
+        attempted[:] = ids
         for sid in ids:
             _mark_retired(conn, RETIRED_PREFIX + sid, expires=sid not in derived, own=True)
         stage_delete(conn, ids, sessions_dir)
@@ -224,7 +227,31 @@ def defer_retirement(db, select, sessions_dir):
                          "WHERE key=?", (key,))
             _record_expiry(conn, key, conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0])
         return ids
-    ids = db._execute_write(stage, skip_result=[]) or []
+
+    def record_attempt(conn):
+        ids, derived = prunable_ids(conn, attempted)
+        for sid in ids:
+            key = RETIRED_PREFIX + sid
+            _mark_retired(conn, key, expires=sid not in derived, own=True)
+            value = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0]
+            conn.execute("UPDATE state_meta SET value=json_set(value, '$.cleanup', json(?), "
+                         "'$.cleanup.retirement_pending', json('true')) WHERE key=?",
+                         (json.dumps({"sessions_dir": str(sessions_dir) if sessions_dir is not None else None}), key))
+            value = conn.execute("SELECT value FROM state_meta WHERE key=?", (key,)).fetchone()[0]
+            _record_expiry(conn, key, value)
+        return ids
+
+    stage_expired = False
+    try:
+        ids = db._execute_write(stage, skip_result=[]) or []
+    except PruneBudgetExpired:
+        stage_expired = True
+        ids = []
+    if not ids and attempted:
+        ids = db._execute_write(record_attempt, skip_result=[]) or []
+        if stage_expired or ids:
+            logger.error("Session cleanup group %r could not complete its retirement stage within the writer ceiling; "
+                         "deferred with a durable attempt record", label() if callable(label) else label)
     current_budget().deferred_ids.update(ids)
     return ids
 

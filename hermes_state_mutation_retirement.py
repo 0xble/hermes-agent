@@ -419,8 +419,10 @@ def _reclaim_expired(conn, prefix, cutoff, limit=None):
     if limit is not None:
         sql += " LIMIT ?"
         params += (limit,)
-    for (key,) in conn.execute(sql, params).fetchall():
+    keys = conn.execute(sql, params).fetchall()
+    for (key,) in keys:
         conn.execute("DELETE FROM state_meta WHERE key=?", (key,))
+    return len(keys)
 
 
 def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S, limit=None):
@@ -431,9 +433,9 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S, limit=None):
     re-admitted or reissued as a Bot Chat generation.
     Tombstones written before ``retired_at`` existed are stamped now and age from this pass."""
     from hermes_state_terminal import ADMISSION_PREFIX, RESULT_PREFIX, WORKER_PREFIX, identity_key
-    prefixes = (ADMISSION_PREFIX, WORKER_PREFIX)
+    reclaimed: dict[str, int] = {}
     now = time.time()
-    for prefix in prefixes:
+    for prefix in (ADMISSION_PREFIX, WORKER_PREFIX):
         params = (prefix + '*',)
         sql = ("SELECT key FROM state_meta WHERE key GLOB ? AND json_valid(value) "
                "AND json_extract(value, '$.retired_at') IS NULL")
@@ -448,16 +450,21 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S, limit=None):
     if limit is not None:
         sql += " LIMIT ?"
         params += (limit,)
-    for key, raw in conn.execute(sql, params).fetchall():
+    admission_rows = conn.execute(sql, params).fetchall()
+    for key, raw in admission_rows:
         row = json.loads(raw)
         conn.execute('DELETE FROM state_meta WHERE key IN (?,?,?)', (key, RESULT_PREFIX + row['admission_id'],
                      identity_key(row['principal_id'], row['target_session_id'], row['request_id'])))
+    reclaimed[ADMISSION_PREFIX] = len(admission_rows)
     params = (WORKER_PREFIX + '*', cutoff)
     sql = f'SELECT key FROM state_meta WHERE key GLOB ? AND {_EXPIRED}'
     if limit is not None:
         sql += " LIMIT ?"
         params += (limit,)
-    for (key,) in conn.execute(sql, params).fetchall():
+    worker_rows = conn.execute(sql, params).fetchall()
+    for (key,) in worker_rows:
         conn.execute('DELETE FROM state_meta WHERE key=?', (key,))
+    reclaimed[WORKER_PREFIX] = len(worker_rows)
     for prefix in (RETIRED_PREFIX, ROUTE_FENCE_PREFIX):
-        _reclaim_expired(conn, prefix, cutoff, limit=limit)
+        reclaimed[prefix] = _reclaim_expired(conn, prefix, cutoff, limit=limit)
+    return reclaimed

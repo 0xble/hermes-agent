@@ -104,7 +104,8 @@ def state_lock(lock, *, db_path, deadline: float | None = None):
 
     Ordinary writers retain their unbounded mutex wait: their SQLite retry budget
     must not turn a queued transcript append into a failed write. Never interrupt
-    an acquired transaction.
+    an acquired transaction. Under a prune budget, its deadline overrides the
+    passed deadline and acquisition uses a 50 ms non-blocking spin.
     """
     from hermes_state_prune_budget import current_budget
     if budget := current_budget():
