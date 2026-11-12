@@ -24,7 +24,7 @@ class TestRunningJobGuard:
             "id": "guard-job",
             "name": "guard-test",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -57,7 +57,7 @@ class TestRunningJobGuard:
             "id": "queued-job",
             "name": "queued",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -109,7 +109,7 @@ class TestRunningJobGuard:
             "id": "failing-job",
             "name": "failing-job",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -118,7 +118,7 @@ class TestRunningJobGuard:
             "id": "healthy-job",
             "name": "healthy-job",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",
@@ -174,7 +174,7 @@ class TestSyncMode:
 
         jobs = [
             {"id": f"job-{i}", "name": f"Job {i}", "prompt": "test",
-             "schedule": "every 5m", "enabled": True,
+             "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"}, "enabled": True,
              "next_run_at": "2020-01-01T00:00:00", "deliver": "local"}
             for i in range(3)
         ]
@@ -203,7 +203,7 @@ class TestSyncMode:
             "id": "slow-job",
             "name": "slow",
             "prompt": "test",
-            "schedule": "every 5m",
+            "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
             "enabled": True,
             "next_run_at": "2020-01-01T00:00:00",
             "deliver": "local",

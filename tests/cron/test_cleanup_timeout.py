@@ -143,7 +143,7 @@ def test_dispatch_guard_releases_after_sessiondb_finalization_hang(tmp_path):
         "id": "cleanup-guard-hang",
         "name": "cleanup-guard-hang",
         "prompt": "hello",
-        "schedule": "every 5m",
+        "schedule": {"kind": "interval", "minutes": 5, "display": "every 5m"},
         "enabled": True,
         "next_run_at": "2020-01-01T00:00:00",
         "deliver": "local",

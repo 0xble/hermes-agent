@@ -41,6 +41,9 @@ def cron_store(tmp_path, monkeypatch):
     monkeypatch.setattr("cron.jobs.CRON_DIR", tmp_path / "cron")
     monkeypatch.setattr("cron.jobs.JOBS_FILE", tmp_path / "cron" / "jobs.json")
     monkeypatch.setattr("cron.jobs.OUTPUT_DIR", tmp_path / "cron" / "output")
+    # Recovery notices resolve the immutable launch home; isolate it too.
+    import hermes_constants
+    monkeypatch.setattr(hermes_constants, "get_routing_process_hermes_home", lambda: tmp_path)
     monkeypatch.setattr("cron.jobs._hermes_now", lambda: FIXED_NOW)
     return tmp_path
 
@@ -174,9 +177,12 @@ def test_dispatch_failure_after_receipt_never_leaves_it_claimed(
 
 
 def test_unwritable_store_degrades_once_throttles_and_catches_up_once(cron_store, monkeypatch):
-    """One degraded state per outage: entered once, advance/claim skipped while the scan's save
-    keeps failing (one write attempt per tick), cleared by the first save that lands; then the recurring job and the one-shot that
-    stayed due across 5 ticks each fire ONCE, and the one-shot keeps a single ``failed`` row."""
+    """One durable outage episode: recurring work catches up once after recovery.
+
+    A never-started overdue one-shot stays held with its exact payload. Its
+    failed on-time admission and terminal scheduler-missed decision are distinct
+    receipts, neither a started attempt nor permission for automatic replay.
+    """
     from cron import executions, scheduler
 
     clock = {"now": FIXED_NOW, "mono": 0.0}
@@ -206,11 +212,18 @@ def test_unwritable_store_degrades_once_throttles_and_catches_up_once(cron_store
     monkeypatch.setattr(store_health, "probe_store", probe)
     outage = True
     per_tick = []
+    admission = None
     for minute, mono in enumerate((0, 30, 60, 90, 120)):  # 5 due ticks, re-probe at most every 60s
         clock["now"], clock["mono"] = FIXED_NOW + timedelta(minutes=minute), float(mono)
         before = len(writes)
         assert scheduler.tick(verbose=False, sync=True) == 0
         per_tick.append(len(writes) - before)
+        if minute == 0:
+            admission_rows = executions.list_executions(job_id="once")
+            assert len(admission_rows) == 1
+            admission = admission_rows[0]
+            assert admission["status"] == "failed" and admission["started_at"] is None
+            assert "Cron store unwritable; not started:" in admission["error"]
     # The scan's failing save after entry is each tick's one write attempt: no extra re-probe.
     assert ran == [] and len(probes) == 0
     assert per_tick[0] == 3 and per_tick[1:] == [1, 1, 1, 1]
@@ -219,6 +232,12 @@ def test_unwritable_store_degrades_once_throttles_and_catches_up_once(cron_store
     assert store_health.degraded_record(cron_store / "cron").skipped_runs == 2
     from cron.occurrences import get_catch_up_occurrence_count
     assert get_catch_up_occurrence_count() == 0  # the fast-forward did not persist: not counted yet
+    # The ledger/outbox can accept the explicit miss while jobs.json is still
+    # unwritable. Retrying the uncommitted hold must reuse that exact miss.
+    assert admission is not None
+    outage_rows = executions.list_executions(job_id="once")
+    assert len(outage_rows) == 2
+    assert executions.get_execution(admission["id"]) == admission
     outage = False
     clock["now"], clock["mono"] = FIXED_NOW + timedelta(minutes=5), 180.0
     assert scheduler.tick(verbose=False, sync=True) == 1
@@ -226,15 +245,25 @@ def test_unwritable_store_degrades_once_throttles_and_catches_up_once(cron_store
     held = cronjobs.get_job("once")
     assert held is not None
     assert held["enabled"] is False and held["state"] == "missed"
-    assert held["prompt"] == once["prompt"]
+    assert held["prompt"] == once["prompt"] and held["schedule"] == once["schedule"]
+    assert "store outage" in held["missed_reason"]
     assert store_health.degraded_record(cron_store / "cron") is None
     assert get_catch_up_occurrence_count() == 1  # counted once, when the fast-forward persisted
     once_rows = executions.list_executions(job_id="once")
-    # The first on-time admission failed on the unwritable jobs store; later
-    # expiry adds one terminal never-started hold, not a duplicate admission.
+    # Preserve the exact original failure; add one idempotent current-occurrence
+    # miss, never a second attempt or a replacement for admission evidence.
     assert len(once_rows) == 2
-    assert all(r["status"] == "failed" and r["started_at"] is None for r in once_rows)
-    assert sum(r["source"] == "scheduler-missed" for r in once_rows) == 1
+    assert once_rows == outage_rows
+    assert executions.get_execution(admission["id"]) == admission
+    missed = [r for r in once_rows if r["source"] == "scheduler-missed"]
+    assert len(missed) == 1 and missed[0]["status"] == "failed"
+    assert missed[0]["started_at"] is None
+    assert missed[0]["scheduled_instant"] == once["next_run_at"]
+    assert "Payload kept" in missed[0]["error"]
+    assert scheduler.tick(verbose=False, sync=True) == 0
+    assert executions.list_executions(job_id="once") == once_rows
+    assert cronjobs.get_job("once") == held
+    assert ran == ["due-job"]
 
 
 def test_skipped_oneshot_survives_recovery_by_any_save(cron_store, monkeypatch):
@@ -470,7 +499,8 @@ def test_unwritable_store_is_shown_in_cron_status_and_announced_once(cron_store,
     assert [m[0] for _, m in sent] == ["⚠", "✅", "⚠", "✅", "⚠", "✅"] and {chat for chat, _ in sent} == {"c1"}
     assert str(cron_dir) in sent[0][1] and "ENOSPC: No space left on device" in sent[0][1] and "since " in sent[0][1]
     assert f"fix permissions on {cron_dir}" in sent[0][1]
-    assert "writable again; 1 skipped run(s), catching up once per job" in sent[1][1]
+    assert "writable again; 1 skipped run(s)" in sent[1][1]
+    assert "Recurring jobs catch up once. Overdue one-shots stay held for a decision." in sent[1][1]
     assert any(r.levelname == "WARNING" and "unwritable notice for" in r.getMessage() for r in caplog.records)
     from cron import scheduler_ownership  # the profile leaves this gateway, its home already deleted
     monkeypatch.setattr(scheduler_ownership, "_ticked_homes", {})

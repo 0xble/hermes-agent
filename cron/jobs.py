@@ -2032,6 +2032,9 @@ def create_job(
     interpreter: Optional[str] = None,
     hard_wall_timeout_seconds: Optional[float] = None,
     max_catch_up_lateness_seconds: Optional[float | str] = None,
+    payload_sha256: Optional[str] = None,
+    payload_path: Optional[str] = None,
+    send_freshness: Optional[dict[str, Any]] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -2142,6 +2145,19 @@ def create_job(
     ):
         if value is not None:
             job[key] = value
+    from cron.scheduled_send import validate_scheduled_send_inputs
+    validate_scheduled_send_inputs(
+        prompt,
+        payload_sha256=payload_sha256,
+        payload_path=payload_path,
+        send_freshness=send_freshness,
+    )
+    if payload_sha256:
+        job["payload_sha256"] = payload_sha256
+    if payload_path:
+        job["payload_path"] = payload_path
+    if send_freshness is not None:
+        job["send_freshness"] = send_freshness
 
     with _jobs_lock():
         save_jobs(load_jobs() + [job])
@@ -2356,6 +2372,15 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
                 _normalize_job_optional_text(updated.get("script")))
         if any(k in updates for k in _PAYLOAD_FIELDS) and job_payload_is_empty(updated):
             raise ValueError(EMPTY_PAYLOAD_ERROR)
+        if ({"prompt", "payload_sha256", "payload_path", "send_freshness", "schedule"}.intersection(updates)
+                or updates.get("enabled") is True):
+            from cron.scheduled_send import validate_scheduled_send_inputs
+            validate_scheduled_send_inputs(
+                updated.get("prompt"),
+                payload_sha256=updated.get("payload_sha256"),
+                payload_path=updated.get("payload_path"),
+                send_freshness=updated.get("send_freshness"),
+            )
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield
@@ -2517,6 +2542,9 @@ def rearm_oneshot(job_id: str, run_at: Any) -> Optional[dict[str, Any]]:
         raise _oneshot_past_grace_error(parsed_schedule.get("run_at") or run_at)
 
     def apply(jobs, _i, job):
+        from cron.scheduled_send import validate_scheduled_send_inputs
+        validate_scheduled_send_inputs(job.get("prompt"), payload_sha256=job.get("payload_sha256"),
+                                       payload_path=job.get("payload_path"), send_freshness=job.get("send_freshness"))
         now = _hermes_now()
         if _claim_is_live(job.get("run_claim"), now, _oneshot_run_claim_ttl_seconds()):
             raise ValueError("Cannot re-arm one-shot over a live run claim.")
@@ -2715,6 +2743,12 @@ def mark_job_run(
     repeat budget. Finite one-shots refund their preclaim and retry on the next tick.
     """
     def apply(jobs, _i, job):
+        if execution_id is not None:
+            from cron.jobs_oneshot import completion_matches_occurrence
+            if not completion_matches_occurrence(job, execution_id):
+                logger.info("Job %s: prior-arm execution %s settled without changing current occurrence",
+                            job_id, execution_id)
+                return True
         if execution_id is not None and execution_id in job.get("canonical_completions", []):
             return True
         if expected_fire_owner is not None:
@@ -2760,10 +2794,11 @@ def mark_job_run(
     return _under_fire_fence(job_id, locked)
 
 
-def _write_oneshot_diagnostic(job: dict[str, Any], text: str, what: str) -> bool:
-    """Durably queue the owner failure before retirement; save the local trace best-effort."""
+def _write_oneshot_diagnostic(job: dict[str, Any], text: str, what: str, *, held: bool = False) -> bool:
+    """Durably queue the owner failure before retirement or hold; save the local trace best-effort."""
     from cron.oneshot_retirement import queue_retirement_alert
-    queue_retirement_alert(job, text, what, now=_hermes_now())
+    queue_retirement_alert(
+        job, text, "missed-oneshot-held" if held else what, now=_hermes_now())
     try:
         save_job_output(job.get("id", ""), text)
         return True
@@ -2841,6 +2876,9 @@ def claim_dispatch(job_id: str) -> bool:
     crash: a self-destructing job fires at most ``repeat.times`` times (#38758).
     """
     def apply(jobs, i, job):
+        from cron.jobs_oneshot import occurrence_recovery_pending
+        if occurrence_recovery_pending(job):
+            return False
         repeat = job.get("repeat") or {}
         times = repeat.get("times")
         # Recurring jobs use advance_next_run(); no/infinite repeat limit always dispatches.
@@ -3457,6 +3495,77 @@ def _fast_forward_missed_recurring(d: _DueJob, grace: int) -> bool:
     return False
 
 
+def _missed_oneshot_diagnostic(job: dict[str, Any], next_run: str, reason: str) -> str:
+    return (
+        f"# Cron job marked missed without firing ({reason})\n\n"
+        f"- job id: {job.get('id')}\n"
+        f"- name: {job.get('name')}\n"
+        f"- scheduled run time: {next_run}\n"
+        f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
+        f"- held at: {_hermes_now().isoformat()}\n\n"
+        "This one-shot was not run and was not deleted. The payload is kept. "
+        "It will not fire on its own. Send now or drop it.\n"
+    )
+
+
+def hold_stale_person_send(job: dict[str, Any]) -> bool:
+    """Hold a declared person-facing one-shot when its freshness checker says stale.
+
+    Called from the dispatch worker, never from the locked due scan. Manual
+    runs also gather fresh evidence. Reapproval updates the approved watermark;
+    triggering an old payload alone does not waive a changed conversation.
+    """
+    if (job.get("schedule") or {}).get("kind") != "once":
+        return False
+    next_run = job.get("next_run_at") or "unknown"
+    due = _parse_aware(next_run) if next_run != "unknown" else None
+    if due is not None and _elapsed_seconds(_hermes_now(), due) > ONESHOT_GRACE_SECONDS:
+        reason = "run time outside grace window after dispatch wait"
+    else:
+        if not isinstance(job.get("send_freshness"), dict):
+            return False
+        from cron.scheduled_send import assess_freshness
+        verdict = assess_freshness(job)
+        if due is not None and _elapsed_seconds(_hermes_now(), due) > ONESHOT_GRACE_SECONDS:
+            reason = "run time outside grace window during freshness read"
+        elif not verdict.get("stale"):
+            reason = None
+        else:
+            reason = f"stale send: {verdict.get('reason') or 'target thread changed'}"
+    def apply(records, _index, current):
+        # The live read ran without the jobs lock. Never let its old verdict
+        # disable a newly edited/reapproved occurrence or another worker's claim.
+        fields = ("next_run_at", "manual_run_at", "schedule", "run_claim", "fire_claim",
+                  "prompt", "send_freshness", "payload_path", "payload_sha256")
+        if not current.get("enabled", True) or any(current.get(k) != job.get(k) for k in fields):
+            return "superseded"
+        if reason is None:
+            return "fresh"
+        _write_oneshot_diagnostic(
+            current, _missed_oneshot_diagnostic(current, next_run, reason),
+            "missed-oneshot", held=True)
+        current.update(
+            enabled=False,
+            state="missed",
+            missed_at=_hermes_now().isoformat(),
+            missed_reason=reason,
+            run_claim=None,
+            fire_claim=None,
+        )
+        save_jobs(records)
+        return current
+
+    held = _with_job(job["id"], apply)
+    if held == "superseded":
+        from cron.oneshot_retirement import release_retirement_claims
+        release_retirement_claims(job)
+    if isinstance(held, dict):
+        record_cron_missed(held)
+    # A fresh verdict is usable only for the exact still-current occurrence.
+    # Missing/superseded attempts stop without mutating the replacement.
+    return held != "fresh"
+
+
 def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool:
     """One-shot dispatch-limit guard; True when the job must not fire this tick.
 
@@ -3466,8 +3575,10 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
     repeat = job.get("repeat") or {}
     times = repeat.get("times")
     completed = repeat.get("completed", 0)
-    from cron.jobs_oneshot import occurrence_started
+    from cron.jobs_oneshot import occurrence_recovery_pending, occurrence_started
 
+    if occurrence_recovery_pending(job):
+        return True  # Suppress redispatch while recovery still owns this exact target.
     if times is None or times <= 0 or (completed < times and not occurrence_started(job, now=scan.now)):
         return False
     name = job.get("name", job.get("id", "?"))

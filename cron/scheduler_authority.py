@@ -1,9 +1,61 @@
 """Transport-only cron execution; output/delivery remain with the firing scheduler."""
 import asyncio
+import concurrent.futures
+import contextvars
 import hashlib
 import json
+import logging
+import threading
 import time
 import uuid
+
+# One recovery lane for the process, with at most one outstanding pass per home.
+# A slow owner must neither occupy a job worker nor accumulate passes on every tick.
+_recovery_pool: concurrent.futures.ThreadPoolExecutor | None = None
+_recovery_futures: dict[str, concurrent.futures.Future] = {}
+_recovery_lock = threading.Lock()
+
+
+def _observe_recovery_result(future):
+    try:
+        future.result()
+    except BaseException:
+        logging.getLogger(__name__).warning('Cron receipt recovery pass deferred', exc_info=True)
+
+
+def reconcile_pending_background(*, allow_connect=True):
+    """Coalesce ticks without waiting for recovery; journals remain the durable retry queue."""
+    from hermes_constants import get_hermes_home, hermes_home_key, set_hermes_home_override
+
+    global _recovery_pool
+    home = get_hermes_home()
+    key = hermes_home_key(home)
+    with _recovery_lock:
+        for finished in [k for k, f in _recovery_futures.items() if f.done()]:
+            del _recovery_futures[finished]
+        if key in _recovery_futures:
+            return
+        if _recovery_pool is None and _recovery_futures:
+            # A failed pool may still be finishing a pass for another home.
+            return
+        try:
+            if _recovery_pool is None:
+                _recovery_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix='cron-receipt-recovery')
+            context = contextvars.copy_context()
+            # Pin even env-selected homes; another ticker's profile scope must not leak here.
+            context.run(set_hermes_home_override, home)
+            future = _recovery_pool.submit(context.run, reconcile_pending, allow_connect=allow_connect)
+        except (OSError, RuntimeError):
+            # submit can enqueue before failing to start a thread. Discard that
+            # queue without waiting; durable journals retry after the pool drains.
+            if _recovery_pool is not None:
+                _recovery_pool.shutdown(wait=False, cancel_futures=True)
+                _recovery_pool = None
+            logging.getLogger(__name__).warning('Cron receipt recovery submission deferred', exc_info=True)
+            return
+        _recovery_futures[key] = future
+        future.add_done_callback(_observe_recovery_result)
 
 # A submit normally answers in 30s; even two contended SQLite writes take 20s each.
 # Leave room for ordered-admission queueing, and require repeated successful owner reads.
@@ -269,6 +321,75 @@ def _reset_missing_reads(journal):
 
 
 def reconcile_pending(*, allow_connect=True):
+    """Serialize recovery across tickers without holding the due-scan lock.
+
+    The journals, receipt checks and execution-owner fences remain authoritative;
+    this separate nonblocking lock replaces the ticker lock's recovery serialization.
+    """
+    from hermes_constants import get_hermes_home
+    from cron.scheduler import _acquire_tick_lock, _release_tick_lock
+
+    root = get_hermes_home() / 'cron'
+    root.mkdir(parents=True, exist_ok=True)
+    lock_fd = _acquire_tick_lock(root / '.receipt-recovery.lock')
+    if lock_fd is None:
+        return
+    try:
+        _reconcile_pending(allow_connect=allow_connect)
+    finally:
+        _release_tick_lock(lock_fd)
+
+
+def _recovery_fence(job, execution_id):
+    """Recheck the arm at output/send, not only before possibly slow receipt composition."""
+    from contextlib import contextmanager
+    from cron.jobs import _jobs_lock, get_job
+    from cron.jobs_oneshot import completion_matches_occurrence
+    from cron.scheduler import _FireOwnership
+
+    class RecoveryFence(_FireOwnership):
+        def lost(self):
+            current = get_job(job['id'])
+            return current is not None and not completion_matches_occurrence(current, execution_id)
+
+        @contextmanager
+        def side_effect_fence(self):
+            with _jobs_lock():
+                yield not self.lost()
+
+    return RecoveryFence(dict(job, fire_claim=None))
+
+
+def _settle_superseded_receipt(delivery, received, params, journal, record, pending_canonical):
+    """Preserve an old arm's result without applying it to its replacement."""
+    from cron.jobs import _jobs_lock, get_job, save_job_output
+    from cron.jobs_oneshot import completion_matches_occurrence
+    from cron.executions import recover_receipted_execution
+    from cron.scheduler_bookkeeping import fail_empty_response
+
+    _success, output, answer, _error = received
+    with _jobs_lock():
+        latest = get_job(params['job_id'])
+        if latest is None or completion_matches_occurrence(latest, params['request_id']):
+            return False
+        # Preserve the old receipt locally, but never apply its output or
+        # terminal schedule tail to the operator's replacement arm.
+        fail_empty_response(delivery, answer)
+        if output.strip():
+            save_job_output(params['job_id'], output)
+        settled = recover_receipted_execution(
+            params['request_id'], params['job_id'], success=delivery.success,
+            error=delivery.error, delivery_outcome='suppressed')
+        if settled is not None:
+            if _capture_unsettled(journal, record, pending_canonical, received):
+                _set_aside_unsettled(journal)
+            else:
+                journal.unlink(missing_ok=True)
+            journal.with_suffix('.cancel').unlink(missing_ok=True)
+        return True
+
+
+def _reconcile_pending(*, allow_connect=True):
     """Observe prepared fires; never submit missing or interrupted work.
 
     With allow_connect=False, a headless tick leaves durable receipts for the next
@@ -279,7 +400,7 @@ def reconcile_pending(*, allow_connect=True):
     from hermes_cli.gateway_client import connect_gateway
     from cron.executions import execution_owner_live, get_execution
     from cron.jobs import get_job
-    from cron.scheduler import (_RunDelivery, _FireOwnership, _apply_agent_failure_marker,
+    from cron.scheduler import (_RunDelivery, _apply_agent_failure_marker,
                                 _save_compose_deliver)
     from cron.scheduler_bookkeeping import fail_empty_response, finish_completed_run
     import logging
@@ -349,9 +470,11 @@ def reconcile_pending(*, allow_connect=True):
             # blank answer are failures, whichever process books them.
             success, error, declared = _apply_agent_failure_marker(job, success, error, answer)
             delivery = _RunDelivery(job, success, error, agent_declared=declared)
+            if _settle_superseded_receipt(delivery, received, params, journal, record, pending_canonical):
+                continue
             # The canonical receipt supplies the result; a dead scheduler's fire claim does not
             # authorize replay and must not prevent finishing its durable bookkeeping.
-            fence = _FireOwnership(dict(job, fire_claim=None))
+            fence = _recovery_fence(job, params['request_id'])
             _save_compose_deliver(delivery, fence, answer, output if output.strip() else None, adapters=None, loop=None,
                                  verbose=False, execution_token=None)
             fail_empty_response(delivery, answer)

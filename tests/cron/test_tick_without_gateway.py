@@ -6,6 +6,7 @@ unmanaged daemon when nothing owns the profile. Headless surfaces refuse rather 
 the agent job is skipped (not failed), keeps its due instant, and one warning names the fix.
 """
 from datetime import timedelta
+from pathlib import Path
 import os
 
 import pytest
@@ -157,6 +158,15 @@ def test_headless_receipt_recovery_never_connects_or_spawns(cron_home, monkeypat
 
 
 def test_no_agent_jobs_still_fire_without_a_gateway(cron_home, monkeypatch):
+    # This fixture owns a fresh home, not PM's committed install facts. Pin the
+    # dependencies already selected by the canonical test runner without asking
+    # PM to probe the developer worktree's parent (which may be in the live home).
+    import httpx
+    from cron import scheduler_worker_env
+    monkeypatch.setattr(scheduler_worker_env, "_committed_dependency_site_packages",
+                        lambda root: Path(httpx.__file__).resolve().parent.parent)
+    # A scratch source test is not the gateway's inherited immutable release.
+    monkeypatch.setattr(S.immutable_releases, "LOADED_RELEASE_ROOT", None)
     counter = cron_home / "fires.txt"
     script = cron_home / "scripts" / "fire.sh"
     script.write_text(f"#!/bin/sh\necho fired >> {counter}\necho fired\n", encoding="utf-8")
@@ -169,4 +179,5 @@ def test_no_agent_jobs_still_fire_without_a_gateway(cron_home, monkeypatch):
     _make_due(job["id"])
 
     assert S.tick(verbose=False, headless=True) == 1
+    assert counter.exists(), J.get_job(job["id"])
     assert counter.read_text(encoding="utf-8").count("fired") == 1

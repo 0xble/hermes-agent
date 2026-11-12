@@ -129,7 +129,7 @@ def note_unwritable(exc: OSError, consequence: str, site: str, skipped_jobs: Ite
     if entered:
         logger.warning(
             "Cron store %s is unwritable (%s); %s. Scheduled jobs are skipped until it accepts writes "
-            "again, then each due job fires once. Fix: %s.", store, exc, consequence,
+            "again. Recurring jobs catch up once; overdue one-shots stay held for a decision. Fix: %s.", store, exc, consequence,
             FIX_HINT.format(store=store))
         _notify("unwritable", record)
     elif new_site:
@@ -147,7 +147,8 @@ def note_writable(cron_dir: Path) -> None:
             _recovered[record.store] = record
     if record is None:
         return
-    logger.warning("Cron store %s is writable again; %d skipped run(s), catching up once per job",
+    logger.warning("Cron store %s is writable again; %d skipped run(s). "
+                   "Recurring jobs catch up once; overdue one-shots stay held for a decision",
                    record.store, record.skipped_runs)
     _notify("recovered", record)
 
