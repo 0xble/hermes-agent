@@ -78,15 +78,18 @@ def test_configured_ceiling_retires_only_over_budget_kernel(monkeypatch, tmp_pat
     assert fresh["output"].strip() == "False"
 
 
-def test_real_process_tree_memory_is_bounded(tmp_path):
+def test_real_process_tree_memory_is_bounded(monkeypatch, tmp_path):
     from hermes_cli.config import atomic_config_write
     from tools import code_kernel_memory as memory
 
+    # Isolate the aggregate watchdog: Linux's address-space limit can refuse the
+    # parent's allocation first (thread stacks count toward AS but not RSS).
+    monkeypatch.setattr(kernels, "KERNEL_RUNNER_SOURCE",
+                        kernels.KERNEL_RUNNER_SOURCE.replace(memory.RUNNER_MEMORY_SOURCE, ""))
     atomic_config_write(tmp_path / "config.yaml", {
         "code_execution": {"kernel_memory_limit_mb": 200},
     })
-    # Two bounded 128 MiB allocations: each process stays below Linux's per-process
-    # backstop, but together they must trip the process-tree watchdog. Never unbounded.
+    # Two bounded 128 MiB allocations must trip the process-tree watchdog.
     pidfile = tmp_path / "descendant.pid"
     child_code = (
         "import os, time; from pathlib import Path; blob = bytearray(128 * 1024**2); "
@@ -102,6 +105,9 @@ def test_real_process_tree_memory_is_bounded(tmp_path):
     result = call(code)
     assert result["status"] == "error", result
     assert "kernel exceeded memory ceiling" in result["error"], result
+    assert "kernel retired" in result["error"], result
+    assert result["kernel"]["state_lost"] is True
+    assert result["kernel"]["ended"] is True
     assert result["kernel"]["memory_bytes"] > 200 * 1024**2
     assert time.monotonic() - started < 8
     assert not kernels._KERNELS
@@ -119,6 +125,85 @@ def test_real_process_tree_memory_is_bounded(tmp_path):
     fresh = call("print('host alive')")
     assert fresh["status"] == "success", fresh
     assert fresh["output"].strip() == "host alive"
+
+
+def test_real_allocation_memory_is_bounded(tmp_path):
+    from hermes_cli.config import atomic_config_write
+
+    atomic_config_write(tmp_path / "config.yaml", {
+        "code_execution": {"kernel_memory_limit_mb": 200},
+    })
+    started = time.monotonic()
+    result = call("kept = 42; blob = bytearray(256 * 1024**2)\nimport time; time.sleep(8)")
+    assert result["status"] == "error", result
+    assert "kernel exceeded memory ceiling 200 MiB" in result["error"], result
+    assert time.monotonic() - started < 8
+    if sys.platform.startswith("linux"):
+        assert "allocation refused by OS limit" in result["error"], result
+        assert "kernel kept alive" in result["error"], result
+        assert not result["kernel"].get("state_lost", False)
+        assert not result["kernel"].get("ended", False)
+        assert next(iter(kernels._KERNELS.values())).alive()
+        recovery = call("print(kept)")
+        assert recovery["kernel"]["reused"] is True
+        assert recovery["output"].strip() == "42"
+    else:
+        assert "kernel retired" in result["error"], result
+        assert result["kernel"]["state_lost"] is True
+        assert result["kernel"]["ended"] is True
+        assert result["kernel"]["memory_bytes"] > 200 * 1024**2
+        assert not kernels._KERNELS
+        recovery = call("print('kept' in globals())")
+        assert recovery["kernel"]["reused"] is False
+        assert recovery["output"].strip() == "False"
+    assert recovery["status"] == "success", recovery
+
+
+@pytest.mark.parametrize("platform,rlimit_available", [
+    ("linux", True), ("linux", False), ("darwin", True),
+])
+def test_memory_error_under_rlimit_reports_ceiling(monkeypatch, platform, rlimit_available):
+    import contextlib
+    import io
+    import traceback
+    from tools.code_kernel_memory import RUNNER_MEMORY_SOURCE
+
+    def setrlimit(kind, limits):
+        if not rlimit_available:
+            raise OSError("rlimit unavailable")
+
+    monkeypatch.setitem(sys.modules, "resource", SimpleNamespace(
+        RLIMIT_AS=1, RLIMIT_DATA=2, RLIM_INFINITY=-1,
+        getrlimit=lambda kind: (-1, -1), setrlimit=setrlimit,
+    ))
+    runner = {
+        "sys": SimpleNamespace(platform=platform, argv=["runner.py", str(200 * 1024**2)],
+                               stderr=io.StringIO()),
+        "io": io, "contextlib": contextlib, "traceback": traceback, "_CAPTURE_LIMIT": 1000000,
+    }
+    # Execute the real runner handlers with fake OS limits, never lower this
+    # pytest process's limits. Raising MemoryError makes the failure deterministic.
+    exec(RUNNER_MEMORY_SOURCE + kernels.RUNNER_CELL_SOURCE, runner)
+    payload, _ = runner["run_cell"]({"code": "kept = 42; raise MemoryError('refused')"}, 1)
+    kernel = kernels.SessionKernel(("unit-memory-test",))
+    result = kernels._cell_result(
+        kernel, kernel.key, "success", payload, timeout=10, sandbox_tools=frozenset(),
+        reused=False, state_reset=False, state_reset_note=None, exec_start=time.monotonic(),
+    )
+    assert result["status"] == "error", result
+    assert "MemoryError: refused" in result["error"], result
+    if platform == "linux" and rlimit_available:
+        message = "kernel exceeded memory ceiling 200 MiB (allocation refused by OS limit)"
+        assert message in result["error"], result
+        assert message in result["output"], result
+        assert "kernel kept alive" in result["error"], result
+    else:
+        assert "kernel exceeded memory ceiling" not in result["error"], result
+    assert not kernel.closed
+    assert not result["kernel"].get("state_lost", False)
+    recovery, _ = runner["run_cell"]({"code": "print(kept)"}, 2)
+    assert recovery["status"] == "ok"
+    assert recovery["stdout"].strip() == "42"
 
 
 @pytest.mark.parametrize("platform,inherited,expected", [

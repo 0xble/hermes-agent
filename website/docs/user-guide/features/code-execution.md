@@ -213,7 +213,11 @@ RSS. Shared pages may be counted more than once. This is a best-effort guard, no
 an OS-enforced aggregate reservation: short allocation bursts between samples and
 allocations from background threads while the kernel is idle are not covered.
 Linux also applies `RLIMIT_AS` and `RLIMIT_DATA` inside newly spawned kernels as
-per-process backstops; those can raise `MemoryError` before the watchdog acts.
+per-process backstops; a cell `MemoryError` with an active backstop reports
+`kernel exceeded memory ceiling N MiB (allocation refused by OS limit)` alongside
+the traceback. This refusal keeps the kernel alive because the allocation failed
+and the cell has unwound; earlier cell mutations may persist. Watchdog-detected
+process-tree excess still retires the kernel and reports state loss.
 Positive integer overrides take effect at the next cell; Linux spawn-time limits
 need `reset: true` to pick up a higher ceiling. Missing, invalid, zero, or negative
 values retain the 8192 MiB safety default; there is no implicit unlimited mode.
