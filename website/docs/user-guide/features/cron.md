@@ -1208,10 +1208,12 @@ hermes cron edit <job-id> --max-catch-up-lateness-seconds 600
 hermes cron edit <job-id> --clear-max-catch-up-lateness
 ```
 
-The value must be a finite, nonnegative number of seconds. Unset/null preserves
-the existing unlimited catch-up behavior; `0` allows no lateness. A start exactly
-at the limit is still eligible. To clear the field through the update tool,
-pass an empty string.
+The value must be a finite, nonnegative number of seconds. For a recurring job,
+unset/null preserves the existing unlimited catch-up behavior and `0` allows no
+lateness. For a one-shot, the field widens the catch-up window to
+`max(120, value)`; unset, invalid, and `0` keep 120 seconds. A start exactly
+at the resulting limit is still eligible. To clear the field through the update
+tool, pass an empty string.
 
 Hermes checks the original scheduled instant both before admission and again
 when the worker starts, including after a wait for capacity or detached-worker
@@ -1222,8 +1224,10 @@ next future occurrence. It queues one owner notice through the cron failure
 route even when normal or failure delivery is `local`.
 
 This deadline is independent of the backlog grace window and applies to both
-interval and cron schedules. One-shots and an explicit manual Run now are
-unchanged. Leaving it unset on other jobs does not change their behavior.
+interval and cron schedules. An explicit manual Run now is unchanged. A one-shot
+uses the field as an allowance of `max(120, value)` seconds; `0` keeps 120
+seconds, and a one-shot past that allowance is held rather than sent. Leaving
+it unset on other jobs does not change their behavior.
 
 ### Misfire catch-up
 

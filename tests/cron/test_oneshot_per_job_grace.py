@@ -56,6 +56,14 @@ def test_per_job_allowance_keeps_one_shot_due(store, monkeypatch, age, allowance
     assert saved["state"] == "scheduled" and saved["enabled"] is True
 
 
+def test_retired_oneshot_diagnostic_reports_actual_allowance(store):
+    job = oneshot(601, **{FIELD: 600})
+    jobs._write_retired_oneshot_diagnostic(job, job["next_run_at"])
+    diagnostic = next((store / "cron/output/once").glob("*.md"))
+    assert "grace window: 600s" in diagnostic.read_text()
+    assert "grace window: 120s" not in diagnostic.read_text()
+
+
 @pytest.mark.parametrize("age, allowance", [(601, 600), (901, 900), (6 * 60 * 60, 900)])
 def test_per_job_allowance_holds_after_deadline_with_actual_message(store, age, allowance):
     job = oneshot(age, **{FIELD: allowance})

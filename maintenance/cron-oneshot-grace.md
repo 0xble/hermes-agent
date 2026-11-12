@@ -15,8 +15,9 @@ backstops, or the `max_catch_up_lateness_seconds` interaction with those paths.
   the provider misfire backstop.
 - A one-shot beyond its allowance is held with its payload and disabled; it is
   never sent or routed through `missed_windows.claim_slot`. The missed-run
-  diagnostic names the actual allowance used. Create/update/resume rejection
-  of an already-past one-shot remains the fixed 120-second scheduling guard.
+  diagnostic and the retired-oneshot diagnostic name the actual allowance used.
+  Create/update/resume rejection of an already-past one-shot remains the fixed
+  120-second scheduling guard.
 - Invalid, boolean, non-finite, and negative field values return 120 and do
   not raise. `grace_minutes` is not read or aliased. Create, update, resume,
   and rearm rejection stay on the fixed 120-second guard.
