@@ -118,17 +118,23 @@ async def test_restore_local_session_yields_while_store_lock_is_held(monkeypatch
     lock = threading.Lock()
     entered, release = threading.Event(), threading.Event()
     sid, live, prepared, adapter = "sid", object(), object(), object()
+    seen_threads = []
     authority = object.__new__(SessionAuthority)
     authority.sessions = {sid: live}
     authority.retiring = False
     authority.runner = SimpleNamespace(_draining=False)
 
     def restore_entry(*args, **kwargs):
+        seen_threads.append(threading.current_thread().name)
         entered.set()
         with lock:
             release.wait()
 
-    monkeypatch.setattr(recovery, "_read_local_session", lambda *_args: prepared)
+    def read_local(*_args):
+        seen_threads.append(threading.current_thread().name)
+        return prepared
+
+    monkeypatch.setattr(recovery, "_read_local_session", read_local)
     monkeypatch.setattr(recovery, "_local_restore_adapter", lambda _authority: adapter)
     monkeypatch.setattr(recovery, "_check_restored_live", lambda *args: None)
     monkeypatch.setattr(recovery, "_restore_local_entry", restore_entry)
@@ -139,6 +145,7 @@ async def test_restore_local_session_yields_while_store_lock_is_held(monkeypatch
         lock, entered, release,
     )
     assert result == "published"
+    assert seen_threads and all(name.startswith("session-store") for name in seen_threads)
 
 
 @pytest.mark.asyncio

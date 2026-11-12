@@ -8,6 +8,7 @@ from pathlib import Path
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_contract import SessionRef
+from gateway.session_store_async import run_store_call
 from hermes_state_keys import local_identity
 from hermes_state_local import POLICY_PREFIX, local_receipt
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
@@ -50,6 +51,10 @@ def _refused_check(exc):
     where = f' at {frames[-1].name}:{frames[-1].lineno}' if frames else ''
     chained = f', caused by {_refused_check(exc.__cause__)}' if exc.__cause__ is not None else ''
     return f'{cause}{where}{chained}'
+
+
+class _LiveSessionChanged(RuntimeStoreError):
+    """The live cache changed during async restoration; a caller may re-read it."""
 
 
 class _ReceiptRefused(RuntimeStoreError):
@@ -242,21 +247,20 @@ async def restore_local_session_async(authority, sid, *, admission_gate=True):
     ``admission_gate=False`` is reserved for cron recovery of an already-admitted receipt while
     the gateway is draining; it does not relax any conflict or lineage check.
     """
-    import asyncio
     live = authority.sessions.get(sid)
-    prepared = await asyncio.to_thread(_read_local_session, authority, sid)
+    prepared = await run_store_call(_read_local_session, authority, sid)
     if admission_gate:
         authority._require_admission_open()
     if authority.sessions.get(sid) is not live:
-        raise RuntimeStoreError('admission_conflict')
+        raise _LiveSessionChanged('admission_conflict')
     adapter = _local_restore_adapter(authority)
     _check_restored_live(live, adapter, prepared)
-    await asyncio.to_thread(_restore_local_entry, authority, prepared, existing=live is not None)
+    await run_store_call(_restore_local_entry, authority, prepared, existing=live is not None)
     if admission_gate:
         authority._require_admission_open()
     if (authority.sessions.get(sid) is not live
             or local_adapter_map(authority).get(Platform.LOCAL) is not adapter):
-        raise RuntimeStoreError('admission_conflict')
+        raise _LiveSessionChanged('admission_conflict')
     _check_restored_live(live, adapter, prepared)
     return _publish_local_session(authority, sid, adapter, prepared, live)
 
