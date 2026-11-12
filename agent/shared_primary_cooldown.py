@@ -281,6 +281,14 @@ def _merge_duplicate_routes(state: dict[str, Any]) -> bool:
         winner = entry if entry_reset > current_reset else current
         other = current if winner is entry else entry
         winner["backoff_count"] = max(int(winner.get("backoff_count", 0) or 0), int(other.get("backoff_count", 0) or 0))
+        outage_ids = set(winner.get("merged_outage_ids") or ())
+        outage_ids.update(other.get("merged_outage_ids") or ())
+        for outage_id in (winner.get("outage_id"), other.get("outage_id")):
+            if outage_id:
+                outage_ids.add(str(outage_id))
+        outage_ids.discard(str(winner.get("outage_id") or ""))
+        if outage_ids:
+            winner["merged_outage_ids"] = sorted(outage_ids)
         winner["notice_claimed"] = bool(winner.get("notice_claimed")) or bool(other.get("notice_claimed"))
         if not winner.get("notice_fallback") and other.get("notice_fallback"):
             winner["notice_fallback"] = other["notice_fallback"]
@@ -465,7 +473,8 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None, *, tomb
             entry = state["routes"].get(key)
             if not isinstance(entry, dict):
                 return False
-            if outage_id is not None and str(entry.get("outage_id")) != str(outage_id):
+            accepted_ids = {str(entry.get("outage_id") or ""), *(str(value) for value in entry.get("merged_outage_ids") or ())}
+            if outage_id is not None and str(outage_id) not in accepted_ids:
                 return False
             if tombstone:
                 now = time.time()
@@ -535,7 +544,10 @@ def _settle_probe(route: tuple[str, str, str], outage_id: str, token: str, *, su
             entry = state["routes"].get(key)
             if (
                 not isinstance(entry, dict)
-                or str(entry.get("outage_id")) != str(outage_id)
+                or str(outage_id) not in {
+                    str(entry.get("outage_id") or ""),
+                    *(str(value) for value in entry.get("merged_outage_ids") or ()),
+                }
                 or str(entry.get("probe_owner") or "") != str(token)
             ):
                 return False
@@ -556,7 +568,7 @@ def _settle_probe(route: tuple[str, str, str], outage_id: str, token: str, *, su
             entry["state"] = "active"
             entry["backoff_count"] = count
             entry["source"] = "backoff"
-            entry["reset_at"] = now + min(60 * (2 ** max(0, count - 2)), _MAX_BACKOFF_SECONDS)
+            entry["reset_at"] = now + min(60 * (2 ** max(0, count - 1)), _MAX_BACKOFF_SECONDS)
             entry["recorded_at"] = now
             state["routes"][key] = entry
             _write_state(path, state)
@@ -592,13 +604,24 @@ def _release_probe(route: tuple[str, str, str], outage_id: str, token: str) -> b
         return False
 
 
-def _fail_agent_probe(agent) -> bool:
-    """Settle an in-flight probe after any provider error, exactly once."""
+_PROBE_OUTAGE_REASONS = frozenset({
+    "rate_limit", "upstream_rate_limit", "overloaded", "server_error", "timeout",
+})
+
+
+def _fail_agent_probe(agent, reason=None) -> bool:
+    """Settle an in-flight probe after an outage-class provider error, exactly once."""
     token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
     record = getattr(agent, "_shared_primary_cooldown_record", None)
     if not token or not isinstance(record, dict):
         return False
     route = route_from_record(record)
+    reason_value = getattr(reason, "value", reason)
+    if reason is not None and reason_value not in _PROBE_OUTAGE_REASONS:
+        released = _release_probe(route, str(record.get("outage_id") or ""), token)
+        if released:
+            agent._shared_primary_probe_token = None
+        return released
     settled = _settle_probe(route, str(record.get("outage_id") or ""), token, success=False)
     if settled:
         agent._shared_primary_probe_token = None
@@ -606,6 +629,7 @@ def _fail_agent_probe(agent) -> bool:
         current = get_cooldown(route)
         if isinstance(current, dict):
             agent._shared_primary_cooldown_record = current
+            agent._fallback_episode_cooled = True
             remaining = max(0, math.ceil(float(current.get("reset_at", 0) or 0) - time.time()))
             agent._rate_limited_until = time.monotonic() + remaining
             agent._rate_limit_backoff_count = int(current.get("backoff_count", 0) or 0)
@@ -701,9 +725,20 @@ def complete_primary_recovery(agent) -> bool:
 
     Request wrappers call this after every successful response, so it must prove the response
     came from the cooled primary: the agent's LIVE route (not its ``_primary_runtime`` snapshot)
-    must equal the record's route and no fallback may be active. A fallback reply never clears.
-    Silent alias retries consume their recovery without a notice and retire that provenance.
+    Primary recovery requires the live route to equal the primary record. A successful fallback
+    response separately clears only that fallback route's own breaker. Silent alias retries
+    consume their recovery without a notice and retire that provenance.
     """
+    fallback_record = getattr(agent, "_shared_fallback_cooldown_record", None)
+    if getattr(agent, "_fallback_activated", False) and isinstance(fallback_record, dict):
+        route = route_from_record(fallback_record)
+        if live_route_from_agent(agent) != route:
+            return False
+        outage_id = str(fallback_record.get("outage_id") or "")
+        if not outage_id or not clear_if_current(route, outage_id, tombstone=True):
+            return False
+        agent._shared_fallback_cooldown_record = None
+        return True
     record = getattr(agent, "_shared_primary_cooldown_record", None)
     if not isinstance(record, dict):
         return False

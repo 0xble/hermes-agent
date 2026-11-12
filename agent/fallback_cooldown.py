@@ -85,6 +85,9 @@ def _arm_rate_limit_cooldown(
     if (failed_outage_id and isinstance(record, dict)
             and str(record.get("outage_id") or "") == failed_outage_id
             and not getattr(agent, "_fallback_activated", False)):
+        # A failed half-open probe already re-armed this outage.  Preserve the
+        # signal that permits a long fallback turn to retry the primary.
+        agent._fallback_episode_cooled = True
         return max(0, math.ceil(float(record.get("reset_at", 0) or 0) - time.time()))
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     if getattr(agent, "_fallback_activated", False):

@@ -91,6 +91,10 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        # This is the start of this physical transport attempt.  Retry attempts
+        # within one logical API call must not reuse the outer call timestamp
+        # when guarding a recovery tombstone.
+        agent._current_api_request_started_at = time.time()
         from agent import relay_llm
         from agent.turn_usage import log_response_service_tier
 
