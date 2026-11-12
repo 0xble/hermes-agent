@@ -229,3 +229,13 @@ def test_projection_limits_hold():
         "not-a-row", [{"text": "Name", "is_header": True}], [{"text": "Brian"}]]}]}).text == "| Name |\n| --- |\n| Brian |"
     tiny = project_rich_message({"blocks": [{"type": "paragraph", "text": "x" * 100}]}, max_chars=10)
     assert tiny.truncated is True and len(tiny.text) <= 10
+
+
+def test_empty_paragraph_is_a_blank_line_not_content():
+    """Telegram carries a blank line between blocks as an empty paragraph (upstream #146067's shape)."""
+    blank = {"type": "paragraph", "text": ""}
+    assert project_rich_message({"blocks": [
+        {"type": "paragraph", "text": "one"}, blank, {"type": "paragraph", "text": "two"}]}).text == "one\n\ntwo"
+    assert project_rich_message({"blocks": [{"type": "list", "items": [
+        {"label": "•", "blocks": [blank, {"type": "paragraph", "text": "item"}]}, {"label": "•", "blocks": [blank]}]}]}).text == "• item"
+    assert project_rich_message({"blocks": [blank, blank]}).text == ""

@@ -31,8 +31,10 @@ def test_rich_message_blocks_reach_the_agent_as_text(rig) -> None:
             {"label": "•", "blocks": [{"type": "paragraph", "text": "Modell: HD103UJ"}]}]}]})
     C.wait_reply(rig, str(uid), aid, "the rich_message DM to be answered")
     assert C.turns(rig, token) == 1
+    # The fork projects rich blocks to Markdown (telegram-inbound-rich-messages), so inline bold
+    # survives; the empty paragraph still reaches the agent as a blank line.
     assert rig.gw.user_rows(f"[in:{token}]") == [
-        f"Can't you update it? [in:{token}]\n\n• Kapazität: 1TB\n• Modell: HD103UJ"]
+        f"Can't you update it? **[in:{token}]**\n\n• Kapazität: 1TB\n• Modell: HD103UJ"]
 
 
 def test_rich_message_group_mention_reaches_the_agent(rig) -> None:
