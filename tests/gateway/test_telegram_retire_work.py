@@ -424,7 +424,7 @@ async def test_transferred_loop_wakes_in_successor_topic_after_restart(runtime, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["goal", "loop"])
-@pytest.mark.parametrize("status", ["done", "cleared", "completed", "stopped"])
+@pytest.mark.parametrize("status", ["done", "cleared", "completed", "stopped", "cancelled"])
 async def test_terminal_destination_controls_allow_preparation_and_atomic_transfer(runtime, monkeypatch, kind, status):
     from hermes_cli import goals, loops
     r = runtime

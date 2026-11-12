@@ -36,7 +36,16 @@ def runtime(tmp_path, monkeypatch, request):
     state = {"phase": "failed", "generation": "gen", "session_id": entry.session_id,
              "session_key": entry.session_key, "source": source.to_dict(), "handoffs": {},
              "error": "closing failed", "reason": "", "target": "", "failed_at": time.time()}
-    monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[]))
+    monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=()))
+    from cron import jobs
+    from tools import async_delegation
+    from tools.process_registry import process_registry
+    from hermes_cli import goals, loops
+    monkeypatch.setattr(jobs, "list_jobs", lambda **_: [])
+    monkeypatch.setattr(async_delegation, "retirement_inventory", lambda *_: [])
+    monkeypatch.setattr(process_registry, "list_sessions", lambda **_: [])
+    monkeypatch.setattr(goals, "_get_session_db", lambda: db)
+    monkeypatch.setattr(loops, "_get_session_db", lambda: db)
     monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
     monkeypatch.setattr(work, "cli", AsyncMock(return_value=[]))
     yield SimpleNamespace(db=db, runner=runner, source=source, state=state, adapter=adapter, bot=bot, entry=entry)
@@ -79,7 +88,7 @@ async def test_absent_recovery_preserves_ambiguous_or_unsettled_topics(runtime, 
         monkeypatch.setattr(work, "cli", AsyncMock(side_effect=RuntimeError(
             "topic closed" if block == "closed" else "network outage")))
     elif block == "open_work":
-        monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[{"id": "loop", "kind": "loop"}]))
+        monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[{"id": "task:t1", "kind": "task"}]))
     elif block == "active_successor":
         monkeypatch.setattr(work, "receipt", AsyncMock(return_value={"receipt_id": "accepted"}))
         from hermes_cli import loops
@@ -200,8 +209,17 @@ async def test_pool_exhaustion_defers_cancelled_goal_before_absent_finalization(
     r = runtime
     r.state["phase"] = "pending"
     r.db.set_meta(f"goal:{r.entry.session_id}", json.dumps({"status": "cancelled", "goal": "Cancelled goal"}))
-    inventory = AsyncMock(side_effect=[RuntimeError("tasks: EMAXCONNSESSION: connection limit"), []])
-    monkeypatch.setattr(work, "inventory", inventory)
+    monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=("tasks",)))
+    failed = False
+
+    async def cli(_runner, _source, *args, **kwargs):
+        nonlocal failed
+        if args[0] == "tasks" and not failed:
+            failed = True
+            raise RuntimeError("tasks: EMAXCONNSESSION: connection limit")
+        return []
+
+    monkeypatch.setattr(work, "cli", AsyncMock(side_effect=cli))
     retries = []
     monkeypatch.setattr(retire, "_schedule_retry", lambda _runner, _source, delay: retries.append(delay))
     await retire.save(r.runner, r.source, r.state)
@@ -219,13 +237,123 @@ async def test_pool_exhaustion_defers_cancelled_goal_before_absent_finalization(
     await retire.advance(r.runner, r.source)
     final = await retire.load(r.runner, r.source)
     assert final["phase"] == "done"
-    assert inventory.await_count == 2
+    assert failed
     assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is None
     assert r.runner.session_store.peek_session_id(r.entry.session_key) is None
     assert json.loads(r.db.get_meta(f"goal:{r.entry.session_id}"))["status"] == "cancelled"
 
     await retire.advance(r.runner, r.source)
     assert await retire.load(r.runner, r.source) == final
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("present", [False, True])
+async def test_real_inventory_cancels_active_control_on_topic_retirement(runtime, monkeypatch, kind, present, caplog):
+    r = runtime
+    r.state.update(phase="pending", reason="User explicitly stopped work.")
+    if present:
+        from gateway.platforms.base import SendResult
+        r.adapter.send.return_value = SendResult(success=True, message_id="19",
+                                                 raw_response={"requested_thread_id": "17"})
+        deleted = False
+
+        async def delete(**kwargs):
+            nonlocal deleted
+            deleted = True
+            return True
+
+        async def cli(*args, **kwargs):
+            return [] if deleted else [{"id": "17"}]
+
+        r.bot.delete_forum_topic.side_effect = delete
+        monkeypatch.setattr(work, "cli", AsyncMock(side_effect=cli))
+    if kind == "goal":
+        from hermes_cli import goals
+        goals.save_goal(r.entry.session_id, goals.GoalState(goal="Retire this work", status="active"))
+    else:
+        from hermes_cli import loops
+        loops.save_loop(r.entry.session_id, loops.LoopState(prompt="Retire this loop", status="active"))
+    r.db.create_session("unrelated", source="telegram")
+    unrelated = {"goal": "Keep working elsewhere", "status": "active"}
+    r.db.set_meta("goal:unrelated", json.dumps(unrelated))
+    await retire.save(r.runner, r.source, r.state)
+
+    with caplog.at_level("INFO", logger=work.__name__):
+        await retire.advance(r.runner, r.source)
+
+    final = await retire.load(r.runner, r.source)
+    assert final is not None and final["phase"] == "done"
+    if present:
+        assert final["closing_receipt"]["message_id"] == "19"
+        r.bot.delete_forum_topic.assert_awaited_once()
+    record = json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}"))
+    assert record["status"] == "cleared"
+    assert final["cancelled_controls"][kind]["action"] == "clear"
+    assert f"cleared {kind}" in caplog.text
+    assert json.loads(r.db.get_meta("goal:unrelated")) == unrelated
+    assert await work.inventory(r.runner, r.source, final) == []
+
+
+@pytest.mark.asyncio
+async def test_real_inventory_treats_cancelled_goal_as_terminal(runtime):
+    r = runtime
+    r.db.set_meta(f"goal:{r.entry.session_id}", json.dumps({"status": "cancelled", "goal": "Already stopped"}))
+    assert await work.inventory(r.runner, r.source, r.state) == []
+
+
+@pytest.mark.asyncio
+async def test_real_inventory_keeps_running_process_as_blocking_work(runtime, monkeypatch):
+    r = runtime
+    from tools.process_registry import ProcessRegistry, ProcessSession, process_registry
+    registry = ProcessRegistry()
+    registry._running = {"proc-live": ProcessSession(id="proc-live", command="build", owner_task_id="old",
+                                                       session_key=r.runner._session_key_for_source(r.source))}
+    monkeypatch.setattr(process_registry, "list_sessions", registry.list_sessions)
+    items = await work.inventory(r.runner, r.source, r.state)
+    assert {item["id"] for item in items} == {"process:proc-live"}
+    await retire.save(r.runner, r.source, r.state)
+    await retire.advance(r.runner, r.source)
+    assert (await retire.load(r.runner, r.source))["phase"] != "done"
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
+    r.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_real_inventory_claim_blocks_cancellation_and_finalization(runtime, monkeypatch):
+    r = runtime
+    from hermes_cli import goals
+    goals.save_goal(r.entry.session_id, goals.GoalState(goal="Pending cancelled work", status="active"))
+    r.state.update(phase="pending", reason="User stopped work.")
+    monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=("tasks",)))
+
+    async def cli(_runner, _source, *args, **kwargs):
+        return [{"id": "claim1"}] if args[0] == "tasks" else []
+
+    monkeypatch.setattr(work, "cli", AsyncMock(side_effect=cli))
+    await retire.save(r.runner, r.source, r.state)
+    with pytest.raises(work.WorkInProgress):
+        await work.inventory(r.runner, r.source, r.state)
+    await retire.advance(r.runner, r.source)
+    assert (await retire.load(r.runner, r.source))["phase"] == "pending"
+    assert json.loads(r.db.get_meta(f"goal:{r.entry.session_id}"))["status"] == "active"
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
+
+
+@pytest.mark.asyncio
+async def test_control_cancellation_does_not_discard_inflight_loop_tick(runtime):
+    r = runtime
+    from hermes_cli import loops
+    loops.save_loop(r.entry.session_id, loops.LoopState(prompt="Still executing", status="active",
+                                                       awaiting_response=True, ticks_fired=1))
+    r.state.update(phase="pending", reason="User stopped work.")
+    await retire.save(r.runner, r.source, r.state)
+    items = await work.inventory(r.runner, r.source, r.state)
+    with pytest.raises(work.WorkInProgress):
+        await work.reconcile_controls(r.runner, r.source, r.state, items)
+    record = json.loads(r.db.get_meta(f"loop:{r.entry.session_id}"))
+    assert record["status"] == "active" and record["awaiting_response"]
+    assert "cancelled_controls" not in (await retire.load(r.runner, r.source))
 
 
 @pytest.mark.asyncio

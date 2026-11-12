@@ -304,7 +304,9 @@ async def _finalize_absent(runner, source, state, bot):
             record.get("item", {}).get("kind") == "context" for record in state["handoffs"].values())):
         return True
     await settle_handoffs(runner, source, state)
-    if await inventory(runner, source, state):
+    from gateway.telegram_retire_work import reconcile_controls
+    items = await inventory(runner, source, state)
+    if await reconcile_controls(runner, source, state, items):
         return True
     current = await _current(runner, source, generation)
     if (not current or current["phase"] not in {"failed", "pending", "waiting"} or runner._is_session_running(key)

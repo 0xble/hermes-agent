@@ -656,6 +656,16 @@ Fork-Patch: reaction-outbound-identity.
 
 Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).
 
+## Telegram topic retirement
+
+Fork patch identity: `telegram-topic-retire`. A selected topic deletion reconciles
+that source session's goal and loop through their supported manager clear paths,
+with an atomic generation-bound receipt and readback. Merge/explicit-owner handoffs
+retain their existing preservation route; claims, in-flight loop ticks and other
+work still block or require verified handoff. `cancelled` controls are terminal.
+See [the retirement contract](maintenance/session-controls.md#telegram-topic-retirement)
+and the real-inventory regressions in `tests/gateway/test_telegram_retire_finalize.py`.
+
 ## Session controls
 
 Fork patch identity: `session-controls`. One session can pause, resume, clear or replace another session's goal, and pause, resume or stop another session's loop, authorized by a fresh verbatim user quote or a Telegram Approve/Deny press. See [the maintenance unit](maintenance/session-controls.md).
