@@ -11,13 +11,19 @@ from typing import Any
 
 
 def stamp_gateway_assistant_entry(entry: dict, event: Any) -> None:
-    """Preserve a runtime assistant UID when the gateway must write the row."""
-    if entry.get("role") != "assistant" or entry.get("message_uid"):
+    """Bind the gateway event to the assistant row it is writing.
+
+    Persistence walks a gateway-written or proxy turn forward. A tool-call
+    assistant row is not the visible final, so each assistant entry replaces
+    the event UID, including one already stamped by an earlier row.
+    """
+    if entry.get("role") != "assistant":
         return
-    from agent.message_metadata import stamp_message_uid
-    entry["message_uid"] = stamp_message_uid(entry)
-    if not getattr(event, "_transcript_message_uid", None):
-        event._transcript_message_uid = entry["message_uid"]
+    uid = entry.get("message_uid")
+    if not (isinstance(uid, str) and uid):
+        from agent.message_metadata import stamp_message_uid
+        uid = stamp_message_uid(entry)
+    event._transcript_message_uid = uid
 
 
 def assistant_reply_uid(messages: Any) -> str | None:

@@ -5035,12 +5035,12 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     async def _send_image_batch(
         self, event: MessageEvent, images: list, metadata: dict[str, Any], human_delay: float,
         record_delivery: Callable) -> None:
-        """Batch-send images; a failure is logged (never raised) so other attachments still go.
-        The batch result feeds ``record_delivery`` so media-only turns report their real
-        outcome instead of FAILURE."""
+        """Batch-send images and record the result; a failure is logged, never raised.
+        The transcript UID is stripped before the adapter sees metadata."""
         try:
             result = await self.send_multiple_images(
-                chat_id=event.source.chat_id, images=images, metadata=metadata, human_delay=human_delay)
+                chat_id=event.source.chat_id, images=images,
+                metadata=adapter_send_metadata(metadata), human_delay=human_delay)
         except Exception as batch_err:
             logger.warning("[%s] Error batching images: %s", self.name, batch_err, exc_info=True)
             record_delivery(SendResult(success=False, error=str(batch_err)))

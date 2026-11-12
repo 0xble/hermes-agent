@@ -252,6 +252,61 @@ async def test_proxy_turn_writes_the_uid_delivery_already_named(tmp_path, monkey
 
 
 @pytest.mark.asyncio
+async def test_multi_assistant_gateway_turn_stamps_the_visible_final_row(tmp_path, monkeypatch):
+    """A tool-call row written before the final answer must not keep the platform id."""
+    from gateway.outbound_reply import reply_uid_for_final
+
+    store = _real_store(tmp_path, monkeypatch)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm")
+    entry = await store.get_or_create_session(source)
+    runner = GatewayTurnMixin.__new__(GatewayTurnMixin)
+    runner._session_db = object()
+    runner.async_session_store = store
+    runner._hmwa_store_turn_prompt_tokens = AsyncMock()
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    event = MessageEvent(text="hello", message_type=MessageType.TEXT, message_id="in-tools", source=source)
+    prepared = SimpleNamespace(
+        history=[{"role": "user", "content": "prior"}], persist_user_message="hello",
+        persist_user_timestamp=None, persist_user_display_kind=None, persistence_owner=None,
+        hygiene_adoption_epoch=0, message_text="hello",
+    )
+    tool_call = {"id": "call-1", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+    tool_assistant = {
+        "role": "assistant", "content": "", "tool_calls": [tool_call], "message_uid": "uid-tool-call",
+    }
+    tool_result = {
+        "role": "tool", "content": "found", "tool_call_id": "call-1", "message_uid": "uid-tool-result",
+    }
+    final_assistant = {"role": "assistant", "content": "visible answer"}
+    messages = [
+        {"role": "user", "content": "hello"},
+        tool_assistant,
+        tool_result,
+        final_assistant,
+    ]
+    agent_result = {
+        "agent_persisted": False, "_gateway_user_turn_persisted": True, "history_offset": 0,
+        "last_prompt_tokens": 0, "messages": messages, "final_response": "visible answer",
+    }
+    await runner._hmwa_persist_turn_transcript(
+        event=event, source=source, session_entry=entry, session_key=entry.session_key,
+        agent_result=agent_result, agent_messages=messages, prepared=prepared,
+        response="visible answer", agent_failed_early=False, hidden_reasoning_incomplete=False,
+        is_context_overflow_failure=False,
+    )
+    named = reply_uid_for_final(event, {})
+    stamped = await store.record_outbound_platform_message(entry.session_key, "reply-final", "", named)
+    rows = [row for row in store._store._db.get_messages(entry.session_id) if row["role"] == "assistant"]
+    assert stamped is True
+    assert named == getattr(event, "_transcript_message_uid", None) == rows[1]["message_uid"]
+    assert named != "uid-tool-call"
+    assert [(row["message_uid"], row.get("platform_message_id")) for row in rows] == [
+        ("uid-tool-call", None),
+        (named, "reply-final"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_adapter_boundary_strips_the_transcript_uid_and_still_stamps_it(tmp_path, monkeypatch):
     """Queued media and the send retry see public metadata; the stamp still names the row."""
     from gateway.outbound_reply import adapter_send_metadata, queued_reply_metadata
@@ -312,3 +367,41 @@ async def test_adapter_boundary_strips_the_transcript_uid_and_still_stamps_it(tm
     assert adapter_send_metadata(None) is None
     assert adapter_send_metadata({"thread_id": "7"}) == {"thread_id": "7"}
     assert adapter_send_metadata({"_transcript_message_uid": "only"}) is None
+
+
+@pytest.mark.asyncio
+async def test_attachment_image_batch_strips_the_transcript_uid():
+    """Normal attachment delivery, not only queued media, keeps routing keys and drops the UID."""
+    from gateway.platforms.base import _ExtractedResponse
+
+    class _BatchAdapter(_Adapter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.sent = []
+            self.image_batches = []
+
+        async def send_multiple_images(self, chat_id, images, metadata=None, human_delay=0.0):
+            self.image_batches.append({"chat_id": chat_id, "images": images, "metadata": metadata})
+            return SendResult(success=True, message_id="img-attach")
+
+    adapter = _BatchAdapter(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+    adapter.gateway_runner = None
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm", thread_id="topic-9")
+    event = MessageEvent(text="photo", message_type=MessageType.TEXT, message_id="in-attach", source=source)
+    metadata = {"thread_id": "topic-9", "notify": True, "_transcript_message_uid": "uid-final"}
+    recorded = []
+    extracted = _ExtractedResponse(
+        text_content="", images=[("https://cdn.example/photo.png", "photo")],
+        media_files=[], local_files=[], force_document_attachments=False, pre_extract="photo",
+    )
+
+    await adapter._deliver_attachments(
+        event, extracted, metadata, anything_sent=True, record_delivery=recorded.append)
+
+    assert adapter.image_batches == [{
+        "chat_id": "chat",
+        "images": [("https://cdn.example/photo.png", "photo")],
+        "metadata": {"thread_id": "topic-9", "notify": True},
+    }]
+    assert recorded[0].success is True
+    assert recorded[0].message_id == "img-attach"
