@@ -81,7 +81,8 @@ def recovery_batch(tmp_path, monkeypatch):
         load_transcript=AsyncMock(side_effect=lambda sid: histories[sid]),
         clear_turn_active=AsyncMock(side_effect=clear),
         # Fork per-room silence (33cf2037) reads the room decision before judging the reply.
-        get_session_metadata=AsyncMock(return_value={}))
+        get_session_metadata=AsyncMock(return_value={}),
+        recover_interrupted_turns=AsyncMock(side_effect=lambda **_: len(active)))
     try:
         yield SimpleNamespace(runner=runner, adapter=adapter, rows=rows, dbs=dbs, active=active)
     finally:
@@ -139,15 +140,20 @@ async def test_unavailable_provenance_does_not_abort_following_profile(recovery_
         assert states[first["session_key"]][0] in {"pending", "attempting", "failed", "delivered"}
         assert (states[first["session_key"]][0] == "delivered") == (first["content"] in sent)
 
-    # A missing DB may use ordinary-final fallback. A real read error is not proof
-    # that the exact turn has no supervisor policy: retain it until readable.
+    # A missing DB may use ordinary-final fallback. Crash-left recovery still
+    # settles a saved final reply when policy inspection fails.
     if fault == "sqlite-read":
         if lane == "ledger":
             assert first["content"] not in sent
             assert states[first["session_key"]][0] in {"pending", "attempting", "failed"}
         else:
-            assert first["session_key"] in f.active
-            assert first["session_key"] not in states
+            assert first["session_key"] not in f.active
+            assert states[first["session_key"]][1] == first["content"]
+    else:
+        if lane == "ledger":
+            assert first["content"] in sent
+        else:
+            assert states[first["session_key"]][1] == first["content"]
     f.runner.session_store._db_for_key = original_lookup
     monkeypatch.setattr(f.dbs["alpha"], "_read_all", original_read)
     if lane == "ledger":
@@ -159,3 +165,20 @@ async def test_unavailable_provenance_does_not_abort_following_profile(recovery_
         await f.runner._ledger_crash_left_replies(7200)
         assert not f.active
         assert _ledger_rows()[first["session_key"]][1] == first["content"]
+
+
+@pytest.mark.asyncio
+async def test_startup_recovery_ledgers_saved_reply_before_resume_sweep(recovery_batch, monkeypatch):
+    f = recovery_batch
+    first = f.rows[0]
+
+    def unreadable(*args, **kwargs):
+        raise sqlite3.OperationalError("transient provenance read failure")
+
+    monkeypatch.setattr(f.dbs["alpha"], "_read_all", unreadable)
+    resumed, ledgered = await f.runner._recover_unclean_sessions()
+
+    assert resumed == 0 and ledgered == 4
+    f.runner.async_session_store.recover_interrupted_turns.assert_awaited_once()
+    assert first["session_key"] not in f.active
+    assert _ledger_rows()[first["session_key"]][1] == first["content"]

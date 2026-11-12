@@ -245,7 +245,8 @@ async def test_pending_retirement_rechecks_same_receipt_on_resume(runtime, monke
         yield
 
     r.runner._async_profile_scope_for_source = scope
-    monkeypatch.setattr(retire, "_probe_deleted", AsyncMock(return_value=True))
+    monkeypatch.setattr(retire, "_probe_deleted", AsyncMock(
+        side_effect=lambda *_args, read_only=False, **_kwargs: not read_only))
     monkeypatch.setattr(work, "inventory", AsyncMock(return_value=[]))
     dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18", "title": "Service Operations"}
     monkeypatch.setattr(work, "destination", AsyncMock(return_value=dest))

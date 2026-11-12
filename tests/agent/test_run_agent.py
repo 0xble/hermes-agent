@@ -6348,7 +6348,7 @@ class TestStreamingApiCall:
         # The builder must route it through the partial-stream-stub path
         # (id=PARTIAL_STREAM_STUB_ID, tool_calls=None so it can't execute,
         # finish_reason=length so the loop's continuation machinery fires with
-        # chunking guidance) rather than stamping a normal 'length' truncation.
+        # transport guidance) rather than stamping a normal 'length' truncation.
         from hermes_constants import PARTIAL_STREAM_STUB_ID
         chunks = [
             _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "write_file", '{"path":"x.txt","content":"hel')]),

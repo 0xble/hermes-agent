@@ -566,6 +566,8 @@ class TestValidateConfigKey:
         # but absent from DEFAULT_CONFIG; they used to trip the false "not a recognized config
         # key" notice with a bogus near-miss suggestion (platform_hints.cli).
         "platform_toolsets.cli",
+        "nodes.default",
+        "nodes.hosts.macstudio.ssh",
     ])
     def test_known_keys_pass(self, key):
         from hermes_cli.config import _validate_config_key

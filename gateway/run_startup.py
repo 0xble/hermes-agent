@@ -841,7 +841,7 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
 
         See #69089.
         """
-        from gateway.shutdown_watchdog import _arm_loop_floor_timer, start_loop_liveness_watchdog
+        from gateway.shutdown_watchdog import _arm_loop_floor_timer, session_store_lock_snapshot, start_loop_liveness_watchdog
         config = getattr(self, "config", None)
         if config is not None and not getattr(config, "loop_watchdog", True):
             return
@@ -860,9 +860,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
                     probe_timeout=float(getattr(
                         config, "loop_watchdog_probe_timeout_s", DEFAULT_LOOP_WATCHDOG_TIMEOUT_S
                     )),
-                    max_strikes=int(getattr(
-                        config, "loop_watchdog_max_strikes", DEFAULT_LOOP_WATCHDOG_MAX_STRIKES
-                    )),
+                    max_strikes=int(getattr(config, "loop_watchdog_max_strikes", DEFAULT_LOOP_WATCHDOG_MAX_STRIKES)),
+                    store_snapshot_fn=lambda: session_store_lock_snapshot(self),
                 )
             except Exception:
                 logger.debug("Failed to start gateway loop liveness watchdog", exc_info=True)

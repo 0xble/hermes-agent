@@ -11,6 +11,7 @@ from typing import Optional, TypeVar
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent
 from gateway.run_shutdown import _log_suppressed
+from hermes_cli.checkins import DISPLAY_KIND
 
 logger = logging.getLogger("gateway.run")
 
@@ -62,7 +63,10 @@ async def _recover_obligation_policy(runner, row, chat_key, blocked_chats):
     """Retain unreadable policy for retry, retire only a proven disarm."""
     from gateway.checkin_delivery import DISARMED, permits_metadata, recovery_metadata
     try:
-        policy = await recovery_metadata(runner, row["session_key"], row.get("resume_turn_id"))
+        policy = await recovery_metadata(
+            runner, row["session_key"], row.get("resume_turn_id"),
+            known_supervisor=bool(row.get("supervisor_checkin")),
+        )
         permitted = await permits_metadata(runner, policy, retry_on_read_error=True)
     except (OSError, sqlite3.Error):
         logger.warning("Delivery policy unreadable for %s; retaining owed reply", row["session_key"], exc_info=True)
@@ -237,19 +241,30 @@ class RuntimeDeliveryRecoveryMixin:
             if started < cutoff:
                 continue
             from gateway.checkin_delivery import permits_recovery
+            text = None
+            supervisor_checkin = False
             try:
                 decision = await self.async_session_store.get_session_metadata(
                     key, "room_silence_decision", {})
-                text = self._crash_left_reply(await self.async_session_store.load_transcript(session_id),
-                                              started, origin, silence_decision=decision,
-                                              active_token=token)
+                history = await self.async_session_store.load_transcript(session_id)
+                visible = [message for message in history if isinstance(message, dict)
+                           and message.get("role") not in ("session_meta", "system")]
+                prompt = next((message for message in reversed(visible[:-1])
+                               if message.get("role") == "user"), {})
+                supervisor_checkin = prompt.get("display_kind") == DISPLAY_KIND
+                text = self._crash_left_reply(history, started, origin,
+                                              silence_decision=decision, active_token=token)
                 if text is None or (text and not ledger_on):
                     continue  # no final reply to deliver: the turn resumes
-                if text and not await permits_recovery(self, key, token):
+                if text and not await permits_recovery(
+                        self, key, token, known_supervisor=supervisor_checkin):
                     text = ""
             except (OSError, sqlite3.Error):
-                logger.warning("Crash-left delivery policy unreadable for %s; retaining turn marker", key, exc_info=True)
-                continue
+                # A saved final reply is still owed. Falling back to the base recovery path
+                # clears the marker and ledgers it, so startup cannot turn it into a fresh resume.
+                logger.warning("Crash-left delivery policy unreadable for %s; ledgering saved reply", key, exc_info=True)
+                if text is None:
+                    continue
             if text:
                 for ref, content in await asyncio.to_thread(
                         self._crash_left_parts, key, token, text, started, origin):
@@ -260,7 +275,8 @@ class RuntimeDeliveryRecoveryMixin:
                         thread_id=origin.thread_id, content=content, since=started, adapter_profile=profile,
                         # Parts were matched against the ledger above; only a single whole-reply
                         # row still needs the content-based duplicate check.
-                        resume_turn_id=token, part=ref != f"crash:{token}" or text != content)
+                        resume_turn_id=token, part=ref != f"crash:{token}" or text != content,
+                        supervisor_checkin=supervisor_checkin)
             if await self.async_session_store.clear_turn_active(key, token) and text:
                 ledgered += 1
         return ledgered

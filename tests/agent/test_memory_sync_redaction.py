@@ -4,9 +4,12 @@ Providers archive whatever they are handed, so a key echoed into tool output use
 provider's store. Asserts on absence of the secret, never on a mask format.
 """
 import json
+import random
+import re
 
 import pytest
 
+from agent import memory_manager
 from agent.memory_manager import MemoryManager
 from agent.memory_provider import MemoryProvider
 
@@ -112,3 +115,83 @@ def test_on_turn_start_scrubs_user_text_but_hands_identity_through_raw():
     message, kwargs = provider.seen[0]
     assert message == "next ask" and _SECRET not in kwargs["previous_message"]
     assert kwargs["author_id"] == phone and kwargs["author_name"] == phone and kwargs["model"] == "test/model"
+
+def _legacy_learned_token_substitution(text, learned):
+    pattern = re.compile("|".join(re.escape(token) for token in sorted(learned, key=len, reverse=True)))
+    return pattern.sub("[redacted]", text)
+
+
+def test_learned_token_substitution_matches_legacy_for_random_embedded_tokens():
+    rng = random.Random(20261111)
+    learned = frozenset({
+        "alpha01234567890",
+        "beta_01234567890",
+        "gamma/01234567890",
+    })
+    alphabet = "abcXYZ012_-./+ "
+    samples = [
+        f"prefix{token}suffix" for token in learned
+    ] + [
+        f"prefixX{token}Ysuffix" for token in learned
+    ]
+    samples.extend(
+        "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 80)))
+        + rng.choice(tuple(learned))
+        + "".join(rng.choice(alphabet) for _ in range(rng.randrange(0, 80)))
+        for _ in range(500)
+    )
+    for text in samples:
+        assert memory_manager._apply_learned_tokens(text, learned) == _legacy_learned_token_substitution(text, learned)
+
+
+def test_sync_redaction_scrubs_each_repeated_transcript_string_once(monkeypatch):
+    calls = 0
+    real_scrub = memory_manager.redact_for_egress
+
+    def counted_scrub(text):
+        nonlocal calls
+        calls += 1
+        return real_scrub(text)
+
+    monkeypatch.setattr(memory_manager, "redact_for_egress", counted_scrub)
+    mgr, _provider = _manager()
+    transcript = [
+        {"role": "user", "content": f"message-{index:03d} distinct"}
+        for index in range(400)
+    ]
+    for _ in range(50):
+        mgr.sync_all("same user content", "same assistant content", messages=transcript)
+    mgr.flush_pending(timeout=5.0)
+
+    unique_strings = {"same user content", "same assistant content", "user", "message-000 distinct"}
+    unique_strings.update(message["content"] for message in transcript)
+    assert calls <= len(unique_strings) + 2
+
+
+def test_scrub_cache_generation_changes_when_a_vault_value_is_registered():
+    from agent.redact import clear_vault_redaction_values, register_vault_redaction_value
+
+    secret = "vault-cache-invalidation-secret"
+    text = f"value={secret}"
+    clear_vault_redaction_values()
+    try:
+        assert memory_manager._scrub(text) == text
+        register_vault_redaction_value(secret)
+        assert secret not in memory_manager._scrub(text)
+    finally:
+        clear_vault_redaction_values()
+
+
+def test_surrogate_transcript_redaction_matches_legacy_and_syncs_without_raising():
+    from agent.redact import redact_for_egress
+
+    surrogate_text = b"caf\xe9".decode("utf-8", "surrogateescape")
+    content = f"{surrogate_text} and \ud800"
+    expected = redact_for_egress(content)
+
+    assert memory_manager._redact_for_provider(content) == expected
+
+    mgr, provider = _manager()
+    mgr.sync_all(content, content)
+    mgr.flush_pending(timeout=5.0)
+    assert provider.seen == [(expected, expected, None)]

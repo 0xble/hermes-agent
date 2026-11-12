@@ -23,7 +23,9 @@ PREFIX = "telegram_retire:"
 NOTICE = "This topic is retiring and no longer accepts new work."
 # Telegram flood waits and timeouts clear on their own. Retry those automatically instead of
 # failing the retirement (2026-10-29: a FLOOD_WAIT during a handoff relay left a topic "failed").
-_TRANSIENT_MARKERS = ("rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror")
+_TRANSIENT_MARKERS = (
+    "rate_limited", "flood_wait", '"retryable":true', "timed out", "timeouterror", "emaxconnsession"
+)
 _TRANSIENT_RETRY_LIMIT = 6
 # A failed retirement is still a standing user request. Housekeeping re-runs it with the saved
 # decisions on a doubling backoff (2026-10-30: 28 topics sat "failed" after faults that had cleared
@@ -280,31 +282,67 @@ async def _unbind(runner, source, state):
 
 
 async def _finalize_absent(runner, source, state, bot):
-    """A failed request can finish quietly after independently confirmed absence."""
+    """Return whether passive recovery owns this pass, including when work blocks it."""
     from gateway.telegram_retire_work import inventory, settle_handoffs
     key, generation = state["session_key"], state["generation"]
     if await asyncio.to_thread(runner.session_store.peek_session_id, key) not in {None, state["session_id"]}:
-        return
-    if bot is None or not await _probe_deleted(bot, source, runner=runner, read_only=True):
-        return
+        return False
+    if bot is None:
+        return False
+    try:
+        absent = await _probe_deleted(bot, source, runner=runner, read_only=True)
+    except Exception as exc:
+        if _transient_delay(exc) is not None:
+            raise
+        logger.debug("Read-only topic absence probe was inconclusive for %s", key, exc_info=True)
+        return False
+    if not absent:
+        return False
     # No new source-topic turn or closing send is possible. A requested merge
     # must already have a saved destination and context handoff to reconcile.
     if state.get("target") and (not state.get("merge_destination") or not any(
             record.get("item", {}).get("kind") == "context" for record in state["handoffs"].values())):
-        return
+        return True
     await settle_handoffs(runner, source, state)
     if await inventory(runner, source, state):
-        return
+        return True
     current = await _current(runner, source, generation)
-    if (not current or current["phase"] != "failed" or runner._is_session_running(key)
+    if (not current or current["phase"] not in {"failed", "pending", "waiting"} or runner._is_session_running(key)
             or await asyncio.to_thread(runner.session_store.peek_session_id, key) not in {None, state["session_id"]}):
-        return
+        return True
     # This records observed absence, not a claim that a closing send succeeded.
     # Historical errors and any real closing receipt remain unchanged.
     current["disposition"] = {"status": "absent_at_finalization", "generation": generation,
                               "chat_id": str(source.chat_id), "thread_id": str(source.thread_id),
-                              "observed_at": time.time()}
+                              "observed_at": time.time(), "phase_at_finalization": current["phase"]}
     await _unbind(runner, source, current)
+    return True
+
+
+async def _recover_retirement(runner, source, state, bot):
+    """Do not prepare or close an absent topic while its existing work settles."""
+    if state["phase"] == "failed":
+        try:
+            await _finalize_absent(runner, source, state, bot)
+        except Exception as exc:
+            if _transient_delay(exc) is not None:
+                raise
+            logger.debug("Absent-topic retirement recovery remains blocked for %s", state["session_key"], exc_info=True)
+        try:
+            await _auto_retry(runner, source, state["generation"])
+        except Exception:
+            logger.warning("Automatic retirement retry could not start for %s", state["session_key"], exc_info=True)
+        return True
+    if state["phase"] not in {"pending", "waiting"} or state.get("closing_attempt") or state.get("closing_receipt"):
+        return False
+    try:
+        return await _finalize_absent(runner, source, state, bot)
+    except Exception as exc:
+        if _transient_delay(exc) is not None:
+            raise
+        # Confirmed absence with unsettled work cannot authorize a closing send.
+        logger.debug("Absent-topic retirement recovery remains blocked for %s", state["session_key"], exc_info=True)
+        return True
 
 
 async def advance(runner, source):
@@ -333,17 +371,9 @@ async def advance(runner, source):
             return
         generation = state["generation"]
         bot = getattr(adapter, "_bot", None)
-        if state["phase"] == "failed":
-            try:
-                await _finalize_absent(runner, source, state, bot)
-            except Exception:
-                logger.debug("Absent-topic retirement recovery remains blocked for %s", key, exc_info=True)
-            try:
-                await _auto_retry(runner, source, generation)
-            except Exception:
-                logger.warning("Automatic retirement retry could not start for %s", key, exc_info=True)
-            return
         try:
+            if await _recover_retirement(runner, source, state, bot):
+                return
             if bot is None:
                 raise RuntimeError("Telegram bot is disconnected")
             if state["phase"] in {"deleting", "delete_unresolved"}:

@@ -124,6 +124,22 @@ OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
+def oneshot_grace_seconds(job: dict[str, Any] | None) -> float:
+    """Return a one-shot catch-up allowance without weakening the 120s floor.
+
+    Invalid persisted values fail closed to the historical allowance rather than
+    interrupting a due scan. Recurring jobs retain their own strict field rules.
+    """
+    try:
+        extra = normalize_max_catch_up_lateness(
+            (job or {}).get("max_catch_up_lateness_seconds"))
+    except (TypeError, ValueError, OverflowError):
+        return float(ONESHOT_GRACE_SECONDS)
+    if extra is None:
+        return float(ONESHOT_GRACE_SECONDS)
+    return max(float(ONESHOT_GRACE_SECONDS), extra)
+
+
 @dataclass(frozen=True)
 class _CronStorePaths:
     cron_dir: Path
@@ -292,6 +308,48 @@ def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
     return None
 
 
+def _jobs_lock_holder_hint(lock_path: Path) -> str:
+    """Return a live holder PID stamped in the lock file, when cheaply available."""
+    try:
+        token = lock_path.read_text(encoding="utf-8-sig", errors="replace").split(maxsplit=1)[0]
+        pid = int(token)
+    except (OSError, ValueError, IndexError):
+        return ""
+    if pid <= 0 or pid == os.getpid():
+        return ""
+    try:
+        import psutil
+
+        alive = psutil.pid_exists(pid)
+    except Exception:  # health: allow BLE001 -- diagnostic-only hint must never break the lock-timeout path
+        return ""
+    if not alive:
+        return ""
+    return f"; holder pid={pid}"
+
+
+def _stamp_jobs_lock_holder_pid(lock_fd) -> None:
+    """Best-effort live-holder stamp for timeout diagnostics."""
+    try:
+        lock_fd.seek(0)
+        lock_fd.truncate(0)
+        lock_fd.write(f"{os.getpid()}\n")
+        lock_fd.flush()
+    except OSError:
+        pass
+
+
+def _clear_jobs_lock_holder_pid(lock_fd) -> None:
+    try:
+        lock_fd.seek(0)
+        lock_fd.truncate(0)
+        if msvcrt is not None:
+            lock_fd.write(" ")
+        lock_fd.flush()
+    except OSError:
+        pass
+
+
 def _release_flock(lock_fd) -> None:
     """Unlock (best effort) and close a lock file opened for ``_acquire_flock``."""
     try:
@@ -335,16 +393,20 @@ def _jobs_lock():
                 ensure_dirs()
                 lock_fd = open(_jobs_lock_file(), "a+", encoding="utf-8")
                 lock_fd.seek(0)
-                if _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS) is False:
+                acquired = _acquire_flock(lock_fd, _JOBS_LOCK_TIMEOUT_SECONDS)
+                if acquired is False:
                     logger.error(
                         "Timed out after %.0fs waiting for the cron "
                         "jobs lock (%s) — another process is holding "
-                        "it. Proceeding with in-process locking only "
+                        "it%s. Proceeding with in-process locking only "
                         "so the scheduler stays alive (#60703).",
-                        _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file())
+                        _JOBS_LOCK_TIMEOUT_SECONDS, _jobs_lock_file(),
+                        _jobs_lock_holder_hint(_jobs_lock_file()))
                     with contextlib.suppress(OSError):
                         lock_fd.close()
                     lock_fd = None
+                elif acquired is True:
+                    _stamp_jobs_lock_holder_pid(lock_fd)
             except OSError as e:
                 # A locking failure must never take down cron writes — in-process lock still held.
                 logger.warning("jobs.json cross-process lock unavailable (%s); "
@@ -353,6 +415,7 @@ def _jobs_lock():
                 yield
             finally:
                 if lock_fd is not None:
+                    _clear_jobs_lock_holder_pid(lock_fd)
                     _release_flock(lock_fd)
         finally:
             _jobs_lock_state.depth = 0
@@ -2062,8 +2125,8 @@ def create_job(
     interpreter: absolute/``~`` Python for ``.py`` script/monitor_script, validated at run time
     (a venv can be rebuilt or moved after creation). timezone: IANA wall-clock zone
     (None/'' = inherit the profile). grace_minutes: catch-up window (0 = never catch up).
-    max_catch_up_lateness_seconds: recurring occurrence expiration deadline,
-    unset is unlimited and 0 permits no lateness."""
+    max_catch_up_lateness_seconds: recurring occurrence deadline (unset is unlimited, 0 permits no lateness);
+    for a one-shot it widens catch-up to max(120s, value), and 0 keeps 120s."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     job_timezone = normalize_job_timezone(job_timezone)
@@ -2530,7 +2593,9 @@ def _claim_is_live(claim: Any, now: datetime, ttl_seconds: float) -> bool:
     claimed_at = _parse_aware(claim["at"])
     if claimed_at is None or not (0 <= _elapsed_seconds(now, claimed_at) < ttl_seconds):
         return False
-    return not _claim_owner_is_dead(claim)
+    from cron.jobs_due_scan import claim_owner_is_dead
+
+    return not claim_owner_is_dead(claim)
 
 
 _REARM_RECURRING_ERROR = (
@@ -2814,6 +2879,79 @@ def mark_job_run(
     return _under_fire_fence(job_id, locked)
 
 
+def _write_oneshot_diagnostic(job: dict[str, Any], text: str, what: str) -> bool:
+    """Durably queue the owner failure before retirement; save the local trace best-effort."""
+    from cron.oneshot_retirement import queue_retirement_alert
+    queue_retirement_alert(job, text, what, now=_hermes_now())
+    try:
+        save_job_output(job.get("id", ""), text)
+        return True
+    except Exception as e:
+        logger.debug("Failed to write %s diagnostic for job %r: %s", what, job.get("id"), e)
+        return False
+
+
+def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
+    """Trace for a wedged one-shot removal: dispatch was claimed but mark_job_run never ran
+    (interrupted mid-run); removing it silently would leave no output, error, or record.
+
+    A spent dispatch without a current-arm completion may have partial effects. Leave an alert
+    and local trace when recovery retires it, rather than replaying it (#73973).
+    """
+    from cron.jobs_oneshot import occurrence_finished, occurrence_started
+
+    if not occurrence_started(job) or occurrence_finished(job):
+        return  # Only a current-arm interrupted dispatch needs a partial-effects warning.
+    repeat = job.get("repeat") or {}
+    claim = job.get("run_claim") or {}
+    written = _write_oneshot_diagnostic(
+        job,
+        "# Cron job removed without producing output\n\n"
+        f"- job id: {job.get('id')}\n"
+        f"- name: {job.get('name')}\n"
+        f"- dispatch claimed: {repeat.get('completed', '?')}/{repeat.get('times', '?')}\n"
+        f"- run claimed at: {claim.get('at', 'unknown')} by {claim.get('by', 'unknown')}\n"
+        f"- removed at: {_hermes_now().isoformat()}\n\n"
+        "This one-shot job's dispatch was claimed, but the run never "
+        "completed for this occurrence (no current completion stamp) — the scheduler "
+        "process was most likely killed or restarted mid-execution. The "
+        "job has been removed to stop it re-firing; recreate it to run "
+        "again.\n",
+        "wedged-oneshot")
+    if written:
+        logger.warning(
+            "Job '%s': removed without a completed run — diagnostic written to "
+            "its output directory",
+            job.get("name", job.get("id", "?")))
+
+
+def _write_retired_oneshot_diagnostic(
+    job: dict[str, Any], next_run: str, *, dispatch_limit: bool = False,
+) -> None:
+    """Route both retirement gates through the same interrupted-versus-unrun diagnostic."""
+    from cron.jobs_oneshot import occurrence_finished, occurrence_started
+
+    if occurrence_started(job) and not occurrence_finished(job):
+        # A consumed, unfinished dispatch may already have side effects.
+        _write_wedged_oneshot_diagnostic(job)
+        return
+    seconds = oneshot_grace_seconds(job)
+    grace = int(seconds) if seconds.is_integer() else seconds
+    reason = "dispatch limit reached" if dispatch_limit else "run time outside grace window"
+    _write_oneshot_diagnostic(
+        job,
+        f"# Cron job removed before firing ({reason})\n\n"
+        f"- job id: {job.get('id')}\n"
+        f"- name: {job.get('name')}\n"
+        f"- scheduled run time: {next_run}\n"
+        f"- grace window: {grace}s\n"
+        f"- removed at: {_hermes_now().isoformat()}\n\n"
+        f"This one-shot was removed without running: {reason}. "
+        "A re-armed record may have consumed its dispatch budget on a prior run. "
+        "Recreate it (or use the Run button) to schedule it again.\n",
+        "missed-oneshot")
+
+
 def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot dispatch BEFORE execution: ``repeat.completed`` is bumped
     and persisted under the jobs lock so a tick dying mid-execution cannot lose the dispatch
@@ -3013,7 +3151,8 @@ def claim_job_for_fire(
         now = _hermes_now()
         if _claim_is_live(job.get("fire_claim"), now, claim_ttl_seconds):
             return False  # someone holds a fresh claim
-        from cron.occurrences import completed_occurrence, scheduled_instant
+        from cron.jobs_due_scan import completed_occurrence
+        from cron.occurrences import scheduled_instant
 
         # ``manual`` (an off-tick run-now) must NOT stamp an occurrence identity: outside a
         # scheduler tick ``next_run_at`` is the NEXT occurrence, not the one being run, so
@@ -3046,7 +3185,7 @@ def claim_job_for_fire(
         if (instant is not None
                 and datetime.fromisoformat(instant) - now >= timedelta(seconds=FIRE_CLAIM_SKEW_SECONDS)):
             instant = None
-        if instant and completed_occurrence(job, instant):
+        if instant and completed_occurrence(job, instant, for_fire=True):
             if job.get("schedule", {}).get("kind") in {"cron", "interval"}:
                 nxt = compute_next_run(
                     job["schedule"], now.isoformat(), timezone=job.get("timezone"))
@@ -3072,7 +3211,10 @@ def claim_job_for_fire(
         save_jobs(jobs)
         return dict(copy.deepcopy(job), _scheduled_instant=instant) if return_job else True
 
-    result = _under_fire_fence(job_id, lambda: _with_job(job_id, apply, False))
+    from cron.jobs_due_scan import with_prefetched_job
+
+    result = _under_fire_fence(
+        job_id, lambda: with_prefetched_job(job_id, lambda: _with_job(job_id, apply, False)))
     if missed_window_saved:
         from cron.scheduler import _notify_provider_jobs_changed
         _notify_provider_jobs_changed()
@@ -3161,8 +3303,11 @@ def get_due_jobs() -> list[dict[str, Any]]:
     This prevents the perpetual-defer loop (#33315) where a job whose runtime exceeds ``interval + grace``
     would be skipped forever.
     """
-    with _jobs_lock():
-        return _get_due_jobs_locked()
+    from cron.jobs_due_scan import prefetched_facts
+
+    with prefetched_facts(load_jobs()):
+        with _jobs_lock():
+            return _get_due_jobs_locked()
 
 
 @dataclass
@@ -3243,10 +3388,11 @@ def _recover_missing_next_run(job: dict[str, Any], scan: _DueScan) -> Optional[s
     to 'scheduled', otherwise they would be silently skipped forever."""
     schedule = job.get("schedule", {})
     kind = schedule.get("kind")
-    # Restore the slot, not eligibility. The occurrence/grace gates decide whether it may run.
+    # Restore the slot, not eligibility: the normal occurrence/grace gates below
+    # must hold never-started misses and retire spent dispatches, including old arms.
     zone = jobs_time.zone_for_job(job)
     run_at = jobs_time.oneshot_instant(schedule.get("run_at"), zone) if kind == "once" else None
-    recovered_next = schedule["run_at"] if run_at is not None else None
+    recovered_next = schedule.get("run_at") if run_at is not None else None
     recovery_kind = "one-shot" if recovered_next else None
     if not recovered_next and kind in {"cron", "interval"}:
         recovered_next = compute_next_run(
@@ -3510,7 +3656,8 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     # into both fields, and any rewrite of next_run_at (edit, re-anchor, fire-claim advance) must
     # invalidate the marker. Do not "fix" this with _ensure_aware normalization.
     manual_run = job.get("manual_run_at") == next_run
-    from cron.occurrences import completed_occurrence, scheduled_instant
+    from cron.jobs_due_scan import completed_occurrence
+    from cron.occurrences import scheduled_instant
 
     if kind == "cron" and not manual_run and _reanchor_future_timezone_shifted_cron(d):
         return False
@@ -3546,7 +3693,9 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
 
     if not manual_run and kind == "cron" and _reanchor_stale_cron(d):
         return False
-    grace = _compute_grace_seconds(d.schedule, job.get("grace_minutes"))
+    grace_minutes = job.get("grace_minutes")
+    grace = (_compute_grace_seconds(d.schedule, grace_minutes)
+             if grace_minutes is not None else _compute_grace_seconds(d.schedule))
     from cron.missed_runs import fast_forward_missed_recurring
 
     if not manual_run and recurring and fast_forward_missed_recurring(d, grace):
@@ -3587,54 +3736,10 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
 
 
 def _get_due_jobs_locked() -> list[dict[str, Any]]:
-    """Inner implementation of get_due_jobs(); must be called with _jobs_lock held."""
-    raw_jobs = load_jobs()
-    scan = _DueScan(raw_jobs, _hermes_now())
-    scan.needs_save = _normalize_due_scan_records(raw_jobs)
-    jobs = [_apply_skill_fields(j) for j in copy.deepcopy(raw_jobs)]
-    # One-shot run-claim TTL, resolved once per scan (see _oneshot_run_claim_ttl_seconds).
-    run_claim_ttl = _oneshot_run_claim_ttl_seconds()
+    """Evaluate and persist under the jobs lock, consuming prefetched read-only facts."""
+    from cron.jobs_due_scan import locked_scan
 
-    # Retention sweep: completed one-shots are kept for inspection but must not accumulate forever.
-    if _sweep_completed_oneshots(raw_jobs, scan.now, removed_ids=scan.removed):
-        scan.needs_save = True
-        jobs = [j for j in jobs if scan.find(j.get("id")) is not None]
-
-    due = []
-    for job in jobs:
-        # Per-job containment: one malformed record must never abort the whole scan. Normalization
-        # above repairs known shapes; this catches FUTURE variants so healthy siblings still
-        # run/persist.
-        try:
-            if is_terminal_job(job) and not _is_recoverable_error_job(job):
-                continue
-            if not job.get("enabled", True):
-                continue
-            if _has_pause_marker(job):
-                _self_disable_half_paused(job, scan)
-                continue
-            if _evaluate_due_job(job, scan, run_claim_ttl):
-                due.append(job)
-        except Exception:
-            logger.exception(
-                "Skipping malformed cron job %r during due scan",
-                job.get("name") or job.get("id") or "?")
-
-    if scan.needs_save:
-        try:
-            save_jobs(raw_jobs, removed_ids=scan.removed or None)
-        except OSError as exc:  # repairs live in memory; the next tick retries the persist
-            store_health.note_unwritable(exc, "due-scan repairs not persisted", "scan")
-            return due
-    # Only now is a skipped one-shot claimed or durably due on disk: normal grace applies again.
-    store_health.end_recovery_window(_current_cron_store().cron_dir)
-    for emit in scan.on_saved:
-        emit()
-    # Preserve the previous scan's evidence for every job in this scan. Capture
-    # the scan instant, not tick/cycle completion (which another profile can stall).
-    from cron.jobs_oneshot import record_due_scan
-    record_due_scan(scan.now)
-    return due
+    return locked_scan()
 
 
 # --- Run output ---

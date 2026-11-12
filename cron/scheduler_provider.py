@@ -322,8 +322,8 @@ def fire_overdue_jobs(
         return 0
 
     from cron.jobs import (
-        ONESHOT_GRACE_SECONDS, _elapsed_seconds, _ensure_aware, _hermes_now,
-        is_job_runnable, load_jobs,
+        _elapsed_seconds, _ensure_aware, _hermes_now, is_job_runnable, load_jobs,
+        oneshot_grace_seconds,
     )
 
     if now is None:
@@ -344,12 +344,12 @@ def fire_overdue_jobs(
         if overdue_seconds < grace_minutes * 60:
             continue
         job_id = str(job.get("id") or "")
-        # One-shots past ONESHOT_GRACE_SECONDS "will never fire"; don't resurrect them hours late.
-        # One-shot jobs share the module-wide policy: more than ONESHOT_GRACE_SECONDS past their run time
-        # means "will never fire" (create/update/resume/recovery and, since #89571, the due-scan all enforce
-        # it). The misfire backstop must not resurrect them hours late after downtime — that's #93526.
+        # One-shots past their effective allowance "will never fire"; don't resurrect them hours late.
+        # Create/update/resume still use the fixed 120-second scheduling guard, while this recovery
+        # path honors a widened per-job catch-up allowance.
         schedule = job.get("schedule") or {}
-        if str(schedule.get("kind") or "") == "once" and overdue_seconds > ONESHOT_GRACE_SECONDS:
+        allowance = oneshot_grace_seconds(job) if schedule.get("kind") == "once" else None
+        if allowance is not None and overdue_seconds > allowance:
             logger.warning(
                 "Misfire catch-up: one-shot job %s (%s) was due %s "
                 "(%.0f min overdue) — outside the %ss one-shot grace "
@@ -358,7 +358,7 @@ def fire_overdue_jobs(
                 job.get("name") or "unnamed",
                 next_run_at,
                 overdue_seconds / 60,
-                ONESHOT_GRACE_SECONDS,
+                allowance,
             )
             continue
         logger.warning(

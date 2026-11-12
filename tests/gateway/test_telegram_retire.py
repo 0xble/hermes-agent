@@ -252,7 +252,7 @@ async def test_internal_completion_can_settle_and_slash_retire_is_fenced(runtime
 @pytest.mark.asyncio
 async def test_ambiguous_delete_probes_before_any_fallback(runtime, monkeypatch):
     runtime.bot.delete_forum_topic.side_effect = TimeoutError("response lost")
-    probe = AsyncMock(side_effect=[True, True])
+    probe = AsyncMock(side_effect=[False, True, True])
     monkeypatch.setattr(retire, "_probe_deleted", probe)
     cli = AsyncMock()
     monkeypatch.setattr("gateway.telegram_retire_work.cli", cli)
@@ -354,7 +354,7 @@ async def test_unresolved_delete_unknown_probe_never_retries_or_cancels(runtime)
 async def test_housekeeping_reconciles_confirmed_deleted_topic_without_sending(runtime, monkeypatch):
     monkeypatch.setattr("hermes_platform.resolver.locate_command", lambda _: SimpleNamespace(command=("telegram",)))
     runtime.bot.get_me = AsyncMock(return_value=SimpleNamespace(username="HermesBot", id=900))
-    lookup = AsyncMock(side_effect=[[{"id": 42}], []])
+    lookup = AsyncMock(side_effect=[[{"id": 42}], [{"id": 42}], []])
     monkeypatch.setattr("gateway.telegram_retire_work.cli", lookup)
     await retire.request(runtime, runtime.source)
     await retire.advance(runtime, runtime.source)
@@ -378,7 +378,7 @@ async def test_housekeeping_reconciles_confirmed_deleted_topic_without_sending(r
     runtime.session_store.unbind_session.assert_called_once_with("topic-key", "session-1")
     runtime._session_db.delete_telegram_topic_binding.assert_awaited_once_with(
         chat_id="100", thread_id="42", profile_name="default")
-    assert lookup.await_count == 2
+    assert lookup.await_count == 3
     assert lookup.await_args is not None
     assert lookup.await_args.args[-3:] == ("@HermesBot", "--id", "42")
 
@@ -482,6 +482,7 @@ _FLOOD = ('relay failed: {"error":{"code":"telegram","message":"telegram: exit s
 def test_transient_delay_reads_flood_wait_and_ignores_permanent_errors():
     assert retire._transient_delay(RuntimeError(_FLOOD)) == 18
     assert retire._transient_delay(TimeoutError()) == 30
+    assert retire._transient_delay(RuntimeError("tasks: EMAXCONNSESSION: connection limit")) == 30
     assert retire._transient_delay(RuntimeError("Missing exact-topic confirmed closing receipt")) is None
 
 

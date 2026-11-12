@@ -1301,6 +1301,10 @@ def build_turn_context(
         persist_user_timestamp, persist_user_platform_id,
     )
     _reset_per_turn_agent_state(agent)
+    # Provenance of this turn (user/relay/process/goal_loop/cron/unknown); distinct from the fork-turn
+    # tag ``_turn_origin``. The guardrail halt reads it to avoid asking an absent user to continue.
+    agent._turn_provenance = turn_origin
+    agent._unattended_guardrail_halts = 0
 
     _preview_text = summarize_user_message_for_log(user_message)
     _msg_preview = _preview_text[:80] + ("..." if len(_preview_text) > 80 else "")

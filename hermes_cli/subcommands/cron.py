@@ -198,8 +198,9 @@ def build_cron_parser(subparsers, *, cmd_cron: Callable) -> None:
     for job_parser in (cron_create, cron_edit):
         job_parser.add_argument(
             "--max-catch-up-lateness-seconds", type=float, default=None,
-            help="Maximum scheduled catch-up lateness in finite nonnegative seconds. "
-                 "0 allows no lateness; unset means legacy unlimited catch-up.",
+            help="Finite nonnegative catch-up limit in seconds. Recurring jobs treat "
+                 "it as a strict deadline (0 = no lateness; unset = unlimited). A one-shot "
+                 "widens its catch-up window to max(120s, value); 0 keeps 120s.",
         )
         job_parser.add_argument(
             "--keep-pinned-lane", action=argparse.BooleanOptionalAction, default=None,

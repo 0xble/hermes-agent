@@ -53,7 +53,7 @@ async def reconcile_turn(runner, source, session_key, *, config=None):
     entry = await runner._run_in_executor_with_context(
         runner.session_store.lookup_by_session_key, session_key)
     if entry is None or entry.suspended:
-        return
+        return True
     watches = getattr(runner, "_checkin_watch", None)
     if watches is None:
         watches = runner._checkin_watch = {}
@@ -64,6 +64,8 @@ async def reconcile_turn(runner, source, session_key, *, config=None):
             watches.pop(session_key, None)
     except Exception:
         logger.warning("Supervisor roster unavailable for %s, will retry", session_key, exc_info=True)
+        return False
+    return True
 
 
 def _queued(adapter, route):
@@ -100,18 +102,21 @@ async def poll_checkins(runner):
         scope = runner._async_profile_scope_for_source(source)
         if scope is None:
             continue
-        async with scope:
-            try:
-                config = await runner._run_in_executor_with_context(CheckinConfig.load)
-            except OSError:
-                logger.warning("Supervisor config unreadable for %s; retaining armed clocks", key, exc_info=True)
-                continue
-            for entry, entry_source in entries:
-                identity = (entry.session_key, entry.session_id)
-                if seen.get(identity) != config:
-                    seen[identity] = config
-                    await reconcile_turn(runner, entry_source, entry.session_key, config=config)
-            await _poll_profile_watches(runner, key, config, scope_key)
+        try:
+            async with scope:
+                try:
+                    config = await runner._run_in_executor_with_context(CheckinConfig.load)
+                except Exception:
+                    logger.warning("Supervisor config unreadable for %s; retaining armed clocks", key, exc_info=True)
+                    continue
+                for entry, entry_source in entries:
+                    identity = (entry.session_key, entry.session_id)
+                    if seen.get(identity) != config:
+                        if await reconcile_turn(runner, entry_source, entry.session_key, config=config) is not False:
+                            seen[identity] = config
+                await _poll_profile_watches(runner, key, config, scope_key)
+        except Exception:
+            logger.warning("Supervisor profile poll deferred for %s; continuing other profiles", key, exc_info=True)
 
 
 async def _poll_profile_watches(runner, profile_key, config, scope_key):
@@ -237,9 +242,17 @@ async def silence_fallback(runner, event, entry, result: dict) -> dict:
         except OSError:
             return _manager(runner, entry, CheckinConfig(enabled=False)), False
         return _manager(runner, entry, config), True
-    manager, config_readable = await runner._run_in_executor_with_context(delivery_manager)
+    try:
+        manager, config_readable = await runner._run_in_executor_with_context(delivery_manager)
+    except Exception:
+        logger.warning("Supervisor delivery policy unavailable; using check-in fallback", exc_info=True)
+        manager, config_readable = None, False
     if result.get("queued_terminal_display_kind", DISPLAY_KIND) != DISPLAY_KIND:
-        await runner._run_in_executor_with_context(lambda: retain_policy(manager, event, None))
+        if manager is not None:
+            try:
+                await runner._run_in_executor_with_context(lambda: retain_policy(manager, event, None))
+            except Exception:
+                logger.warning("Supervisor delivery policy could not be cleared", exc_info=True)
         result["checkin_pending_root"] = None
         return result
     response = str(result.get("final_response") or "").strip()
@@ -252,6 +265,8 @@ async def silence_fallback(runner, event, entry, result: dict) -> dict:
                   or (result.get("completed") is not True
                       and (result.get("failure_reason") or exit_failure)))))
     def observe():
+        if manager is None:
+            raise OSError("Supervisor delivery policy unavailable")
         # Disarm is a delivery policy, not evidence that the last dependency completed.
         work = outstanding_work(manager.db, entry.session_id)
         if config_readable:
@@ -266,11 +281,22 @@ async def silence_fallback(runner, event, entry, result: dict) -> dict:
         inspected, pending = False, True
         status = getattr(event, "_checkin_fallback", "Background work could not be inspected. Supervision will retry.")
     pending = (pending or not inspected or failed or result.get("completed") is not True
-               or result.get("interrupted") or manager.root != tick[0])
+               or result.get("interrupted") or manager is None or manager.root != tick[0])
     root = tick[0] if pending else None
-    await runner._run_in_executor_with_context(lambda: retain_policy(manager, event, root))
+    if manager is not None:
+        try:
+            await runner._run_in_executor_with_context(lambda: retain_policy(manager, event, root))
+        except Exception:
+            logger.warning("Supervisor delivery policy could not be retained; using check-in fallback", exc_info=True)
+            status = getattr(event, "_checkin_fallback", "Background work could not be inspected. Supervision will retry.")
+            inspected, pending, root = False, True, tick[0]
+            event._checkin_pending_root = root
+            from gateway.session_results import execution_result
+            captured = execution_result.get()
+            if captured is not None:
+                captured.setdefault("result", {})["checkin_pending_root"] = root
     result["checkin_pending_root"] = root
-    disarmed = pending and not manager.config.permits(tick[0])
+    disarmed = manager is not None and pending and not manager.config.permits(tick[0])
     if not disarmed and (result.get("interrupted") or (not failed and
             response and not runner._is_intentional_silence(result, response))):
         return result
@@ -402,7 +428,8 @@ async def record_visible(runner, adapter, chat_id, thread_id=None, platform=None
             if visible is None:
                 visible = runner._checkin_visible = {}
             def record():
-                manager = _manager(runner, entry)
+                manager = _manager(runner, entry, config)
                 visible[(entry.session_key, manager.root)] = now
                 manager.visible(now)
+            config = await runner._run_in_executor_with_context(CheckinConfig.load)
             await runner._run_in_executor_with_context(record)

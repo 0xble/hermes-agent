@@ -8,6 +8,7 @@ from pathlib import Path
 from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_contract import SessionRef
+from gateway.session_store_async import run_store_call
 from hermes_state_keys import local_identity
 from hermes_state_local import POLICY_PREFIX, local_receipt
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
@@ -60,6 +61,10 @@ def _refused_check(exc):
     where = f' at {frames[-1].name}:{frames[-1].lineno}' if frames else ''
     chained = f', caused by {_refused_check(exc.__cause__)}' if exc.__cause__ is not None else ''
     return f'{cause}{where}{chained}'
+
+
+class _LiveSessionChanged(RuntimeStoreError):
+    """The live cache changed during async restoration; a caller may re-read it."""
 
 
 class _ReceiptRefused(RuntimeStoreError):
@@ -175,12 +180,10 @@ def _read_local_session(authority, sid):
     try:
         # The catch-up writes, so the receipt as stored must already be this owner's (#140060).
         receipt, source, route, entry = owned_receipt(authority, sid)
-        _chat_id, _store = source.chat_id, authority.runner.session_store
         adopted = _with_untracked_compression(authority, sid, receipt)
         policy = restore_policy(adopted['policy'])
         if adopted is not receipt:  # re-read after a catch-up: check the copy that will be served
             receipt, entry = adopted, _checked_entry(authority, adopted, source, route)
-        _target = entry.session_id
         from hermes_state_local_lineage import validate_local_lineage
         with authority.db._read_ctx() as conn:
             validate_local_lineage(conn, receipt)
@@ -280,27 +283,31 @@ def restore_local_session(authority, sid):
     return _publish_local_session(authority, sid, adapter, prepared, live)
 
 
-async def restore_local_session_async(authority, sid):
+async def restore_local_session_async(authority, sid, *, admission_gate=True):
     """Producer restoration: blocking validation/store work off-loop, live publication on-loop.
 
     The producer's tracked ordered admission owns this whole preparation, including cancellation.
     Existing sessions still validate the durable receipt and lineage, never trust the live cache.
+    ``admission_gate=False`` is reserved for cron recovery of an already-admitted receipt while
+    the gateway is draining; it does not relax any conflict or lineage check.
     """
     from gateway.session_history_mount import is_history_mount
     live = authority.sessions.get(sid)
-    prepared = await asyncio.to_thread(_read_local_session, authority, sid)
-    authority._require_admission_open()
+    prepared = await run_store_call(_read_local_session, authority, sid)
+    if admission_gate:
+        authority._require_admission_open()
     if authority.sessions.get(sid) is not live:
-        raise RuntimeStoreError('admission_conflict')
+        raise _LiveSessionChanged('admission_conflict')
     adapter = _local_restore_adapter(authority)
     prepared = _check_restored_live(live, adapter, prepared)
-    await asyncio.to_thread(_restore_local_entry, authority, prepared,
-                            existing=live is not None and not is_history_mount(live))
-    authority._require_admission_open()
+    await run_store_call(_restore_local_entry, authority, prepared,
+                         existing=live is not None and not is_history_mount(live))
+    if admission_gate:
+        authority._require_admission_open()
     if (authority.sessions.get(sid) is not live
             or local_adapter_map(authority).get(Platform.LOCAL) is not adapter):
-        raise RuntimeStoreError('admission_conflict')
-    prepared = _check_restored_live(live, adapter, prepared)
+        raise _LiveSessionChanged('admission_conflict')
+    _check_restored_live(live, adapter, prepared)
     return _publish_local_session(authority, sid, adapter, prepared, live)
 
 
