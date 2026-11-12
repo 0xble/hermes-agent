@@ -199,11 +199,7 @@ def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
     t = plugins._background_discovery_thread
     if t is None or t is threading.current_thread() or plugins.in_plugin_load_worker():
         return
-    if not t.is_alive():
-        if timeout is None and (plugins._background_discovery_error is not None
-                                or not getattr(plugins.get_plugin_manager(), "_discovery_complete", False)):
-            error = plugins._background_discovery_error
-            raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+    if not t.is_alive() and timeout is not None:
         return
     if timeout is None:
         while t.is_alive():
@@ -217,8 +213,13 @@ def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
     if plugins._background_discovery_error is not None:
         error = plugins._background_discovery_error
         raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
-    if timeout is None and not getattr(plugins.get_plugin_manager(), "_discovery_complete", False):
-        raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
+    if timeout is None:
+        manager = plugins.get_plugin_manager()
+        # The control listener can force-reload before gateway startup finishes. Its
+        # transient false flag is not a failed background sweep; await the verdict.
+        with manager._discovery_lock:
+            if not manager._discovery_complete:
+                raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
 
 
 def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:
