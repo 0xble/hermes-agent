@@ -46,6 +46,7 @@ class ToolRoundVerdict:
     _turn_exit_reason: Any
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
+    interrupted: bool = False
     result: Optional[dict[str, Any]] = None
 
 
@@ -92,6 +93,7 @@ def run_tool_round(
     system_message: Any, active_system_prompt: Any, compression_attempts: Any,
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
     truncated_tool_call_retries: Any, current_turn_user_idx: Any,
+    interrupted: bool = False,
 ) -> ToolRoundVerdict:
     """Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
@@ -105,7 +107,7 @@ def run_tool_round(
             active_system_prompt=active_system_prompt, compression_attempts=compression_attempts,
             final_response=final_response, failed=failed, _turn_exit_reason=_turn_exit_reason,
             truncated_tool_call_retries=truncated_tool_call_retries,
-            current_turn_user_idx=current_turn_user_idx, result=result,
+            current_turn_user_idx=current_turn_user_idx, interrupted=interrupted, result=result,
         )
 
     if not agent.quiet_mode:
@@ -227,6 +229,31 @@ def run_tool_round(
         return _verdict("break")
 
     if agent._tool_guardrail_halt_decision is not None:
+        decision = agent._tool_guardrail_halt_decision
+        if decision.code in {"loop_web_search_cap", "loop_subagent_cap"}:
+            # Every refused call already has a synthetic tool result. Allow one bounded
+            # answer from the collected results, but never run tools returned by it.
+            _turn_exit_reason = "tool_cap_answer"
+            try:
+                # This completion bypasses the normal request lifecycle. Prior tool-round
+                # commentary is not evidence that this final answer reached chat display.
+                agent._reset_stream_delivery_tracking()
+                final_response = agent._handle_max_iterations(messages, api_call_count, tool_cap=decision)
+            except InterruptedError:
+                from agent.interrupt_control import interrupted_during_api_call_reason
+                interrupted = True
+                _turn_exit_reason = interrupted_during_api_call_reason(agent)
+                final_response = ""
+            # A cap completion may already have reached display through its stream.
+            # Replay only when chat display did not accept the complete answer.
+            if final_response:
+                agent._safe_print(f"\n{final_response}\n")
+                if agent.stream_delta_callback and not getattr(agent, "_hold_stream", False):
+                    with suppress(Exception):
+                        if not agent._interim_content_fully_streamed(final_response):
+                            agent.stream_delta_callback(final_response)
+                        agent.stream_delta_callback(None)
+            return _verdict("break")
         halt_reply = _end_turn_on_guardrail_halt(agent, messages)
         if halt_reply is not None:
             final_response = halt_reply
