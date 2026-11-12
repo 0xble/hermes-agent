@@ -9,7 +9,7 @@ import time
 
 import pytest
 
-from tools import terminal_tool, terminal_tool_heavy_slot as heavy
+from tools import terminal_tool, terminal_tool_semaphore as semaphore
 from tools.environments.local import LocalEnvironment
 from tools.process_registry import process_registry
 from tests.waiting import wait_until
@@ -34,18 +34,18 @@ def _executable(path, source):
 
 @pytest.mark.parametrize(("compound", "gate"), [(False, False), (True, False), (False, True)])
 def test_waiting_process_is_adopted_once_with_its_ticket(tmp_path, monkeypatch, compound, gate):
-    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
-    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
     ticket = tmp_path / "ticket"
     release = tmp_path / "admit"
     os.mkfifo(release)
     # An open read/write endpoint lets the test release the helper without a
     # blocking writer open. The helper itself waits for this explicit admission.
     fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
-    helper = _executable(tmp_path / "heavy-slot", f'''#!{sys.executable}
+    helper = _executable(tmp_path / "semaphore", f'''#!{sys.executable}
 import os, sys
 from pathlib import Path
-assert not os.environ.get("HEAVY_SLOT_MAX_WAIT")
+assert not os.environ.get("SEMAPHORE_MAX_WAIT")
 assert sys.argv[sys.argv.index("--label") + 1].startswith("bin/ci gate " + "a" * 40) is {gate!r}
 with Path({str(ticket)!r}).open("a") as stream:
     stream.write(str(os.getpid()) + "\\n")
@@ -55,8 +55,8 @@ args = sys.argv[sys.argv.index("--") + 1:]
 os.execvp(args[0], args)
 ''')
     runner = _executable(tmp_path / "pytest", "#!/bin/sh\nprintf 'completed\\n'\n")
-    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _: str(helper))
-    monkeypatch.setattr(terminal_tool, "_heavy_slot_max_wait_for", lambda **_: 0)
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _: str(helper))
+    monkeypatch.setattr(terminal_tool, "_semaphore_max_wait_for", lambda **_: 0)
     env = LocalEnvironment(cwd=str(tmp_path), env={"PATH": f"{tmp_path}:{os.environ['PATH']}"})
     monkeypatch.setattr(terminal_tool, "_acquire_env", lambda *_: env)
     monkeypatch.setattr(terminal_tool, "_get_env_config", lambda: {
@@ -79,7 +79,7 @@ os.execvp(args[0], args)
         result = json.loads(terminal_tool.terminal_tool(command, timeout=30, task_id="ticket-handoff", force=True))
         assert result.get("status") == "yielded_to_background", result
         assert result["notify_on_complete"] is True
-        assert "still queued for a heavy slot" in result["note"]
+        assert "still queued for semaphore admission" in result["note"]
         assert "same shell and ticket" in result["note"]
         assert "notified when it exits" in result["note"]
         assert "user sent a message" not in result["note"].lower()
@@ -104,13 +104,13 @@ os.execvp(args[0], args)
 
 
 def test_admitted_process_keeps_its_foreground_deadline(tmp_path, monkeypatch):
-    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
-    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
     started = tmp_path / "started"
     release = tmp_path / "release"
     os.mkfifo(release)
     fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
-    helper = _executable(tmp_path / "heavy-slot", "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\"\n")
+    helper = _executable(tmp_path / "semaphore", "#!/bin/sh\nwhile [ \"$1\" != -- ]; do shift; done; shift; exec \"$@\"\n")
     runner = _executable(tmp_path / "pytest", f'''#!{sys.executable}
 from pathlib import Path
 Path({str(started)!r}).touch()
@@ -118,8 +118,8 @@ with open({str(release)!r}, "rb", buffering=0) as stream:
     stream.read(1)
 print("completed")
 ''')
-    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _: str(helper))
-    monkeypatch.setattr(terminal_tool, "_heavy_slot_max_wait_for", lambda **_: 0)
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _: str(helper))
+    monkeypatch.setattr(terminal_tool, "_semaphore_max_wait_for", lambda **_: 0)
     env = LocalEnvironment(cwd=str(tmp_path))
     wait_for_process = env._wait_for_process
     checked = []
@@ -169,16 +169,16 @@ def test_cron_waits_inline_until_admission_or_its_own_timeout(
     from tools.code_execution_tool import execute_code
     from tools.code_kernel import shutdown_all_kernels
 
-    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
-    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
     monkeypatch.setenv("HERMES_TURN_ORIGIN", "user")  # task-local provenance wins
     ticket, started, release = (tmp_path / name for name in ("ticket", "started", "release"))
     os.mkfifo(release)
     fd = os.open(release, os.O_RDWR | os.O_NONBLOCK)
-    helper = _executable(tmp_path / "heavy-slot", f'''#!{sys.executable}
+    helper = _executable(tmp_path / "semaphore", f'''#!{sys.executable}
 import os, sys
 from pathlib import Path
-assert not os.environ.get("HEAVY_SLOT_MAX_WAIT")
+assert not os.environ.get("SEMAPHORE_MAX_WAIT")
 Path({str(ticket)!r}).touch()
 with open({str(release)!r}, "rb", buffering=0) as stream:
     stream.read(1)
@@ -186,9 +186,9 @@ args = sys.argv[sys.argv.index("--") + 1:]
 os.execvp(args[0], args)
 ''')
     runner = _executable(tmp_path / "pytest", f"#!/bin/sh\ntouch {shlex.quote(str(started))}\nprintf 'completed\\n'\n")
-    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _: str(helper))
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _: str(helper))
     # Exercise both automatic promotion paths without a multi-minute test.
-    monkeypatch.setattr(terminal_tool, "_FOREGROUND_HEAVY_SLOT_WAIT_CAP", 0)
+    monkeypatch.setattr(terminal_tool, "_FOREGROUND_SEMAPHORE_WAIT_CAP", 0)
     monkeypatch.setattr(terminal_tool, "FOREGROUND_MAX_TIMEOUT", 1)
     monkeypatch.setattr(terminal_tool, "spawn_background_process", lambda **_: pytest.fail("cron must stay inline"))
     monkeypatch.setattr(terminal_tool, "yield_to_background_handler", lambda **_: pytest.fail("cron must not adopt"))
@@ -249,7 +249,7 @@ os.execvp(args[0], args)
         else:
             assert result["exit_code"] == 124, result
             assert "not started" in result["output"]
-            assert "waiting for heavy-slot admission" in result["output"]
+            assert "waiting for semaphore admission" in result["output"]
             assert not started.exists()
     finally:
         shutdown_all_kernels()
