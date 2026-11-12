@@ -933,6 +933,7 @@ class AIAgent(
         self._session_messages = []
         self._db_flush_scan_prefix = None
         self._streamed_assistant_text_parts = []
+        self._display_streamed_assistant_text_parts = []
         _quietly(self._trim_process_memory)
         _quietly(self._finalize_owned_session_row)
 
