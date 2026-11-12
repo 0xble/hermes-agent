@@ -307,19 +307,16 @@ def _acquire_flock(lock_fd, timeout: float) -> Optional[bool]:
 def _jobs_lock_holder_hint(lock_path: Path) -> str:
     """Return a live holder PID stamped in the lock file, when cheaply available."""
     try:
-        token = lock_path.read_text(encoding="utf-8", errors="replace").split(maxsplit=1)[0]
+        token = lock_path.read_text(encoding="utf-8-sig", errors="replace").split(maxsplit=1)[0]
         pid = int(token)
     except (OSError, ValueError, IndexError):
         return ""
     if pid <= 0 or pid == os.getpid():
         return ""
-    if os.name == "posix":
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            return ""
-        except OSError:
-            pass  # EPERM still proves that the PID exists.
+    import psutil
+
+    if not psutil.pid_exists(pid):
+        return ""
     return f"; holder pid={pid}"
 
 
