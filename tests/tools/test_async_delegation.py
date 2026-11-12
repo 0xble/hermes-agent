@@ -23,20 +23,22 @@ from tools.process_registry import process_registry
 from tools.process_registry_notifications import format_process_notification
 
 
+_PENDING_EVENTS = []
+
+
 @pytest.fixture(autouse=True)
 def _clean_state():
     ad._reset_for_tests()
+    _PENDING_EVENTS.clear()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
     yield
-    # Give just-released workers a beat to finalize BEFORE draining, so their
-    # completion events land now instead of leaking into the next test's
-    # queue (worker threads push events asynchronously; a drain that races an
-    # in-flight _finalize misses it).
+    # Let released workers enqueue before teardown drains to avoid stragglers.
     deadline = time.monotonic() + 2.0
     while ad.active_count() and time.monotonic() < deadline:
         time.sleep(0.02)
     ad._reset_for_tests()
+    _PENDING_EVENTS.clear()
     while not process_registry.completion_queue.empty():
         process_registry.completion_queue.get_nowait()
 
@@ -51,19 +53,17 @@ def _drain_one(timeout=5.0):
 
 
 def _drain_for(delegation_id, timeout=5.0):
-    """Drain until the event for *delegation_id* appears (discarding others).
-
-    Completion events are pushed asynchronously by worker threads, so a
-    straggler from a PREVIOUS test can land after that test's teardown drain
-    and leak into the current test's queue. Matching on delegation_id makes
-    the assertion immune to that cross-test leak.
-    """
+    """Drain until the event for *delegation_id* appears, retaining other events."""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
+        for index, evt in enumerate(_PENDING_EVENTS):
+            if evt.get("delegation_id") == delegation_id:
+                return _PENDING_EVENTS.pop(index)
         if not process_registry.completion_queue.empty():
             evt = process_registry.completion_queue.get_nowait()
             if evt.get("delegation_id") == delegation_id:
                 return evt
+            _PENDING_EVENTS.append(evt)
             continue
         time.sleep(0.02)
     return None
@@ -379,7 +379,7 @@ def test_randomized_capacity_stress_never_exceeds_slot_cap():
     for thread in threads:
         thread.join(timeout=15)
     assert all(not thread.is_alive() for thread in threads)
-    for index, handle in list(handles):
+    for index, handle in handles:
         if index in cancel_indexes and handle["status"] == "queued":
             ad.interrupt_delegation(handle["delegation_id"], reason="stress cancel")
     release.set()
