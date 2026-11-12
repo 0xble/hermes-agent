@@ -254,33 +254,29 @@ def private_control_query(home: Path, request: bytes, timeout: float = 5) -> byt
     The socket authenticates the peer (same user only), which is what lets a private verb answer.
     A socket timeout is a gateway handshake failure, not a bare ``TimeoutError: timed out``.
     """
-    try:
-        return _private_control_query(home, request, timeout)
-    except TimeoutError as exc:
-        from cron.dependency_timeout import name_gateway_handshake_timeout
-        raise name_gateway_handshake_timeout(exc) from exc
-
-
-def _private_control_query(home: Path, request: bytes, timeout: float) -> bytes:
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
         return query_runtime_control(home, request, timeout)
     from hermes_cli.gateway_runtime_discovery import connect_private
     deadline = time.monotonic() + timeout
-    with connect_private(home, timeout) as peer:
-        peer.sendall(request)
-        data = bytearray()
-        while b"\n" not in data:
-            budget = deadline - time.monotonic()
-            if budget <= 0:
-                raise GatewayClientError("Gateway bootstrap timed out")
-            peer.settimeout(budget)
-            chunk = peer.recv(4096)
-            if not chunk:
-                raise GatewayClientError("incomplete_control_response")
-            if len(data) + len(chunk) > 65536:
-                raise GatewayClientError("Invalid gateway bootstrap response")
-            data.extend(chunk)
+    try:
+        with connect_private(home, timeout) as peer:
+            peer.sendall(request)
+            data = bytearray()
+            while b"\n" not in data:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise GatewayClientError("Gateway bootstrap timed out")
+                peer.settimeout(budget)
+                chunk = peer.recv(4096)
+                if not chunk:
+                    raise GatewayClientError("incomplete_control_response")
+                if len(data) + len(chunk) > 65536:
+                    raise GatewayClientError("Invalid gateway bootstrap response")
+                data.extend(chunk)
+    except TimeoutError as exc:
+        from cron.dependency_timeout import name_gateway_handshake_timeout
+        raise name_gateway_handshake_timeout(exc) from exc
     return bytes(data)
 
 
