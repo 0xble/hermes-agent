@@ -1047,6 +1047,7 @@ def _proxy_upstream_verdict(c: _Ctx) -> Optional[Verdict]:
     _prefix, marker, upstream = c.msg.partition("last upstream error:")
     if not marker:
         return None
+    upstream = upstream.lower()
     overflow = _first_match(upstream, _OVERFLOW_AS_5XX_RULES)
     if overflow is not None:
         return overflow
@@ -1054,9 +1055,18 @@ def _proxy_upstream_verdict(c: _Ctx) -> Optional[Verdict]:
     # validation detail should outrank that upstream account reason.
     if any(pattern in upstream for pattern in _400_VALIDATION_PATTERNS):
         return _V_FORMAT_ERROR
-    if any(pattern in upstream for pattern in _BILLING_PATTERNS):
+    explicit_rate_limit = any(pattern in upstream for pattern in _RATE_LIMIT_PATTERNS)
+    quota_wall = "usage_limit_reached" in upstream or any(
+        pattern in upstream for pattern in _USAGE_LIMIT_PATTERNS + _BILLING_PATTERNS
+    )
+    # ``limit exceeded`` can be a hard usage wall, but "Rate limit exceeded" is
+    # transient and must take the same path as a normal 429.
+    if quota_wall and not explicit_rate_limit:
         return _billing_hints(upstream)
-    if "rate_limit_error" in upstream:
+    if explicit_rate_limit:
+        reset = _rate_limit_reset_seconds(upstream, c.body, c.headers)
+        if reset:
+            return _v(_R.rate_limit, **_ROTATE_FALLBACK, error_context={"reset_at": time.time() + reset})
         return _V_RATE_LIMIT
     if any(pattern in upstream for pattern in _OVERLOADED_PATTERNS):
         return {**_V_OVERLOADED, "error_context": {"provider_wide": True}}
