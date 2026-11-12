@@ -32,16 +32,17 @@ def _stall_covers(d) -> bool:
         pid == os.getpid() and process_id == _SCAN_PROCESS_ID
         and math.isfinite(epoch) and epoch > 0
         and epoch <= d.scan.now.timestamp()
-        and epoch <= d.next_run_dt.timestamp() + jobs.ONESHOT_GRACE_SECONDS
+        and epoch <= d.next_run_dt.timestamp() + jobs.oneshot_grace_seconds(d.job)
     )
 
 
-def _record_miss(d, cause: str) -> str:
+def _record_miss(d, cause: str, allowance: float) -> str:
     from cron import executions, incidents
     from cron.oneshot_retirement import held_outcome
+    seconds = int(allowance) if float(allowance).is_integer() else allowance
     error = (
         f"Missed one-shot: scheduled for {d.next_run}; due scan at {d.scan.now.isoformat()} "
-        f"was beyond the 120-second grace window ({cause}). "
+        f"was beyond the {seconds}-second grace window ({cause}). "
         "Job did not run. Payload kept for an owner decision; no automatic replay."
     )
     row = executions.record_missed_execution(
@@ -96,10 +97,11 @@ def retire_expired_oneshot(d) -> bool:
     from cron import jobs
     from cron.oneshot_retirement import queue_retirement_alert
 
-    if jobs._elapsed_seconds(d.scan.now, d.next_run_dt) <= jobs.ONESHOT_GRACE_SECONDS:
+    allowance = jobs.oneshot_grace_seconds(d.job)
+    if jobs._elapsed_seconds(d.scan.now, d.next_run_dt) <= allowance:
         return False
     covered = jobs.store_health.outage_covers(
-        jobs._current_cron_store().cron_dir, d.next_run_dt.timestamp(), jobs.ONESHOT_GRACE_SECONDS)
+        jobs._current_cron_store().cron_dir, d.next_run_dt.timestamp(), allowance)
     claim = d.job.get("run_claim")
     fire_live = jobs._claim_is_live(d.job.get("fire_claim"), d.scan.now, jobs.FIRE_CLAIM_TTL_SECONDS)
     # An outage-covered admission that never acquired a live fire claim never started.
@@ -121,7 +123,7 @@ def retire_expired_oneshot(d) -> bool:
     if not in_flight:
         cause = ("scheduler scan stalled with continuity" if _stall_covers(d) else
                  "store outage covered run time" if covered else "without scheduler continuity")
-        error = _record_miss(d, cause)
+        error = _record_miss(d, cause, allowance)
         # Match #1068's fail-closed policy: prompts and scripts can send to a
         # person even with deliver=local, so do not guess safety from delivery.
         queue_retirement_alert(d.job, error, "missed-oneshot-held", now=d.scan.now)

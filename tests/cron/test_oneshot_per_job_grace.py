@@ -101,7 +101,10 @@ def test_missing_slot_recovery_applies_allowance_without_losing_misses(store, mi
         job.pop("next_run_at")
     jobs.save_jobs([job])
     assert bool(jobs.get_due_jobs()) is due
-    assert jobs.load_jobs()[0]["state"] == ("scheduled" if due else "missed")
+    saved = jobs.load_jobs()[0]
+    assert saved["state"] == ("scheduled" if due else "missed")
+    if due and missing:
+        assert saved["next_run_at"] == job["schedule"]["run_at"]
 
 
 def test_recovery_helper_uses_per_job_allowance_but_cannot_replay_a_run():

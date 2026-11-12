@@ -119,6 +119,19 @@ OUTPUT_DIR = CRON_DIR / "output"
 ONESHOT_GRACE_SECONDS = 120
 
 
+def oneshot_grace_seconds(job: dict[str, Any] | None) -> float:
+    """Catch-up allowance for one kind=once job.
+
+    An absent field keeps the historical 120-second floor. A present field can
+    only widen that floor: recurring jobs treat zero as a strict deadline, but
+    a stored zero must not make an already-accepted one-shot expire immediately.
+    """
+    extra = normalize_max_catch_up_lateness((job or {}).get("max_catch_up_lateness_seconds"))
+    if extra is None:
+        return float(ONESHOT_GRACE_SECONDS)
+    return max(float(ONESHOT_GRACE_SECONDS), extra)
+
+
 @dataclass(frozen=True)
 class _CronStorePaths:
     cron_dir: Path
@@ -934,14 +947,16 @@ def _stored_wall_clock_is_future(stored: datetime, current: datetime) -> bool:
 
 def _recoverable_oneshot_run_at(
     schedule: dict[str, Any], now: datetime, *, last_run_at: Optional[str] = None,
+    job: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
-    """One-shot run time if still eligible: a small grace window covers jobs created just after
-    their minute; once run, a one-shot is never eligible again."""
+    """One-shot run time if still eligible: the per-job allowance covers jobs
+    created just after their minute; once run, a one-shot is never eligible again."""
     if not isinstance(schedule, dict) or schedule.get("kind") != "once" or last_run_at:
         return None
     run_at = schedule.get("run_at")
     run_at_dt = _parse_aware(run_at) if run_at else None
-    if run_at_dt is not None and _elapsed_seconds(now, run_at_dt) <= ONESHOT_GRACE_SECONDS:
+    allowance = oneshot_grace_seconds(job if job is not None else {"schedule": schedule})
+    if run_at_dt is not None and _elapsed_seconds(now, run_at_dt) <= allowance:
         return run_at
     return None
 
@@ -3254,7 +3269,7 @@ def _recover_missing_next_run(job: dict[str, Any], scan: _DueScan) -> Optional[s
     # Restore the slot, not eligibility: the normal occurrence/grace gates below
     # must hold never-started misses and retire spent dispatches, including old arms.
     run_at = _parse_aware(schedule.get("run_at")) if kind == "once" else None
-    recovered_next = schedule["run_at"] if run_at is not None else None
+    recovered_next = schedule.get("run_at") if run_at is not None else None
     recovery_kind = "one-shot" if recovered_next else None
     if not recovered_next and kind in {"cron", "interval"}:
         recovered_next = compute_next_run(schedule, scan.now.isoformat(), job.get("timezone"))
