@@ -120,13 +120,16 @@ ONESHOT_GRACE_SECONDS = 120
 
 
 def oneshot_grace_seconds(job: dict[str, Any] | None) -> float:
-    """Catch-up allowance for one kind=once job.
+    """Return a one-shot catch-up allowance without weakening the 120s floor.
 
-    An absent field keeps the historical 120-second floor. A present field can
-    only widen that floor: recurring jobs treat zero as a strict deadline, but
-    a stored zero must not make an already-accepted one-shot expire immediately.
+    Invalid persisted values fail closed to the historical allowance rather than
+    interrupting a due scan. Recurring jobs retain their own strict field rules.
     """
-    extra = normalize_max_catch_up_lateness((job or {}).get("max_catch_up_lateness_seconds"))
+    try:
+        extra = normalize_max_catch_up_lateness(
+            (job or {}).get("max_catch_up_lateness_seconds"))
+    except (TypeError, ValueError, OverflowError):
+        return float(ONESHOT_GRACE_SECONDS)
     if extra is None:
         return float(ONESHOT_GRACE_SECONDS)
     return max(float(ONESHOT_GRACE_SECONDS), extra)
@@ -947,16 +950,14 @@ def _stored_wall_clock_is_future(stored: datetime, current: datetime) -> bool:
 
 def _recoverable_oneshot_run_at(
     schedule: dict[str, Any], now: datetime, *, last_run_at: Optional[str] = None,
-    job: Optional[dict[str, Any]] = None,
 ) -> Optional[str]:
-    """One-shot run time if still eligible: the per-job allowance covers jobs
-    created just after their minute; once run, a one-shot is never eligible again."""
+    """One-shot run time if still eligible: a small grace window covers jobs created just after
+    their minute; once run, a one-shot is never eligible again."""
     if not isinstance(schedule, dict) or schedule.get("kind") != "once" or last_run_at:
         return None
     run_at = schedule.get("run_at")
     run_at_dt = _parse_aware(run_at) if run_at else None
-    allowance = oneshot_grace_seconds(job if job is not None else {"schedule": schedule})
-    if run_at_dt is not None and _elapsed_seconds(now, run_at_dt) <= allowance:
+    if run_at_dt is not None and _elapsed_seconds(now, run_at_dt) <= ONESHOT_GRACE_SECONDS:
         return run_at
     return None
 

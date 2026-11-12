@@ -147,6 +147,15 @@ def test_catch_up_limit_does_not_change_oneshot_grace(store):
     assert scheduler.drain_delivery_queue({}, None) == 0
 
 
+def test_catch_up_limit_widens_oneshot_grace(store):
+    job = recurring(300, 600)
+    job["schedule"] = {"kind": "once", "run_at": job["next_run_at"]}
+    job["repeat"]["times"] = 1
+    jobs.save_jobs([job])
+    assert len(jobs.get_due_jobs()) == 1
+    assert scheduler.drain_delivery_queue({}, None) == 0
+
+
 @pytest.mark.parametrize("value", [-1, True, "hello", float("inf"), float("nan")])
 def test_invalid_policy_never_persists(store, value):
     with pytest.raises(ValueError, match=FIELD):

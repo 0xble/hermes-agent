@@ -33,16 +33,18 @@ def oneshot(age, **extra):
     }
 
 
-@pytest.mark.parametrize("value, expected", [(None, 120), ("", 120), (0, 120),
-                                             (119, 120), (300, 300), (300.5, 300.5)])
+@pytest.mark.parametrize("value, expected", [
+    (None, 120), ("", 120), (0, 120), (119, 120), (300, 300), (300.5, 300.5),
+    (-1, 120), (True, 120), ("hello", 120), (float("inf"), 120), (float("nan"), 120),
+])
 def test_oneshot_grace_defaults_to_120_and_only_widens(value, expected):
     assert jobs.oneshot_grace_seconds({FIELD: value}) == expected
     assert jobs.oneshot_grace_seconds({}) == 120
 
 
-@pytest.mark.parametrize("age", [150, 200, 300])
-def test_per_job_allowance_keeps_one_shot_due(store, monkeypatch, age):
-    job = oneshot(age, **{FIELD: 300})
+@pytest.mark.parametrize("age, allowance", [(300, 600), (899, 900)])
+def test_per_job_allowance_keeps_one_shot_due(store, monkeypatch, age, allowance):
+    job = oneshot(age, **{FIELD: allowance})
     jobs_oneshot.record_due_scan(NOW - timedelta(seconds=1))
     retirement = Mock(wraps=jobs_oneshot.retire_expired_oneshot)
     monkeypatch.setattr(jobs_oneshot, "retire_expired_oneshot", retirement)
@@ -54,21 +56,22 @@ def test_per_job_allowance_keeps_one_shot_due(store, monkeypatch, age):
     assert saved["state"] == "scheduled" and saved["enabled"] is True
 
 
-@pytest.mark.parametrize("age", [301, 3 * 60 * 60])
-def test_per_job_allowance_holds_after_deadline_with_actual_message(store, age):
-    job = oneshot(age, **{FIELD: 300})
+@pytest.mark.parametrize("age, allowance", [(601, 600), (901, 900), (6 * 60 * 60, 900)])
+def test_per_job_allowance_holds_after_deadline_with_actual_message(store, age, allowance):
+    job = oneshot(age, **{FIELD: allowance})
     jobs.save_jobs([job])
     assert jobs.get_due_jobs() == []
     saved = jobs.load_jobs()[0]
     assert saved["state"] == "missed" and saved["enabled"] is False
     assert saved["prompt"] == job["prompt"]
     diagnostic = next((store / "cron/output/once").glob("*.md"))
-    assert "300-second grace window" in diagnostic.read_text()
+    assert f"{allowance}-second grace window" in diagnostic.read_text()
 
 
-@pytest.mark.parametrize("age, due", [(119, True), (120, True), (121, False)])
-def test_unset_allowance_keeps_historical_120_second_boundary(store, age, due):
-    jobs.save_jobs([oneshot(age)])
+@pytest.mark.parametrize("field, age, due", [(None, 119, True), (0, 119, True), (0, 121, False)])
+def test_unset_and_zero_allowance_keep_historical_120_second_boundary(store, field, age, due):
+    extra = {} if field is None else {FIELD: field}
+    jobs.save_jobs([oneshot(age, **extra)])
     assert bool(jobs.get_due_jobs()) is due
     if not due:
         diagnostic = next((store / "cron/output/once").glob("*.md"))
@@ -107,12 +110,10 @@ def test_missing_slot_recovery_applies_allowance_without_losing_misses(store, mi
         assert saved["next_run_at"] == job["schedule"]["run_at"]
 
 
-def test_recovery_helper_uses_per_job_allowance_but_cannot_replay_a_run():
-    job = oneshot(200, **{FIELD: 300})
-    assert jobs._recoverable_oneshot_run_at(job["schedule"], NOW, job=job) == job["next_run_at"]
-    assert jobs._recoverable_oneshot_run_at(job["schedule"], NOW) is None
+def test_recovery_keeps_fixed_create_update_resume_allowance():
+    job = oneshot(200, **{FIELD: 900})
     assert jobs._recoverable_oneshot_run_at(
-        job["schedule"], NOW, job=job, last_run_at=NOW.isoformat(),
+        job["schedule"], NOW, last_run_at=None,
     ) is None
 
 
