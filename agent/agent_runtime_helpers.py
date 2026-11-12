@@ -1525,10 +1525,11 @@ def restore_primary_runtime(agent) -> bool:
         fallback_route = (getattr(agent, "model", ""), getattr(agent, "provider", ""))
     previous_model, previous_provider = (str(v or "unknown") for v in fallback_route)
     provider_fallback_active = bool(getattr(agent, "_provider_fallback_active", False))
-    from agent.shared_primary_probe_runtime import claim_primary_probe, release_primary_probe
-    probe_token = claim_primary_probe(agent, shared_state)
-    if probe_token is False:
+    from agent.shared_primary_probe_runtime import claim_primary_probe, probe_claim_allows_primary, release_primary_probe
+    probe_outcome = claim_primary_probe(agent, shared_state)
+    if not probe_claim_allows_primary(probe_outcome):
         return False
+    probe_token = getattr(agent, "_shared_primary_probe_token", None)
     try:
         from agent.route_binding import reinstall_primary_runtime
         reinstall_primary_runtime(

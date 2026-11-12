@@ -75,6 +75,8 @@ def _arm_rate_limit_cooldown(
     """
     if reason not in _SHARED_COOLDOWN_REASONS:
         return None
+    if getattr(agent, "_shared_primary_probe_token", None):
+        return 0
     request_id = str(getattr(agent, "_current_api_request_id", "") or "").strip()
     if not request_id:
         sequence = int(getattr(agent, "_cooldown_failure_sequence", 0) or 0) + 1

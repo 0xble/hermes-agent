@@ -4,6 +4,15 @@ The in-memory fallback deadline is useful for a single agent, but gateway agent 
 cron workers, delegated children, and restarts create new objects and processes.  This module
 keeps only the small provider-route breaker state on disk; callers still own model switching
 and notice delivery.
+
+Invariants:
+- ``active`` and ``expired`` are shared lease states; ``probing`` has one owner and token.
+- The state writer may arm or re-arm an outage and claim the sole probe.
+- The probe owner may settle success/failure once, or release before a request leaves the primary.
+- A successful primary response settles success in ``complete_primary_recovery``.
+- Fallback activation and terminal failure settle failed at their primary exit point.
+- Interrupt and cancellation paths release the probe without changing backoff.
+- Classification and same-primary recovery never settle or release a probe lease.
 """
 from __future__ import annotations
 
@@ -18,6 +27,8 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -41,6 +52,34 @@ _FIRST_BACKOFF_SECONDS = 15
 _PROBE_LEASE_SECONDS = 120
 _RECOVERY_TOMBSTONE_SECONDS = 5 * 60
 _RECOVERY_TOMBSTONE_GRACE_SECONDS = 2
+
+
+class ProbeClaimKind(str, Enum):
+    """The complete result space for an attempted half-open probe claim."""
+
+    CLAIMED = "claimed"
+    OWNED_ELSEWHERE = "owned_elsewhere"
+    STILL_COOLING = "still_cooling"
+    REPLACED = "replaced"
+    CLEARED = "cleared"
+    UNAVAILABLE = "unavailable"
+
+
+@dataclass(frozen=True)
+class ProbeClaimOutcome:
+    """Typed probe claim result; ``record`` is a snapshot for replacement/adoption."""
+
+    kind: ProbeClaimKind
+    token: str | None = None
+    record: dict[str, Any] | None = None
+
+    def __bool__(self) -> bool:
+        return self.kind == ProbeClaimKind.CLAIMED
+
+
+def _claim_outcome(kind: ProbeClaimKind, *, token: str | None = None,
+                   record: dict[str, Any] | None = None) -> ProbeClaimOutcome:
+    return ProbeClaimOutcome(kind=kind, token=token, record=dict(record) if isinstance(record, dict) else None)
 
 
 def _state_path() -> Path:
@@ -503,8 +542,8 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None, *, tomb
         return False
 
 
-def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> str | bool | None:
-    """Atomically claim the single half-open probe for an expired outage."""
+def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> ProbeClaimOutcome:
+    """Atomically claim the single half-open probe, returning every observable state explicitly."""
     now = time.time()
     route = canonical_route(route)
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
@@ -518,32 +557,38 @@ def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> str | boo
                 str(entry.get("outage_id") or ""),
                 *(str(value) for value in entry.get("merged_outage_ids") or ()),
             } if isinstance(entry, dict) else set()
-            if not isinstance(entry, dict) or str(outage_id) not in accepted_ids:
+            if not isinstance(entry, dict):
                 if changed:
                     _write_state(path, state)
-                return None
+                return _claim_outcome(ProbeClaimKind.CLEARED)
+            if str(outage_id) not in accepted_ids:
+                if changed:
+                    _write_state(path, state)
+                return _claim_outcome(ProbeClaimKind.REPLACED, record=entry)
             if entry.get("state") == "tombstone":
-                return None
+                if changed:
+                    _write_state(path, state)
+                return _claim_outcome(ProbeClaimKind.CLEARED)
             probe_until = _finite_float(entry.get("probe_until")) or 0.0
             if probe_until > now:
                 if changed:
                     _write_state(path, state)
-                return False
+                return _claim_outcome(ProbeClaimKind.OWNED_ELSEWHERE, record=entry)
             reset_at = _plausible_reset(entry.get("reset_at", 0), now)
             if reset_at is not None and reset_at > now:
                 if changed:
                     _write_state(path, state)
-                return None
+                return _claim_outcome(ProbeClaimKind.STILL_COOLING, record=entry)
             entry["probe_owner"] = token
             entry["probe_until"] = now + _PROBE_LEASE_SECONDS
             entry["state"] = "probing"
             state["routes"][key] = entry
             _write_state(path, state)
             logger.info("Primary cooldown probe claimed route=%s outage_id=%s token=%s pid=%s", key, outage_id, token, os.getpid())
-            return token
+            return _claim_outcome(ProbeClaimKind.CLAIMED, token=token, record=entry)
     except OSError as exc:
         logger.debug("Could not claim primary cooldown probe: %s", exc)
-        return None
+        return _claim_outcome(ProbeClaimKind.UNAVAILABLE)
 
 
 def _settle_probe(
@@ -555,6 +600,8 @@ def _settle_probe(
     A provider reset observed by the probe must survive the re-arm: the exponential window is
     still the floor, but a later valid reset hint wins.
     """
+    if isinstance(token, ProbeClaimOutcome):
+        token = token.token or ""
     now = time.time()
     route = canonical_route(route)
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
@@ -610,6 +657,8 @@ def _settle_probe(
 
 def _release_probe(route: tuple[str, str, str], outage_id: str, token: str) -> bool:
     """Release a probe lease when restoration never reached a request."""
+    if isinstance(token, ProbeClaimOutcome):
+        token = token.token or ""
     route = canonical_route(route)
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
     try:
@@ -645,30 +694,46 @@ _PROBE_OUTAGE_REASONS = frozenset({
 
 def _fail_agent_probe(agent, reason=None, reset_at=None) -> bool:
     """Settle an in-flight probe after an outage-class provider error, exactly once."""
-    token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
+    reason_value = getattr(reason, "value", reason)
+    if reason is not None and reason_value not in _PROBE_OUTAGE_REASONS:
+        return settle_primary_probe_on_exit(agent, reason="release")
+    return settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)
+
+
+def settle_primary_probe_on_exit(agent, *, reason=None, reset_at=None) -> bool:
+    """Settle a held primary probe exactly when the request leaves the primary route.
+
+    Same-primary recovery must leave the token untouched.  Outage-class exits re-arm the
+    shared breaker. Only explicit interrupt/cancel exits release the lease without changing backoff.
+    """
+    raw_token = getattr(agent, "_shared_primary_probe_token", "")
+    token = raw_token.token if isinstance(raw_token, ProbeClaimOutcome) else str(raw_token or "")
     record = getattr(agent, "_shared_primary_cooldown_record", None)
     if not token or not isinstance(record, dict):
         return False
     route = route_from_record(record)
-    reason_value = getattr(reason, "value", reason)
-    if reason is not None and reason_value not in _PROBE_OUTAGE_REASONS:
-        released = _release_probe(route, str(record.get("outage_id") or ""), token)
-        if released:
-            agent._shared_primary_probe_token = None
-        return released
-    settled = _settle_probe(
-        route, str(record.get("outage_id") or ""), token, success=False, reset_at=reset_at,
-    )
+    outage_id = str(record.get("outage_id") or "")
+    if reason in {"success", "primary_success"}:
+        settled = _settle_probe(route, outage_id, token, success=True)
+    elif reason in {"interrupt", "cancel", "release"}:
+        settled = _release_probe(route, outage_id, token)
+    else:
+        reason_value = getattr(reason, "value", reason)
+        if reason is not None and reason_value not in _PROBE_OUTAGE_REASONS:
+            settled = _release_probe(route, outage_id, token)
+        else:
+            settled = _settle_probe(route, outage_id, token, success=False, reset_at=reset_at)
     if settled:
         agent._shared_primary_probe_token = None
-        agent._shared_primary_probe_failed_outage_id = str(record.get("outage_id") or "")
-        current = get_cooldown(route)
-        if isinstance(current, dict):
-            agent._shared_primary_cooldown_record = current
-            agent._fallback_episode_cooled = True
-            remaining = max(0, math.ceil(float(current.get("reset_at", 0) or 0) - time.time()))
-            agent._rate_limited_until = time.monotonic() + remaining
-            agent._rate_limit_backoff_count = int(current.get("backoff_count", 0) or 0)
+        if reason not in {"success", "primary_success", "interrupt", "cancel", "release"}:
+            agent._shared_primary_probe_failed_outage_id = outage_id
+            current = get_cooldown(route)
+            if isinstance(current, dict):
+                agent._shared_primary_cooldown_record = current
+                agent._fallback_episode_cooled = True
+                remaining = max(0, math.ceil(float(current.get("reset_at", 0) or 0) - time.time()))
+                agent._rate_limited_until = time.monotonic() + remaining
+                agent._rate_limit_backoff_count = int(current.get("backoff_count", 0) or 0)
     return settled
 
 
@@ -788,7 +853,7 @@ def complete_primary_recovery(agent) -> bool:
     if not outage_id:
         return False
     if probe_token:
-        cleared = _settle_probe(route, outage_id, probe_token, success=True)
+        cleared = settle_primary_probe_on_exit(agent, reason="success")
         if not cleared:
             # The lease may have been released or replaced before this successful primary
             # response arrived. A success on the live primary still proves the current outage
@@ -796,7 +861,7 @@ def complete_primary_recovery(agent) -> bool:
             current = get_cooldown(route)
             if isinstance(current, dict) and not current.get("probe_owner"):
                 cleared = clear_if_current(route, outage_id, tombstone=True)
-    else:
+    elif not probe_token:
         cleared = clear_if_current(route, outage_id, tombstone=True)
     if not cleared:
         return False
@@ -816,8 +881,8 @@ def complete_primary_recovery(agent) -> bool:
 
 
 __all__ = [
-    "active_cooldown", "announced_fallback", "arm_cooldown", "canonical_route", "claim_outage_notice",
-    "claim_probe", "clear_cooldowns", "clear_if_current", "complete_primary_recovery", "get_cooldown",
-    "is_active", "list_cooldowns", "live_route_from_agent", "read_cooldown", "route_from_agent",
-    "route_from_record", "route_key",
+    "ProbeClaimKind", "ProbeClaimOutcome", "active_cooldown", "announced_fallback", "arm_cooldown",
+    "canonical_route", "claim_outage_notice", "claim_probe", "clear_cooldowns", "clear_if_current",
+    "complete_primary_recovery", "get_cooldown", "is_active", "list_cooldowns", "live_route_from_agent",
+    "read_cooldown", "route_from_agent", "route_from_record", "route_key", "settle_primary_probe_on_exit",
 ]

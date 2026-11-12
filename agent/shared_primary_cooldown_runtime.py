@@ -35,12 +35,16 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
             return False
         if not is_active(record):
             agent._shared_primary_cooldown_record = record
-            from agent.shared_primary_cooldown import claim_probe, route_from_record
-            probe = claim_probe(route_from_record(record), str(record.get("outage_id") or ""))
-            if probe:
-                agent._shared_primary_probe_token = probe
+            from agent.shared_primary_cooldown import ProbeClaimKind, ProbeClaimOutcome, claim_probe, route_from_record
+            outcome = claim_probe(route_from_record(record), str(record.get("outage_id") or ""))
+            if not isinstance(outcome, ProbeClaimOutcome):
+                logger.warning("Primary cooldown probe returned an invalid outcome; adopting fallback")
+                outcome = ProbeClaimOutcome(ProbeClaimKind.UNAVAILABLE)
+            if outcome.kind == ProbeClaimKind.CLAIMED:
+                agent._shared_primary_probe_token = outcome.token
                 return False
-            if probe is False:
+            if outcome.kind in (ProbeClaimKind.OWNED_ELSEWHERE, ProbeClaimKind.STILL_COOLING,
+                                ProbeClaimKind.UNAVAILABLE):
                 from agent.error_classifier import FailoverReason
                 from agent.chat_completion_helpers import try_activate_fallback
                 try:
@@ -48,19 +52,20 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
                 except ValueError:
                     reason = FailoverReason.rate_limit
                 return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=record))
-            # A concurrent writer may have replaced the record between our read
-            # and claim.  A missing/tombstoned record means the primary is clear,
-            # but a surviving record still owns the fallback decision.
-            current = read_cooldown(route_from_agent(agent))
-            if current is None:
+            if outcome.kind == ProbeClaimKind.CLEARED:
+                agent._shared_primary_cooldown_record = None
                 return False
-            from agent.error_classifier import FailoverReason
-            from agent.chat_completion_helpers import try_activate_fallback
-            try:
-                reason = FailoverReason(str(current.get("reason") or FailoverReason.rate_limit.value))
-            except ValueError:
-                reason = FailoverReason.rate_limit
-            return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=current))
+            if outcome.kind == ProbeClaimKind.REPLACED and isinstance(outcome.record, dict):
+                record = outcome.record
+                agent._shared_primary_cooldown_record = record
+                from agent.error_classifier import FailoverReason
+                from agent.chat_completion_helpers import try_activate_fallback
+                try:
+                    reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))
+                except ValueError:
+                    reason = FailoverReason.rate_limit
+                return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=record))
+            raise AssertionError(f"unhandled probe claim outcome: {outcome.kind!r}")
         from agent.error_classifier import FailoverReason
         try:
             reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))
