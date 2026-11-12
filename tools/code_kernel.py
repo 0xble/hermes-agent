@@ -36,6 +36,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from tools.code_kernel_memory import KernelMemoryWatch, RUNNER_MEMORY_SOURCE, kernel_memory_limit_bytes
+
 logger = logging.getLogger(__name__)
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -140,6 +142,8 @@ def _start_parent_process_watchdog():
 
     threading.Thread(target=_wait, name="hermes-parent-watchdog", daemon=True).start()
 
+
+{RUNNER_MEMORY_SOURCE}
 
 _start_parent_process_watchdog()
 
@@ -300,6 +304,8 @@ class SessionKernel:
         self.kernel_id = uuid.uuid4().hex
         self.process_start: int | str | None = None
         self.retire_reason = "teardown"
+        self.tree_memory_bytes = 0
+        self.memory_ceiling_bytes = 0
         self.current_task = ""
         self.current_caller = ""
         # Cells currently attached (bumped under the registry lock on selection, dropped when the
@@ -402,6 +408,9 @@ def _emit_kernel_lifecycle(kernel, event: str, *, task_id: str, caller: str, rea
         "pid": pid, "process_start": getattr(kernel, "process_start", None) or "unknown",
         "rss_bytes": rss, "reason": reason, "attached": kernel.attached, "pinned": kernel.pinned,
     }
+    if not remote:
+        record.update(tree_memory_bytes=kernel.tree_memory_bytes,
+                      memory_ceiling_bytes=kernel.memory_ceiling_bytes)
     logger.info("kernel_lifecycle %s", json.dumps(record, ensure_ascii=True))
 
 
@@ -756,7 +765,8 @@ def _spawn_locked(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     try:
         kernel.ensure_open()
         kernel.proc = spawn_owned(
-            [child_python, os.path.join(kernel.tmpdir, "hermes_kernel_runner.py")], purpose="code-kernel",
+            [child_python, os.path.join(kernel.tmpdir, "hermes_kernel_runner.py"),
+             str(kernel_memory_limit_bytes())], purpose="code-kernel",
             # Strict mode passes an empty cwd: the kernel's staging dir plays the per-call tmpdir's role.
             cwd=child_cwd or kernel.tmpdir, env=child_env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE,
@@ -902,15 +912,24 @@ def _background_reaper() -> None:
 def _await_cell(kernel: SessionKernel, timeout: int, is_interrupted) -> tuple[str, dict[str, Any]]:
     """Wait for the cell's reply; returns (host status, payload)."""
     deadline = time.monotonic() + timeout if timeout else None
+    assert kernel.proc is not None
+    kernel.memory_ceiling_bytes = kernel_memory_limit_bytes()
+    watch = KernelMemoryWatch(kernel.proc.pid, kernel.memory_ceiling_bytes)
     while True:
         if is_interrupted():
             return "interrupted", {}
         if deadline is not None and time.monotonic() > deadline:
             return "timeout", {}
+        if usage := watch.exceeded():
+            kernel.tree_memory_bytes = usage
+            return "memory_ceiling", {}
         try:
             payload = kernel.response_q.get(timeout=0.05)
         except queue.Empty:
             continue
+        if usage := watch.exceeded(final=True):
+            kernel.tree_memory_bytes = usage
+            return "memory_ceiling", {}
         if payload.get("status") in ("kernel-eof", "protocol-error"):
             return "error", payload
         return "success", payload
@@ -929,7 +948,7 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
     from tools.ansi_strip import strip_ansi
     def clean(text: str) -> str:
         return redact_sensitive_text(strip_ansi(text), code_file=True)
-    if status in ("timeout", "interrupted"):
+    if status in ("timeout", "interrupted", "memory_ceiling"):
         # No safe way to interrupt one cell in place: kill the kernel, report the loss, respawn next call.
         _REGISTRY.discard(key, kernel, reason=status)
     duration = round(time.monotonic() - exec_start, 2)
@@ -960,7 +979,17 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
             f'— page it with read_file(path="{cell_spill}", offset=...) instead of re-running. '
             "(Kernel state persists: printing a narrower slice next call is often cheaper.)"
         )
-    if status == "timeout":
+    if status == "memory_ceiling":
+        ceiling_mb = kernel.memory_ceiling_bytes / (1024 ** 2)
+        message = (f"kernel exceeded memory ceiling {ceiling_mb:g} MiB "
+                   f"(process-tree footprint {kernel.tree_memory_bytes} bytes); kernel retired "
+                   "and its state was lost. The next execute_code call starts a fresh kernel.")
+        result.update(status="error", exit_code=-1, error=message,
+                      output=(stdout_text + "\n\n" + message) if stdout_text else message)
+        result["kernel"].update(ended=True, state_lost=True,
+                                 memory_bytes=kernel.tree_memory_bytes,
+                                 memory_ceiling_bytes=kernel.memory_ceiling_bytes)
+    elif status == "timeout":
         message = (f"Cell timed out after {timeout}s; the session kernel was killed and its "
                    "state was lost. The next execute_code call starts a fresh kernel.")
         result.update(exit_code=-1, error=message,

@@ -475,7 +475,7 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
         self.assertEqual([r["status"] for r in results], ["success"] * 6)
         self.assertEqual(len(_KERNELS), 1)
         runners = [proc for proc, args in spawned
-                   if len(args) == 2 and Path(args[1]).name == "hermes_kernel_runner.py"]
+                   if len(args) == 3 and Path(args[1]).name == "hermes_kernel_runner.py"]
         self.assertEqual(len(runners), 1, "parallel cells spawned an unowned kernel")
         kernel = next(iter(_KERNELS.values()))
         self.assertIs(kernel.proc, runners[0])
