@@ -132,7 +132,7 @@ def handle_api_error(
     )
     with contextlib.suppress(Exception):
         from agent.shared_primary_cooldown import _fail_agent_probe
-        _fail_agent_probe(agent, classified.reason)
+        _fail_agent_probe(agent, classified.reason, error_context.get("reset_at") if isinstance(error_context, dict) else None)
     logger.debug(
         "Error classified: reason=%s status=%s retryable=%s compress=%s rotate=%s fallback=%s",
         classified.reason.value, classified.status_code,

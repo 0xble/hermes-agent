@@ -533,8 +533,15 @@ def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> str | boo
         return None
 
 
-def _settle_probe(route: tuple[str, str, str], outage_id: str, token: str, *, success: bool) -> bool:
-    """Settle only the lease owner, clearing on success or doubling on failure."""
+def _settle_probe(
+    route: tuple[str, str, str], outage_id: str, token: str, *, success: bool,
+    reset_at: Any = None,
+) -> bool:
+    """Settle only the lease owner, clearing on success or doubling on failure.
+
+    A provider reset observed by the probe must survive the re-arm: the exponential window is
+    still the floor, but a later valid reset hint wins.
+    """
     now = time.time()
     route = canonical_route(route)
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
@@ -567,8 +574,14 @@ def _settle_probe(route: tuple[str, str, str], outage_id: str, token: str, *, su
             entry.pop("probe_until", None)
             entry["state"] = "active"
             entry["backoff_count"] = count
-            entry["source"] = "backoff"
-            entry["reset_at"] = now + min(60 * (2 ** max(0, count - 1)), _MAX_BACKOFF_SECONDS)
+            backoff_reset = now + min(60 * (2 ** max(0, count - 1)), _MAX_BACKOFF_SECONDS)
+            provider_reset = _plausible_reset(reset_at, now)
+            if provider_reset is not None and provider_reset > backoff_reset:
+                entry["reset_at"] = provider_reset
+                entry["source"] = "provider_reset"
+            else:
+                entry["reset_at"] = backoff_reset
+                entry["source"] = "backoff"
             entry["recorded_at"] = now
             state["routes"][key] = entry
             _write_state(path, state)
@@ -585,10 +598,15 @@ def _release_probe(route: tuple[str, str, str], outage_id: str, token: str) -> b
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
     try:
         with _locked_state() as (path, state):
+            _merge_duplicate_routes(state)
             entry = state["routes"].get(key)
+            accepted_ids = {
+                str(entry.get("outage_id") or ""),
+                *(str(value) for value in entry.get("merged_outage_ids") or ()),
+            } if isinstance(entry, dict) else set()
             if (
                 not isinstance(entry, dict)
-                or str(entry.get("outage_id")) != str(outage_id)
+                or str(outage_id) not in accepted_ids
                 or str(entry.get("probe_owner") or "") != str(token)
             ):
                 return False
@@ -609,7 +627,7 @@ _PROBE_OUTAGE_REASONS = frozenset({
 })
 
 
-def _fail_agent_probe(agent, reason=None) -> bool:
+def _fail_agent_probe(agent, reason=None, reset_at=None) -> bool:
     """Settle an in-flight probe after an outage-class provider error, exactly once."""
     token = str(getattr(agent, "_shared_primary_probe_token", "") or "")
     record = getattr(agent, "_shared_primary_cooldown_record", None)
@@ -622,7 +640,9 @@ def _fail_agent_probe(agent, reason=None) -> bool:
         if released:
             agent._shared_primary_probe_token = None
         return released
-    settled = _settle_probe(route, str(record.get("outage_id") or ""), token, success=False)
+    settled = _settle_probe(
+        route, str(record.get("outage_id") or ""), token, success=False, reset_at=reset_at,
+    )
     if settled:
         agent._shared_primary_probe_token = None
         agent._shared_primary_probe_failed_outage_id = str(record.get("outage_id") or "")

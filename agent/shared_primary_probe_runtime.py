@@ -44,9 +44,27 @@ def _configured_base_url(provider, model) -> str:
     return ""
 
 
+def _builtin_base_url(provider: str) -> str:
+    """Return a built-in endpoint without resolving credentials or invoking recovery."""
+    normalized = str(provider or "").strip().lower()
+    if normalized == "openrouter":
+        from hermes_constants import OPENROUTER_BASE_URL
+        return OPENROUTER_BASE_URL
+    try:
+        from hermes_cli.providers import get_provider
+        definition = get_provider(normalized, allow_network=False)
+        return str(getattr(definition, "base_url", "") or "").strip()
+    except (ImportError, OSError, TypeError, ValueError, KeyError):
+        return ""
+
+
 def fallback_route_is_active(provider, base_url, model) -> bool:
     from agent.shared_primary_cooldown import active_cooldown, canonical_route
-    resolved_base_url = str(base_url or "").strip() or _configured_base_url(provider, model)
+    resolved_base_url = (
+        str(base_url or "").strip()
+        or _configured_base_url(provider, model)
+        or _builtin_base_url(provider)
+    )
     return bool(active_cooldown(canonical_route((provider, resolved_base_url, model))))
 
 
