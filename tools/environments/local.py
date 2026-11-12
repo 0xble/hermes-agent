@@ -326,12 +326,19 @@ def _strip_default_profile_home(env: dict) -> dict:
     Hermes code falls back to the same platform default when HERMES_HOME is absent. Keeping the
     variable for routed or custom homes is required because it is their home route.
     """
-    from hermes_constants import _expand_hermes_home, _get_platform_default_hermes_home
+    from hermes_constants import _expand_hermes_home, _platform_default_hermes_home
     raw_home = str(env.get("HERMES_HOME", "")).strip()
     if not raw_home:
         return env
     try:
-        if _expand_hermes_home(raw_home).resolve() == _get_platform_default_hermes_home().resolve():
+        # Compute the fallback from the child's environment.  The child may have HOME set to
+        # ``{HERMES_HOME}/home`` by profile mode or container auto mode, so the parent's
+        # ``Path.home()/.hermes`` is not the value its own resolver would choose.
+        child_home = str(env.get("HOME") or env.get("USERPROFILE") or "").strip()
+        if not child_home:
+            return env
+        platform_default = _platform_default_hermes_home(env, lambda: Path(child_home))
+        if _expand_hermes_home(raw_home).resolve() == platform_default.resolve():
             env.pop("HERMES_HOME", None)
     except (OSError, RuntimeError, ValueError):
         pass

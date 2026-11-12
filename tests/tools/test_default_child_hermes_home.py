@@ -6,15 +6,19 @@ The persistent shell snapshot follows the same rule so later commands cannot rep
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
+import hermes_constants
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from tools.code_execution_env import _build_child_env
 from tools.environments.local import LocalEnvironment, _make_run_env
 from tools.process_registry import ProcessRegistry
+
+_ROOT = Path(__file__).resolve().parents[2]
 
 
 def _child_env():
@@ -33,6 +37,17 @@ def _cron_worker_env(monkeypatch, home: Path) -> dict[str, str]:
     ))
 
 
+def _child_resolved_home(env: dict[str, str]) -> Path:
+    child_env = dict(os.environ)
+    child_env.update(env)
+    child_env["PYTHONPATH"] = str(_ROOT)
+    result = subprocess.run(
+        [sys.executable, "-c", "from hermes_constants import get_hermes_home; print(get_hermes_home())"],
+        env=child_env, capture_output=True, text=True, check=True,
+    )
+    return Path(result.stdout.strip())
+
+
 class _SnapshotEnv(LocalEnvironment):
     def cleanup(self) -> None:
         return None
@@ -41,11 +56,77 @@ class _SnapshotEnv(LocalEnvironment):
 def test_default_profile_terminal_children_do_not_see_live_home(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     assert "HERMES_HOME" not in _make_run_env({})
     assert "HERMES_HOME" not in ProcessRegistry._spawn_env({})
     assert "HERMES_HOME" not in _child_env()
+
+
+def test_plain_default_child_resolves_its_default_home(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    child_env = _make_run_env({})
+    assert "HERMES_HOME" not in child_env
+    assert _child_resolved_home(child_env) == home
+
+
+def test_profile_home_child_keeps_and_resolves_explicit_home(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    (home / "home").mkdir(parents=True)
+    real_home = tmp_path / "user"
+    real_home.mkdir()
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: False)
+    monkeypatch.setenv("TERMINAL_HOME_MODE", "profile")
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    child_env = _make_run_env({})
+    assert child_env["HERMES_HOME"] == str(home)
+    assert child_env["HOME"] == str(home / "home")
+    assert _child_resolved_home(child_env) == home
+
+
+def test_container_auto_profile_home_child_keeps_and_resolves_explicit_home(monkeypatch, tmp_path):
+    home = tmp_path / ".hermes"
+    (home / "home").mkdir(parents=True)
+    real_home = tmp_path / "user"
+    real_home.mkdir()
+    monkeypatch.setattr(hermes_constants, "is_container", lambda: True)
+    monkeypatch.delenv("TERMINAL_HOME_MODE", raising=False)
+    monkeypatch.setenv("HOME", str(real_home))
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    child_env = _make_run_env({})
+    assert child_env["HERMES_HOME"] == str(home)
+    assert child_env["HOME"] == str(home / "home")
+    assert _child_resolved_home(child_env) == home
+
+
+def test_delegated_child_explicit_kanban_home_overrides_lineage_fallback(
+    tmp_path, monkeypatch
+):
+    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER, scrub_kanban_env
+    from hermes_cli import kanban_db as kb
+
+    lineage_root = tmp_path / "lineage"
+    explicit_root = tmp_path / "explicit"
+    lineage_root.mkdir()
+    explicit_root.mkdir()
+    child_env = scrub_kanban_env({
+        "HERMES_HOME": str(lineage_root),
+        "HERMES_KANBAN_HOME": str(explicit_root),
+    })
+    monkeypatch.setenv("HERMES_HOME", child_env["HERMES_HOME"])
+    monkeypatch.setenv("HERMES_KANBAN_HOME", child_env["HERMES_KANBAN_HOME"])
+    monkeypatch.setenv(DELEGATED_CHILD_ENV_MARKER, child_env[DELEGATED_CHILD_ENV_MARKER])
+
+    assert kb.kanban_home() == explicit_root
+    assert child_env[DELEGATED_CHILD_ENV_MARKER] != child_env["HERMES_KANBAN_HOME"]
 
 
 def test_named_profile_children_keep_their_home(monkeypatch, tmp_path):
@@ -61,6 +142,7 @@ def test_named_profile_children_keep_their_home(monkeypatch, tmp_path):
 def test_cron_worker_keeps_its_profile_home(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
 
     env = _cron_worker_env(monkeypatch, home)
@@ -70,6 +152,7 @@ def test_cron_worker_keeps_its_profile_home(monkeypatch, tmp_path):
 def test_default_profile_snapshot_does_not_replay_live_home(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
     env = _SnapshotEnv(cwd=str(tmp_path), timeout=1)
 
@@ -90,6 +173,7 @@ def test_named_profile_snapshot_keeps_home(monkeypatch, tmp_path):
 def test_pty_path_uses_the_same_spawn_env(monkeypatch, tmp_path):
     home = tmp_path / ".hermes"
     monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("HERMES_HOME", str(home))
     registry = ProcessRegistry()
     captured = {}

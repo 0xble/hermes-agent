@@ -171,6 +171,13 @@ def _fenced_kanban_root() -> str:
         return "1"
 
 
+def is_injected_kanban_home() -> bool:
+    """Whether a child home is the lineage fallback injected by ``scrub_kanban_env``."""
+    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
+    marker = os.environ.get(DELEGATED_CHILD_ENV_MARKER, "").strip()
+    return bool(override and marker and os.path.realpath(override) == os.path.realpath(marker))
+
+
 def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[str, str]:
     """Remove worker identity, retaining board/location and an inherited write fence.
 
@@ -189,7 +196,16 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
     if cleaned.get("HERMES_SESSION_SOURCE") == "kanban":
         del cleaned["HERMES_SESSION_SOURCE"]
     inherited = str(env.get(DELEGATED_CHILD_ENV_MARKER) or "")
-    fenced_root = inherited if inherited and inherited != "1" else _fenced_kanban_root()
+    if inherited and inherited != "1":
+        fenced_root = inherited
+    elif str(env.get("HERMES_KANBAN_HOME") or "").strip():
+        # An operator override already present in the parent is explicit.  Derive the
+        # lineage fence from HERMES_HOME without letting that override become its marker,
+        # so kanban_home() can distinguish the injected fallback from the operator value.
+        from hermes_constants import get_default_hermes_root
+        fenced_root = str(get_default_hermes_root(home=env.get("HERMES_HOME")))
+    else:
+        fenced_root = _fenced_kanban_root()
     cleaned[DELEGATED_CHILD_ENV_MARKER] = fenced_root
     if fenced_root != "1" and (inherited or _DELEGATED_CHILD_CONTEXT.get()):
         cleaned.setdefault("HERMES_KANBAN_HOME", fenced_root)
