@@ -358,6 +358,10 @@ async def execute_admission(authority, ref, row):
     native = row['admission_id'] in authority.native_waiters
     authority.native_waiters.discard(row['admission_id'])
     if 'native_text_v1' in row['payload']:
+        # A turn claimed while its adapter reconnects waits for the slot instead of failing.
+        from gateway.session_ingress_context import await_reconnecting_adapter
+        await await_reconnecting_adapter(authority.runner, row['payload']['native_text_v1'],
+                                         lambda: getattr(authority.runner, '_draining', False) or authority.retiring)
         event = restore_native(row['payload'], authority.runner)
     else:
         from gateway.session_ingress_media import restore_attachments
