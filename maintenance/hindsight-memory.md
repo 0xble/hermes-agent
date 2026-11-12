@@ -1,6 +1,7 @@
 # Hindsight memory provider
 
-**Patch identity:** `hindsight-retain-visibility`, `evict-memory-shutdown`, and `hindsight-client-selection`.
+**Patch identity:** `hindsight-retain-visibility`, `evict-memory-shutdown`, `hindsight-client-selection`, and
+`memory-sync-redaction`.
 
 **Release-readiness patch identity:** `hindsight-memory` owns advisory recovery
 preflight, origin-relative forward checks, and release-scoped readiness notices.

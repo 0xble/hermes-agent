@@ -39,6 +39,12 @@ _VAULT_REDACTION_VALUES: dict = {}  # profile home → ordered {value: None}
 _VAULT_DATE_PARTS: dict = {}  # (profile home, tab key, origin) → ordered {(component, value)}
 _VAULT_CARD_PARTS: dict = {}  # same scope → separately bounded card metadata components
 _VAULT_REDACTION_LOCK = threading.Lock()
+_REDACTION_GENERATION = 0
+
+
+def redaction_generation() -> int:
+    """Return a process-wide generation for dynamic egress redaction rules."""
+    return _REDACTION_GENERATION
 
 
 def _vault_scope() -> str:
@@ -56,6 +62,7 @@ def register_vault_redaction_value(value) -> None:
     if not isinstance(value, str) or not value:
         return
     normalized = value.replace("\r", "").replace("\n", "")
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_REDACTION_VALUES.setdefault(_vault_scope(), {})
         for v in (value, normalized):
@@ -64,6 +71,7 @@ def register_vault_redaction_value(value) -> None:
                 bucket[v] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+        _REDACTION_GENERATION += 1
 
 
 def _date_scope(tab: str, origin: str) -> tuple[str, str, str]:
@@ -75,6 +83,7 @@ def register_vault_date_component(token: str, value: str, *,
     """Register one exact date component for a browser tab and its filled origin."""
     if token not in ("bday-month", "bday-day", "bday-year") or not isinstance(value, str) or not value.isdigit():
         return
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_DATE_PARTS.setdefault(_date_scope(tab, origin), {})
         key = (token.removeprefix("bday-"), value)
@@ -82,6 +91,7 @@ def register_vault_date_component(token: str, value: str, *,
         bucket[key] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+        _REDACTION_GENERATION += 1
 
 
 def register_vault_card_component(field: str, value: str, *, tab: str, origin: str) -> None:
@@ -91,6 +101,7 @@ def register_vault_card_component(field: str, value: str, *, tab: str, origin: s
     """
     if field not in {"cardholder_name", "exp_month", "exp_year", "billing_postal_code", "cvc", "expiry"} or not isinstance(value, str) or not value:
         return
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
         bucket = _VAULT_CARD_PARTS.setdefault(_date_scope(tab, origin), {})
         key = (field, value)
@@ -98,13 +109,16 @@ def register_vault_card_component(field: str, value: str, *, tab: str, origin: s
         bucket[key] = None
         while len(bucket) > _VAULT_REDACTION_MAX_PER_PROFILE:
             del bucket[next(iter(bucket))]
+        _REDACTION_GENERATION += 1
 
 
 def mark_vault_protected_tab(tab: str, origin: str) -> None:
     """Record a protected fill on a tab/origin even when no short component exists
     (a combined ``input[type=date]``): pixel capture must still be refused there."""
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
         _VAULT_DATE_PARTS.setdefault(_date_scope(tab, origin), {})
+        _REDACTION_GENERATION += 1
 
 
 def vault_read_has_protected_field_context(expression: str) -> bool:
@@ -114,11 +128,16 @@ def vault_read_has_protected_field_context(expression: str) -> bool:
 
 def clear_vault_date_components(tab: str, origin: str | None = None) -> None:
     """Forget a tab's birthday and card components on close or cross-origin navigation."""
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
+        changed = False
         for registry in (_VAULT_DATE_PARTS, _VAULT_CARD_PARTS):
             for key in list(registry):
                 if key[:2] == (_vault_scope(), str(tab)) and (origin is None or key[2] != str(origin).lower()):
                     del registry[key]
+                    changed = True
+        if changed:
+            _REDACTION_GENERATION += 1
 
 
 def has_vault_date_components(tab: str) -> bool:
@@ -189,12 +208,17 @@ def redact_registered_vault_number(value: Any, *,
 
 def clear_vault_redaction_values() -> None:
     """Drop the current profile's registered values (profile teardown / explicit lock)."""
+    global _REDACTION_GENERATION
     with _VAULT_REDACTION_LOCK:
+        changed = _vault_scope() in _VAULT_REDACTION_VALUES
         _VAULT_REDACTION_VALUES.pop(_vault_scope(), None)
         for registry in (_VAULT_DATE_PARTS, _VAULT_CARD_PARTS):
             for key in list(registry):
                 if key[0] == _vault_scope():
                     del registry[key]
+                    changed = True
+        if changed:
+            _REDACTION_GENERATION += 1
 
 
 def redact_registered_vault_values(text: str, *,

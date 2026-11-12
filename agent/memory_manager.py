@@ -13,10 +13,11 @@ import math
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.redact import redact_for_egress
+from agent.redact import redact_for_egress, redaction_generation
 
 from agent.memory_caller_scope import bound_scope, caller_scope, claim_instance, in_owner_home, refused_tool_message
 # Moved to agent.memory_context / agent.memory_manager_tools; still importable here because agent.memory_manager is a public
@@ -112,14 +113,82 @@ def _accepts_require_checkpoint(fn: Callable[..., Any]) -> bool:
 
 # -- Provider egress scrubbing -----------------------------------------------
 
+_SCRUB_CACHE_MAX_ENTRIES = 4096
+_SCRUB_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_SCRUB_CACHE: OrderedDict[tuple[str, int, str], str] = OrderedDict()
+_SCRUB_CACHE_BYTES = 0
+_SCRUB_CACHE_LOCK = threading.Lock()
+
+
 def _scrub(text: str) -> str:
     """The shared egress scrub. Like chat-platform and cron delivery it holds even when
     ``security.redact_secrets`` is off (that setting governs local logs, not what leaves the agent)
     and fails closed."""
-    return redact_for_egress(text)
+    global _SCRUB_CACHE_BYTES
+    key = (hermes_home_key(), redaction_generation(), text)
+    with _SCRUB_CACHE_LOCK:
+        cached = _SCRUB_CACHE.get(key)
+        if cached is not None:
+            _SCRUB_CACHE.move_to_end(key)
+            return cached
+    scrubbed = redact_for_egress(text)
+    size = len(text.encode("utf-8")) + len(scrubbed.encode("utf-8"))
+    if size > _SCRUB_CACHE_MAX_BYTES:
+        return scrubbed
+    with _SCRUB_CACHE_LOCK:
+        previous = _SCRUB_CACHE.pop(key, None)
+        if previous is not None:
+            _SCRUB_CACHE_BYTES -= len(text.encode("utf-8")) + len(previous.encode("utf-8"))
+        _SCRUB_CACHE[key] = scrubbed
+        _SCRUB_CACHE_BYTES += size
+        while (len(_SCRUB_CACHE) > _SCRUB_CACHE_MAX_ENTRIES
+               or _SCRUB_CACHE_BYTES > _SCRUB_CACHE_MAX_BYTES):
+            old_key, old_value = _SCRUB_CACHE.popitem(last=False)
+            _SCRUB_CACHE_BYTES -= (len(old_key[2].encode("utf-8"))
+                                   + len(old_value.encode("utf-8")))
+    return scrubbed
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-./+]{16,}")
+_LEARNED_PATTERN_CACHE: OrderedDict[frozenset[str], re.Pattern[str]] = OrderedDict()
+_LEARNED_PATTERN_CACHE_MAX_ENTRIES = 64
+_LEARNED_PATTERN_CACHE_LOCK = threading.Lock()
+
+
+def _learned_pattern(learned: frozenset[str]) -> re.Pattern[str]:
+    with _LEARNED_PATTERN_CACHE_LOCK:
+        pattern = _LEARNED_PATTERN_CACHE.get(learned)
+        if pattern is not None:
+            _LEARNED_PATTERN_CACHE.move_to_end(learned)
+            return pattern
+    pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
+    with _LEARNED_PATTERN_CACHE_LOCK:
+        _LEARNED_PATTERN_CACHE[learned] = pattern
+        _LEARNED_PATTERN_CACHE.move_to_end(learned)
+        while len(_LEARNED_PATTERN_CACHE) > _LEARNED_PATTERN_CACHE_MAX_ENTRIES:
+            _LEARNED_PATTERN_CACHE.popitem(last=False)
+    return pattern
+
+
+def _has_embedded_learned_token(text: str, learned: frozenset[str]) -> bool:
+    token_chars = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.+/")
+    for token in learned:
+        start = text.find(token)
+        while start >= 0:
+            end = start + len(token)
+            if ((start and text[start - 1] in token_chars)
+                    or (end < len(text) and text[end] in token_chars)):
+                return True
+            start = text.find(token, start + 1)
+    return False
+
+
+def _apply_learned_tokens(text: str, learned: frozenset[str]) -> str:
+    if not learned or not any(token in text for token in learned):
+        return text
+    if not _has_embedded_learned_token(text, learned):
+        return _TOKEN_RE.sub(lambda match: "[redacted]" if match.group(0) in learned else match.group(0), text)
+    return _learned_pattern(learned).sub("[redacted]", text)
 
 
 def _redact_for_provider(*values: Any) -> Any:
@@ -156,8 +225,8 @@ def _redact_for_provider(*values: Any) -> Any:
 
     scrubbed = [walk(v, scrub) for v in values]
     if learned:
-        pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
-        scrubbed = [walk(v, lambda t: pattern.sub("[redacted]", t) if pattern.search(t) else t) for v in scrubbed]
+        learned_tokens = frozenset(learned)
+        scrubbed = [walk(v, lambda t: _apply_learned_tokens(t, learned_tokens)) for v in scrubbed]
     return scrubbed[0] if len(scrubbed) == 1 else tuple(scrubbed)
 
 
