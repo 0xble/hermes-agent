@@ -140,6 +140,16 @@ def register_session(session_id: str, enabled: bool = True) -> None:
     install_logging_filter()
 
 
+def register_foreground_session(session_id: str) -> None:
+    """Register a private session unless this call is a delegated child.
+
+    Children inherit the parent's interval and must not create a second registry entry.
+    """
+    from agent.delegation_context import is_delegated_child_context
+    if not is_delegated_child_context():
+        register_session(session_id)
+
+
 def _private_work_state(session_id: str | None) -> dict:
     # Called under _lock. Obsolete workers must not recreate a departed session
     # or share the scratch state belonging to a later private interval.

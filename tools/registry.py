@@ -972,12 +972,7 @@ class ToolRegistry:
                 # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
                 # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
                 # plugin handler is not broken by every field the dispatcher injects (#68318).
-                kwargs = _kwargs_accepted_by(entry.handler, kwargs)
-                if entry.is_async:
-                    from model_tools import _run_async
-                    result = _run_async(entry.handler(args, **kwargs))
-                else:
-                    result = entry.handler(args, **kwargs)
+                result = _invoke_tool_handler(entry.handler, args, kwargs, is_async=entry.is_async)
                 return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
@@ -1099,6 +1094,45 @@ def tool_error(message, **extra) -> str:
 def tool_result(data=None, **kwargs) -> str:
     """JSON-encode a dict positional arg *or* keyword arguments (not both)."""
     return json.dumps(data if data is not None else kwargs, ensure_ascii=False)
+
+
+def _context_signature_target(handler: Callable) -> Callable:
+    """Callable whose declared parameters should receive injected context.
+
+    ``unittest.mock.Mock`` accepts ``**kwargs`` and forwards them to ``side_effect``.
+    Inspect that inner callable so a narrow ``handle(args)`` plugin handler is not
+    broken by context the dispatcher injects. Private scope is the caller's
+    ``incognito_scope``, not these keywords.
+    """
+    side_effect = getattr(handler, "side_effect", None)
+    if callable(side_effect) and not isinstance(side_effect, type):
+        return side_effect
+    wrapped = getattr(handler, "_mock_wraps", None)
+    if callable(wrapped):
+        return wrapped
+    return handler
+
+
+def _invoke_tool_handler(handler: Callable, args: dict, kwargs: dict, *, is_async: bool):
+    """Call *handler* with only context kwargs it accepts.
+
+    A wrapper can still reject a keyword its signature claimed to accept. Drop the
+    injected context and retry once; do not retry any other ``TypeError``.
+    """
+    accepted = _kwargs_accepted_by(_context_signature_target(handler), kwargs)
+
+    def _call(passed: dict):
+        if is_async:
+            from model_tools import _run_async
+            return _run_async(handler(args, **passed))
+        return handler(args, **passed)
+
+    try:
+        return _call(accepted)
+    except TypeError as exc:
+        if not accepted or "unexpected keyword argument" not in str(exc):
+            raise
+        return _call({})
 
 
 def _kwargs_accepted_by(handler: Callable, kwargs: dict) -> dict:

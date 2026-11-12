@@ -221,12 +221,3 @@ def disposable_path_for_current_session() -> Path | None:
     remove files the public thread did not own.
     """
     return private_path_for_current_session()
-
-
-def private_subdir_for_current_session(relative: str) -> Path | None:
-    root = private_path_for_current_session()
-    if root is None:
-        return None
-    path = root / relative
-    path.mkdir(parents=True, exist_ok=True)
-    return path

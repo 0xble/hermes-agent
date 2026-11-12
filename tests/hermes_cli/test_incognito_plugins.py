@@ -61,7 +61,9 @@ class IncognitoPluginTests(unittest.TestCase):
         interval = self.home / "private-interval"
         interval.mkdir()
         bind_private_session(self.sid, interval)
-        def callback_fn(_args):
+        def callback_fn(_args, **_context):
+            # Public handlers may receive optional context (session_id, task_id, ...).
+            # Storage stays private through the dispatch scope, not through those keywords.
             plugin_data_dir("unsafe").joinpath("state.txt").write_text(CANARY, encoding="utf-8")
             return '{"ok": true}'
         callback = mock.Mock(side_effect=callback_fn)
@@ -79,6 +81,17 @@ class IncognitoPluginTests(unittest.TestCase):
             private_file = interval / "plugin-data" / "unsafe" / "state.txt"
             self.assertEqual(private_file.read_text(encoding="utf-8"), CANARY)
             self.assertFalse((self.home / "plugin-data").exists())
+            narrow = self.unsafe.register_tool(
+                name="incognito_probe_narrow", toolset="incognito-probe",
+                schema={"name": "incognito_probe_narrow", "parameters": {"type": "object"}},
+                handler=lambda _args: '{"ok": true}',
+            )
+            assert narrow is not None
+            self.addCleanup(narrow.dispose)
+            self.assertEqual(
+                registry.dispatch("incognito_probe_narrow", {"content": CANARY}, session_id=self.sid),
+                '{"ok": true}',
+            )
         finally:
             register_session(self.sid, False)
             discard_private_dir(self.sid)
