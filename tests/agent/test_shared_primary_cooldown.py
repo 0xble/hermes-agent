@@ -2,9 +2,11 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import time
+from datetime import UTC, datetime
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -903,7 +905,17 @@ def test_fresh_adopters_share_one_primary_probe_lease():
     assert activate.call_args.kwargs["_shared_cooldown_record"]["outage_id"] == entry["outage_id"]
 
 
-def test_probe_failure_with_provider_reset_arms_until_reset():
+@pytest.mark.parametrize(
+    ("hint_kind", "expected_source"),
+    [
+        ("float", "provider_reset"),
+        ("milliseconds", "provider_reset"),
+        ("iso8601", "provider_reset"),
+        ("past", "backoff"),
+        ("implausible", "backoff"),
+    ],
+)
+def test_probe_failure_with_provider_reset_arms_until_reset(hint_kind, expected_source):
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
     entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
     with spc._locked_state() as (path, state):
@@ -917,12 +929,24 @@ def test_probe_failure_with_provider_reset_arms_until_reset():
         _fallback_activated=False, _rate_limit_backoff_count=1,
     )
     reset_at = time.time() + 3600
-    assert spc._fail_agent_probe(agent, FailoverReason.rate_limit, reset_at)
-    armed = _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit, reset_at=reset_at)
+    hints = {
+        "float": reset_at,
+        "milliseconds": str(round(reset_at * 1000)),
+        "iso8601": datetime.fromtimestamp(reset_at, UTC).isoformat(),
+        "past": str(time.time() - 1),
+        "implausible": str(time.time() + spc._MAX_PROVIDER_RESET_SECONDS + 1),
+    }
+    hint = hints[hint_kind]
+    assert spc._fail_agent_probe(agent, FailoverReason.rate_limit, hint)
+    armed = _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit, reset_at=hint)
     current = spc.read_cooldown(_ROUTE)
-    assert current["source"] == "provider_reset"
-    assert abs(current["reset_at"] - reset_at) < 1
-    assert armed is not None and 3500 < armed <= 3600
+    assert current["source"] == expected_source
+    if expected_source == "provider_reset":
+        assert abs(current["reset_at"] - reset_at) < 1
+        assert armed is not None and 3500 < armed <= 3600
+    else:
+        assert 110 < current["reset_at"] - current["recorded_at"] < 130
+        assert armed is not None and 110 < armed < 130
     assert agent._shared_primary_probe_token is None
 
 
@@ -967,6 +991,23 @@ def test_builtin_fallback_lookup_uses_provider_default_base_url():
                side_effect=AssertionError("fallback lookup must not resolve credentials")):
         spc.arm_cooldown(("openrouter", "https://openrouter.ai/api/v1", "x/model"), reason="rate_limit")
         assert fallback_route_is_active("openrouter", None, "x/model")
+
+
+def test_configured_fallback_url_requires_matching_model():
+    from agent.shared_primary_probe_runtime import _configured_base_url
+
+    config = {
+        "model": {
+            "provider": "openrouter",
+            "model": "primary-model",
+            "base_url": "https://stale-model-url.invalid/v1",
+        },
+        "providers": {
+            "openrouter": {"api": "https://provider-default.invalid/v1"},
+        },
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=config):
+        assert _configured_base_url("openrouter", "fallback-model") == "https://provider-default.invalid/v1"
 
 
 def test_probe_failure_flag_is_scoped_to_its_outage():
@@ -1100,6 +1141,17 @@ def test_local_probe_release_does_not_escalate_backoff():
     released = spc.read_cooldown(_ROUTE)
     assert released["state"] == "expired"
     assert released["backoff_count"] == entry["backoff_count"]
+
+
+def test_probe_release_logs_suppressed_exception(caplog):
+    from agent.shared_primary_probe_runtime import release_primary_probe
+
+    entry = {"provider": _ROUTE[0], "base_url": _ROUTE[1], "model": _ROUTE[2], "outage_id": "outage"}
+    agent = SimpleNamespace(_shared_primary_cooldown_record=entry, _shared_primary_probe_token="token")
+    with patch("agent.shared_primary_cooldown._release_probe", side_effect=RuntimeError("release failed")):
+        with caplog.at_level(logging.DEBUG, logger="agent.shared_primary_probe_runtime"):
+            release_primary_probe(agent, "token")
+    assert "Could not release primary cooldown probe" in caplog.text
 
 
 def test_fresh_recovery_tombstone_rejects_late_failure():
