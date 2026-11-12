@@ -53,7 +53,7 @@ async def reconcile_turn(runner, source, session_key, *, config=None):
     entry = await runner._run_in_executor_with_context(
         runner.session_store.lookup_by_session_key, session_key)
     if entry is None or entry.suspended:
-        return
+        return True
     watches = getattr(runner, "_checkin_watch", None)
     if watches is None:
         watches = runner._checkin_watch = {}
@@ -64,6 +64,8 @@ async def reconcile_turn(runner, source, session_key, *, config=None):
             watches.pop(session_key, None)
     except Exception:
         logger.warning("Supervisor roster unavailable for %s, will retry", session_key, exc_info=True)
+        return False
+    return True
 
 
 def _queued(adapter, route):
@@ -110,8 +112,8 @@ async def poll_checkins(runner):
                 for entry, entry_source in entries:
                     identity = (entry.session_key, entry.session_id)
                     if seen.get(identity) != config:
-                        seen[identity] = config
-                        await reconcile_turn(runner, entry_source, entry.session_key, config=config)
+                        if await reconcile_turn(runner, entry_source, entry.session_key, config=config) is not False:
+                            seen[identity] = config
                 await _poll_profile_watches(runner, key, config, scope_key)
         except Exception:
             logger.warning("Supervisor profile poll deferred for %s; continuing other profiles", key, exc_info=True)
@@ -288,6 +290,11 @@ async def silence_fallback(runner, event, entry, result: dict) -> dict:
             logger.warning("Supervisor delivery policy could not be retained; using check-in fallback", exc_info=True)
             status = getattr(event, "_checkin_fallback", "Background work could not be inspected. Supervision will retry.")
             inspected, pending, root = False, True, tick[0]
+            event._checkin_pending_root = root
+            from gateway.session_results import execution_result
+            captured = execution_result.get()
+            if captured is not None:
+                captured.setdefault("result", {})["checkin_pending_root"] = root
     result["checkin_pending_root"] = root
     disarmed = manager is not None and pending and not manager.config.permits(tick[0])
     if not disarmed and (result.get("interrupted") or (not failed and
