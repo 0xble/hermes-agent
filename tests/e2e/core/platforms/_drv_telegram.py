@@ -82,6 +82,9 @@ class TelegramDriver:
     def document(self, filename: str, data: bytes, mime: str, caption: str = "") -> Inbound:
         return self._wrap(self.standin.dm_document(int(self.user_id), filename, data, mime, caption))
 
+    def voice(self, data: bytes, caption: str = "") -> Inbound:
+        return self._wrap(self.standin.dm_voice(int(self.user_id), data, caption))
+
     def buttons(self, chat_id: str) -> list[dict[str, Any]]:
         return self.standin.buttons(chat_id)
 
