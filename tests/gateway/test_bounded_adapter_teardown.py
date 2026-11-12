@@ -284,12 +284,14 @@ async def test_timed_out_restart_spools_followups_before_slow_cleanup(bare_runne
 
 
 @pytest.mark.asyncio
-async def test_stop_impl_detaches_finalizer_that_swallow_cancellation(bare_runner, monkeypatch):
+@pytest.mark.parametrize("signal_stop", ["restart", "unplanned", "planned-SIGTERM", "SIGINT"])
+async def test_stop_impl_detaches_finalizer_that_swallow_cancellation(bare_runner, monkeypatch, signal_stop):
     """A finalizer that ignores cancellation cannot consume the restart handoff bound."""
     import time
 
     runner = bare_runner
-    runner._restart_requested = True
+    runner._restart_requested = signal_stop == "restart"
+    runner._signal_initiated_shutdown = signal_stop == "unplanned"
     runner._restart_detached = False
     runner._restart_via_service = False
     runner._restart_shutdown_bound = lambda: 0.2
@@ -297,7 +299,7 @@ async def test_stop_impl_detaches_finalizer_that_swallow_cancellation(bare_runne
     runner._pending_messages = {}
     runner._queued_events = {}
     runner._background_tasks = set()
-    runner._stop_requested_by_signal = False
+    runner._stop_requested_by_signal = signal_stop in ("planned-SIGTERM", "SIGINT")
     release = asyncio.Event()
     started = asyncio.Event()
     cancelled = asyncio.Event()
