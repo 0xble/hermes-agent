@@ -35,6 +35,10 @@ def test_same_remote_file_edits_from_distinct_sessions_do_not_lose_updates(peers
                 elapsed.append(time.monotonic() - started)
             else:
                 self.lock.acquire()
+                # Signal after the physical mutex is held, so the second editor's contention
+                # does not depend on remote-read or patch preparation latency.
+                first_ready.set()
+                assert release_first.wait(10), "first writer was not released"
 
         def release(self):
             self.lock.release()
@@ -47,10 +51,7 @@ def test_same_remote_file_edits_from_distinct_sessions_do_not_lose_updates(peers
     original = ShellFileOperations._atomic_write
 
     def controlled_write(self, destination, content):
-        if threading.current_thread().name.startswith("first-editor"):
-            first_ready.set()
-            assert release_first.wait(10), "first writer was not released"
-        else:
+        if not threading.current_thread().name.startswith("first-editor"):
             second_write.set()
         return original(self, destination, content)
 
