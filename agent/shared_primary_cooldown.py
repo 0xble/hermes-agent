@@ -50,10 +50,7 @@ _STALE_GRACE_FLOOR_SECONDS = 600
 # Furthest-out reset a reader or writer accepts. Weekly usage caps reset within 7 days;
 # 31 days leaves room for monthly billing caps without letting a corrupt value pin a route.
 _MAX_PROVIDER_RESET_SECONDS = 31 * 86_400
-# A fresh gateway/cron worker may need several seconds to import and start.  Keep the
-# first no-hint window at the documented one-minute floor so durable adoption does
-# not race process startup into an immediate probe.
-_FIRST_BACKOFF_SECONDS = 60
+_FIRST_BACKOFF_SECONDS = 15
 _PROBE_LEASE_SECONDS = 120
 _RECOVERY_TOMBSTONE_SECONDS = 5 * 60
 _RECOVERY_TOMBSTONE_GRACE_SECONDS = 2
