@@ -193,6 +193,41 @@ async def test_moa_busy_command_is_deferred_and_replayed_once():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("binding", ["meetings", ["research", "meetings"], None, "research"])
+@pytest.mark.parametrize("explicit", [None, {"enabled": True, "effort": "xhigh"}, {"enabled": False}])
+async def test_meeting_reasoning_default_uses_existing_session_pick(tmp_path, monkeypatch, binding, explicit):
+    """Resolve a real route before model preparation; persisted/manual picks always win."""
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+
+    store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    runner = _make_runner("queue")
+    runner.session_store = store
+    runner.config = GatewayConfig()
+    runner._recover_telegram_lobby_thread_id = lambda source: None
+    runner._is_telegram_topic_lane = lambda _source: False
+    runner._cache_session_source = lambda *_args: None
+    runner._evict_idle_agent_after_session_control = lambda _key: None
+    event = _make_event("a live chunk")
+    event.source.thread_id = "topic-1"
+    event.auto_skill = binding
+    key = runner._session_key_for_source(event.source)
+    store.get_or_create_session(event.source)
+    if explicit is not None:
+        store.set_reasoning_override(key, explicit, scope="session")
+    source, entry, resolved_key = await runner._hmwa_resolve_session(event, event.source)
+    expected = explicit if explicit is not None else (
+        {"enabled": True, "effort": "medium"} if binding and "meetings" in binding else None)
+    assert resolved_key == key and source == event.source
+    assert store.get_reasoning_override(key) == expected
+    assert runner._session_reasoning_override(key) == expected
+    assert entry.reasoning_override == expected
+    assert store.get_reasoning_override_scope(key) == "session"
+    # Exact same persisted override survives a fresh store, with no attended/config edits.
+    assert SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig()).get_reasoning_override(key) == expected
+
+
+@pytest.mark.asyncio
 async def test_empty_moa_busy_command_returns_usage_without_queue(monkeypatch):
     from hermes_cli.commands import resolve_command
     runner = _make_runner()
