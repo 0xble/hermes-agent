@@ -61,7 +61,7 @@ from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
-from agent.memory_provider import ctx_bound
+from agent.memory_provider import ctx_bound, spawn_context_thread
 from agent.session_activity import AwakeIdleMeter
 from agent.turn_failure_copy import is_max_iteration_handoff
 
@@ -4373,8 +4373,27 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                completed = run_one_job(job, adapters=None, loop=None, verbose=False,
-                                        hard_wall_fence=watchdog_stop)
+                cancel_event = threading.Event()
+                cancel_stop = threading.Event()
+
+                def watch_cancel() -> None:
+                    from cron.detached_authority import _cancel_path
+
+                    while not cancel_stop.wait(.1):
+                        if _cancel_path(job["id"], execution_id).exists():
+                            cancel_event.set()
+                            return
+
+                cancel_watcher = spawn_context_thread(
+                    watch_cancel, name=f"cron-cancel-{execution_id}")
+                cancel_watcher.start()
+                try:
+                    completed = run_one_job(
+                        job, adapters=None, loop=None, verbose=False,
+                        cancel_event=cancel_event, hard_wall_fence=watchdog_stop)
+                finally:
+                    cancel_stop.set()
+                    cancel_watcher.join(timeout=1)
                 with contextlib.suppress(OSError):
                     ack_path.with_suffix(".stderr").unlink(missing_ok=True)
                 return completed
