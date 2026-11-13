@@ -1096,12 +1096,15 @@ def test_fallback_breaker_does_not_inherit_primary_backoff_count():
 
 
 @pytest.mark.parametrize("hint_kind", ["float", "milliseconds", "iso8601"])
-def test_fallback_breaker_normalizes_provider_reset_hints(hint_kind):
+def test_fallback_breaker_normalizes_provider_reset_hints(hint_kind, monkeypatch):
     """Fallback-route arming accepts every provider reset representation."""
     from agent.fallback_cooldown import _arm_rate_limit_cooldown
 
     agent = _agent_with_chain(_CHAIN)
     _activate(agent)
+    # Millisecond hints round up by up to 0.5 ms; do not race that precision
+    # against a sub-millisecond cached-config arming path.
+    monkeypatch.setattr(time, "time", lambda: 1_900_000_000.0)
     reset_at = time.time() + 3600
     hints = {
         "float": reset_at,

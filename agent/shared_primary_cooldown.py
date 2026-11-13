@@ -311,9 +311,6 @@ def _stale(entry: Any, now: float) -> bool:
     """True when a record is malformed, or expired past its grace and no longer the current outage."""
     if not isinstance(entry, dict):
         return True
-    probe_until = _finite_float(entry.get("probe_until"))
-    if entry.get("probe_owner") and probe_until is not None and probe_until > now:
-        return False  # A long request's live lease must outlast the normal expired-record grace.
     tombstone_until = _finite_float(entry.get("tombstone_until"))
     if tombstone_until is not None:
         return tombstone_until <= now
@@ -321,6 +318,9 @@ def _stale(entry: Any, now: float) -> bool:
     recorded_at = _finite_float(entry.get("recorded_at", reset_at)) if reset_at is not None else None
     if reset_at is None or recorded_at is None:
         return True
+    probe_until = _finite_float(entry.get("probe_until"))
+    if entry.get("probe_owner") and probe_until is not None and probe_until > now:
+        return False  # A valid long-request lease outlasts the expired-record grace.
     window = min(max(0.0, reset_at - recorded_at), float(_MAX_BACKOFF_SECONDS))
     return now > reset_at + max(float(_STALE_GRACE_FLOOR_SECONDS), window)
 

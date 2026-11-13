@@ -119,6 +119,32 @@ def test_custom_route_resolution_caches_config_scan_per_home_and_revision(tmp_pa
     assert len(reads) == 3
 
 
+@pytest.mark.parametrize("invalid_field", ["reset_at", "recorded_at"])
+def test_long_probe_lease_does_not_preserve_malformed_record(invalid_field):
+    agent = _claim_agent()
+    with spc._locked_state() as (path, state):
+        key = spc.route_key(provider=ROUTE[0], base_url=ROUTE[1], model=ROUTE[2])
+        state["routes"][key][invalid_field] = "not-a-timestamp"
+        spc._write_state(path, state)
+    assert spc.read_cooldown(ROUTE) is None
+    assert not spc.primary_probe_is_owned(agent)
+    assert agent._shared_primary_probe_token is None
+
+
+def test_expired_runtime_owner_reclaims_before_request(monkeypatch):
+    from agent.shared_primary_cooldown_runtime import _adopt_shared_primary_cooldown
+
+    now = 1_900_000_000.0
+    monkeypatch.setattr(spc.time, "time", lambda: now)
+    agent = _claim_agent()
+    old_token = agent._shared_primary_probe_token
+    agent._fallback_chain = [{"provider": "openai", "model": "fallback"}]
+    now += spc._PROBE_LEASE_SECONDS + 1
+    assert not _adopt_shared_primary_cooldown(agent)
+    assert agent._shared_primary_probe_token != old_token
+    assert spc.primary_probe_is_owned(agent)
+
+
 @pytest.mark.parametrize("entrypoint", ["restore", "adopt"])
 def test_runtime_probe_lease_covers_long_request_timeout(monkeypatch, entrypoint):
     from agent.shared_primary_cooldown_runtime import _adopt_shared_primary_cooldown
