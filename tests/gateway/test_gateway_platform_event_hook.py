@@ -185,6 +185,8 @@ class TestNormalizePlatformEvent:
                 "chat_id": "123",
                 "message_id": "456",
                 "thread_id": None,
+                "user_id": None,
+                "is_bot": False,
             },
         }
 
@@ -596,6 +598,8 @@ class TestFixturePluginObservationPath:
                 "chat_id": "123",
                 "message_id": "456",
                 "thread_id": None,
+                "user_id": "777",
+                "is_bot": False,
             },
         }]
 

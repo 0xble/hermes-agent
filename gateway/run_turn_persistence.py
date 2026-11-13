@@ -535,7 +535,7 @@ class GatewayTurnPersistenceMixin:
         return chat_refusal_wording(response, agent_result.get("failure_resets_at"))
 
     def _event_thread_metadata(self, event, source):
-        """Thread metadata for a send that replies to ``event`` on ``source``."""
+        """Public thread metadata for a send that replies to ``event``."""
         from gateway.checkin_delivery import delivery_metadata
         return delivery_metadata(event, self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)))
 

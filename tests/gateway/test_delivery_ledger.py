@@ -1290,3 +1290,46 @@ async def test_cancel_after_captured_send_preserves_accounting_and_settlement(su
     ]
     assert len(delivery_metrics) == 1
     assert delivery_metrics[0].args[4].success is success
+
+
+@pytest.mark.asyncio
+async def test_blocking_outbound_stamp_cannot_strand_a_delivered_ledger():
+    """A slow transcript stamp must not sit between send success and ledger finalization."""
+    import asyncio
+    import threading
+    from gateway.platforms.base import SendResult
+
+    gate = threading.Event()
+    started = threading.Event()
+
+    def block_record(*_args, **_kwargs):
+        started.set()
+        if not gate.wait(timeout=5):
+            raise TimeoutError("stamp gate was not released")
+        return True
+
+    async def send(**kwargs):
+        return SendResult(success=True, message_id="362092")
+
+    adapter = _LedgerAdapter(send)
+    adapter._base._session_store = type("Store", (), {
+        "record_outbound_platform_message": staticmethod(block_record),
+        "_outbound_stamp_tasks": set(),
+    })()
+    event = _telegram_event()
+    event._transcript_message_uid = "row-1"  # type: ignore[attr-defined]
+    key = "agent:main:telegram:dm:2027045491:113596"
+    try:
+        await asyncio.wait_for(adapter.send_final_ledgered(
+            event, key, "landed text", {}, reply_to=None,
+        ), timeout=2)
+    finally:
+        gate.set()
+        tasks = list(getattr(adapter._base._session_store, "_outbound_stamp_tasks", ()))
+        if tasks:
+            await asyncio.wait(tasks, timeout=2)
+    row = _row(dl.compute_obligation_id(key, "m-queued", "landed text"))
+    assert row is not None
+    assert row["state"] == "delivered"
+    await asyncio.sleep(0)
+    assert started.is_set()
