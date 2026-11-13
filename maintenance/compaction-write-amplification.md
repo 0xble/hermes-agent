@@ -69,7 +69,7 @@ Existing attempt-local metrics emit `display_incremental=1` or `display_fallback
 
 The 3 invariant tests in `test_display_fold_incremental.py` compare randomized archives with the full-fold oracle, exercise real snapshot/writer interleavings, and bound indexed work as unrelated history grows. Coverage includes both archive paths, split generations, colliding aliases across groups and sessions, order-only drift, NULLs, oldest-member removal, gap clones, handoff normalization, stable tool identities, paging, unavailable guards, missing indexes, connection replacement and a real writer retry after the first fold rolls back. The full-index diagnostic test explicitly selects fallback so both diagnostic paths retain coverage.
 
-Reproduce measurements through the repository test environment and `heavy-slot`:
+Reproduce measurements through the repository test environment and `semaphore`:
 
 ```sh
 python scripts/bench_display_fold_incremental.py --base 9cc95ec4b933e877c58e15357b194e7b016b1506 --output "$TMPDIR/display-fold-incremental.json"

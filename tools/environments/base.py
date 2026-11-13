@@ -607,7 +607,7 @@ class BaseEnvironment(ABC):
                         handed = None
                     if handed is not None:
                         if admission_yield:
-                            handed["yield_reason"] = "heavy_slot_wait"
+                            handed["yield_reason"] = "semaphore_wait"
                         output.close_spill()
                         return handed
                     drain_stop.clear()

@@ -31,7 +31,7 @@ def history(tmp_path):
     git(root, "commit", "-qm", "base")
     base = git(root, "rev-parse", "HEAD")
     (root / "state").write_text("B\n", encoding="utf-8")
-    git(root, "commit", "-qam", "merged heavy-slot fix")
+    git(root, "commit", "-qam", "merged semaphore fix")
     main_one = git(root, "rev-parse", "HEAD")
     (root / "state").write_text("C\n", encoding="utf-8")
     git(root, "commit", "-qam", "merged gateway fix")
@@ -57,7 +57,7 @@ def test_refuses_target_that_drops_live_main_commits(history):
     assert finding.count == 2
     assert "would drop 2 commits" in finding.message
     assert "merged gateway fix" in finding.message
-    assert "merged heavy-slot fix" in finding.message
+    assert "merged semaphore fix" in finding.message
     assert "Merge origin/main into the candidate and retry." in finding.message
 
 

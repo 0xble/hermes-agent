@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Synthetic fixed-affected-set comparison against an explicit full-index baseline.
 
-Run with scripts/run-in-hermes-env under heavy-slot. All databases are disposable,
+Run with scripts/run-in-hermes-env under semaphore. All databases are disposable,
 created under TMPDIR. Never opens a profile database. Component timing follows the
 original 21-pair warm SAVEPOINT protocol, with a real freshness selection. The
 archive arm additionally runs archive_and_compact with original FTS triggers.
