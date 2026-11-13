@@ -241,18 +241,16 @@ def _attach_worker(rpc, scope):
     ambiguous = False
 
     def timeout_phase(exc, operation):
-        from hermes_state_errors import GatewayOwnerRestartError
         current = exc
         while current is not None:
-            text = str(current)
-            if text.startswith('gateway handshake timed out ('):
-                return text
-            if isinstance(current, GatewayOwnerRestartError):
-                return 'gateway handshake timed out (owner-transition)'
+            phase = getattr(current, 'phase', None)
+            if phase:
+                return f"gateway handshake timed out ({str(phase).replace('_', '-')})"
             if isinstance(current, TimeoutError):
                 # run_detached calls this only BEFORE start_detached_body wins
                 # the durable body gate. Later reconnect timeouts must never use
                 # this classifier: an ambiguous started body cannot be replayed.
+                text = str(current)
                 phase = 'connect' if text in ('', 'timed out') else operation + '-answer'
                 return f'gateway handshake timed out ({phase})'
             current = current.__cause__
@@ -277,10 +275,6 @@ def _attach_worker(rpc, scope):
             if attempt == 3:
                 phase = timeout_phase(exc, operation)
                 if phase is not None:
-                    if (phase == 'gateway handshake timed out (owner-transition)'
-                            and scope['execution_id'].startswith(PREFIX)):
-                        from cron.executions import mark_detached_attach_lost
-                        mark_detached_attach_lost(scope['execution_id'][len(PREFIX):])
                     raise DetachedHandshakeTimeout(phase) from exc
                 raise
             ambiguous = True

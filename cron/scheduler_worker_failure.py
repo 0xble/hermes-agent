@@ -5,14 +5,8 @@ import logging
 logger = logging.getLogger("cron.scheduler")
 
 
-def _is_typed_prebody_loss(execution: dict, *, worker_exited: bool) -> bool:
-    """Accept only the positive marker written at a permitted transient-loss site."""
-    return (execution.get('body_phase') == 'attach_lost'
-            and execution.get('status') in {'failed', 'unknown'})
-
-
 def defer_proven_unstarted_worker(
-    job: dict, execution: dict, *, worker_exited: bool = False, pause: dict | None = None,
+    job: dict, execution: dict, *, pause: dict | None = None,
 ) -> bool:
     """Reclaim only a terminal worker whose durable body gate was never won.
 
@@ -23,9 +17,8 @@ def defer_proven_unstarted_worker(
     from cron.scheduler_control import defer_unstarted_fire
 
     if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attach_lost'
+            or execution.get('status') not in {'failed', 'unknown'}
             or not (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
-        return False
-    if not _is_typed_prebody_loss(execution, worker_exited=worker_exited):
         return False
     deferred = dict(job, _scheduled_instant=(
         job.get('_scheduled_instant') or execution['scheduled_instant']))
@@ -72,12 +65,9 @@ def record_external_worker_outcome(
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
             return True
-        if (execution.get('body_phase') == 'attach_lost'
-                and (job.get('_scheduled_instant') or execution.get('scheduled_instant'))
-                and _is_typed_prebody_loss(execution, worker_exited=worker_exited)):
-            if defer_proven_unstarted_worker(job, execution, worker_exited=worker_exited):
-                # A typed pre-body loss restores the occurrence; it is not a job failure.
-                return True
+        if defer_proven_unstarted_worker(job, execution):
+            # A typed pre-body loss restores the occurrence; it is not a job failure.
+            return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit
         execution_error = execution.get("error")

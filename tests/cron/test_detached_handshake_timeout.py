@@ -2,9 +2,13 @@
 
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
+import json
 
 import pytest
 
+from cron import executions, jobs, scheduler, scheduler_authority
+from hermes_cli import gateway_client
+from agent.runtime_session_store import GatewayHandshakeTimeout
 
 def test_attach_retries_connect_timeout_then_adopts(monkeypatch):
     from cron import detached_authority
@@ -17,7 +21,7 @@ def test_attach_retries_connect_timeout_then_adopts(monkeypatch):
         def __call__(self, method, **_params):
             calls.append(method)
             if len(calls) <= 3:
-                raise TimeoutError("gateway handshake timed out (connect)")
+                raise GatewayHandshakeTimeout('connect')
             return {"owner_epoch": 7} if method == "worker.adopt" else None
 
     result = detached_authority._attach_worker(
@@ -34,7 +38,7 @@ def test_exhausted_attach_timeout_is_phase_labeled():
 
     class RPC:
         def __call__(self, _method, **_params):
-            raise TimeoutError("gateway handshake timed out (connect)")
+            raise GatewayHandshakeTimeout('connect')
 
     with pytest.raises(detached_authority.DetachedHandshakeTimeout, match=r"\(connect\)"):
         detached_authority._attach_worker(
@@ -76,8 +80,6 @@ def test_run_one_job_defers_marked_handshake_before_delivery(occurrence_home, mo
 
 @pytest.fixture
 def occurrence_home(tmp_path, monkeypatch):
-    from cron import executions, jobs, scheduler
-
     home = tmp_path / 'home'
     (home / 'scripts').mkdir(parents=True)
     counter = home / 'fires.txt'
@@ -360,7 +362,6 @@ def test_exhausted_attach_answer_timeout_is_prebody_deferral(monkeypatch, method
 
 
 def _prebody_journal(env, monkeypatch, kind, pause_kind):
-    from cron import scheduler_authority
     from utils import atomic_json_write
 
     jobs, executions, _scheduler, _counter = env
@@ -388,17 +389,30 @@ def _prebody_journal(env, monkeypatch, kind, pause_kind):
 @pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
 @pytest.mark.parametrize('pause_kind', ['none', 'recovery', 'operator'])
 def test_prebody_journal_recovery_obeys_exact_pause_owner(occurrence_home, monkeypatch, kind, pause_kind):
-    from cron import scheduler_authority
+    from cron import scheduler_control
 
     jobs, executions, scheduler, counter = occurrence_home
+    calls = []
+    original_defer = scheduler_control.defer_unstarted_fire
+
+    def counted_defer(*args, **kwargs):
+        calls.append(1)
+        return original_defer(*args, **kwargs)
+
+    monkeypatch.setattr(scheduler_control, 'defer_unstarted_fire', counted_defer)
     claimed, journal = _prebody_journal(occurrence_home, monkeypatch, kind, pause_kind)
     scheduler_authority.reconcile_pending(allow_connect=False)
-    assert not journal.exists()
     current = jobs.get_job(claimed['id'])
+    assert calls == [1]
     if pause_kind == 'operator':
-        assert current['last_run_at'] is not None and current.get('failure_streak') == 1
-    else:
+        assert journal.exists()
+        assert current['paused_reason'] == 'Operator hold'
         assert current['last_run_at'] is None and not current.get('failure_streak')
+        assert not counter.exists()
+        return
+    assert not journal.exists()
+    assert current.get('paused_reason') is None
+    assert current['last_run_at'] is None and not current.get('failure_streak')
     if kind == 'oneshot' and pause_kind != 'operator':
         monkeypatch.setattr(jobs, '_hermes_now', lambda: datetime.fromisoformat(current['next_run_at']) + timedelta(seconds=1))
     scheduler.tick(verbose=False, sync=True)
@@ -412,17 +426,19 @@ def test_prebody_journal_recovery_obeys_exact_pause_owner(occurrence_home, monke
 
 
 @pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
-def test_recovery_fence_refusal_uses_failure_lane(occurrence_home, monkeypatch, kind):
-    from cron import scheduler_authority, scheduler_control
+def test_recovery_fence_refusal_stays_on_base_path(occurrence_home, monkeypatch, kind):
+    from cron import scheduler_control
 
     jobs, _executions, _scheduler, _counter = occurrence_home
     claimed, journal = _prebody_journal(occurrence_home, monkeypatch, kind, 'recovery')
     with monkeypatch.context() as patch:
         patch.setattr(scheduler_control, 'defer_unstarted_fire', lambda *_a, **_k: False)
         scheduler_authority.reconcile_pending(allow_connect=False)
-    assert not journal.exists()
-    assert jobs.get_job(claimed['id'])['state'] == ('completed' if kind == 'oneshot' else 'paused')
-    assert jobs.get_job(claimed['id'])['failure_streak'] == 1
+    assert journal.exists()
+    current = jobs.get_job(claimed['id'])
+    assert current['state'] == 'paused'
+    assert current['paused_reason'] == 'Canonical cron unverified'
+    assert not current.get('failure_streak')
 
 
 @pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
@@ -460,7 +476,7 @@ def test_real_worker_death_before_body_reclaims_exact_occurrence(occurrence_home
 
 @pytest.mark.parametrize('prebody', [True, False])
 def test_canonical_detached_timeout_uses_shared_flag_only_before_body(occurrence_home, monkeypatch, prebody):
-    from cron import detached_authority, scheduler_authority, scheduler_transport
+    from cron import detached_authority, scheduler_transport
     from gateway import session_cron
 
     _jobs, _executions, _scheduler, _counter = occurrence_home

@@ -219,6 +219,8 @@ class SessionActiveWriteGuardError(RuntimeError):
 class GatewayOwnerRestartError(RuntimeError):
     """The worker could not reconnect before its owner-transition deadline."""
 
+    phase = 'owner_transition'
+
 
 class StateDbReplacedError(RuntimeError):
     """The state.db path no longer names the file this SessionDB opened

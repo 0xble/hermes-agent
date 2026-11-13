@@ -268,13 +268,6 @@ def retire_completed_journal(job_id, execution_id):
             journal.with_suffix('.cancel').unlink(missing_ok=True)
 
 
-def retire_failed_journal(job_id, execution_id):
-    """Retire an ordinary failure receipt without changing an uncertainty pause."""
-    journal = journal_path(job_id, execution_id)
-    journal.unlink(missing_ok=True)
-    journal.with_suffix('.cancel').unlink(missing_ok=True)
-
-
 def _observe_unverified(journal, state, current):
     """Bound a never-committed submit; a receipt/worker capture is never aged into failure."""
     from cron.jobs import _jobs_lock
@@ -345,24 +338,14 @@ def reconcile_pending(*, allow_connect=True):
                 # output or re-marking the job on every tick would duplicate its side effects.
                 continue
             row = get_execution(params['request_id'])
-            from cron.scheduler_worker_failure import defer_proven_unstarted_worker
             if (row is not None and row.get('body_phase') == 'attach_lost'
-                    and record.get('job')):
-                if defer_proven_unstarted_worker(
-                        record['job'], row, pause=record.get('pause_recorded')):
+                    and 'worker_result' not in record and record.get('job')):
+                from cron.scheduler_worker_failure import defer_proven_unstarted_worker
+                if defer_proven_unstarted_worker(record['job'], row, pause=record.get('pause_recorded')):
                     # Local body gate + proved dead owner replaces guesswork from a lost
                     # RPC answer. Do not re-submit, replay a result, or pause this fire.
                     retire_completed_journal(params['job_id'], params['request_id'])
                     continue
-                # Refused: fall through to the ordinary terminal handling below.
-            if (row is not None and row.get('status') == 'unknown'
-                    and record.get('job')):
-                from cron.scheduler_worker_failure import record_external_worker_outcome
-                record_external_worker_outcome(
-                    record['job'], error=row.get('error'), worker_exited=True,
-                    execution_id=params['request_id'])
-                retire_failed_journal(params['job_id'], params['request_id'])
-                continue
             terminal_execution = (row is not None and row['job_id'] == params['job_id']
                                   and row['status'] in {'completed', 'failed'})
             current = get_job(params['job_id'])
