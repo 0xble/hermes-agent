@@ -299,6 +299,7 @@ class TestDoctorToolAvailabilityOverrides:
         assert available == []
         assert unavailable == [kanban_entry]
 
+@pytest.mark.parametrize("running_in_container", (False, True))
 def test_doctor_reports_vercel_backend_diagnostics(monkeypatch, tmp_path, running_in_container):
     monkeypatch.setattr(hermes_constants, "is_container", lambda: running_in_container)
     monkeypatch.setenv("TERMINAL_ENV", "vercel_sandbox")
@@ -499,6 +500,17 @@ def test_run_doctor_flags_missing_credentials_for_active_openrouter_provider(mon
     out = buf.getvalue()
     assert "model.provider 'openrouter' is set but no API key is configured" in out
 
+@pytest.mark.parametrize(
+    ("provider", "default_model"),
+    [
+        ("ai-gateway", "anthropic/claude-sonnet-4.6"),
+        ("opencode-zen", "anthropic/claude-sonnet-4.6"),
+        ("kilocode", "anthropic/claude-sonnet-4.6"),
+        ("kimi-coding", "kimi-k2"),
+        ("nvidia", "qwen/qwen3.5-122b-a10b"),
+        ("moa", "anthropic/claude-sonnet-4.6"),
+    ],
+)
 def test_run_doctor_accepts_hermes_provider_ids_that_catalog_aliases(
     monkeypatch, tmp_path, provider, default_model
 ):
@@ -590,6 +602,13 @@ def test_run_doctor_accepts_vendor_slugs_for_named_custom_provider(monkeypatch, 
     )
     assert "Either set model.provider to 'openrouter', or drop the vendor prefix." not in out
 
+@pytest.mark.parametrize(
+    ("base_url", "expects_warning"),
+    [
+        ("http://localhost:20128/v1", False),
+        ("https://api.openai.com/v1", True),
+    ],
+)
 def test_run_doctor_vendor_slug_policy_for_openai_api_endpoint(
     monkeypatch, tmp_path, base_url, expects_warning
 ):
@@ -754,6 +773,11 @@ def test_doctor_fix_reports_pm_install_failure(monkeypatch, tmp_path):
     assert "Chromium install failed" in out
     assert "offline" in out
 
+@pytest.mark.parametrize("browser_yaml,reason", [
+    ("browser:\n  cdp_url: http://127.0.0.1:9222\n", "CDP override"),
+    ("browser:\n  engine: lightpanda\n", "lightpanda"),
+    ("browser:\n  cloud_provider: browserbase\n", "browserbase"),
+])
 def test_missing_chromium_is_info_when_config_needs_none(monkeypatch, tmp_path, browser_yaml, reason):
     """A CDP override, Lightpanda or a cloud provider runs no local Chromium: no warning row."""
     from hermes_cli import doctor_tools
@@ -872,6 +896,7 @@ def test_run_doctor_dashscope_retries_china_endpoint_after_intl_unauthorized(mon
         for url, _, _ in calls
     )
 
+@pytest.mark.parametrize("base_url", [None, "https://opencode.ai/zen/go/v1"])
 def test_run_doctor_opencode_go_skips_invalid_models_probe(monkeypatch, tmp_path, base_url):
     home = tmp_path / ".hermes"
     home.mkdir(parents=True, exist_ok=True)

@@ -234,6 +234,27 @@ def _run_doctor_with_healthy_oauth_fallback(
         doctor_mod.run_doctor(Namespace(fix=False))
     return buf.getvalue()
 
+@pytest.mark.parametrize(
+    ("env_key", "bad_key", "failing_host", "minimax_oauth_status", "xai_oauth_status", "unexpected_issue"),
+    [
+        (
+            "MINIMAX_API_KEY",
+            "bad-minimax-key",
+            "minimax.io",
+            {"logged_in": True, "region": "global"},
+            None,
+            "Check MINIMAX_API_KEY in .env",
+        ),
+        (
+            "XAI_API_KEY",
+            "bad-xai-key",
+            "api.x.ai",
+            {},
+            {"logged_in": True, "auth_mode": "oauth_pkce"},
+            "Check XAI_API_KEY in .env",
+        ),
+    ],
+)
 def test_run_doctor_ignores_invalid_direct_keys_when_oauth_fallback_is_healthy(
     monkeypatch,
     tmp_path,
@@ -346,6 +367,7 @@ class TestDoctorXaiOAuthStatus:
         out = self._run(monkeypatch, tmp_path, xai_auth_fn=_raise)
         assert "Auth Providers" in out
 
+@pytest.mark.usefixtures("isolated_machine_home")
 class TestDoctorStaleMaxIterationsDrift:
     """Regression for #17534: a stale HERMES_MAX_ITERATIONS in .env shadows
     agent.max_turns in config.yaml. The repro symptom is config.yaml saying
@@ -564,6 +586,7 @@ def test_doctor_reports_auxiliary_blocks_that_do_not_resolve(tmp_path, monkeypat
     doctor_config._validate_auxiliary_config(cfg_file, issues)
     assert len(issues) == 1 and "auxiliary.background_review" in issues[0] and "no-such-provider" in issues[0]
 
+@pytest.mark.platforms("macos")
 class TestMacOSTCCGrants:
     """macOS TCC grant persistence check (#86385): a cdhash-pinned DR (pre-#73681
     local builds) silently resets Screen Recording/Accessibility grants on every
@@ -632,6 +655,14 @@ class TestMacOSTCCGrants:
         assert "could not read code-signing requirement" in out
         assert "stable" not in out
 
+@pytest.mark.parametrize("probe_error,free,root,expected,issues", [
+    (None, 50 << 30, False, "store is writable", []),
+    (OSError(28, "No space left on device"), 50 << 30, False, "NOT writable (ENOSPC", ["is not writable"]),
+    (None, 10 << 20, False, "free — cron jobs stop when it fills", ["Free disk space"]),
+    # root may fill the reserved blocks: 0 B for disk_usage, but statvfs f_bfree says 4 GB
+    pytest.param(None, 0, True, "store is writable", [], id="root-reserved-blocks",
+                 marks=pytest.mark.skipif(not hasattr(os, "geteuid"), reason="no os.geteuid")),
+])
 def test_cron_store_check_reports_writability_and_low_space(
         monkeypatch, tmp_path, capsys, probe_error, free, root, expected, issues):
     from cron import store_health
@@ -647,6 +678,7 @@ def test_cron_store_check_reports_writability_and_low_space(
     assert expected in capsys.readouterr().out
     assert len(finding.issues) == len(issues) and all(any(s in i for i in finding.issues) for s in issues)
 
+@pytest.mark.platforms("any")  # the wrapper name differs per host (.bat on Windows)
 def test_profile_alias_status_follows_the_wrapper_the_profile_really_has(monkeypatch, tmp_path):
     """#131753: doctor said "no alias" for every Windows profile (``.bat`` wrapper) and for any
     profile reachable only through a custom alias name; a bare (pre-``.bat`` on Windows) wrapper counts."""
