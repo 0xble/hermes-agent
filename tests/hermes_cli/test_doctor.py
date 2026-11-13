@@ -166,8 +166,6 @@ class TestGitHubTokenCheck:
         so that invocation exits 1 even for a logged-in user. A logged-in user on
         such a gh must still be reported as authenticated."""
         from hermes_cli import doctor_state
-        from hermes_cli import doctor_tools
-
         def gh_2_98(cmd, **kwargs):
             assert cmd == ["gh", "auth", "status"], cmd
             return types.SimpleNamespace(returncode=0, stdout=b"", stderr=b"Logged in to github.com")
@@ -541,8 +539,6 @@ def test_docker_daemon_probe_uses_version_not_info(monkeypatch):
     """`docker info` needs the /info endpoint, which socket proxies commonly block, so doctor reported
     "daemon not running" against a working DOCKER_HOST (#72927). `docker version` (/version) is what the
     backend itself probes with."""
-    from hermes_cli import doctor_tools
-
     calls: list = []
     monkeypatch.setattr(doctor_tools, "find_docker", lambda: "/usr/bin/docker")
     monkeypatch.setattr(doctor_tools, "_run_ok", lambda cmd, timeout, **kw: calls.append(cmd) or True)

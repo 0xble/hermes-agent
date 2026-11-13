@@ -15,7 +15,6 @@ import pytest
 
 import hermes_constants
 from hermes_cli import doctor
-import hermes_constants
 from hermes_cli import config as config_mod
 import hermes_cli.gateway as gateway_cli
 from hermes_cli import doctor as doctor_mod
