@@ -3,6 +3,7 @@
 import asyncio
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -55,6 +56,9 @@ def _make_adapter():
     adapter._team_clients = {"T1": AsyncMock()}
     adapter._team_bot_user_ids = {"T1": "U_BOT"}
     adapter._channel_team = {"C1": "T1"}
+    adapter._team_clients["T1"].conversations_info = AsyncMock(return_value={
+        "ok": True, "channel": {"id": "C1", "is_channel": True},
+    })
     return adapter
 
 
@@ -839,3 +843,284 @@ class TestSlackReactionAuthorizationGate:
         assert "U_RANDO" in runner.auth_checked
         assert runner.handled == []
         adapter.handle_message.assert_not_called()
+
+
+class TestSlackPlatformEventReaction:
+    @pytest.mark.asyncio
+    async def test_dm_and_channel_sources_and_bot_reactor(self):
+        adapter = _make_adapter()
+        seen = []
+
+        async def handler(event, source):
+            seen.append((event, source))
+
+        adapter.set_platform_event_handler(handler)
+        adapter._resolve_user_is_bot = AsyncMock(return_value=True)
+        with patch("hermes_cli.lifecycle.has_hook", return_value=True):
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U1",
+                "reaction": "thumbsup",
+                "channel_type": "im",
+                "item": {"type": "message", "channel": "D9", "ts": "1000.0", "thread_ts": "900.0"},
+                "item_user": "U_BOT",
+                "event_ts": "3000.0",
+            })
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U2",
+                "reaction": "eyes",
+                "item": {"type": "message", "channel": "C1", "ts": "2000.0", "thread_ts": "1500.0"},
+                "item_user": "U_OTHER",
+                "event_ts": "3001.0",
+            })
+
+        assert adapter._resolve_user_is_bot.await_count == 2
+        dm_event, dm_source = seen[0]
+        channel_event, channel_source = seen[1]
+        assert dm_event["payload"]["user_id"] == "U1"
+        assert dm_event["payload"]["is_bot"] is True
+        assert dm_event["payload"]["action"] == "added"
+        assert dm_event["payload"]["thread_id"] == "900.0"
+        assert dm_source.chat_type == "dm"
+        assert channel_source.chat_type == "group"
+        assert channel_event["payload"]["thread_id"] == "1500.0"
+        assert channel_event["payload"]["chat_id"] == "C1"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_id", ["G_MPIM", "C_MPIM"])
+    @pytest.mark.parametrize("payload_type", [None, "channel"])
+    @pytest.mark.parametrize("authorized", [False, True])
+    async def test_mpim_reaction_uses_dm_authorization_without_channel_type(
+        self, monkeypatch, channel_id, payload_type, authorized,
+    ):
+        """Exercise the real gateway auth + hook seam, with a conflicting group grant."""
+        from gateway.config import GatewayConfig
+        from gateway.run import GatewayRunner
+        from gateway.session import SessionSource
+
+        monkeypatch.setenv("SLACK_ALLOWED_USERS", "U_ALLOWED")
+        for name in ("SLACK_ALLOW_ALL_USERS", "GATEWAY_ALLOWED_USERS", "GATEWAY_ALLOW_ALL_USERS"):
+            monkeypatch.delenv(name, raising=False)
+        adapter = _make_adapter()
+        adapter.config.extra["group_allowed_chats"] = [channel_id]
+        client = adapter._team_clients["T1"]
+        client.conversations_info = AsyncMock(return_value={
+            "ok": True, "channel": {"id": channel_id, "is_mpim": True},
+        })
+        adapter._resolve_user_is_bot = AsyncMock(return_value=False)
+        runner = GatewayRunner(GatewayConfig())
+        runner.adapters[Platform.SLACK] = adapter
+        adapter.set_platform_event_handler(runner._handle_gateway_platform_event)
+        user_id = "U_ALLOWED" if authorized else "U_DENIED"
+        # A misclassified group would be admitted even for U_DENIED.
+        group = SessionSource(platform=Platform.SLACK, chat_id=channel_id,
+                              chat_type="group", user_id=user_id)
+        assert runner._is_user_authorized_for_source(group) is True
+        dm = SessionSource(platform=Platform.SLACK, chat_id=channel_id,
+                           chat_type="dm", user_id=user_id)
+        assert runner._is_user_authorized_for_source(dm) is authorized
+        event = {
+            "type": "reaction_added", "user": user_id, "reaction": "thumbsup",
+            "item": {"type": "message", "channel": channel_id, "ts": "1000.0"},
+            "item_user": "U_BOT", "event_ts": "3000.0",
+        }
+        if payload_type:
+            event["channel_type"] = payload_type
+        with patch("hermes_cli.lifecycle.has_hook", return_value=True), patch(
+            "hermes_cli.lifecycle.invoke_hook",
+        ) as published:
+            await adapter._handle_slack_reaction(event)
+        client.conversations_info.assert_awaited_once_with(channel=channel_id)
+        assert published.call_count == (1 if authorized else 0)
+        if authorized:
+            assert published.call_args.args == ("gateway_platform_event",)
+            assert published.call_args.kwargs["payload"]["user_id"] == user_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("channel_id,flags", [
+        ("G_PRIVATE", {"is_group": True}),
+        ("C_PUBLIC", {"is_channel": True}),
+    ])
+    async def test_channel_identity_overrides_untrusted_dm_hint(self, channel_id, flags):
+        adapter = _make_adapter()
+        client = adapter._team_clients["T1"]
+        # Match the real SlackResponse shape, not just a dict test double.
+        client.conversations_info = AsyncMock(return_value=SimpleNamespace(data={
+            "ok": True, "channel": {"id": channel_id, **flags},
+        }))
+        adapter._resolve_user_is_bot = AsyncMock(return_value=False)
+        handler = AsyncMock()
+        adapter.set_platform_event_handler(handler)
+        event = {
+            "user": "U1", "reaction": "eyes", "channel_type": "im",
+            "item": {"type": "message", "channel": channel_id, "ts": "1000.0"},
+        }
+        with patch("hermes_cli.lifecycle.has_hook", return_value=True):
+            await adapter._handle_slack_reaction(event)
+            await adapter._handle_slack_reaction(event)
+        client.conversations_info.assert_awaited_once_with(channel=channel_id)
+        assert handler.await_count == 2
+        assert all(call.args[1].chat_type == "group" for call in handler.await_args_list)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("response", [
+        {"ok": False}, {"ok": True, "channel": {"id": "G1"}},
+        {"ok": True, "channel": {"id": "G_OTHER", "is_mpim": True}},
+        RuntimeError("missing_scope"),
+    ])
+    async def test_unknown_conversation_fails_closed_without_caching(self, response):
+        adapter = _make_adapter()
+        client = adapter._team_clients["T1"]
+        if isinstance(response, Exception):
+            client.conversations_info = AsyncMock(side_effect=response)
+        else:
+            client.conversations_info = AsyncMock(return_value=response)
+        handler, legacy_hook = AsyncMock(), AsyncMock()
+        adapter.set_platform_event_handler(handler)
+        adapter.set_reaction_handler(legacy_hook)
+        with patch("hermes_cli.lifecycle.has_hook", return_value=True):
+            await adapter._handle_slack_reaction({
+                "user": "U1", "reaction": "eyes", "channel_type": "channel",
+                "item": {"type": "message", "channel": "G1", "ts": "1000.0"},
+            })
+        handler.assert_not_awaited()
+        legacy_hook.assert_awaited_once()
+        assert adapter._reaction_channel_type_cache == {}
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("response", [
+        RuntimeError("missing_scope"), RuntimeError("ratelimited"),
+        {"ok": True, "channel": {"id": "C_OTHER", "is_channel": True}},
+        {"ok": True, "channel": {"id": "C1"}},
+    ])
+    @pytest.mark.parametrize("observing", [False, True])
+    async def test_unknown_observation_kind_does_not_disable_opt_in_routing(self, response, observing):
+        adapter = _make_adapter()
+        adapter.config.extra["reaction_triggers"] = True
+        client = adapter._team_clients["T1"]
+        client.conversations_info = (AsyncMock(side_effect=response) if isinstance(response, Exception)
+                                     else AsyncMock(return_value=response))
+        client.conversations_replies = AsyncMock(return_value={
+            "messages": [{"ts": "2000.0", "thread_ts": "1000.0", "user": "U_BOT"}],
+        })
+        published, legacy, routed = AsyncMock(), AsyncMock(), AsyncMock()
+        adapter.set_platform_event_handler(published)
+        adapter.set_reaction_handler(legacy)
+        adapter._handle_slack_message = routed
+        with patch("hermes_cli.lifecycle.has_hook", return_value=observing):
+            await adapter._handle_slack_reaction({
+                "user": "U1", "reaction": "thumbsup", "event_ts": "3000.0", "item_user": "U_BOT",
+                "item": {"type": "message", "channel": "C1", "ts": "2000.0"},
+            })
+        published.assert_not_awaited()  # Unresolved observation identity still fails closed.
+        legacy.assert_awaited_once()
+        routed.assert_awaited_once()
+        assert routed.await_args is not None
+        assert routed.await_args.args[0]["thread_ts"] == "1000.0"
+        assert client.conversations_info.await_count == int(observing)
+
+    @pytest.mark.asyncio
+    async def test_reaction_channel_kind_cache_is_workspace_scoped(self):
+        adapter = _make_adapter()
+        dm_client, group_client = AsyncMock(), AsyncMock()
+        dm_client.conversations_info.return_value = {
+            "ok": True, "channel": {"id": "G1", "is_mpim": True},
+        }
+        group_client.conversations_info.return_value = {
+            "ok": True, "channel": {"id": "G1", "is_group": True},
+        }
+        assert await adapter._reaction_chat_type(dm_client, "G1", "T1") == "dm"
+        assert await adapter._reaction_chat_type(group_client, "G1", "T2") == "group"
+        assert await adapter._reaction_chat_type(dm_client, "G1", "T1") == "dm"
+        assert dm_client.conversations_info.await_count == 1
+        assert group_client.conversations_info.await_count == 1
+
+    @pytest.mark.parametrize("channel_id,team_id,message_ts,expected", [
+        ("C1", "T1", "1000.0", "900.0"),
+        ("C1", "T1", "900.0", "900.0"),
+        ("C1", "T2", "1000.0", "800.0"),
+        ("C_OTHER", "T1", "1000.0", ""),
+        ("C1", "T1", "UNKNOWN", ""),
+    ])
+    def test_cached_reaction_thread_requires_exact_message_and_tenant(
+        self, channel_id, team_id, message_ts, expected,
+    ):
+        adapter = _make_adapter()
+        adapter._thread_context_cache = {
+            "C1:900.0:T1": SimpleNamespace(messages=[
+                {"ts": "900.0"}, {"ts": "1000.0", "thread_ts": "900.0"},
+            ]),
+            "C1:800.0:T2": SimpleNamespace(messages=[
+                {"ts": "1000.0", "thread_ts": "800.0"},
+            ]),
+        }
+        assert adapter._cached_reaction_thread_ts(channel_id, message_ts, team_id) == expected
+
+    @pytest.mark.asyncio
+    async def test_reaction_uses_cached_thread_root_when_payload_omits_thread_ts(self):
+        adapter = _make_adapter()
+        client = adapter._team_clients["T1"]
+        client.conversations_info = AsyncMock(return_value={
+            "ok": True, "channel": {"id": "G_MPIM", "is_mpim": True},
+        })
+        adapter._resolve_user_is_bot = AsyncMock(return_value=False)
+        adapter._thread_context_cache = {
+            "G_MPIM:900.0:T1": SimpleNamespace(
+                messages=[{"ts": "1000.0", "thread_ts": "900.0"}],
+            ),
+        }
+        seen = []
+
+        async def handler(event, source):
+            seen.append((event, source))
+
+        adapter.set_platform_event_handler(handler)
+        with patch("hermes_cli.lifecycle.has_hook", return_value=True):
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U_REACTOR",
+                "reaction": "thumbsup",
+                "item": {"type": "message", "channel": "G_MPIM", "ts": "1000.0"},
+                "item_user": "U_BOT",
+                "event_ts": "3000.0",
+            })
+
+        assert seen[0][1].thread_id == "900.0"
+        assert seen[0][0]["payload"]["thread_id"] == "900.0"
+        client.conversations_replies.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_skips_users_info_and_source_when_no_hook(self):
+        adapter = _make_adapter()
+        adapter.set_platform_event_handler(AsyncMock())
+        adapter._resolve_user_is_bot = AsyncMock(return_value=True)
+        adapter.build_source = MagicMock()
+        with patch("hermes_cli.lifecycle.has_hook", return_value=False):
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U1",
+                "reaction": "thumbsup",
+                "item": {"type": "message", "channel": "C1", "ts": "1000.0"},
+                "event_ts": "3000.0",
+            })
+        adapter._resolve_user_is_bot.assert_not_awaited()
+        adapter._team_clients["T1"].conversations_info.assert_not_awaited()
+        adapter.build_source.assert_not_called()
+        adapter._platform_event_handler.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_self_reaction_is_dropped(self):
+        adapter = _make_adapter()
+        adapter.set_platform_event_handler(AsyncMock())
+        adapter._resolve_user_is_bot = AsyncMock()
+        with patch("hermes_cli.lifecycle.has_hook", return_value=True):
+            await adapter._handle_slack_reaction({
+                "type": "reaction_added",
+                "user": "U_BOT",
+                "reaction": "eyes",
+                "item": {"type": "message", "channel": "C1", "ts": "1000.0"},
+                "event_ts": "3000.0",
+            })
+        adapter._platform_event_handler.assert_not_awaited()
+        adapter._resolve_user_is_bot.assert_not_awaited()

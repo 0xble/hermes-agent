@@ -2840,9 +2840,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 session_key or "?",
             )
             try:
+                from gateway.outbound_reply import ensure_reply_uid
+                _queued_reply_uid = ensure_reply_uid(result)
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
-                    metadata=turn_ctx._status_thread_metadata, event_message_id=turn_ctx.event_message_id,
+                    metadata=turn_ctx._status_thread_metadata,
+                    event_message_id=turn_ctx.event_message_id,
+                    transcript_message_uid=_queued_reply_uid,
                     text_already_delivered=_already_streamed,
                     deliver_media=_deliver_media, stream_consumer=_sc,
                     # The text send records a delivery-ledger obligation under this key, keyed on
@@ -3299,6 +3303,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 "possible duplicate send (see wecom ack-timeout RCA).",
                 _sk, _streamed, _previewed, _content_delivered, _transformed, len(_final),
             )
+        if isinstance(response, dict) and response.get("already_sent") and _sc is not None:
+            delivered_id = getattr(_sc, "message_id", None)
+            if delivered_id and str(delivered_id) != "__no_edit__":
+                # Last chunk of a split stream: the surviving message a reaction targets.
+                response["_delivered_platform_message_id"] = str(delivered_id)
 
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Register turn-local deletion, awaited after confirmed final delivery."""

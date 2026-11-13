@@ -4,7 +4,18 @@ from __future__ import annotations
 import asyncio
 import os
 import sys
+from contextvars import ContextVar
 from contextlib import suppress
+
+
+_PROCESS_EXIT_STATE: ContextVar[dict | None] = ContextVar(
+    "gateway_process_exit_state", default=None
+)
+
+
+def current_process_exit_state() -> dict | None:
+    """Return the process-entry state collected by the active exit wrapper."""
+    return _PROCESS_EXIT_STATE.get()
 
 
 async def run_gateway_process(start_gateway, *args, before_exit=None, **kwargs):
@@ -19,23 +30,43 @@ async def run_gateway_process(start_gateway, *args, before_exit=None, **kwargs):
 
     success = None
     error = None
+    hard_exit = True
+    state_token = _PROCESS_EXIT_STATE.set({})
     try:
-        success = await start_gateway(*args, **kwargs)
-    except (SystemExit, KeyboardInterrupt, asyncio.CancelledError) as exc:
-        # start_gateway's finally has already awaited durable stop. Exit here,
-        # before Runner.close can join a blocked default-executor worker.
-        error = exc
-        code = 0
-        if isinstance(exc, SystemExit):
+        try:
+            success = await start_gateway(*args, **kwargs)
+        except SystemExit as exc:
+            error = exc
             code = 0 if exc.code is None else exc.code if isinstance(exc.code, int) else 1
-    else:
-        code = 0 if success else 1
-    if before_exit is not None:
-        before_exit(code, success, error)
-    _exit_after_graceful_shutdown(code)
-    if error is not None:
-        raise error  # Preserve the exception if a test replaces the terminating call.
-    return success  # Test doubles may replace os._exit.
+        except KeyboardInterrupt as exc:
+            error = exc
+            code = 0
+        except asyncio.CancelledError as exc:
+            # A cancellation is clean only when the runner recorded a requested stop.
+            # Otherwise launchd must see a failure and relaunch the gateway.
+            error = exc
+            state = current_process_exit_state() or {}
+            requested = bool(state.get("shutdown_requested"))
+            requested_code = state.get("exit_code")
+            code = requested_code if requested and isinstance(requested_code, int) else int(not requested)
+        except Exception as exc:  # health: allow BLE001 -- preserve ordinary gateway failure after diagnostics
+            # Preserve the diagnostic hook for ordinary exceptions, while retaining the
+            # existing propagation path instead of hiding the original failure. The
+            # BaseException paths above still use the hard-exit backstop.
+            error = exc
+            code = 1
+            hard_exit = False
+        else:
+            code = 0 if success else 1
+        if before_exit is not None:
+            before_exit(code, success, error)
+        if hard_exit:
+            _exit_after_graceful_shutdown(code)
+        if error is not None:
+            raise error.with_traceback(error.__traceback__)
+        return success  # Test doubles may replace os._exit.
+    finally:
+        _PROCESS_EXIT_STATE.reset(state_token)
 
 
 def exit_after_graceful_shutdown(exit_code: int) -> None:
@@ -90,11 +121,3 @@ def exit_after_graceful_shutdown(exit_code: int) -> None:
     for _step in (_release_locks, _mark_exited, _flush_metrics, _write_cpu_profile, _drain_logs):
         _best_effort(_step)
     os._exit(exit_code)
-
-
-
-def hard_exit_after_gateway_teardown(code: int) -> None:
-    # Mirror gateway.run.main()'s wedge-proof exit: bypass Python finalization so non-daemon
-    # threads (in-flight cron jobs) can't delay a /restart by minutes.
-    from gateway.run import _exit_after_graceful_shutdown
-    _exit_after_graceful_shutdown(code)

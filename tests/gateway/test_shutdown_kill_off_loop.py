@@ -165,8 +165,11 @@ async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
     events: list = []
     runner, _loop_thread = _make_phase_runner(monkeypatch, events)
     runner._restart_requested = False
+    runner._stop_requested_by_signal = False
     runner._signal_initiated_shutdown = True
     runner._signal_interrupt_grace_timeout = 0.0
+    bound = 0.1
+    runner._restart_shutdown_bound = lambda: bound
 
     entered = threading.Event()
     release = threading.Event()
@@ -186,18 +189,58 @@ async def test_nonrestart_mark_running_cron_jobs_is_bounded(monkeypatch):
     started = time.monotonic()
     operation = asyncio.create_task(runner._stop_interrupt_remaining_work(_make_ctx()))
     # Isolate the initial marker's bound from the ordinary unbounded tool sweep.
-    done, _pending = await asyncio.wait({operation}, timeout=3.0)
+    done, _pending = await asyncio.wait({operation}, timeout=bound + 2.0)
     elapsed = time.monotonic() - started
 
     try:
         assert operation in done
-        assert elapsed < 3.0
+        assert bound / 2 <= elapsed < bound + 2.0
         assert entered.wait(timeout=0.2)
         assert not finished.is_set()
     finally:
         release.set()
         await asyncio.wait({operation}, timeout=0.5)
         assert finished.wait(timeout=1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("restart_requested", [False, True])
+async def test_held_cron_mark_reserves_time_for_bounded_tool_sweep(monkeypatch, restart_requested):
+    runner, _ = _make_phase_runner(monkeypatch, [])
+    runner._restart_requested = restart_requested
+    runner._stop_requested_by_signal = True
+    bound = 0.1
+    runner._restart_shutdown_bound = lambda: bound
+    release = threading.Event()
+    finished = threading.Event()
+    observed = []
+
+    def mark(*_args, **_kwargs):
+        try:
+            release.wait(5)
+            return ["late-job"]
+        finally:
+            finished.set()
+
+    async def sweep(phase, *, timeout=None, restart=False):
+        observed.append((phase, timeout, restart))
+        # A held fire fence must leave the sweep enough budget to run, not detach immediately.
+        assert timeout is not None and bound / 4 < timeout <= bound
+        release.set()
+        return []
+
+    monkeypatch.setattr("cron.scheduler.mark_running_jobs_interrupted", mark)
+    monkeypatch.setattr(
+        "gateway.run.GatewayRunner._stop_kill_tool_subprocesses_off_loop", staticmethod(sweep),
+    )
+    try:
+        await runner._stop_interrupt_remaining_work(_make_ctx())
+        assert len(observed) == 1
+        assert observed[0][0] == "post-interrupt"
+        assert observed[0][2] is restart_requested
+    finally:
+        release.set()
+        assert await asyncio.to_thread(finished.wait, 5)
 
 
 @pytest.mark.asyncio

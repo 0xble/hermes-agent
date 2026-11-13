@@ -209,24 +209,9 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
     async def _connect_adapter_with_timeout(
         self, adapter, platform, *, is_reconnect: bool = False, initial: bool = False, predecessor=None
     ) -> bool:
-        """Connect with a bound so one platform can't block others. ``is_reconnect``: cold boot
-        drops the stale server-side queue, a reconnect keeps it. ``initial``: capped budget.
-
-        ``is_reconnect`` is forwarded to ``adapter.connect()`` so platform adapters can distinguish a cold
-        first boot (drop any stale server-side queue) from a watcher reconnect after a prolonged outage
-        (preserve the queue so messages sent during the outage are delivered rather than silently dropped —
-        #46621).
-        ``initial`` selects the capped cold-start budget for platforms whose full connect budget is too long
-        to spend before the gateway reaches ``running`` (#85993 — Telegram's 180s).
-        """
-        try:
-            ok = await self._connect_adapter_bounded(
-                adapter, platform, is_reconnect=is_reconnect, initial=initial, predecessor=predecessor)
-        except Exception as exc:
-            record_platform_connect(adapter, platform, is_reconnect=is_reconnect, ok=False, exc=exc)
-            raise
-        record_platform_connect(adapter, platform, is_reconnect=is_reconnect, ok=bool(ok))
-        return ok
+        from gateway.run_adapters_connect import connect_adapter_with_timeout
+        return await connect_adapter_with_timeout(
+            self, adapter, platform, is_reconnect=is_reconnect, initial=initial, predecessor=predecessor)
 
     async def _connect_adapter_bounded(self, adapter, platform, *, is_reconnect: bool, initial: bool,
                                        predecessor=None) -> bool:
@@ -256,7 +241,7 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
             adapter._platform_lock_takeover_allowed = False
 
     async def _handle_reaction_event(self, ctx: dict[str, Any]) -> None:
-        """Fan a normalised reaction event out to the HookRegistry; errors never block the adapter."""
+        """Fan a normalized reaction event to plugin and built-in hook registries."""
         event_name = str(ctx.get("event_name") or "reaction:added")
         with _log_suppressed(logging.DEBUG, "[Gateway] reaction hook emit failed", exc_info=True):
             await self.hooks.emit(event_name, ctx)
@@ -1943,54 +1928,6 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
 
     def _make_adapter_auth_check(
         self, platform: Platform, profile_name: Optional[str] = None
-    ) -> Callable[[str, Optional[str], Optional[str]], bool]:
-        """Platform-bound auth callback for adapters (prompt-injection mitigation for fetched
-        context); delegates to :meth:`_is_user_authorized`. ``profile_name`` binds a secondary to
-        its scope; for the shared primary (None) the routed profile is stamped so its pairing store
-        is consulted while allowlist reads stay under the transport home.
-
-        Without this an inline-button caller approved only in the routed profile's pairing store was denied
-        (#86296), because the adapter's callback source was never route-stamped. A secondary-owned bot's
-        callback fires outside the profile runtime scope (straight off the adapter's event loop), so the
-        check re-enters the owning profile's scope per call — the gate's scoped env read otherwise falls
-        back to os.environ (the default profile's env) and denies the secondary's own allowlisted
-        callers (#120639).
-        """
-        from gateway.run import get_hermes_home
-        transport_home = Path(get_hermes_home()) if self._multiplex_on() and profile_name is None else None
-        # Resolved once; the scope is entered per call so an ``.env`` allowlist edit reaches the next
-        # tap, matching the message path's per-message re-read.
-        profile_home = self._routed_profile_home(profile_name) if profile_name else None
-
-        def check(
-            user_id: str, chat_type: Optional[str] = None, chat_id: Optional[str] = None, *,
-            is_bot: bool = False, thread_id: Optional[str] = None,
-        ) -> bool:
-            if not user_id:
-                return False
-            source = SessionSource(
-                platform=platform, chat_id=chat_id or "", chat_type=chat_type or "group",
-                user_id=user_id, thread_id=thread_id, is_bot=bool(is_bot), profile=profile_name,
-            )
-            # Same transport provenance as ``build_source``, so policy reads resolve the receiving adapter.
-            registry = (
-                (getattr(self, "_profile_adapters", None) or {}).get(profile_name)
-                if profile_name else getattr(self, "adapters", None)
-            ) or {}
-            adapter = registry.get(platform)
-            if adapter is not None:
-                source._transport_adapter_ref = _weakref.ref(adapter)
-            if transport_home is None:
-                # Sync, on the adapter's event loop (per tap, per inline-query keystroke): never
-                # hydrate external secret sources here — that takes the process-global source lock
-                # (#99519). Startup and the message path hydrate off-loop; this reads their cache.
-                from gateway.run import _profile_runtime_scope
-                with self._scope_or_null(
-                        functools.partial(_profile_runtime_scope, hydrate_secrets=False), profile_home):
-                    return self._is_user_authorized(source)
-            # Canonicalize FIRST (callback sources never went through ``build_source``): the routed
-            # profile's pairing store is consulted, allowlists read under the transport home.
-            if self._canonicalize(source, primary_home=transport_home) is None:
-                return False  # fail-closed, like the ``_handle_message`` ingress gate
-            return self._is_user_authorized_for_source(source)
-        return check
+    ):
+        from gateway.run_adapters_auth import make_adapter_auth_check
+        return make_adapter_auth_check(self, platform, profile_name)

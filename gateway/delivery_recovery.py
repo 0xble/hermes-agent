@@ -62,6 +62,15 @@ class RuntimeDeliverySettlement:
 async def _recover_obligation_policy(runner, row, chat_key, blocked_chats):
     """Retain unreadable policy for retry, retire only a proven disarm."""
     from gateway.checkin_delivery import DISARMED, permits_metadata, recovery_metadata
+    if row.get("supervisor_checkin") and not row.get("resume_turn_id"):
+        reason = "supervisor_checkin_missing_resume_turn_id"
+        logger.warning(
+            "Abandoning supervisor delivery obligation %s: no resume_turn_id; it cannot be resumed",
+            row["obligation_id"],
+        )
+        from gateway.delivery_ledger import abandon_obligation
+        await asyncio.to_thread(abandon_obligation, row["obligation_id"], reason)
+        return None
     try:
         policy = await recovery_metadata(
             runner, row["session_key"], row.get("resume_turn_id"),

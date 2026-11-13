@@ -11,8 +11,9 @@ import pytest
 @pytest.mark.parametrize("outcome", [0, 1, 78, "KeyboardInterrupt", "CancelledError"])
 @pytest.mark.parametrize("entrypoint", ["module", "cli"])
 def test_process_main_exits_after_stop_with_blocked_executor(tmp_path, outcome, entrypoint):
-    exit_code = outcome if isinstance(outcome, int) else 0
+    exit_code = outcome if isinstance(outcome, int) else 1 if outcome == "CancelledError" else 0
     marker = tmp_path / "persisted"
+    imports_ready = tmp_path / "imports-ready"
     script = f'''
 import asyncio, os, threading
 from pathlib import Path
@@ -45,6 +46,7 @@ async def fake_gateway(*args, **kwargs):
         raise SystemExit(78)
     return {exit_code == 0!r}
 gateway.start_gateway = fake_gateway
+cli = None
 if {entrypoint == "cli"!r}:
     from tests.hermes_cli.test_gateway_run_hard_exit import _prepare
     from pytest import MonkeyPatch
@@ -54,17 +56,41 @@ if {entrypoint == "cli"!r}:
     gateway.start_gateway = fake_gateway
     gateway._exit_after_graceful_shutdown = real_exit
     cli._respawn_storm_backoff = lambda: None
+Path({str(imports_ready)!r}).write_text("ready")
+if cli is not None:
     cli.run_gateway()
 else:
     gateway.main()
 '''
-    started = time.monotonic()
+    env = dict(os.environ)
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
     try:
-        result = subprocess.run([sys.executable, "-c", script], capture_output=True,
-                                text=True, timeout=5, env=dict(os.environ))
-    except subprocess.TimeoutExpired:
-        pytest.fail("stop persisted, but process waited >5s for blocked worker finalization")
-    elapsed = time.monotonic() - started
+        import_deadline = time.monotonic() + 30
+        while not imports_ready.exists():
+            if time.monotonic() >= import_deadline:
+                process.kill()
+                process.wait()
+                pytest.fail("child did not finish its cold imports")
+            time.sleep(0.01)
+        started = time.monotonic()
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            pytest.fail("stop persisted, but process waited >5s for blocked worker finalization")
+        elapsed = time.monotonic() - started
+        result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
     print(f"process exit code={exit_code} elapsed={elapsed:.3f}s")
     assert result.returncode == exit_code, result.stderr
     assert marker.read_text() == "durable-stop"
@@ -74,6 +100,8 @@ else:
 @pytest.mark.parametrize("stop_kind", ["planned-SIGTERM", "SIGINT", "unplanned-SIGTERM"])
 def test_signal_handler_process_exits_after_bounded_stop(tmp_path, stop_kind):
     marker = tmp_path / "persisted"
+    imports_ready = tmp_path / "signal-imports-ready"
+    stop_ready = tmp_path / "signal-stop-ready"
     script = f'''
 import asyncio, os, signal, threading
 from pathlib import Path
@@ -82,6 +110,7 @@ import gateway.run as gateway
 from gateway import status
 from gateway.run_process_exit import run_gateway_process
 from tests.gateway.test_planned_restart_signal import _deliver_sigterm
+Path({str(imports_ready)!r}).write_text("ready")
 patches = MonkeyPatch()
 patches.setattr(gateway, "_hermes_home", Path(os.environ["HERMES_HOME"]))
 async def deliver_signal(handler, sig):
@@ -99,6 +128,7 @@ async def fake_gateway():
     runner, sweeps, unexpected = await _deliver_sigterm(
         patches, signal.SIGINT if {stop_kind == "SIGINT"!r} else signal.SIGTERM,
         deliver_signal=deliver_signal)
+    Path({str(stop_ready)!r}).write_text("ready")
     await asyncio.to_thread(Path({str(marker)!r}).write_text, "durable-stop")
     entered = threading.Event()
     def blocked():
@@ -110,12 +140,42 @@ async def fake_gateway():
     return not unexpected
 asyncio.run(run_gateway_process(fake_gateway))
 '''
-    started = time.monotonic()
-    # The existing planned-stop post-interrupt grace alone is 5s; include it
-    # and interpreter imports without altering any production drain budget.
-    result = subprocess.run([sys.executable, "-c", script], capture_output=True,
-                            text=True, timeout=15, env=dict(os.environ))
-    elapsed = time.monotonic() - started
+    process = subprocess.Popen(
+        [sys.executable, "-c", script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=dict(os.environ),
+    )
+    try:
+        import_deadline = time.monotonic() + 30
+        while not imports_ready.exists():
+            if time.monotonic() >= import_deadline:
+                process.kill()
+                process.wait()
+                pytest.fail("child did not finish its cold imports")
+            time.sleep(0.01)
+        stop_deadline = time.monotonic() + 30
+        while not stop_ready.exists():
+            if time.monotonic() >= stop_deadline:
+                process.kill()
+                process.wait()
+                pytest.fail("child did not finish its durable stop")
+            time.sleep(0.01)
+        started = time.monotonic()
+        # the post-import stop and exit, without altering any production drain budget.
+        try:
+            stdout, stderr = process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            stdout, stderr = process.communicate()
+            pytest.fail("stop persisted, but process waited >5s for blocked worker finalization")
+        elapsed = time.monotonic() - started
+        result = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
     print(f"signal-handler stop={stop_kind} code={result.returncode} elapsed={elapsed:.3f}s")
     assert result.returncode == (1 if stop_kind == "unplanned-SIGTERM" else 0), result.stderr
     assert marker.read_text() == "durable-stop"

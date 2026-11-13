@@ -624,6 +624,10 @@ class GatewayTurnPersistenceMixin:
                 # counts session_meta entries stripped before the agent saw them.
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
+                for _msg in reversed(new_messages):
+                    if _msg.get("role") == "assistant" and _msg.get("message_uid"):
+                        event._transcript_message_uid = str(_msg["message_uid"])
+                        break
                 if not new_messages:
                     # Edge case: fall back to simple user/assistant rows. The recovered-reply
                     # marker labels delivery only; the transcript keeps the model's answer.
@@ -632,10 +636,13 @@ class GatewayTurnPersistenceMixin:
                     if not _proxy_user_row_persisted:
                         await store.append_to_transcript(sid, _user_row, skip_db=agent_persisted)
                     if response:
-                        await store.append_to_transcript(
-                            sid, {"role": "assistant", "content": response, "timestamp": ts},
-                            skip_db=agent_persisted,
-                        )
+                        assistant_row = {"role": "assistant", "content": response, "timestamp": ts}
+                        queued_uid = agent_result.get("_queued_reply_uid")
+                        if isinstance(queued_uid, str) and queued_uid:
+                            assistant_row["message_uid"] = queued_uid
+                        from agent.message_metadata import stamp_message_uid
+                        event._transcript_message_uid = stamp_message_uid(assistant_row)
+                        await store.append_to_transcript(sid, assistant_row, skip_db=agent_persisted)
                 else:
                     # Attach the inbound platform message_id to the first user entry so platform-level
                     # quote-resolution (e.g. Yuanbao) can find earlier @bot messages by original id.
@@ -648,6 +655,9 @@ class GatewayTurnPersistenceMixin:
                             _proxy_user_row_skipped = True
                             continue
                         entry = {**msg, "timestamp": ts}
+                        if msg.get("role") == "assistant":
+                            from gateway.outbound_reply import stamp_gateway_assistant_entry
+                            stamp_gateway_assistant_entry(entry, event)
                         if (
                             not _user_msg_id_attached
                             and msg.get("role") == "user"
@@ -720,7 +730,7 @@ class GatewayTurnPersistenceMixin:
         return chat_refusal_wording(response, agent_result.get("failure_resets_at"))
 
     def _event_thread_metadata(self, event, source):
-        """Thread metadata for a send that replies to ``event`` on ``source``."""
+        """Public thread metadata for a send that replies to ``event``."""
         from gateway.checkin_delivery import delivery_metadata
         return delivery_metadata(event, self._thread_metadata_for_source(source, self._reply_anchor_for_event(event)))
 
@@ -855,6 +865,13 @@ class GatewayTurnPersistenceMixin:
                 from gateway.stream_recovery import unmark_recovered_reply
                 event._streamed_final_response = unmark_recovered_reply(
                     str(agent_result.get("final_response") or ""), agent_result)
+            delivered_id = agent_result.get("_delivered_platform_message_id")
+            reply_uid = getattr(event, "_transcript_message_uid", None)
+            if delivered_id and str(delivered_id) != "__no_edit__" and reply_uid:
+                from gateway.platforms.base import _schedule_outbound_platform_stamp
+                _schedule_outbound_platform_stamp(
+                    getattr(self, "session_store", None), session_key,
+                    str(delivered_id), str(reply_uid))
             return None
 
         if agent_result.get("interrupted") and response:

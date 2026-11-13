@@ -1,10 +1,11 @@
 """Execution attempts never masquerade as acknowledged supervisor output."""
 import asyncio
+import logging
 from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway import run_checkins
+from gateway import delivery_ledger, run_checkins
 from gateway.checkin_delivery import delivery_metadata, fence_local_settlement, permits_metadata
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
@@ -262,3 +263,50 @@ async def test_unavailable_db_holds_known_supervisor_but_allows_ordinary(fixture
     assert await _recover_obligation_policy(f.runner, supervisor, "chat", blocked) is None
     assert "chat" in blocked
     assert await _recover_obligation_policy(f.runner, ordinary, "other-chat", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_non_resumable_supervisor_does_not_hold_later_reply(fixture, caplog):
+    from gateway.delivery_recovery import RuntimeDeliveryRecoveryMixin
+
+    f = fixture
+    f.adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="later-ack"))
+    f.runner._obligation_adapter = AsyncMock(return_value=f.adapter)
+    f.runner._redelivery_restart_note_event = AsyncMock(return_value=None)
+    f.runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+    rows = [
+        {"obligation_id": "supervisor", "session_key": f.entry.session_key,
+         "platform": "telegram", "profile": "default", "chat_id": "42", "thread_id": "3",
+         "content": "stale supervisor status", "attempts": 1, "resume_turn_id": None,
+         "supervisor_checkin": True},
+        {"obligation_id": "later", "session_key": f.entry.session_key,
+         "platform": "telegram", "profile": "default", "chat_id": "42", "thread_id": "3",
+         "content": "later reply", "attempts": 1, "resume_turn_id": "later-turn",
+         "supervisor_checkin": False},
+    ]
+    for row in rows:
+        delivery_ledger.record_obligation(
+            obligation_id=row["obligation_id"], session_key=row["session_key"],
+            platform=row["platform"], chat_id=row["chat_id"], thread_id=row["thread_id"],
+            content=row["content"], resume_turn_id=row["resume_turn_id"],
+            supervisor_checkin=row["supervisor_checkin"])
+        delivery_ledger.mark_attempting(row["obligation_id"])
+
+    with caplog.at_level(logging.WARNING):
+        redelivered = await RuntimeDeliveryRecoveryMixin._redeliver_claimed_obligations(
+            f.runner, rows)
+
+    assert redelivered == 1
+    assert [call.kwargs["content"] for call in f.adapter.send.await_args_list] == ["later reply"]
+    assert any("no resume_turn_id" in record.getMessage() for record in caplog.records)
+    with delivery_ledger._connect() as conn:
+        states = {
+            obligation_id: conn.execute(
+                "SELECT state, last_error FROM delivery_obligations WHERE obligation_id=?",
+                (obligation_id,),
+            ).fetchone()
+            for obligation_id in ("supervisor", "later")
+        }
+    assert states["supervisor"] == ("abandoned", "supervisor_checkin_missing_resume_turn_id")
+    assert states["later"][0] == "delivered"
+    assert delivery_ledger.sweep_recoverable(deliverable_platforms={"telegram"}) == []
