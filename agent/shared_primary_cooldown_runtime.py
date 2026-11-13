@@ -24,7 +24,7 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
         # refuse the turn if no fallback can be bound, rather than use the primary.
         raise
     try:
-        if (isinstance(record, dict)
+        if (isinstance(record, dict) and is_active(record)
                 and str(record.get("probe_owner") or "")
                 and str(record.get("probe_owner") or "") == _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))):
             agent._shared_primary_cooldown_record = record
@@ -32,7 +32,6 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
         agent._shared_primary_probe_token = None
         if record is None:
             agent._shared_primary_cooldown_record = None
-            agent._shared_primary_probe_token = None
             return False
         if not is_active(record):
             agent._shared_primary_cooldown_record = record
