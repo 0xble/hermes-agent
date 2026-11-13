@@ -139,6 +139,29 @@ def test_private_delegated_child_uses_parent_interval():
         assert private_dirs.disposable_path_for_current_session() is None
 
 
+@pytest.mark.parametrize("root_registered", [True, False])
+def test_nested_private_delegated_child_resolves_only_a_live_root(root_registered):
+    from agent.delegation_context import delegated_child_context
+
+    root_id = "private-a"
+    if root_registered:
+        register_session(root_id)
+    root = private_dirs.private_dir_for_session(root_id)
+    try:
+        with delegated_child_context("grandchild-session", parent_session_id="child-session", root_session_id=root_id):
+            with incognito_scope(True, "grandchild-session"):
+                assert private_dirs.private_dir_for_session("grandchild-session") == root
+                if root_registered:
+                    assert root is not None
+                else:
+                    assert root is None
+    finally:
+        register_session(root_id, False)
+        private_dirs.discard_private_dir(root_id)
+    if root is not None:
+        assert not root.exists()
+
+
 def test_discard_shuts_down_kernels_for_session_and_aliases_before_removal(monkeypatch):
     calls = []
     removed = []

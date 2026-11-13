@@ -138,10 +138,18 @@ def private_dir_for_session(session_id: str | None, *, create: bool = True) -> P
         return None
     from agent.incognito import is_registered
     if not is_registered(session_id):
-        from agent.delegation_context import delegated_child_parent_session_id, is_delegated_child_context
+        from agent.delegation_context import (
+            delegated_child_parent_session_id,
+            delegated_child_root_session_id,
+            is_delegated_child_context,
+        )
         if not is_delegated_child_context():
             return None
         parent_id = delegated_child_parent_session_id()
+        if not parent_id or not is_registered(parent_id):
+            # Nested helpers do not register their immediate parent. Their root
+            # remains the live private topic throughout the delegation chain.
+            parent_id = delegated_child_root_session_id()
         if not parent_id or not is_registered(parent_id):
             return None
         session_id = parent_id

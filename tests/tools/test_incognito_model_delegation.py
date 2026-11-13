@@ -16,7 +16,8 @@ from tests.gateway.test_incognito_turn_e2e import (
 
 
 class _HelperProvider:
-    def __init__(self):
+    def __init__(self, nested=False):
+        self.nested = nested
         self.priming = True
         self.observed = []
         self.joined = []
@@ -63,9 +64,17 @@ class _HelperProvider:
         (interval / f"{sid}.txt").write_text("PRIVATE_HELPER_CANARY")
         messages = kwargs["messages"]
         user = next(m["content"] for m in reversed(messages) if m["role"] == "user")
-        if "CHILD_HELPER" in user:
-            return _mock_response(content="CHILD_RESULT")
         results = [json.loads(m["content"]) for m in messages if m["role"] == "tool"]
+        if "LEAF_HELPER" in user:
+            return _mock_response(content="LEAF_RESULT")
+        if "CHILD_HELPER" in user:
+            if self.nested and not results:
+                return _mock_response(content="", finish_reason="tool_calls", tool_calls=[
+                    _mock_tool_call("delegate_task", json.dumps({"goal": "LEAF_HELPER"}), call_id="call_leaf"),
+                ])
+            if self.nested:
+                assert results[-1]["results"][0]["summary"] == "LEAF_RESULT", results
+            return _mock_response(content="CHILD_RESULT")
         if results:
             assert results[-1]["results"][0]["summary"] == "CHILD_RESULT", results
             self.joined.append("CHILD_RESULT")
@@ -91,8 +100,9 @@ def _durable_state(home):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("route", ["intercept", "registry"])
 @pytest.mark.parametrize("privacy_source", ["parent", "session"])
+@pytest.mark.parametrize("nested", [False, True])
 async def test_private_model_helper_joins_without_durable_state(
-        request, monkeypatch, tmp_path, route, privacy_source):
+        request, monkeypatch, tmp_path, route, privacy_source, nested):
     from agent import incognito_private_dir as private_dirs
     from agent.incognito import is_incognito, register_session
     from gateway.incognito import event_scope
@@ -105,7 +115,7 @@ async def test_private_model_helper_joins_without_durable_state(
     config["streaming"] = {"enabled": False}
     import hermes_yaml
     (tmp_path / "config.yaml").write_text(hermes_yaml.safe_dump(config))
-    provider = _HelperProvider()
+    provider = _HelperProvider(nested=nested)
     monkeypatch.setattr("agent.process_bootstrap.OpenAI", provider)
     started(runner, db)
     assert "ON" in await incognito(runner, event, "/incognito on")
@@ -144,9 +154,10 @@ async def test_private_model_helper_joins_without_durable_state(
             ))
             assert result.get("results", [{}])[0].get("summary") == "CHILD_RESULT", result
             assert provider.joined == []
-        assert len(bound) == 1 and all(path == interval for _, path in bound)
+        expected_children = 1 + int(nested)
+        assert len(bound) == expected_children and all(path == interval for _, path in bound)
         child_ids = {child_sid for child_sid, _ in bound}
-        assert len(child_ids) == 1 and sid not in child_ids
+        assert len(child_ids) == expected_children and sid not in child_ids
         assert {path for _, path, _ in provider.observed} == {interval}
         assert all(not registered for observed_sid, _, registered in provider.observed if observed_sid != sid)
         assert all(private_dirs.private_dir_for_session(child_sid, create=False) is None for child_sid in child_ids)
