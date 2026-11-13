@@ -5,6 +5,22 @@ from typing import Optional
 EMPTY_RESPONSE_ERROR = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
 
+def hard_wall_outcome(job, execution_id, execution_token, success, error, final_response):
+    """Discard a late worker result once the watchdog owns terminal completion."""
+    from cron import scheduler
+
+    if (scheduler.get_execution(execution_id) or {}).get("status") != "running":
+        scheduler.logger.info("Cron job %s: discarding result after hard-wall terminalization", job["id"])
+        return None
+    if success and scheduler._is_interrupted(job["id"], execution_token):
+        success = False
+        error = "Run stopped before finishing; no result this run."
+    if success and not final_response.strip():
+        success = False
+        error = EMPTY_RESPONSE_ERROR
+    return success, error
+
+
 def fail_empty_response(d, final_response):
     """A "successful" run with a blank answer is a soft failure (never ``ok``): the ordinary tail and
     receipt recovery both book it, so a recovered whitespace answer cannot turn the job green."""

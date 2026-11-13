@@ -974,8 +974,10 @@ class GatewayModelCommandsMixin:
                          failures=len(failures), detail=detail)
             count = await self._reset_all_session_overrides()
             return ContextNotice(t("gateway.model.reset_all_done", count=count))
-        if not request.explicit_provider and alias_name(request.target, _load_gateway_config() if profile_home is None
-                                                       else _load_gateway_config(profile_home / "config.yaml")):
+        from gateway.session_setting_commands import local_authority_live
+        if (local_authority_live(self, source)[1] is None and not request.explicit_provider
+                and alias_name(request.target, _load_gateway_config() if profile_home is None
+                               else _load_gateway_config(profile_home / "config.yaml"))):
             return await self._handle_model_role_command(event, request, source, session_key, profile_home)
 
         from gateway.model_pick import model_pick_deadline, model_pick_ttl_hours

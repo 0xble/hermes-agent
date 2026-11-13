@@ -3592,16 +3592,13 @@ def _run_one_job_body(
             # run_job is still unwinding. A killed no-agent script can return a
             # plausible silent success; do not publish its output or delivery
             # after the timeout has already won the durable result CAS.
-            if (get_execution(execution_id) or {}).get("status") != "running":
-                logger.info("Cron job %s: discarding result after hard-wall terminalization", job["id"])
+            from cron.scheduler_bookkeeping import hard_wall_outcome
+            bounded_outcome = hard_wall_outcome(
+                job, execution_id, execution_token, success, error, final_response)
+            if bounded_outcome is None:
                 _teardown_deferred()
                 return False
-            if success and _is_interrupted(job["id"], execution_token):
-                success = False
-                error = "Run stopped before finishing; no result this run."
-            if success and not final_response.strip():
-                success = False
-                error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
+            success, error = bounded_outcome
 
         def _commit_before_delivery() -> None:
             nonlocal committed
