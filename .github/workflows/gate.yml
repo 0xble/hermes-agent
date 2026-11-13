@@ -24,7 +24,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: node:26.8.2-bookworm-slim@sha256:cd9f682fa2885cd1056e830424764158570061c59736a1da836bc3d73df095ae
-      options: --init
+      options: --init --security-opt seccomp=unconfined
     steps:
       - name: Install Git for checkout
         shell: bash
