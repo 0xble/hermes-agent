@@ -136,10 +136,15 @@ active source goals/loops as open items without clearing them. The generation-fe
 preparation decision acknowledges the offered control definitions: `owners` preserves
 them by handoff, while leaving them unowned clears them only at finalization. A changed
 definition needs another owner choice. A queued preparation alone never authorizes
-clearing. Independently confirmed topic absence also allows finalization without a
-preparation wake. Source goals/loops without a chosen owner or saved handoff are cleared through
-`GoalManager.clear()` or `LoopManager.clear()` inside the retirement transaction; the
-receipt is saved under the retirement generation and the durable control row is read
+clearing. Preparation fingerprints include the authored definition digest, so an in-place
+change with the same title re-wakes the owner choice; execution counters do not.
+Independently confirmed topic absence also allows finalization without a
+preparation wake. Source goals/loops without a chosen owner or saved handoff are cleared only
+after every other inventory obligation settles. External inventories cannot share the session
+DB transaction; both source control rows are rechecked in that transaction before either is
+cleared through `GoalManager.clear()` or `LoopManager.clear()`. Receipts are keyed by kind and
+control mutation identity (a snapshot digest for legacy controls), preserving earlier clears
+under the same retirement generation. The durable control row is read
 back before inventory continues. A cancelled goal is terminal for inventory. Running
 session, rebound-key, and current-generation/phase fences run before absent-topic
 control clearing, so a declined finalization pass leaves controls unchanged. Running
