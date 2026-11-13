@@ -989,6 +989,38 @@ class TestSlackPlatformEventReaction:
         assert adapter._reaction_channel_type_cache == {}
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("response", [
+        RuntimeError("missing_scope"), RuntimeError("ratelimited"),
+        {"ok": True, "channel": {"id": "C_OTHER", "is_channel": True}},
+        {"ok": True, "channel": {"id": "C1"}},
+    ])
+    @pytest.mark.parametrize("observing", [False, True])
+    async def test_unknown_observation_kind_does_not_disable_opt_in_routing(self, response, observing):
+        adapter = _make_adapter()
+        adapter.config.extra["reaction_triggers"] = True
+        client = adapter._team_clients["T1"]
+        client.conversations_info = (AsyncMock(side_effect=response) if isinstance(response, Exception)
+                                     else AsyncMock(return_value=response))
+        client.conversations_replies = AsyncMock(return_value={
+            "messages": [{"ts": "2000.0", "thread_ts": "1000.0", "user": "U_BOT"}],
+        })
+        published, legacy, routed = AsyncMock(), AsyncMock(), AsyncMock()
+        adapter.set_platform_event_handler(published)
+        adapter.set_reaction_handler(legacy)
+        adapter._handle_slack_message = routed
+        with patch("hermes_cli.lifecycle.has_hook", return_value=observing):
+            await adapter._handle_slack_reaction({
+                "user": "U1", "reaction": "thumbsup", "event_ts": "3000.0", "item_user": "U_BOT",
+                "item": {"type": "message", "channel": "C1", "ts": "2000.0"},
+            })
+        published.assert_not_awaited()  # Unresolved observation identity still fails closed.
+        legacy.assert_awaited_once()
+        routed.assert_awaited_once()
+        assert routed.await_args is not None
+        assert routed.await_args.args[0]["thread_ts"] == "1000.0"
+        assert client.conversations_info.await_count == int(observing)
+
+    @pytest.mark.asyncio
     async def test_reaction_channel_kind_cache_is_workspace_scoped(self):
         adapter = _make_adapter()
         dm_client, group_client = AsyncMock(), AsyncMock()

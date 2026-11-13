@@ -127,38 +127,38 @@ class SlackReactionsMixin:
         if platform_event_handler is not None and has_hook("gateway_platform_event"):
             try:
                 chat_type = await self._reaction_chat_type(client, channel_id, team_id)
-                if chat_type is None:
-                    return
-                reactor_is_bot = await self._resolve_user_is_bot(user_id, channel_id, team_id) if client else False
-                # Use Slack's conversation identity for auth. In particular, MPIMs have
-                # G-prefixed ids and must use the same DM policy as message intake; the
-                # event's optional channel_type is not an authorization source.
-                # Slack reaction payloads normally omit item.thread_ts. A previously fetched
-                # thread cache can provide an exact root without an authorization-time API call;
-                # otherwise leave group reactions unscoped rather than inventing a thread id.
-                thread_ts = str(item.get("thread_ts") or event.get("thread_ts") or "")
-                if not thread_ts:
-                    thread_ts = self._cached_reaction_thread_ts(channel_id, msg_ts, team_id)
-                thread_id = thread_ts or (str(msg_ts) if chat_type == "dm" else None)
-                source = self.build_source(
-                    chat_id=str(channel_id), chat_type=chat_type, user_id=str(user_id),
-                    thread_id=thread_id or None,
-                    scope_id=str(team_id) if team_id else None, message_id=str(msg_ts),
-                    is_bot=bool(reactor_is_bot),
-                )
-                await platform_event_handler({
-                    "platform": "slack", "event_type": "reaction",
-                    "payload": {
-                        "reaction": str(reaction_name)[:128], "action": action,
-                        "user_id": str(user_id)[:128], "is_bot": bool(reactor_is_bot),
-                        "item_user_id": str(event.get("item_user"))[:128]
-                        if event.get("item_user") else None,
-                        "chat_id": str(channel_id)[:128], "message_id": str(msg_ts)[:128],
-                        "thread_id": thread_id or None, "team_id": str(team_id)[:128] if team_id else None,
-                        "event_ts": str(event.get("event_ts"))[:128]
-                        if event.get("event_ts") else None,
-                    },
-                }, source)
+                # Observation must fail closed without disabling independent opt-in routing.
+                if chat_type is not None:
+                    reactor_is_bot = await self._resolve_user_is_bot(user_id, channel_id, team_id) if client else False
+                    # Use Slack's conversation identity for auth. In particular, MPIMs have
+                    # G-prefixed ids and must use the same DM policy as message intake; the
+                    # event's optional channel_type is not an authorization source.
+                    # Slack reaction payloads normally omit item.thread_ts. A previously fetched
+                    # thread cache can provide an exact root without an authorization-time API call;
+                    # otherwise leave group reactions unscoped rather than inventing a thread id.
+                    thread_ts = str(item.get("thread_ts") or event.get("thread_ts") or "")
+                    if not thread_ts:
+                        thread_ts = self._cached_reaction_thread_ts(channel_id, msg_ts, team_id)
+                    thread_id = thread_ts or (str(msg_ts) if chat_type == "dm" else None)
+                    source = self.build_source(
+                        chat_id=str(channel_id), chat_type=chat_type, user_id=str(user_id),
+                        thread_id=thread_id or None,
+                        scope_id=str(team_id) if team_id else None, message_id=str(msg_ts),
+                        is_bot=bool(reactor_is_bot),
+                    )
+                    await platform_event_handler({
+                        "platform": "slack", "event_type": "reaction",
+                        "payload": {
+                            "reaction": str(reaction_name)[:128], "action": action,
+                            "user_id": str(user_id)[:128], "is_bot": bool(reactor_is_bot),
+                            "item_user_id": str(event.get("item_user"))[:128]
+                            if event.get("item_user") else None,
+                            "chat_id": str(channel_id)[:128], "message_id": str(msg_ts)[:128],
+                            "thread_id": thread_id or None, "team_id": str(team_id)[:128] if team_id else None,
+                            "event_ts": str(event.get("event_ts"))[:128]
+                            if event.get("event_ts") else None,
+                        },
+                    }, source)
             except Exception:
                 logger.debug("[Slack] gateway platform-event forwarding failed", exc_info=True)
         # None → routing disabled; empty set → all emoji; non-empty → allowlist.

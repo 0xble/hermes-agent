@@ -5090,11 +5090,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayTurnPersistenceMixin):
                 session_key or "?",
             )
             try:
-                from gateway.outbound_reply import ensure_reply_uid, queued_reply_metadata
+                from gateway.outbound_reply import ensure_reply_uid
                 _queued_reply_uid = ensure_reply_uid(result)
                 _text_delivered = await self._deliver_queued_first_response(
                     first_response, source=turn_ctx.source, adapter=adapter,
-                    metadata=queued_reply_metadata(turn_ctx._status_thread_metadata, result),
+                    metadata=turn_ctx._status_thread_metadata,
                     event_message_id=turn_ctx.event_message_id,
                     transcript_message_uid=_queued_reply_uid,
                     text_already_delivered=_already_streamed,

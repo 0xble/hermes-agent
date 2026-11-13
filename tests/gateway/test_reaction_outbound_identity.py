@@ -18,6 +18,8 @@ from hermes_state import SessionDB
 
 
 class _Adapter(BasePlatformAdapter):
+    sent: list
+
     async def connect(self, **kwargs):
         return True
 
@@ -235,8 +237,8 @@ async def test_proxy_turn_writes_the_uid_delivery_already_named(tmp_path, monkey
         "agent_persisted": True, "_gateway_user_turn_persisted": True, "history_offset": 0,
         "last_prompt_tokens": 0, "messages": [{"role": "user", "content": "hello"}, proxy_assistant],
     }
-    from gateway.outbound_reply import queued_reply_metadata
-    queued_reply_metadata({"thread_id": "7"}, agent_result)
+    from gateway.outbound_reply import ensure_reply_uid
+    ensure_reply_uid(agent_result)
     await runner._hmwa_persist_turn_transcript(
         event=event, source=source, session_entry=entry, session_key=entry.session_key,
         agent_result=agent_result, agent_messages=agent_result["messages"], prepared=prepared,
@@ -307,9 +309,128 @@ async def test_multi_assistant_gateway_turn_stamps_the_visible_final_row(tmp_pat
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("lane", ["gateway", "proxy", "fallback"])
+async def test_queued_delivery_before_gateway_persistence_keeps_exact_identity(tmp_path, monkeypatch, lane):
+    """Drain the queued send's stamp before the gateway creates the assistant row."""
+    from gateway import delivery_ledger as dl
+    from gateway.outbound_reply import ensure_reply_uid
+    from gateway.run import GatewayRunner
+
+    store = _real_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "ledger.db")
+    monkeypatch.setattr(dl, "ledger_enabled", lambda config=None: True)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat", chat_type="dm")
+    entry = await store.get_or_create_session(source)
+    older = {"role": "assistant", "content": "same answer", "message_uid": "older"}
+    await store.append_to_transcript(entry.session_id, older)
+    adapter = _Adapter(PlatformConfig(enabled=True, token="***"), Platform.TELEGRAM)
+    adapter.sent = []
+    adapter._session_store = store._store
+    adapter.gateway_runner = None
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store._store
+    runner._session_db = object() if lane == "proxy" else None
+    runner._hmwa_store_turn_prompt_tokens = AsyncMock()
+    runner._refresh_agent_cache_message_count = AsyncMock()
+    messages = ([] if lane == "fallback" else [
+        {"role": "user", "content": "hello"},
+        {"role": "assistant", "content": "", "tool_calls": [{
+            "id": "call", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}]},
+        {"role": "tool", "content": "found", "tool_call_id": "call"},
+        {"role": "assistant", "content": "same answer"},
+    ])
+    result = {"agent_persisted": lane == "proxy", "history_offset": 0, "last_prompt_tokens": 0,
+              "messages": messages, "final_response": "same answer"}
+    if lane == "proxy":
+        result["_gateway_user_turn_persisted"] = True
+    named = ensure_reply_uid(result)
+    event = MessageEvent(text="hello", message_id="queued-in", source=source)
+    assert await runner._deliver_queued_first_response(
+        "same answer", source=source, adapter=adapter, metadata={"thread_id": "7"},
+        event_message_id="queued-in", transcript_message_uid=named,
+        session_key=entry.session_key, inbound_message_id="queued-in") is True
+    tasks = list(getattr(store._store, "_outbound_stamp_tasks", ()))
+    if tasks:
+        await asyncio.gather(*tasks)  # The absent-row write has completed, not raced the append.
+    with dl._connect() as conn:
+        assert conn.execute("SELECT state FROM delivery_obligations").fetchone()[0] == "delivered"
+    assert adapter.sent == [("same answer", {"thread_id": "7", "notify": True})]
+    assert not any(uid == named for uid, _platform_id, _active in _ids(store._store._db, entry.session_id))
+    prepared = SimpleNamespace(
+        history=[{"role": "user", "content": "prior"}], persist_user_message="hello",
+        persist_user_timestamp=None, persist_user_display_kind=None, persistence_owner=None,
+        hygiene_adoption_epoch=0, message_text="hello")
+    await runner._hmwa_persist_turn_transcript(
+        event=event, source=source, session_entry=entry, session_key=entry.session_key,
+        agent_result=result, agent_messages=messages, prepared=prepared, response="same answer",
+        agent_failed_early=False, hidden_reasoning_incomplete=False, is_context_overflow_failure=False)
+    rows = _ids(store._store._db, entry.session_id)
+    assert rows[-1] == (named, "reply-1", 1)
+    assert named == getattr(event, "_transcript_message_uid", None)
+    assert all(platform_id is None for _uid, platform_id, _active in rows[:-1])
+
+
+@pytest.mark.asyncio
+async def test_pending_stamp_is_session_and_assistant_scoped(tmp_path, monkeypatch):
+    store = _real_store(tmp_path, monkeypatch)
+    first = await store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="one", chat_type="dm"))
+    other = await store.get_or_create_session(SessionSource(platform=Platform.TELEGRAM, chat_id="two", chat_type="dm"))
+    assert store._store.record_outbound_platform_message(first.session_key, "visible", "", "exact-uid") is False
+    await store.append_to_transcript(other.session_id, {"role": "assistant", "content": "same", "message_uid": "exact-uid"})
+    await store.append_to_transcript(first.session_id, {"role": "user", "content": "same", "message_uid": "exact-uid"})
+    await store.append_to_transcript(first.session_id, {"role": "assistant", "content": "same", "message_uid": "exact-uid"})
+    assert _ids(store._store._db, first.session_id) == [("exact-uid", "visible", 1)]
+    assert _ids(store._store._db, other.session_id) == [("exact-uid", None, 1)]
+    assert getattr(store._store, "_pending_outbound_platform_messages", {}) == {}
+    assert store._store.record_outbound_platform_message(first.session_key, "auxiliary", "", "exact-uid") is True
+    assert getattr(store._store, "_pending_outbound_platform_messages", {}) == {}
+    assert _ids(store._store._db, first.session_id) == [("exact-uid", "visible", 1)]
+
+
+@pytest.mark.asyncio
+async def test_queued_ledger_settles_while_identity_stamp_is_blocked(tmp_path, monkeypatch):
+    import threading
+    from gateway import delivery_ledger as dl
+    from gateway.run import GatewayRunner
+
+    store = _real_store(tmp_path, monkeypatch)
+    monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "ledger.db")
+    monkeypatch.setattr(dl, "ledger_enabled", lambda config=None: True)
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="blocked", chat_type="dm")
+    entry = await store.get_or_create_session(source)
+    started, release = threading.Event(), threading.Event()
+    record = store._store.record_outbound_platform_message
+
+    def blocked_record(*args, **kwargs):
+        started.set()
+        assert release.wait(5), "test did not release the identity stamp"
+        return record(*args, **kwargs)
+
+    monkeypatch.setattr(store._store, "record_outbound_platform_message", blocked_record)
+    adapter = _Adapter(PlatformConfig(enabled=True), Platform.TELEGRAM)
+    adapter.sent = []
+    adapter._session_store = store._store
+    adapter.gateway_runner = None
+    runner = object.__new__(GatewayRunner)
+    runner.session_store = store._store
+    try:
+        assert await asyncio.wait_for(runner._deliver_queued_first_response(
+            "reply", source, adapter, transcript_message_uid="blocked-uid",
+            session_key=entry.session_key, inbound_message_id="blocked-in"), timeout=2)
+        assert await asyncio.to_thread(started.wait, 2)
+        with dl._connect() as conn:
+            assert conn.execute("SELECT state FROM delivery_obligations").fetchone()[0] == "delivered"
+        await store.append_to_transcript(entry.session_id, {
+            "role": "assistant", "content": "reply", "message_uid": "blocked-uid"})
+    finally:
+        release.set()
+        await asyncio.gather(*list(getattr(store._store, "_outbound_stamp_tasks", ())))
+    assert _ids(store._store._db, entry.session_id) == [("blocked-uid", "reply-1", 1)]
+
+
+@pytest.mark.asyncio
 async def test_queued_media_keeps_uid_out_of_adapter_metadata(tmp_path, monkeypatch):
     """Queued media sees public metadata; the stamp still names the row."""
-    from gateway.outbound_reply import queued_reply_metadata
     from gateway.run import GatewayRunner
 
     store = _real_store(tmp_path, monkeypatch)
@@ -342,8 +463,7 @@ async def test_queued_media_keeps_uid_out_of_adapter_metadata(tmp_path, monkeypa
     event = MessageEvent(
         text="hello", message_type=MessageType.TEXT, message_id="in-media", source=source)
     event._transcript_message_uid = "uid-media"  # type: ignore[attr-defined]
-    metadata = queued_reply_metadata({"thread_id": "discord-thread"}, {"messages": [assistant]})
-    assert metadata == {"thread_id": "discord-thread"}
+    metadata = {"thread_id": "discord-thread"}
 
     delivered = await runner._deliver_queued_first_response(
         f"first response\nMEDIA:{media_path}", source=source, adapter=adapter, metadata=metadata,

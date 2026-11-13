@@ -1867,17 +1867,21 @@ class SessionMessagesMixin(DisplayFoldMixin, SessionDetachedResultsMixin, Sessio
         ``message_uid`` selects the active assistant row for that turn. Compaction keeps inactive
         copies of the same uid; only ``active = 1`` is the row a later reaction must find. Callers
         without a row identity do not stamp: matching delivered text can attach an older turn.
+        True includes an already-receipted exact row (first receipt wins); False means no row
+        was bound, so the gateway store may retain the receipt until a future append.
         """
         if not message_uid:
             return False
         def _write(conn):
             row = conn.execute(
-                "SELECT id FROM messages WHERE session_id = ? AND role = 'assistant' AND active = 1 "
-                "AND message_uid = ? AND platform_message_id IS NULL ORDER BY id DESC LIMIT 1",
+                "SELECT id, platform_message_id FROM messages WHERE session_id = ? AND role = 'assistant' AND active = 1 "
+                "AND message_uid = ? ORDER BY id DESC LIMIT 1",
                 (session_id, str(message_uid)),
             ).fetchone()
             if row is None:
                 return False
+            if row[1] is not None:
+                return True  # The exact row already has its primary receipt; never overwrite it.
             return bool(conn.execute(
                 "UPDATE messages SET platform_message_id = ? WHERE id = ?",
                 (str(platform_message_id), row[0]),

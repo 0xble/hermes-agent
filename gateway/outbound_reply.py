@@ -26,28 +26,6 @@ def stamp_gateway_assistant_entry(entry: dict, event: Any) -> None:
     event._transcript_message_uid = uid
 
 
-def assistant_reply_uid(messages: Any) -> str | None:
-    """The last assistant UID in a result message list."""
-    if not isinstance(messages, list):
-        return None
-    for msg in reversed(messages):
-        if isinstance(msg, dict) and msg.get("role") == "assistant":
-            uid = msg.get("message_uid")
-            if isinstance(uid, str) and uid:
-                return uid
-    return None
-
-
-def queued_reply_metadata(metadata: dict | None, result: Any) -> dict | None:
-    """Return queued-lane routing metadata after persistence has chosen the row.
-
-    The row UID is carried separately by the queued delivery event. Keeping it
-    out of this public metadata prevents any adapter method from observing it.
-    """
-    ensure_reply_uid(result)
-    return metadata
-
-
 def ensure_reply_uid(result: Any) -> str | None:
     """Ensure the assistant row that gateway persistence will write has a UID."""
     if not isinstance(result, dict):
@@ -70,15 +48,6 @@ def ensure_reply_uid(result: Any) -> str | None:
         uid = stamp_message_uid({"role": "assistant", "content": result["final_response"]})
         result["_queued_reply_uid"] = uid
     return uid
-
-
-def refresh_reply_metadata(metadata: dict | None, event: Any = None, messages: Any = None) -> dict | None:
-    """Compatibility helper returning public routing metadata unchanged.
-
-    Identity is deliberately not refreshed into adapter metadata. ``event`` and
-    ``messages`` remain accepted for callers from older integrations.
-    """
-    return metadata
 
 
 def reply_uid_for_final(event: Any, metadata: dict | None) -> str | None:

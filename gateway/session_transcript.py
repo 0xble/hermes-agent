@@ -462,7 +462,12 @@ class SessionTranscriptMixin:
             # into the ambient store.
             raise RuntimeError(
                 f"no owning session store for {session_id}; deferring transcript write")
+        pending = self._lazy("_pending_outbound_platform_messages", dict)
+        key = (session_id, str(message.get("message_uid") or "")) if message.get("role") == "assistant" else None
+        if key in pending:
+            message = {**message, "platform_message_id": message.get("platform_message_id") or pending[key]}
         _db.append_message(**transcript_append_kwargs(session_id, message))
+        pending.pop(key, None)  # Consume only after the exact row was successfully written.
 
     @staticmethod
     def _is_fts_corruption_error(exc: Exception) -> bool:
@@ -519,23 +524,41 @@ class SessionTranscriptMixin:
 
     def _clear_dirty_transcript(self, session_id: str) -> None:
         """Drop queued pending messages so a rewrite/rewind doesn't re-insert them."""
-        with self._transcript_retry_lock:
+        with self._get_transcript_drain_lock(), self._transcript_retry_lock:
             self._dirty_transcripts.pop(session_id, None)
             self._transcript_append_failures.pop(session_id, None)
+            pending = self._lazy("_pending_outbound_platform_messages", dict)
+            for key in tuple(pending):
+                if key[0] == session_id:
+                    pending.pop(key, None)
 
     def record_outbound_platform_message(
         self, session_key: str, platform_message_id: str, content: str,
         message_uid: str | None = None,
     ) -> bool:
-        """Record one delivered assistant reply in its owning profile database."""
-        with self._lock:
-            entry = self._entry_locked(session_key)
-            session_id = getattr(entry, "session_id", None)
-        if not session_id:
+        """Record a delivered reply, or retain its UID receipt until the row is appended.
+
+        Queued gateway-written turns deliver before transcript persistence. Serialize that
+        rendezvous with append so either ordering binds the same exact session/assistant UID.
+        The caller runs this after ledger finalization; no send waits for this lock or DB work.
+        """
+        if not message_uid:
             return False
-        db = self._db_for_session_id(session_id)
-        return bool(db and db.record_outbound_platform_message(
-            session_id, platform_message_id, content, message_uid=message_uid))
+        with self._get_transcript_drain_lock():
+            with self._lock:
+                entry = self._entry_locked(session_key)
+                session_id = getattr(entry, "session_id", None)
+            if not session_id:
+                return False
+            db = self._db_for_session_id(session_id)
+            if db is None:
+                return False
+            if db.record_outbound_platform_message(
+                    session_id, platform_message_id, content, message_uid=message_uid):
+                return True
+            self._lazy("_pending_outbound_platform_messages", dict).setdefault(
+                (session_id, str(message_uid)), str(platform_message_id))
+            return False
 
     def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
         """Whether a message with this platform_message_id is persisted (False without a DB).

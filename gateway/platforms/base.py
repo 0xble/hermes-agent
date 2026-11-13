@@ -3401,7 +3401,6 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         None means suppressed, NOT successfully sent. Transport receipts/exceptions
         pass through unchanged; logs and producer state belong outside this boundary.
         Existing routing/stream metadata is preserved, never inferred from text.
-        The transcript UID is gateway-internal and is stripped before the send.
         """
         if not self.warning_notifications_enabled(logical_platform, chat_id=chat_id, metadata=metadata):
             return None
@@ -5035,8 +5034,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     async def _send_image_batch(
         self, event: MessageEvent, images: list, metadata: dict[str, Any], human_delay: float,
         record_delivery: Callable) -> None:
-        """Batch-send images and record the result; a failure is logged, never raised.
-        The transcript UID is stripped before the adapter sees metadata."""
+        """Batch-send images and record the result; a failure is logged, never raised."""
         try:
             result = await self.send_multiple_images(
                 chat_id=event.source.chat_id, images=images,
@@ -5084,9 +5082,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 result = await delivery_adapter._send_with_retry(
                     chat_id=event.source.chat_id, content=text_content, reply_to=reply_to, metadata=metadata)
             record_final_reply(receipt, text_content, result)
-            # Persistence may have chosen the row after this metadata was built.
-            # Refresh from the event the same way handle_message does, and keep a
-            # uid the queued lane already placed on metadata.
+            # Read the exact row UID from the private gateway event, never adapter metadata.
             reply_uid = reply_uid_for_final(event, metadata)
             if result.success and result.message_id and reply_uid:
                 outbound_stamp = (session_key, str(result.message_id), str(reply_uid))
@@ -5481,8 +5477,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             await self._run_processing_hook("on_processing_start", event)
             event._turn_marker_handoff = self.gateway_runner is not None  # it can release the marker
             response = await self._handle_compression_retries(event, session_key, interrupt_event)
-            # Transcript persistence selects the exact assistant row during the handler;
-            # refresh metadata before any final delivery is started.
+            # The handler can recover source routing (for example, a missing thread id);
+            # build final transport metadata from that resolved event.
             _thread_metadata = _thread_metadata_for_event(event)
             if self._pending_messages.get(session_key) is event and getattr(event, "_drain_deferred", False):
                 return  # Shutdown owns the retained input, not a completed delivery.
