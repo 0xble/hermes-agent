@@ -624,10 +624,8 @@ class GatewayTurnPersistenceMixin:
                 # counts session_meta entries stripped before the agent saw them.
                 history_len = agent_result.get("history_offset", len(history))
                 new_messages = agent_messages[history_len:] if len(agent_messages) > history_len else []
-                for _msg in reversed(new_messages):
-                    if _msg.get("role") == "assistant" and _msg.get("message_uid"):
-                        event._transcript_message_uid = str(_msg["message_uid"])
-                        break
+                from gateway.outbound_reply import bind_persisted_assistant_uid
+                bind_persisted_assistant_uid(new_messages, event)
                 if not new_messages:
                     # Edge case: fall back to simple user/assistant rows. The recovered-reply
                     # marker labels delivery only; the transcript keeps the model's answer.
