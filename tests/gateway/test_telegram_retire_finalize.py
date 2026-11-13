@@ -28,6 +28,9 @@ def runtime(tmp_path, monkeypatch, request):
     bot = SimpleNamespace(get_me=AsyncMock(return_value=SimpleNamespace(username="bot")),
                           send_message=AsyncMock(), delete_forum_topic=AsyncMock())
     adapter = SimpleNamespace(_bot=bot, send=AsyncMock(), _dm_topics={"101:Retired": "17"})
+    async def admit(event):
+        event._gateway_accepted = True
+    adapter.handle_message = AsyncMock(side_effect=admit)
     runner = SimpleNamespace(_session_db=AsyncSessionDB(db), session_store=store,
                              _session_key_for_source=store._generate_session_key,
                              _delivery_adapter_for=lambda _: adapter,
@@ -251,6 +254,15 @@ async def test_pool_exhaustion_defers_cancelled_goal_before_absent_finalization(
 @pytest.mark.parametrize("present", [False, True])
 async def test_real_inventory_cancels_active_control_on_topic_retirement(runtime, monkeypatch, kind, present, caplog):
     r = runtime
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+    manager = GoalManager if kind == "goal" else LoopManager
+    clear = manager.clear
+    cleared = []
+    def observed_clear(self):
+        cleared.append(self)
+        return clear(self)
+    monkeypatch.setattr(manager, "clear", observed_clear)
     r.state.update(phase="pending", reason="User explicitly stopped work.")
     if present:
         from gateway.platforms.base import SendResult
@@ -281,6 +293,21 @@ async def test_real_inventory_cancels_active_control_on_topic_retirement(runtime
 
     with caplog.at_level("INFO", logger=work.__name__):
         await retire.advance(r.runner, r.source)
+        if present:
+            prepared = await retire.load(r.runner, r.source)
+            assert prepared is not None
+            assert prepared["phase"] == "waiting"
+            assert [item["id"] for item in prepared["preparation"]["items"]] == [kind]
+            assert json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}"))["status"] == "active"
+            assert not cleared
+            event = r.adapter.handle_message.await_args.args[0]
+            assert kind in event.text and "Choosing delete clears unowned source goals and loops" in event.text
+            # Merely observing a queued wake is not a model owner decision.
+            await retire.advance(r.runner, r.source)
+            assert not cleared
+            assert r.adapter.handle_message.await_count == 1
+            await retire.request(r.runner, r.source, generation=prepared["generation"])
+            await retire.advance(r.runner, r.source)
 
     final = await retire.load(r.runner, r.source)
     assert final is not None and final["phase"] == "done"
@@ -289,10 +316,72 @@ async def test_real_inventory_cancels_active_control_on_topic_retirement(runtime
         r.bot.delete_forum_topic.assert_awaited_once()
     record = json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}"))
     assert record["status"] == "cleared"
+    assert len(cleared) == 1
     assert final["cancelled_controls"][kind]["action"] == "clear"
     assert f"cleared {kind}" in caplog.text
     assert json.loads(r.db.get_meta("goal:unrelated")) == unrelated
     assert await work.inventory(r.runner, r.source, final) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+async def test_preparation_owner_choice_preserves_active_control_without_cancellation(runtime, monkeypatch, kind):
+    r = runtime
+    from hermes_cli import goals, loops
+    manager = goals.GoalManager if kind == "goal" else loops.LoopManager
+    monkeypatch.setattr(manager, "clear", lambda _: pytest.fail("Owner choice must transfer, not cancel"))
+    record = {"status": "active", "goal" if kind == "goal" else "prompt": "Keep the standing commitment"}
+    r.db.set_meta(f"{kind}:{r.entry.session_id}", json.dumps(record))
+    r.state.update(phase="pending", reason="The topic is finished.")
+    await retire.save(r.runner, r.source, r.state)
+    assert not await work.prepare(r.runner, r.source, r.state)
+    assert [item["id"] for item in r.state["preparation"]["items"]] == [kind]
+    assert json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}")) == record
+
+    r.db.create_session("next", source="telegram")
+    dest = {"session_id": "next", "session_key": "next-key", "thread_id": "18", "title": "Service Operations"}
+    monkeypatch.setattr(work, "destination", AsyncMock(return_value=dest))
+    monkeypatch.setattr(work, "receipt", AsyncMock(return_value={"receipt_id": "accepted"}))
+    await retire.request(r.runner, r.source, generation=r.state["generation"], owners={kind: dest["title"]})
+    decided = await retire.load(r.runner, r.source)
+    assert decided is not None
+    assert await work.prepare(r.runner, r.source, decided)
+    successor = json.loads(r.db.get_meta(f"{kind}:next"))
+    assert successor["status"] == "active"
+    assert successor["goal" if kind == "goal" else "prompt"] == "Keep the standing commitment"
+    assert decided["handoffs"][kind]["moved"]
+    assert not decided.get("cancelled_controls")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("fence", ["running", "rebound", "generation", "phase"])
+async def test_absent_finalization_fences_before_clearing_real_control(runtime, monkeypatch, kind, fence):
+    r = runtime
+    record = {"status": "active", "goal" if kind == "goal" else "prompt": "Must survive a declined pass"}
+    r.db.set_meta(f"{kind}:{r.entry.session_id}", json.dumps(record))
+    r.state.update(phase="pending", reason="Topic deletion selected.")
+    await retire.save(r.runner, r.source, r.state)
+
+    async def probe(*args, **kwargs):
+        # The fence changes after the initial binding check but before finalization.
+        if fence == "running":
+            r.runner._is_session_running = lambda _: True
+        elif fence == "rebound":
+            r.runner.session_store.get_or_create_session(r.source, force_new=True)
+        else:
+            newer = {**r.state, "generation": "new"} if fence == "generation" else {**r.state, "phase": "cancelled"}
+            await retire.save(r.runner, r.source, newer, force=True)
+        return []
+
+    monkeypatch.setattr(work, "cli", AsyncMock(side_effect=probe))
+    assert await retire._finalize_absent(r.runner, r.source, r.state, r.bot)
+    assert json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}")) == record
+    final = await retire.load(r.runner, r.source)
+    assert final is not None and not final.get("cancelled_controls")
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
+    r.bot.delete_forum_topic.assert_not_awaited()
+    r.adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -350,7 +439,7 @@ async def test_control_cancellation_does_not_discard_inflight_loop_tick(runtime)
     await retire.save(r.runner, r.source, r.state)
     items = await work.inventory(r.runner, r.source, r.state)
     with pytest.raises(work.WorkInProgress):
-        await work.reconcile_controls(r.runner, r.source, r.state, items)
+        await work.reconcile_controls(r.runner, r.source, r.state, items, confirmed_absent=True)
     record = json.loads(r.db.get_meta(f"loop:{r.entry.session_id}"))
     assert record["status"] == "active" and record["awaiting_response"]
     assert "cancelled_controls" not in (await retire.load(r.runner, r.source))

@@ -17,6 +17,9 @@ from gateway.telegram_retire import save
 from gateway.telegram_retire_context import authored_definition, context_identity, task_context
 
 
+logger = logging.getLogger(__name__)
+
+
 def address(source, session_id):
     return f"hermes:{source.profile or 'default'}/{session_id}"
 
@@ -576,7 +579,7 @@ async def settle_handoffs(runner, source, state):
             await save(runner, source, state)
 
 
-async def reconcile_controls(runner, source, state, items):
+async def reconcile_controls(runner, source, state, items, *, confirmed_absent=False):
     """A selected delete retires session controls, never claims or other obligations."""
     if not state.get("reason") or state.get("target"):
         return items
@@ -585,7 +588,8 @@ async def reconcile_controls(runner, source, state, items):
     from hermes_cli.loops import LoopManager
 
     controls = [item for item in items if item["kind"] in {"goal", "loop"}
-                and item["id"] not in state["handoffs"] and not state.get("owners", {}).get(item["id"])]
+                and item["id"] not in state["handoffs"] and not state.get("owners", {}).get(item["id"])
+                and (confirmed_absent or prepared_control(state, item))]
     if not controls:
         return items
     db = runner._session_db._db
@@ -623,10 +627,16 @@ async def reconcile_controls(runner, source, state, items):
 
     state["cancelled_controls"] = await asyncio.to_thread(db._execute_write, cancel)
     for kind in state["cancelled_controls"]:
-        logging.getLogger(__name__).info("Topic retirement %s cleared %s for session %s: selected topic deletion",
-                                        state["generation"], kind, state["session_id"])
+        logger.info("Topic retirement %s cleared %s for session %s: selected topic deletion",
+                    state["generation"], kind, state["session_id"])
     # Cancellation cannot turn a failed or incomplete inventory into permission to delete.
     return await inventory(runner, source, state)
+
+
+def prepared_control(state, item):
+    """A changed authored control needs a fresh owner choice, not an old omission."""
+    record = state.get("prepared_controls", {}).get(item["id"])
+    return record is not None and _handoff_definition(record) == _handoff_definition(item["record"])
 
 
 async def prepare(runner, source, state):
@@ -634,7 +644,6 @@ async def prepare(runner, source, state):
     await settle_handoffs(runner, source, state)
     try:
         items = await inventory(runner, source, state)
-        items = await reconcile_controls(runner, source, state, items)
     except WorkInProgress as exc:
         return await queue_preparation(runner, source, state, [], busy=str(exc))
     if not state.get("reason") or (state.get("target") and not state.get("context")):
@@ -661,6 +670,8 @@ async def prepare(runner, source, state):
             raise RuntimeError(f"Previously handed-off work still targets this topic: {item['id']}")
         selector = owners.get(item["id"]) or state.get("target")
         if not selector:
+            if item["kind"] in {"goal", "loop"} and prepared_control(state, item):
+                continue  # The preparation decision left this control unowned for deletion.
             # An exact-title hit is a candidate, not proof of subject ownership.
             # The normal session turn verifies the context and records a choice.
             unresolved.append(item)
@@ -692,6 +703,11 @@ async def prepare(runner, source, state):
         return await queue_preparation(runner, source, state, unresolved)
     # Repeating discovery catches work created by a final tool call and stale
     # destinations. Nothing can be deleted on an incomplete/failed inventory.
-    if await inventory(runner, source, state):
+    try:
+        remaining = await inventory(runner, source, state)
+        remaining = await reconcile_controls(runner, source, state, remaining)
+    except WorkInProgress as exc:
+        return await queue_preparation(runner, source, state, [], busy=str(exc))
+    if remaining:
         raise RuntimeError("Open work still points at this topic after handoff")
     return True
