@@ -358,6 +358,17 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # Synthetic authority ids such as "owned" are relative profile homes in scope
+    # readers. Keep their real initialization (including SOUL.md) inside this test,
+    # rather than materializing those profiles in the checkout shared by workers.
+    set_home_override = hermes_constants.set_hermes_home_override
+
+    def isolated_home_override(value):
+        if value is not None and not Path(value).is_absolute():
+            value = fake_hermes_home / "profile-scopes" / value
+        return set_home_override(value)
+
+    monkeypatch.setattr(hermes_constants, "set_hermes_home_override", isolated_home_override)
     # A test that pins the process home (hermes_constants.pin_process_hermes_home) must not
     # leak that module-global into the next test's routed-profile decisions.
     try:
