@@ -37,6 +37,7 @@ from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.run_shutdown_deadlines import GatewayShutdownDeadlinesMixin, bounded_stop_requested
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay, session_store_lock_snapshot
+from gateway.zero_cut_handover_drain import handover_owns_external_drain
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -759,6 +760,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
     def _exit_external_drain(self) -> None:
         """Cancel external drain: re-accept new turns. Idempotent; never resurrects a stopping gateway."""
         if not self._external_drain_active:
+            return
+        if handover_owns_external_drain(self):
+            # The handover owns this shared quiescence until it either fails and restores
+            # transport ownership or hands control to the real shutdown drain.
             return
         self._external_drain_active = False
         if self._draining or not self._running:
