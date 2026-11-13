@@ -1,6 +1,7 @@
 """Scratch dir contract: TMPDIR/TMP/TEMP follow HERMES_HOME/cache/scratch unless the user set them."""
 
 import contextlib
+import errno
 import json
 import os
 import shlex
@@ -678,14 +679,8 @@ def test_midprune_vanished_entry_is_recorded_not_counted(tmp_path: Path) -> None
     assert "re-scan failed" not in log, log
 
 
-def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path: Path) -> None:
-    """R2/P2 on #134173: after rmtree, the removal-confirmation gate uses
-    os.path.lexists(), which swallows OSError from lstat and returns False — so an
-    entry that stayed (rmtree left residue) but became unreadable is counted and
-    recorded as removed. Only an explicit lstat proves absence: FileNotFoundError
-    confirms gone, a successful stat is residue, any other OSError means the
-    removal state is unknown, so the entry is neither counted nor recorded removed.
-    Red on the previous head: removed == 1 and a false 'removed' record."""
+def test_postremoval_residue_is_not_counted_as_removed(tmp_path: Path) -> None:
+    """A rename that leaves the source behind must not count or log a removal."""
     scratch = get_scratch_dir(tmp_path, prune=False)
     entry = scratch / "residue-lane"
     entry.mkdir()
@@ -707,6 +702,44 @@ def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path: Path) 
     assert f"removed {str(entry)!r} (" not in log, log
     assert "could not fully remove" in log, log
     assert "could not confirm removal" not in log, log
+
+
+@pytest.mark.parametrize("move", [False, True], ids=["residue", "moved"])
+@pytest.mark.parametrize("error", [errno.EACCES, errno.EIO])
+def test_postremoval_unreadable_entry_is_not_counted_as_removed(tmp_path, move, error):
+    """Only ENOENT confirms removal; another lstat error leaves the result unknown."""
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "unknown-removal")
+    real_rename, real_lstat = os.rename, os.lstat
+    attempted = False
+    post_move_checks = 0
+
+    def rename(src, dst, *args, **kwargs):
+        nonlocal attempted
+        if move:
+            real_rename(src, dst, *args, **kwargs)
+        attempted = True
+
+    def lstat(path, *args, **kwargs):
+        nonlocal post_move_checks
+        if attempted and os.fspath(path) == os.fspath(entry):
+            post_move_checks += 1
+            # Let hold_expired_entry observe its result, then fail the caller's
+            # independent removal-confirmation check (never lexists()).
+            if post_move_checks > 1:
+                raise OSError(error, "post-move stat failed")
+        return real_lstat(path, *args, **kwargs)
+
+    with patch("hermes_constants_scratch.os.rename", rename), \
+         patch("hermes_constants_scratch.os.lstat", lstat):
+        assert prune_scratch_dir(scratch) == 0
+    log = (tmp_path / "logs" / "scratch-prune.log").read_text(encoding="utf-8")
+    assert f"could not confirm removal of {str(entry)!r}" in log
+    assert f"removed {str(entry)!r} (" not in log
+    assert entry.exists() is not move
+    if move:
+        held = next((tmp_path / "cache" / ".scratch-trash").glob("*/entries/unknown-removal"))
+        assert (held / "sub" / "out.log").read_text(encoding="utf-8") == "old output"
 
 
 @pytest.mark.platforms("posix")
@@ -1073,6 +1106,83 @@ def test_prune_moves_expired_entry_to_restorable_holding_dir(tmp_path):
     assert (entry / "result.txt").read_text(encoding="utf-8") == "restore this"
 
 
+@pytest.mark.platforms("posix")
+def test_holding_dir_resolves_beside_symlink_target_outside_scratch(tmp_path, monkeypatch):
+    import hermes_constants_scratch as retention
+
+    scratch = tmp_path / "home" / "cache" / "scratch"
+    target = tmp_path / "other-volume" / "scratch"
+    scratch.parent.mkdir(parents=True)
+    target.mkdir(parents=True)
+    scratch.symlink_to(target, target_is_directory=True)
+    trash = retention.holding_dir(scratch)
+    assert trash == target.resolve().parent / ".scratch-trash"
+    assert trash.parent.stat().st_dev == scratch.stat().st_dev
+    assert not trash.is_relative_to(scratch.resolve())
+    entry = _idle_entry(scratch, "held-on-target")
+    now = time.time()
+    held = retention.hold_expired_entry(entry, scratch, 0, now)
+    _age_tree(trash)
+    # An old holding root is never selected by the ordinary 24-hour entry scan.
+    monkeypatch.setattr(retention.time, "time", lambda: now + 48 * 3600)
+    assert prune_scratch_dir(scratch) == 0
+    assert (held / "sub" / "out.log").read_text(encoding="utf-8") == "old output"
+
+
+@pytest.mark.platforms("posix")
+def test_prune_symlinked_scratch_avoids_cross_device_rename(tmp_path, monkeypatch):
+    """Emulate a separate volume: rename across the target-volume boundary raises EXDEV."""
+    import hermes_constants_scratch as retention
+
+    scratch = tmp_path / "home" / "cache" / "scratch"
+    target_volume = tmp_path / "other-volume"
+    target = target_volume / "scratch"
+    scratch.parent.mkdir(parents=True)
+    target.mkdir(parents=True)
+    scratch.symlink_to(target, target_is_directory=True)
+    entry = _idle_entry(scratch, "restorable")
+    real_rename = os.rename
+    renamed = []
+
+    def rename(src, dst, *args, **kwargs):
+        if Path(src).resolve().is_relative_to(target_volume.resolve()) != Path(dst).resolve().is_relative_to(target_volume.resolve()):
+            raise OSError(errno.EXDEV, "cross-volume rename")
+        renamed.append((Path(src), Path(dst)))
+        return real_rename(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr(retention.os, "rename", rename)
+    assert prune_scratch_dir(scratch) == 1
+    assert len(renamed) == 1 and not entry.exists()
+    held = renamed[0][1]
+    record = json.loads((held.parent.parent / "manifest.jsonl").read_text(encoding="utf-8"))
+    assert record["original"] == str(entry) and record["held"] == str(held)
+    held.rename(entry)
+    assert (entry / "sub" / "out.log").read_text(encoding="utf-8") == "old output"
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("mode", [None, "2770"])
+def test_holding_directories_follow_scratch_permission_policy(tmp_path, monkeypatch, mode):
+    import hermes_constants_scratch as retention
+
+    TestScratchDirPermissionPolicy()._isolate_env(monkeypatch, tmp_path)
+    if mode is not None:
+        monkeypatch.setenv("HERMES_HOME_MODE", mode)
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    entry = _idle_entry(scratch, "private")
+    trash = retention.holding_dir(scratch)
+    # Existing directories from an older pass must also be tightened.
+    trash.mkdir(mode=0o755)
+    os.chmod(trash, 0o755)
+    assert prune_scratch_dir(scratch) == 1
+    assert not entry.exists()
+    held = next(trash.glob("*/entries/private"))
+    expected = stat.S_IMODE(scratch.stat().st_mode)
+    assert expected == (0o700 if mode is None else _expected_mode(int(mode, 8), scratch))
+    for directory in (trash, held.parent.parent, held.parent):
+        assert stat.S_IMODE(directory.stat().st_mode) == expected
+
+
 def test_prune_purges_holding_entries_after_seven_days(tmp_path, monkeypatch):
     scratch = get_scratch_dir(tmp_path, prune=False)
     entry = scratch / "old-hold"
@@ -1111,6 +1221,26 @@ def test_prune_keeps_enabled_job_references_but_not_disabled_jobs(tmp_path):
     assert prune_scratch_dir(scratch) == 2
     assert referenced.exists()
     assert not disabled.exists() and not free.exists()
+
+
+@pytest.mark.parametrize("field", ["prompt", "script", "script_args", "args", "command"])
+@pytest.mark.parametrize("container", [str, list, dict], ids=["string", "argv", "mapping"])
+def test_job_references_match_raw_windows_paths(tmp_path, monkeypatch, field, container):
+    """Windows path text is data, even on POSIX; JSON escaping must not change the matcher input."""
+    import hermes_constants_scratch as retention
+
+    scratch = get_scratch_dir(tmp_path, prune=False)
+    referenced = _idle_entry(scratch, "referenced")
+    free = _idle_entry(scratch, "free")
+    prefix = r"C:\Users\tester\.hermes\cache\scratch"
+    text = prefix + r"\referenced\sub\out.log"
+    value = {str: text, list: ["--input", text], dict: {"input": text}}[container]
+    jobs = tmp_path / "cron" / "jobs.json"
+    jobs.parent.mkdir()
+    jobs.write_text(json.dumps({"jobs": [{"enabled": True, field: value}]}), encoding="utf-8")
+    monkeypatch.setattr(retention, "_job_spellings", lambda root: [prefix])
+    assert prune_scratch_dir(scratch) == 1
+    assert referenced.exists() and not free.exists()
 
 
 def test_prune_moves_symlink_without_following_target(tmp_path):
