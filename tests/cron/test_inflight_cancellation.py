@@ -8,8 +8,7 @@ from unittest.mock import Mock
 
 import pytest
 
-import cron.jobs as jobs
-import cron.scheduler as scheduler
+from cron import jobs, scheduler
 import tools.cronjob_tools  # registers the public tool
 from agent.interrupt_scope import track_in_interrupt_scope
 from tools.registry import registry
@@ -124,6 +123,53 @@ def test_remote_claim_reports_running_but_not_interrupted(isolated_store, action
     assert "may still perform side effects" in receipt["warning"]
     if action == "pause":
         assert not jobs.heartbeat_fire_claim(job["id"], expected_owner=claimed["fire_claim"]["by"])
+
+
+def test_remove_detached_no_agent_run_reports_and_cancels_live_execution(isolated_store, monkeypatch):
+    """A detached script is not in this process's cancellation registry."""
+    from cron import detached_authority, executions
+
+    job = jobs.create_job(
+        prompt="send", schedule="every 5m", deliver="local", no_agent=True, script="send.py")
+    live = executions.create_execution(job["id"], source="external")
+    executions.mark_execution_running(live["id"])
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET owner_kind='detached' WHERE id=?", (live["id"],))
+    live = executions.get_execution(live["id"])
+    assert live is not None
+
+    receipt = dispatch("remove", job_id=job["id"])
+
+    assert receipt["success"] is True
+    assert receipt["was_running"] is True
+    assert receipt["interrupted"] is True
+    assert receipt["run_id"] == live["id"]
+    assert detached_authority._cancel_path(job["id"], live["id"]).exists()
+
+
+def test_detached_interrupt_is_idempotent_when_execution_finishes(isolated_store, monkeypatch):
+    """A terminal race must not turn a second stop request into an exception."""
+    from cron import detached_authority, executions
+    from cron.scheduler_control import interrupt_job_run
+
+    job = jobs.create_job(
+        prompt="send", schedule="every 5m", deliver="local", no_agent=True, script="send.py")
+    live = executions.create_execution(job["id"], source="external")
+    executions.mark_execution_running(live["id"])
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET owner_kind='detached' WHERE id=?", (live["id"],))
+    live = executions.get_execution(live["id"])
+    reads = iter((live, None))
+    cancelled = Mock(return_value=True)
+    monkeypatch.setattr(executions, "live_inflight_execution", lambda job_id: next(reads))
+    monkeypatch.setattr(detached_authority, "cancel_detached", cancelled)
+
+    first = interrupt_job_run(job)
+    second = interrupt_job_run(job)
+
+    assert first["was_running"] is True and first["interrupted"] is True
+    assert second["was_running"] is False and second["interrupted"] is False
+    cancelled.assert_called_once_with(live)
 
 
 @pytest.mark.parametrize("action", ["remove", "pause"])
