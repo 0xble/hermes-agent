@@ -60,16 +60,34 @@ def _report(name: str, payload: dict) -> None:
 
 
 def _scan(root: Path, canary: bytes) -> list[str]:
+    """Find raw canaries and the hex representation emitted by command STT."""
     hits: list[str] = []
     if not root.exists():
         return hits
+    needles = (canary, canary.hex().encode("ascii"))
     for path in root.rglob("*"):
         try:
-            if path.is_file() and not path.is_symlink() and canary in path.read_bytes():
-                hits.append(str(path.relative_to(root)))
+            if path.is_file() and not path.is_symlink():
+                data = path.read_bytes()
+                if any(needle in data for needle in needles):
+                    hits.append(str(path.relative_to(root)))
         except OSError:
             pass
     return sorted(hits)
+
+
+def test_scan_detects_raw_and_command_stt_but_not_clean_artifacts(tmp_path):
+    canary = ("incognito-" + secrets.token_hex(24)).encode()
+    (tmp_path / "raw-only").write_bytes(canary)
+    encoded = ("[in:heard] voice-" + canary.hex()).encode()
+    assert canary not in encoded, "encoded control must not also contain raw bytes"
+    (tmp_path / "encoded-only").write_bytes(encoded)
+    (tmp_path / "clean").write_bytes(b"unrelated fixture content")
+    assert _scan(tmp_path, canary) == ["encoded-only", "raw-only"]
+    (tmp_path / "raw-only").unlink()
+    assert _scan(tmp_path, canary) == ["encoded-only"]
+    (tmp_path / "encoded-only").unlink()
+    assert _scan(tmp_path, canary) == []
 
 
 def _roots(gw, private_parent: Path) -> list[tuple[str, Path]]:

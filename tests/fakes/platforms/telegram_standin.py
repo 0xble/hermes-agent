@@ -15,6 +15,7 @@ reserved character outside an entity must be backslash-escaped, else ``400 can't
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import itertools
 import re
 import time
@@ -147,7 +148,10 @@ class TelegramStandin(StandinServer):
             reader = await request.multipart()
             async for part in reader:
                 if part.filename:
-                    params[part.name] = {"filename": part.filename, "size": len(await part.read())}
+                    data = await part.read()
+                    params[part.name] = {"filename": part.filename, "size": len(data)}
+                    if part.name == "photo":
+                        params[part.name]["sha256"] = hashlib.sha256(data).hexdigest()
                 else:
                     params[part.name] = decode_value(await part.text())
         elif request.can_read_body:
@@ -354,6 +358,18 @@ class TelegramStandin(StandinServer):
         chat = {"id": int(user_id), "type": "private", "first_name": "Tester"}
         fields: dict[str, Any] = {"document": {"file_id": fid, "file_unique_id": f"u-{fid}", "file_name": filename,
                                                "mime_type": mime, "file_size": len(data)}}
+        if caption:
+            fields["caption"] = caption
+        return self._inbound(chat, user_id, **fields)
+
+    def dm_photo(self, user_id: int, data: bytes, caption: str = "") -> dict[str, Any]:
+        """Queue a native Telegram photo with one photo-size variant."""
+        fid = f"photo-{len(self.files) + 1}"
+        self.files[fid] = data
+        self.file_paths[fid] = f"photos/{fid}.jpg"
+        chat = {"id": int(user_id), "type": "private", "first_name": "Tester"}
+        fields: dict[str, Any] = {"photo": [{"file_id": fid, "file_unique_id": f"u-{fid}",
+                                               "file_size": len(data), "width": 32, "height": 32}]}
         if caption:
             fields["caption"] = caption
         return self._inbound(chat, user_id, **fields)
