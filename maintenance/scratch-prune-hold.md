@@ -6,7 +6,12 @@
 
 The 24-hour scratch prune must not make an irreversible delete. After process and worktree
 reaping, an expired top-level entry is moved with same-volume `os.rename` into
-`<home>/cache/.scratch-trash/<UTC-date>/entries/<relative path>`. A JSONL manifest at
+`<realpath(scratch).parent>/.scratch-trash/<UTC-date>/entries/<relative path>`. For a
+non-symlinked scratch this is `<home>/cache/.scratch-trash`; for a symlink onto another volume,
+it stays beside the target rather than crossing volumes from the configured home. As a sibling,
+the holding root cannot be selected as a normal scratch entry. The holding root, day directories,
+and `entries/` directories follow `apply_secure_dir_policy` using the configured owning home,
+including existing directories from earlier passes. A JSONL manifest at
 `<UTC-date>/manifest.jsonl` records the original path, apparent tree size, source mtime, prune
 timestamp, and holding path. Entries live under `entries/` so no scratch entry name can collide
 with the manifest. A later pass purges held entries older than seven days and appends a `purged`
@@ -19,7 +24,9 @@ the existing stuck-entry state outside `entries/` and is not retried every pass.
 
 Existing `.keep` and transitive `input-pins.json` retention is unchanged. Enabled cron jobs are
 also scanned using the Fleet generator's PR #691 field set and token matcher (`prompt`, `script`,
-`script_args`, `args`, `command`); a literal scratch path keeps its top-level entry. Disabled
+`script_args`, `args`, `command`); a literal scratch path keeps its top-level entry. Matching
+uses raw string values (including strings nested in argv lists and mappings), not JSON-encoded
+text, so Windows backslash prefixes are preserved. Disabled
 jobs do not retain inputs. A missing jobs file retains nothing; malformed or unreadable jobs data
 fails closed for that pass.
 
@@ -37,6 +44,11 @@ manual: move a held entry back to its recorded original path before the seven-da
 
 Contract tests: `tests/test_scratch_dir.py::test_prune_moves_expired_entry_to_restorable_holding_dir`
   `tests/test_scratch_dir.py::test_prune_purges_holding_entries_after_seven_days`
+  `tests/test_scratch_dir.py::test_holding_dir_resolves_beside_symlink_target_outside_scratch`
+  `tests/test_scratch_dir.py::test_prune_symlinked_scratch_avoids_cross_device_rename`
+  `tests/test_scratch_dir.py::test_holding_directories_follow_scratch_permission_policy`
+  `tests/test_scratch_dir.py::test_job_references_match_raw_windows_paths`
+  `tests/test_scratch_dir.py::test_postremoval_unreadable_entry_is_not_counted_as_removed`
   `tests/test_scratch_dir.py::test_prune_keeps_enabled_job_references_but_not_disabled_jobs`
   `tests/test_scratch_dir.py::test_prune_moves_symlink_without_following_target`
   `tests/test_scratch_dir.py::test_entry_named_manifest_is_held_intact_and_restorable`
