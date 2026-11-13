@@ -79,7 +79,7 @@ def test_unknown_stored_alias_refuses_before_any_store_write(tmp_path):
     assert path.read_bytes() == before
 
 
-def test_subscription_migration_removes_paid_proxy_credentials_and_fallbacks():
+def test_alias_migration_preserves_proxy_credentials_and_fallback_policy():
     before = _config()
     before['model'].update(default='gpt-6.1-sol', provider='custom:openai-proxy',
                            api_key='test-key', base_url='https://proxy.invalid/v1')
@@ -87,11 +87,10 @@ def test_subscription_migration_removes_paid_proxy_credentials_and_fallbacks():
     before['model_presets']['delegation-sol']['model'] = 'gpt-6.1-sol'
     before['fallback_providers'] = [{'provider': 'openai', 'model': 'paid'}]
     after, _ = migrate_document(before)
-    assert after['model']['provider'] == 'openai-codex'
-    assert 'api_key' not in after['model'] and 'base_url' not in after['model']
-    assert after['fallback_providers'] == []
+    assert after['model'] == before['model']
+    assert after['fallback_providers'] == before['fallback_providers']
     route = after['delegation']['backends']['model_map']['options'][0]
-    assert after['model_aliases']['delegation-sol']['provider'] == 'openai-codex'
+    assert after['model_aliases']['delegation-sol']['provider'] == 'custom:openai-proxy'
     assert route['provider'] == 'custom:openai-proxy'
     assert route['fallback_providers'][0]['model'] == 'gpt-6.1-terra'
 
@@ -117,19 +116,12 @@ def test_migration_persists_disabled_routes_as_comments_through_config_writer(tm
     }
 
 
-def test_cli_dry_run_reads_bom_config_and_grant_without_writing(tmp_path, monkeypatch, capsys):
-    import time
+def test_cli_dry_run_reads_bom_config_without_writing(tmp_path, capsys):
     from hermes_cli.config_migrations_model_aliases import main
 
     config = tmp_path / "config.yaml"
     config.write_text(json.dumps(_config()), encoding="utf-8-sig")
-    grant = tmp_path / "cached-grant.json"
-    grant.write_text(json.dumps({"type": "codex", "access_token": "fixture",
-                                 "refresh_token": "fixture"}), encoding="utf-8-sig")
-    monkeypatch.setattr("hermes_cli.auth_constants._decode_jwt_claims", lambda _: {"exp": time.time() + 7200})
-    monkeypatch.setattr("hermes_cli.auth_codex._save_codex_tokens",
-                        lambda *args, **kwargs: pytest.fail("dry run wrote credentials"))
-    before = {path: path.read_bytes() for path in (config, grant)}
-    assert main(["--home", str(tmp_path), "--dry-run", "--codex-auth-source", str(grant)]) == 0
+    before = config.read_bytes()
+    assert main(["--home", str(tmp_path), "--dry-run"]) == 0
     assert "DRY RUN" in capsys.readouterr().out
-    assert all(path.read_bytes() == body for path, body in before.items())
+    assert config.read_bytes() == before

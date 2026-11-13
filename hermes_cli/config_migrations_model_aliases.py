@@ -17,23 +17,6 @@ _REFERENCE = re.compile(r"\A@([A-Za-z0-9_-]+)\Z")
 _ALIAS_FIELDS = ("model", "provider", "base_url", "api_key", "key_env", "reasoning_effort", "service_tier")
 
 
-def subscription_routes(value: Any, changes: list[str], path: str = "") -> None:
-    """Codex labels use the OAuth provider, never an API-key proxy's fallback pool."""
-    if isinstance(value, list):
-        for i, item in enumerate(value):
-            subscription_routes(item, changes, f"{path}[{i}]")
-    elif isinstance(value, dict):
-        model = str(value.get("model") or value.get("default") or "")
-        if value.get("provider") == "custom:openai-proxy" and model.startswith("gpt-"):
-            value["provider"] = "openai-codex"
-            for key in ("base_url", "api_key", "key_env", "api_mode"):
-                value.pop(key, None)
-            changes.append(f"{path}: Codex subscription OAuth, API-key proxy removed")
-        for key, item in value.items():
-            if key != "backends":
-                subscription_routes(item, changes, f"{path}.{key}" if path else key)
-
-
 def rewrite_references(value: Any, aliases: dict, changes: list[str], path: str = "") -> Any:
     """Rewrite exact old route references, leaving prompts and unrelated text alone."""
     if isinstance(value, list):
@@ -117,10 +100,7 @@ def _migrate_delegation(delegation: dict, changes: list[str]) -> bool:
 def migrate_document(config: dict) -> tuple[dict, list[str]]:
     cfg = copy.deepcopy(config)
     changes: list[str] = []
-    retiring_presets = "model_presets" in cfg
     aliases = _migrate_aliases(cfg, changes)
-    if retiring_presets:
-        subscription_routes(cfg, changes)
     delegation = cfg.get("delegation") or {}
     if not isinstance(delegation, dict):
         raise ValueError("delegation must be a mapping")
@@ -139,9 +119,6 @@ def migrate_document(config: dict) -> tuple[dict, list[str]]:
             option["provider"] = alias["provider"]
             changes.append(f"model_map.{option.get('name')}: provider follows model_aliases")
     cfg = rewrite_references(cfg, aliases, changes)
-    if isinstance(cfg.get("model"), dict) and cfg["model"].get("provider") == "openai-codex" and cfg.get("fallback_providers"):
-        cfg["fallback_providers"] = []
-        changes.append("fallback_providers: [] (Codex subscription only)")
     return cfg, changes
 
 
@@ -192,27 +169,12 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--home", type=Path, default=Path(get_hermes_home()))
     parser.add_argument("--dry-run", action="store_true")
-    parser.add_argument("--codex-auth-source", type=Path,
-                        help="Import a currently valid cached Codex OAuth grant into the selected home without refreshing it")
     args = parser.parse_args(argv)
     token = set_hermes_home_override(str(args.home.resolve()))
     try:
         path = args.home / "config.yaml"
         before = read_config_doc(path) or {}
         after, changes = migrate_document(before)
-        if args.codex_auth_source:
-            import time
-            from hermes_cli.auth_constants import _decode_jwt_claims
-            grant = json.loads(args.codex_auth_source.read_text(encoding="utf-8-sig"))
-            if (grant.get("type") != "codex" or grant.get("disabled")
-                    or not grant.get("refresh_token")
-                    or _decode_jwt_claims(grant.get("access_token", "")).get("exp", 0) < time.time() + 3600):
-                raise ValueError("Codex source must contain an enabled OAuth grant valid for at least 1 hour, no refresh attempted")
-            if not args.dry_run:
-                from hermes_cli.auth_codex import _save_codex_tokens
-                _save_codex_tokens({k: grant[k] for k in ("access_token", "refresh_token", "id_token") if k in grant},
-                                   set_active=False, write_through=False)
-            changes.append("Imported cached Codex subscription grant into selected home, no refresh or source write")
         changes += migrate_stores(args.home, after.get("model_aliases", {}), dry_run=args.dry_run)
         if not args.dry_run and before != after:
             atomic_config_replace(path, after)

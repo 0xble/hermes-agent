@@ -28,11 +28,9 @@ advanced-delegation, and leaves 5 Claude options commented until the proxy prote
 Brian's 25% reserve. The existing update/startup plugin migration installs the
 official Advanced Delegation plugin when legacy routing or the migrated backend
 requires it. A later explicit plugin removal remains respected. The supplied
-custom proxy IDs and fallback IDs are preserved. The
-shared proxy's paid API-key pool remains an activation blocker for a strict
-subscription-only guarantee. Isolated proofs use a disposable OAuth-only proxy.
-Old GPT preset aliases use native openai-codex with no paid fallback. The optional
-`--codex-auth-source PATH` imports a cached unexpired grant without refreshing it.
+custom proxy IDs and fallback IDs are preserved. The shared proxy's API-key pool
+and the user's stated free-credit and auto-top-up policy remain an external
+billing-state limitation, not something this migration changes or can prove.
 
 Retire this seam when upstream persists and resolves alias names at all these
 boundaries. Contract tests: tests/hermes_cli/test_model_alias_migration.py and
