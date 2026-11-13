@@ -1608,7 +1608,7 @@ def dump_api_request_debug(
         dump_file = agent.logs_dir / f"request_dump_{safe_sid}_{datetime.now().strftime('%Y%m%d_%H%M%S_%f')}.json"
         # Redact secrets first: this fires unconditionally on API errors and captures the full
         # request body, so context-embedded secrets would otherwise land in cleartext on disk.
-        from agent.redact import redact_sensitive_json
+        from agent.redact_json import redact_sensitive_json
         _plain = json.loads(json.dumps(dump_payload, ensure_ascii=False, default=str))
         from agent.request_debug import bounded_request_dump, prune_request_dumps
         _redacted_payload = bounded_request_dump(redact_sensitive_json(_plain, force=True))

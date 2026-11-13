@@ -70,6 +70,8 @@ jobs:
         run: |
           useradd --uid 1001 --create-home --shell /bin/bash ci
           chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"
+          runuser -u ci -- env HOME="$HOME" ./bin/ci setup
+          bash ci/prepare-electron-sandbox.sh
           runuser -u ci -- env HOME="$HOME" ./bin/ci gate '${{ github.event.pull_request.head.sha }}'
   python-shard:
     name: Python and e2e (${{ matrix.shard }}/10)

@@ -8,9 +8,9 @@ import json
 import pytest
 
 from agent import redact
+from agent.redact_json import redact_sensitive_json
 from agent.redact import (
     clear_vault_redaction_values,
-    redact_sensitive_json,
     register_vault_date_component,
     register_vault_redaction_value,
     register_vault_card_component,

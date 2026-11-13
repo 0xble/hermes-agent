@@ -36,7 +36,8 @@ def harness_env(tmp_path, monkeypatch):
             return None
 
     monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY", _Registry())
-    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda: {"browser": {}})
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda: {
+        "browser": {"cdp_url": "ws://127.0.0.1:47000/devtools/browser/x"}})
     monkeypatch.setattr("tools.browser_session_cdp.resolve_cdp_override", lambda url: url)
     cli = tmp_path / "browser-harness"
     cli.write_text('#!/bin/sh\ncat > /dev/null\necho "{\\"home\\": \\"$HOME\\", \\"runtime\\": \\"$BH_RUNTIME_DIR\\", '

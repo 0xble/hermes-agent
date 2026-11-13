@@ -98,9 +98,10 @@ def test_origin_probe_failure_protects_dispatch_and_snapshot_cache(
 
 @pytest.mark.parametrize("origin", [ORIGIN, ""])
 def test_default_tab_card_values_do_not_become_global_masks(origin):
+    from agent.redact_json import redact_sensitive_json
     from agent.redact import (
         redact_registered_vault_number, redact_registered_vault_values,
-        redact_sensitive_json, redact_sensitive_text, register_vault_card_component, register_vault_date_component,
+        redact_sensitive_text, register_vault_card_component, register_vault_date_component,
     )
     from tools.browser_tool_snapshot import _redact_browser_output
 

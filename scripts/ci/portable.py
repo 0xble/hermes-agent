@@ -888,7 +888,7 @@ def setup(env: dict[str, str]) -> None:
     pm_setup_phase('dependencies', env, '--extras', json.dumps(EXTRAS), '--test-environment')
     require_tools(('uv', 'node', 'npm', 'pnpm'), env)
     run(['node', 'scripts/build/node-deps.mjs', '--source', str(ROOT), '--reuse',
-         *[arg for workspace in ('apps/desktop', 'ui-tui', 'ui-tui/packages/hermes-ink', 'web', 'tests-js')
+         *[arg for workspace in ('apps/desktop', 'apps/bootstrap-installer', 'ui-tui', 'ui-tui/packages/hermes-ink', 'web', 'tests-js')
            for arg in ('--workspace', workspace)]], env=env)
     run(['npm', 'ci', '--no-audit', '--no-fund'], cwd=ROOT / 'website', env=env)
     run([python(env), '-c',

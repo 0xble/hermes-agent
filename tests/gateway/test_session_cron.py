@@ -58,7 +58,7 @@ async def test_cron_delivery_retries_when_another_restore_publishes_live_session
     sid = "chat"
     live = LiveSession(SimpleNamespace(platform=Platform.LOCAL), "route")
     authority = SimpleNamespace(
-        sessions={sid: object()},
+        sessions={sid: LiveSession(SimpleNamespace(platform=Platform.LOCAL), "previous-route")},
         db=SimpleNamespace(db_path=tmp_path / "state.db"),
         runner=SimpleNamespace(adapters={Platform.LOCAL: object()}),
     )
