@@ -1,4 +1,5 @@
 """Process-local callback provenance; private snapshots are revalidated, not grants."""
+import asyncio
 from contextlib import contextmanager
 from copy import copy
 from contextvars import ContextVar
@@ -7,8 +8,11 @@ import weakref
 import hashlib
 import hmac
 import json
+import logging
 
 from hermes_state_runtime import RuntimeStoreError
+
+logger = logging.getLogger(__name__)
 
 _callback: ContextVar[tuple | None] = ContextVar('native_ingress_callback', default=None)
 _relay_callback: ContextVar[tuple | None] = ContextVar('relay_ingress_callback', default=None)
@@ -132,13 +136,54 @@ def _runtime_profile(runner, source, profile, owner_name, homes, relay):
     return owner_name
 
 
-def _binding(runner, source, profile):
+def _registry_candidates(runner, platform):
     registries = [(None, runner.adapters), *getattr(runner, '_profile_adapters', {}).items()]
+    return [(owner, mapping.get(platform)) for owner, mapping in registries]
+
+
+def _slot_adapter(candidates, profile):
+    return next((adapter for owner, adapter in candidates if owner == profile), None)
+
+
+# A platform adapter leaves its registry slot when it goes fatal and returns when the reconnect
+# watcher installs the replacement: the first retry is immediate and the watcher ticks every 10s,
+# so a reconnect that succeeds lands well inside this bound (the next retry backs off 30s).
+ADAPTER_RECONNECT_WAIT_S = 30.0
+_ADAPTER_RECONNECT_POLL_S = 0.25
+
+
+async def await_reconnecting_adapter(runner, envelope, stopping):
+    """Wait, bounded, for a restored turn's adapter slot to refill after a reconnect.
+
+    Only an EMPTY slot waits: ``_binding`` still decides every identity check (an ambiguous
+    registration, a profile or connector mismatch) once this returns, and a slot still empty at
+    the bound fails there as ``not_found`` exactly as before."""
+    provenance = envelope.get('provenance')
+    if not isinstance(provenance, dict):
+        return
+    from gateway.config import Platform
+    platform = Platform.RELAY if 'relay' in provenance else Platform(envelope['source']['platform'])
+    profile = provenance.get('transport_profile')
+    if _slot_adapter(_registry_candidates(runner, platform), profile) is not None:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + ADAPTER_RECONNECT_WAIT_S
+    logger.info('Admitted turn waiting up to %.0fs for the %s adapter (profile %s) to reconnect',
+                ADAPTER_RECONNECT_WAIT_S, platform.value, profile or 'primary')
+    while _slot_adapter(_registry_candidates(runner, platform), profile) is None:
+        if stopping() or loop.time() >= deadline:
+            logger.warning('%s adapter (profile %s) still absent; the admitted turn fails',
+                           platform.value, profile or 'primary')
+            return
+        await asyncio.sleep(_ADAPTER_RECONNECT_POLL_S)
+
+
+def _binding(runner, source, profile):
     from gateway.config import Platform
     relay = source.delivered_via_upstream_relay is True
     platform = Platform.RELAY if relay else source.platform
-    candidates = [(owner, mapping.get(platform)) for owner, mapping in registries]
-    adapter = next((adapter for owner, adapter in candidates if owner == profile), None)
+    candidates = _registry_candidates(runner, platform)
+    adapter = _slot_adapter(candidates, profile)
     if adapter is None or sum(item is adapter for _, item in candidates) != 1:
         raise RuntimeStoreError('not_found')
     home = getattr(runner, '_native_transport_homes', {}).get(profile)
