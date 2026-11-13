@@ -220,7 +220,7 @@ class PortableGateTests(unittest.TestCase):
                 self.assertNotIn('scripts/ci/portable.py', ci.source_files())
                 ci.run([
                     sys.executable, '-c',
-                    'from pathlib import Path; Path(r"%s").write_text(str(Path.cwd().resolve()))' % probe,
+                    f'from pathlib import Path; Path(r"{probe}").write_text(str(Path.cwd().resolve()))',
                 ])
                 config = root / 'gitconfig'
                 bound = ci.git_environment(config_path=config)
@@ -872,7 +872,7 @@ try {
             self.assertEqual(ci.main(), 1)
             self.assertEqual(seen, ['setup', 'static', ('tests',), 'e2e', 'node', 'docs', 'rust', 'container_lint'])
 
-    def test_local_exact_gate_owns_full_coverage_while_hosted_uses_matrix_partition(self):
+    def test_exact_gate_runs_the_bounded_partition_locally_and_hosted(self):
         for hosted in ('', 'true'):
             with self.subTest(hosted=hosted), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
                 stack.enter_context(patch.dict(os.environ, {'GITHUB_ACTIONS': hosted}))
@@ -888,8 +888,7 @@ try {
                 for name in ('static', 'node', 'node_gate', 'docs', 'rust', 'container_lint', 'python_tests', 'e2e_tests'):
                     stack.enter_context(patch.object(ci, name, side_effect=lambda *args, name=name: seen.append(name)))
                 self.assertEqual(ci.main(), 0)
-                self.assertEqual(seen, ['static', 'node_gate'] if hosted else
-                                 ['static', 'python_tests', 'e2e_tests', 'node', 'docs', 'rust', 'container_lint'])
+                self.assertEqual(seen, ['static', 'node_gate'])
 
     def test_e2e_lane_bounds_only_the_upgrade_suite_higher_and_runs_both_parts(self):
         calls = []

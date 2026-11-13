@@ -1256,7 +1256,7 @@ def main() -> int:
             'native-os': lambda: native_os(env, args.workers),
         }
         selected = (['python-shard'] if args.shard else args.lane or
-                    (list(GATE_LANES) if args.command == 'gate' and os.environ.get('GITHUB_ACTIONS') == 'true' else
+                    (list(GATE_LANES) if args.command == 'gate' else
                      ['native-os'] if args.command == 'nightly-native' else list(LANES)))
         if args.shard:
             lanes['python-shard'] = lambda: python_shard(env, args.workers, shard_index, shard_count)

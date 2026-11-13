@@ -423,11 +423,13 @@ Host-specific cases use one native `platforms` marker. Real profile and adapter 
 
 The startup-gate config read uses the repository-required `utf-8-sig` decoding policy. Its safe YAML parser already accepts a BOM, so this correction is a source-policy alignment, not a reproduced runtime decoding failure. The existing public A→B→A startup invariant exercises BOM and BOM-less configurations. Mutable startup-gate fixtures use upstream's `hermes_yaml` owner rather than the removed PyYAML dependency. The historical frozen outbox fixture remains unchanged and its child receives the actual `pyyaml==6.0.3` dependency from that release in a disposable local dependency directory. It does not restore PyYAML to the current runtime or substitute a fake module.
 
-Local exact-SHA `bin/ci gate` runs every source lane, including Python, E2E,
-full Node, documentation, Rust and container lint. The hosted gate keeps its
-bounded static/Node partition because its qualification job separately requires
-the Python shard matrix. A local receipt has no hosted matrix to supply that
-coverage, so its gate must execute the complete source profile itself.
+Exact-SHA `bin/ci gate` runs the same bounded static/Node partition locally and
+hosted. Full Python and E2E coverage comes from the hosted shard matrix, which
+`qualification` requires, and landing requires both that check and the local
+receipt, so a receipt never stands in for the matrix. Running every source lane
+locally cannot finish inside the heavy slot's 5400-second hold on this host, so it
+would block every exact-head receipt. Complete local coverage stays available
+through `bin/ci full` and `bin/ci nightly`.
 
 The v0.23.1 reusable `repo-guards.yml` had no caller after the fork replaced upstream `ci.yaml`. The fork gate calls it on the exact PR head with every guard lane enabled, and qualification requires its success. It uses the same standard Ubuntu runner and pinned checkout action as the fork gate, without an external runner service. The reusable-workflow caller regression remains. Static also invokes upstream's lazy-dependency-import and blob-size guards. Two tests of lane orchestration isolate bootstrap-tool lookup while preserving real lane aggregation/retry assertions; dedicated resolver tests still exercise exact, missing and mismatched pins. PM docs generations sit under `.ci/environments/docs`, keeping PM's stable parent lock inside ignored checkout state instead of creating `.locks/.ci.lock` in source.
 
