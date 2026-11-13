@@ -468,6 +468,20 @@ async def test_post_delivery_cleanup_keeps_the_registering_turns_trigger(tmp_pat
         reset_trigger(token)
 
 
+@pytest.mark.asyncio
+async def test_post_delivery_registration_reports_success_and_honours_first(tmp_path):
+    """Deferred goal bookkeeping only waits for delivery when registration says True; a ``first``
+    signal must run ahead of the bubble cleanup chained before it."""
+    adapter = _adapter(tmp_path)
+    order = []
+    assert adapter.register_post_delivery_callback("sk", lambda: order.append("cleanup"), generation=1) is True
+    assert adapter.register_post_delivery_callback(
+        "sk", lambda: order.append("delivered"), generation=1, first=True) is True
+    assert adapter.register_post_delivery_callback("sk", lambda: None, generation=0) is False
+    await adapter._fire_post_delivery_callback("sk", 1)
+    assert order == ["delivered", "cleanup"]
+
+
 # --- Daily call budget (2026-10-24: 36261s ban at 19875 calls, 10116 of them from typed turns) ---
 
 
