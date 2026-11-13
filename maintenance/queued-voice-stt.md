@@ -52,10 +52,9 @@ transcript echo, or queued follow-up drain.
 ## Verification
 
 Contract tests: `tests/gateway/test_voice_admission_prefetch.py` covers two clips across idle,
-claim-race, started-row, durable `/queue` and relay admissions, unchanged text handling,
-FIFO execution, single-call/single-echo adoption, and restart recovery before preparation.
-
-Also: `tests/gateway/test_queued_voice_durable_fifo.py::test_voice_queued_behind_running_turn_echoes_before_it_finishes_and_is_transcribed_once`,
+  claim-race, started-row, durable /queue and relay admissions, unchanged text handling,
+  FIFO execution, single-call/single-echo adoption, and restart recovery before preparation;
+  pinned with `tests/gateway/test_queued_voice_durable_fifo.py::test_voice_queued_behind_running_turn_echoes_before_it_finishes_and_is_transcribed_once`,
   `tests/gateway/test_telegram_voice_v0_regressions.py::test_queued_voice_transcribes_immediately_and_drain_reuses_it`,
   `tests/gateway/test_telegram_voice_v0_regressions.py::test_fifo_voice_from_queue_command_prefetches_before_drain`
 
