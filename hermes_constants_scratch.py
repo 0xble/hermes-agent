@@ -642,12 +642,21 @@ def _parse_pruned_at(value: object) -> float | None:
 
 
 def _ensure_real_dir(path: Path, *, home: Path) -> bool:
-    """Create *path* as a real directory. A symlink (or junction) at that name is refused."""
+    """Create *path* only when it is this user's private 0700 directory.
+
+    Holding directories are security boundaries, not ordinary Hermes-home directories: they may
+    never be shared with another uid or a group. Existing directories are deliberately refused
+    when their mode or owner is wrong instead of being repaired underneath a concurrent writer.
+    """
+    if not hasattr(os, "getuid"):
+        return False
+    created = False
     try:
         os.lstat(path)
     except FileNotFoundError:
         try:
             path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            created = True
         except OSError:
             return False
     except OSError:
@@ -658,9 +667,13 @@ def _ensure_real_dir(path: Path, *, home: Path) -> bool:
         return False
     if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or _is_dir_link(path):
         return False
-    from hermes_constants import apply_secure_dir_policy
-    apply_secure_dir_policy(path, home=home)
-    return True
+    if created:
+        try:
+            os.chmod(path, 0o700)
+            st = os.lstat(path)
+        except OSError:
+            return False
+    return st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700
 
 
 def _unique_hold_dest(dest: Path) -> Path:
@@ -725,6 +738,10 @@ def hold_expired_entry(entry: Path, scratch_root: Path, size: int, now: float) -
     try:
         os.lstat(entry)
     except FileNotFoundError:
+        pass
+    except OSError:
+        # The rename is atomic; an inspection failure after it must not lose the audit record.
+        # Continue as if the source were absent, and let the manifest be the purge clock.
         pass
     else:
         return None
@@ -825,6 +842,14 @@ def _manifest_ages(text: str) -> dict[str, float]:
     return ages
 
 
+def _day_start(name: str) -> float | None:
+    try:
+        day = datetime.datetime.strptime(name, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return day.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
 def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -> int:  # health: allow CC -- explicit no-follow retention purge phases
     """Delete held entries older than 7 days; append purge records without rewriting the manifest."""
     trash = holding_dir(scratch_root)
@@ -839,6 +864,7 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
         audit.info("scratch prune: holding dir %r is a symlink; not followed", os.fspath(trash))
         return 0
     purged = 0
+    repos: set[str] = set()
     try:
         children = list(os.scandir(trash))
     except OSError as exc:
@@ -863,13 +889,22 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
         manifest = day_dir / _TRASH_MANIFEST
         manifest_text: str | None = None
         try:
-            if manifest.is_file() and not manifest.is_symlink():
+            if not os.path.lexists(manifest):
+                # Older/incomplete holds may have no manifest. The UTC day directory is
+                # still an authoritative seven-day purge clock for every entry below it.
+                pass
+            elif manifest.is_file() and not manifest.is_symlink():
                 manifest_text = manifest.read_text(encoding="utf-8-sig")
             else:
                 continue
         except OSError:
+            # A manifest that exists but cannot be read is an audit-integrity failure: keep
+            # the day untouched rather than purging from an unknown record set.
             continue
-        ages = _manifest_ages(manifest_text)
+        ages = _manifest_ages(manifest_text or "")
+        day_age = _day_start(day_dir.name)
+        if day_age is None:
+            continue
         entries_dir = day_dir / "entries"
         try:
             entries_st = os.lstat(entries_dir)
@@ -891,9 +926,10 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
             except OSError:
                 continue
             pruned_at = ages.get(os.path.abspath(held_path))
-            age_from = pruned_at if pruned_at is not None else held_st.st_mtime
+            age_from = pruned_at if pruned_at is not None else day_age
             if now - age_from <= _TRASH_HOLD_SECONDS:
                 continue
+            held_repos = _linked_worktree_repos(held_path) if stat.S_ISDIR(held_st.st_mode) else set()
             blockers = _remove_nofollow(held_path)
             try:
                 os.lstat(held_path)
@@ -908,12 +944,14 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
                     audit.info("scratch prune: could not purge %r (%s)", os.fspath(held_path), blockers[0])
                 continue
             purged += 1
-            try:
-                _append_manifest(manifest, {
-                    "held": os.fspath(held_path), "purged": _utc_stamp(now)[1],
-                })
-            except OSError:
-                pass
+            repos |= held_repos
+            if manifest_text is not None:
+                try:
+                    _append_manifest(manifest, {
+                        "held": os.fspath(held_path), "purged": _utc_stamp(now)[1],
+                    })
+                except OSError:
+                    pass
         try:
             with os.scandir(entries_dir) as day_entries:
                 empty = next(day_entries, None) is None
@@ -921,6 +959,8 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
                 os.rmdir(entries_dir)
         except OSError:
             pass
+    # Registrations of linked worktrees are dropped only now that the held tree is really gone.
+    release_git_worktrees(repos)
     if purged:
         audit.info("scratch prune: purged %d holding-dir entr%s older than 7 days",
                    purged, "y" if purged == 1 else "ies")
@@ -1047,15 +1087,17 @@ def _retention_filter(root: Path, skip_names: frozenset[str], doomed: list[Path]
 
 def prune_idle_entries(
     root: Path, max_idle_hours: float, skip_names: frozenset[str], log_file: Path | None = None,
+    *, restorable_hold: bool = False,
 ) -> int:
-    """Move top-level entries of *root* with no write anywhere in their subtree for
-    *max_idle_hours* into a 7-day holding directory, reaping processes and worktree
-    registrations rooted in them first. Each move, each signalled process and each
-    entry rescued mid-prune is recorded in *log_file*. Returns the count that left
-    scratch. Holding-dir entries older than 7 days are purged on every pass."""
+    """Prune idle entries, optionally moving them to a private seven-day hold.
+
+    ``restorable_hold`` is enabled only by the real Hermes scratch path. Test and other
+    temporary roots retain the historical direct-delete behavior and never create a shared
+    ``.scratch-trash`` beside ``/var/tmp``.
+    """
     audit = _open_prune_log(log_file)
     try:
-        return _prune_idle_entries(root, max_idle_hours, skip_names, audit)
+        return _prune_idle_entries(root, max_idle_hours, skip_names, audit, restorable_hold=restorable_hold)
     finally:
         if audit is not logger:
             for handler in audit.handlers:
@@ -1064,10 +1106,12 @@ def prune_idle_entries(
 
 def _prune_idle_entries(  # health: allow CC -- preserves ordered fail-closed prune gates
     root: Path, max_idle_hours: float, skip_names: frozenset[str], audit: logging.Logger,
+    *, restorable_hold: bool = False,
 ) -> int:
     now = time.time()
     cutoff = now - max_idle_hours * 3600
-    purge_expired_holds(root, now, audit)
+    if restorable_hold:
+        purge_expired_holds(root, now, audit)
     # Entries already known to hold files this user cannot read or delete are skipped before
     # any walk, until that is fixed (hermes_constants_scratch_stuck).
     skip_names = skip_names | stuck.load_skips(root) | {stuck.STUCK_STATE_NAME, stuck.STUCK_LOCK_NAME}
@@ -1145,32 +1189,50 @@ def _prune_idle_entries(  # health: allow CC -- preserves ordered fail-closed pr
                     os.fspath(entry),
                 )
             continue
-        try:
-            held_at = hold_expired_entry(entry, root, size, time.time())
-        except PermissionError as exc:
-            if stuck.tracking_supported():
-                stuck.record(root, entry, [os.fspath(entry)], audit)
-            else:
+        held_at: Path | None = None
+        denied: list[str] = []
+        if restorable_hold:
+            try:
+                held_at = hold_expired_entry(entry, root, size, time.time())
+            except PermissionError as exc:
+                if stuck.tracking_supported():
+                    stuck.record(root, entry, [os.fspath(entry)], audit)
+                else:
+                    audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
+                continue
+            except OSError as exc:
                 audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
-            continue
-        except OSError as exc:
-            audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
-            continue
-        # A rename is atomic, but only an explicit lstat proves the entry left scratch.
-        # lexists() swallows OSError from lstat, so an entry that stayed but cannot be
-        # inspected would be counted and recorded as removed (P2 on #134173).
+                continue
+        else:
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    denied = stuck.rmtree_collecting_permission_errors(entry)
+                else:
+                    entry.unlink()
+            except OSError as exc:
+                audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
+                continue
+        # A rename or direct removal is counted only after an explicit lstat proves the
+        # entry left scratch. lstat errors are not treated as absence.
         try:
             os.lstat(entry)
-            audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
+            if not restorable_hold and denied and stuck.tracking_supported():
+                stuck.record(root, entry, denied, audit)
+            else:
+                audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
             continue
         except FileNotFoundError:
             pass
         except OSError:
             audit.info("scratch prune: could not confirm removal of %r", os.fspath(entry))
             continue
-        assert held_at is not None
-        audit.info("scratch prune: removed %r (%d bytes), held at %r",
-                   os.fspath(entry), size, os.fspath(held_at))
+        if restorable_hold:
+            assert held_at is not None
+            audit.info("scratch prune: removed %r (%d bytes), held at %r",
+                       os.fspath(entry), size, os.fspath(held_at))
+        else:
+            audit.info("scratch prune: removed %r (%d bytes)", os.fspath(entry), size)
         removed += 1
-    release_git_worktrees(repos)
+    if not restorable_hold:
+        release_git_worktrees(repos)
     return removed

@@ -193,5 +193,20 @@ def record(
 
 
 def stuck_entries(root: Path) -> list[Path]:
-    """Entries the prune is currently skipping as not removable (for ``hermes doctor``)."""
-    return [root / name for name in sorted(load_skips(root, persist=False))]
+    """Entries the prune is currently skipping as not removable (for ``hermes doctor``).
+
+    Held entries keep their stuck state beside the holding day's ``entries/`` directory, so
+    inspect those day directories as well as the live scratch root.
+    """
+    result = [root / name for name in sorted(load_skips(root, persist=False))]
+    trash = Path(os.path.realpath(root)).parent / ".scratch-trash"
+    try:
+        days = list(trash.iterdir())
+    except OSError:
+        return result
+    for day in days:
+        entries = day / "entries"
+        if not day.is_dir() or day.is_symlink() or not entries.is_dir() or entries.is_symlink():
+            continue
+        result.extend(entries / name for name in sorted(load_skips(entries, persist=False, state_dir=day)))
+    return result
