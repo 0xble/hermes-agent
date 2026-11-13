@@ -223,8 +223,11 @@ class ChatOutboundBudget:
 
     async def take(self, chat_id: Any) -> None:
         wait = self.reserve(chat_id)
-        if wait > 0:
+        while wait > 0:
             await asyncio.sleep(wait)
+            # Event-loop timers may wake a little early under load. Recheck the
+            # reserved deadline before allowing the request to reach Telegram.
+            wait = self.remaining(chat_id)
 
     def note_retry_after(self, chat_id: Any, wait: float) -> None:
         """A published ``retry_after`` means the chat is already near its limit: widen its gap
