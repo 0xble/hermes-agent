@@ -73,7 +73,8 @@ def test_delegation_ledger_reconciles_schema_once_per_database_file(tmp_path, mo
     real = hermes_state_schema.reconcile_state_schema
     monkeypatch.setattr(hermes_state_schema, "reconcile_state_schema", lambda conn: (calls.append(1), real(conn)))
     monkeypatch.setattr(async_delegation, "_db_path", lambda: tmp_path / "state.db")
-    monkeypatch.setattr(async_delegation, "_SCHEMA_RECONCILED", set())
+    from tools import async_delegation_schema
+    monkeypatch.setattr(async_delegation_schema, "_SCHEMA_RECONCILED", set())
     for _ in range(3):
         with async_delegation._transaction() as conn:
             conn.execute("SELECT count(*) FROM async_delegations").fetchone()
