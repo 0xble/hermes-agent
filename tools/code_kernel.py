@@ -714,9 +714,9 @@ def _bind_rpc_socket(kernel: SessionKernel) -> str:
         rpc_endpoint = f"tcp://{host}:{port}"
     else:
         from hermes_constants import socket_safe_tmpdir
-        from agent.incognito_private_dir import private_subdir_for_current_session
-        private_root = private_subdir_for_current_session("rpc")
-        sock_tmpdir = str(private_root) if private_root is not None else socket_safe_tmpdir()
+        # AF_UNIX endpoints store no content on disk. Private interval paths can
+        # exceed the OS limit, so keep this 0600 transport under the short root.
+        sock_tmpdir = socket_safe_tmpdir()
         rpc_endpoint = kernel.sock_path = os.path.join(sock_tmpdir, f"hermes_rpc_{uuid.uuid4().hex}.sock")
         server_sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         server_sock.bind(kernel.sock_path)

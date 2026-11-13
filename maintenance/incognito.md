@@ -78,7 +78,10 @@ not only the command reply.
   `$XDG_CACHE_HOME/Hermes/incognito/<home-hash>/` elsewhere), because the startup sweep
   removes everything under the parent and must never reach another home's live interval.
   `incognito.private_dir` may override that parent (for example, to a RAM-backed volume)
-  and must not be shared between Hermes homes.
+  and must not be shared between Hermes homes. Kernel scripts, spill files and temporary
+  content stay inside the interval. The random 0600 AF_UNIX RPC endpoint uses
+  `socket_safe_tmpdir()` because deep private paths exceed the OS socket-path limit.
+  Socket nodes contain no persisted payload and are unlinked on kernel teardown.
   Resolver identity is `agent.incognito_private_dir`: a bound public session is never
   redirected into another topic's directory. A thread with no bound identity, while any
   private interval is active, uses a shared `unattributed` disposable directory under the

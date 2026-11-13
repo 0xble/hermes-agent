@@ -215,6 +215,27 @@ def test_private_content_tools_memory_and_restored_request(rig):
         C.wait_reply(rig, pdf.chat_id, pdf_aid)
         C.barrier(rig, "pdf-barrier-" + tag)
 
+        code_token, code_aid = "code-" + tag, "A-code-" + tag
+        code = (
+            "import tempfile\nfrom hermes_tools import read_file\n"
+            f"with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:\n    f.write({word!r})\n"
+            "print(40 + 2)\nprint(read_file(f.name))\nprint(f.name)"
+        )
+        director.script(code_token, ToolCall("execute_code", {"code": code}),
+                        _conditional_answer(code_aid, lambda body: json.loads(_tool_content(body)).get("status") == "success"))
+        code_in = drv.dm(f"Run the private code [in:{code_token}]")
+        wait_until(lambda: len(director.requests.get(code_token, [])) >= 2,
+                   "real code execution result", on_timeout=rig.ctx)
+        code_result = json.loads(_tool_content(director.requests[code_token][1]))
+        assert code_result.get("status") == "success", code_result
+        assert code_result.get("tool_calls_made") == 1, "kernel never round-tripped through tool RPC"
+        assert code_result["output"].splitlines()[0] == "42"
+        assert word in code_result["output"], "kernel did not read the private tempfile through tool RPC"
+        code_artifact = Path(code_result["output"].splitlines()[-1])
+        assert code_artifact.is_relative_to(parent) and code_artifact.read_text() == word
+        C.wait_reply(rig, code_in.chat_id, code_aid)
+        C.barrier(rig, "code-barrier-" + tag)
+
         image_token, image_aid = "generate-" + tag, "A-generate-" + tag
         generated = []
 
@@ -262,6 +283,7 @@ def test_private_content_tools_memory_and_restored_request(rig):
         _slash(rig, "/incognito off", "Incognito OFF")
         assert _ledger(gw) == ledger_before, "leaving incognito flushed private backend records"
         assert not generated[0].exists(), "generated image survived /incognito off"
+        assert not code_artifact.exists(), "kernel tempfile survived /incognito off"
         assert not _leftovers(parent)
         assert not _hits(gw, parent, word.encode())
 

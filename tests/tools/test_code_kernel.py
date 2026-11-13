@@ -82,7 +82,7 @@ class TestSessionStatePersistence(unittest.TestCase):
         from agent.incognito_private_dir import bind_private_session, discard_private_dir
 
         sid = "private-kernel-session"
-        with tempfile.TemporaryDirectory(prefix="h-", dir="/tmp") as interval_dir:
+        with tempfile.TemporaryDirectory(prefix="hermes-incognito-" + "a" * 32 + "-") as interval_dir:
             interval = Path(interval_dir)
             register_session(sid, True)
             bind_private_session(sid, interval)
@@ -97,13 +97,17 @@ class TestSessionStatePersistence(unittest.TestCase):
                 kernel = next(iter(_KERNELS.values()))
                 self.assertTrue(Path(kernel.tmpdir).is_relative_to(interval))
                 self.assertTrue(Path(first["output"].splitlines()[-1]).is_relative_to(interval))
-                self.assertTrue(Path(kernel.sock_path).is_relative_to(interval))
+                sock_path = Path(kernel.sock_path) if kernel.sock_path else None
+                if sock_path is not None:
+                    self.assertEqual(sock_path.stat().st_mode & 0o777, 0o600)
                 self.assertTrue(all(path.is_relative_to(interval) for path in interval.rglob("*")))
             finally:
                 shutdown_all_kernels()
                 register_session(sid, False)
                 discard_private_dir(sid)
             self.assertFalse(interval.exists())
+            if sock_path is not None:
+                self.assertFalse(sock_path.exists())
 
     def test_reset_discards_state(self):
         with _kernel_config():
