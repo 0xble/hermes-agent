@@ -212,6 +212,7 @@ def record_cancelled_run(job_id: str, owner: str, error: str) -> bool:
 def running_job_state(job: dict) -> dict:
     from cron import scheduler as sched
     from cron.jobs import FIRE_CLAIM_TTL_SECONDS, _claim_is_live, _hermes_now
+    from cron.executions import live_inflight_execution
 
     key = sched._inflight_key(str(job.get("id") or "unknown"))
     with sched._running_lock:
@@ -220,11 +221,22 @@ def running_job_state(job: dict) -> dict:
         started = control.started_at if control is not None else None
     claim = job.get("fire_claim") or {}
     live_claim = _claim_is_live(claim, _hermes_now(), FIRE_CLAIM_TTL_SECONDS)
+    detached = live_inflight_execution(str(job.get("id") or ""))
+    if detached is not None and detached.get("owner_kind") == "detached":
+        return {
+            "was_running": True,
+            "run_started_at": detached.get("started_at") or detached.get("claimed_at"),
+            "run_id": detached.get("id"),
+            "interrupted": False,
+            "delivery_completed": False,
+            "_detached_execution": detached,
+        }
     queued = local and control is not None and control.local and started is None
     return {
         "was_running": not queued and (bool(started) or live_claim),
         "run_started_at": (
             None if queued else started or (claim.get("started_at", claim.get("at")) if live_claim else None)),
+        "run_id": None,
         "interrupted": False,
         "delivery_completed": bool(control and control.delivery_completed),
     }
@@ -234,8 +246,17 @@ def interrupt_job_run(job: dict) -> dict:
     """Report a live remote claim honestly; an Event cannot stop another process."""
     from cron import scheduler as sched
     from cron.jobs import self_removal_delivery_allowed
+    from cron.detached_authority import cancel_detached
 
     result = running_job_state(job)
+    detached = result.pop("_detached_execution", None)
+    if detached is not None and detached.get("owner_kind") == "detached":
+        cancel_detached(detached)
+        result["interrupted"] = True
+        result["warning"] = (
+            "A detached run was in progress and cancellation was recorded. "
+            "Side effects already performed cannot be undone; read back the target before retrying.")
+        return result
     with sched._running_lock:
         control = sched._running_cancel_events.get(sched._inflight_key(job["id"]))
     if control is not None and control.local and not self_removal_delivery_allowed(job["id"]):

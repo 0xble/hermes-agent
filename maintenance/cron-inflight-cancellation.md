@@ -15,8 +15,9 @@ Proof: `tests/cron/test_inflight_cancellation.py` holds the heartbeat at one hou
 removes/pauses an active run through registry dispatch, verifies synchronous hard
 interruption before another side effect, and checks running, remote-claim and idle
 receipts. Preserve existing self-removal delivery semantics (#111039): a run
-removing its own schedule is not an external operator stop. Detached workers are
-not falsely reported interrupted; remote pause must invalidate heartbeat renewal.
+removing its own schedule is not an external operator stop. A live detached worker is
+reported as running and receives the durable cancellation marker; its runner stops
+before the next script side effect. Remote pause must invalidate heartbeat renewal.
 
 An explicit `update_job(..., {"enabled": False})` has the same stop intent as pause:
 interrupt a local active run immediately, revoke detached/remote heartbeat renewal,
@@ -35,10 +36,10 @@ already consumed by `claim_dispatch`; it does not refund `repeat.completed` or i
 ordinary resume can replay that occurrence. Explicit one-shot re-arm is required.
 Recurring cancellations do not consume a completed-run repeat or failure budget.
 
-Listing and tool formatting inspect process-local controls only if `cron.scheduler`
-is already loaded. Otherwise the durable live claim supplies running visibility;
-scheduler lookup failures must not break these read-only responses.
-
+Listing and tool formatting inspect process-local controls plus the durable execution ledger. A live
+external worker is reported with its execution ID and cancellation marker; the runner watches that
+marker and passes it through the existing script process-tree cancellation path. A concurrent finish
+is harmless and terminal. Remote pause must invalidate heartbeat renewal.
 Verification must include `tests/cron/test_fire_claim_lost_after_delivery.py` and
 `tests/cron/test_inflight_cancellation.py`; a passing exact-SHA gate alone does not
 prove these paths ran. The bounded integration check is
