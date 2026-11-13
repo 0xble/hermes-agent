@@ -38,19 +38,30 @@ def _probe_macos_keychain() -> None:
     if sys.platform != "darwin":
         return
     path = os.environ.get("HERMES_TEST_KEYCHAIN")
-    if not path:
-        return
     try:
+        if not path:
+            selected = subprocess.run(
+                ["security", "default-keychain", "-d", "user"],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            path = selected.stdout.strip().strip('"')
+        if not path:
+            raise KeychainUnavailable("the macOS user keychain is not configured")
         subprocess.run(
             ["security", "show-keychain-info", path],
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,
-            timeout=10,
+            timeout=2,
         )
     except subprocess.TimeoutExpired as exc:
         raise KeychainUnavailable("the macOS keychain probe timed out; it may be locked or prompt-gated") from exc
+    except KeychainUnavailable:
+        raise
     except (OSError, subprocess.CalledProcessError) as exc:
         raise KeychainUnavailable(f"the macOS keychain is unavailable ({type(exc).__name__})") from exc
 
