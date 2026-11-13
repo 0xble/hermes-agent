@@ -3780,11 +3780,13 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         await self._stop_typing_quietly(chat_id, metadata)
 
     def register_post_delivery_callback(
-        self, session_key: str, callback: Callable, *, generation: int | None = None) -> bool:
+        self, session_key: str, callback: Callable, *, generation: int | None = None,
+        first: bool = False) -> bool:
         """Register a deferred callback to fire after the main response. Same-key registrations are
         chained (both fire in order, per-callback exception isolation) so independent features
         coexist; ``generation`` ties it to a gateway run — stale generations never overwrite a
-        fresher slot. Return whether this caller's callback was registered."""
+        fresher slot. ``first`` runs an instant signal ahead of slower cosmetic callbacks, so their
+        bounded timeout cannot swallow it. Return whether this caller's callback was registered."""
         if not session_key or not callable(callback):
             return False
         owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
@@ -3802,7 +3804,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         if existing is not None:
             _, existing_cb = _split_post_delivery_entry(existing)
             if callable(existing_cb):
-                callback = self._chain_callbacks(existing_cb, callback)
+                callback = (self._chain_callbacks(callback, existing_cb) if first
+                            else self._chain_callbacks(existing_cb, callback))
         if generation is None:
             self._post_delivery_callbacks[session_key] = callback
         else:

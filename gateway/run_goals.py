@@ -80,6 +80,23 @@ def _goal_notice_outbound_class(message: str, notice_kind: Optional[str] = None)
     return OUTBOUND_FINAL if kind in {"achieved", "blocked", "paused", "failed", "resumed"} else OUTBOUND_NOTICE
 
 
+# A reply is delivered before its goal/loop bookkeeping; until that deferred pass finishes, its
+# session still has a turn owner for the loop watcher and goal wakeups (not for new admissions).
+POST_TURN_DELIVERY_WAIT_S = 60.0
+
+
+def _pending_bookkeeping(runner) -> dict:
+    pending = getattr(runner, "_pending_post_turn_bookkeeping", None)
+    if pending is None:
+        pending = {}
+        runner._pending_post_turn_bookkeeping = pending
+    return pending
+
+
+def post_turn_bookkeeping_pending(runner, session_key) -> bool:
+    return bool(session_key) and getattr(runner, "_pending_post_turn_bookkeeping", {}).get(session_key, 0) > 0
+
+
 class GatewayGoalsMixin(GatewayLoopWakeMixin):
     """Goal/heartbeat continuation, post-turn hooks and loop-wakeup watcher methods for GatewayRunner."""
 
@@ -800,7 +817,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                         agent_result=agent_result, source=source, is_internal=is_internal, event=event,
                         invalidation_epoch=invalidation_epoch, existing_session_only=deferred)
             except Exception:
-                logger.debug("Post-delivery goal/loop bookkeeping failed", exc_info=True)
+                logger.warning("Post-delivery goal/loop bookkeeping failed", exc_info=True)
             finally:
                 _post_turn_delivered.reset(delivered_token)
                 execution_result.reset(token)
@@ -821,7 +838,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             await finish()
             return
         delivered = asyncio.Event()
-        if register(session_key, delivered.set, generation=generation) is not True:
+        try:
+            registered = register(session_key, delivered.set, generation=generation, first=True)
+        except TypeError:  # an adapter double without the ``first`` keyword
+            registered = register(session_key, delivered.set, generation=generation)
+        if registered is not True:
             await finish()
             return
 
@@ -829,9 +850,24 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             delivered.set()
             await finish(deferred=True)
 
+        pending = _pending_bookkeeping(self)
+        pending[session_key] = pending.get(session_key, 0) + 1
+
         async def wait_for_delivery():
-            await delivered.wait()
-            await finish(deferred=True)
+            try:
+                try:
+                    # The delivered signal rides the cosmetic cleanup chain, which can time out.
+                    await asyncio.wait_for(delivered.wait(), POST_TURN_DELIVERY_WAIT_S)
+                except asyncio.TimeoutError:
+                    logger.warning("post-turn bookkeeping for %s ran without a delivery signal after %.0fs",
+                                   session_key, POST_TURN_DELIVERY_WAIT_S)
+                await finish(deferred=True)
+            finally:
+                left = pending.get(session_key, 0) - 1
+                if left > 0:
+                    pending[session_key] = left
+                else:
+                    pending.pop(session_key, None)
 
         # Track before settlement can report idle. Only the signal callback enters
         # the cosmetic cleanup chain, never the auxiliary judge's lifetime.
@@ -1177,6 +1213,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         def _turn_owner_exists(include_marker: bool = True) -> bool:
             if self._is_session_running(session_key) or session_key in self._running_agents:
                 return True
+            if post_turn_bookkeeping_pending(self, session_key):
+                return True  # the finished turn's deferred judge still owns the tick
             if session_key in getattr(adapter, "_active_sessions", {}):
                 return True
             with suppress(Exception):
@@ -1422,6 +1460,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
         key = entry.session_key
         if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
+                or post_turn_bookkeeping_pending(self, key)
                 or self._queue_depth(key, adapter=adapter) > 0):
             return  # a turn (or restart auto-resume) is in flight; its post-turn judge owns the barrier
         if not self._background_turn_room():
@@ -1457,6 +1496,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         # The barrier check ran off-loop; a turn, adapter guard, or queued event may have appeared
         # while it was running. Re-check every admission fence before clearing or injecting.
         if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
+                or post_turn_bookkeeping_pending(self, key)
                 or self._queue_depth(key, adapter=adapter) > 0):
             return
         from gateway.run_goal_wait import dispatch_goal_wait
