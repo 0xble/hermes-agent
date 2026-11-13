@@ -47,6 +47,34 @@ def _active_handover_work_count(runner) -> int:
     return count + _handover_process_work_count() + _handover_notification_work_count(runner)
 
 
+def _queued_process_work_count(process_registry, sessions) -> int:
+    """Count queued process events that the old runner still owns."""
+    queue = process_registry.completion_queue
+    try:
+        with queue.mutex:
+            events = tuple(queue.queue)
+    except Exception:
+        logger.debug("Could not inspect process completion queue", exc_info=True)
+        return 1
+
+    by_session_id = {
+        entry.get("session_id"): entry
+        for entry in sessions
+        if entry.get("session_id")
+    }
+    for event in events:
+        if not isinstance(event, Mapping):
+            return 1
+        # Heartbeats are progress observations, not undelivered results. They may remain
+        # queued while a restart-safe producer continues under the successor.
+        if event.get("type", "completion") == "heartbeat":
+            continue
+        entry = by_session_id.get(event.get("session_id"))
+        if entry is None or not entry.get("survive_restart"):
+            return 1
+    return 0
+
+
 def _handover_process_work_count() -> int:
     """Count non-restart-safe tool processes and their queued completion notices."""
     try:
@@ -55,7 +83,7 @@ def _handover_process_work_count() -> int:
         sessions = process_registry.list_sessions()
         active = any(entry.get("status") == "running" and not entry.get("survive_restart")
                      for entry in sessions)
-        pending = not process_registry.completion_queue.empty()
+        pending = _queued_process_work_count(process_registry, sessions)
         return int(active or pending)
     except Exception:
         logger.debug("Could not read process handover state", exc_info=True)
