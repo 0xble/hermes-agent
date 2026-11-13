@@ -5,7 +5,6 @@ Each function takes the parent ``AIAgent`` as ``agent`` except the stateless mes
 ``_ra()`` resolves ``run_agent`` lazily so tests patching ``run_agent.X`` keep intercepting.
 """
 
-
 from __future__ import annotations
 import contextlib
 import copy

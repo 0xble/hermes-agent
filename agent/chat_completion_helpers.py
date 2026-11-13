@@ -8,7 +8,6 @@ forwarders. Symbols tests patch on ``run_agent`` (``cleanup_vm`` /
 ``cleanup_browser``) are resolved through :func:`_ra` at call time.
 """
 
-
 from __future__ import annotations
 
 import contextlib

@@ -6,7 +6,6 @@ retries, fallbacks, compression, post-turn hooks). Symbols that callers patch on
 ``run_agent`` (``handle_function_call``, ``_set_interrupt``, ``OpenAI``) resolve via
 ``_ra`` so those patches keep working."""
 
-
 from __future__ import annotations
 
 import inspect
