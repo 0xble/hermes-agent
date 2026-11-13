@@ -74,6 +74,10 @@ def save_plugin_setting(plugin_id: str, segments: tuple[str, ...], value: Any) -
     from hermes_cli import config as config_mod
     from hermes_cli import managed_scope
 
+    from agent.incognito import is_incognito
+
+    if is_incognito():
+        raise PermissionError("Plugin settings cannot be changed in incognito mode")
     if config_mod.is_managed():
         raise PermissionError("Plugin settings cannot be changed in a managed install")
     full_path = ("plugins", "entries", plugin_id, "settings", *segments)

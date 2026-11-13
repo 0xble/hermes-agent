@@ -110,6 +110,25 @@ class IncognitoPluginTests(unittest.TestCase):
             discard_private_dir(self.sid)
         self.assertFalse(interval.exists())
 
+    def test_incognito_safe_plugin_cannot_persist_settings(self):
+        from hermes_cli.plugins_state import save_plugin_setting
+
+        register_session(self.sid, True)
+        config = self.home / "config.yaml"
+        config.write_text(
+            "plugins:\n  entries:\n    safe:\n      settings:\n        existing: keep\n",
+            encoding="utf-8",
+        )
+        before = config.read_bytes()
+        try:
+            with incognito_scope(session_id=self.sid):
+                with self.assertRaisesRegex(PermissionError, "incognito mode"):
+                    save_plugin_setting("safe", ("probe",), CANARY)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertNotIn(CANARY.encode(), config.read_bytes())
+        finally:
+            register_session(self.sid, False)
+
     def test_explicit_false_plugin_tool_stays_refused(self):
         from tools.registry import registry
         denied = PluginContext(
