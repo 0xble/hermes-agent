@@ -67,8 +67,12 @@ def read_archive(row, node, label):
     result = call("read_file", {"node": node, "path": path})
     assert label + "-archive-line" in result.get("content", ""), result
     archived = Path(path).read_text()
-    assert json.loads(archived)["node"] == node
-    assert json.loads(archived)["output"].count(label + "-archive-line") == 500
+    header, separator, output = archived.partition("\n</tool-result-metadata>\n\n")
+    assert separator, archived
+    metadata = json.loads(header.removeprefix("<tool-result-metadata>\n"))
+    assert metadata["node"] == node
+    assert metadata["text_field"] == "output"
+    assert output.count(label + "-archive-line") == 500
     return path
 
 
@@ -235,8 +239,6 @@ def test_archive_destination_does_not_leak_between_sessions(archive_transport, a
                 reset_current_session_key(token)
     paths = [read_archive(row, node, node) for row, node in zip(rows, ("macstudio", "macbook"))]
     assert paths[0] != paths[1]
-    for node, path in zip(("macstudio", "macbook"), paths):
-        assert json.loads(Path(path).read_text())["output"].count(node + "-archive-line") == 500
 
 
 def test_legacy_controller_archive_remains_controller_owned(archive_transport, agent):
