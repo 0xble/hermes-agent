@@ -6,29 +6,11 @@ logger = logging.getLogger("cron.scheduler")
 
 
 def _is_typed_prebody_loss(execution: dict, *, worker_exited: bool) -> bool:
-    """Accept only durable, typed proof that the detached body never began."""
-    if execution.get('body_phase') != 'attaching':
-        return False
-    status = execution.get('status')
-    if status == 'failed':
-        # The handshake path owns this marker; deterministic refusals and watchdog
-        # failures remain ordinary visible failures.
-        return execution.get('delivery_outcome') == 'deferred'
-    if status != 'unknown':
-        return False
-    from cron.executions import _owner_identity
-    if not worker_exited and _owner_identity(
-            execution['pid'], execution['process_started_at']) != 'dead':
-        return False
-    # Deterministic refusals and watchdog termination are exact typed causes;
-    # every other reaped attaching row has no proof that the body ran.
-    if execution.get('error') in {
-            'admission_conflict', 'producer_not_started', 'permission_denied'}:
-        return False
-    from cron.scheduler_detached_worker import HARD_WALL_TIMEOUT_ERROR_PREFIX
-    if str(execution.get('error') or '').startswith(HARD_WALL_TIMEOUT_ERROR_PREFIX):
-        return False
-    return True
+    """Accept only the positive marker written at a permitted transient-loss site."""
+    return (execution.get('body_phase') == 'attach_lost'
+            and execution.get('status') in {'failed', 'unknown'})
+
+
 def defer_proven_unstarted_worker(
     job: dict, execution: dict, *, worker_exited: bool = False, pause: dict | None = None,
 ) -> bool:
@@ -40,28 +22,15 @@ def defer_proven_unstarted_worker(
     """
     from cron.scheduler_control import defer_unstarted_fire
 
-    if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attaching'
+    if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attach_lost'
             or not (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
         return False
     if not _is_typed_prebody_loss(execution, worker_exited=worker_exited):
         return False
     deferred = dict(job, _scheduled_instant=(
         job.get('_scheduled_instant') or execution['scheduled_instant']))
-    from cron import jobs
-    restored = defer_unstarted_fire(
+    return defer_unstarted_fire(
         deferred, execution.get('error') or 'Detached worker died before body start', pause=pause)
-    if restored:
-        return True
-    current = jobs.get_job(job['id'])
-    # Distinguish a transient lock refusal (same claim, still recoverable) from
-    # an operator supersession. Only the latter may retire the recovery journal.
-    own_pause = (isinstance(pause, dict) and current is not None
-                 and (current.get('paused_at'), current.get('paused_reason'))
-                 == (pause.get('paused_at'), pause.get('reason')))
-    return (current is None
-            or (current.get('fire_claim') or {}).get('by') != (job.get('fire_claim') or {}).get('by')
-            or (not own_pause and not jobs.is_job_runnable(current))
-            or any(current.get(key) != job.get(key) for key in ('schedule', 'timezone')))
 
 
 def record_external_worker_outcome(
@@ -103,12 +72,12 @@ def record_external_worker_outcome(
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
             return True
-        if (execution.get('body_phase') == 'attaching'
+        if (execution.get('body_phase') == 'attach_lost'
                 and (job.get('_scheduled_instant') or execution.get('scheduled_instant'))
                 and _is_typed_prebody_loss(execution, worker_exited=worker_exited)):
-            defer_proven_unstarted_worker(job, execution, worker_exited=worker_exited)
-            # A typed pre-body loss restores the occurrence; it is not a job failure.
-            return True
+            if defer_proven_unstarted_worker(job, execution, worker_exited=worker_exited):
+                # A typed pre-body loss restores the occurrence; it is not a job failure.
+                return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit
         execution_error = execution.get("error")

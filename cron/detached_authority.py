@@ -277,6 +277,10 @@ def _attach_worker(rpc, scope):
             if attempt == 3:
                 phase = timeout_phase(exc, operation)
                 if phase is not None:
+                    if (phase == 'gateway handshake timed out (owner-transition)'
+                            and scope['execution_id'].startswith(PREFIX)):
+                        from cron.executions import mark_detached_attach_lost
+                        mark_detached_attach_lost(scope['execution_id'][len(PREFIX):])
                     raise DetachedHandshakeTimeout(phase) from exc
                 raise
             ambiguous = True
@@ -297,7 +301,7 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     from websockets.exceptions import ConnectionClosed
     import psutil
 
-    from cron.executions import mark_detached_attaching, start_detached_body
+    from cron.executions import mark_detached_attach_lost, mark_detached_attaching, start_detached_body
 
     if (not owns_detached_execution(job['id'], execution_id)
             or not mark_detached_attaching(execution_id)):
@@ -308,6 +312,13 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     rpc = WorkerRPC(get_hermes_home())
     try:
         adopted = _attach_worker(rpc, scope)
+    except DetachedHandshakeTimeout:
+        # This is the only handshake loss that is eligible for pre-body recovery.
+        # Record it while the durable attaching fence still identifies this worker;
+        # downstream code must not infer it from the eventual error text.
+        mark_detached_attach_lost(execution_id)
+        rpc.close()
+        raise
     except BaseException:
         rpc.close()
         raise

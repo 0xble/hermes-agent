@@ -79,13 +79,17 @@ def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -
             current["paused_at"] = None
             current["paused_reason"] = None
         kind = (current.get("schedule") or {}).get("kind")
-        if kind == "once":
+        if kind in {"cron", "interval"}:
+            current["pending_slot"] = pending_slot_stamp(instant, now)
+        elif kind == "once":
             preserve_unstarted_run(current, now.isoformat())
+            if current.get("run_claim") is not None:
+                current["run_claim"] = None
         elif kind not in {"cron", "interval"}:
             return False
-        current["pending_slot"] = pending_slot_stamp(instant, now)
         current["fire_claim"] = None
-        current["run_claim"] = None
+        if kind in {"cron", "interval"}:
+            current["run_claim"] = None
         current["last_fire_error"] = {
             "at": now.isoformat(), "detail": f"Deferred, not started: {reason}"[:500]}
         jobs.save_jobs(records)
