@@ -42,7 +42,7 @@
   `MemoryError` reporting and state reuse. Deterministic platform/resource tests
   assert that the runner never installs a virtual-address limit, preserves inherited
   DATA limits, and samples readable descendants after an `AccessDenied` sibling.
-  cover integer-valued floats and warnings for ignored values.
+  Config tests cover integer-valued floats and warnings for ignored values.
 - **Limits/follow-ups:** Sampling is best-effort, not an OS-enforced aggregate
   reservation; bursts within one second can overshoot. Background allocation while
   idle, aggregate pressure across many kernels, remote kernels, standalone fallback,
