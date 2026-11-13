@@ -207,7 +207,7 @@ jobs:
         run: |
           if [ -f "$RUNNER_TEMP/hermes-ci-default.before" ]; then
             default_keychain=$(sed -n 's/^ *"\(.*\)" *$/\1/p' "$RUNNER_TEMP/hermes-ci-default.before")
-            [ -n "$default_keychain" ] && security default-keychain -d user -s "$default_keychain" || true
+            [ -n "$default_keychain" ] && security default-keychain -d user -s "$default_keychain" </dev/null || true
           fi
           if [ -f "$RUNNER_TEMP/hermes-ci-keychains.before" ]; then
             keychains=()
