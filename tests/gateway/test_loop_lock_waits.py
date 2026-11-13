@@ -74,7 +74,7 @@ def test_delegation_ledger_reconciles_schema_once_per_database_file(tmp_path, mo
     real = hermes_state_schema.reconcile_state_schema
     monkeypatch.setattr(hermes_state_schema, "reconcile_state_schema", lambda conn: (calls.append(1), real(conn)))
     monkeypatch.setattr(async_delegation, "_db_path", lambda: tmp_path / "state.db")
-    monkeypatch.setattr(async_delegation_ledger, "_SCHEMA_RECONCILED", set())
+    monkeypatch.setattr(async_delegation_ledger, "_SCHEMA_RECONCILED", {})
     for _ in range(3):
         with async_delegation._transaction() as conn:
             conn.execute("SELECT count(*) FROM async_delegations").fetchone()
@@ -82,8 +82,6 @@ def test_delegation_ledger_reconciles_schema_once_per_database_file(tmp_path, mo
     # A replaced state.db (restore, recovery) is a new file and must be reconciled again.
     for suffix in ("", "-wal", "-shm"):
         (tmp_path / f"state.db{suffix}").unlink(missing_ok=True)
-    keep = tmp_path / "keep-inode"  # hold the old inode so the new file cannot reuse it
-    keep.touch()
     with async_delegation._transaction() as conn:
         conn.execute("SELECT count(*) FROM async_delegations").fetchone()
     assert len(calls) == 2

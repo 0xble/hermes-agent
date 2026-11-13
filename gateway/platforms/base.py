@@ -1651,6 +1651,10 @@ class ExecApprovalPrompt:
 _INGRESS_CONSUMER: "_contextvars.ContextVar[Optional[asyncio.Task]]" = _contextvars.ContextVar(
     "gateway_ingress_consumer", default=None)
 
+# Only this invocation's adapter lifecycle promises to fire delivery callbacks.
+post_delivery_owner: _contextvars.ContextVar[Optional[tuple]] = _contextvars.ContextVar(
+    "gateway_post_delivery_owner", default=None)
+
 
 # (obligation id, event, adapter) while send_final_ledgered awaits the send. Task-local, because
 # one adapter serves many sessions at once: the send's finally reads only its own turn's entry if
@@ -3749,13 +3753,15 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         await self._stop_typing_quietly(chat_id, metadata)
 
     def register_post_delivery_callback(
-        self, session_key: str, callback: Callable, *, generation: int | None = None) -> None:
+        self, session_key: str, callback: Callable, *, generation: int | None = None,
+        first: bool = False) -> bool:
         """Register a deferred callback to fire after the main response. Same-key registrations are
         chained (both fire in order, per-callback exception isolation) so independent features
         coexist; ``generation`` ties it to a gateway run — stale generations never overwrite a
-        fresher slot."""
+        fresher slot. ``first`` runs an instant signal ahead of slower cosmetic callbacks, so their
+        bounded timeout cannot swallow it. Return whether this caller's callback was registered."""
         if not session_key or not callable(callback):
-            return
+            return False
         owned = _lazy_attr(self, "_post_delivery_callbacks_by_generation", dict)
         if generation is None:
             existing = self._post_delivery_callbacks.get(session_key)
@@ -3767,15 +3773,17 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             if existing is None and any(
                 key == session_key and gen > generation for key, gen in owned
             ):
-                return
+                return False
         if existing is not None:
             _, existing_cb = _split_post_delivery_entry(existing)
             if callable(existing_cb):
-                callback = self._chain_callbacks(existing_cb, callback)
+                callback = (self._chain_callbacks(callback, existing_cb) if first
+                            else self._chain_callbacks(existing_cb, callback))
         if generation is None:
             self._post_delivery_callbacks[session_key] = callback
         else:
             owned[(session_key, generation)] = callback
+        return True
 
     def claim_post_delivery(self, session_key: str, generation: int | None) -> None:
         """A deliverer will fire this generation's callback once its reply is sent, so a newer
@@ -5293,7 +5301,11 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         """
         assert self._message_handler is not None
         while True:
-            response = await self._message_handler(event)
+            token = post_delivery_owner.set((self, event))
+            try:
+                response = await self._message_handler(event)
+            finally:
+                post_delivery_owner.reset(token)
             if (response is not None or not getattr(event, "_gateway_compression_deferred", False)
                     or self._pending_messages.get(session_key) is not event):
                 return response
@@ -5487,6 +5499,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                 await release_temporary_notices(event)
             # Callback work or a late refresh may have recreated typing — one final bounded stop.
             await self._stop_typing_refresh(event.source.chat_id, None, metadata=_typing_metadata, stop_attempts=1)
+            from gateway.session_ingress import join_turn_bookkeeping
+            await join_turn_bookkeeping(event)
             # Flush any timer that missed the in-band drain, then reconcile ownership.
             await self._flush_text_debounce_now(session_key)
             self._finish_session_task(session_key, interrupt_event)

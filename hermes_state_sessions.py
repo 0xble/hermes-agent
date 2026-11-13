@@ -851,11 +851,7 @@ class SessionSessionsMixin:
         """Get a session by ID, with exact token totals except inside reader-only recall."""
         from hermes_state_search_runtime import current_search
 
-        # Recall metadata can lag queued usage. Draining it would wait on the writer
-        # once per ancestor and defeat the reader-only scope before any SELECT runs.
-        # The token writer commits under the state.db write lock, so draining it on the gateway event
-        # loop parks the loop behind every queued writer. Loop callers read ownership, lineage and
-        # titles, never token totals (usage reads go through AsyncSessionDB's worker threads).
+        # No drain in reader-only recall or on the gateway loop (the writer holds the state.db lock).
         if current_search(self) is None and not hermes_loop_guard.on_loop_thread():
             self.flush_for_read()
         row = self._read_one(

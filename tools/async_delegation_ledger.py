@@ -3,22 +3,21 @@
 from __future__ import annotations
 
 import logging
-import os
 import sqlite3
 from typing import Any, Callable, Optional
 
 
 logger = logging.getLogger('tools.async_delegation')
 
-_SCHEMA_RECONCILED: set[tuple[str, int]] = set()
+_SCHEMA_RECONCILED: dict[str, int] = {}
 
 
-def _schema_key(conn: sqlite3.Connection) -> Optional[tuple[str, int]]:
+def _schema_state(conn: sqlite3.Connection) -> tuple[Optional[str], Optional[int]]:
     try:
         path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
-        return (path, os.stat(path).st_ino) if path else None
-    except (sqlite3.Error, OSError, StopIteration):
-        return None
+        return (path or None), conn.execute("PRAGMA schema_version").fetchone()[0]
+    except (sqlite3.Error, StopIteration):
+        return None, None
 
 
 def _db_path():
@@ -63,13 +62,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # nullability/defaults depending on which authority touched the database
     # first (#94691).
     # Each ledger transaction opens a connection, often while the registry lock is held.
-    # Replaying DDL there stalls the loop's readers. Reconcile once per database generation.
-    key = _schema_key(conn)
-    if key is not None and key in _SCHEMA_RECONCILED:
+    # A schema-version change invalidates this cache, including a freshly recreated file.
+    path, version = _schema_state(conn)
+    if path is not None and _SCHEMA_RECONCILED.get(path) == version:
         return
     reconcile_state_schema(conn)
-    if key is not None:
-        _SCHEMA_RECONCILED.add(key)
+    if path is not None:
+        _SCHEMA_RECONCILED[path] = _schema_state(conn)[1]
 
 
 def _transaction(*, immediate: bool = False):

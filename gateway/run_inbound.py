@@ -1919,7 +1919,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             return False, None
         # The message handler entered the routed profile's scope; its authority owns this turn.
         from gateway.session_authorities import active_authority
-        from gateway.session_ingress import admit_message, admitted_queued, executing_admission
+        from gateway.session_ingress import executing_admission
         authority = active_authority(self)
         if authority is not None and not event.get_command() and not is_internal:
             if not executing_admission.get():
@@ -1932,6 +1932,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                     return await self._hm_admit_to_fifo(authority, event, source, _quick_key, busy)
                 finally:
                     settle_busy_arrival(event)  # never admitted, refused or dropped: its fate is known
+                    self._forget_admitted_voice(event)
         if (authority is None and not is_internal and not event.get_command()
                 and getattr(self, 'session_authority', None) is not None):
             # Scoped to a home this process does not serve: never fall back to the launch ledger.
@@ -1962,15 +1963,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         # A failed admit stays the authority's answer (refusal notice or turn error), never a
         # pending legacy turn: that would run unadmitted, outside the FIFO's order.
         note_busy_admitting(event)
-        from gateway.session_ingress import admitted_queued
-        if not (busy and self._pending_event_audio_paths(event)):
-            return True, await admit_message(authority, event)
-        token = admitted_queued.set(lambda: self._prefetch_admitted_voice(event))
-        try:
-            return True, await admit_message(authority, event)
-        finally:
-            admitted_queued.reset(token)
-            self._forget_admitted_voice(event)
+        return True, await admit_message(authority, event)
 
     async def _handle_admitted_message(self, event: MessageEvent) -> Optional[str]:  # health: allow CC -- this is the single ordered admission boundary for session controls and loop wakes.
         """Handle an incoming message from any platform: auth → command check → running-agent
@@ -2105,6 +2098,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             else self._begin_session_run_generation(_quick_key)
         )
         _claim_state = self._session_state(_quick_key)
+        _invalidation_epoch = self._session_invalidation_epoch(_quick_key)
         if _active_session_lease is not None:
             _claim_state.turn.lease = _active_session_lease
         _claim_state.turn.agent = _AGENT_PENDING_SENTINEL
@@ -2144,8 +2138,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
                 return t("gateway.busy.another_turn_running")
             try:
                 if not getattr(event, "_gateway_compression_deferred", False):
-                    await self._run_post_turn_hooks(
+                    await self._defer_post_turn_hooks(
                         agent_result=_agent_result, source=source, is_internal=is_internal, event=event,
+                        session_key=_quick_key, generation=_run_generation, invalidation_epoch=_invalidation_epoch,
                     )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
@@ -2911,15 +2906,15 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         return source.platform.value, str(source.chat_id), str(message_id)
 
     def _prefetch_admitted_voice(self, event) -> None:
-        """Start STT for a voice message the durable FIFO queued behind a running turn.
+        """Start STT at durable admission, independently of when the FIFO runs this turn.
 
         The claimed turn runs a NEW event restored from the committed row, so the live event's
         in-flight STT is published under its transport identity for that turn to adopt
         (``_adopt_admitted_voice``) instead of transcribing and echoing a second time."""
         try:
             key = self._admitted_voice_key(event)
-            if key is None:
-                return
+            if key is None or key in self.__dict__.get("_admitted_voice_prefetches", {}):
+                return  # a redelivery or repeated recovery adopts the existing single-flight
             self._prefetch_queued_voice_transcript(event, self._delivery_adapter_for(event.source))
             # Steer fallback and interrupt mode already transcribed (and echoed) it: publish that too.
             if (getattr(event, "_gateway_pending_stt_prefetch", None) is not None
