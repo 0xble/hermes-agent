@@ -87,10 +87,12 @@ def _arm_rate_limit_cooldown(
             return None
         try:
             from agent.shared_primary_cooldown import arm_cooldown
+            primary_record = getattr(agent, "_shared_primary_cooldown_record", None)
+            primary_outage_id = primary_record.get("outage_id") if isinstance(primary_record, dict) else None
             record = arm_cooldown(
                 live_route, reason=reason,
                 reset_at=_provider_reset_epoch(reset_at),
-                backoff_count=0,
+                backoff_count=0, outage_id=primary_outage_id,
             )
         except Exception:
             record = None

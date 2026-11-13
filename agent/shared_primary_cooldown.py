@@ -246,13 +246,15 @@ def active_cooldown(route: tuple[str, str, str]) -> dict[str, Any] | None:
 
 def arm_cooldown(
     route: tuple[str, str, str], *, reason: Any, reset_at: Any = None,
-    backoff_count: int | None = None,
+    backoff_count: int | None = None, outage_id: Any = None,
 ) -> dict[str, Any] | None:
     """Create or re-arm a route outage and return its durable record.
 
     Billing/quota failures are durable for the bounded billing window when the provider
     does not supply a reset. The same route-keyed record is used for primary and fallback
-    routes, so fresh sessions and cron workers can avoid a known-depleted backend.
+    routes, so fresh sessions and cron workers can avoid a known-depleted backend. A fallback
+    route in the same outage episode may reuse the primary outage id so primary recovery clears
+    the episode's route records together.
     """
     now = time.time()
     reason_value = getattr(reason, "value", str(reason or "rate_limit"))
@@ -275,7 +277,7 @@ def arm_cooldown(
                 outage_id = str(old.get("outage_id") or f"{now:.6f}-{os.getpid()}-{threading.get_ident()}")
                 prior_count = max(int(old.get("backoff_count", 0) or 0), int(backoff_count or 0))
             else:
-                outage_id = f"{now:.6f}-{os.getpid()}-{threading.get_ident()}"
+                outage_id = str(outage_id or f"{now:.6f}-{os.getpid()}-{threading.get_ident()}")
                 prior_count = max(0, int(backoff_count or 0))
             # A 429 that lands while the record is still active comes from a request that was
             # already in flight before the outage was recorded, not from a fresh probe, so it
@@ -345,7 +347,7 @@ def claim_outage_notice(
 
 
 def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool:
-    """Clear only the outage this agent observed; return true for the recovery-notice owner."""
+    """Clear the observed outage and its route records; return true for the recovery owner."""
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
     try:
         with _locked_state() as (path, state):
@@ -354,7 +356,10 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool
                 return False
             if outage_id is not None and str(entry.get("outage_id")) != str(outage_id):
                 return False
-            del state["routes"][key]
+            cleared_id = str(entry.get("outage_id") or outage_id or "")
+            for candidate_key, candidate in list(state["routes"].items()):
+                if isinstance(candidate, dict) and str(candidate.get("outage_id") or "") == cleared_id:
+                    del state["routes"][candidate_key]
             _write_state(path, state)
             return True
     except OSError as exc:

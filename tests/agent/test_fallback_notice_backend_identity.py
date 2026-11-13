@@ -179,6 +179,6 @@ def test_deployment_skip_allows_only_different_label_alias_retry(provider, skip)
     entry = {"provider": provider, "model": "m", "base_url": agent.base_url}
     with (
         patch("agent.chat_completion_helpers._fallback_entry_unavailable_without_network", return_value=None),
-        patch("agent.chat_completion_helpers._candidate_pool_exhausted", return_value=False),
+        patch("agent.fallback_route_cooldowns.candidate_pool_exhausted", return_value=False),
     ):
         assert _should_skip_fallback_candidate(agent, entry, (provider, "m"), provider, "m", set()) is skip
