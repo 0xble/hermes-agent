@@ -1085,7 +1085,8 @@ class GatewayBusySessionMixin:
             event, event.source,
             enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda _source=None: False)(event.source)),
         )
-        effective_mode = self._effective_busy_input_mode(event.source)
+        from gateway.meeting_lane import busy_input_mode
+        effective_mode = await busy_input_mode(self, event, session_key)
         if passive_fyi and effective_mode == "interrupt":
             # An FYI never redirects or interrupts a running turn; it queues exactly like queue mode.
             effective_mode = "queue"

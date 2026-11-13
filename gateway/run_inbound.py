@@ -1048,7 +1048,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if _handled:
             return _result
 
-        effective_busy_input_mode = self._effective_busy_input_mode(source)
+        from gateway.meeting_lane import busy_input_mode
+        effective_busy_input_mode = await busy_input_mode(self, event, _quick_key)
         from gateway.response_filters import is_passive_fyi_relay_event
         if effective_busy_input_mode == "interrupt" and is_passive_fyi_relay_event(
             event, source, enabled=bool(self._relay_fyi_passive_enabled(source)),
@@ -1864,7 +1865,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         must NOT also be admitted as its own turn; False when the caller should admit it (queue mode,
         a demotion, or an interrupt — the ended turn lets the FIFO run the follow-up next)."""
         from gateway.run import _AGENT_PENDING_SENTINEL
-        mode = self._effective_busy_input_mode(source)
+        from gateway.meeting_lane import busy_input_mode
+        mode = await busy_input_mode(self, event, _quick_key)
         state = self._peek_session_state(_quick_key)
         running_agent = state.turn.agent if state else None
         adapter = self._delivery_adapter_for(source)
