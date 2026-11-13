@@ -2070,8 +2070,8 @@ DEFAULT_CONFIG = {
         "kernel_idle_timeout": 1800,
         "max_session_kernels": 4,
         # Local kernel + descendant footprint, sampled every second during cells. MiB;
-        # positive values only (invalid/nonpositive retains 8192). Linux also applies
-        # per-process RLIMIT_AS/DATA at spawn; macOS uses physical footprint + RSS.
+        # positive integer values only (invalid/nonpositive retains 8192). Linux applies
+        # per-process RLIMIT_DATA at spawn; macOS uses physical footprint + RSS.
         "kernel_memory_limit_mb": 8192,
     },
     # Tool Search replaces deferred tools in the model-facing array with the

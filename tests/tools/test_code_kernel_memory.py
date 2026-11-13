@@ -31,7 +31,7 @@ def call(code, owner="memory-test"):
 
 
 @pytest.mark.parametrize("setting,expected_mb", [
-    (None, 8192), (200, 200), ("256", 256), (0, 8192), (-1, 8192),
+    (None, 8192), (200, 200), ("256", 256), (1024.0, 1024), (0, 8192), (-1, 8192),
     (True, 8192), ("invalid", 8192), (float("inf"), 8192),
 ])
 def test_configured_ceiling_retires_only_over_budget_kernel(monkeypatch, tmp_path, caplog,
@@ -78,12 +78,50 @@ def test_configured_ceiling_retires_only_over_budget_kernel(monkeypatch, tmp_pat
     assert fresh["output"].strip() == "False"
 
 
+@pytest.mark.parametrize("setting", [None, False, 0, -1, 1.5, "bad", float("inf"),
+                                    float("nan"), [], 2 ** 63])
+def test_invalid_memory_limit_logs_warning(tmp_path, caplog, setting):
+    from hermes_cli.config import atomic_config_write
+    from tools import code_kernel_memory as memory
+
+    atomic_config_write(tmp_path / "config.yaml", {
+        "code_execution": {"kernel_memory_limit_mb": setting},
+    })
+    caplog.set_level(logging.WARNING, logger=memory.__name__)
+    assert memory.kernel_memory_limit_bytes() == 8192 * 1024 ** 2
+    warnings = [record for record in caplog.records if record.name == memory.__name__
+                and record.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert "ignoring invalid kernel_memory_limit_mb=" in warnings[0].message
+    assert "using 8192 MiB" in warnings[0].message
+
+
+@pytest.mark.parametrize("denied_operation", ["is_running", "memory_info"])
+def test_memory_watch_skips_access_denied_descendant(monkeypatch, denied_operation):
+    from tools import code_kernel_memory as memory
+    from unittest.mock import Mock
+
+    root, denied, allowed = (Mock(pid=pid) for pid in (1, 2, 3))
+    root.is_running.return_value = True
+    root.children.return_value = [denied, allowed]
+    denied.is_running.return_value = True
+    allowed.is_running.return_value = True
+    getattr(denied, denied_operation).side_effect = psutil.AccessDenied(denied.pid)
+    root.memory_info.return_value = SimpleNamespace(rss=10)
+    allowed.memory_info.return_value = SimpleNamespace(rss=10)
+    monkeypatch.setattr(memory.psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(memory, "darwin_physical_footprint", lambda pid: 10)
+
+    watch = memory.KernelMemoryWatch(123, 15)
+    assert watch.exceeded(final=True) == 20
+
+
 def test_real_process_tree_memory_is_bounded(monkeypatch, tmp_path):
     from hermes_cli.config import atomic_config_write
     from tools import code_kernel_memory as memory
 
-    # Isolate the aggregate watchdog: Linux's address-space limit can refuse the
-    # parent's allocation first (thread stacks count toward AS but not RSS).
+    # Isolate the aggregate watchdog: Linux's per-process data limit can refuse
+    # allocations first, independently of the process-tree total.
     monkeypatch.setattr(kernels, "KERNEL_RUNNER_SOURCE",
                         kernels.KERNEL_RUNNER_SOURCE.replace(memory.RUNNER_MEMORY_SOURCE, ""))
     atomic_config_write(tmp_path / "config.yaml", {
@@ -225,4 +263,5 @@ def test_child_rlimit_backstop_is_linux_only_and_never_widens_limits(monkeypatch
     monkeypatch.setitem(sys.modules, "resource", resource)
     child_sys = SimpleNamespace(platform=platform, argv=["runner.py", "200"], stderr=sys.stderr)
     exec(RUNNER_MEMORY_SOURCE, {"sys": child_sys})
-    assert calls == ([(1, expected), (2, expected)] if expected is not None else [])
+    assert all(kind != resource.RLIMIT_AS for kind, _ in calls)
+    assert calls == ([(resource.RLIMIT_DATA, expected)] if expected is not None else [])

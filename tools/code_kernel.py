@@ -72,7 +72,7 @@ def run_cell(request, execution_count):
         if isinstance(exc, MemoryError) and globals().get("_memory_rlimit_bytes", 0):
             ceiling_mb = _memory_rlimit_bytes / (1024 ** 2)
             trace += ("\\nkernel exceeded memory ceiling %g MiB " % ceiling_mb
-                      + "(allocation refused by OS limit); kernel kept alive. "
+                      + "(allocation refused by OS limit); RLIMIT_DATA backstop; kernel kept alive. "
                       + "Earlier cell mutations may persist.\\n")
     stdout_text, stdout_clipped = _clip(out.getvalue())
     stderr_text, stderr_clipped = _clip(err.getvalue())
