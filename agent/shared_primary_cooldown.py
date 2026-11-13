@@ -16,6 +16,7 @@ Invariants:
 """
 from __future__ import annotations
 
+from agent.fallback_cooldown import _SHARED_COOLDOWN_REASONS
 from agent.notice_style import ContextNotice
 
 import contextlib
@@ -728,9 +729,12 @@ def _release_probe(route: tuple[str, str, str], outage_id: str, token: str) -> b
         return False
 
 
-_PROBE_OUTAGE_REASONS = frozenset({
-    "rate_limit", "upstream_rate_limit", "overloaded", "server_error", "timeout",
-})
+# Keep probe failures aligned with the reasons that arm the shared breaker. These extra reasons
+# do not arm a fresh breaker on their own, but a failed probe proves the existing outage persists.
+_PROBE_ONLY_OUTAGE_REASONS = frozenset({"server_error", "timeout"})
+_PROBE_OUTAGE_REASONS = frozenset(
+    getattr(reason, "value", reason) for reason in _SHARED_COOLDOWN_REASONS
+) | _PROBE_ONLY_OUTAGE_REASONS
 
 
 def _fail_agent_probe(agent, reason=None, reset_at=None) -> bool:

@@ -92,6 +92,13 @@ replacement), and every primary exit consumes its local token even if settlement
 An older claimant must not overwrite another process's live probe. Runtime claims size
 the lease to the primary request timeout plus a 120 s margin (SDK default: 600 s),
 rather than scheduling renewal. A valid live lease survives expired-record pruning.
+Probe failure reasons derive from `_SHARED_COOLDOWN_REASONS`, so billing failures,
+like rate limits and overload, re-arm the existing outage and double its backoff instead
+of releasing the lease for an immediate retry. `server_error` and `timeout` are explicit
+probe-only additions: they do not arm a fresh shared breaker, but a failed half-open
+probe is evidence that an already-recorded outage persists. When the request leaves the
+primary for either reason, re-arm that outage with the same exponential backoff. Same-primary
+retries retain the lease; interrupt/cancel exits release it without escalation.
 Custom URL ownership is cached per profile/config revision and snapshotted before taking
 the cross-process state lock; alias merging cannot parse config while holding that lock.
 
@@ -112,7 +119,9 @@ the cross-process state lock; alias merging cannot parse config while holding th
   clearing that reaches a cached agent at its next turn. Overload cases cover 529 with
   Retry-After and 503 without it through `run_conversation`, in-flight versus lapsed
   overload backoff, non-arming 500 and timeout, and non-finite record pruning.
-- `tests/agent/test_shared_primary_probe_review.py`: lost-lease rearming, operator clear,
+- `tests/agent/test_shared_primary_probe_review.py`: all shared arming reasons (including billing)
+  re-arm and double probe backoff for enum/string inputs; server errors and timeouts escalate only
+  an existing probe outage, never arm a fresh breaker. Also covers lost-lease rearming, operator clear,
   takeover recovery, preserved tombstones, profile/revision-scoped config caching, and
   long-request lease coverage through both runtime claim entry points.
 - `tests/hermes_cli/test_fallback_cmd.py`: the `cooldowns` list and clear surface, plus `clear`

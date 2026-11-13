@@ -1,6 +1,5 @@
 """Runtime bridge for the shared primary cooldown's half-open probe."""
 
-import contextlib
 import logging
 
 logger = logging.getLogger(__name__)

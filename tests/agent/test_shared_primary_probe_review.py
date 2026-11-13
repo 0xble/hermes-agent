@@ -5,7 +5,7 @@ import pytest
 
 from agent import shared_primary_cooldown as spc
 from agent.error_classifier import FailoverReason
-from agent.fallback_cooldown import _arm_rate_limit_cooldown
+from agent.fallback_cooldown import _SHARED_COOLDOWN_REASONS, _arm_rate_limit_cooldown
 from agent.shared_primary_probe_runtime import claim_primary_probe
 
 ROUTE = ("custom:review", "https://review.invalid/v1", "primary")
@@ -24,6 +24,52 @@ def _claim_agent():
         _shared_primary_cooldown_record=record, _shared_primary_probe_token=claim.token,
         _fallback_activated=False,
     )
+
+
+@pytest.mark.parametrize("reason", sorted(_SHARED_COOLDOWN_REASONS, key=str))
+@pytest.mark.parametrize("as_string", [False, True])
+def test_shared_outage_probe_failure_rearms_and_doubles_backoff(monkeypatch, reason, as_string):
+    now = 1_900_000_000.0
+    monkeypatch.setattr(spc.time, "time", lambda: now)
+    agent = _claim_agent()
+    original = agent._shared_primary_cooldown_record
+    original_window = original["reset_at"] - original["recorded_at"]
+    assert _arm_rate_limit_cooldown(agent, reason) == 0  # the probe owns settlement
+
+    assert spc.settle_primary_probe_on_exit(agent, reason=reason.value if as_string else reason)
+
+    current = spc.read_cooldown(ROUTE)
+    assert isinstance(current, dict)
+    assert current["outage_id"] == original["outage_id"]
+    assert current["state"] == "active"
+    assert current["backoff_count"] == original["backoff_count"] + 1
+    assert current["reset_at"] - now == 2 * original_window
+    assert "probe_owner" not in current and "probe_until" not in current
+    assert agent._shared_primary_probe_token is None
+    assert agent._rate_limit_backoff_count == current["backoff_count"]
+    assert spc.claim_probe(ROUTE, original["outage_id"]).kind is spc.ProbeClaimKind.STILL_COOLING
+
+
+@pytest.mark.parametrize("reason", [FailoverReason.server_error, FailoverReason.timeout])
+@pytest.mark.parametrize("as_string", [False, True])
+def test_probe_only_outages_rearm_existing_breaker_but_do_not_arm_fresh(monkeypatch, reason, as_string):
+    now = 1_900_000_000.0
+    monkeypatch.setattr(spc.time, "time", lambda: now)
+    assert _arm_rate_limit_cooldown(SimpleNamespace(), reason) is None
+    assert spc.read_cooldown(ROUTE) is None
+    agent = _claim_agent()
+    original = agent._shared_primary_cooldown_record
+
+    assert spc.settle_primary_probe_on_exit(agent, reason=reason.value if as_string else reason)
+
+    current = spc.read_cooldown(ROUTE)
+    assert isinstance(current, dict)
+    assert current["outage_id"] == original["outage_id"]
+    assert current["state"] == "active"
+    assert current["backoff_count"] == 2
+    assert current["reset_at"] - now == 120
+    assert agent._shared_primary_probe_token is None
+    assert spc.claim_probe(ROUTE, original["outage_id"]).kind is spc.ProbeClaimKind.STILL_COOLING
 
 
 @pytest.mark.parametrize("reason", ["rate_limit", "success", "release", "interrupt"])
