@@ -3484,6 +3484,26 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
     return success, error, False
 
 
+def _settled_before_outcome(job, success, error, execution_id, fire_owner, ownership_lost, teardown) -> bool:
+    """Settle a run that must not book an outcome: a lost fire claim, or a gateway handshake that
+    failed before any submit (no admission exists to recover or pause for, so the occurrence is
+    released and re-queued instead of booked as a failed run)."""
+    if ownership_lost():
+        teardown()
+        _record_fire_ownership_lost(job, fire_owner, execution_id)
+        return True
+    from cron.scheduler_authority import NOT_STARTED_FLAG
+    if not job.pop(NOT_STARTED_FLAG, False) or success:
+        return False
+    from cron.scheduler_control import defer_unstarted_fire
+    if not defer_unstarted_fire(job, error or "gateway handshake failed"):
+        return False
+    teardown()
+    finish_execution(execution_id, success=False, error=f"Not started; occurrence deferred: {error}")
+    logger.warning("Job '%s': gateway handshake failed before submit; deferred: %s", job["id"], error)
+    return True
+
+
 def _run_one_job_body(
     job: dict, *, adapters=None, loop=None, verbose: bool = False,
     extra_prompt: Optional[str] = None, claim_lost: Optional[_CancelEventLike] = None,
@@ -3576,13 +3596,8 @@ def _run_one_job_body(
             return True
         success, output, final_response, error = outcome
 
-        if _fire_claim_ownership_lost():
-            _teardown_deferred()
-            _record_fire_ownership_lost(job, fire_owner, execution_id)
-            return True
-
-        from cron.scheduler_control import defer_unstarted_outcome
-        if defer_unstarted_outcome(job, success, error, execution_id, _teardown_deferred):
+        if _settled_before_outcome(job, success, error, execution_id, fire_owner,
+                                   _fire_claim_ownership_lost, _teardown_deferred):
             return True
 
         success, error, agent_declared = _apply_agent_failure_marker(job, success, error, final_response)
