@@ -800,13 +800,13 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         captured = execution_result.get()
         if invalidation_epoch is None:
             invalidation_epoch = self._session_invalidation_epoch(session_key)
-        if self._session_invalidation_epoch(session_key) != invalidation_epoch:
-            return
+        # No early return on invalidation: the delivered turn's loop tick still settles; only the goal
+        # continuation is fenced (it checks the epoch itself, and the hook loop skips it below).
         started = False
 
         async def finish(*, deferred=False):
             nonlocal started
-            if started or self._session_invalidation_epoch(session_key) != invalidation_epoch:
+            if started:
                 return
             started = True
             token = execution_result.set(captured)
@@ -989,10 +989,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 goal_kwargs["invalidation_epoch"] = invalidation_epoch
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
-            if invalidation_epoch is not None and (
+            if hook == self._post_turn_goal_continuation and invalidation_epoch is not None and (
                 self._session_invalidation_epoch(self._session_key_for_source(source))
                 != invalidation_epoch):
-                return
+                continue  # a stop/reset supersedes the goal; the delivered loop tick still settles
             try:
                 await hook(
                     session_entry=session_entry, source=source, final_response=final_text if successful else "",

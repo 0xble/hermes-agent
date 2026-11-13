@@ -49,7 +49,9 @@ async def _teardown(runner, adapter, authority):
 
 
 @pytest.mark.asyncio
-async def test_loop_watcher_waits_for_the_deferred_judge_before_recovering_a_tick(tmp_path, monkeypatch):
+@pytest.mark.parametrize('interference', ['watcher_scan', 'stop_command'])
+async def test_a_delivered_loop_tick_settles_despite_interference_during_its_judge(
+        tmp_path, monkeypatch, interference):
     runner, adapter, authority, source, key = await _native_discord(tmp_path, monkeypatch, 'loop-race')
     turns, sent = [], []
     gate, entered = asyncio.Event(), asyncio.Event()
@@ -95,13 +97,17 @@ async def test_loop_watcher_waits_for_the_deferred_judge_before_recovering_a_tic
         await runner._loop_wakeup_fire_one(owner, manager.state, 1e12, set())
         await asyncio.wait_for(entered.wait(), 20)
         # The tick's reply is delivered and its turn settled; the judge is mid-flight. A watcher scan
-        # now must treat that judge as the tick's owner instead of skipping the tick.
-        await runner._loop_wakeup_fire_one(owner, loops.load_loop(owner), time.time(), set())
+        # must treat that judge as the tick's owner, and a /stop must not drop the tick's verdict.
+        if interference == 'watcher_scan':
+            await runner._loop_wakeup_fire_one(owner, loops.load_loop(owner), time.time(), set())
+        else:
+            runner._invalidate_session_run_generation(key, reason='stop_command')
         gate.set()
         await async_wait_until(
             lambda: not adapter._background_tasks and not runner._is_session_running(key)
             and all(r['status'] == 'terminal' for r in admissions()),
             timeout=20, what='deferred bookkeeping finished')
+        await runner._loop_wakeup_fire_one(owner, loops.load_loop(owner), time.time(), set())
         assert loops.load_loop(owner).status == 'done'
     finally:
         gate.set()
