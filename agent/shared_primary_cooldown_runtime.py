@@ -29,6 +29,7 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
                 and str(record.get("probe_owner") or "") == _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))):
             agent._shared_primary_cooldown_record = record
             return False
+        agent._shared_primary_probe_token = None
         if record is None:
             agent._shared_primary_cooldown_record = None
             agent._shared_primary_probe_token = None
@@ -36,7 +37,11 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
         if not is_active(record):
             agent._shared_primary_cooldown_record = record
             from agent.shared_primary_cooldown import ProbeClaimKind, ProbeClaimOutcome, claim_probe, route_from_record
-            outcome = claim_probe(route_from_record(record), str(record.get("outage_id") or ""))
+            from agent.shared_primary_probe_runtime import primary_probe_lease_seconds
+            outcome = claim_probe(
+                route_from_record(record), str(record.get("outage_id") or ""),
+                lease_seconds=primary_probe_lease_seconds(agent),
+            )
             if not isinstance(outcome, ProbeClaimOutcome):
                 logger.warning("Primary cooldown probe returned an invalid outcome; adopting fallback")
                 outcome = ProbeClaimOutcome(ProbeClaimKind.UNAVAILABLE)
