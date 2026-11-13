@@ -1,7 +1,6 @@
 """Schema setup for the async-delegation ledger connections (split from async_delegation)."""
 from __future__ import annotations
 
-import os
 import sqlite3
 from typing import Optional
 
@@ -20,22 +19,23 @@ def initialize_ledger_schema(conn: sqlite3.Connection) -> None:
     # nullability/defaults depending on which authority touched the database
     # first (#94691).
     # Every ledger transaction opens a fresh connection, often under _records_lock, so replaying the
-    # full DDL each time held that lock for the whole reconcile. Once per database file is enough;
-    # the inode key re-reconciles a state.db that was replaced or restored mid-process.
-    key = _schema_key(conn)
-    if key is not None and key in _SCHEMA_RECONCILED:
+    # full DDL each time held that lock for the whole reconcile. SQLite bumps schema_version on any
+    # schema change and a replaced or recreated file starts from its own value, so an unchanged
+    # version for this path means the canonical DDL already applied.
+    path, version = _schema_state(conn)
+    if path is not None and _SCHEMA_RECONCILED.get(path) == version:
         return
     reconcile_state_schema(conn)
-    if key is not None:
-        _SCHEMA_RECONCILED.add(key)
+    if path is not None:
+        _SCHEMA_RECONCILED[path] = _schema_state(conn)[1]
 
 
-_SCHEMA_RECONCILED: set[tuple[str, int]] = set()
+_SCHEMA_RECONCILED: dict[str, int] = {}
 
 
-def _schema_key(conn: sqlite3.Connection) -> Optional[tuple[str, int]]:
+def _schema_state(conn: sqlite3.Connection) -> tuple[Optional[str], Optional[int]]:
     try:
         path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
-        return (path, os.stat(path).st_ino) if path else None
-    except (sqlite3.Error, OSError, StopIteration):
-        return None
+        return (path or None), conn.execute("PRAGMA schema_version").fetchone()[0]
+    except (sqlite3.Error, StopIteration):
+        return None, None
