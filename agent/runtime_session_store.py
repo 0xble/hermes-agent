@@ -52,6 +52,17 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+class GatewayHandshakeTimeout(TimeoutError):
+    """A timeout during the pre-send gateway handshake, with its phase typed."""
+
+    def __init__(self, phase, detail=None):
+        self.phase = phase
+        message = f"gateway handshake timed out ({phase})"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -142,12 +153,9 @@ def _handshake_call(phase, call):
     try:
         return call()
     except TimeoutError as exc:
-        if str(exc).startswith("gateway handshake timed out ("):
+        if isinstance(exc, GatewayHandshakeTimeout):
             raise
-        message = f"gateway handshake timed out ({phase})"
-        if str(exc):
-            message += f": {exc}"
-        raise TimeoutError(message) from exc
+        raise GatewayHandshakeTimeout(phase, str(exc)) from exc
 
 
 class WorkerRPC:

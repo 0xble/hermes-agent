@@ -74,10 +74,11 @@ def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -
     """Restore a proven unstarted occurrence under its exact fire-owner fence.
 
     Shared by pre-submit deferral and detached pre-body recovery: no run outcome, pause, or
-    failure-streak write. Releases only this attempt's claim and re-stamps the ORIGINAL
-    occurrence as an unclaimed ``pending_slot``; one-shots also refund the preclaim rather than
-    inventing a retry fire. The due scan enforces ordinary catch-up limits. A ``pause`` this
-    fire's recovery recorded is lifted with the restore. Returns ``"deferred"``.
+    failure-streak write. Releases only this attempt's claim; recurring fires restore the
+    original occurrence as an unclaimed ``pending_slot``, while one-shots refund the preclaim
+    and refresh their retry instant through ``preserve_unstarted_run``. The due scan enforces
+    ordinary catch-up limits. A ``pause`` this fire's recovery recorded is lifted with the
+    restore. Returns ``"deferred"``.
 
     When an operator schedule or lifecycle edit superseded the occurrence while the handshake
     stalled, the edit already chose what runs next: the claim is released (a one-shot's
@@ -116,8 +117,10 @@ def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -
             if paused_by_recovery:
                 jobs._activate_job_record(current)
             if kind == "once":
+                # #1281: the one-shot's retry instant is refreshed; no pending slot.
                 preserve_unstarted_run(current, now.isoformat())
-            current["pending_slot"] = pending_slot_stamp(instant, now)
+            else:
+                current["pending_slot"] = pending_slot_stamp(instant, now)
             outcome, detail = "deferred", f"Deferred, not started: {reason}"
         else:
             return None

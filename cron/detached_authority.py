@@ -241,23 +241,20 @@ def _attach_worker(rpc, scope):
     ambiguous = False
 
     def timeout_phase(exc, operation):
-        from hermes_state_errors import GatewayOwnerRestartError
         current = exc
         while current is not None:
-            text = str(current)
-            if text.startswith('gateway handshake timed out ('):
-                return text
-            if isinstance(current, GatewayOwnerRestartError):
-                return 'gateway handshake timed out (owner-transition)'
+            phase = getattr(current, 'phase', None)
+            if phase:
+                return f"gateway handshake timed out ({str(phase).replace('_', '-')})"
             if isinstance(current, TimeoutError):
                 # run_detached calls this only BEFORE start_detached_body wins
                 # the durable body gate. Later reconnect timeouts must never use
                 # this classifier: an ambiguous started body cannot be replayed.
+                text = str(current)
                 phase = 'connect' if text in ('', 'timed out') else operation + '-answer'
                 return f'gateway handshake timed out ({phase})'
             current = current.__cause__
         return None
-
     for attempt in range(4):
         operation = 'register'
         try:
@@ -297,7 +294,7 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     from websockets.exceptions import ConnectionClosed
     import psutil
 
-    from cron.executions import mark_detached_attaching, start_detached_body
+    from cron.executions import mark_detached_attach_lost, mark_detached_attaching, start_detached_body
 
     if (not owns_detached_execution(job['id'], execution_id)
             or not mark_detached_attaching(execution_id)):
@@ -308,6 +305,13 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     rpc = WorkerRPC(get_hermes_home())
     try:
         adopted = _attach_worker(rpc, scope)
+    except DetachedHandshakeTimeout:
+        # This is the only handshake loss that is eligible for pre-body recovery.
+        # Record it while the durable attaching fence still identifies this worker;
+        # downstream code must not infer it from the eventual error text.
+        mark_detached_attach_lost(execution_id)
+        rpc.close()
+        raise
     except BaseException:
         rpc.close()
         raise

@@ -78,7 +78,7 @@ def occurrence_started(job: dict, *, now: datetime | None = None) -> bool:
     with _transaction() as conn:
         return conn.execute(
             "SELECT 1 FROM executions WHERE job_id=? AND scheduled_instant=? "
-            "AND started_at IS NOT NULL AND (body_phase IS NULL OR body_phase!='attaching') LIMIT 1", (str(job["id"]), instant),
+            "AND started_at IS NOT NULL LIMIT 1", (str(job["id"]), instant),
         ).fetchone() is not None
 
 

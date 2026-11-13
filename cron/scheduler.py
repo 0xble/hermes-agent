@@ -3499,25 +3499,17 @@ def _settled_before_outcome(job, success, error, execution_id, fire_owner, owner
         return False
     if not job.get('_scheduled_instant') or not (job.get('fire_claim') or {}).get('by'):
         return False  # Manual fires have no scheduled occurrence to restore; fail visibly.
-    from cron.executions import mark_unstarted_execution
+    # Pre-submit failures never reach the body gate (NULL). A detached attempt
+    # that did reach it is deferrable only with the positive attach_lost marker.
+    if (get_execution(execution_id) or {}).get('body_phase') not in (None, 'attach_lost'):
+        return False
     from cron.scheduler_control import defer_unstarted_fire
-    mark_unstarted_execution(execution_id)
     outcome = defer_unstarted_fire(job, error or "gateway handshake failed")
     if outcome is None:
-        # The exact fire owner no longer controls this occurrence (a lost claim or a
-        # fenced write refusal; operator edits and pauses come back "superseded").
-        # Release that owner's claim before the ordinary visible failure path so it
-        # cannot block the next fire.
-        from cron import jobs as cron_jobs
-        cron_jobs.mark_job_run(
-            job["id"], False, error or "Pre-body deferral was refused.",
-            expected_fire_owner=(job.get("fire_claim") or {}).get("by"),
-            execution_id=execution_id)
-        from cron.scheduler_control import release_unstarted_claim
-        release_unstarted_claim(job)
-        teardown()
-        finish_execution(execution_id, success=False, error=error or "Pre-body deferral was refused.")
-        return True
+        # Refused (lost claim or busy/fenced write): nothing was restored. The ordinary
+        # failure lane owns visible delivery, incident bookkeeping, claim release, and
+        # the terminal execution write.
+        return False
     teardown()
     if outcome == "superseded":
         # Typed like a deferral so journal reconciliation retires it instead of retrying.

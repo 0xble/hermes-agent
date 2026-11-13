@@ -90,7 +90,7 @@ def unclaimed_pending_slot(job, now):
     if not isinstance(pending, dict):
         return None
     slot = pending.get("scheduled_at")
-    if job.get("schedule", {}).get("kind") not in {"cron", "interval", "once"} or not isinstance(slot, str):
+    if job.get("schedule", {}).get("kind") not in {"cron", "interval"} or not isinstance(slot, str):
         return None
     try:
         datetime.fromisoformat(slot)

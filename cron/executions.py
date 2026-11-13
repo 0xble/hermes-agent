@@ -600,17 +600,6 @@ def adopt_claimed_execution(execution_id: str) -> Optional[dict[str, Any]]:
     return record
 
 
-def mark_unstarted_execution(execution_id: str) -> bool:
-    """Record that this owner exited before the body-start fence."""
-    with _transaction() as conn:
-        cur = conn.execute(
-            "UPDATE executions SET body_phase='attaching' WHERE id=? AND status='running' "
-            "AND process_id=? AND pid=? AND body_phase IS NULL",
-            (execution_id, _PROCESS_ID, os.getpid()),
-        )
-        return cur.rowcount == 1
-
-
 def _advance_detached_body_phase(execution_id: str, expected: str | None, phase: str) -> bool:
     with _transaction() as conn:
         cur = conn.execute(
@@ -624,6 +613,11 @@ def _advance_detached_body_phase(execution_id: str, expected: str | None, phase:
 def mark_detached_attaching(execution_id: str) -> bool:
     """Opt this worker into the durable body gate; old workers remain NULL/ambiguous."""
     return _advance_detached_body_phase(execution_id, None, 'attaching')
+
+
+def mark_detached_attach_lost(execution_id: str) -> bool:
+    """Record the positive marker for a transient loss before the body gate."""
+    return _advance_detached_body_phase(execution_id, 'attaching', 'attach_lost')
 
 
 def start_detached_body(execution_id: str) -> bool:
@@ -763,6 +757,18 @@ def execution_owner_live(execution_id: str, job_id: str) -> bool:
     return row is not None and _row_owner_live(row)
 
 
+def mark_deferred_execution(execution_id: str) -> bool:
+    """Mark an attach-lost attempt settled by occurrence deferral, without booking a run result."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET delivery_outcome='deferred'
+               WHERE id=? AND body_phase='attach_lost' AND status IN ('failed','unknown')
+                 AND (delivery_outcome IS NULL OR delivery_outcome='deferred')""",
+            (str(execution_id),),
+        )
+    return cur.rowcount == 1
+
+
 def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
     """Replace a terminal attempt's ``queued`` delivery outcome with the drain's real one.
 
@@ -814,7 +820,8 @@ def recover_interrupted_executions() -> int:
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at, claimed_at, progress_at, owner_kind
+                      handoff_pending, handoff_started_at, claimed_at, progress_at, owner_kind,
+                      body_phase, error
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
@@ -862,15 +869,19 @@ def recover_interrupted_executions() -> int:
                 continue
             # The SELECT ran outside a write transaction and the liveness probe takes time: the
             # owner may have stamped progress since, so act only on the snapshot that was judged.
+            attach_lost = (row["owner_kind"] == "detached"
+                           and row["body_phase"] == "attaching"
+                           and not row["error"])
             cur = conn.execute(
                 """UPDATE executions
                    SET status='unknown', finished_at=?, error=?,
+                       body_phase=CASE WHEN ? THEN 'attach_lost' ELSE body_phase END,
                        handoff_pending=0, handoff_started_at=NULL
                    WHERE id=? AND status=? AND process_id=? AND pid=?
                      AND handoff_pending=?
                      AND handoff_started_at IS ?
                      AND claimed_at=? AND progress_at IS ?""",
-                (now, reason, row["id"], row["status"], row["process_id"], row["pid"],
+                (now, reason, int(attach_lost), row["id"], row["status"], row["process_id"], row["pid"],
                  row["handoff_pending"], row["handoff_started_at"],
                  row["claimed_at"], row["progress_at"]),
             )
@@ -909,7 +920,7 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
     with _transaction() as conn:
         row = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at
+                      handoff_pending, handoff_started_at, owner_kind, body_phase, error
                FROM executions WHERE id=?""",
             (execution_id,),
         ).fetchone()
@@ -926,12 +937,16 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
             and time.time() - float(handoff_started_at) < HANDOFF_ADOPTION_GRACE_SECONDS
         ):
             return False
+        attach_lost = (row["owner_kind"] == "detached"
+                       and row["body_phase"] == "attaching"
+                       and not row["error"])
         cur = conn.execute(
             """UPDATE executions
                SET status='unknown', finished_at=?, error=?,
+                   body_phase=CASE WHEN ? THEN 'attach_lost' ELSE body_phase END,
                    handoff_pending=0, handoff_started_at=NULL
                WHERE id=? AND status=? AND process_id=? AND pid=?""",
-            (now, reason, row["id"], row["status"], row["process_id"], row["pid"]),
+            (now, reason, int(attach_lost), row["id"], row["status"], row["process_id"], row["pid"]),
         )
         if cur.rowcount != 1:
             return False

@@ -338,17 +338,17 @@ def reconcile_pending(*, allow_connect=True):
                 # output or re-marking the job on every tick would duplicate its side effects.
                 continue
             row = get_execution(params['request_id'])
-            from cron.scheduler_worker_failure import defer_proven_unstarted_worker
-            if (row is not None and row.get('body_phase') == 'attaching'
-                    and record.get('job')):
-                if defer_proven_unstarted_worker(
-                        record['job'], row, pause=record.get('pause_recorded')):
+            if (row is not None and row.get('body_phase') == 'attach_lost'
+                    and 'worker_result' not in record and record.get('job')):
+                from cron.scheduler_worker_failure import defer_proven_unstarted_worker
+                if row.get('delivery_outcome') == 'deferred':
+                    retire_completed_journal(params['job_id'], params['request_id'])
+                    continue
+                if defer_proven_unstarted_worker(record['job'], row, pause=record.get('pause_recorded')):
                     # Local body gate + proved dead owner replaces guesswork from a lost
                     # RPC answer. Do not re-submit, replay a result, or pause this fire.
-                    retire_completed_journal(params['job_id'], params['request_id'])
-                # A transient fenced write refusal leaves the journal for the next
-                # reconciliation pass; only restoration or supersession retires it.
-                continue
+                    continue
+                # A refused deferral falls through to the base recovery path by design.
             terminal_execution = (row is not None and row['job_id'] == params['job_id']
                                   and row['status'] in FIRER_FINISHED_STATES)
             current = get_job(params['job_id'])

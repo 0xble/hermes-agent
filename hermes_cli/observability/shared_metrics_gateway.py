@@ -472,7 +472,7 @@ def record_cron_finish(record: Any, delivery_outcome: Any = None) -> None:
     success = record.get("status") == "completed"
     if record.get("status") == "cancelled":  # an operator stop, not a failure
         outcome = "cancelled"
-    elif gated or (not started and not success and delivery_outcome is None):
+    elif gated or (not started and not success and delivery_outcome in (None, "deferred")):
         outcome = "skipped"
     else:
         outcome = "success" if success else "failed"

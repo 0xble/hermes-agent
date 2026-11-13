@@ -5,60 +5,35 @@ import logging
 logger = logging.getLogger("cron.scheduler")
 
 
-def _is_typed_prebody_loss(execution: dict, *, worker_exited: bool) -> bool:
-    """Accept only durable, typed proof that the detached body never began."""
-    if execution.get('body_phase') != 'attaching':
-        return False
-    status = execution.get('status')
-    if status == 'failed':
-        # The handshake path owns this marker; deterministic refusals and watchdog
-        # failures remain ordinary visible failures.
-        return execution.get('delivery_outcome') == 'deferred'
-    if status != 'unknown':
-        return False
-    from cron.executions import _owner_identity
-    if not worker_exited and _owner_identity(
-            execution['pid'], execution['process_started_at']) != 'dead':
-        return False
-    # Deterministic refusals and watchdog termination are exact typed causes;
-    # every other reaped attaching row has no proof that the body ran.
-    if execution.get('error') in {
-            'admission_conflict', 'producer_not_started', 'permission_denied'}:
-        return False
-    from cron.scheduler_detached_worker import HARD_WALL_TIMEOUT_ERROR_PREFIX
-    if str(execution.get('error') or '').startswith(HARD_WALL_TIMEOUT_ERROR_PREFIX):
-        return False
-    return True
 def defer_proven_unstarted_worker(
-    job: dict, execution: dict, *, worker_exited: bool = False, pause: dict | None = None,
+    job: dict, execution: dict, *, pause: dict | None = None,
 ) -> bool:
     """Reclaim only a terminal worker whose durable body gate was never won.
 
-    Reaped process + attaching is proof, not an empty transcript or started_at.
-    Reconnect refusals and hard-wall failures stay on the visible failure lane.
-    NULL/legacy and started rows fail closed.
+    The positive attach_lost marker proves the body gate was never won; neither an
+    empty transcript nor started_at is proof. Reconnect refusals and hard-wall
+    failures stay on the visible failure lane. NULL/legacy and started rows fail closed.
     """
     from cron.scheduler_control import defer_unstarted_fire
 
-    if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attaching'
+    if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attach_lost'
+            or execution.get('status') not in {'failed', 'unknown'}
             or not (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
-        return False
-    if not _is_typed_prebody_loss(execution, worker_exited=worker_exited):
         return False
     deferred = dict(job, _scheduled_instant=(
         job.get('_scheduled_instant') or execution['scheduled_instant']))
-    from cron import jobs
     outcome = defer_unstarted_fire(
         deferred, execution.get('error') or 'Detached worker died before body start', pause=pause)
-    if outcome is not None:
-        # Restored, or superseded by an operator edit (claim released either way).
-        return True
-    current = jobs.get_job(job['id'])
-    # None is either a transient fence refusal (same claim, still recoverable on the next
-    # pass, which also classifies any operator edit under the fence) or a claim this
-    # attempt no longer owns. Only the latter may retire the recovery journal now.
-    return (current is None
-            or (current.get('fire_claim') or {}).get('by') != (job.get('fire_claim') or {}).get('by'))
+    if outcome is None:
+        # No occurrence restored (busy fence, lost claim): stay on the base failure lane.
+        return False
+    # "deferred" or "superseded" by an operator edit: the claim is released either way.
+    from cron.executions import mark_deferred_execution
+    mark_deferred_execution(execution['id'])
+    # The settlement retires this admission through the same guarded path as completion.
+    from cron.scheduler_authority import retire_completed_journal
+    retire_completed_journal(job['id'], execution['id'])
+    return True
 
 
 def record_external_worker_outcome(
@@ -102,11 +77,7 @@ def record_external_worker_outcome(
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
             return True
-        if (execution.get('body_phase') == 'attaching'
-                and (job.get('_scheduled_instant') or execution.get('scheduled_instant'))
-                and _is_typed_prebody_loss(execution, worker_exited=worker_exited)):
-            defer_proven_unstarted_worker(job, execution, worker_exited=worker_exited)
-            # A typed pre-body loss restores the occurrence; it is not a job failure.
+        if defer_proven_unstarted_worker(job, execution):
             return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit
