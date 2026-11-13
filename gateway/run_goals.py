@@ -835,6 +835,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         mismatched_guard = (not fifo_owned and guard is not None
                             and getattr(guard, '_hermes_run_generation', None) != generation)
         if not callable(register) or not delivery_owned or mismatched_guard:
+            # Inline bookkeeping delays the reply by the judge's runtime; name why it was not deferred.
+            logger.info("post-turn bookkeeping inline for %s: register=%s fifo_owned=%s owner_match=%s "
+                        "mismatched_guard=%s", session_key, callable(register), fifo_owned,
+                        delivery_owned and not fifo_owned, mismatched_guard)
             await finish()
             return
         delivered = asyncio.Event()
@@ -843,6 +847,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         except TypeError:  # an adapter double without the ``first`` keyword
             registered = register(session_key, delivered.set, generation=generation)
         if registered is not True:
+            logger.info("post-turn bookkeeping inline for %s: post-delivery callback not registered",
+                        session_key)
             await finish()
             return
 
