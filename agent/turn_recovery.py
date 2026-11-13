@@ -1963,7 +1963,7 @@ def route_classified_error(
             # A durable-write failure still returns the local cooldown, so it never escalates
             # backoff per retry. Mark the guard only when a cooldown was armed: an unarmed attempt
             # (e.g. a rate limit from an active fallback) must leave terminal exhaustion its window.
-            if _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at) is not None:
+            if _arm_rate_limit_cooldown(agent, classified.reason, reset_at=reset_at, billing_unverified=classified.billing_unverified) is not None:
                 _retry.shared_cooldown_arm_attempted = True
     # Z.AI overload 429s classify `overloaded`, which `is_rate_limited` excludes. Detect
     # directly so the long backoff runs, and raise the ceiling to reach it.
@@ -1987,7 +1987,7 @@ def route_classified_error(
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
-            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
+            if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at, billing_unverified=classified.billing_unverified):
                 return _fallback_break()
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:

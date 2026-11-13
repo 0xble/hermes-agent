@@ -2024,7 +2024,10 @@ def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_a
     return False
 
 
-def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set) -> bool:
+def _should_skip_fallback_candidate(
+    agent, fb: dict, fb_key: tuple, fb_provider: str, fb_model: str, unavailable: set,
+    *, fallback_start: int | None = None, fallback_stop: int | None = None,
+) -> bool:
     """True when the entry is already unavailable, malformed, locally unusable, or resolves
     to the backend that just failed (falling back to it would loop the failure)."""
     if fb_key in unavailable:
@@ -2033,12 +2036,6 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     if not fb_provider or not fb_model:
         return True
     from agent.fallback_route_cooldowns import candidate_is_soonest_cooled, cooldown_entries, candidate_pool_exhausted
-    cooled = cooldown_entries(fb_provider, fb_model, fb.get("base_url") or "")
-    if cooled and not candidate_is_soonest_cooled(
-        agent, fb_provider, fb_model, fb.get("base_url") or ""
-    ):
-        logger.info("Fallback skip: %s/%s is in a shared billing/quota cooldown", fb_provider, fb_model)
-        return True
     from agent.fallback_cooldown import _is_entitlement_rejected
     if _is_entitlement_rejected(agent, fb_provider, fb_model):
         logger.info("Fallback skip: %s/%s was rejected as unentitled for this account", fb_provider, fb_model)
@@ -2050,6 +2047,13 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
     if local_skip_reason:
         unavailable.add(fb_key)
         logger.warning("Fallback skip: %s/%s is not locally usable (%s); suppressing for this session", fb_provider, fb_model, local_skip_reason)
+        return True
+    cooled = cooldown_entries(fb_provider, fb_model, fb.get("base_url") or "")
+    if cooled and not candidate_is_soonest_cooled(
+        agent, fb_provider, fb_model, fb.get("base_url") or "",
+        start=fallback_start, stop=fallback_stop,
+    ):
+        logger.info("Fallback skip: %s/%s is in a shared billing/quota cooldown", fb_provider, fb_model)
         return True
     # Identity semantics (axes, shim aliases, credential surfaces, multi-endpoint pools)
     # are owned by agent.backend_identity — do not re-implement comparisons here.
@@ -2212,7 +2216,7 @@ def _finalize_fallback_route(agent, provider: str) -> None:
 
 def try_activate_fallback(
     agent, reason: "FailoverReason | None" = None, reset_at=None, *,
-    _shared_cooldown_record=None,
+    _shared_cooldown_record=None, billing_unverified: bool = False,
 ) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
     model slug and provider in place so the retry loop continues on the new backend; client
@@ -2239,7 +2243,8 @@ def try_activate_fallback(
         agent._rate_limit_backoff_count = int(_shared_cooldown_record.get("backoff_count", 0) or 0)
         cooldown_seconds = remaining
     else:
-        cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
+        cooldown_seconds = _arm_rate_limit_cooldown(
+            agent, reason, reset_at=reset_at, billing_unverified=billing_unverified)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
             return _fallback_chain_exhausted(agent, reason, cooldown_armed=cooldown_seconds is not None)

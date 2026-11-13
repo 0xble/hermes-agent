@@ -63,7 +63,7 @@ def switch_deferred_by_reset(agent, reason: FailoverReason | None, reset_at) -> 
 
 
 def _arm_rate_limit_cooldown(
-    agent, reason: FailoverReason | None, reset_at=None,
+    agent, reason: FailoverReason | None, reset_at=None, *, billing_unverified: bool = False,
 ) -> int | None:
     """Arm the current route cooldown until the provider reset, or use exponential backoff.
 
@@ -87,18 +87,16 @@ def _arm_rate_limit_cooldown(
             return None
         try:
             from agent.shared_primary_cooldown import arm_cooldown
-            primary_record = getattr(agent, "_shared_primary_cooldown_record", None)
-            primary_outage_id = primary_record.get("outage_id") if isinstance(primary_record, dict) else None
-            record = arm_cooldown(
+            verified_billing = reason == FailoverReason.billing and not billing_unverified
+            arm_cooldown(
                 live_route, reason=reason,
                 reset_at=_provider_reset_epoch(reset_at),
-                backoff_count=0, outage_id=primary_outage_id,
+                backoff_count=0, billing_default=verified_billing,
             )
         except Exception:
-            record = None
             logger.debug("Shared fallback cooldown write failed", exc_info=True)
-        if record:
-            return max(0, math.ceil(float(record["reset_at"]) - time.time()))
+        # The return value means "primary cooldown armed" (it skips the exhaustion guard and
+        # adds the primary-retry notice suffix); a fallback route record is not that.
         return None
     if getattr(agent, "_fallback_activated", False):
         # Compare the whole route: a same-provider fallback (another model or endpoint) failing

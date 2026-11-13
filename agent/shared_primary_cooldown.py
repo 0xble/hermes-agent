@@ -49,6 +49,11 @@ def _lock_path() -> Path:
     return _state_path().with_name(".model_cooldowns.lock")
 
 
+def _now() -> float:
+    """Module clock seam: tests patch this instead of the global ``time.time``."""
+    return time.time()
+
+
 def route_key(*, provider: Any, base_url: Any, model: Any) -> str:
     """Stable JSON key for a primary provider route."""
     return json.dumps(
@@ -208,7 +213,7 @@ def _prune_stale(state: dict[str, Any], now: float) -> bool:
 def _active(entry: Any, now: float | None = None) -> bool:
     if not isinstance(entry, dict):
         return False
-    now = time.time() if now is None else now
+    now = _now() if now is None else now
     reset_at = _plausible_reset(entry.get("reset_at", 0), now)
     return reset_at is not None and reset_at > now
 
@@ -221,7 +226,7 @@ def read_cooldown(route: tuple[str, str, str]) -> dict[str, Any] | None:
     """
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
     with _locked_state() as (path, state):
-        if _prune_stale(state, time.time()):
+        if _prune_stale(state, _now()):
             _write_state(path, state)
         entry = state["routes"].get(key)
         return dict(entry) if isinstance(entry, dict) else None
@@ -246,19 +251,17 @@ def active_cooldown(route: tuple[str, str, str]) -> dict[str, Any] | None:
 
 def arm_cooldown(
     route: tuple[str, str, str], *, reason: Any, reset_at: Any = None,
-    backoff_count: int | None = None, outage_id: Any = None,
+    backoff_count: int | None = None, billing_default: bool = False,
 ) -> dict[str, Any] | None:
     """Create or re-arm a route outage and return its durable record.
 
-    Billing/quota failures are durable for the bounded billing window when the provider
-    does not supply a reset. The same route-keyed record is used for primary and fallback
-    routes, so fresh sessions and cron workers can avoid a known-depleted backend. A fallback
-    route in the same outage episode may reuse the primary outage id so primary recovery clears
-    the episode's route records together.
+    ``billing_default`` is set only for a fallback ROUTE record with a verified billing
+    verdict: without a provider reset it is durable for the bounded billing window. Every other
+    caller (the primary, an unverified billing body) keeps the 60 s exponential backoff.
     """
-    now = time.time()
+    now = _now()
     reason_value = getattr(reason, "value", str(reason or "rate_limit"))
-    billing_default = reset_at is None and reason_value == "billing"
+    billing_default = billing_default and reset_at is None and reason_value == "billing"
     if billing_default:
         reset_at = now + _DEFAULT_BILLING_COOLDOWN_SECONDS
     requested_reset = (_plausible_reset(reset_at, now) or 0.0) if reset_at is not None else 0.0
@@ -277,7 +280,7 @@ def arm_cooldown(
                 outage_id = str(old.get("outage_id") or f"{now:.6f}-{os.getpid()}-{threading.get_ident()}")
                 prior_count = max(int(old.get("backoff_count", 0) or 0), int(backoff_count or 0))
             else:
-                outage_id = str(outage_id or f"{now:.6f}-{os.getpid()}-{threading.get_ident()}")
+                outage_id = f"{now:.6f}-{os.getpid()}-{threading.get_ident()}"
                 prior_count = max(0, int(backoff_count or 0))
             # A 429 that lands while the record is still active comes from a request that was
             # already in flight before the outage was recorded, not from a fresh probe, so it
@@ -347,19 +350,18 @@ def claim_outage_notice(
 
 
 def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool:
-    """Clear the observed outage and its route records; return true for the recovery owner."""
+    """Clear only the observed route's outage; return true for the recovery owner."""
     key = route_key(provider=route[0], base_url=route[1], model=route[2])
     try:
         with _locked_state() as (path, state):
             entry = state["routes"].get(key)
             if not isinstance(entry, dict):
                 return False
-            if outage_id is not None and str(entry.get("outage_id")) != str(outage_id):
+            if not outage_id or str(entry.get("outage_id") or "") != str(outage_id):
                 return False
-            cleared_id = str(entry.get("outage_id") or outage_id or "")
-            for candidate_key, candidate in list(state["routes"].items()):
-                if isinstance(candidate, dict) and str(candidate.get("outage_id") or "") == cleared_id:
-                    del state["routes"][candidate_key]
+            # Recovery proves only this route is usable, never another route which happened
+            # to share its outage id (including records written by older versions).
+            del state["routes"][key]
             _write_state(path, state)
             return True
     except OSError as exc:
@@ -379,7 +381,7 @@ def list_cooldowns(*, strict: bool = False) -> list[dict[str, Any]]:
     """
     try:
         with _locked_state() as (path, state):
-            now = time.time()
+            now = _now()
             if _prune_stale(state, now):
                 _write_state(path, state)
             return [dict(entry) for entry in state["routes"].values() if _active(entry, now)]

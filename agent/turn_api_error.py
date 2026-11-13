@@ -364,7 +364,7 @@ def settle_unrecovered_error(
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
             if (
                 (not getattr(_retry, "shared_cooldown_arm_attempted", False) or agent._has_pending_fallback())
-                and agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at)
+                and agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at, billing_unverified=classified.billing_unverified)
             ):
                 # Direct ``return _verdict("break")`` is load-bearing: the restart handler
                 # re-runs the pre-API preflight against the fallback's context window.
@@ -417,7 +417,7 @@ def settle_unrecovered_error(
         # Do not arm again on terminal exhaustion, including after a durable-write failure.
         if (
             (not getattr(_retry, "shared_cooldown_arm_attempted", False) or agent._has_pending_fallback())
-            and agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at)
+            and agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at, billing_unverified=classified.billing_unverified)
         ):
             # Direct ``return _verdict("break")`` is load-bearing: the restart handler
             # re-runs the pre-API preflight against the fallback's context window.

@@ -107,7 +107,10 @@ def test_long_turn_uses_shared_recovery_and_preserves_tool_pairs(tmp_path, monke
 
     with patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve):
         assert agent._try_activate_fallback(reason=FailoverReason.rate_limit)
-        assert agent._try_activate_fallback(reason=FailoverReason.rate_limit)
+        from agent.shared_primary_cooldown import live_route_from_agent
+        failed_fallback_route = live_route_from_agent(agent)
+        reason = FailoverReason.billing if recovery == "cleared" else FailoverReason.rate_limit
+        assert agent._try_activate_fallback(reason=reason)
     assert agent.model == "last-resort"
     resolved.clear()
     requested = []
@@ -151,7 +154,11 @@ def test_long_turn_uses_shared_recovery_and_preserves_tool_pairs(tmp_path, monke
                 base_url="https://primary.invalid/v1", _emit_diagnostic_status=Mock(),
             )
             assert complete_primary_recovery(peer)
-            assert not path.exists()
+            # Fallback failures now have their own durable records. Primary recovery must
+            # remove exactly the primary, not erase those independent route cooldowns.
+            from agent.shared_primary_cooldown import active_cooldown, route_from_agent
+            assert active_cooldown(route_from_agent(peer)) is None
+            assert active_cooldown(failed_fallback_route)["reason"] == "billing"
         tool_finished.append(True)
         return "tool result"
 

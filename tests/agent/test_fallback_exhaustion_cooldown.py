@@ -91,6 +91,30 @@ class TestExhaustionArmsCooldown:
         # not the 60s rate-limit one.
         assert cooldown == frozen + _FALLBACK_EXHAUSTED_COOLDOWN_S
 
+    def test_billing_from_active_fallback_keeps_exhaustion_guard(self):
+        """Fallback->fallback billing persists its route record but is not a primary cooldown:
+        exhaustion still gets the short window and episode marker, with no primary-retry notice."""
+        fbs = [
+            {"provider": "openai", "model": "gpt-4o"},
+            {"provider": "zai", "model": "glm-4.7"},
+        ]
+        agent = _make_agent(fallback_model=fbs)
+        frozen = 1_000.0
+        notices = []
+        with (
+            patch("agent.chat_completion_helpers.time.monotonic", return_value=frozen),
+            patch("agent.chat_completion_helpers._buffer_fallback_notice", side_effect=lambda _agent, notice: notices.append(notice)),
+            patch("agent.auxiliary_client.resolve_provider_client", return_value=(_mock_client(), "resolved")),
+        ):
+            assert agent._try_activate_fallback() is True
+            agent._fallback_episode_cooled = False
+            assert agent._try_activate_fallback(reason=FailoverReason.billing) is True
+            assert agent._try_activate_fallback(reason=FailoverReason.billing) is False
+        assert agent._rate_limited_until == frozen + _FALLBACK_EXHAUSTED_COOLDOWN_S
+        assert agent._fallback_episode_cooled is True
+        assert agent._shared_primary_cooldown_record is None
+        assert notices and not any("Primary retry eligible" in n for n in notices)
+
     def test_no_chain_does_not_arm_cooldown(self):
         """An empty chain (no fallback configured) must not arm a cooldown —
         there is no chain to storm, and gating primary restoration would be

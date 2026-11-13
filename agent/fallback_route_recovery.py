@@ -166,7 +166,10 @@ def _try_reclaim_earlier_fallback(agent, before_index):
     for index, entry in enumerate(agent._fallback_chain[:before_index]):
         provider = (entry.get("provider") or "").strip().lower()
         model = (entry.get("model") or "").strip()
-        if _should_skip_fallback_candidate(agent, entry, _fallback_entry_key(entry), provider, model, unavailable):
+        if _should_skip_fallback_candidate(
+            agent, entry, _fallback_entry_key(entry), provider, model, unavailable,
+            fallback_start=index, fallback_stop=before_index,
+        ):
             continue
         attempt = _capture_route_state(agent)
         try:

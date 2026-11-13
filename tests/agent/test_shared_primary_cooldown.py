@@ -715,3 +715,28 @@ def test_arm_ignores_a_non_finite_provider_reset():
     assert entry is not None
     assert 59 <= entry["reset_at"] - entry["recorded_at"] <= 61
     assert entry["source"] == "backoff"
+
+
+def test_clear_if_current_never_matches_an_empty_id_and_spares_other_routes(tmp_path, monkeypatch):
+    """Same outage ids on different routes must not broaden a recovery receipt."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    from agent import shared_primary_cooldown as spc
+
+    # Deliberately collide ids, as older versions did when recording fallback failures.
+    monkeypatch.setattr(spc, "_now", lambda: 1_800_000_000.0)
+    primary = ("custom:p", "http://p.invalid/v1", "primary")
+    other = ("custom:o", "http://o.invalid/v1", "other")
+    p_rec = spc.arm_cooldown(primary, reason="rate_limit")
+    o_rec = spc.arm_cooldown(other, reason="billing", billing_default=True)
+    assert p_rec["outage_id"] == o_rec["outage_id"]
+    assert spc.clear_if_current(primary, p_rec["outage_id"]) is True
+    assert spc.get_cooldown(primary) is None
+    assert spc.get_cooldown(other) == o_rec
+
+    # An old malformed record without an id cannot be claimed by None or empty string.
+    with spc._locked_state() as (path, state):
+        state["routes"][spc.route_key(provider=other[0], base_url=other[1], model=other[2])].pop("outage_id")
+        spc._write_state(path, state)
+    assert spc.clear_if_current(other, "") is False
+    assert spc.clear_if_current(other, None) is False
+    assert spc.get_cooldown(other) is not None

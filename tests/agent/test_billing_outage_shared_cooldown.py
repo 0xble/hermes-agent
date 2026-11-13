@@ -8,6 +8,40 @@ import pytest
 from tests.agent import _shared_cooldown_stub as harness
 
 
+def test_unverified_billing_stays_short_after_fallback_chain_exhaustion(tmp_path, monkeypatch):
+    status = 400
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "agent:\n  api_max_retries: 0\n  auto_recovery_cycles: 0\ncompression:\n  enabled: false\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setitem(harness._FAILURE_BODIES, status, {
+        "error": {"type": "api_error", "message": "out of extra usage"},
+    })
+    # Fail only the fallback and begin on that route with an active primary cooldown.
+    # This drives real classification, eager fallback, and nonretryable terminal exhaustion.
+    monkeypatch.setattr(harness, "PRIMARY_MODEL", harness.FALLBACK_MODEL)
+    child = harness.CHILD.replace(
+        '    result = agent.run_conversation("hello")',
+        '    from agent.error_classifier import FailoverReason\n'
+        '    assert agent._try_activate_fallback(reason=FailoverReason.rate_limit)\n'
+        '    result = agent.run_conversation("hello")',
+    )
+    monkeypatch.setattr(harness, "CHILD", child)
+    with harness.StubProvider() as stub:
+        stub.failure_status = status
+        stub.retry_after = None
+        result = harness.run_turn(home, stub.url, "nonstream")
+    assert result["failed"] is True
+    records = json.loads((home / "state" / "model_cooldowns.json").read_text())["routes"]
+    (fallback,) = [record for record in records.values() if record["model"] == harness.FALLBACK_MODEL]
+    assert fallback["reason"] == "billing"
+    assert fallback["source"] == "backoff"
+    assert 59 <= fallback["reset_at"] - fallback["recorded_at"] < 120
+
+
+
 @pytest.mark.parametrize(
     ("status", "message", "reason"),
     [
