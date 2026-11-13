@@ -325,6 +325,7 @@ class GatewayConfigLoadersMixin:
 
     def _set_session_reasoning_override(
         self, session_key: str, reasoning_config: Optional[dict], *, scope: Optional[str] = None,
+        persist: bool = True,
     ) -> None:
         """Set or clear the session-scoped reasoning override, writing it through to the session
         store so the pick survives a gateway restart."""
@@ -338,7 +339,7 @@ class GatewayConfigLoadersMixin:
         )
         conversation.reasoning_override_scope = scope if scope in ("session", "temporary") else "session"
         store = getattr(self, "session_store", None)
-        if store is not None:
+        if persist and store is not None:
             try:
                 if reasoning_config is not None and conversation.reasoning_override_scope != "session":
                     store.set_reasoning_override(session_key, reasoning_config, scope=conversation.reasoning_override_scope)

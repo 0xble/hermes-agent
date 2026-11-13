@@ -18,7 +18,10 @@ The same binding defaults the existing durable session reasoning override to
 session picks (including reasoning off) are preserved. The live agent receives
 the default on its next request through the existing inference-control setter.
 No `model.attended` or other global/profile configuration changes. Removing the
-binding does not delete a persisted session pick; `/reasoning reset` clears it.
+binding does not delete a persisted session pick. While the binding remains,
+`/reasoning reset` is temporary: the next ordinary meeting message restores the
+lane's medium default. After unbinding, `/reasoning reset` clears the pick and the
+next message uses the configured effort.
 
 ## Provenance and verification
 
