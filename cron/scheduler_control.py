@@ -53,7 +53,7 @@ def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -
     but retain the ORIGINAL occurrence identity rather than inventing a retry fire.
     Returns ``"deferred"``.
 
-    When an operator schedule edit (schedule, timezone or ``next_run_at``) superseded the
+    When an operator edit (schedule, timezone or ``next_run_at`` through ``update_job``) superseded the
     occurrence while it was unstarted, the edit already chose what runs next. ``update_job``
     dropped the unclaimed slot for the same reason, so restoring it would revive the old
     occurrence, and the ordinary failure lane would recompute ``next_run_at`` or consume the
@@ -88,7 +88,7 @@ def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -
             current["paused_at"] = None
             current["paused_reason"] = None
         kind = (current.get("schedule") or {}).get("kind")
-        if any(current.get(key) != job.get(key) for key in _OCCURRENCE_FIELDS):
+        if _occurrence_superseded(job, current):
             if kind == "once":
                 _refund_oneshot_preclaim(current)
             outcome, detail = "superseded", f"Not started; superseded by an operator edit: {reason}"
@@ -109,9 +109,17 @@ def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -
     return jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply, None))
 
 
-# Edits that supersede an unstarted occurrence: ``update_job`` drops ``pending_slot`` for them.
-# Nothing between the claim and a deferral rewrites these, so any difference is an operator edit.
-_OCCURRENCE_FIELDS = ("schedule", "timezone", "next_run_at")
+def _occurrence_superseded(claimed: dict, current: dict) -> bool:
+    """True when an operator edit replaced this claimed occurrence before it started.
+
+    ``update_job`` marks the live claim (``superseded_at``) for schedule, timezone and
+    ``next_run_at`` edits. A raw ``next_run_at`` comparison is not evidence, because an
+    overlapping tick's ``advance_next_runs`` rewrites it while the fire is in flight. Schedule and
+    timezone are also compared directly, since a definition import rewrites them outside
+    ``update_job``, and nothing in the scheduler changes them."""
+    if (current.get("fire_claim") or {}).get("superseded_at"):
+        return True
+    return any(current.get(key) != claimed.get(key) for key in ("schedule", "timezone"))
 
 
 def _refund_oneshot_preclaim(current: dict) -> None:
