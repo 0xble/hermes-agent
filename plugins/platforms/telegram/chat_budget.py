@@ -128,9 +128,9 @@ class ChatOutboundBudget:
     is never faster than the base gap, so an override can only tighten the sum it bounds.
     """
 
-    def __init__(self, *, gap_override: Optional[float] = None, clock: Callable[[], float] = time.monotonic):
+    def __init__(self, *, gap_override: Optional[float] = None, clock: Optional[Callable[[], float]] = None):
         self._gap_override = gap_override
-        self._clock = clock
+        self._clock = clock or time.monotonic
         self._chats: dict[str, _ChatState] = {}
 
     def _state(self, key: str) -> _ChatState:
@@ -223,11 +223,14 @@ class ChatOutboundBudget:
 
     async def take(self, chat_id: Any) -> None:
         wait = self.reserve(chat_id)
-        while wait > 0:
+        # Keep this caller's own reservation. Rechecking ``remaining(chat_id)``
+        # would observe a later caller's reservation and make all queued sends
+        # wake together at the tail of the queue.
+        deadline = self._clock() + wait
+        while (wait := deadline - self._clock()) > 0:
             await asyncio.sleep(wait)
-            # Event-loop timers may wake a little early under load. Recheck the
-            # reserved deadline before allowing the request to reach Telegram.
-            wait = self.remaining(chat_id)
+            # Event-loop timers may wake a little early under load. Recheck this
+            # reservation's deadline before allowing the request to reach Telegram.
 
     def note_retry_after(self, chat_id: Any, wait: float) -> None:
         """A published ``retry_after`` means the chat is already near its limit: widen its gap

@@ -245,7 +245,11 @@ def _install_telegram_mock(monkeypatch, bot):
     # MessageEntity needed by #27865 mention-detection path; tests don't
     # inspect it but the import must succeed.
     _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
-    telegram_mod = SimpleNamespace(Bot=lambda token: bot, MessageEntity=_MessageEntity, constants=constants_mod)
+    # The standalone sender now passes the gateway-built request transports to PTB's Bot.
+    # Keep this seam compatible with that production constructor while still returning the
+    # controlled test double.
+    telegram_mod = SimpleNamespace(Bot=lambda token, **_kwargs: bot, MessageEntity=_MessageEntity,
+                                   constants=constants_mod)
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
 
@@ -772,7 +776,15 @@ class TestSendTelegramHtmlDetection:
         )
         _install_telegram_mock(monkeypatch, bot)
 
-        with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        from plugins.platforms.telegram import chat_budget
+        fake_time = [0.0]
+        monkeypatch.setattr(chat_budget.time, "monotonic", lambda: fake_time[0])
+
+        async def fake_sleep(seconds):
+            fake_time[0] += seconds
+
+        sleep_mock = AsyncMock(side_effect=fake_sleep)
+        with patch("asyncio.sleep", new=sleep_mock):
             result = asyncio.run(_send_telegram("tok", "123", "hello"))
 
         assert result["success"] is True
