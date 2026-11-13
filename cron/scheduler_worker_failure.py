@@ -30,7 +30,8 @@ def defer_proven_unstarted_worker(
         # The deferral settles this admission through the same guarded retirement path as completion.
         from cron.scheduler_authority import retire_completed_journal
         retire_completed_journal(job['id'], execution['id'])
-    return deferred
+    # "superseded" settles the same way: the claim is released and the operator's edit stands.
+    return bool(deferred)
 
 
 def record_external_worker_outcome(

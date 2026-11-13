@@ -3487,11 +3487,19 @@ def _settled_before_outcome(job, success, error, execution_id, fire_owner, owner
     if (get_execution(execution_id) or {}).get('body_phase') not in (None, 'attach_lost'):
         return False
     from cron.scheduler_control import defer_unstarted_fire
-    if not defer_unstarted_fire(job, error or "gateway handshake failed"):
+    outcome = defer_unstarted_fire(job, error or "gateway handshake failed")
+    if not outcome:
         # The ordinary failure lane owns visible delivery, incident bookkeeping,
         # claim release, and the terminal execution write.
         return False
     teardown()
+    if outcome == "superseded":
+        finish_execution(execution_id, success=False,
+                         error=f"Not started; occurrence superseded by an operator edit: {error}",
+                         delivery_outcome="deferred")
+        logger.warning("Job '%s': gateway handshake failed before body start; occurrence superseded "
+                       "by an operator edit, schedule left as edited: %s", job["id"], error)
+        return True
     finish_execution(execution_id, success=False, error=f"Not started; occurrence deferred: {error}",
                      delivery_outcome="deferred")
     logger.warning("Job '%s': gateway handshake failed before body start; deferred: %s", job["id"], error)
