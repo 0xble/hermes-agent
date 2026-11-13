@@ -15,7 +15,12 @@ async def admit_relay_delivery(adapter, runner, event):
     ``outbound_result`` only that reader delivers: plugin code (``pre_gateway_dispatch``,
     ``post_gateway_admission``) and answering the chat's running turn (``session_ingress_live_turn``:
     a busy ack, a resolved prompt's card), which can become possible while admission waits."""
-    lanes = adapter._admission_lanes
+    # RelayAdapter initializes this lane map eagerly. Keep the shared admission
+    # helper usable by adapters that exercise the relay contract through a test
+    # or replacement transport without inheriting RelayAdapter itself.
+    lanes = getattr(adapter, '_admission_lanes', None)
+    if lanes is None:
+        lanes = adapter._admission_lanes = {}
     lane = (event.source.platform.value, event.source.chat_id)
     task = asyncio.create_task(_admit_after(lanes.get(lane), adapter, runner, event))
     lanes[lane] = task

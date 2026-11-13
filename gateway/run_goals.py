@@ -827,7 +827,14 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         from gateway.platforms.base import post_delivery_owner
         owner = post_delivery_owner.get()
         register = getattr(adapter, 'register_post_delivery_callback', None)
-        fifo_owned = captured is not None and captured.get('post_delivery_owned') is True
+        # A goal wake is a gateway-authored continuation. It may have a pending
+        # adapter delivery after settlement, but it has no inbound transport
+        # lifecycle that can signal this callback. Keep its bookkeeping inline;
+        # otherwise the watcher treats the callback as an active turn until the
+        # 60-second fallback and suppresses the next wait generation.
+        fifo_owned = (captured is not None
+                      and captured.get('post_delivery_owned') is True
+                      and not bool(getattr(event, 'metadata', {}).get('goal_continuation')))
         delivery_owned = fifo_owned or (
             owner is not None and owner[0] is adapter and owner[1] is event)
         # FIFO execution hands off an explicit owner below. Legacy adapter delivery
