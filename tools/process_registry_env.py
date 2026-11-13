@@ -7,7 +7,7 @@ import time
 from typing import Any, TYPE_CHECKING
 
 from tools.environments.local import (
-    _sanitize_subprocess_env, _strip_default_profile_home, _terminal_env,
+    _replace_default_profile_home, _sanitize_subprocess_env, _terminal_env,
 )
 
 
@@ -15,9 +15,8 @@ def child_spawn_env(env_vars: dict) -> dict:
     """Sanitized terminal child env; PYTHONUNBUFFERED so poll sees progress."""
     from agent.session_client_env import toolchain_environ
 
-    env = _strip_default_profile_home(
-        _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
-    )
+    env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
+    _replace_default_profile_home(env)
     env["PYTHONUNBUFFERED"] = "1"
     return env
 

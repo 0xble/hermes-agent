@@ -24,6 +24,7 @@ _NON_DISPATCHER_OWNED_CONTEXT: ContextVar[bool] = ContextVar("hermes_non_dispatc
 DELEGATED_CHILD_ENV_MARKER = "HERMES_DELEGATED_CHILD_CONTEXT"
 DELEGATED_PARENT_SESSION_ENV = "HERMES_DELEGATED_PARENT_SESSION_ID"
 KANBAN_HOME_INJECTED_ENV = "HERMES_KANBAN_HOME_INJECTED"
+KANBAN_HOME_FENCED_ENV = "HERMES_KANBAN_HOME_FENCED"
 
 KANBAN_ENV_KEYS: tuple[str, ...] = (
     "HERMES_KANBAN_TASK", "HERMES_KANBAN_RUN_ID", "HERMES_KANBAN_CLAIM_LOCK",
@@ -197,9 +198,9 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
 
     The marker's value is the fenced board ROOT, so the fence applies to the lineage's
     board and not to every Kanban DB the descendant touches: a child running a repro
-    against a temp ``HERMES_HOME`` got a silently read-only board there. An inherited
-    path-valued marker is kept unless the environment carries an operator-set board
-    override, which is the board the child actually resolves.
+    against a temp ``HERMES_HOME`` got a silently read-only board there. A path-valued
+    lineage marker stays frozen; an explicit override is fenced only when inherited
+    at the first scrub boundary, not when a grandchild chooses its own scratch board.
     """
     cleaned = {k: v for k, v in env.items() if k not in KANBAN_ENV_KEYS}
     # Only the gateway mints ``kanban`` sessions: a descendant ``hermes chat`` sending it is refused.
@@ -216,7 +217,14 @@ def scrub_kanban_env(env: Mapping[str, str] | MutableMapping[str, str]) -> dict[
         fenced_root = _fenced_kanban_root()
     cleaned[DELEGATED_CHILD_ENV_MARKER] = fenced_root
     if fenced_root != "1" and (inherited or _DELEGATED_CHILD_CONTEXT.get()):
-        if operator_home and not injected_home:
+        if operator_home and not injected_home and not inherited:
+            # Capture an explicit override once at the child boundary. A later
+            # grandchild may select its own scratch board without extending this fence.
+            cleaned[KANBAN_HOME_FENCED_ENV] = operator_home
+            cleaned.pop(KANBAN_HOME_INJECTED_ENV, None)
+        elif operator_home and not injected_home and inherited:
+            # The current override is a grandchild choice; preserve only the
+            # inherited lineage marker and any earlier fenced override.
             cleaned.pop(KANBAN_HOME_INJECTED_ENV, None)
         else:
             cleaned["HERMES_KANBAN_HOME"] = fenced_root
@@ -264,9 +272,11 @@ def kanban_path_is_fenced(path: os.PathLike[str] | str) -> bool:
     if pinned and target == Path(pinned).expanduser().resolve():
         return True
     roots = [marker]
-    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-    if override and not _kanban_home_matches_injected(os.environ):
-        roots.append(override)
+    # Only the override recorded at scrub time is inherited. A grandchild's
+    # current HERMES_KANBAN_HOME may name its own writable scratch board.
+    inherited_home = os.environ.get(KANBAN_HOME_FENCED_ENV, "").strip()
+    if inherited_home:
+        roots.append(inherited_home)
     for root in roots:
         try:
             target.relative_to(Path(root).expanduser().resolve())

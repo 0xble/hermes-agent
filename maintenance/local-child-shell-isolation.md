@@ -16,20 +16,31 @@ Contract tests: `tests/tools/test_local_delegated_shell_isolation.py`, `tests/to
 
 Patch identity: `default-child-live-home`.
 
-The default-profile terminal, PTY, `execute_code` and persistent-shell snapshot children do not
-receive the live default `HERMES_HOME`. Named profiles, cron workers and remote backends keep their
-existing environment. Delegated children keep their Kanban lineage fence through
-`HERMES_KANBAN_HOME` as a fallback, and an explicit child `HERMES_HOME` resolves its own board.
-The `HERMES_KANBAN_HOME_INJECTED` marker carries the injected board path, so a later changed
-`HERMES_KANBAN_HOME` is explicit while the inherited lineage fence remains in place.
+The default-profile agent shell initializes `HERMES_HOME` as a **non-exported shell variable**,
+so documented paths such as `$HERMES_HOME/skills/...` still read the active home and do not
+expand to `/skills/...`. This setup runs after login initialization and snapshot replay,
+including old snapshots that exported the live value. Ordinary test/Codex processes launched
+from that shell do not inherit the live value. An explicit scratch-home export still persists.
+Terminal background/PTY children, `execute_code` children, and delegated shells instead receive
+a defined disposable process-local home; named/custom profiles and cron workers retain their
+explicit profile route. No cleanup lifecycle or destructive env-derived operation is added.
+
+Delegated descendants carry their Kanban lineage fence in `HERMES_DELEGATED_CHILD_CONTEXT`.
+`HERMES_KANBAN_HOME_INJECTED` identifies the injected location fallback, while
+`HERMES_KANBAN_HOME_FENCED` captures an explicit override at the first scrub boundary.
+A grandchild may choose its own `HERMES_KANBAN_HOME` scratch board without extending that
+inherited fence. Both provenance markers are removed from the snapshot dump; the injected
+home itself is removed only while it still equals the injected value. These are cooperative
+runtime guards, not OS confinement or protection from arbitrary direct SQLite/file access.
 
 On 2026-11-11 a Codex cleanup ran `rmtree($HERMES_HOME)` after scoping a scratch value to only
 pytest, and wiped the live `~/.hermes`.
 
-This does not cover commands that name `~/.hermes` literally. The shell-guard `home_env_delete` rule
-covers those commands.
+This does not cover commands that name `~/.hermes` literally or code that explicitly resolves
+the default home after the variable is absent. The shell-guard `home_env_delete` rule covers
+environment-derived deletion commands, not all literal paths or arbitrary Python cleanup.
 
-Contract tests: `tests/tools/test_default_child_hermes_home.py`, `tests/tools/test_delegate_kanban_isolation.py::test_delegate_child_kanban_cli_cannot_delete_parent_board`, `tests/tools/test_kanban_descendant_scope.py::test_child_shell_can_write_a_kanban_board_outside_its_lineage_root`.
+Contract tests: `tests/tools/test_default_child_hermes_home.py`, `tests/tools/test_snapshot_session_id_leak.py`, `tests/tools/test_delegate_kanban_isolation.py::test_delegate_child_kanban_cli_cannot_delete_parent_board`, `tests/tools/test_kanban_descendant_scope.py::test_child_shell_can_write_a_kanban_board_outside_its_lineage_root`.
 
 ## Evidence and upstream disposition
 

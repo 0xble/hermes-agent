@@ -205,6 +205,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
     # The injected-Kanban-home marker rides with the lineage marker in delegated shells;
     # leaked into tests, it would make kanban_home() ignore a monkeypatched HERMES_KANBAN_HOME.
     "HERMES_KANBAN_HOME_INJECTED",
+    "HERMES_KANBAN_HOME_FENCED",
     "HERMES_TENANT",
     # Honcho host selection changes which nested config block wins. A local
     # shell override leaked "myhost" into the full suite and flipped 20
