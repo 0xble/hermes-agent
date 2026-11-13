@@ -5,8 +5,13 @@ delayed Telegram delivery and surfaced as spurious connect timeouts.
 """
 from __future__ import annotations
 
+from contextlib import closing
+import shutil
+import sqlite3
 import threading
 import time
+
+import pytest
 
 import hermes_loop_guard
 from hermes_state import SessionDB
@@ -85,3 +90,59 @@ def test_delegation_ledger_reconciles_schema_once_per_database_file(tmp_path, mo
     with async_delegation._transaction() as conn:
         conn.execute("SELECT count(*) FROM async_delegations").fetchone()
     assert len(calls) == 2
+
+
+@pytest.mark.parametrize("reuse_inode", [False, True], ids=["new-file", "same-inode"])
+def test_delegation_ledger_reconciles_same_cookie_older_replacement(tmp_path, monkeypatch, reuse_inode):
+    import hermes_state_schema
+
+    calls = []
+    real = hermes_state_schema.reconcile_state_schema
+    monkeypatch.setattr(hermes_state_schema, "reconcile_state_schema", lambda conn: (calls.append(1), real(conn)))
+    db_path = tmp_path / "state.db"
+    monkeypatch.setattr(async_delegation, "_db_path", lambda: db_path)
+    from tools import async_delegation_ledger
+    monkeypatch.setattr(async_delegation_ledger, "_SCHEMA_RECONCILED", {})
+
+    with async_delegation._transaction() as conn:
+        conn.execute(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, state, dispatched_at, updated_at) "
+            "VALUES ('original', 'session', 'completed', 1, 1)"
+        )
+        schema_cookie = conn.execute("PRAGMA schema_version").fetchone()[0]
+    assert calls == [1]
+
+    older_path = tmp_path / "older.db"
+    with closing(sqlite3.connect(older_path)) as conn:
+        conn.execute("PRAGMA journal_mode=DELETE")
+        conn.execute(
+            "CREATE TABLE async_delegations ("
+            "delegation_id TEXT PRIMARY KEY, origin_session TEXT NOT NULL, "
+            "state TEXT NOT NULL, dispatched_at REAL NOT NULL, updated_at REAL NOT NULL)"
+        )
+        conn.execute(
+            "INSERT INTO async_delegations "
+            "(delegation_id, origin_session, state, dispatched_at, updated_at) "
+            "VALUES ('restored', 'session', 'completed', 2, 2)"
+        )
+        conn.execute(f"PRAGMA schema_version = {schema_cookie}")
+        assert conn.execute("PRAGMA schema_version").fetchone()[0] == schema_cookie
+        conn.commit()
+
+    original_inode = db_path.stat().st_ino
+    for suffix in ("-wal", "-shm"):
+        (tmp_path / f"state.db{suffix}").unlink(missing_ok=True)
+    if reuse_inode:
+        # A restore can overwrite the same inode; Linux can also reuse a deleted inode immediately.
+        shutil.copyfile(older_path, db_path)
+        assert db_path.stat().st_ino == original_inode
+    else:
+        older_path.replace(db_path)
+        assert db_path.stat().st_ino != original_inode
+    for _ in range(2):
+        with async_delegation._transaction() as conn:
+            assert conn.execute(
+                "SELECT retry_root_started_at FROM async_delegations WHERE delegation_id = 'restored'"
+            ).fetchone() == (None,)
+    assert calls == [1, 1]

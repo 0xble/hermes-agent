@@ -3,20 +3,30 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from typing import Any, Callable, Optional
 
 
 logger = logging.getLogger('tools.async_delegation')
 
-_SCHEMA_RECONCILED: dict[str, int] = {}
+_SCHEMA_RECONCILED: dict[str, tuple[int, int, int, Optional[str]]] = {}
 
 
-def _schema_state(conn: sqlite3.Connection) -> tuple[Optional[str], Optional[int]]:
+def _schema_state(
+    conn: sqlite3.Connection,
+) -> tuple[Optional[str], Optional[tuple[int, int, int, Optional[str]]]]:
     try:
         path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
-        return (path or None), conn.execute("PRAGMA schema_version").fetchone()[0]
-    except (sqlite3.Error, StopIteration):
+        if not path:
+            return None, None
+        stat = os.stat(path)
+        version = conn.execute("PRAGMA schema_version").fetchone()[0]
+        table = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'async_delegations'"
+        ).fetchone()
+        return path, (stat.st_dev, stat.st_ino, version, table[0] if table else None)
+    except (OSError, sqlite3.Error, StopIteration):
         return None, None
 
 
@@ -62,13 +72,16 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # nullability/defaults depending on which authority touched the database
     # first (#94691).
     # Each ledger transaction opens a connection, often while the registry lock is held.
-    # A schema-version change invalidates this cache, including a freshly recreated file.
-    path, version = _schema_state(conn)
-    if path is not None and _SCHEMA_RECONCILED.get(path) == version:
+    # A restored file can reuse both its inode and its schema cookie, so the cache identity also
+    # carries the ledger's stored table definition: a cheap content signal that changes with its
+    # columns, not with row writes, and needs no second column list to keep in sync with SCHEMA_SQL.
+    path, state = _schema_state(conn)
+    if path is not None and _SCHEMA_RECONCILED.get(path) == state:
         return
     reconcile_state_schema(conn)
-    if path is not None:
-        _SCHEMA_RECONCILED[path] = _schema_state(conn)[1]
+    path, state = _schema_state(conn)
+    if path is not None and state is not None:
+        _SCHEMA_RECONCILED[path] = state
 
 
 def _transaction(*, immediate: bool = False):
