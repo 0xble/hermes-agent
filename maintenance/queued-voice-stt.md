@@ -20,12 +20,17 @@ transcript echo, or queued follow-up drain.
   on every FIFO enqueue, including `/queue`. The shielded inner STT task is
   tracked for shutdown, and completion or cancellation clears its handle while a
   finished result stays reusable after the outer awaiter is cancelled.
-- Under session authority a busy messaging follow-up is committed to the durable FIFO
-  (`_hm_authority_admission`) and its turn runs a new event restored from the row. Once that
-  row is durably `queued`, the live event's STT starts (the `admitted_queued` hook) and is
-  published under its transport identity; the claimed turn adopts the transcript and echo
-  ledger in `_prepare_inbound_message_text` instead of transcribing again. A refused or
-  fenced admission starts no STT. Steer-fallback and interrupt transcripts are adopted too.
+- Every accepted, STT-eligible native audio message starts background STT at the durable
+  admission boundary, before new execution is scheduled: idle sessions, claim races,
+  already-started rows, relay deliveries and durable `/queue` all use `SessionAuthority._admitted`.
+  The shared prefetch is published under its transport identity; the claimed turn adopts its
+  transcript and echo ledger instead of transcribing again. No RAM-busy snapshot or later
+  `queued`-status read gates the trigger. Refused or fenced admissions start no STT.
+  Steer-fallback and interrupt transcripts are adopted too.
+- Restart recovery primes queued native audio after route validation and before scheduling
+  replay; repeated recovery shares the same process-local prefetch. This is an admission-time
+  guarantee, not a bypass of authorization, adapter debounce, media capture, or the max-two
+  provider-call limit. STT/echo state is not persisted across process restarts.
 - Preserve queue admission receipts when integrating the shared FIFO prefetch:
   `_queue_or_replace_pending_event` returns true only for an admitted event and
   false for a missing adapter or a full queue. Refused voice events start no STT;
@@ -46,7 +51,11 @@ transcript echo, or queued follow-up drain.
 
 ## Verification
 
-Contract tests: `tests/gateway/test_queued_voice_durable_fifo.py::test_voice_queued_behind_running_turn_echoes_before_it_finishes_and_is_transcribed_once`,
+Contract tests: `tests/gateway/test_voice_admission_prefetch.py` covers two clips across idle,
+claim-race, started-row, durable `/queue` and relay admissions, unchanged text handling,
+FIFO execution, single-call/single-echo adoption, and restart recovery before preparation.
+
+Also: `tests/gateway/test_queued_voice_durable_fifo.py::test_voice_queued_behind_running_turn_echoes_before_it_finishes_and_is_transcribed_once`,
   `tests/gateway/test_telegram_voice_v0_regressions.py::test_queued_voice_transcribes_immediately_and_drain_reuses_it`,
   `tests/gateway/test_telegram_voice_v0_regressions.py::test_fifo_voice_from_queue_command_prefetches_before_drain`
 

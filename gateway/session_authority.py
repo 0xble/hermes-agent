@@ -622,6 +622,11 @@ class SessionAuthority:
     def _admitted(self, ref, event, row):
         if event is not None:
             event._gateway_accepted = True
+            # Every native entry point (including relay and /queue) crosses this committed
+            # boundary before scheduling, regardless of a racy busy snapshot or later row read.
+            if row['status'] in ('queued', 'started'):
+                if prefetch := getattr(self.runner, '_prefetch_admitted_voice', None):
+                    prefetch(event)
             if row['status'] == 'queued' and (committed := getattr(event, '_on_commit', None)) is not None:
                 committed()  # a queued slash command's ack follows its commit (``_queue_command_turn``)
         self._publish_pending(ref)
@@ -667,6 +672,12 @@ class SessionAuthority:
                     self.sessions[sid] = mount(self, sid, source, route)
                 if any(row['status'] == 'unknown' for row in rows):
                     raise RuntimeStoreError('unknown_execution')
+                # Recover audio only after all route checks, before the replay can prepare it.
+                if prefetch := getattr(self.runner, '_prefetch_admitted_voice', None):
+                    from gateway.session_envelope import restore_native
+                    for row in native:
+                        if row['status'] == 'queued':
+                            prefetch(await asyncio.to_thread(restore_native, row['payload'], self.runner))
                 self._schedule(SessionRef(self.profile_id, sid))
                 results[sid] = 'ready'
             except RuntimeStoreError as exc:
