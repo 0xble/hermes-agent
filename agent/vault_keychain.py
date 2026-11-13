@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import uuid
 from contextlib import suppress
 from pathlib import Path
@@ -29,6 +31,28 @@ _NOT_A_KEYCHAIN = ("keyring.backends.fail", "keyring.backends.null", "keyrings.a
 
 class KeychainUnavailable(Exception):
     """No OS keychain is reachable from this process (headless, no keyring extra, plaintext backend)."""
+
+
+def _probe_macos_keychain() -> None:
+    """Fail fast when the CI keychain would block waiting for an unlock prompt."""
+    if sys.platform != "darwin":
+        return
+    path = os.environ.get("HERMES_TEST_KEYCHAIN")
+    if not path:
+        return
+    try:
+        subprocess.run(
+            ["security", "show-keychain-info", path],
+            check=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=10,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise KeychainUnavailable("the macOS keychain probe timed out; it may be locked or prompt-gated") from exc
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise KeychainUnavailable(f"the macOS keychain is unavailable ({type(exc).__name__})") from exc
 
 
 def _is_os_keychain(backend) -> bool:
@@ -52,6 +76,7 @@ def os_keyring():
     if not _is_os_keychain(backend):
         raise KeychainUnavailable(
             f"no OS keychain is reachable from this session (keyring backend: {type(backend).__module__}.{type(backend).__name__})")
+    _probe_macos_keychain()
     return backend
 
 
