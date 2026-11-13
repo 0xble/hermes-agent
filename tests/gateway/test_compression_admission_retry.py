@@ -174,7 +174,10 @@ async def test_native_compression_deferral_keeps_claim_until_commit(monkeypatch,
         if not during_hygiene:
             _commit()
             db.release_compression_lock(sid, 'fixture-compressor')
-        await async_wait_until(lambda: len(adapter.sent) == 3, timeout=15)
+        # Replies are delivered before deferred post-turn bookkeeping. Wait for the
+        # tracked cleanup task too so the hook assertion observes the same settled
+        # boundary as the durable admission rows.
+        await async_wait_until(lambda: len(adapter.sent) == 3 and not adapter._background_tasks, timeout=15)
         assert executions == ['A', 'B', 'C']
         assert hooks == ['A', 'B', 'C']
         assert adapter.sent == ['REPLY_A', 'REPLY_B', 'REPLY_C']
