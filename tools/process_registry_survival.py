@@ -313,7 +313,7 @@ class ProcessSurvivalMixin:
         session = self.get(session_id)
         if session is not None and is_restart_safe(session):
             self._mark_survivor_delivered(session)
-        elif session is not None and session.persist_on_release:
+        elif session is not None:
             # Known delivery must not become a new shutdown handoff. This does
             # not consume wait/log output or create a durable delivered marker.
             with self._lock:

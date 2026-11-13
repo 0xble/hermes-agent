@@ -1,8 +1,5 @@
 """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner.
-
-Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
-``gateway.run`` internals are imported lazily inside method bodies (import cycle),
-so ``patch("gateway.run.X")`` keeps intercepting them at call time.
+``gateway.run`` internals stay lazy for import cycles and facade patches.
 """
 
 from __future__ import annotations
@@ -35,7 +32,7 @@ from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
-from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin, owns_notice_work
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 
@@ -1512,6 +1509,7 @@ class GatewayNotificationsMixin(
                     platform, home, transport, message, "state.db warning notification failed for %s:%s: %s"),
                 platform=platform)
 
+    @owns_notice_work
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume watches in their owning profile, backing off refusals even during drain."""
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
@@ -2517,6 +2515,7 @@ class GatewayNotificationsMixin(
         finally:
             self._detach_batch_flush(tasks, releases, key, current_task, release)
 
+    @owns_notice_work
     async def _enqueue_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
         """Deliver a same-tick group now, or hold routine results per the batch window.
 
@@ -2852,6 +2851,7 @@ class GatewayNotificationsMixin(
                 return source, None
         return source, True
 
+    @owns_notice_work
     async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
         """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
         async with self._completion_event_scope(evt):
