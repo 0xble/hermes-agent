@@ -231,6 +231,7 @@ async def test_meeting_reasoning_default_uses_existing_session_pick(tmp_path, mo
 @pytest.mark.asyncio
 @pytest.mark.parametrize("selection", ["xhigh", "reset"])
 async def test_meeting_default_cannot_overwrite_concurrent_reasoning_selection(tmp_path, monkeypatch, selection):
+    import hermes_loop_guard
     from gateway.config import GatewayConfig
     from gateway.meeting_lane import apply_reasoning_default
     from gateway.session import SessionStore
@@ -261,6 +262,7 @@ async def test_meeting_default_cannot_overwrite_concurrent_reasoning_selection(t
 
     monkeypatch.setattr(runner, "_session_state", track_state_creation)
     monkeypatch.setattr(runner, "_load_persisted_reasoning_override", paused_read)
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
     default = asyncio.create_task(apply_reasoning_default(runner, event, key))
     try:
         assert await asyncio.to_thread(read_started.wait, 10), "meeting default read did not start"
@@ -269,17 +271,42 @@ async def test_meeting_default_cannot_overwrite_concurrent_reasoning_selection(t
         await asyncio.wait_for(default, 10)
         expected = {"enabled": True, "effort": "xhigh"} if selection == "xhigh" else None
         assert runner._session_state(key).conversation.reasoning_override == expected
-        assert runner.session_store.get_reasoning_override(key) == expected
-        restarted = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
-        assert restarted.get_reasoning_override(key) == expected
+        assert await asyncio.to_thread(runner.session_store.get_reasoning_override, key) == expected
+        restarted = await asyncio.to_thread(SessionStore, sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+        assert await asyncio.to_thread(restarted.get_reasoning_override, key) == expected
         assert creation_threads == [owner_thread]
     finally:
         release_read.set()
         await asyncio.gather(default, return_exceptions=True)
+        hermes_loop_guard.set_loop_thread(None)
+
+
+@pytest.mark.asyncio
+async def test_meeting_default_write_stays_off_loop(tmp_path):
+    import hermes_loop_guard
+    from gateway.config import GatewayConfig
+    from gateway.meeting_lane import apply_reasoning_default
+    from gateway.session import SessionStore
+
+    runner = _make_runner("queue")
+    runner.session_store = SessionStore(sessions_dir=tmp_path / "sessions", config=GatewayConfig())
+    runner._evict_idle_agent_after_session_control = lambda _key: None
+    event = _make_event("a live chunk")
+    event.source.thread_id = "topic-1"
+    event.auto_skill = "meetings"
+    key = runner._session_key_for_source(event.source)
+    runner.session_store.get_or_create_session(event.source)
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
+    try:
+        await apply_reasoning_default(runner, event, key)
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
+    assert runner.session_store.get_reasoning_override(key) == {"enabled": True, "effort": "medium"}
 
 
 @pytest.mark.asyncio
 async def test_meeting_reasoning_reset_requires_unbinding_for_profile_default(tmp_path):
+    import hermes_loop_guard
     from gateway.config import GatewayConfig
     from gateway.meeting_lane import apply_reasoning_default
     from gateway.session import SessionStore
@@ -295,17 +322,21 @@ async def test_meeting_reasoning_reset_requires_unbinding_for_profile_default(tm
     runner.session_store.get_or_create_session(event.source)
     medium = {"enabled": True, "effort": "medium"}
 
-    await apply_reasoning_default(runner, event, key)
-    assert runner.session_store.get_reasoning_override(key) == medium
-    await runner._apply_reasoning_selection_off_loop(key, "telegram", "reset")
-    assert runner.session_store.get_reasoning_override(key) is None
-    await apply_reasoning_default(runner, event, key)
-    assert runner.session_store.get_reasoning_override(key) == medium
-    event.auto_skill = None
-    await runner._apply_reasoning_selection_off_loop(key, "telegram", "reset")
-    await apply_reasoning_default(runner, event, key)
-    assert runner._session_reasoning_override(key) is None
-    assert runner.session_store.get_reasoning_override(key) is None
+    hermes_loop_guard.set_loop_thread(threading.get_ident())
+    try:
+        await apply_reasoning_default(runner, event, key)
+        assert await asyncio.to_thread(runner.session_store.get_reasoning_override, key) == medium
+        await runner._apply_reasoning_selection_off_loop(key, "telegram", "reset")
+        assert await asyncio.to_thread(runner.session_store.get_reasoning_override, key) is None
+        await apply_reasoning_default(runner, event, key)
+        assert await asyncio.to_thread(runner.session_store.get_reasoning_override, key) == medium
+        event.auto_skill = None
+        await runner._apply_reasoning_selection_off_loop(key, "telegram", "reset")
+        await apply_reasoning_default(runner, event, key)
+        assert await runner._session_reasoning_override_async(key) is None
+        assert await asyncio.to_thread(runner.session_store.get_reasoning_override, key) is None
+    finally:
+        hermes_loop_guard.set_loop_thread(None)
 
 
 @pytest.mark.asyncio

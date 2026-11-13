@@ -5,10 +5,13 @@ attended configuration must remain unchanged.
 """
 
 import asyncio
+import logging
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageType
 from gateway.response_filters import is_passive_fyi_relay_event
+
+logger = logging.getLogger("gateway.run")  # log-record parity with gateway/run.py
 
 
 def is_meeting_lane(event) -> bool:
@@ -27,23 +30,31 @@ async def apply_reasoning_default(runner, event, session_key: str) -> None:
             or getattr(runner, "session_store", None) is None):
         return
     state = runner._session_state(session_key)
-    conversation = state.conversation
-    if conversation.reasoning_override is not None:
+    epoch = state.conversation.reasoning_override_epoch
+    # Shared accessor semantics (bulk-reset, restart rehydration), with its store read off-loop.
+    if await runner._session_reasoning_override_async(session_key) is not None:
         return
-    epoch = conversation.reasoning_override_epoch
-    loaded = await asyncio.to_thread(runner._load_persisted_reasoning_override, session_key)
-    state = runner._peek_session_state(session_key)
-    conversation = state.conversation if state is not None else None
-    if conversation is None or conversation.reasoning_override_epoch != epoch:
-        return
-    if conversation.reasoning_override is not None:
-        return
-    if loaded is not None:
-        runner._publish_persisted_reasoning_override(session_key, loaded)
-        return
-    runner._set_reasoning_override(
-        session_key, {"enabled": True, "effort": "medium"}, event.source, scope="session",
-    )
+
+    # Same per-session fence as /reasoning: an explicit pick or reset always wins this race.
+    async with runner._session_reasoning_override_lock(session_key):
+        def unchanged() -> bool:
+            live = runner._peek_session_state(session_key)
+            return (live is not None and live.conversation.reasoning_override_epoch == epoch
+                    and live.conversation.reasoning_override is None)
+
+        if not unchanged():
+            return
+        default = {"enabled": True, "effort": "medium"}
+        try:
+            await asyncio.to_thread(
+                runner.session_store.set_reasoning_override, session_key, default, scope="session",
+            )
+        except Exception:
+            logger.debug("Failed to persist meeting reasoning default", exc_info=True)
+        if unchanged():
+            runner._set_reasoning_override(
+                session_key, default, event.source, scope="session", persist=False,
+            )
 
 
 async def busy_input_mode(runner, event, session_key: str) -> str:
