@@ -72,7 +72,7 @@ def run_cell(request, execution_count):
         if isinstance(exc, MemoryError) and globals().get("_memory_rlimit_bytes", 0):
             ceiling_mb = _memory_rlimit_bytes / (1024 ** 2)
             trace += ("\\nkernel exceeded memory ceiling %g MiB " % ceiling_mb
-                      + "(allocation refused by OS limit); kernel kept alive. "
+                      + "(allocation refused by OS limit); RLIMIT_DATA backstop; kernel kept alive. "
                       + "Earlier cell mutations may persist.\\n")
     stdout_text, stdout_clipped = _clip(out.getvalue())
     stderr_text, stderr_clipped = _clip(err.getvalue())
@@ -394,8 +394,8 @@ class SessionKernel:
             tmpdir, self.tmpdir = self.tmpdir, ""
         _log_kernel_lifecycle(self, "retire", task_id=self.current_task,
                               caller=self.current_caller, reason=reason, proc=proc)
-        # Snapshot/kill descendants before closing the death pipe: its EOF can make
-        # the kernel exit before process-tree teardown has discovered its children.
+        # Kill first so the child cannot react to pipe EOF and race descendant discovery;
+        # this slightly delays pipe-close-driven shutdown but preserves the full process tree.
         if proc is not None and proc.poll() is None:
             from tools.code_execution_tool import _kill_process_group
             _kill_process_group(proc, escalate=True)

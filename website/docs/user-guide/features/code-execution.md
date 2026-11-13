@@ -212,15 +212,21 @@ cell runs, and once before accepting its reply. macOS uses the larger of RSS and
 RSS. Shared pages may be counted more than once. This is a best-effort guard, not
 an OS-enforced aggregate reservation: short allocation bursts between samples and
 allocations from background threads while the kernel is idle are not covered.
-Linux also applies `RLIMIT_AS` and `RLIMIT_DATA` inside newly spawned kernels as
-per-process backstops; a cell `MemoryError` with an active backstop reports
-`kernel exceeded memory ceiling N MiB (allocation refused by OS limit)` alongside
-the traceback. This refusal keeps the kernel alive because the allocation failed
-and the cell has unwound; earlier cell mutations may persist. Watchdog-detected
-process-tree excess still retires the kernel and reports state loss.
-Positive integer overrides take effect at the next cell; Linux spawn-time limits
-need `reset: true` to pick up a higher ceiling. Missing, invalid, zero, or negative
-values retain the 8192 MiB safety default; there is no implicit unlimited mode.
+Linux also applies `RLIMIT_DATA` inside newly spawned kernels as a per-process
+backstop (including private writable mappings on Linux 4.7+). It does not cap
+virtual address space, so Chromium and JVM address reservations are not restricted.
+A cell `MemoryError` with an active backstop reports
+`kernel exceeded memory ceiling N MiB (allocation refused by OS limit)` and names
+the `RLIMIT_DATA` backstop alongside the traceback. This refusal keeps the kernel
+alive because the allocation failed and the cell has unwound; earlier cell mutations
+may persist. Watchdog-detected process-tree excess still retires the kernel and
+reports state loss.
+Positive integer overrides, including integer-valued floats such as `1024.0`,
+take effect at the next cell; Linux spawn-time limits need `reset: true` to pick up
+a higher ceiling. Missing, invalid, zero, or negative values retain the 8192 MiB
+safety default; ignored values log a warning. There is no implicit unlimited mode.
+Unreadable descendants are skipped individually, so they do not suppress checks
+on the remaining readable process tree.
 This ceiling does not yet cover remote kernels or standalone per-call fallback.
 
 **Remote backends** (Docker, SSH, Modal) run a remote session kernel with the same contract. If the kernel cannot be spawned on the backend, Hermes falls back to running each call as a standalone script and says so in the result.
