@@ -197,7 +197,11 @@ def _handshake_failure(exc):
     """A connect/ticket/WebSocket-open failure before any submit: a stalled or absent owner's
     transport, never an owner refusal (``GatewayRPCError``) or a protocol/version mismatch."""
     from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, GatewayUnavailableError
-    if isinstance(exc, (GatewayRPCError, GatewayUnavailableError)):
+    if isinstance(exc, GatewayUnavailableError):
+        # Nothing was submitted. An update drain or a slow start is transient; a gateway that could not
+        # start at all stays a visible failure.
+        return getattr(exc, 'state', None) in ('draining', 'starting')
+    if isinstance(exc, GatewayRPCError):
         return False
     if isinstance(exc, OSError):  # TimeoutError and socket.timeout included
         return True
