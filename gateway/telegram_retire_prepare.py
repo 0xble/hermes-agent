@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 
 from gateway.platforms.base import MessageEvent, MessageType
@@ -35,11 +36,14 @@ async def save_decision(runner, source, state, previous, generation, retry_of):
 async def queue_preparation(runner, source, state: dict, items: list[dict], *, busy: str = "") -> bool:
     """Choose owners in context, never turn an ownership gap into a user questionnaire."""
     from gateway.telegram_retire import save
+    from gateway.telegram_retire_work import _handoff_definition
 
     # Runtime snapshots contain advancing clocks and output. Only a changed
     # decision, not another observation of the same work, may wake the model.
     decision_items = [
-        {field: item.get(field, "") for field in ("id", "kind", "title", "blocked_owner", "blocked_reason")}
+        {**{field: item.get(field, "") for field in ("id", "kind", "title", "blocked_owner", "blocked_reason")},
+         "definition_sha256": hashlib.sha256(json.dumps(_handoff_definition(item.get("record", {})),
+             sort_keys=True, default=str).encode("utf-8")).hexdigest()}
         for item in sorted(items, key=lambda item: item["id"])
     ]
     fingerprint = json.dumps({"items": decision_items, "busy": busy, "reason": state.get("reason", ""),

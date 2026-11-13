@@ -317,7 +317,9 @@ async def test_real_inventory_cancels_active_control_on_topic_retirement(runtime
     record = json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}"))
     assert record["status"] == "cleared"
     assert len(cleared) == 1
-    assert final["cancelled_controls"][kind]["action"] == "clear"
+    cancellation, = final["cancelled_controls"].values()
+    assert cancellation["kind"] == kind and cancellation["action"] == "clear"
+    assert f"{kind}:{cancellation['control_id']}" in final["cancelled_controls"]
     assert f"cleared {kind}" in caplog.text
     assert json.loads(r.db.get_meta("goal:unrelated")) == unrelated
     assert await work.inventory(r.runner, r.source, final) == []
@@ -385,10 +387,106 @@ async def test_absent_finalization_fences_before_clearing_real_control(runtime, 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+async def test_control_replacement_preserves_each_cancellation_receipt(runtime, kind):
+    r = runtime
+    from hermes_cli import goals, loops
+    r.state.update(phase="pending", reason="Topic deletion selected.")
+    await retire.save(r.runner, r.source, r.state)
+    previous = {}
+    for title in ("Original work", "Replacement work"):
+        if kind == "goal":
+            goals.save_goal(r.entry.session_id, goals.GoalState(goal=title))
+        else:
+            loops.save_loop(r.entry.session_id, loops.LoopState(prompt=title))
+        before = r.db.get_meta(f"{kind}:{r.entry.session_id}")
+        control_id = json.loads(before)["mutation_id"]
+        items = await work.inventory(r.runner, r.source, r.state)
+        assert not await work.reconcile_controls(r.runner, r.source, r.state, items, confirmed_absent=True)
+        stored = await retire.load(r.runner, r.source)
+        assert stored is not None
+        receipts = stored["cancelled_controls"]
+        assert receipts[f"{kind}:{control_id}"]["before"] == before
+        assert all(receipts[key] == value for key, value in previous.items())
+        assert len(receipts) == len(previous) + 1
+        previous = dict(receipts)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("new_kind", ["goal", "loop"])
+async def test_new_control_blocks_all_clears_in_the_same_transaction(runtime, monkeypatch, new_kind):
+    r = runtime
+    from hermes_cli import goals, loops
+    for manager in (goals.GoalManager, loops.LoopManager):
+        monkeypatch.setattr(manager, "clear", lambda _: pytest.fail("All blockers must be checked before clearing"))
+    kind = "loop" if new_kind == "goal" else "goal"
+    record = {"status": "active", "goal" if kind == "goal" else "prompt": "Original control"}
+    r.db.set_meta(f"{kind}:{r.entry.session_id}", json.dumps(record))
+    r.state.update(phase="pending", reason="Topic deletion selected.")
+    await retire.save(r.runner, r.source, r.state)
+    items = await work.inventory(r.runner, r.source, r.state)
+    new_record = {"status": "active", "goal" if new_kind == "goal" else "prompt": "New undecided control"}
+    r.db.set_meta(f"{new_kind}:{r.entry.session_id}", json.dumps(new_record))
+    with pytest.raises(work.WorkInProgress, match="new source control"):
+        await work.reconcile_controls(r.runner, r.source, r.state, items, confirmed_absent=True)
+    assert json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}")) == record
+    assert json.loads(r.db.get_meta(f"{new_kind}:{r.entry.session_id}")) == new_record
+    stored = await retire.load(r.runner, r.source)
+    assert stored is not None and not stored.get("cancelled_controls")
+
+
+@pytest.mark.asyncio
 async def test_real_inventory_treats_cancelled_goal_as_terminal(runtime):
     r = runtime
     r.db.set_meta(f"goal:{r.entry.session_id}", json.dumps({"status": "cancelled", "goal": "Already stopped"}))
     assert await work.inventory(r.runner, r.source, r.state) == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["goal", "loop"])
+@pytest.mark.parametrize("path", ["absent", "prepare"])
+async def test_real_inbox_blocks_control_clear_until_work_settles(runtime, monkeypatch, kind, path):
+    r = runtime
+    record = {"status": "active", "goal" if kind == "goal" else "prompt": "Keep working until safe to retire"}
+    r.db.set_meta(f"{kind}:{r.entry.session_id}", json.dumps(record))
+    r.state.update(phase="pending", reason="Topic deletion selected.", prepared_controls={kind: record})
+    await retire.save(r.runner, r.source, r.state)
+    monkeypatch.setattr(work, "locate_command", lambda _: SimpleNamespace(command=("tasks",)))
+    settled, inbox_reads = False, 0
+
+    async def cli(_runner, _source, *args, **kwargs):
+        nonlocal inbox_reads
+        if args[0] != "tasks" or args[2] != "inbox":
+            return []
+        inbox_reads += 1
+        # In prepare(), work can appear after the initial owner-selection pass.
+        if not settled and (path == "absent" or inbox_reads > 1):
+            return [{"id": "task1", "title": "Unsettled inbox work", "status": "waiting"}]
+        return []
+
+    monkeypatch.setattr(work, "cli", cli)
+    if path == "absent":
+        await retire.advance(r.runner, r.source)
+    else:
+        with pytest.raises(RuntimeError, match="Open work still points"):
+            await work.prepare(r.runner, r.source, r.state)
+    pending = await retire.load(r.runner, r.source)
+    assert pending is not None and pending["phase"] == "pending" and not pending.get("cancelled_controls")
+    assert json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}")) == record
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) == r.entry.session_id
+    r.adapter.send.assert_not_awaited()
+    r.bot.delete_forum_topic.assert_not_awaited()
+
+    settled = True
+    if path == "prepare":
+        assert await work.prepare(r.runner, r.source, pending)
+    await retire.advance(r.runner, r.source)
+    final = await retire.load(r.runner, r.source)
+    assert final is not None and final["phase"] == "done" and final["cancelled_controls"]
+    assert json.loads(r.db.get_meta(f"{kind}:{r.entry.session_id}"))["status"] == "cleared"
+    assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is None
+    assert r.runner.session_store.peek_session_id(r.entry.session_key) is None
 
 
 @pytest.mark.asyncio
@@ -406,6 +504,45 @@ async def test_real_inventory_keeps_running_process_as_blocking_work(runtime, mo
     assert (await retire.load(r.runner, r.source))["phase"] != "done"
     assert r.db.get_telegram_topic_binding(chat_id="101", thread_id="17") is not None
     r.bot.delete_forum_topic.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind,field,value", [
+    ("goal", "max_turns", 3), ("loop", "until", "The service is healthy"),
+    ("cron", "prompt", "Watch a different service"),
+])
+async def test_real_definition_change_rewakes_preparation_without_title_change(runtime, monkeypatch, kind, field, value):
+    r = runtime
+    from cron import jobs
+    record = {"status": "active", "goal" if kind == "goal" else "prompt": "Watch Service",
+              "gates": [{"command": "true", "attempts": 0}]}
+    if kind == "cron":
+        record.update(id="watch", name="Watch Service", deliver="telegram:101:17")
+        monkeypatch.setattr(jobs, "list_jobs", lambda **_: [dict(record)])
+
+    async def prepare():
+        if kind != "cron":
+            r.db.set_meta(f"{kind}:{r.entry.session_id}", json.dumps(record))
+        state = await retire.load(r.runner, r.source)
+        assert not await work.prepare(r.runner, r.source, state)
+        return await retire.load(r.runner, r.source)
+
+    r.state["phase"] = "pending"
+    await retire.save(r.runner, r.source, r.state)
+    first = await prepare()
+    assert first is not None and r.adapter.handle_message.await_count == 1
+    record["gates"][0]["attempts"] = 1
+    record.update(turns_used=2, ticks_fired=2, next_run=24, last_output_tail="New runtime output")
+    await prepare()
+    assert r.adapter.handle_message.await_count == 1
+    record[field] = value
+    changed = await prepare()
+    assert changed is not None and r.adapter.handle_message.await_count == 2
+    assert changed["preparation"]["items"][0]["title"] == first["preparation"]["items"][0]["title"]
+    assert changed["preparation"]["items"][0]["record"][field] == value
+    await prepare()
+    assert r.adapter.handle_message.await_count == 2
+    r.adapter.send.assert_not_awaited()
 
 
 @pytest.mark.asyncio

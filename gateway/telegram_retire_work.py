@@ -590,7 +590,9 @@ async def reconcile_controls(runner, source, state, items, *, confirmed_absent=F
     controls = [item for item in items if item["kind"] in {"goal", "loop"}
                 and item["id"] not in state["handoffs"] and not state.get("owners", {}).get(item["id"])
                 and (confirmed_absent or prepared_control(state, item))]
-    if not controls:
+    # Clearing is the last settlement step, not a way to make a blocked
+    # retirement look idle. External inventories cannot share this DB's lock.
+    if not controls or len(controls) != len(items):
         return items
     db = runner._session_db._db
 
@@ -603,32 +605,39 @@ async def reconcile_controls(runner, source, state, items, *, confirmed_absent=F
                 or stored.get("reason") != state.get("reason")):
             raise RetirementSuperseded
         receipts = stored.setdefault("cancelled_controls", {})
-        for item in controls:
-            kind = item["kind"]
+        current_controls = []
+        for kind in ("goal", "loop"):
             key = f"{kind}:{state['session_id']}"
             row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
             before = row[0] if row else None
             if before is None or not open_control(before):
                 continue
+            item = next((item for item in controls if item["kind"] == kind), None)
+            if item is None:
+                raise WorkInProgress("A new source control needs an owner decision before retirement.")
             record = json.loads(before)
             if _handoff_definition(record) != _handoff_definition(item["record"]):
                 raise RuntimeError(f"Cannot cancel {kind}: its definition changed during retirement")
             if kind == "loop" and record.get("awaiting_response"):
                 raise WorkInProgress("The loop's execution must settle before its topic retires.")
+            current_controls.append((kind, key, before, record))
+        for kind, key, before, record in current_controls:
             manager = (GoalManager if kind == "goal" else LoopManager)(state["session_id"], cursor=conn)
             manager.clear()
             after = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()[0]
             if open_control(after):
                 raise RuntimeError(f"Retirement {kind} cancellation did not read back")
-            receipts[kind] = {"before": before, "after": after, "generation": state["generation"],
-                              "reason": state["reason"], "action": "clear"}
+            control_id = record.get("mutation_id") or hashlib.sha256(before.encode("utf-8")).hexdigest()
+            receipts[f"{kind}:{control_id}"] = {"kind": kind, "control_id": control_id,
+                "before": before, "after": after, "generation": state["generation"],
+                "reason": state["reason"], "action": "clear"}
         db.set_meta(state_key(source), json.dumps(stored), cursor=conn)
         return receipts
 
     state["cancelled_controls"] = await asyncio.to_thread(db._execute_write, cancel)
-    for kind in state["cancelled_controls"]:
+    for receipt in state["cancelled_controls"].values():
         logger.info("Topic retirement %s cleared %s for session %s: selected topic deletion",
-                    state["generation"], kind, state["session_id"])
+                    state["generation"], receipt.get("kind", "control"), state["session_id"])
     # Cancellation cannot turn a failed or incomplete inventory into permission to delete.
     return await inventory(runner, source, state)
 
