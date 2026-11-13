@@ -208,39 +208,7 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state_repair import apply_durability_barriers
-    from hermes_state_schema import reconcile_state_schema
-    # Preserve the journal mode SessionDB configured on state.db: forcing WAL from
-    # every short-lived connection collides with live transcript/FTS writers.
-    apply_durability_barriers(conn)
-    # Single durable-shape authority: the canonical SCHEMA_SQL drives both
-    # table creation and column backfill (reconcile_state_schema replays the
-    # canonical DDL and reuses SessionDB's declarative reconciliation). This
-    # module previously carried its own CREATE TABLE + ALTER column list,
-    # which drifted from SCHEMA_SQL — same-name columns with different
-    # nullability/defaults depending on which authority touched the database
-    # first (#94691).
-    # Every ledger transaction opens a fresh connection, often under _records_lock, so replaying the
-    # full DDL each time held that lock for the whole reconcile. Once per database file is enough;
-    # the inode key re-reconciles a state.db that was replaced or restored mid-process.
-    key = _schema_key(conn)
-    if key is not None and key in _SCHEMA_RECONCILED:
-        return
-    reconcile_state_schema(conn)
-    if key is not None:
-        _SCHEMA_RECONCILED.add(key)
-
-
-_SCHEMA_RECONCILED: set[tuple[str, int]] = set()
-
-
-def _schema_key(conn: sqlite3.Connection) -> Optional[tuple[str, int]]:
-    try:
-        path = next(row[2] for row in conn.execute("PRAGMA database_list") if row[1] == "main")
-        return (path, os.stat(path).st_ino) if path else None
-    except (sqlite3.Error, OSError, StopIteration):
-        return None
+from tools.async_delegation_schema import initialize_ledger_schema as _initialize_schema  # noqa: E402
 
 
 def _transaction(*, immediate: bool = False):
@@ -1465,8 +1433,7 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 def active_count() -> int:
     """Number of live async delegation UNITS (one per completion message: a task group or an ungrouped task)."""
-    # Lock-free on purpose: the gateway loop calls this at every turn boundary, and writers hold
-    # _records_lock across state.db commits. list() copies the values in one C call under the GIL.
+    # Lock-free: writers hold _records_lock across state.db commits; list() copies under the GIL.
     return sum(1 for r in list(_records.values()) if r.get("status") in _LIVE_STATES)
 
 
