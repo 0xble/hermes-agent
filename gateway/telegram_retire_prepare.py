@@ -20,6 +20,18 @@ def validate_decision(existing, owners, generation):
         raise TopicRequestError("Retirement owners must map item IDs to live topic titles.")
 
 
+async def save_decision(runner, source, state, previous, generation, retry_of):
+    """A queued wake alone is not a model owner decision; its fenced reply is."""
+    from gateway.telegram_retire import save
+    decided = bool(generation and previous.get("preparation"))
+    if decided:
+        state["prepared_controls"] = {item["id"]: item["record"]
+                                      for item in previous["preparation"]["items"]
+                                      if item["kind"] in {"goal", "loop"}}
+    if state is not previous or decided:
+        await save(runner, source, state, force=True, expected_generation=generation, retry_of=retry_of)
+
+
 async def queue_preparation(runner, source, state: dict, items: list[dict], *, busy: str = "") -> bool:
     """Choose owners in context, never turn an ownership gap into a user questionnaire."""
     from gateway.telegram_retire import save
@@ -54,8 +66,10 @@ async def queue_preparation(runner, source, state: dict, items: list[dict], *, b
         "hand each item to an existing live topic: the merge target by default, or a verified existing owner. "
         "Never create a new topic during retirement: work whose destination already runs its own goal or loop "
         "arrives there as a task. "
-        "Do not use an Inbox or generic retirement queue. Do not cancel standing commitments or overwrite "
-        "destination goals/loops. Stop only proven disposable machinery whose purpose has ended, using "
+        "Do not use an Inbox or generic retirement queue. Choosing delete clears unowned source goals and loops "
+        "at finalization; use owners to keep them in a verified live topic. Preserve standing commitments "
+        "with owners rather than leaving them unowned. Never overwrite destination goals/loops. "
+        "Stop only proven disposable machinery whose purpose has ended, using "
         "its normal control path. Settle completed execution claims normally, never transfer tokens. "
         "If claims are still executing, wait silently and do not requeue retirement just to poll them. "
         "Retirement cannot authorize spending or an irreversible external action. Ask only if that "

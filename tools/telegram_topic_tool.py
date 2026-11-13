@@ -36,7 +36,8 @@ TELEGRAM_TOPIC_SCHEMA = {
         "Merge into a verified live topic owning the same lasting subject, or delete when nothing "
         "lasting remains. Preserve useful unfinished obligations and transcripts. Provide a short reason "
         "for the closing note and target plus message (source context summary) for a merge, "
-        "or owners for individual destinations. Retirement "
+        "or owners for individual destinations. Choosing delete clears unowned source goals and loops "
+        "at finalization; the owners field keeps them by handing them to verified live topics. Retirement "
         "runs after the active turn, with verified handoffs and confirmed closing delivery before deletion. "
         "A queued result is not proof of deletion. Set now=true only when interruption was explicitly requested. "
         "action=cancel_retire clears the pending request. "
@@ -49,7 +50,7 @@ TELEGRAM_TOPIC_SCHEMA = {
                        "description": "create or edit a topic, schedule retirement after this turn, or cancel retirement."},
             "target": {"type": "string", "description": "retire only: exact live subject-owner title for a merge, selected automatically or named by the user. An empty string clears a previous merge choice."},
             "owners": {"type": "object", "additionalProperties": {"type": "string"},
-                       "description": "retire only: open-item IDs mapped to verified live topic titles. Resolve routine choices without asking."},
+                       "description": "retire only: open-item IDs mapped to verified live topic titles. Keeps goals/loops that choosing delete would otherwise clear. Resolve routine choices without asking."},
             "reason": {"type": "string", "description": "retire only: short reason for choosing merge or delete, shown in the closing note."},
             "generation": {"type": "string", "description": "retire only: echo the generation supplied by a native retirement preparation wake, if any."},
             "now": {"type": "boolean", "description": "retire only: interrupt the active turn only when the user explicitly requested it, preserving obligations."},

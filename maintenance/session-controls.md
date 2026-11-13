@@ -131,11 +131,18 @@ session ID, routing key and retirement generation, including at strict-pin
 admission. A cancelled or superseded wake cannot re-arm
 retirement. Active claims are a quiet wait, not a failed retirement. No standing
 commitment is cancelled merely because its owner is unclear. Once an explicit retirement
-selects deletion (a reason, no merge target), source goals/loops without a chosen owner
-or saved handoff are cleared through
+selects deletion (a reason, no merge target), the first preparation pass still lists
+active source goals/loops as open items without clearing them. The generation-fenced
+preparation decision acknowledges the offered control definitions: `owners` preserves
+them by handoff, while leaving them unowned clears them only at finalization. A changed
+definition needs another owner choice. A queued preparation alone never authorizes
+clearing. Independently confirmed topic absence also allows finalization without a
+preparation wake. Source goals/loops without a chosen owner or saved handoff are cleared through
 `GoalManager.clear()` or `LoopManager.clear()` inside the retirement transaction; the
 receipt is saved under the retirement generation and the durable control row is read
 back before inventory continues. A cancelled goal is terminal for inventory. Running
+session, rebound-key, and current-generation/phase fences run before absent-topic
+control clearing, so a declined finalization pass leaves controls unchanged. Running
 processes, delegation, cron, task claims and destination-topic controls are never
 cleared by this reconciliation. A merge hands off
 the source context summary (the tool's existing `message` field) even with no
