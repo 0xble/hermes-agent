@@ -344,6 +344,48 @@ def test_handover_does_not_wait_for_restart_safe_process(monkeypatch):
     assert drain.status(runner)["idle"] is True
 
 
+def test_handover_does_not_wait_for_restart_safe_watch_event_after_drain(monkeypatch):
+    import queue
+
+    from gateway import zero_cut_handover_drain as drain
+    from tests.gateway.restart_test_helpers import make_restart_runner
+    from tools.process_registry import process_registry
+
+    runner, _ = make_restart_runner()
+    setattr(runner, "_zero_cut_handover_state", {
+        "accepted": True, "updates_settled": True, "token_lock_released": True,
+        "active_turns": 0, "idle": False, "failed": None,
+    })
+    events = queue.Queue()
+    events.put({"type": "heartbeat", "session_id": "survivor"})
+    monkeypatch.setattr(process_registry, "completion_queue", events)
+    monkeypatch.setattr(process_registry, "list_sessions", lambda: [])
+    assert drain.status(runner)["idle"] is True
+
+
+def test_handover_waits_for_non_restart_safe_completion(monkeypatch):
+    import queue
+
+    from gateway import zero_cut_handover_drain as drain
+    from tests.gateway.restart_test_helpers import make_restart_runner
+    from tools.process_registry import process_registry
+
+    runner, _ = make_restart_runner()
+    setattr(runner, "_zero_cut_handover_state", {
+        "accepted": True, "updates_settled": True, "token_lock_released": True,
+        "active_turns": 0, "idle": False, "failed": None,
+    })
+    events = queue.Queue()
+    events.put({"type": "completion", "session_id": "owned"})
+    monkeypatch.setattr(process_registry, "completion_queue", events)
+    monkeypatch.setattr(
+        process_registry,
+        "list_sessions",
+        lambda: [{"session_id": "owned", "status": "exited", "survive_restart": False}],
+    )
+    assert drain.status(runner)["idle"] is False
+
+
 def test_handover_waits_for_completion_ownership(monkeypatch):
     from gateway import zero_cut_handover_drain as drain
     from tests.gateway.restart_test_helpers import make_restart_runner
