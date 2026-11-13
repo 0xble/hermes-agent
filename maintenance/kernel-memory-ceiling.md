@@ -31,7 +31,7 @@
   targets the macOS enforcement gap with a host-side tree-footprint watchdog; no
   equivalent macOS process-tree watchdog was found at upstream main
   `273fb853acdabfdcf60be44435051d554f124647`.
-- **Focused regression:** `h=$(mktemp -d /tmp/ci-home.XXXXXX) && export HERMES_HOME="$h" &&
+- **Focused regression:** `h=$(mktemp -d) && export HERMES_HOME="$h" &&
   python -m pytest tests/tools/test_code_kernel_memory.py tests/tools/test_code_kernel.py
   tests/tools/test_code_kernel_lifetime.py tests/tools/test_code_kernel_remote.py
   tests/tui_gateway/test_session_finalize_reaps_kernels.py -q`.
