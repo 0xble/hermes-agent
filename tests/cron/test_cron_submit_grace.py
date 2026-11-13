@@ -137,3 +137,20 @@ def test_handshake_timeout_of_a_manual_fire_still_fails_visibly(tmp_path, monkey
         current = jobs.get_job(job['id'])
         assert current['last_status'] == 'error' and current['state'] != 'paused'
         assert executions.get_execution(fire)['status'] == 'failed'
+
+
+@pytest.mark.parametrize('state, deferred', [('draining', True), ('starting', True), ('failed', False)])
+def test_unavailable_gateway_defers_only_transient_states(tmp_path, monkeypatch, state, deferred):
+    @asynccontextmanager
+    async def unavailable():
+        raise gateway_client.GatewayUnavailableError(f'Gateway {state}: update_paused', state)
+        yield
+
+    monkeypatch.setattr(gateway_client, 'connect_gateway', unavailable)
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        claimed, fire = _claimed_due_fire(job['id'])
+        scheduler._run_one_job_body(claimed)
+        current = jobs.get_job(job['id'])
+        assert (current.get('last_status') != 'error') is deferred
+        assert ('Not started; occurrence deferred' in executions.get_execution(fire)['error']) is deferred
