@@ -27,6 +27,8 @@ import threading
 import time
 import uuid
 from contextlib import contextmanager
+from contextvars import ContextVar
+from functools import lru_cache
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -97,37 +99,58 @@ def _lock_path() -> Path:
     return _state_path().with_name(".model_cooldowns.lock")
 
 
-def _custom_provider_for_url(base_url: str) -> str | None:
-    """Return the only configured custom provider owning *base_url*, if there is one."""
+_locked_provider_owners: ContextVar[dict[str, str | None] | None] = ContextVar(
+    "cooldown_provider_owners", default=None,
+)
+
+
+def _provider_owners() -> dict[str, str | None]:
+    """Cache identity resolution by profile and config revision, never by launch environment."""
+    path = get_hermes_home() / "config.yaml"
+    try:
+        stat = path.stat()
+        revision = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+    except OSError:
+        revision = None
+    return _load_provider_owners(str(path), revision)
+
+
+@lru_cache(maxsize=32)
+def _load_provider_owners(path: str, revision: tuple | None) -> dict[str, str | None]:
+    """Load once per revision; *path* keys the cache across multiplexed profiles."""
     try:
         from hermes_cli.config import load_config_readonly
         from hermes_cli.providers import custom_provider_slug
         config = load_config_readonly() or {}
     except (ImportError, OSError, TypeError, ValueError, KeyError):
-        return None
-    matches: list[tuple[str, str]] = []
+        return {}
+    matches: dict[str, list[tuple[str, str]]] = {}
     providers = config.get("providers") if isinstance(config, dict) else None
     if isinstance(providers, dict):
         for key, entry in providers.items():
             if not isinstance(entry, dict):
                 continue
             url = entry.get("api") or entry.get("url") or entry.get("base_url")
-            if normalize_route_base_url(url) == base_url:
-                matches.append((str(entry.get("name") or key), str(key)))
+            matches.setdefault(normalize_route_base_url(url), []).append((str(entry.get("name") or key), str(key)))
     legacy = config.get("custom_providers") if isinstance(config, dict) else None
     if isinstance(legacy, list):
         for entry in legacy:
             if not isinstance(entry, dict):
                 continue
             url = entry.get("api") or entry.get("url") or entry.get("base_url")
-            if normalize_route_base_url(url) == base_url:
-                name = str(entry.get("name") or "").strip()
-                if name:
-                    matches.append((name, str(entry.get("provider_key") or "")))
-    if len(matches) != 1:
-        return None
-    name, key = matches[0]
-    return custom_provider_slug(name, key).lower()
+            name = str(entry.get("name") or "").strip()
+            if name:
+                matches.setdefault(normalize_route_base_url(url), []).append((name, str(entry.get("provider_key") or "")))
+    return {
+        url: custom_provider_slug(*owners[0]).lower() if len(owners) == 1 else None
+        for url, owners in matches.items()
+    }
+
+
+def _custom_provider_for_url(base_url: str) -> str | None:
+    """Resolve aliases from one cached snapshot throughout a locked transaction."""
+    owners = _locked_provider_owners.get()
+    return (_provider_owners() if owners is None else owners).get(base_url)
 
 
 def canonical_route(route: tuple[Any, Any, Any]) -> tuple[str, str, str]:
@@ -198,6 +221,8 @@ def _route_fields(route: tuple[str, str, str]) -> dict[str, str]:
 @contextmanager
 def _locked_state(*, quarantine_unreadable: bool = False) -> Iterator[tuple[Path, dict[str, Any]]]:
     """Hold an exclusive lock while reading and atomically rewriting the state file."""
+    # Config parsing and provider scans must never hold the cross-process state lock.
+    owners = _provider_owners()
     state_path = _state_path()
     lock_path = _lock_path()
     lock_path.parent.mkdir(parents=True, exist_ok=True)
@@ -237,7 +262,11 @@ def _locked_state(*, quarantine_unreadable: bool = False) -> Iterator[tuple[Path
             state = {"version": _STATE_VERSION, "routes": raw["routes"]}
             if backup is not None:
                 state["quarantined"] = str(backup)
-            yield state_path, state
+            scope = _locked_provider_owners.set(owners)
+            try:
+                yield state_path, state
+            finally:
+                _locked_provider_owners.reset(scope)
         finally:
             unlock()
 
@@ -282,6 +311,9 @@ def _stale(entry: Any, now: float) -> bool:
     """True when a record is malformed, or expired past its grace and no longer the current outage."""
     if not isinstance(entry, dict):
         return True
+    probe_until = _finite_float(entry.get("probe_until"))
+    if entry.get("probe_owner") and probe_until is not None and probe_until > now:
+        return False  # A long request's live lease must outlast the normal expired-record grace.
     tombstone_until = _finite_float(entry.get("tombstone_until"))
     if tombstone_until is not None:
         return tombstone_until <= now
@@ -549,7 +581,9 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None, *, tomb
         return False
 
 
-def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> ProbeClaimOutcome:
+def claim_probe(
+    route: tuple[str, str, str], outage_id: str | None, *, lease_seconds: float = _PROBE_LEASE_SECONDS,
+) -> ProbeClaimOutcome:
     """Atomically claim the single half-open probe, returning every observable state explicitly."""
     now = time.time()
     route = canonical_route(route)
@@ -587,7 +621,7 @@ def claim_probe(route: tuple[str, str, str], outage_id: str | None) -> ProbeClai
                     _write_state(path, state)
                 return _claim_outcome(ProbeClaimKind.STILL_COOLING, record=entry)
             entry["probe_owner"] = token
-            entry["probe_until"] = now + _PROBE_LEASE_SECONDS
+            entry["probe_until"] = now + max(_PROBE_LEASE_SECONDS, _finite_float(lease_seconds) or 0.0)
             entry["state"] = "probing"
             state["routes"][key] = entry
             _write_state(path, state)
@@ -717,6 +751,7 @@ def settle_primary_probe_on_exit(agent, *, reason=None, reset_at=None) -> bool:
     token = _probe_token_value(raw_token)
     record = getattr(agent, "_shared_primary_cooldown_record", None)
     if not token or not isinstance(record, dict):
+        agent._shared_primary_probe_token = None
         return False
     route = route_from_record(record)
     outage_id = str(record.get("outage_id") or "")
@@ -730,8 +765,10 @@ def settle_primary_probe_on_exit(agent, *, reason=None, reset_at=None) -> bool:
             settled = _release_probe(route, outage_id, token)
         else:
             settled = _settle_probe(route, outage_id, token, success=False, reset_at=reset_at)
+    # The primary exit consumes the local lease even if clear/takeover or an I/O
+    # failure prevented settlement. A stale token must never bypass future arming.
+    agent._shared_primary_probe_token = None
     if settled:
-        agent._shared_primary_probe_token = None
         if reason not in {"success", "primary_success", "interrupt", "cancel", "release"}:
             agent._shared_primary_probe_failed_outage_id = outage_id
             current = get_cooldown(route)
@@ -742,6 +779,22 @@ def settle_primary_probe_on_exit(agent, *, reason=None, reset_at=None) -> bool:
                 agent._rate_limited_until = time.monotonic() + remaining
                 agent._rate_limit_backoff_count = int(current.get("backoff_count", 0) or 0)
     return settled
+
+
+def primary_probe_is_owned(agent) -> bool:
+    """Keep a local token only while the durable record still owns an unexpired lease."""
+    token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", None))
+    record = getattr(agent, "_shared_primary_cooldown_record", None)
+    if token and isinstance(record, dict):
+        try:
+            current = read_cooldown(route_from_record(record))
+        except OSError:
+            current = None
+        if (isinstance(current, dict) and current.get("probe_owner") == token
+                and (_finite_float(current.get("probe_until")) or 0.0) > time.time()):
+            return True
+    agent._shared_primary_probe_token = None
+    return False
 
 
 def list_cooldowns(*, strict: bool = False) -> list[dict[str, Any]]:
@@ -783,7 +836,7 @@ def _matches_target(entry: dict[str, Any], target: str) -> bool:
 
 
 def clear_cooldowns(target: str | None = None, *, all_routes: bool = False) -> list[dict[str, Any]]:
-    """Clear every record (``all_routes``) or the records exactly matching *target*.
+    """Clear cooldowns (``all_routes`` or exact *target*), preserving recovery tombstones.
 
     *target* is ``provider/model`` or a bare model name, compared exactly (no substrings). A
     bare model clears that model on every provider. Returns the removed records. Raises
@@ -801,7 +854,7 @@ def clear_cooldowns(target: str | None = None, *, all_routes: bool = False) -> l
         _merge_duplicate_routes(state)
         removed = []
         for key, entry in list(state["routes"].items()):
-            if not isinstance(entry, dict):
+            if not isinstance(entry, dict) or entry.get("state") == "tombstone":
                 continue
             if all_routes or _matches_target(entry, wanted):
                 removed.append(dict(entry))
@@ -868,7 +921,7 @@ def complete_primary_recovery(agent) -> bool:
             current = get_cooldown(route)
             if isinstance(current, dict) and not current.get("probe_owner"):
                 cleared = clear_if_current(route, outage_id, tombstone=True)
-    elif not probe_token:
+    else:
         cleared = clear_if_current(route, outage_id, tombstone=True)
     if not cleared:
         return False

@@ -70,14 +70,33 @@ def fallback_route_is_active(provider, base_url, model) -> bool:
     return bool(active_cooldown(canonical_route((provider, resolved_base_url, model))))
 
 
+def primary_probe_lease_seconds(agent) -> float:
+    """Size the lease to the primary request timeout plus the normal 120 s safety margin."""
+    from hermes_cli.timeouts import get_provider_request_timeout
+    from agent.shared_primary_cooldown import _PROBE_LEASE_SECONDS, _finite_float, route_from_agent
+    provider, _, model = route_from_agent(agent)
+    timeout = _finite_float(get_provider_request_timeout(provider, model))
+    runtime = getattr(agent, "_primary_runtime", None)
+    kwargs = runtime.get("client_kwargs", {}) if isinstance(runtime, dict) else getattr(agent, "_client_kwargs", {})
+    raw = (kwargs or {}).get("timeout")
+    client_timeout = _finite_float(raw if isinstance(raw, (int, float)) else getattr(raw, "read", None))
+    # The OpenAI/Anthropic SDKs default to 600 s when config does not pin a timeout.
+    return max(timeout or client_timeout or 600.0, 0.0) + _PROBE_LEASE_SECONDS
+
+
 def claim_primary_probe(agent, shared_state: str):
     from agent.shared_primary_cooldown import ProbeClaimKind, ProbeClaimOutcome
     if shared_state != "expired" or not isinstance(getattr(agent, "_shared_primary_cooldown_record", None), dict):
+        from agent.shared_primary_cooldown import primary_probe_is_owned
+        primary_probe_is_owned(agent)
         return ProbeClaimOutcome(ProbeClaimKind.CLEARED)
     from agent.shared_primary_cooldown import claim_probe, route_from_record
     record = agent._shared_primary_cooldown_record
     try:
-        outcome = claim_probe(route_from_record(record), str(record.get("outage_id") or ""))
+        outcome = claim_probe(
+            route_from_record(record), str(record.get("outage_id") or ""),
+            lease_seconds=primary_probe_lease_seconds(agent),
+        )
     except OSError:
         logger.warning("Primary cooldown probe state is unavailable; staying on fallback")
         outcome = ProbeClaimOutcome(ProbeClaimKind.UNAVAILABLE)
