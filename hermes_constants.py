@@ -1003,7 +1003,9 @@ def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float = SCRAT
 
     root = scratch if scratch is not None else get_scratch_dir(prune=False)
     log_file = root.parent.parent / "logs" / "scratch-prune.log"
-    return prune_idle_entries(root, max_idle_hours, frozenset({_SCRATCH_PRUNE_STAMP}), log_file)
+    return prune_idle_entries(
+        root, max_idle_hours, frozenset({_SCRATCH_PRUNE_STAMP}), log_file, restorable_hold=True,
+    )
 
 
 def _prune_scratch_dir_once(scratch: Path) -> None:

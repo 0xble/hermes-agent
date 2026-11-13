@@ -10,8 +10,14 @@ reaping, an expired top-level entry is moved with same-volume `os.rename` into
 non-symlinked scratch this is `<home>/cache/.scratch-trash`; for a symlink onto another volume,
 it stays beside the target rather than crossing volumes from the configured home. As a sibling,
 the holding root cannot be selected as a normal scratch entry. The holding root, day directories,
-and `entries/` directories follow `apply_secure_dir_policy` using the configured owning home,
-including existing directories from earlier passes. A JSONL manifest at
+and `entries/` directories are created `0700` and must be owned by the current uid with mode exactly
+`0700`, whatever `HERMES_HOME_MODE` says; a hold directory owned by another uid or with another mode
+is refused (not repaired) and the entry stays in scratch. The hold is enabled only for the Hermes
+scratch prune (`prune_scratch_dir`, `restorable_hold=True`); test-temp sweeps (`tests/conftest.py`,
+`scripts/run_tests_parallel.py`) delete directly and never create a hold beside `/var/tmp`. A hold
+with no manifest is purged by its UTC day directory date, and the purge clock is always the manifest
+or day date, never the entry's original mtime. `hermes doctor` excludes `.scratch-trash` from its
+unpruned-cache warning and reports stuck held entries. A JSONL manifest at
 `<UTC-date>/manifest.jsonl` records the original path, apparent tree size, source mtime, prune
 timestamp, and holding path. Entries live under `entries/` so no scratch entry name can collide
 with the manifest. A later pass purges held entries older than seven days and appends a `purged`
@@ -21,6 +27,12 @@ after all their entries are purged. Holding-dir cleanup uses an explicit bottom-
 3.11's `os.walk` is recursive) and `lstat` before traversing each directory: symlinks and junctions
 are unlinked as links and never traversed. A held subtree that cannot be removed is tracked with
 the existing stuck-entry state outside `entries/` and is not retried every pass.
+
+The seven-day purge is the point at which a held linked worktree is actually gone; until then,
+its git registration is intentionally left intact. If an operator restores a held linked worktree
+manually, run `git worktree repair` in the containing repository if Git needs the registration
+repaired. Do not run `git worktree prune` before purge, or it can discard the registration needed
+for restoration.
 
 Existing `.keep` and transitive `input-pins.json` retention is unchanged. Enabled cron jobs are
 also scanned using the Fleet generator's PR #691 field set and token matcher (`prompt`, `script`,
@@ -46,7 +58,7 @@ Contract tests: `tests/test_scratch_dir.py::test_prune_moves_expired_entry_to_re
   `tests/test_scratch_dir.py::test_prune_purges_holding_entries_after_seven_days`
   `tests/test_scratch_dir.py::test_holding_dir_resolves_beside_symlink_target_outside_scratch`
   `tests/test_scratch_dir.py::test_prune_symlinked_scratch_avoids_cross_device_rename`
-  `tests/test_scratch_dir.py::test_holding_directories_follow_scratch_permission_policy`
+  `tests/test_scratch_dir.py::test_holding_directories_are_always_private_regardless_of_home_mode`
   `tests/test_scratch_dir.py::test_job_references_match_raw_windows_paths`
   `tests/test_scratch_dir.py::test_postremoval_unreadable_entry_is_not_counted_as_removed`
   `tests/test_scratch_dir.py::test_prune_keeps_enabled_job_references_but_not_disabled_jobs`
