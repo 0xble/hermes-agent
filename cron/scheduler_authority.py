@@ -9,6 +9,9 @@ import uuid
 # Leave room for ordered-admission queueing, and require repeated successful owner reads.
 MISSING_SUBMIT_GRACE_SECONDS = 600
 MISSING_SUBMIT_READS = 2
+# Job flag (like ``_session_store_unavailable``): this fire failed to reach the owner before any
+# submit, so no admission can exist and the firer may put the occurrence back instead of failing it.
+NOT_STARTED_FLAG = '_gateway_not_started'
 
 
 class CronExecutionUnknown(RuntimeError):
@@ -184,7 +187,28 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 f'Cron execution unverified; {identity}; reconcile {journal} '
                 f'{type(exc).__name__}: {exc}') from exc
         error = f'{type(exc).__name__}: {exc}'
+        if _handshake_failure(exc):
+            # Nothing reached the owner: the firing scheduler may defer this fire, not fail it.
+            job[NOT_STARTED_FLAG] = True
         return False, f'# Cron Job: {job["id"]} (FAILED)\n\n{error}\n', '', error
+
+
+def _handshake_failure(exc):
+    """A connect/ticket/WebSocket-open failure before any submit: a stalled or absent owner's
+    transport, never an owner refusal (``GatewayRPCError``) or a protocol/version mismatch."""
+    from hermes_cli.gateway_client import GatewayClientError, GatewayRPCError, GatewayUnavailableError
+    if isinstance(exc, GatewayUnavailableError):
+        # Nothing was submitted. An update drain or a slow start is transient; a gateway that could not
+        # start at all stays a visible failure.
+        return getattr(exc, 'state', None) in ('draining', 'starting')
+    if isinstance(exc, GatewayRPCError):
+        return False
+    if isinstance(exc, OSError):  # TimeoutError and socket.timeout included
+        return True
+    if isinstance(exc, GatewayClientError):
+        # connect_gateway wraps the WebSocket open; the control socket reports its own deadline.
+        return isinstance(exc.__cause__, OSError) or str(exc) == 'Gateway bootstrap timed out'
+    return False
 
 def _settled_now(journal):
     """Recovery stamps canonical_settled after import; re-read rather than trust the pre-recover copy."""
