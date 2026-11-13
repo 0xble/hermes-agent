@@ -26,14 +26,24 @@ async def apply_reasoning_default(runner, event, session_key: str) -> None:
     if (not is_meeting_lane(event) or event.internal or event.get_command()
             or getattr(runner, "session_store", None) is None):
         return
-    await asyncio.to_thread(_apply_reasoning_default, runner, event, session_key)
-
-
-def _apply_reasoning_default(runner, event, session_key: str) -> None:
-    if runner._session_reasoning_override(session_key) is None:
-        runner._set_reasoning_override(
-            session_key, {"enabled": True, "effort": "medium"}, event.source, scope="session",
-        )
+    state = runner._session_state(session_key)
+    conversation = state.conversation
+    if conversation.reasoning_override is not None:
+        return
+    epoch = conversation.reasoning_override_epoch
+    loaded = await asyncio.to_thread(runner._load_persisted_reasoning_override, session_key)
+    state = runner._peek_session_state(session_key)
+    conversation = state.conversation if state is not None else None
+    if conversation is None or conversation.reasoning_override_epoch != epoch:
+        return
+    if conversation.reasoning_override is not None:
+        return
+    if loaded is not None:
+        runner._publish_persisted_reasoning_override(session_key, loaded)
+        return
+    runner._set_reasoning_override(
+        session_key, {"enabled": True, "effort": "medium"}, event.source, scope="session",
+    )
 
 
 async def busy_input_mode(runner, event, session_key: str) -> str:
