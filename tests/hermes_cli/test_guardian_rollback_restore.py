@@ -170,7 +170,7 @@ def test_exception_after_bootout_restores_the_serving_release(tmp_path, monkeypa
 @pytest.mark.platforms("macos")
 def test_slow_rollback_target_gets_its_own_startup_window(tmp_path, monkeypatch):
     """A rollback target still starting when the run deadline ends is not booted out."""
-    home, plist, label, a, b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     from hermes_cli import gateway_launchd
     # The old incarnation is absent; only the replacement exists after bootstrap. A constant PID
     # can be a real process on macOS CI, which would trip the live-system guard during reap.
@@ -199,7 +199,7 @@ def test_slow_rollback_target_gets_its_own_startup_window(tmp_path, monkeypatch)
 
 @pytest.mark.platforms("macos")
 def test_running_but_unhealthy_target_is_not_replaced(tmp_path, monkeypatch):
-    home, plist, label, a, b, _calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
+    home, plist, label, a, b, calls = _service(tmp_path, monkeypatch, path=_op_on(tmp_path))
     from hermes_cli import gateway_launchd
     monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid",
                         lambda name, **_: 123 if "bootstrap" in calls else None)
