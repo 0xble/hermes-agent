@@ -708,6 +708,12 @@ def environment(home: Path) -> dict[str, str]:
     # isolated HOME is created. Retain that exact toolchain, not runner config.
     if (STATE / 'rustup').is_dir():
         env['RUSTUP_HOME'] = str(STATE / 'rustup')
+    sandbox_runtime = STATE / 'electron-sandbox'
+    if sys.platform.startswith('linux') and sandbox_runtime.is_dir():
+        pinned = json.loads((ROOT / 'apps/desktop/package.json').read_text())['devDependencies']['electron']
+        if (sandbox_runtime / 'version').read_text().strip().removeprefix('v') != pinned:
+            raise RuntimeError('Prepared sandbox runtime does not match the locked Electron version')
+        env['ELECTRON_OVERRIDE_DIST_PATH'] = str(sandbox_runtime)
     if os.name == 'nt' and os.environ.get('VCToolsInstallDir'):
         env.update(msvc_linker_environment(Path(os.environ['VCToolsInstallDir']), os.environ))
     env.update(git_environment(root=ROOT, base=env, config_path=home / 'gitconfig'))

@@ -1,6 +1,6 @@
 # Cron Admission
 
-**Patch identities:** `cron-protected-admission`, `cron-max-catch-up-lateness`.
+**Patch identities:** `cron-admission`, `cron-protected-admission`, `cron-max-catch-up-lateness`.
 
 This unit extends the [fork contract](../MAINTENANCE.md). Load it for cron
 completion rearming, built-in ticker waits, or executor admission changes.

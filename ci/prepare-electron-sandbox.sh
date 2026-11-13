@@ -16,5 +16,10 @@ console.log(join(dirname(require.resolve('electron/package.json')), 'dist/chrome
 JS
 )
 test -f "$sandbox"
-chown root:root "$sandbox"
-chmod 4755 "$sandbox"
+# The exact gate prepares dependencies again under a fresh home. That can replace
+# node_modules and erase setuid ownership, so keep the same locked runtime outside it.
+runtime="$PWD/.ci/electron-sandbox"
+mkdir -p "$runtime"
+cp -a "$(dirname "$sandbox")/." "$runtime/"
+chown -R root:root "$runtime"
+chmod 4755 "$runtime/chrome-sandbox"
