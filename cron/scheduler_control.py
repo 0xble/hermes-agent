@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone, UTC
+from datetime import UTC, datetime
 
 from agent.interrupt_scope import InterruptScope
 
@@ -45,16 +45,22 @@ def release_unstarted_claim(job: dict) -> None:
     jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply))
 
 
-def _occurrence_superseded(claimed: dict, current: dict) -> bool:
+def _occurrence_superseded(claimed: dict, current: dict, *, paused_by_recovery: bool = False) -> bool:
     """True when an operator schedule or lifecycle edit landed after this fire was claimed.
 
     ``update_job`` drops ``pending_slot`` for exactly these fields because the edit supersedes
     any occurrence the dispatcher left unclaimed. A claimed-but-never-started fire is the same
     occurrence, so restoring it would revive the old slot and overwrite the operator's
     ``next_run_at`` (or, for a one-shot, the edited run time). Nothing between the claim and a
-    pre-submit deferral legitimately rewrites these fields, so any difference is an edit."""
+    pre-submit deferral legitimately rewrites these fields, so any difference is an edit.
+
+    The one exception is the uncertainty pause this fire's own recovery recorded: it owns
+    ``enabled``/``state`` and the pause markers, so it is judged as the claimed lifecycle."""
     from cron.jobs import is_job_runnable
 
+    if paused_by_recovery:
+        current = dict(current, enabled=claimed.get("enabled"), state=claimed.get("state"),
+                       paused_at=None, paused_reason=None)
     if not is_job_runnable(current):
         return True
     return any(current.get(key) != claimed.get(key) for key in _OCCURRENCE_FIELDS)
@@ -64,44 +70,56 @@ def _occurrence_superseded(claimed: dict, current: dict) -> bool:
 _OCCURRENCE_FIELDS = ("schedule", "timezone", "next_run_at", "enabled", "state")
 
 
-def defer_unstarted_fire(job: dict, reason: str) -> str | None:
-    """Put a scheduled fire that never reached the gateway owner back on the schedule.
+def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -> str | None:
+    """Restore a proven unstarted occurrence under its exact fire-owner fence.
 
-    Releases only this attempt's claim and re-stamps its occurrence as an unclaimed
-    ``pending_slot`` (one-shots refund their preclaim instead), recording no run outcome and
-    no pause. The next due scan restores the slot once this process no longer runs the job,
-    and the ordinary late / catch-up policy bounds the retries. Returns ``"deferred"``.
+    Shared by pre-submit deferral and detached pre-body recovery: no run outcome, pause, or
+    failure-streak write. Releases only this attempt's claim and re-stamps the ORIGINAL
+    occurrence as an unclaimed ``pending_slot``; one-shots also refund the preclaim rather than
+    inventing a retry fire. The due scan enforces ordinary catch-up limits. A ``pause`` this
+    fire's recovery recorded is lifted with the restore. Returns ``"deferred"``.
 
     When an operator schedule or lifecycle edit superseded the occurrence while the handshake
     stalled, the edit already chose what runs next: the claim is released (a one-shot's
     preclaim refunded) with no slot restored and the edited ``next_run_at`` untouched. Returns
     ``"superseded"``.
 
-    None when the fire has no occurrence to restore (a manual run) or the claim is no longer
-    this attempt's: the caller then fails the run as before, so nothing is dropped silently."""
+    None when the fire has no occurrence to restore (a manual run), the claim is no longer
+    this attempt's, or the fire fence refused: nothing was restored or released, so the
+    caller must keep or fail the run visibly rather than drop it."""
     from cron import jobs
     from cron.job_run_retry import preserve_unstarted_run
     from cron.occurrences import pending_slot_stamp
 
     owner = (job.get("fire_claim") or {}).get("by")
     instant = job.get("_scheduled_instant")
-    if owner is None or not instant:
+    if not owner or not instant:
         return None
 
     def apply(records, _index, current):
         if (current.get("fire_claim") or {}).get("by") != owner:
             return None
+        paused_by_recovery = (
+            isinstance(pause, dict)
+            and (current.get("paused_at"), current.get("paused_reason"))
+            == (pause.get("paused_at"), pause.get("reason"))
+        )
         now = jobs._hermes_now()
         kind = (current.get("schedule") or {}).get("kind")
-        if _occurrence_superseded(job, current):
+        if _occurrence_superseded(job, current, paused_by_recovery=paused_by_recovery):
+            # The recovery pause, if any, is lifted when its journal retires (resume_job then
+            # derives the next run from the edited schedule).
             if (job.get("schedule") or {}).get("kind") == "once":
                 _refund_oneshot_preclaim(current)
             outcome, detail = "superseded", f"Not started; superseded by an operator edit: {reason}"
-        elif kind in {"cron", "interval"}:
+        elif kind in {"once", "cron", "interval"}:
+            if paused_by_recovery:
+                jobs._activate_job_record(current)
+            if kind == "once":
+                preserve_unstarted_run(current, now.isoformat())
             current["pending_slot"] = pending_slot_stamp(instant, now)
-            outcome, detail = "deferred", f"Deferred, not started: {reason}"
-        elif kind == "once":
-            preserve_unstarted_run(current, now.isoformat())
+            if kind == "once":
+                current["pending_slot"]["deferred_unstarted"] = True
             outcome, detail = "deferred", f"Deferred, not started: {reason}"
         else:
             return None
@@ -112,7 +130,8 @@ def defer_unstarted_fire(job: dict, reason: str) -> str | None:
         jobs.save_jobs(records)
         return outcome
 
-    return jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply, None))
+    # ``_under_fire_fence`` answers False when the fence is busy: nothing was written.
+    return jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply, None)) or None
 
 
 def _refund_oneshot_preclaim(current: dict) -> None:

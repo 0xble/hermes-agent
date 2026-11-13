@@ -3618,10 +3618,15 @@ def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str
         "(scheduler stopped before dispatch); restoring it as the due instant (was %s).",
         job.get("name", job.get("id")), job.get("id"), slot, job.get("next_run_at"))
     job["next_run_at"] = slot
-    job.pop("pending_slot", None)
-    rj = scan.find(job["id"])
-    if rj is not None:
-        rj.pop("pending_slot", None)
+    # A proven-unstarted one-shot keeps its deferral proof until the fire claim
+    # consumes it. Dropping it here would lose eligibility on a scan/claim crash.
+    deferred_once = (job.get("schedule", {}).get("kind") == "once"
+                     and job["pending_slot"].get("deferred_unstarted") is True)
+    if not deferred_once:
+        job.pop("pending_slot", None)
+        rj = scan.find(job["id"])
+        if rj is not None:
+            rj.pop("pending_slot", None)
     scan.persist(job["id"], next_run_at=slot)
     return slot
 

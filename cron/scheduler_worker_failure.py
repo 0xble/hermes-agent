@@ -5,6 +5,45 @@ import logging
 logger = logging.getLogger("cron.scheduler")
 
 
+def defer_proven_unstarted_worker(
+    job: dict, execution: dict, *, worker_exited: bool = False, pause: dict | None = None,
+) -> bool:
+    """Reclaim only a terminal worker whose durable body gate was never won.
+
+    Reaped process + attaching is proof, not an empty transcript or started_at.
+    The body CAS requires running, so an unknown attempt cannot start late even
+    if an old register/adopt answer arrives. NULL/legacy and started fail closed.
+    A stale owner is handled without changing any newer claim or operator edit.
+    """
+    from cron.executions import _owner_identity
+    from cron.scheduler_control import defer_unstarted_fire
+
+    if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attaching'
+            or not (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
+        return False
+    status = execution.get('status')
+    if status not in {'unknown', 'failed'}:
+        return False
+    typed_deferral = status == 'failed' and execution.get('delivery_outcome') == 'deferred'
+    if not typed_deferral and not worker_exited and _owner_identity(
+            execution['pid'], execution['process_started_at']) != 'dead':
+        return False
+    deferred = dict(job, _scheduled_instant=(
+        job.get('_scheduled_instant') or execution['scheduled_instant']))
+    from cron import jobs
+    outcome = defer_unstarted_fire(
+        deferred, execution.get('error') or 'Detached worker died before body start', pause=pause)
+    if outcome is not None:
+        # Restored, or superseded by an operator edit (claim released either way).
+        return True
+    current = jobs.get_job(job['id'])
+    # None is either a transient fence refusal (same claim, still recoverable on the next
+    # pass, which also classifies any operator edit under the fence) or a claim this
+    # attempt no longer owns. Only the latter may retire the recovery journal now.
+    return (current is None
+            or (current.get('fire_claim') or {}).get('by') != (job.get('fire_claim') or {}).get('by'))
+
+
 def record_external_worker_outcome(
     job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False,
     worker_terminated: bool = False, worker_exit_code: int | None = None,
@@ -45,6 +84,12 @@ def record_external_worker_outcome(
         return False
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
+            return True
+        if (execution.get('body_phase') == 'attaching'
+                and (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
+            defer_proven_unstarted_worker(job, execution, worker_exited=worker_exited)
+            # If the fire fence was busy, its durable admission journal remains
+            # the retry intent. Never turn that transient refusal into a run failure.
             return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit
