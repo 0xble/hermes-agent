@@ -3474,9 +3474,7 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
 
 
 def _settled_before_outcome(job, success, error, execution_id, fire_owner, ownership_lost, teardown) -> bool:
-    """Settle a run that must not book an outcome: a lost fire claim, or a gateway handshake that
-    failed before any submit (no admission exists to recover or pause for, so the occurrence is
-    released and re-queued instead of booked as a failed run)."""
+    """Settle ownership loss or a proven pre-body deferral without booking an outcome."""
     if ownership_lost():
         teardown()
         _record_fire_ownership_lost(job, fire_owner, execution_id)
@@ -3484,12 +3482,19 @@ def _settled_before_outcome(job, success, error, execution_id, fire_owner, owner
     from cron.scheduler_authority import NOT_STARTED_FLAG
     if not job.pop(NOT_STARTED_FLAG, False) or success:
         return False
+    # Pre-submit failures never reach the body gate (NULL). A detached attempt
+    # that did reach it is deferrable only with the positive attach_lost marker.
+    if (get_execution(execution_id) or {}).get('body_phase') not in (None, 'attach_lost'):
+        return False
     from cron.scheduler_control import defer_unstarted_fire
     if not defer_unstarted_fire(job, error or "gateway handshake failed"):
+        # The ordinary failure lane owns visible delivery, incident bookkeeping,
+        # claim release, and the terminal execution write.
         return False
     teardown()
-    finish_execution(execution_id, success=False, error=f"Not started; occurrence deferred: {error}")
-    logger.warning("Job '%s': gateway handshake failed before submit; deferred: %s", job["id"], error)
+    finish_execution(execution_id, success=False, error=f"Not started; occurrence deferred: {error}",
+                     delivery_outcome="deferred")
+    logger.warning("Job '%s': gateway handshake failed before body start; deferred: %s", job["id"], error)
     return True
 
 

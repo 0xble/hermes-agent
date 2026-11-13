@@ -5,6 +5,34 @@ import logging
 logger = logging.getLogger("cron.scheduler")
 
 
+def defer_proven_unstarted_worker(
+    job: dict, execution: dict, *, pause: dict | None = None,
+) -> bool:
+    """Reclaim only a terminal worker whose durable body gate was never won.
+
+    Reaped process + attaching is proof, not an empty transcript or started_at.
+    Reconnect refusals and hard-wall failures stay on the visible failure lane.
+    NULL/legacy and started rows fail closed.
+    """
+    from cron.scheduler_control import defer_unstarted_fire
+
+    if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attach_lost'
+            or execution.get('status') not in {'failed', 'unknown'}
+            or not (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
+        return False
+    deferred = dict(job, _scheduled_instant=(
+        job.get('_scheduled_instant') or execution['scheduled_instant']))
+    deferred = defer_unstarted_fire(
+        deferred, execution.get('error') or 'Detached worker died before body start', pause=pause)
+    if deferred:
+        from cron.executions import mark_deferred_execution
+        mark_deferred_execution(execution['id'])
+        # The deferral settles this admission through the same guarded retirement path as completion.
+        from cron.scheduler_authority import retire_completed_journal
+        retire_completed_journal(job['id'], execution['id'])
+    return deferred
+
+
 def record_external_worker_outcome(
     job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False,
     worker_terminated: bool = False, worker_exit_code: int | None = None,
@@ -43,6 +71,8 @@ def record_external_worker_outcome(
         return False
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
+            return True
+        if defer_proven_unstarted_worker(job, execution):
             return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit

@@ -470,7 +470,7 @@ def record_cron_finish(record: Any, delivery_outcome: Any = None) -> None:
         _cron_skipped.discard(execution_id)
     started = record.get("started_at")
     success = record.get("status") == "completed"
-    if gated or (not started and not success and delivery_outcome is None):
+    if gated or (not started and not success and delivery_outcome in (None, "deferred")):
         outcome = "skipped"
     else:
         outcome = "success" if success else "failed"
