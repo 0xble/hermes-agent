@@ -253,10 +253,7 @@ def test_handover_waits_for_real_runner_followup_views():
     from tests.gateway.restart_test_helpers import make_restart_runner
 
     runner, _ = make_restart_runner()
-    setattr(runner, "_zero_cut_handover_state", {
-        "accepted": True, "updates_settled": True, "token_lock_released": True,
-        "active_turns": 0, "idle": False, "failed": None,
-    })
+    runner._zero_cut_handover_state = {"accepted": True, "updates_settled": True, "token_lock_released": True, "active_turns": 0, "idle": False, "failed": None}
     runner._pending_messages["pending"] = "received follow-up"
     runner._queued_events["overflow"] = [object()]
     assert drain.status(runner)["idle"] is False
@@ -275,10 +272,7 @@ async def test_handover_waits_for_detached_delegation_before_stopping(monkeypatc
     from tests.waiting import async_wait_until
 
     runner, _ = make_restart_runner()
-    setattr(runner, "_zero_cut_handover_state", {
-        "accepted": True, "updates_settled": True, "token_lock_released": True,
-        "active_turns": 0, "idle": False, "failed": None,
-    })
+    runner._zero_cut_handover_state = {"accepted": True, "updates_settled": True, "token_lock_released": True, "active_turns": 0, "idle": False, "failed": None}
     live = [1]
     observed = asyncio.Event()
 
@@ -302,7 +296,7 @@ async def test_handover_waits_for_detached_delegation_before_stopping(monkeypatc
             lambda: stop.await_count == 1,
             what="the settled handover stop",
         )
-        await getattr(runner, "_zero_cut_stop_task")
+        await runner._zero_cut_stop_task
         stop.assert_awaited_once()
     finally:
         waiter.cancel()
@@ -314,10 +308,7 @@ def test_handover_waits_for_non_restart_safe_process(monkeypatch):
     from tests.gateway.restart_test_helpers import make_restart_runner
 
     runner, _ = make_restart_runner()
-    setattr(runner, "_zero_cut_handover_state", {
-        "accepted": True, "updates_settled": True, "token_lock_released": True,
-        "active_turns": 0, "idle": False, "failed": None,
-    })
+    runner._zero_cut_handover_state = {"accepted": True, "updates_settled": True, "token_lock_released": True, "active_turns": 0, "idle": False, "failed": None}
     sessions = [{"status": "running", "survive_restart": False}]
     monkeypatch.setattr(
         "tools.process_registry.process_registry.list_sessions",
@@ -333,10 +324,7 @@ def test_handover_does_not_wait_for_restart_safe_process(monkeypatch):
     from tests.gateway.restart_test_helpers import make_restart_runner
 
     runner, _ = make_restart_runner()
-    setattr(runner, "_zero_cut_handover_state", {
-        "accepted": True, "updates_settled": True, "token_lock_released": True,
-        "active_turns": 0, "idle": False, "failed": None,
-    })
+    runner._zero_cut_handover_state = {"accepted": True, "updates_settled": True, "token_lock_released": True, "active_turns": 0, "idle": False, "failed": None}
     monkeypatch.setattr(
         "tools.process_registry.process_registry.list_sessions",
         lambda: [{"status": "running", "survive_restart": True}],
@@ -349,11 +337,8 @@ def test_handover_waits_for_completion_ownership(monkeypatch):
     from tests.gateway.restart_test_helpers import make_restart_runner
 
     runner, _ = make_restart_runner()
-    setattr(runner, "_zero_cut_handover_state", {
-        "accepted": True, "updates_settled": True, "token_lock_released": True,
-        "active_turns": 0, "idle": False, "failed": None,
-    })
-    setattr(runner, "_completion_notification_batches", {("chat",): ["completion"]})
+    runner._zero_cut_handover_state = {"accepted": True, "updates_settled": True, "token_lock_released": True, "active_turns": 0, "idle": False, "failed": None}
+    runner._completion_notification_batches = {("chat",): ["completion"]}
     assert drain.status(runner)["idle"] is False
     runner._completion_notification_batches.clear()
     assert drain.status(runner)["idle"] is True
