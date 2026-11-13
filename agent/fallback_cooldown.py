@@ -65,21 +65,43 @@ def switch_deferred_by_reset(agent, reason: FailoverReason | None, reset_at) -> 
 def _arm_rate_limit_cooldown(
     agent, reason: FailoverReason | None, reset_at=None,
 ) -> int | None:
-    """Arm the primary cooldown until the provider reset, or use exponential backoff.
+    """Arm the current route cooldown until the provider reset, or use exponential backoff.
 
     ``reset_at`` is an absolute wall-clock timestamp while ``_rate_limited_until`` is monotonic;
     convert through a duration so wall-clock epoch values never enter the monotonic comparison.
-    Missing, invalid, or expired provider resets retain the 60s → 2m → ... → 4h fallback.
-    Only arm when leaving the primary: chain-switching from an active fallback means the primary
-    was not the failing source. Return the armed cooldown in seconds, or None when not armed.
+    Missing, invalid, or expired provider resets retain the 60s → 2m → ... → 4h fallback for
+    transient rate limits; billing/quota exhaustion uses the shared bounded billing window.
+    Primary and fallback routes both persist through the shared route-keyed state.
     """
     if reason not in _SHARED_COOLDOWN_REASONS:
+        return None
+    from agent.shared_primary_cooldown import live_route_from_agent, route_from_agent
+    live_route = live_route_from_agent(agent)
+    primary_route = route_from_agent(agent)
+    # A fallback outage belongs to the fallback route, not to the configured primary.
+    # Persist billing/quota failures so a fresh session or cron worker can skip that
+    # backend too. Primary cooldown adoption remains separate and keeps its existing
+    # recovery semantics.
+    if getattr(agent, "_fallback_activated", False) and live_route != primary_route:
+        if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+            return None
+        try:
+            from agent.shared_primary_cooldown import arm_cooldown
+            record = arm_cooldown(
+                live_route, reason=reason,
+                reset_at=_provider_reset_epoch(reset_at),
+                backoff_count=0,
+            )
+        except Exception:
+            record = None
+            logger.debug("Shared fallback cooldown write failed", exc_info=True)
+        if record:
+            return max(0, math.ceil(float(record["reset_at"]) - time.time()))
         return None
     if getattr(agent, "_fallback_activated", False):
         # Compare the whole route: a same-provider fallback (another model or endpoint) failing
         # says nothing about the primary and must not arm the primary's shared window.
-        from agent.shared_primary_cooldown import live_route_from_agent, route_from_agent
-        if live_route_from_agent(agent) != route_from_agent(agent):
+        if live_route != primary_route:
             return None
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     agent._rate_limit_backoff_count = backoff_count + 1
@@ -110,7 +132,12 @@ def _arm_rate_limit_cooldown(
         backoff_seconds = max(0, math.ceil(float(record["reset_at"]) - time.time()))
         agent._rate_limited_until = time.monotonic() + backoff_seconds
         agent._rate_limit_backoff_count = int(record.get("backoff_count", backoff_count + 1) or 0)
-        source = "provider reset" if record.get("source") == "provider_reset" else "exponential fallback"
+        if record.get("source") == "provider_reset":
+            source = "provider reset"
+        elif record.get("source") == "billing_default":
+            source = "billing default"
+        else:
+            source = "exponential fallback"
     logging.info(
         "Rate-limit backoff level %d: cooldown %d s (%.1f min, backoff#%d, %s)",
         max(0, agent._rate_limit_backoff_count - 1), backoff_seconds, backoff_seconds / 60,

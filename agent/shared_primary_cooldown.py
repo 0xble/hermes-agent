@@ -36,6 +36,9 @@ _STALE_GRACE_FLOOR_SECONDS = 600
 # Furthest-out reset a reader or writer accepts. Weekly usage caps reset within 7 days;
 # 31 days leaves room for monthly billing caps without letting a corrupt value pin a route.
 _MAX_PROVIDER_RESET_SECONDS = 31 * 86_400
+# Billing/quota failures without a provider reset are not transient 60-second throttles.
+# Keep them bounded so a missing reset cannot make a route retry every turn forever.
+_DEFAULT_BILLING_COOLDOWN_SECONDS = 6 * 60 * 60
 
 
 def _state_path() -> Path:
@@ -245,8 +248,17 @@ def arm_cooldown(
     route: tuple[str, str, str], *, reason: Any, reset_at: Any = None,
     backoff_count: int | None = None,
 ) -> dict[str, Any] | None:
-    """Create or re-arm a route outage and return its durable record."""
+    """Create or re-arm a route outage and return its durable record.
+
+    Billing/quota failures are durable for the bounded billing window when the provider
+    does not supply a reset. The same route-keyed record is used for primary and fallback
+    routes, so fresh sessions and cron workers can avoid a known-depleted backend.
+    """
     now = time.time()
+    reason_value = getattr(reason, "value", str(reason or "rate_limit"))
+    billing_default = reset_at is None and reason_value == "billing"
+    if billing_default:
+        reset_at = now + _DEFAULT_BILLING_COOLDOWN_SECONDS
     requested_reset = (_plausible_reset(reset_at, now) or 0.0) if reset_at is not None else 0.0
     if requested_reset <= now:
         requested_reset = 0.0
@@ -272,7 +284,7 @@ def arm_cooldown(
             old_reset = float(old.get("reset_at", 0) or 0) if still_active else 0.0
             if requested_reset:
                 effective_reset = requested_reset
-                source = "provider_reset"
+                source = "billing_default" if billing_default else "provider_reset"
                 backoff_count = max(1, prior_count + (0 if still_active else 1))
             elif still_active:
                 backoff_count = max(1, prior_count)
