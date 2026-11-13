@@ -694,6 +694,18 @@ def execution_owner_live(execution_id: str, job_id: str) -> bool:
     return row is not None and _row_owner_live(row)
 
 
+def mark_deferred_execution(execution_id: str) -> bool:
+    """Mark an attach-lost attempt settled by occurrence deferral, without booking a run result."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET delivery_outcome='deferred'
+               WHERE id=? AND body_phase='attach_lost' AND status IN ('failed','unknown')
+                 AND (delivery_outcome IS NULL OR delivery_outcome='deferred')""",
+            (str(execution_id),),
+        )
+    return cur.rowcount == 1
+
+
 def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
     """Replace a terminal attempt's ``queued`` delivery outcome with the drain's real one.
 

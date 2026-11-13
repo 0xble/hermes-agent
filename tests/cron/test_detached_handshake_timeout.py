@@ -386,6 +386,66 @@ def _prebody_journal(env, monkeypatch, kind, pause_kind):
     return claimed, journal
 
 
+def _terminal_dead_worker(monkeypatch, job):
+    @asynccontextmanager
+    async def connected():
+        class Peer:
+            async def rpc(self, method, **_params):
+                assert method == 'cron.recover'
+                return {
+                    'status': 'terminal',
+                    'job': job,
+                    'result': [False, '', '', 'detached_cron_worker_lost'],
+                }
+        yield Peer()
+    monkeypatch.setattr(gateway_client, 'connect_gateway', connected)
+
+
+@pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
+def test_attach_lost_ordering_waiter_then_reconcile_defers_once(occurrence_home, monkeypatch, kind):
+    from cron import scheduler_worker_failure
+
+    jobs, executions, _scheduler, _counter = occurrence_home
+    claimed, journal = _prebody_journal(occurrence_home, monkeypatch, kind, 'none')
+    retired = []
+    original_retire = scheduler_authority.retire_completed_journal
+    monkeypatch.setattr(
+        scheduler_authority, 'retire_completed_journal',
+        lambda *args: retired.append(args) or original_retire(*args),
+    )
+    assert scheduler_worker_failure.record_external_worker_outcome(
+        claimed, execution_id=claimed['execution_id'], worker_exited=True)
+    assert executions.get_execution(claimed['execution_id'])['delivery_outcome'] == 'deferred'
+    _terminal_dead_worker(monkeypatch, claimed)
+    scheduler_authority.reconcile_pending()
+    current = jobs.get_job(claimed['id'])
+    assert not current.get('failure_streak') and current['last_run_at'] is None
+    assert current.get('pending_slot') or current['repeat']['completed'] == 0
+    assert not journal.exists() and retired == [(claimed['id'], claimed['execution_id'])]
+
+
+@pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
+def test_attach_lost_ordering_reconcile_then_waiter_defers_once(occurrence_home, monkeypatch, kind):
+    from cron import scheduler_worker_failure
+
+    jobs, executions, _scheduler, _counter = occurrence_home
+    claimed, journal = _prebody_journal(occurrence_home, monkeypatch, kind, 'none')
+    retired = []
+    original_retire = scheduler_authority.retire_completed_journal
+    monkeypatch.setattr(
+        scheduler_authority, 'retire_completed_journal',
+        lambda *args: retired.append(args) or original_retire(*args),
+    )
+    scheduler_authority.reconcile_pending(allow_connect=False)
+    assert executions.get_execution(claimed['execution_id'])['delivery_outcome'] == 'deferred'
+    assert scheduler_worker_failure.record_external_worker_outcome(
+        claimed, execution_id=claimed['execution_id'], worker_exited=True)
+    current = jobs.get_job(claimed['id'])
+    assert not current.get('failure_streak') and current['last_run_at'] is None
+    assert current.get('pending_slot') or current['repeat']['completed'] == 0
+    assert not journal.exists() and retired == [(claimed['id'], claimed['execution_id'])]
+
+
 @pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
 @pytest.mark.parametrize('pause_kind', ['none', 'recovery', 'operator'])
 def test_prebody_journal_recovery_obeys_exact_pause_owner(occurrence_home, monkeypatch, kind, pause_kind):

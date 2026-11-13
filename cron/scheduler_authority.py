@@ -341,11 +341,14 @@ def reconcile_pending(*, allow_connect=True):
             if (row is not None and row.get('body_phase') == 'attach_lost'
                     and 'worker_result' not in record and record.get('job')):
                 from cron.scheduler_worker_failure import defer_proven_unstarted_worker
+                if row.get('delivery_outcome') == 'deferred':
+                    retire_completed_journal(params['job_id'], params['request_id'])
+                    continue
                 if defer_proven_unstarted_worker(record['job'], row, pause=record.get('pause_recorded')):
                     # Local body gate + proved dead owner replaces guesswork from a lost
                     # RPC answer. Do not re-submit, replay a result, or pause this fire.
-                    retire_completed_journal(params['job_id'], params['request_id'])
                     continue
+                # A refused deferral falls through to the base recovery path by design.
             terminal_execution = (row is not None and row['job_id'] == params['job_id']
                                   and row['status'] in {'completed', 'failed'})
             current = get_job(params['job_id'])

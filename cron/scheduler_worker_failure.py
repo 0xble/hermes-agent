@@ -22,8 +22,15 @@ def defer_proven_unstarted_worker(
         return False
     deferred = dict(job, _scheduled_instant=(
         job.get('_scheduled_instant') or execution['scheduled_instant']))
-    return defer_unstarted_fire(
+    deferred = defer_unstarted_fire(
         deferred, execution.get('error') or 'Detached worker died before body start', pause=pause)
+    if deferred:
+        from cron.executions import mark_deferred_execution
+        mark_deferred_execution(execution['id'])
+        # The deferral settles this admission through the same guarded retirement path as completion.
+        from cron.scheduler_authority import retire_completed_journal
+        retire_completed_journal(job['id'], execution['id'])
+    return deferred
 
 
 def record_external_worker_outcome(
@@ -66,7 +73,6 @@ def record_external_worker_outcome(
         if not owns_claim:
             return True
         if defer_proven_unstarted_worker(job, execution):
-            # A typed pre-body loss restores the occurrence; it is not a job failure.
             return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit
