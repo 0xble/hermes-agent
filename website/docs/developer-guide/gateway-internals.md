@@ -647,6 +647,15 @@ delivery confirmations. Legacy text-only first-reply observations cannot establi
 first-visible latency and remain missing. These are local transport confirmations,
 not proof that a person read the reply. Historical progress times cannot be recovered.
 
+Goal and loop post-turn bookkeeping runs through the existing post-delivery callback
+owner. Durable settlement still precedes the final send, while a slow auxiliary
+judge no longer delays the answer it evaluates. A direct handler caller without
+an explicit delivery owner runs bookkeeping inline. Deferred bookkeeping belongs
+to the adapter's background tasks, outside the cosmetic cleanup timeout.
+Legacy adapter tasks join bookkeeping after their cosmetic cleanup completes.
+An invalidation epoch fences stop/reset/new boundaries without rejecting
+ordinary FIFO succession. Stale progress cleanup remains independent.
+
 ## Hooks
 
 Gateway hooks are Python modules that respond to lifecycle events:

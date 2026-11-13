@@ -157,7 +157,11 @@ def trim_memory(
         now = time.monotonic()
         cooldown = configured_cooldown if cooldown_seconds is None else _cooldown_seconds(cooldown_seconds)
         since_last = now - _last_trim_monotonic
-        if _last_trim_monotonic and since_last < (_FORCE_FLOOR_SECONDS if force else cooldown):
+        # The short force floor exists to release pages right after an agent closes. Without a
+        # page-release primitive (macOS) a forced pass is only a stop-the-world gc.collect() that
+        # holds the GIL for every thread, so it keeps the normal cooldown.
+        floor = _FORCE_FLOOR_SECONDS if force and trim is not None else cooldown
+        if _last_trim_monotonic and since_last < floor:
             return False
         # Record the attempt before calling into libc so repeated failures do not
         # turn every turn boundary into an expensive full collection.

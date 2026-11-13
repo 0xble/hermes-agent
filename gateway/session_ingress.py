@@ -21,9 +21,6 @@ busy_acceptance = ContextVar('busy_acceptance', default=None)
 # commit task, which command barriers and /restart wait on): ``busy_acceptance`` may already resolve
 # once the input's FIFO position is fixed behind an earlier input of its chat still capturing.
 busy_commit = ContextVar('busy_commit', default=None)
-# Set by a messaging caller to run synchronously once its committed row is still ``queued`` (not yet
-# claimed by a drain), so work it starts is visible before the turn's own preprocessing can run.
-admitted_queued = ContextVar('admitted_queued', default=None)
 # ``_validate_native`` clauses about the message's own content, safe to name to the sender's chat.
 _CONTENT_CLAUSES = frozenset({
     'text', 'auto_skill', 'channel_prompt', 'channel_context', 'reply_expected',
@@ -38,10 +35,9 @@ QUEUE_FULL_REPLY = ('⏳ Too many messages are already waiting in this conversat
 async def admit_message(authority, event):
     from gateway.session_refusals import internal_input, log_internal_refusal, user_notice_due
     from gateway.session_authority import messaging_admission
-    accepted, committed, on_queued = busy_acceptance.get(), busy_commit.get(), admitted_queued.get()
+    accepted, committed = busy_acceptance.get(), busy_commit.get()
     busy_acceptance.set(None)  # the drain task this schedules must not inherit the busy caller's future
     busy_commit.set(None)
-    admitted_queued.set(None)
     ingress = messaging_admission.set(True if accepted is None else accepted)
     try:
         receipt = await authority.admit_native(event)
@@ -93,8 +89,6 @@ async def admit_message(authority, event):
             del adopters[receipt.admission_id]
         return (None if status == 'terminal' or internal_input(event)
                 else pause_notice(authority, receipt.ref, 'unknown_execution'))
-    if on_queued is not None and status == 'queued':
-        on_queued()
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
@@ -132,6 +126,27 @@ def _claim_post_delivery(authority, admission_id, event, waiter):
     waiter.add_done_callback(abandoned)
 
 
+_BOOKKEEPING_JOIN_TIMEOUT_SECONDS = 30.0
+
+
+async def join_turn_bookkeeping(event):
+    """A lost delivery signal must not keep the adapter's session guard forever."""
+    task = getattr(event, '_post_turn_bookkeeping_task', None)
+    if task is not None:
+        try:
+            await asyncio.wait_for(asyncio.shield(task), _BOOKKEEPING_JOIN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            logger.warning('Post-turn bookkeeping join timed out, finishing inline for message %s', event.message_id)
+            await event._post_turn_bookkeeping_fallback()
+
+
+def post_delivery_owners(post_delivery):
+    """Keep the bubble and bookkeeping owners when their delivery routes differ."""
+    if post_delivery is None:
+        return []
+    return list(post_delivery) if isinstance(post_delivery, list) else [post_delivery]
+
+
 async def fire_turn_post_delivery(event):
     """Fire, once, the post-delivery cleanup (temporary progress bubbles) of the turn whose reply
     ``event``'s sender just delivered. False when the drain handed this event none."""
@@ -139,10 +154,10 @@ async def fire_turn_post_delivery(event):
     if post_delivery is None:
         return False
     event._turn_post_delivery = None
-    owner, session_key, generation = post_delivery
-    fire = getattr(owner, '_fire_post_delivery_callback', None)
-    if fire is not None:
-        await fire(session_key, generation)
+    for owner, session_key, generation in post_delivery_owners(post_delivery):
+        fire = getattr(owner, '_fire_post_delivery_callback', None)
+        if fire is not None:
+            await fire(session_key, generation)
     return True
 
 
@@ -399,7 +414,7 @@ async def execute_admission(authority, ref, row):
     from gateway.session_operator import is_viewer_input
     viewer_token = viewer_turn.set(live if is_viewer_input(row) else None)
     api_token = api_execution.set(None)
-    captured = {}
+    captured = {'post_delivery_owned': True}
     result_token = execution_result.set(captured)
     token = executing_admission.set(True)
     # This drain, not the handler's unwind, releases the turn's crash marker (see below).
@@ -529,20 +544,20 @@ _post_delivery_tasks = set()
 
 def _claim(post_delivery):
     """The turn's reply is still to be sent: keep a newer generation's sweep off its cleanup."""
-    owner, session_key, generation = post_delivery
-    claim = getattr(owner, 'claim_post_delivery', None)
-    if claim is not None:
-        claim(session_key, generation)
+    for owner, session_key, generation in post_delivery_owners(post_delivery):
+        claim = getattr(owner, 'claim_post_delivery', None)
+        if claim is not None:
+            claim(session_key, generation)
 
 
 def _fire_post_delivery(post_delivery):
     """Detached: bubble deletes can wait out a chat's flood limit, and the FIFO must not."""
-    owner, session_key, generation = post_delivery
-    fire = getattr(owner, '_fire_post_delivery_callback', None)
-    if fire is not None:
-        task = asyncio.create_task(fire(session_key, generation))
-        _post_delivery_tasks.add(task)
-        task.add_done_callback(_post_delivery_tasks.discard)
+    for owner, session_key, generation in post_delivery_owners(post_delivery):
+        fire = getattr(owner, '_fire_post_delivery_callback', None)
+        if fire is not None:
+            task = asyncio.create_task(fire(session_key, generation))
+            _post_delivery_tasks.add(task)
+            task.add_done_callback(_post_delivery_tasks.discard)
 
 
 async def deliver_settled(authority, admission_id):
@@ -597,8 +612,12 @@ async def _deliver_settled(authority, admission_id):
 
 async def deliver_response(adapter, event, session_key, response):
     from gateway.platforms.base import _thread_metadata_for_event, _mark_notify_metadata
+    from gateway.response_filters import display_kind_for_event, is_intentional_silence_response, silence_allowed
     text, ttl = adapter._unwrap_ephemeral(response)
     if not text:
+        return
+    if (is_intentional_silence_response(text)
+            and silence_allowed(display_kind_for_event(event), event.reply_expected)):
         return
     extracted = await adapter._extract_response_content(text, event, session_key, is_ephemeral_response=ttl > 0)
     metadata = _mark_notify_metadata(_thread_metadata_for_event(event))

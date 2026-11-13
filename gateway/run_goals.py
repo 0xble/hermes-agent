@@ -13,6 +13,7 @@ import functools
 import logging
 import time
 from contextlib import nullcontext, suppress
+from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform
@@ -27,6 +28,7 @@ if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
+_post_turn_delivered = ContextVar("gateway_post_turn_delivered", default=False)
 
 
 # Parallels the CLI's "user-interrupted (Ctrl+C)": an explicit pause that user input never revives.
@@ -76,6 +78,23 @@ def _goal_notice_outbound_class(message: str, notice_kind: Optional[str] = None)
     if kind == "status":
         kind = notice_kind or kind
     return OUTBOUND_FINAL if kind in {"achieved", "blocked", "paused", "failed", "resumed"} else OUTBOUND_NOTICE
+
+
+# A reply is delivered before its goal/loop bookkeeping; until that deferred pass finishes, its
+# session still has a turn owner for the loop watcher and goal wakeups (not for new admissions).
+POST_TURN_DELIVERY_WAIT_S = 60.0
+
+
+def _pending_bookkeeping(runner) -> dict:
+    pending = getattr(runner, "_pending_post_turn_bookkeeping", None)
+    if pending is None:
+        pending = {}
+        runner._pending_post_turn_bookkeeping = pending
+    return pending
+
+
+def post_turn_bookkeeping_pending(runner, session_key) -> bool:
+    return bool(session_key) and getattr(runner, "_pending_post_turn_bookkeeping", {}).get(session_key, 0) > 0
 
 
 class GatewayGoalsMixin(GatewayLoopWakeMixin):
@@ -524,7 +543,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         session_key = None
         with suppress(Exception):
             session_key = self._session_key_for_source(source)
-        if session_key and hasattr(adapter, "register_post_delivery_callback"):
+        if session_key and not _post_turn_delivered.get() and hasattr(adapter, "register_post_delivery_callback"):
             try:
                 active = getattr(adapter, "_active_sessions", {}).get(session_key)
                 generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
@@ -672,11 +691,17 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         self, *, session_entry: Any, source: Any, final_response: str,
         user_initiated: bool = False, external_event: bool = False,
         goal_instance: Optional[float] = None,
+        invalidation_epoch: Optional[int] = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
         """
         from gateway.wake import automatic_route_available
+
+        def is_current():
+            return invalidation_epoch is None or (
+                self._session_invalidation_epoch(self._session_key_for_source(source))
+                == invalidation_epoch)
 
         def _load():
             from hermes_cli.goals import GoalManager
@@ -722,8 +747,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 turn_started_at=turn_started_at,
                 background_processes=_bg_procs,
                 active_delegations=_active_deleg,
-            ),
+            ) if is_current() else {},
         )
+        if not is_current():
+            return
         msg = decision.get("message") or ""
         # Routine parked/continuing/wait-age text remains durable bookkeeping and log output, but
         # never consumes chat budget. Outcome/control notices still follow the visible path.
@@ -735,7 +762,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 logger.info("goal continuation: routine status notice suppressed kind=%s message=%s",
                             notice_kind, msg)
         prompt = decision.get("continuation_prompt") or ""
-        if not decision.get("should_continue") or not prompt or source is None:
+        if not is_current() or not decision.get("should_continue") or not prompt or source is None:
             return
         if getattr(source, "platform", None) == Platform.LOCAL:
             # A local session's adapter FIFO has no reader: its turns are authority admissions.
@@ -761,8 +788,110 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
+    async def _defer_post_turn_hooks(
+        self, *, agent_result, source, is_internal, event, session_key, generation, invalidation_epoch=None,
+    ) -> None:
+        """Let the durable FIFO settle and the transport answer before auxiliary bookkeeping.
+
+        Only a delivery owner can promise to fire the callback. Direct callers
+        finish inline. Invalidation fences superseded work without rejecting FIFO successors.
+        """
+        from gateway.session_results import execution_result
+        captured = execution_result.get()
+        if invalidation_epoch is None:
+            invalidation_epoch = self._session_invalidation_epoch(session_key)
+        # No early return on invalidation: the delivered turn's loop tick still settles; only the goal
+        # continuation is fenced (it checks the epoch itself, and the hook loop skips it below).
+        started = False
+
+        async def finish(*, deferred=False):
+            nonlocal started
+            if started:
+                return
+            started = True
+            token = execution_result.set(captured)
+            delivered_token = _post_turn_delivered.set(True)
+            try:
+                with self._profile_scope_for_source(source):
+                    await self._run_post_turn_hooks(
+                        agent_result=agent_result, source=source, is_internal=is_internal, event=event,
+                        invalidation_epoch=invalidation_epoch, existing_session_only=deferred)
+            except Exception:
+                logger.warning("Post-delivery goal/loop bookkeeping failed", exc_info=True)
+            finally:
+                _post_turn_delivered.reset(delivered_token)
+                execution_result.reset(token)
+
+        adapter = self._delivery_adapter_for(source)
+        from gateway.platforms.base import post_delivery_owner
+        owner = post_delivery_owner.get()
+        register = getattr(adapter, 'register_post_delivery_callback', None)
+        fifo_owned = captured is not None and captured.get('post_delivery_owned') is True
+        delivery_owned = fifo_owned or (
+            owner is not None and owner[0] is adapter and owner[1] is event)
+        # FIFO execution hands off an explicit owner below. Legacy adapter delivery
+        # instead reads the guard's generation, which an early return may never bind.
+        guard = getattr(adapter, '_active_sessions', {}).get(session_key)
+        mismatched_guard = (not fifo_owned and guard is not None
+                            and getattr(guard, '_hermes_run_generation', None) != generation)
+        if not callable(register) or not delivery_owned or mismatched_guard:
+            # Inline bookkeeping delays the reply by the judge's runtime; name why it was not deferred.
+            logger.info("post-turn bookkeeping inline for %s: register=%s fifo_owned=%s owner_match=%s "
+                        "mismatched_guard=%s", session_key, callable(register), fifo_owned,
+                        delivery_owned and not fifo_owned, mismatched_guard)
+            await finish()
+            return
+        delivered = asyncio.Event()
+        try:
+            registered = register(session_key, delivered.set, generation=generation, first=True)
+        except TypeError:  # an adapter double without the ``first`` keyword
+            registered = register(session_key, delivered.set, generation=generation)
+        if registered is not True:
+            logger.info("post-turn bookkeeping inline for %s: post-delivery callback not registered",
+                        session_key)
+            await finish()
+            return
+
+        async def finish_inline():
+            delivered.set()
+            await finish(deferred=True)
+
+        pending = _pending_bookkeeping(self)
+        pending[session_key] = pending.get(session_key, 0) + 1
+
+        async def wait_for_delivery():
+            try:
+                try:
+                    # The delivered signal rides the cosmetic cleanup chain, which can time out.
+                    await asyncio.wait_for(delivered.wait(), POST_TURN_DELIVERY_WAIT_S)
+                except asyncio.TimeoutError:
+                    logger.warning("post-turn bookkeeping for %s ran without a delivery signal after %.0fs",
+                                   session_key, POST_TURN_DELIVERY_WAIT_S)
+                await finish(deferred=True)
+            finally:
+                left = pending.get(session_key, 0) - 1
+                if left > 0:
+                    pending[session_key] = left
+                else:
+                    pending.pop(session_key, None)
+
+        # Track before settlement can report idle. Only the signal callback enters
+        # the cosmetic cleanup chain, never the auxiliary judge's lifetime.
+        task = self._retain_background_task(asyncio.create_task(wait_for_delivery()))
+        self._track_task_in(adapter._background_tasks, task)
+        event._post_turn_bookkeeping_task = task
+        event._post_turn_bookkeeping_fallback = finish_inline
+        if captured is not None:
+            from gateway.session_ingress import post_delivery_owners
+            owners = post_delivery_owners(captured.get('post_delivery'))
+            bookkeeping_owner = (adapter, session_key, generation)
+            if bookkeeping_owner not in owners:
+                owners.append(bookkeeping_owner)
+            captured['post_delivery'] = owners
+
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
+        invalidation_epoch: Optional[int] = None, existing_session_only: bool = False,
     ) -> None:
         """Run goal and loop bookkeeping after an agent turn returns."""
         from gateway.session_authorities import active_authority
@@ -777,9 +906,17 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not successful:
             final_text = ""
         try:
-            session_entry = await self.async_session_store.get_or_create_session(
-                source, touch_activity=not is_internal,
-            )
+            if existing_session_only:
+                # Settlement can precede a stop that suspends this route. Deferred
+                # auxiliary work must not reopen it by resolving a fresh session.
+                session_entry = await self.async_session_store.lookup_by_session_key(
+                    self._session_key_for_source(source))
+                if session_entry is None:
+                    return
+            else:
+                session_entry = await self.async_session_store.get_or_create_session(
+                    source, touch_activity=not is_internal,
+                )
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
@@ -854,8 +991,14 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             instance = identity.get("goal_instance")
             if type(instance) in (int, float):
                 goal_kwargs["goal_instance"] = instance
+            if invalidation_epoch is not None:
+                goal_kwargs["invalidation_epoch"] = invalidation_epoch
             hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
+            if hook == self._post_turn_goal_continuation and invalidation_epoch is not None and (
+                self._session_invalidation_epoch(self._session_key_for_source(source))
+                != invalidation_epoch):
+                continue  # a stop/reset supersedes the goal; the delivered loop tick still settles
             try:
                 await hook(
                     session_entry=session_entry, source=source, final_response=final_text if successful else "",
@@ -1076,6 +1219,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         def _turn_owner_exists(include_marker: bool = True) -> bool:
             if self._is_session_running(session_key) or session_key in self._running_agents:
                 return True
+            if post_turn_bookkeeping_pending(self, session_key):
+                return True  # the finished turn's deferred judge still owns the tick
             if session_key in getattr(adapter, "_active_sessions", {}):
                 return True
             with suppress(Exception):
@@ -1321,6 +1466,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
         key = entry.session_key
         if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
+                or post_turn_bookkeeping_pending(self, key)
                 or self._queue_depth(key, adapter=adapter) > 0):
             return  # a turn (or restart auto-resume) is in flight; its post-turn judge owns the barrier
         if not self._background_turn_room():
@@ -1356,6 +1502,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         # The barrier check ran off-loop; a turn, adapter guard, or queued event may have appeared
         # while it was running. Re-check every admission fence before clearing or injecting.
         if (self._is_session_running(key) or key in getattr(adapter, "_active_sessions", {})
+                or post_turn_bookkeeping_pending(self, key)
                 or self._queue_depth(key, adapter=adapter) > 0):
             return
         from gateway.run_goal_wait import dispatch_goal_wait

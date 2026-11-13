@@ -208,20 +208,7 @@ def _connect() -> sqlite3.Connection:
     return conn
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
-    from hermes_state_repair import apply_durability_barriers
-    from hermes_state_schema import reconcile_state_schema
-    # Preserve the journal mode SessionDB configured on state.db: forcing WAL from
-    # every short-lived connection collides with live transcript/FTS writers.
-    apply_durability_barriers(conn)
-    # Single durable-shape authority: the canonical SCHEMA_SQL drives both
-    # table creation and column backfill (reconcile_state_schema replays the
-    # canonical DDL and reuses SessionDB's declarative reconciliation). This
-    # module previously carried its own CREATE TABLE + ALTER column list,
-    # which drifted from SCHEMA_SQL — same-name columns with different
-    # nullability/defaults depending on which authority touched the database
-    # first (#94691).
-    reconcile_state_schema(conn)
+from tools.async_delegation_schema import initialize_ledger_schema as _initialize_schema  # noqa: E402
 
 
 def _transaction(*, immediate: bool = False):
@@ -1446,8 +1433,8 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 def active_count() -> int:
     """Number of live async delegation UNITS (one per completion message: a task group or an ungrouped task)."""
-    with _records_lock:
-        return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+    # Lock-free: writers hold _records_lock across state.db commits; list() copies under the GIL.
+    return sum(1 for r in list(_records.values()) if r.get("status") in _LIVE_STATES)
 
 
 def active_records() -> list[dict[str, Any]]:
