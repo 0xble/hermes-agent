@@ -22,6 +22,21 @@ logger = logging.getLogger(__name__)
 # the PID and start time but not this set, so its unacknowledged claims are stale.
 _LIVE_CLAIM_NONCES: set[str] = set()
 
+# Survivor pollers are intentionally eager for the first few checks so short commands
+# still publish promptly, then back off while an idle process remains unchanged.  The
+# cap bounds completion detection latency and keeps a large fleet from waking at a
+# fixed 10 Hz per process.
+SURVIVOR_POLL_INITIAL_SECONDS = 0.1
+SURVIVOR_POLL_BACKOFF_FACTOR = 1.5
+SURVIVOR_POLL_MAX_SECONDS = 2.0
+
+
+def _next_survivor_poll_delay(delay: float, *, changed: bool) -> float:
+    """Return the next poll interval, restarting only after observed progress."""
+    if changed:
+        return SURVIVOR_POLL_INITIAL_SECONDS
+    return min(SURVIVOR_POLL_MAX_SECONDS, delay * SURVIVOR_POLL_BACKOFF_FACTOR)
+
 
 def is_restart_safe(entry_or_session) -> bool:
     """Only an explicit opt-in grants restart-safe lifecycle and delivery semantics."""
@@ -506,6 +521,7 @@ class ProcessSurvivalMixin:
         if self._survivor_poller_stopped(session):
             return
         exit_path = Path(session.exit_path)
+        poll_delay = SURVIVOR_POLL_INITIAL_SECONDS
         while not session.exited:
             if self._survivor_poller_stopped(session):
                 return
@@ -516,7 +532,9 @@ class ProcessSurvivalMixin:
                 exit_text = ""
                 if exit_path.exists():
                     exit_text = exit_path.read_text(encoding="utf-8-sig", errors="replace").strip()
+                previous_log_offset = getattr(session, "_survivor_log_offset", 0)
                 self._read_survivor_log(session)
+                observed_change = getattr(session, "_survivor_log_offset", 0) != previous_log_offset
                 if exit_text:
                     try:
                         exit_code = int(exit_text.splitlines()[-1])
@@ -527,7 +545,8 @@ class ProcessSurvivalMixin:
                     return
                 if self._poll_persistent_detached(session):
                     if not session.exited:
-                        time.sleep(0.1)
+                        time.sleep(poll_delay)
+                        poll_delay = _next_survivor_poll_delay(poll_delay, changed=observed_change)
                     continue
                 alive = (
                     session.process.poll() is None
@@ -559,7 +578,8 @@ class ProcessSurvivalMixin:
                     "survivor_lost" if is_restart_safe(session) else "checkpoint.exit_uncollected",
                 )
                 return
-            time.sleep(0.1)
+            time.sleep(poll_delay)
+            poll_delay = _next_survivor_poll_delay(poll_delay, changed=observed_change)
 
     @staticmethod
     def _recorded_survivor_exit(exit_path: str | None) -> int | None:
