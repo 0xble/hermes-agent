@@ -21,6 +21,9 @@ async def voice_lane(tmp_path, monkeypatch):
     monkeypatch.setenv('HERMES_GATEWAY_BUSY_ACK_ENABLED', 'false')
     runner = GatewayRunner(GatewayConfig())
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token='fixture-token', typing_indicator=False))
+    # The relay-helper arm uses this registered transport double, so supply the
+    # per-chat admission lanes normally initialized by RelayAdapter.
+    adapter._admission_lanes = {}
     adapter.gateway_runner = runner
     runner.adapters = {Platform.TELEGRAM: adapter}
     monkeypatch.setattr(runner, '_read_user_config', dict)
