@@ -84,8 +84,6 @@ def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -
         elif kind not in {"cron", "interval"}:
             return False
         current["pending_slot"] = pending_slot_stamp(instant, now)
-        if kind == "once":
-            current["pending_slot"]["deferred_unstarted"] = True
         current["fire_claim"] = None
         current["run_claim"] = None
         current["last_fire_error"] = {

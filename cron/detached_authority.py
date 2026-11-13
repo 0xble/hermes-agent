@@ -241,11 +241,14 @@ def _attach_worker(rpc, scope):
     ambiguous = False
 
     def timeout_phase(exc, operation):
+        from hermes_state_errors import GatewayOwnerRestartError
         current = exc
         while current is not None:
             text = str(current)
             if text.startswith('gateway handshake timed out ('):
                 return text
+            if isinstance(current, GatewayOwnerRestartError):
+                return 'gateway handshake timed out (owner-transition)'
             if isinstance(current, TimeoutError):
                 # run_detached calls this only BEFORE start_detached_body wins
                 # the durable body gate. Later reconnect timeouts must never use

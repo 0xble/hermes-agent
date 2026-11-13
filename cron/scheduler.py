@@ -3483,7 +3483,7 @@ def _settled_before_outcome(job, success, error, execution_id, fire_owner, owner
         teardown()
         _record_fire_ownership_lost(job, fire_owner, execution_id)
         return True
-    from cron.scheduler_authority import NOT_STARTED_FLAG, retain_unstarted_fire
+    from cron.scheduler_authority import NOT_STARTED_FLAG
     if not job.pop(NOT_STARTED_FLAG, False) or success:
         return False
     if not job.get('_scheduled_instant') or not (job.get('fire_claim') or {}).get('by'):
@@ -3492,9 +3492,19 @@ def _settled_before_outcome(job, success, error, execution_id, fire_owner, owner
     from cron.scheduler_control import defer_unstarted_fire
     mark_unstarted_execution(execution_id)
     if not defer_unstarted_fire(job, error or "gateway handshake failed"):
-        # A refused fence is not a successful restore. Keep recovery intent for
-        # both pre-submit and detached paths; journal errors fail visibly below.
-        retain_unstarted_fire(job, execution_id)
+        # The exact fire owner no longer controls this occurrence (operator edit,
+        # pause, or a fenced write refusal). Release that owner's claim before the
+        # ordinary visible failure path so it cannot block the next fire.
+        from cron import jobs as cron_jobs
+        cron_jobs.mark_job_run(
+            job["id"], False, error or "Pre-body deferral was refused.",
+            expected_fire_owner=(job.get("fire_claim") or {}).get("by"),
+            execution_id=execution_id)
+        from cron.scheduler_control import release_unstarted_claim
+        release_unstarted_claim(job)
+        teardown()
+        finish_execution(execution_id, success=False, error=error or "Pre-body deferral was refused.")
+        return True
     teardown()
     finish_execution(execution_id, success=False, error=f"Not started; occurrence deferred: {error}",
                      delivery_outcome="deferred")

@@ -71,26 +71,6 @@ def _lift_pause(job_id, pause):
                 pass
 
 
-def retain_unstarted_fire(job, execution_id):
-    """Keep durable recovery intent when the occurrence's immediate fire fence refuses.
-
-    Do not overwrite an admission or its pause ownership. If no submit happened,
-    the same journal shape lets reconciliation restore the proven pre-body fire.
-    Write errors propagate to the firer's normal visible failure bookkeeping.
-    """
-    from cron.jobs import _jobs_lock
-    from utils import atomic_json_write
-
-    journal = journal_path(job['id'], execution_id)
-    with _jobs_lock():
-        if not journal.exists():
-            atomic_json_write(journal, {
-                'params': {'job_id': job['id'], 'request_id': execution_id,
-                           'extra_prompt': None},
-                'job': job, 'receipt': None,
-            }, mode=0o600, fsync_dir=True)
-
-
 def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
     from gateway.session_cron import owner_for_home, operation
     from cron.scheduler_transport import recovering_cron_client

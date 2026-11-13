@@ -97,13 +97,6 @@ def retire_expired_oneshot(d) -> bool:
     from cron import jobs
     from cron.oneshot_retirement import queue_retirement_alert
 
-    pending = d.job.get("pending_slot") or {}
-    # This occurrence already won admission within its window; only the fenced
-    # pre-body attempt was refunded. A slow handshake must not expire that proof.
-    # Fire claiming consumes the stamp; pause/edit paths invalidate it as usual.
-    if (pending.get("deferred_unstarted") is True
-            and pending.get("scheduled_at") == d.next_run):
-        return False
     allowance = jobs.oneshot_grace_seconds(d.job)
     if jobs._elapsed_seconds(d.scan.now, d.next_run_dt) <= allowance:
         return False

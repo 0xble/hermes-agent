@@ -144,7 +144,10 @@ def _handshake_call(phase, call):
     except TimeoutError as exc:
         if str(exc).startswith("gateway handshake timed out ("):
             raise
-        raise TimeoutError(f"gateway handshake timed out ({phase})") from exc
+        message = f"gateway handshake timed out ({phase})"
+        if str(exc):
+            message += f": {exc}"
+        raise TimeoutError(message) from exc
 
 
 class WorkerRPC:
