@@ -44,6 +44,7 @@ def _probe_macos_keychain() -> None:
                 ["security", "default-keychain", "-d", "user"],
                 check=True,
                 capture_output=True,
+                stdin=subprocess.DEVNULL,
                 text=True,
                 timeout=2,
             )
@@ -55,6 +56,7 @@ def _probe_macos_keychain() -> None:
             check=True,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
             text=True,
             timeout=2,
         )

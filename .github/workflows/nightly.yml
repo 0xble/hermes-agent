@@ -177,18 +177,19 @@ jobs:
           echo "TMPDIR=$ci_tmp" >> "$GITHUB_ENV"
       - name: Provision isolated macOS keychain
         if: runner.os == 'macOS'
+        timeout-minutes: 3
         shell: bash
         env:
           CI_KEYCHAIN: ${{ runner.temp }}/hermes-ci.keychain-db
         run: |
-          keychain_password=$(python -c 'import secrets; print(secrets.token_urlsafe(32))')
-          security list-keychains -d user > "$RUNNER_TEMP/hermes-ci-keychains.before"
-          security default-keychain -d user > "$RUNNER_TEMP/hermes-ci-default.before"
-          security create-keychain -p "$keychain_password" "$CI_KEYCHAIN"
-          security set-keychain-settings -lut 0 "$CI_KEYCHAIN"
-          security unlock-keychain -p "$keychain_password" "$CI_KEYCHAIN"
-          security list-keychains -d user -s "$CI_KEYCHAIN"
-          security default-keychain -s "$CI_KEYCHAIN"
+          export CI_KEYCHAIN_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          security list-keychains -d user </dev/null > "$RUNNER_TEMP/hermes-ci-keychains.before"
+          security default-keychain -d user </dev/null > "$RUNNER_TEMP/hermes-ci-default.before"
+          security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
+          security set-keychain-settings -lt 0 "$CI_KEYCHAIN" </dev/null
+          security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
+          security list-keychains -d user -s "$CI_KEYCHAIN" </dev/null
+          security default-keychain -s "$CI_KEYCHAIN" </dev/null
           echo "HERMES_TEST_KEYCHAIN=$CI_KEYCHAIN" >> "$GITHUB_ENV"
       - name: Qualify native OS at exact SHA
         shell: bash
