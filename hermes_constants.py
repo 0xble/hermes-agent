@@ -994,7 +994,7 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
 
 def prune_scratch_dir(scratch: Path | None = None, max_idle_hours: float = SCRATCH_MAX_IDLE_HOURS) -> int:
     """Move top-level scratch entries with no write anywhere in their subtree for
-    *max_idle_hours* into ``<home>/cache/.scratch-trash`` for 7 days, reaping processes
+    *max_idle_hours* into ``.scratch-trash`` beside the real scratch target for 7 days, reaping processes
     and git worktree registrations rooted in them first (``hermes_constants_scratch``);
     return the count that left scratch. Each move, each kill and each entry rescued
     mid-prune is recorded in ``<home>/logs/scratch-prune.log``

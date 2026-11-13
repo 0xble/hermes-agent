@@ -47,8 +47,8 @@ _KEEP_MARKER = ".keep"
 _INPUT_PINS = "input-pins.json"
 # Package fixtures under these trees are not user keep markers.
 _KEEP_SCAN_SKIP = frozenset({"node_modules", ".venv", "venv"})
-# Expired entries are renamed here, never unlinked. Sibling of ``cache/scratch``, so a later
-# scratch walk cannot see its own holding dir. Layout: ``<home>/cache/.scratch-trash/<UTC-date>/``;
+# Expired entries are renamed here, never unlinked. Sibling of the real scratch target, so
+# symlinked scratch stays on-volume and a scratch walk cannot select its own holding dir.
 # entries live below ``entries`` so no user entry name can collide with the holding manifest.
 _TRASH_DIR_NAME = ".scratch-trash"
 _TRASH_HOLD_SECONDS = 7 * 24 * 3600
@@ -620,8 +620,8 @@ def _is_dir_link(path: Path) -> bool:
 
 
 def holding_dir(scratch_root: Path) -> Path:
-    """``<home>/cache/.scratch-trash``, the sibling of *scratch_root*."""
-    return scratch_root.parent / _TRASH_DIR_NAME
+    """A sibling of the real scratch target, on the volume that holds scratch."""
+    return Path(os.path.realpath(scratch_root)).parent / _TRASH_DIR_NAME
 
 
 def _utc_stamp(now: float) -> tuple[str, str]:
@@ -641,13 +641,13 @@ def _parse_pruned_at(value: object) -> float | None:
     return parsed.replace(tzinfo=datetime.timezone.utc).timestamp()
 
 
-def _ensure_real_dir(path: Path) -> bool:
+def _ensure_real_dir(path: Path, *, home: Path) -> bool:
     """Create *path* as a real directory. A symlink (or junction) at that name is refused."""
     try:
         os.lstat(path)
     except FileNotFoundError:
         try:
-            path.mkdir(parents=True, exist_ok=True)
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
         except OSError:
             return False
     except OSError:
@@ -656,7 +656,11 @@ def _ensure_real_dir(path: Path) -> bool:
         st = os.lstat(path)
     except OSError:
         return False
-    return stat.S_ISDIR(st.st_mode) and not stat.S_ISLNK(st.st_mode) and not _is_dir_link(path)
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or _is_dir_link(path):
+        return False
+    from hermes_constants import apply_secure_dir_policy
+    apply_secure_dir_policy(path, home=home)
+    return True
 
 
 def _unique_hold_dest(dest: Path) -> Path:
@@ -695,14 +699,15 @@ def hold_expired_entry(entry: Path, scratch_root: Path, size: int, now: float) -
     if rel.is_absolute() or ".." in rel.parts or not rel.parts:
         raise OSError(errno.EINVAL, "entry relative path escapes scratch")
     trash = holding_dir(scratch_root)
-    if not _ensure_real_dir(trash):
+    home = scratch_root.parent.parent
+    if not _ensure_real_dir(trash, home=home):
         raise OSError(errno.EINVAL, "holding dir is missing or a symlink")
     day, pruned_at = _utc_stamp(now)
     day_dir = trash / day
-    if not _ensure_real_dir(day_dir) or not _lexically_within(day_dir, trash):
+    if not _ensure_real_dir(day_dir, home=home) or not _lexically_within(day_dir, trash):
         raise OSError(errno.EINVAL, "holding day dir is missing or a symlink")
     entries_dir = day_dir / "entries"
-    if not _ensure_real_dir(entries_dir):
+    if not _ensure_real_dir(entries_dir, home=home):
         raise OSError(errno.EINVAL, "holding entries dir is missing or a symlink")
     dest = _unique_hold_dest(entries_dir / rel)
     if not _lexically_within(dest, trash):
@@ -984,12 +989,25 @@ def job_referenced_entries(scratch_root: Path, candidates: list[Path]) -> set[st
     for job in jobs:
         if not isinstance(job, dict) or not job.get("enabled", True):
             continue
-        blob = json.dumps({key: job.get(key) for key in _JOB_FIELDS}, ensure_ascii=False)
-        for token in pattern.findall(blob):
-            name = _entry_named_by_token(scratch_root, token, spellings)
-            if name in wanted:
-                held.add(name)
+        for field in _JOB_FIELDS:
+            for text in _raw_job_strings(job.get(field)):
+                for token in pattern.findall(text):
+                    name = _entry_named_by_token(scratch_root, token, spellings)
+                    if name in wanted:
+                        held.add(name)
     return held
+
+
+def _raw_job_strings(value: object):
+    """Yield strings from a cron field without JSON re-encoding path separators."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _raw_job_strings(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _raw_job_strings(child)
 
 
 def _retention_filter(root: Path, skip_names: frozenset[str], doomed: list[Path],
@@ -1127,7 +1145,6 @@ def _prune_idle_entries(  # health: allow CC -- preserves ordered fail-closed pr
                     os.fspath(entry),
                 )
             continue
-        denied: list[str] = []
         try:
             held_at = hold_expired_entry(entry, root, size, time.time())
         except PermissionError as exc:
@@ -1144,21 +1161,16 @@ def _prune_idle_entries(  # health: allow CC -- preserves ordered fail-closed pr
         # inspected would be counted and recorded as removed (P2 on #134173).
         try:
             os.lstat(entry)
-            if denied and stuck.tracking_supported():
-                stuck.record(root, entry, denied, audit)
-            else:
-                audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
+            audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
             continue
         except FileNotFoundError:
             pass
         except OSError:
             audit.info("scratch prune: could not confirm removal of %r", os.fspath(entry))
             continue
-        if held_at is None:
-            audit.info("scratch prune: removed %r (%d bytes)", os.fspath(entry), size)
-        else:
-            audit.info("scratch prune: removed %r (%d bytes), held at %r",
-                       os.fspath(entry), size, os.fspath(held_at))
+        assert held_at is not None
+        audit.info("scratch prune: removed %r (%d bytes), held at %r",
+                   os.fspath(entry), size, os.fspath(held_at))
         removed += 1
     release_git_worktrees(repos)
     return removed
