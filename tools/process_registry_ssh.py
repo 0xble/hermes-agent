@@ -96,6 +96,7 @@ with (run / "lock").open("a") as lock:
             publish({"state": "running", "pid": child.pid, "started": identity(child.pid)})
             killed = False
             source = ""
+            poll_delay = 0.1
             while True:
                 # No poll/wait has reaped the child between this check and the
                 # signal. Its PID/process group cannot be recycled onto a stranger.
@@ -112,7 +113,8 @@ with (run / "lock").open("a") as lock:
                 code = child.poll()
                 if code is not None:
                     break
-                time.sleep(0.1)
+                time.sleep(poll_delay)
+                poll_delay = min(2.0, poll_delay * 1.5)
             publish({"state": "exited", "pid": child.pid, "exit_code": code,
                      "reason": "killed" if killed else "exited", "source": source})
     except Exception as exc:
