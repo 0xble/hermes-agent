@@ -39,9 +39,11 @@ transcript echo, or queued follow-up drain.
 
 ## Provenance and patches
 
-- Fork patch identity: `queued-voice-eager-stt`. Restores the archived fork's
+- Fork patch identities: `queued-voice-eager-stt`, `queued-voice-stt`. The first
+  restores the archived fork's
   immediate busy-voice transcription (archived `d55304c`, `0fd0161`, `ea80b55`)
-  for the queue path.
+  for the queue path. The second starts transcription at every durable admission
+  (idle, claim race, started row, relay, `/queue`), not only when the topic was busy.
 - Upstream: [issue 58780](https://github.com/NousResearch/hermes-agent/issues/58780)
   and [PR 73518](https://github.com/NousResearch/hermes-agent/pull/73518) fixed
   steer-path STT. Queue mode still transcribes only at drain time upstream. Own
