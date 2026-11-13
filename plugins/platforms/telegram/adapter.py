@@ -3673,12 +3673,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         return event
 
     def register_post_delivery_callback(
-        self, session_key: str, callback: Callable, *, generation: int | None = None) -> None:
+        self, session_key: str, callback: Callable, *, generation: int | None = None,
+        first: bool = False) -> bool:
         # Bubble cleanup fires after the in-band drain above has relabelled the task for the
         # follow-up; keep it under the trigger of the turn that registered it.
         if callable(callback):
             callback = keep_trigger(callback)
-        super().register_post_delivery_callback(session_key, callback, generation=generation)
+        return super().register_post_delivery_callback(
+            session_key, callback, generation=generation, first=first)
 
     def set_topic_transfer_fn(self, fn: Optional[TopicTransferFn]) -> None:
         self._topic_transfer_fn = fn
