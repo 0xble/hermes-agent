@@ -1,8 +1,5 @@
 """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner.
-
-Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
-``gateway.run`` internals are imported lazily inside method bodies (import cycle),
-so ``patch("gateway.run.X")`` keeps intercepting them at call time.
+``gateway.run`` internals stay lazy for import cycles and facade patches.
 """
 
 from __future__ import annotations
@@ -35,7 +32,7 @@ from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
-from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin, owns_notice_work
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 
@@ -535,7 +532,6 @@ class GatewayNotificationsMixin(
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
         return delivered_any
 
-
     async def _deliver_queued_first_response(
         self, response: str, source: SessionSource, adapter,
         metadata: Optional[dict[str, Any]] = None, event_message_id: Optional[str] = None,
@@ -894,6 +890,7 @@ class GatewayNotificationsMixin(
         except (OSError, ValueError, TypeError, AttributeError):
             pass
         return "✅ Update Complete", "Hermes update finished successfully."
+
     @staticmethod
     def _read_update_output_since(path: Path, offset: int) -> tuple[bytes, int]:
         """Keep the original bytes: a replacement character cannot reconstruct its file offset."""
@@ -1526,45 +1523,6 @@ class GatewayNotificationsMixin(
                     platform, home, transport, message, "state.db warning notification failed for %s:%s: %s"),
                 platform=platform)
 
-    async def _drain_watch_notifications(self, completion_queue) -> None:
-        """Consume watches in their owning profile, backing off refusals even during drain."""
-        from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = _drain_gateway_watch_events(completion_queue)
-        for evt in watch_events:
-            next_retry_at = evt.get("_watch_next_retry_at")
-            draining = getattr(self, "_draining", False)
-            drain_offered = evt.pop("_watch_drain_offered", False)
-            if draining:
-                evt["_watch_drain_offered"] = True
-            # Offer a held event once per drain for spooling, not on every refused tick.
-            if (next_retry_at is not None and next_retry_at > time.monotonic()
-                    and (not draining or drain_offered)):
-                # Backoff between refused injections: hold the event for a later drain tick
-                # instead of re-attempting admission every 2 s (#140899).
-                completion_queue.put(evt)
-                continue
-            async with self._completion_event_scope(evt):
-                from tools.process_registry_notifications import should_surface_notification
-                if not should_surface_notification(evt):
-                    continue
-                if self._load_background_notifications_mode() == "off":
-                    continue
-                if evt.get("type") == "heartbeat":
-                    from gateway.session_automation import deliver_heartbeat
-                    delivered = await deliver_heartbeat(self, evt)
-                else:
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
-                        continue
-                    try:
-                        delivered = await self._inject_watch_notification(synth_text, evt)
-                    except Exception:
-                        logger.exception("Watch notification injection error")
-                        delivered = False
-            # The original event: a requeued tick folds again from what is still queued.
-            if delivered is False:
-                self._requeue_refused_watch_event(completion_queue, evt)
-
     @staticmethod
     def _requeue_refused_watch_event(completion_queue, evt: dict) -> None:
         """Retry a refused watch event on a bounded backoff, never on every 2 s tick (#140899).
@@ -1940,6 +1898,135 @@ class GatewayNotificationsMixin(
 
     # Ledger transitions write state.db: run them off the loop (see ``gateway.run_notifications_ledger``).
     _settle_durable_claim = staticmethod(settle_durable_claim)
+
+    @owns_notice_work
+    async def _drain_watch_notifications(self, completion_queue) -> None:
+        """Consume watches in their owning profile, backing off refusals even during drain."""
+        from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
+        watch_events = _drain_gateway_watch_events(completion_queue)
+        for evt in watch_events:
+            next_retry_at = evt.get("_watch_next_retry_at")
+            draining = getattr(self, "_draining", False)
+            drain_offered = evt.pop("_watch_drain_offered", False)
+            if draining:
+                evt["_watch_drain_offered"] = True
+            # Offer a held event once per drain for spooling, not on every refused tick.
+            if (next_retry_at is not None and next_retry_at > time.monotonic()
+                    and (not draining or drain_offered)):
+                # Backoff between refused injections: hold the event for a later drain tick
+                # instead of re-attempting admission every 2 s (#140899).
+                completion_queue.put(evt)
+                continue
+            async with self._completion_event_scope(evt):
+                from tools.process_registry_notifications import should_surface_notification
+                if not should_surface_notification(evt):
+                    continue
+                if self._load_background_notifications_mode() == "off":
+                    continue
+                if evt.get("type") == "heartbeat":
+                    from gateway.session_automation import deliver_heartbeat
+                    delivered = await deliver_heartbeat(self, evt)
+                else:
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        continue
+                    try:
+                        delivered = await self._inject_watch_notification(synth_text, evt)
+                    except Exception:
+                        logger.exception("Watch notification injection error")
+                        delivered = False
+            # The original event: a requeued tick folds again from what is still queued.
+            if delivered is False:
+                self._requeue_refused_watch_event(completion_queue, evt)
+
+    @owns_notice_work
+    async def _enqueue_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
+        """Deliver a same-tick group now, or hold routine results per the batch window.
+
+        True while held: the rows stay unclaimed and pending in the durable ledger until delivery.
+        """
+        self._ensure_completion_batch_state()
+        if self._completion_notification_batches_stopping:
+            return False
+        hold = min([await self._completion_hold_seconds(evt) for evt in group] or [0.0])
+        key = self._event_route_key(group[0], self._ASYNC_GROUP_KEY_FIELDS)
+        if hold <= 0:
+            self._release_held_completions(str(group[0].get("session_key") or ""))
+        if hold <= 0 and key not in self._async_delegation_batch_tasks:
+            return await self._deliver_async_delegation_group(group)
+        self._async_delegation_batches.setdefault(key, []).extend(group)
+        self._schedule_batch_flush(
+            self._async_delegation_batch_tasks, self._async_delegation_batch_releases,
+            self._async_delegation_batch_flush_tasks, key, hold, self._flush_async_delegation_batch,
+        )
+        return True
+
+    @owns_notice_work
+    async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
+        """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
+        async with self._completion_event_scope(evt):
+            parent_session_id = str(evt.get("parent_session_id") or "").strip()
+            from tools.delegation_resume import (
+                claim_auto_resume_trigger, complete_auto_resume_trigger,
+                inspect_resumable, release_auto_resume_trigger,
+            )
+
+            delegation_id = str(evt.get("delegation_id") or "")
+
+            def _claim_and_consume() -> None:
+                record, reason = claim_auto_resume_trigger(delegation_id)
+                if reason is None and record is not None:
+                    complete_auto_resume_trigger(delegation_id, str(record.get("auto_resume_claim") or ""))
+
+            async def _suppress_claimed_notice() -> bool:
+                """Terminally consume a notice that must not be retried (claim and consume in one hop)."""
+                await asyncio.to_thread(_claim_and_consume)
+                return True
+
+            if parent_session_id:
+                verdict = await self._classify_completion_target(parent_session_id)
+                if verdict == "terminal":
+                    # Closed owners are terminal even if their transport is disconnected.
+                    return await _suppress_claimed_notice()
+                if verdict != "deliver":
+                    return False
+            _, authorized = await self._authorized_completion_notice_target(evt, check_delivery_ready=True)
+            if authorized is False:
+                return False
+            if authorized is None:
+                return await _suppress_claimed_notice()
+            def _release_abandoned(claimed) -> None:
+                record, reason = claimed
+                if reason is None and record is not None:
+                    release_auto_resume_trigger(delegation_id, str(record.get("auto_resume_claim") or ""))
+
+            record, reason = await claim_off_loop(lambda: claim_auto_resume_trigger(delegation_id),
+                                                  _release_abandoned)
+            if reason is not None or record is None:
+                # Includes an explicit resume claim racing this notice, or another gateway
+                # already owning/finishing the boot notice.
+                return True
+            claim_id = str(record.get("auto_resume_claim") or "")
+            accepted = False
+            try:
+                # Cheap guard for a row resumed or pruned between the claim above and
+                # injection. It narrows that window but cannot close it; a notice that
+                # still slips through is refused safely by claim_resume. Inside the try so
+                # the finally releases the claim on this path and on cancellation alike.
+                _, eligibility_reason = await asyncio.to_thread(inspect_resumable, delegation_id)
+                if eligibility_reason is not None:
+                    return True
+                injected = await self._inject_watch_notification(
+                    str(evt.get("text") or ""), evt, raise_not_accepted=True,
+                )
+                accepted = injected is True
+                return injected
+            except Exception:
+                logger.debug("Boot auto-resume notice injection failed", exc_info=True)
+                return False
+            finally:
+                settle = complete_auto_resume_trigger if accepted else release_auto_resume_trigger
+                await asyncio.to_thread(settle, delegation_id, claim_id)
 
     @staticmethod
     def _back_off_refused_completions(group: list[dict]) -> None:

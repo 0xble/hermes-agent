@@ -111,9 +111,9 @@ async def admit_process_notice(runner, authority, adapter, event, evt):
         event.metadata['heartbeat_tick'] = {'output': str(evt.get('output') or ''),
                                             'omitted': int(evt.get('omitted') or 0)}
         if evt.get('_replaces'):
-            return await authority.admit_automation(adapter, event, identity, replaces=evt['_replaces'])
+            return await authority.admit_automation(adapter, event, identity, replaces=evt['_replaces'], owned_work=True)
     if evt.get('type') != 'completion':
-        return await authority.admit_automation(adapter, event, identity)
+        return await authority.admit_automation(adapter, event, identity, owned_work=True)
     async with _heartbeat_lock(runner):
         receipt = await _admit_folded_completion(authority, adapter, event, evt, identity)
         await withdraw_process_ticks(runner, evt)
@@ -137,7 +137,7 @@ async def _admit_folded_completion(authority, adapter, event, evt, identity):
             if exc.reason != 'stale_generation':
                 raise
             event.text, event.metadata = unfolded
-    return await authority.admit_automation(adapter, event, identity)
+    return await authority.admit_automation(adapter, event, identity, owned_work=True)
 
 
 def _waiting_completion(authority, evt, event):
@@ -738,7 +738,7 @@ def restore_local_automation(authority, ref, row):
     return event
 
 
-async def admit_automation(authority, adapter, event, identity, replaces=None, fold=None, *, authorize_write=None):
+async def admit_automation(authority, adapter, event, identity, replaces=None, fold=None, *, authorize_write=None, owned_work=False):
     """Capture and commit within the existing ordered tracked admission reservation.
 
     ``replaces`` cancels a queued predecessor in this admission's own transaction.
@@ -747,7 +747,7 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
     from functools import partial
     from gateway.session_authority import LiveSession
     from gateway.session_runtime_workers import tracked_write
-    authority._require_admission_open()
+    authority._require_admission_open(owned_work=owned_work)
     prepared, replaced = {}, []
 
     def authorize(conn):
@@ -759,7 +759,7 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
             replacement(conn)
 
     async def prepare():
-        authority._require_admission_open()
+        authority._require_admission_open(owned_work=owned_work)
         entry = await asyncio.to_thread(_owner, authority.runner, event, authority)
         owner = None
         from gateway.session_detached import detached_route_of
@@ -771,7 +771,7 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
         else:
             captured, owner = await asyncio.to_thread(
                 lambda: (committed_route_envelope(authority, entry), authority.logical_owner(entry.session_id)))
-        authority._require_admission_open()
+        authority._require_admission_open(owned_work=owned_work)
         # Provenance/adapter identity and all live publication remain on the owner loop.
         payload, entry = snapshot_automation(authority, adapter, event, identity, (entry, captured, owner))
         sid = (payload.get('local_automation_v1') or payload['native_text_v1']['automation'])['owner']
@@ -781,11 +781,14 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
             from gateway.session_envelope import restore_native_source
             source = restore_native_source(payload, authority.runner)
         if sid not in authority.sessions:
-            authority.sessions[sid] = LiveSession(source, entry.session_key)
+            from gateway.session_route_recovery import moved_local
+            handed_off = await asyncio.to_thread(moved_local, authority, sid, source)
+            authority._require_admission_open(owned_work=owned_work)
+            authority.sessions[sid] = LiveSession(source, entry.session_key, handed_off=handed_off)
         return partial(admit_session_input, authority.db, epoch=authority.epoch,
             principal_id='automation:' + entry.session_key, session_id=sid, request_id=identity,
             payload=deepcopy(payload),
-            _authorize_write=authority._admission_gate(authorize))
+            _authorize_write=authority._admission_gate(authorize, owned_work=owned_work))
 
     def admitted(row):
         ref = prepared['ref']
