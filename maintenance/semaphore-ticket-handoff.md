@@ -2,6 +2,8 @@
 
 Fork patch identity: `semaphore-ticket-handoff`.
 
+Former patch identity, before the 2026-11 heavy-slot to semaphore rename, still carried by earlier fork commits: `heavy-slot-ticket-handoff`.
+
 ## Required Behavior
 
 A foreground heavy terminal command still waiting for admission must keep its
