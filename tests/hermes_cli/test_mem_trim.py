@@ -48,6 +48,24 @@ def test_gc_collect_runs_even_without_platform_primitive(monkeypatch):
     collect.assert_called_once()
 
 
+def test_forced_trims_without_page_release_keep_the_normal_cooldown(monkeypatch):
+    # macOS: a forced close cannot release pages, so a burst of closes must not stack full
+    # gc.collect() passes every 5s; it coalesces on the normal cooldown instead.
+    collect = Mock()
+    monkeypatch.setattr(mem_trim.gc, "collect", collect)
+    monkeypatch.setattr(mem_trim, "_probe_glibc_malloc_trim", lambda: None)
+    monkeypatch.setattr(mem_trim, "_config_settings", lambda: (True, 60.0, 1, 0.0))
+    monkeypatch.setattr(mem_trim, "_last_trim_monotonic", 0.0)
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 100.0)
+    mem_trim.trim_memory(force=True, reason="agent close")
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 120.0)
+    mem_trim.trim_memory(force=True, reason="agent close")
+    assert collect.call_count == 1
+    monkeypatch.setattr(mem_trim.time, "monotonic", lambda: 161.0)
+    mem_trim.trim_memory(force=True, reason="agent close")
+    assert collect.call_count == 2
+
+
 def test_collect_memory_snapshot_parses_linux_proc_status(monkeypatch):
     # No ``sys.platform`` pin: the only platform check lives inside
     # ``_read_proc_status``, which is replaced below — the subject here is

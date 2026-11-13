@@ -26,13 +26,28 @@ general executor best-effort in its unchanged FIFO order. A long run holding
 the reservation must not occupy a general worker or overlap itself.
 
 Script-only (`no_agent`) jobs outside that selected reservation use a separate
-serial FIFO lane per profile, managed by the same admission pool lifecycle.
-They never queue behind detached agent waiters, even while the protected
-reservation is busy. Agent jobs, including monitor or pre-run scripts that may
-wake an agent, cannot enter this lane. This adds 1 script worker, not agent
-capacity: the general cap and the single protected reservation are unchanged.
-Script jobs can still wait behind another ordinary script, bounded by the existing
-script timeout. Frozen person-send wrappers can opt into a separate serial per-profile
+four-worker bounded executor per profile, managed by the same admission pool
+lifecycle. They never queue behind detached agent waiters, even while the
+protected reservation is busy. One slow script cannot by itself starve a due
+safety watchdog. Agent jobs, including monitor or pre-run scripts that may wake
+an agent, cannot enter this lane. This adds 4 script workers, not agent capacity:
+the general cap and the single protected reservation are unchanged. Enqueue-time
+per-job single-flight ownership covers running and queued scripts; duplicate
+submissions still log `already running — skipping`. Preserve the common execution
+journal, copied profile context, fire claims, cancellation and process-exit fences.
+Departure and shutdown reclaim all auxiliary lanes.
+
+History/rationale: `acd2204d1db` (#925) introduced the serial script lane to
+isolate scripts from detached agent waiters while preserving the one-worker
+protected reservation. `03106cf4a45` added protected-agent start ordering.
+Neither history nor this unit identifies script-to-script serialization as a
+shared-state safety boundary; the current no-agent path passes workdir as
+subprocess `cwd`, never `os.chdir()`. Only the script executor expands to four;
+the reserved and person-send executors stay serial. Four blocked scripts can still exhaust the
+bound: this prevents starvation from one slow script, not arbitrary saturation
+or a promise of watchdog priority.
+
+Frozen person-send wrappers can opt into a separate serial per-profile
 `person-send` lane with the marker on line 1, or line 2 after a `#!` shebang, but only for
 `no_agent` jobs with a one-shot schedule and `deliver=local`. This is an author
 scheduling declaration, not send authorization or a sandbox. Do not infer eligibility
@@ -45,9 +60,9 @@ The additional lane keeps one worker, FIFO order and the existing script timeout
 it does not promise hard real-time delivery or shorten provider/readback deadlines.
 A prior person-send may still occupy this lane. Validate the persisted job and current
 marker under the fire-claim lock before leasing. If edited out of class, hand it to
-the ordinary script FIFO (or general pool for agent mode), preserving the original
+the bounded ordinary script executor (or general pool for agent mode), preserving the original
 execution and in-flight owner without starting a lease while queued. This does not
-increase ordinary-script or agent concurrency. The older `TERMINAL_CWD` serialization
+increase ordinary-script or agent concurrency beyond their own lane limits. The older `TERMINAL_CWD` serialization
 hazard in upstream #73804 must not return: current script spawning uses subprocess
 `cwd` and profile-scoped child environments; agent cwd uses ContextVars.
 
@@ -59,9 +74,9 @@ lanes. No new dependency, config, job-store schema, provider or transport is add
 
 Independent hypothesis (2026-11-04, before discussion search): the serial no-agent
 FIFO introduced in fork [#925](https://github.com/0xble/hermes-agent/pull/925) prevents
-agent starvation but explicitly permits script-vs-script head-of-line delay. A
-separate narrow serial class is preferable to raising worker counts or introducing
-another scheduler. A real tick/fire-claim regression on base
+agent starvation but explicitly permits script-vs-script head-of-line delay. At that time a
+separate narrow serial class was chosen instead of raising worker counts or introducing
+another scheduler; the ordinary lane now separately allows four workers for watchdogs. A real tick/fire-claim regression on base
 `2fece2a7529e495c2026be0f4b92ed0231678c4a` failed waiting 3 seconds for the fake
 person-send marker while an ordinary script held its event. The corrected path
 starts the real marker-only subprocess before releasing that event.
@@ -78,13 +93,13 @@ not a claim that unmodified upstream contains fork #925's exact regression.
 
 Qualification: `tests/cron/test_person_send_admission.py` and
 `tests/cron/test_script_admission.py` cover class refusal, actual script overlap,
-ordinary FIFO, edited-job reroutes, execution/dedup retention, serial per-profile
+bounded ordinary concurrency, edited-job reroutes, execution/dedup retention, serial per-profile
 capacity, departure/shutdown, and real concurrent subprocess cwd/profile-home
 isolation. No transport is called. Native delivery budgets are unchanged; marked
 jobs deliver locally. External provider scheduling declarations do not grant a rate
 budget: the prepared-send owner must retain its provider/conversation throttling and
 readback checks. Rollback removes only this lane/classification and its reroute
-extension, returning marked scripts to the existing serial script lane. Retire this
+extension, returning marked scripts to the bounded ordinary script lane. Retire this
 private extension when upstream preserves the same narrow-class start, claim,
 profile and shutdown contract. Source publication only: do not merge, promote or
 restart as part of this change.
@@ -119,10 +134,8 @@ Recurring jobs can opt into `max_catch_up_lateness_seconds`, a finite,
 nonnegative number of elapsed seconds after their scheduled occurrence. Unset
 or null retains the historical unlimited/coalesced catch-up behavior; `0` is
 strict zero lateness, and equality remains eligible. This is an expiration
-policy, not the recurring backlog grace or the one-shot allowance. Manual Run now
-is not a delayed scheduled occurrence. One-shot catch-up allowance is owned by
-[Cron one-shot grace](cron-oneshot-grace.md); do not treat this recurring deadline
-as that allowance.
+policy, not the recurring backlog grace or the one-shot grace. Manual Run now
+is not a delayed scheduled occurrence. One-shot behavior is unchanged.
 
 Enforce expiration before catch-up rewrites the original due slot, on external
 provider admission, and again at executor/detached-worker entry. Compare UTC
@@ -163,9 +176,8 @@ failure-routing contract rather than introducing a transport.
 
 ## Missed One-Shots
 
-Ordinary catch-up uses the per-job one-shot allowance in
-[Cron one-shot grace](cron-oneshot-grace.md), not a duplicated 120-second rule.
-Persist each profile's actual scan-start instant in `ticker_due_scan` after evaluating that scan, separately
+Retain the 120-second grace for ordinary catch-up. Persist each profile's actual
+scan-start instant in `ticker_due_scan` after evaluating that scan, separately
 from the provider's tick-completion heartbeat. The marker contains epoch, PID,
 and process nonce; only this process's previous scan at/before the job's grace
 deadline proves continuity. Heartbeats refreshed after another profile stalls

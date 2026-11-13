@@ -45,6 +45,45 @@ def release_unstarted_claim(job: dict) -> None:
     jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply))
 
 
+def defer_unstarted_fire(job: dict, reason: str) -> bool:
+    """Put a scheduled fire that never reached the gateway owner back on the schedule.
+
+    Releases only this attempt's claim and re-stamps its occurrence as an unclaimed
+    ``pending_slot`` (one-shots refund their preclaim instead), recording no run outcome and
+    no pause. The next due scan restores the slot once this process no longer runs the job,
+    and the ordinary late / catch-up policy bounds the retries. False when the fire has no
+    occurrence to restore (a manual run) or the claim is no longer this attempt's: the caller
+    then fails the run as before, so nothing is dropped silently."""
+    from cron import jobs
+    from cron.job_run_retry import preserve_unstarted_run
+    from cron.occurrences import pending_slot_stamp
+
+    owner = (job.get("fire_claim") or {}).get("by")
+    instant = job.get("_scheduled_instant")
+    if owner is None or not instant:
+        return False
+
+    def apply(records, _index, current):
+        if (current.get("fire_claim") or {}).get("by") != owner:
+            return False
+        now = jobs._hermes_now()
+        kind = (current.get("schedule") or {}).get("kind")
+        if kind in {"cron", "interval"}:
+            current["pending_slot"] = pending_slot_stamp(instant, now)
+        elif kind == "once":
+            preserve_unstarted_run(current, now.isoformat())
+            if current.get("run_claim") is not None:
+                current["run_claim"] = None
+        else:
+            return False
+        current["fire_claim"] = None
+        current["last_fire_error"] = {"at": now.isoformat(), "detail": f"Deferred, not started: {reason}"[:500]}
+        jobs.save_jobs(records)
+        return True
+
+    return bool(jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply, False)))
+
+
 def owns_terminal_claim(job_id: str, owner: str) -> bool:
     """Rejected/missing claims cannot write a run; a stopped own claim still needs release."""
     from cron import scheduler as sched

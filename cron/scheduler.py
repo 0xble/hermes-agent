@@ -3581,6 +3581,19 @@ def _run_one_job_body(
             _record_fire_ownership_lost(job, fire_owner, execution_id)
             return True
 
+        from cron.scheduler_authority import NOT_STARTED_FLAG
+        if job.pop(NOT_STARTED_FLAG, False) and not success:
+            # The gateway handshake failed before any submit, so no admission exists to recover
+            # or pause for. Release and re-queue the occurrence instead of booking a failed run.
+            from cron.scheduler_control import defer_unstarted_fire
+            if defer_unstarted_fire(job, error or "gateway handshake failed"):
+                _teardown_deferred()
+                finish_execution(execution_id, success=False,
+                                 error=f"Not started; occurrence deferred: {error}")
+                logger.warning("Job '%s': gateway handshake failed before submit; deferred: %s",
+                               job["id"], error)
+                return True
+
         success, error, agent_declared = _apply_agent_failure_marker(job, success, error, final_response)
 
         if hard_wall_fence is not None:

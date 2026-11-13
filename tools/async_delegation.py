@@ -223,8 +223,9 @@ def _get_executor(max_workers: int) -> ThreadPoolExecutor:
 
 def active_count() -> int:
     """Number of live async delegation UNITS (one per completion message: a task group or an ungrouped task)."""
-    with _records_lock:
-        return sum(1 for r in _records.values() if r.get("status") in _LIVE_STATES)
+    # Writers hold the registry lock across state.db commits. The gateway loop only needs a
+    # snapshot, copied in one C call under the GIL, so it must never wait for that writer.
+    return sum(1 for r in list(_records.values()) if r.get("status") in _LIVE_STATES)
 
 
 def active_records() -> list[dict[str, Any]]:
