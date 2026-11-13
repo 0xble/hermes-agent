@@ -36,7 +36,7 @@ from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
-from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id, _raw_process_event_session_id
+from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 
 # Log-record parity with the origin module.
