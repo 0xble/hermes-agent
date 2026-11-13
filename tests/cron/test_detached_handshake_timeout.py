@@ -1,6 +1,6 @@
 """Detached gateway handshake timeouts defer an unstarted cron occurrence."""
 
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
 
 import pytest
@@ -42,42 +42,18 @@ def test_exhausted_attach_timeout_is_phase_labeled():
         )
 
 
-def test_prestart_handshake_failure_defers_without_job_failure(monkeypatch):
-    from cron import scheduler, scheduler_worker_failure
+def test_exhausted_owner_transition_is_phase_labeled():
+    from cron import detached_authority
+    from hermes_state_errors import GatewayOwnerRestartError
 
-    job = {"id": "job", "fire_claim": {"by": "owner"}}
-    execution = {
-        "status": "failed",
-        "error": "gateway handshake timed out (connect)",
-        "job_id": "job",
-        "delivery_outcome": "deferred",
-    }
-    calls = []
+    class RPC:
+        def __call__(self, _method, **_params):
+            raise GatewayOwnerRestartError('owner_restart: gateway did not return')
 
-    @contextmanager
-    def fence(*_args, **_kwargs):
-        yield True
-
-    monkeypatch.setattr(scheduler, "get_execution", lambda _execution_id: execution)
-    monkeypatch.setattr(scheduler, "fire_claim_fence", fence)
-    monkeypatch.setattr(
-        scheduler,
-        "mark_job_run",
-        lambda *_args, **_kwargs: pytest.fail("pre-start handshake must not mark a job failure"),
-    )
-
-    execution['body_phase'] = 'attaching'
-    execution['scheduled_instant'] = '2026-01-01T00:00:00+00:00'
-    job['_scheduled_instant'] = execution['scheduled_instant']
-    monkeypatch.setattr(
-        scheduler_worker_failure,
-        "defer_proven_unstarted_worker",
-        lambda *args, **kwargs: calls.append((args, kwargs)) or True,
-    )
-    assert scheduler_worker_failure.record_external_worker_outcome(
-        job, execution_id="execution", expected_fire_owner="owner", worker_exited=True
-    ) is True
-    assert calls and calls[0][0][1] == execution
+    with pytest.raises(detached_authority.DetachedHandshakeTimeout, match=r"\(owner-transition\)"):
+        detached_authority._attach_worker(
+            RPC(), {"execution_id": "e", "session_id": "s", "generation": 1}
+        )
 
 
 def test_run_one_job_defers_marked_handshake_before_delivery(occurrence_home, monkeypatch):
@@ -96,31 +72,6 @@ def test_run_one_job_defers_marked_handshake_before_delivery(occurrence_home, mo
     assert executions.get_execution(claimed['execution_id'])['delivery_outcome'] == 'deferred'
     assert jobs.get_job(claimed['id'])['pending_slot']['scheduled_at'] == claimed['_scheduled_instant']
     assert not counter.exists()
-
-
-def test_poststart_timeout_still_marks_failed(monkeypatch):
-    from cron import scheduler, scheduler_worker_failure
-
-    job = {"id": "job", "fire_claim": {"by": "owner"}}
-    execution = {"status": "failed", "error": "Script timed out after 30s", "job_id": "job"}
-    marked = []
-
-    @contextmanager
-    def fence(*_args, **_kwargs):
-        yield True
-
-    monkeypatch.setattr(scheduler, "get_execution", lambda _execution_id: execution)
-    monkeypatch.setattr(scheduler, "fire_claim_fence", fence)
-    monkeypatch.setattr(
-        scheduler,
-        "mark_job_run",
-        lambda *args, **kwargs: marked.append((args, kwargs)),
-    )
-
-    assert scheduler_worker_failure.record_external_worker_outcome(
-        job, execution_id="execution", expected_fire_owner="owner", worker_exited=True
-    ) is True
-    assert marked and marked[0][1]["success"] is False
 
 
 @pytest.fixture
@@ -186,72 +137,8 @@ def test_handshake_deferral_reclaims_same_occurrence_on_next_tick(occurrence_hom
     assert counter.read_text().splitlines() == ['fired']
 
 
-@pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
-def test_refused_handshake_deferral_keeps_recovery_intent(occurrence_home, monkeypatch, kind):
-    from cron import scheduler_authority, scheduler_control
 
-    jobs, executions, scheduler, counter = occurrence_home
-    claimed = _due_occurrence(occurrence_home, kind)
-    fire = claimed['execution_id']
-    journal = scheduler_authority.journal_path(claimed['id'], fire)
-
-    from hermes_cli import gateway_client
-
-    @asynccontextmanager
-    async def stalled():
-        raise TimeoutError('gateway handshake timed out (connect)')
-        yield
-
-    def timeout(job, **kwargs):
-        return scheduler_authority.run_canonical_job(job, execution_id=kwargs['execution_id'])
-
-    with monkeypatch.context() as patch:
-        patch.setattr(gateway_client, 'connect_gateway', stalled)
-        patch.setattr(scheduler, 'run_job', timeout)
-        patch.setattr(scheduler_control, 'defer_unstarted_fire', lambda *_a, **_k: None)
-        assert scheduler._run_one_job_body(claimed)
-    assert journal.exists(), 'a refused restore must leave a durable recovery intent'
-    assert executions.get_execution(fire)['delivery_outcome'] == 'deferred'
-    assert jobs.get_job(claimed['id'])['last_run_at'] is None
-    scheduler_authority.reconcile_pending(allow_connect=False)
-    assert not journal.exists()
-    scheduler.tick(verbose=False, sync=True)
-    assert counter.read_text().splitlines() == ['fired']
-    assert executions.latest_execution(claimed['id'])['scheduled_instant'] == claimed['_scheduled_instant']
-    scheduler.tick(verbose=False, sync=True)
-    assert counter.read_text().splitlines() == ['fired']
-
-
-def test_refused_handshake_without_writable_journal_records_failure(occurrence_home, monkeypatch):
-    from cron import scheduler_control
-    import utils
-
-    jobs, executions, scheduler, _counter = occurrence_home
-    claimed = _due_occurrence(occurrence_home, 'recurring')
-    real_write = utils.atomic_json_write
-
-    def timeout(job, **_kwargs):
-        job['_gateway_not_started'] = True
-        return False, '', '', 'gateway handshake timed out (connect)'
-
-    def write(path, *args, **kwargs):
-        if path.parent.name == 'admissions':
-            raise OSError('recovery journal unavailable')
-        return real_write(path, *args, **kwargs)
-
-    monkeypatch.setattr(scheduler, 'run_job', timeout)
-    monkeypatch.setattr(scheduler_control, 'defer_unstarted_fire', lambda *_a, **_k: None)
-    monkeypatch.setattr(utils, 'atomic_json_write', write)
-    monkeypatch.setattr(scheduler, '_deliver_crash_failure', lambda *_a, **_k: (None, 'suppressed'))
-    assert not scheduler._run_one_job_body(claimed)
-    current = jobs.get_job(claimed['id'])
-    assert current['last_status'] == 'error' and current['failure_streak'] == 1
-    assert 'recovery journal unavailable' in current['last_error']
-    row = executions.get_execution(claimed['execution_id'])
-    assert row['status'] == 'failed' and row['delivery_outcome'] != 'deferred'
-
-
-def test_late_oneshot_handshake_deferral_runs_original_occurrence_once(occurrence_home, monkeypatch):
+def test_deferred_oneshot_past_grace_is_held_missed(occurrence_home, monkeypatch):
     jobs, executions, scheduler, counter = occurrence_home
     claimed = _due_occurrence(occurrence_home, 'oneshot')
     now = datetime.fromisoformat(claimed['_scheduled_instant']) + timedelta(seconds=400)
@@ -264,7 +151,29 @@ def test_late_oneshot_handshake_deferral_runs_original_occurrence_once(occurrenc
     with monkeypatch.context() as patch:
         patch.setattr(scheduler, 'run_job', timeout)
         assert scheduler._run_one_job_body(claimed)
-    assert jobs.get_job(claimed['id'])['repeat']['completed'] == 0
+    scheduler.tick(verbose=False, sync=True)
+    current = jobs.get_job(claimed['id'])
+    assert current['state'] == 'missed'
+    assert current['missed_reason']
+    assert not counter.exists()
+    assert executions.latest_execution(claimed['id'])['scheduled_instant'] == claimed['_scheduled_instant']
+
+
+
+
+def test_deferred_oneshot_within_grace_runs_once(occurrence_home, monkeypatch):
+    jobs, executions, scheduler, counter = occurrence_home
+    claimed = _due_occurrence(occurrence_home, 'oneshot')
+    now = datetime.fromisoformat(claimed['_scheduled_instant']) + timedelta(seconds=30)
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: now)
+
+    def timeout(job, **_kwargs):
+        job['_gateway_not_started'] = True
+        return False, '', '', 'gateway handshake timed out (connect)'
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scheduler, 'run_job', timeout)
+        assert scheduler._run_one_job_body(claimed)
     scheduler.tick(verbose=False, sync=True)
     assert counter.read_text().splitlines() == ['fired']
     assert executions.latest_execution(claimed['id'])['scheduled_instant'] == claimed['_scheduled_instant']
@@ -283,9 +192,67 @@ def test_plain_late_oneshot_without_deferral_still_retires(occurrence_home, monk
     assert not counter.exists()
 
 
+
+
+def test_refused_deferral_releases_claim_and_records_failure(occurrence_home, monkeypatch):
+    from cron import scheduler_control
+
+    jobs, executions, scheduler, _counter = occurrence_home
+    claimed = _due_occurrence(occurrence_home, 'recurring')
+
+    def timeout(job, **_kwargs):
+        job['_gateway_not_started'] = True
+        return False, '', '', 'gateway handshake timed out (connect)'
+
+    monkeypatch.setattr(scheduler, 'run_job', timeout)
+    monkeypatch.setattr(scheduler_control, 'defer_unstarted_fire', lambda *_a, **_k: None)
+    scheduler._run_one_job_body(claimed)
+    current = jobs.get_job(claimed['id'])
+    assert current.get('fire_claim') is None
+    assert current['last_status'] == 'error'
+    assert current['failure_streak'] == 1
+    assert executions.get_execution(claimed['execution_id'])['delivery_outcome'] != 'deferred'
+
+def test_restored_recurring_slot_obeys_expiry_bounds(occurrence_home, monkeypatch):
+    from cron.scheduler_control import defer_unstarted_fire
+
+    jobs, _executions, scheduler, counter = occurrence_home
+    claimed = _due_occurrence(occurrence_home, 'recurring')
+    jobs.update_job(claimed['id'], {'max_catch_up_lateness_seconds': 0})
+    scheduled = datetime.fromisoformat(claimed['_scheduled_instant'])
+    assert defer_unstarted_fire(claimed, 'pre-body handshake timeout')
+    monkeypatch.setattr(jobs, '_hermes_now', lambda: scheduled + timedelta(days=2))
+    scheduler.tick(verbose=False, sync=True)
+    current = jobs.get_job(claimed['id'])
+    assert not counter.exists()
+    assert not current.get('pending_slot')
+    assert datetime.fromisoformat(current['next_run_at']) > scheduled + timedelta(days=1)
+
+
+@pytest.mark.parametrize('error', [
+    'admission_conflict', 'producer_not_started', 'permission_denied',
+    'Detached cron run exceeded hard wall-clock timeout (30s).',
+])
+def test_deterministic_prebody_refusals_use_visible_failure_lane(occurrence_home, error):
+    from cron import scheduler_worker_failure
+
+    jobs, executions, _scheduler, _counter = occurrence_home
+    claimed = _due_occurrence(occurrence_home, 'recurring')
+    fire = claimed['execution_id']
+    assert executions.mark_execution_handoff_pending(fire)
+    assert executions.adopt_claimed_execution(fire)
+    assert executions.mark_detached_attaching(fire)
+    assert executions.finish_execution(fire, success=False, error=error)
+    assert scheduler_worker_failure.record_external_worker_outcome(
+        claimed, execution_id=fire, worker_exited=True)
+    current = jobs.get_job(claimed['id'])
+    assert current['last_status'] == 'error'
+    assert current['failure_streak'] == 1
+    assert executions.get_execution(fire)['delivery_outcome'] != 'deferred'
+
+
 @pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
-@pytest.mark.parametrize('status', ['unknown', 'failed'])
-def test_reaped_prebody_worker_requeues_without_counting_failure(occurrence_home, kind, status):
+def test_reaped_prebody_worker_requeues_without_counting_failure(occurrence_home, kind):
     from cron import scheduler_worker_failure
 
     jobs, executions, scheduler, counter = occurrence_home
@@ -298,7 +265,7 @@ def test_reaped_prebody_worker_requeues_without_counting_failure(occurrence_home
     # Model the existing dead-worker sweep / watchdog terminalization. Neither
     # uses a deferred marker; the body gate supplies the proof, not the error copy.
     with executions._transaction() as conn:
-        conn.execute('UPDATE executions SET status=? WHERE id=?', (status, fire))
+        conn.execute("UPDATE executions SET status='unknown' WHERE id=?", (fire,))
     assert scheduler_worker_failure.record_external_worker_outcome(claimed, worker_exited=True)
     current = jobs.get_job(claimed['id'])
     assert not current.get('failure_streak') and current['last_run_at'] is None

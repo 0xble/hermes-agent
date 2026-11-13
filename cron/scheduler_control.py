@@ -118,8 +118,6 @@ def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -
             if kind == "once":
                 preserve_unstarted_run(current, now.isoformat())
             current["pending_slot"] = pending_slot_stamp(instant, now)
-            if kind == "once":
-                current["pending_slot"]["deferred_unstarted"] = True
             outcome, detail = "deferred", f"Deferred, not started: {reason}"
         else:
             return None

@@ -5,28 +5,45 @@ import logging
 logger = logging.getLogger("cron.scheduler")
 
 
+def _is_typed_prebody_loss(execution: dict, *, worker_exited: bool) -> bool:
+    """Accept only durable, typed proof that the detached body never began."""
+    if execution.get('body_phase') != 'attaching':
+        return False
+    status = execution.get('status')
+    if status == 'failed':
+        # The handshake path owns this marker; deterministic refusals and watchdog
+        # failures remain ordinary visible failures.
+        return execution.get('delivery_outcome') == 'deferred'
+    if status != 'unknown':
+        return False
+    from cron.executions import _owner_identity
+    if not worker_exited and _owner_identity(
+            execution['pid'], execution['process_started_at']) != 'dead':
+        return False
+    # Deterministic refusals and watchdog termination are exact typed causes;
+    # every other reaped attaching row has no proof that the body ran.
+    if execution.get('error') in {
+            'admission_conflict', 'producer_not_started', 'permission_denied'}:
+        return False
+    from cron.scheduler_detached_worker import HARD_WALL_TIMEOUT_ERROR_PREFIX
+    if str(execution.get('error') or '').startswith(HARD_WALL_TIMEOUT_ERROR_PREFIX):
+        return False
+    return True
 def defer_proven_unstarted_worker(
     job: dict, execution: dict, *, worker_exited: bool = False, pause: dict | None = None,
 ) -> bool:
     """Reclaim only a terminal worker whose durable body gate was never won.
 
     Reaped process + attaching is proof, not an empty transcript or started_at.
-    The body CAS requires running, so an unknown attempt cannot start late even
-    if an old register/adopt answer arrives. NULL/legacy and started fail closed.
-    A stale owner is handled without changing any newer claim or operator edit.
+    Reconnect refusals and hard-wall failures stay on the visible failure lane.
+    NULL/legacy and started rows fail closed.
     """
-    from cron.executions import _owner_identity
     from cron.scheduler_control import defer_unstarted_fire
 
     if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attaching'
             or not (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
         return False
-    status = execution.get('status')
-    if status not in {'unknown', 'failed'}:
-        return False
-    typed_deferral = status == 'failed' and execution.get('delivery_outcome') == 'deferred'
-    if not typed_deferral and not worker_exited and _owner_identity(
-            execution['pid'], execution['process_started_at']) != 'dead':
+    if not _is_typed_prebody_loss(execution, worker_exited=worker_exited):
         return False
     deferred = dict(job, _scheduled_instant=(
         job.get('_scheduled_instant') or execution['scheduled_instant']))
@@ -86,10 +103,10 @@ def record_external_worker_outcome(
         if not owns_claim:
             return True
         if (execution.get('body_phase') == 'attaching'
-                and (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
+                and (job.get('_scheduled_instant') or execution.get('scheduled_instant'))
+                and _is_typed_prebody_loss(execution, worker_exited=worker_exited)):
             defer_proven_unstarted_worker(job, execution, worker_exited=worker_exited)
-            # If the fire fence was busy, its durable admission journal remains
-            # the retry intent. Never turn that transient refusal into a run failure.
+            # A typed pre-body loss restores the occurrence; it is not a job failure.
             return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit
