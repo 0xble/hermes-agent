@@ -3474,22 +3474,31 @@ def _apply_agent_failure_marker(job: dict, success: bool, error, final_response)
 
 
 def _settled_before_outcome(job, success, error, execution_id, fire_owner, ownership_lost, teardown) -> bool:
-    """Settle a run that must not book an outcome: a lost fire claim, or a gateway handshake that
-    failed before any submit (no admission exists to recover or pause for, so the occurrence is
-    released and re-queued instead of booked as a failed run)."""
+    """Settle lost ownership or a proven pre-body exit without booking a run outcome.
+
+    Both pre-submit transport failures and detached attach timeouts use the same
+    flag and occurrence deferral; ambiguous/started bodies never set that flag.
+    """
     if ownership_lost():
         teardown()
         _record_fire_ownership_lost(job, fire_owner, execution_id)
         return True
-    from cron.scheduler_authority import NOT_STARTED_FLAG
+    from cron.scheduler_authority import NOT_STARTED_FLAG, retain_unstarted_fire
     if not job.pop(NOT_STARTED_FLAG, False) or success:
         return False
+    if not job.get('_scheduled_instant') or not (job.get('fire_claim') or {}).get('by'):
+        return False  # Manual fires have no scheduled occurrence to restore; fail visibly.
+    from cron.executions import mark_unstarted_execution
     from cron.scheduler_control import defer_unstarted_fire
+    mark_unstarted_execution(execution_id)
     if not defer_unstarted_fire(job, error or "gateway handshake failed"):
-        return False
+        # A refused fence is not a successful restore. Keep recovery intent for
+        # both pre-submit and detached paths; journal errors fail visibly below.
+        retain_unstarted_fire(job, execution_id)
     teardown()
-    finish_execution(execution_id, success=False, error=f"Not started; occurrence deferred: {error}")
-    logger.warning("Job '%s': gateway handshake failed before submit; deferred: %s", job["id"], error)
+    finish_execution(execution_id, success=False, error=f"Not started; occurrence deferred: {error}",
+                     delivery_outcome="deferred")
+    logger.warning("Job '%s': gateway handshake failed before body start; deferred: %s", job["id"], error)
     return True
 
 

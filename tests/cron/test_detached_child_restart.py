@@ -22,6 +22,13 @@ def test_detached_child_restart_returns_failed_delegation(tmp_path, monkeypatch,
     from tools import delegate_tool
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    from cron import executions
+    monkeypatch.setattr(executions, 'EXECUTIONS_FILE', tmp_path / 'executions.db')
+    row = executions.create_execution('inert', source='test')
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET id='inert' WHERE id=?", (row['id'],))
+    assert executions.mark_execution_handoff_pending('inert')
+    assert executions.adopt_claimed_execution('inert')
     db = SessionDB(tmp_path / 'owner.db')
     db.create_session('parent', 'cron')
     state = SimpleNamespace(epoch=begin_runtime_epoch(db, instance_id='first'),

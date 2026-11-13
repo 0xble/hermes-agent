@@ -9,8 +9,8 @@ import uuid
 # Leave room for ordered-admission queueing, and require repeated successful owner reads.
 MISSING_SUBMIT_GRACE_SECONDS = 600
 MISSING_SUBMIT_READS = 2
-# Job flag (like ``_session_store_unavailable``): this fire failed to reach the owner before any
-# submit, so no admission can exist and the firer may put the occurrence back instead of failing it.
+# Job flag (like ``_session_store_unavailable``): no body can have started, either
+# before submit or behind the detached attach gate. The firer may restore the occurrence.
 NOT_STARTED_FLAG = '_gateway_not_started'
 
 
@@ -69,6 +69,26 @@ def _lift_pause(job_id, pause):
                 resume_job(job_id)
             except ValueError:  # a one-shot whose instant has passed stays paused for the operator
                 pass
+
+
+def retain_unstarted_fire(job, execution_id):
+    """Keep durable recovery intent when the occurrence's immediate fire fence refuses.
+
+    Do not overwrite an admission or its pause ownership. If no submit happened,
+    the same journal shape lets reconciliation restore the proven pre-body fire.
+    Write errors propagate to the firer's normal visible failure bookkeeping.
+    """
+    from cron.jobs import _jobs_lock
+    from utils import atomic_json_write
+
+    journal = journal_path(job['id'], execution_id)
+    with _jobs_lock():
+        if not journal.exists():
+            atomic_json_write(journal, {
+                'params': {'job_id': job['id'], 'request_id': execution_id,
+                           'extra_prompt': None},
+                'job': job, 'receipt': None,
+            }, mode=0o600, fsync_dir=True)
 
 
 def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id=None):
@@ -143,9 +163,27 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                 state = await call('recover', params)
                 if state['status'] != 'started':
                     continue
-                value = await asyncio.to_thread(run_detached, dict(state['job']), receipt, state, record, save,
-                    execution_id=request_id, extra_prompt=params['extra_prompt'], cancel_event=cancel_event)
-                job.update(record['worker_result']['job_flags'])
+                try:
+                    value = await asyncio.to_thread(
+                        run_detached,
+                        dict(state['job']),
+                        receipt,
+                        state,
+                        record,
+                        save,
+                        execution_id=request_id,
+                        extra_prompt=params['extra_prompt'],
+                        cancel_event=cancel_event,
+                    )
+                except Exception as exc:
+                    from cron.detached_authority import DetachedHandshakeTimeout
+
+                    if not isinstance(exc, DetachedHandshakeTimeout):
+                        raise
+                    job[NOT_STARTED_FLAG] = True
+                    value = False, '', '', str(exc)
+                if record.get('worker_result') is not None:
+                    job.update(record['worker_result']['job_flags'])
                 return value
             if state.get('progress_at') not in (None, progress):
                 # The owner's agent is still working: refresh OUR ledger row (the owner's stamp is
@@ -320,6 +358,17 @@ def reconcile_pending(*, allow_connect=True):
                 # output or re-marking the job on every tick would duplicate its side effects.
                 continue
             row = get_execution(params['request_id'])
+            from cron.scheduler_worker_failure import defer_proven_unstarted_worker
+            if (row is not None and row.get('body_phase') == 'attaching'
+                    and record.get('job')):
+                if defer_proven_unstarted_worker(
+                        record['job'], row, pause=record.get('pause_recorded')):
+                    # Local body gate + proved dead owner replaces guesswork from a lost
+                    # RPC answer. Do not re-submit, replay a result, or pause this fire.
+                    retire_completed_journal(params['job_id'], params['request_id'])
+                # A transient fenced write refusal leaves the journal for the next
+                # reconciliation pass; only restoration or supersession retires it.
+                continue
             terminal_execution = (row is not None and row['job_id'] == params['job_id']
                                   and row['status'] in {'completed', 'failed'})
             current = get_job(params['job_id'])

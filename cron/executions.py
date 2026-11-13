@@ -142,6 +142,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "code_sha", "code_sha TEXT")
     add_column_if_missing(conn, "executions", "execution_identity", "execution_identity TEXT")
     add_column_if_missing(conn, "executions", "owner_kind", "owner_kind TEXT")
+    # NULL is legacy/ambiguous, never proof of an unstarted body. Only the new
+    # detached runner writes attaching, and must win attaching->started before
+    # any pre-script or agent effect. Terminalization makes that CAS impossible.
+    add_column_if_missing(conn, "executions", "body_phase", "body_phase TEXT")
     add_column_if_missing(conn, "executions", "delivery_status", "delivery_status TEXT")
     # 0 means an unknown status is a terminal queue projection; 1 is the
     # detached finish-before-enqueue provisional marker.  Additive so older
@@ -559,6 +563,37 @@ def adopt_claimed_execution(execution_id: str) -> Optional[dict[str, Any]]:
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
     return record
+
+
+def mark_unstarted_execution(execution_id: str) -> bool:
+    """Record that this owner exited before the body-start fence."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET body_phase='attaching' WHERE id=? AND status='running' "
+            "AND process_id=? AND pid=? AND body_phase IS NULL",
+            (execution_id, _PROCESS_ID, os.getpid()),
+        )
+        return cur.rowcount == 1
+
+
+def _advance_detached_body_phase(execution_id: str, expected: str | None, phase: str) -> bool:
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET body_phase=? WHERE id=? AND status='running' "
+            "AND owner_kind='detached' AND process_id=? AND pid=? AND body_phase IS ?",
+            (phase, execution_id, _PROCESS_ID, os.getpid(), expected),
+        )
+        return cur.rowcount == 1
+
+
+def mark_detached_attaching(execution_id: str) -> bool:
+    """Opt this worker into the durable body gate; old workers remain NULL/ambiguous."""
+    return _advance_detached_body_phase(execution_id, None, 'attaching')
+
+
+def start_detached_body(execution_id: str) -> bool:
+    """Win before ANY pre-script/agent effect; an unknown/deferred attempt cannot start."""
+    return _advance_detached_body_phase(execution_id, 'attaching', 'started')
 
 
 def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
