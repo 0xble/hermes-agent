@@ -59,7 +59,7 @@ def test_contact_card_reaches_model_and_stop_drops_buffered_photo(tmp_path) -> N
         buffered_at = time.monotonic()
         st._inbound(chat, uid, text="/stop", entities=[{"type": "bot_command", "offset": 0, "length": 5}])
         drv.dm("fresh question [in:fresh]")
-        wait_until(lambda: director.turns.get("fresh"), "fresh turn")
+        wait_until(lambda: director.turns.get("fresh"), "fresh turn", on_timeout=gw.tail)
         # health: allow HX013 -- absence proof: a leaked photo flushes once the burst window closes
         time.sleep(max(0.0, buffered_at + _BURST_WINDOW + 2.0 - time.monotonic()))
         assert bodies_with("old photo caption") == []

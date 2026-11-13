@@ -710,8 +710,8 @@ def environment(home: Path) -> dict[str, str]:
         env['RUSTUP_HOME'] = str(STATE / 'rustup')
     sandbox_runtime = STATE / 'electron-sandbox'
     if sys.platform.startswith('linux') and sandbox_runtime.is_dir():
-        pinned = json.loads((ROOT / 'apps/desktop/package.json').read_text())['devDependencies']['electron']
-        if (sandbox_runtime / 'version').read_text().strip().removeprefix('v') != pinned:
+        pinned = json.loads((ROOT / 'apps/desktop/package.json').read_text(encoding='utf-8-sig'))['devDependencies']['electron']
+        if (sandbox_runtime / 'version').read_text(encoding='utf-8-sig').strip().removeprefix('v') != pinned:
             raise RuntimeError('Prepared sandbox runtime does not match the locked Electron version')
         env['ELECTRON_OVERRIDE_DIST_PATH'] = str(sandbox_runtime)
     if os.name == 'nt' and os.environ.get('VCToolsInstallDir'):
