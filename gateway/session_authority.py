@@ -624,7 +624,9 @@ class SessionAuthority:
             event._gateway_accepted = True
             # Every native entry point (including relay and /queue) crosses this committed
             # boundary before scheduling, regardless of a racy busy snapshot or later row read.
-            if row['status'] in ('queued', 'started'):
+            # A first delivery always commits as queued; 'started' here is a replayed delivery
+            # whose turn already consumed the transcript, so prefetching again would re-echo it.
+            if row['status'] == 'queued':
                 if prefetch := getattr(self.runner, '_prefetch_admitted_voice', None):
                     prefetch(event)
             if row['status'] == 'queued' and (committed := getattr(event, '_on_commit', None)) is not None:
