@@ -45,15 +45,40 @@ def release_unstarted_claim(job: dict) -> None:
     jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply))
 
 
-def defer_unstarted_fire(job: dict, reason: str) -> bool:
+def _occurrence_superseded(claimed: dict, current: dict) -> bool:
+    """True when an operator schedule or lifecycle edit landed after this fire was claimed.
+
+    ``update_job`` drops ``pending_slot`` for exactly these fields because the edit supersedes
+    any occurrence the dispatcher left unclaimed. A claimed-but-never-started fire is the same
+    occurrence, so restoring it would revive the old slot and overwrite the operator's
+    ``next_run_at`` (or, for a one-shot, the edited run time). Nothing between the claim and a
+    pre-submit deferral legitimately rewrites these fields, so any difference is an edit."""
+    from cron.jobs import is_job_runnable
+
+    if not is_job_runnable(current):
+        return True
+    return any(current.get(key) != claimed.get(key) for key in _OCCURRENCE_FIELDS)
+
+
+# The fields whose rewrite ``update_job`` treats as superseding an unclaimed occurrence.
+_OCCURRENCE_FIELDS = ("schedule", "timezone", "next_run_at", "enabled", "state")
+
+
+def defer_unstarted_fire(job: dict, reason: str) -> str | None:
     """Put a scheduled fire that never reached the gateway owner back on the schedule.
 
     Releases only this attempt's claim and re-stamps its occurrence as an unclaimed
     ``pending_slot`` (one-shots refund their preclaim instead), recording no run outcome and
     no pause. The next due scan restores the slot once this process no longer runs the job,
-    and the ordinary late / catch-up policy bounds the retries. False when the fire has no
-    occurrence to restore (a manual run) or the claim is no longer this attempt's: the caller
-    then fails the run as before, so nothing is dropped silently."""
+    and the ordinary late / catch-up policy bounds the retries. Returns ``"deferred"``.
+
+    When an operator schedule or lifecycle edit superseded the occurrence while the handshake
+    stalled, the edit already chose what runs next: the claim is released (a one-shot's
+    preclaim refunded) with no slot restored and the edited ``next_run_at`` untouched. Returns
+    ``"superseded"``.
+
+    None when the fire has no occurrence to restore (a manual run) or the claim is no longer
+    this attempt's: the caller then fails the run as before, so nothing is dropped silently."""
     from cron import jobs
     from cron.job_run_retry import preserve_unstarted_run
     from cron.occurrences import pending_slot_stamp
@@ -61,27 +86,41 @@ def defer_unstarted_fire(job: dict, reason: str) -> bool:
     owner = (job.get("fire_claim") or {}).get("by")
     instant = job.get("_scheduled_instant")
     if owner is None or not instant:
-        return False
+        return None
 
     def apply(records, _index, current):
         if (current.get("fire_claim") or {}).get("by") != owner:
-            return False
+            return None
         now = jobs._hermes_now()
         kind = (current.get("schedule") or {}).get("kind")
-        if kind in {"cron", "interval"}:
+        if _occurrence_superseded(job, current):
+            if (job.get("schedule") or {}).get("kind") == "once":
+                _refund_oneshot_preclaim(current)
+            outcome, detail = "superseded", f"Not started; superseded by an operator edit: {reason}"
+        elif kind in {"cron", "interval"}:
             current["pending_slot"] = pending_slot_stamp(instant, now)
+            outcome, detail = "deferred", f"Deferred, not started: {reason}"
         elif kind == "once":
             preserve_unstarted_run(current, now.isoformat())
-            if current.get("run_claim") is not None:
-                current["run_claim"] = None
+            outcome, detail = "deferred", f"Deferred, not started: {reason}"
         else:
-            return False
+            return None
+        if current.get("run_claim") is not None:
+            current["run_claim"] = None
         current["fire_claim"] = None
-        current["last_fire_error"] = {"at": now.isoformat(), "detail": f"Deferred, not started: {reason}"[:500]}
+        current["last_fire_error"] = {"at": now.isoformat(), "detail": detail[:500]}
         jobs.save_jobs(records)
-        return True
+        return outcome
 
-    return bool(jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply, False)))
+    return jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply, None))
+
+
+def _refund_oneshot_preclaim(current: dict) -> None:
+    """Undo ``claim_dispatch``'s increment so an edited one-shot can still fire at its new time."""
+    repeat = current.get("repeat") or {}
+    times = repeat.get("times")
+    if times is not None and times > 0 and repeat.get("completed", 0) > 0:
+        repeat["completed"] -= 1
 
 
 def owns_terminal_claim(job_id: str, owner: str) -> bool:

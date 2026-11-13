@@ -3496,9 +3496,16 @@ def _settled_before_outcome(job, success, error, execution_id, fire_owner, owner
     if not job.pop(NOT_STARTED_FLAG, False) or success:
         return False
     from cron.scheduler_control import defer_unstarted_fire
-    if not defer_unstarted_fire(job, error or "gateway handshake failed"):
+    outcome = defer_unstarted_fire(job, error or "gateway handshake failed")
+    if outcome is None:
         return False
     teardown()
+    if outcome == "superseded":
+        finish_execution(execution_id, success=False,
+                         error=f"Not started; occurrence superseded by an operator edit: {error}")
+        logger.warning("Job '%s': gateway handshake failed before submit; occurrence superseded "
+                       "by an operator edit, schedule left as edited: %s", job["id"], error)
+        return True
     finish_execution(execution_id, success=False, error=f"Not started; occurrence deferred: {error}")
     logger.warning("Job '%s': gateway handshake failed before submit; deferred: %s", job["id"], error)
     return True
