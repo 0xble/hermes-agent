@@ -236,7 +236,7 @@ def cmd_fallback_clear(args) -> None:
 
 
 def cmd_fallback_status(args) -> None:  # noqa: ARG001
-    """Show active shared primary-model cooldowns (``hermes fallback status`` / ``cooldowns``)."""
+    """Show active shared route cooldowns (``hermes fallback status`` / ``cooldowns``)."""
     from datetime import datetime
     from agent.shared_primary_cooldown import list_cooldowns
     try:
@@ -246,9 +246,9 @@ def cmd_fallback_status(args) -> None:  # noqa: ARG001
         return
     print()
     if not records:
-        print("  No primary-model cooldowns active.\n")
+        print("  No shared route cooldowns active.\n")
         return
-    print("  Shared primary-model cooldowns:\n")
+    print("  Shared route cooldowns:\n")
     for record in records:
         try:
             reset_at = float(record.get("reset_at", 0) or 0)

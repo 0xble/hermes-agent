@@ -398,7 +398,7 @@ class TestCooldownsCommand:
         cmd_fallback(_parse(["fallback", "status"]))
         status = capsys.readouterr().out
         assert "unreadable" in status.lower()
-        assert "No primary-model cooldowns active" not in status
+        assert "No shared route cooldowns active" not in status
         assert path.read_text(encoding="utf-8-sig") == "{"
 
     @pytest.mark.parametrize("failure", ["malformed", "wrong_shape", "permission"])
@@ -437,7 +437,7 @@ class TestCooldownsCommand:
         }}}), encoding="utf-8")
         from hermes_cli.fallback_cmd import cmd_fallback
         cmd_fallback(_parse(["fallback", "status"]))
-        assert "No primary-model cooldowns active" in capsys.readouterr().out
+        assert "No shared route cooldowns active" in capsys.readouterr().out
         assert not path.exists()
 
     def test_status_survives_a_huge_finite_record(self, isolated_home, capsys):
@@ -451,7 +451,7 @@ class TestCooldownsCommand:
         }}}), encoding="utf-8")
         from hermes_cli.fallback_cmd import cmd_fallback
         cmd_fallback(_parse(["fallback", "status"]))
-        assert "No primary-model cooldowns active" in capsys.readouterr().out
+        assert "No shared route cooldowns active" in capsys.readouterr().out
 
 # ---------------------------------------------------------------------------
 # cmd_fallback dispatcher

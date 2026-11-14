@@ -24,6 +24,10 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
         # refuse the turn if no fallback can be bound, rather than use the primary.
         raise
     try:
+        if isinstance(record, dict) and record.get("source") == "billing_default":
+            # This long window is a fallback-only default. A primary would use the short
+            # backoff for the same billing failure, so never adopt it as a primary outage.
+            return False
         if not is_active(record):
             # Keep an expired record as a recovery probe: the first successful primary request
             # clears it atomically and owns the sole recovery notice. None drops a record that

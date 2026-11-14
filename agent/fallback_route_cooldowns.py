@@ -7,21 +7,25 @@ import time
 logger = logging.getLogger("agent.chat_completion_helpers")
 
 
+def _matching_entries(entries: list[dict], provider: str, model: str, base_url: str = "") -> list[dict]:
+    from hermes_cli.model_normalize import normalize_model_for_provider
+    from hermes_cli.route_identity import normalize_route_base_url
+    normalized_provider = str(provider or "").strip().lower()
+    wanted_model = normalize_model_for_provider(str(model or "").strip(), normalized_provider)
+    wanted_base = normalize_route_base_url(base_url) if base_url else ""
+    return [
+        entry for entry in entries
+        if str(entry.get("provider") or "").strip().lower() == normalized_provider
+        and normalize_model_for_provider(str(entry.get("model") or "").strip(), normalized_provider) == wanted_model
+        and (not wanted_base or normalize_route_base_url(entry.get("base_url")) == wanted_base)
+    ]
+
+
 def cooldown_entries(provider: str, model: str, base_url: str = "") -> list[dict]:
     """Return active durable cooldowns matching a fallback's provider/model route."""
     try:
         from agent.shared_primary_cooldown import list_cooldowns
-        from hermes_cli.model_normalize import normalize_model_for_provider
-        from hermes_cli.route_identity import normalize_route_base_url
-        normalized_provider = str(provider or "").strip().lower()
-        wanted_model = normalize_model_for_provider(str(model or "").strip(), normalized_provider)
-        wanted_base = normalize_route_base_url(base_url) if base_url else ""
-        return [
-            entry for entry in list_cooldowns()
-            if str(entry.get("provider") or "").strip().lower() == normalized_provider
-            and normalize_model_for_provider(str(entry.get("model") or "").strip(), normalized_provider) == wanted_model
-            and (not wanted_base or normalize_route_base_url(entry.get("base_url")) == wanted_base)
-        ]
+        return _matching_entries(list_cooldowns(), provider, model, base_url)
     except Exception:
         logger.debug("Fallback cooldown read failed", exc_info=True)
         return []
@@ -32,7 +36,13 @@ def candidate_is_soonest_cooled(
     stop: int | None = None,
 ) -> bool:
     """Allow the soonest-reset usable route when every remaining fallback is cooled."""
-    current = cooldown_entries(provider, model, base_url)
+    try:
+        from agent.shared_primary_cooldown import list_cooldowns
+        records = list_cooldowns()
+    except Exception:
+        logger.debug("Fallback cooldown read failed", exc_info=True)
+        return False
+    current = _matching_entries(records, provider, model, base_url)
     if not current:
         return False
     remaining = []
@@ -61,7 +71,7 @@ def candidate_is_soonest_cooled(
             base_url=candidate.get("base_url") or "")
         if should_skip_candidate(candidate_ident, current_ident) and candidate_provider == current_ident.provider:
             continue
-        entries = cooldown_entries(candidate_provider, candidate_model, candidate.get("base_url") or "")
+        entries = _matching_entries(records, candidate_provider, candidate_model, candidate.get("base_url") or "")
         if not entries:
             return False
         remaining.append(entries)

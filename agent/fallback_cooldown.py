@@ -79,11 +79,10 @@ def _arm_rate_limit_cooldown(
     live_route = live_route_from_agent(agent)
     primary_route = route_from_agent(agent)
     # A fallback outage belongs to the fallback route, not to the configured primary.
-    # Persist billing/quota failures so a fresh session or cron worker can skip that
-    # backend too. Primary cooldown adoption remains separate and keeps its existing
-    # recovery semantics.
+    # Only billing/quota failures are durable: transient rate limits stay session-local because
+    # fallback success does not run primary recovery and therefore cannot clear their records.
     if getattr(agent, "_fallback_activated", False) and live_route != primary_route:
-        if reason not in _RATE_LIMIT_FAILOVER_REASONS:
+        if reason != FailoverReason.billing:
             return None
         try:
             from agent.shared_primary_cooldown import arm_cooldown

@@ -64,6 +64,15 @@ def test_lookup_normalizes_the_same_route_identity_as_live_binding(provider, mod
         ) == [entry]
 
 
+def test_transient_rate_limits_on_fallback_do_not_persist_or_escalate():
+    """Fallback success is not primary recovery, so transient fallback 429s stay session-local."""
+    agent = _agent([_entry(ROUTE_ONE), _entry(ROUTE_TWO)])
+    agent.provider, agent.base_url, agent.model = ROUTE_TWO
+    for _ in range(4):
+        assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) is None
+    assert _record(ROUTE_TWO) is None
+
+
 def test_402_on_fallback_route_is_skipped_by_next_session():
     """A billing 402 on route two writes the shared record keyed to route two."""
     first = _agent([_entry(ROUTE_ONE), _entry(ROUTE_TWO)])
@@ -222,5 +231,5 @@ def test_primary_recovery_spares_an_independent_fallback_billing_record(tmp_path
 
     assert clear_if_current(PRIMARY, primary_record["outage_id"]) is True
     assert _record(PRIMARY) is None
-    assert _record(ROUTE_ONE)["source"] == "backoff"
+    assert _record(ROUTE_ONE) is None
     assert _record(ROUTE_TWO)["source"] == "billing_default"

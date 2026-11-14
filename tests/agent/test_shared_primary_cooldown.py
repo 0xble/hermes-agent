@@ -456,6 +456,20 @@ def _arm_for(agent, seconds=7200):
     return arm_cooldown(route_from_agent(agent), reason="rate_limit", reset_at=time.time() + seconds)
 
 
+def test_fallback_billing_default_is_not_adopted_as_primary_cooldown():
+    """A fallback-only six-hour default must not hold a fresh primary off for six hours."""
+    agent = _agent_with_chain(_CHAIN)
+    from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+    route = route_from_agent(agent)
+    record = arm_cooldown(route, reason="billing", billing_default=True)
+    assert record["source"] == "billing_default"
+    with patch("agent.chat_completion_helpers.try_activate_fallback") as activate:
+        from agent.shared_primary_cooldown_runtime import _adopt_shared_primary_cooldown
+        assert _adopt_shared_primary_cooldown(agent) is False
+    activate.assert_not_called()
+    assert agent.model == "primary-model"
+
+
 def test_stranded_fallback_index_does_not_send_the_turn_to_a_cooled_primary():
     with patch("agent.agent_runtime_helpers._adopt_shared_primary_cooldown", return_value=False):
         agent = _agent_with_chain(_CHAIN)
