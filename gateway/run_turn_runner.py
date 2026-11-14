@@ -1924,8 +1924,7 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            # Model/credential resolution failed before the turn began. Keep the raw cause in logs,
-            # but return a failed turn with a stable user-facing recovery message and reason.
+            # Resolution failed before the turn began: raw cause to logs, a stable recovery reply to the user.
             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
             from agent.turn_failure_copy import stamp_failure
             text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
