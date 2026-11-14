@@ -61,7 +61,9 @@ def annotate_job_failure(exc: BaseException, *, base_url: str | None, elapsed: f
         named = RuntimeError(model_proxy_unavailable_message(endpoint, detail))
         named.__cause__ = exc
         return named
-    if not _is_transport_timeout(exc):
+    if not _is_transport_timeout(exc) or _request_endpoint(exc) != endpoint:
+        # A loopback base_url alone does not make a timeout the proxy's: a bare socket
+        # ``timed out`` from a tool or the job's own code must stay that job's failure.
         return exc
     seconds = elapsed if isinstance(elapsed, (int, float)) and elapsed >= 0 else _timeout_seconds(exc)
     if seconds is None:
@@ -77,6 +79,27 @@ def _is_transport_timeout(exc: BaseException) -> bool:
     if name in {"ConnectTimeout", "ReadTimeout", "WriteTimeout", "PoolTimeout", "APITimeoutError"}:
         return True
     return isinstance(exc, TimeoutError) and text in {"", "timed out"}
+
+
+def _request_endpoint(exc: BaseException) -> str | None:
+    """Loopback ``host:port`` of the HTTP request that raised ``exc`` (or caused it), if any.
+
+    httpx and openai timeouts carry the request they were sending; that is the proof the
+    timeout came from the model proxy call rather than some other socket in the run.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        try:
+            request = getattr(current, "request", None)
+        except RuntimeError:  # httpx raises when the exception was built without a request
+            request = None
+        url = getattr(request, "url", None)
+        if url is not None:
+            return model_proxy_endpoint(str(url))
+        current = current.__cause__ or current.__context__
+    return None
 
 
 def _timeout_seconds(exc: BaseException) -> float | None:

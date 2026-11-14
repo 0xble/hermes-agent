@@ -17,6 +17,7 @@ import re
 import sqlite3
 import threading
 from contextlib import contextmanager
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -68,6 +69,12 @@ _MAX_SIGNATURE_ERROR_CHARS = 200
 _DURATION_RE = re.compile(
     r"\b\d+(?:\.\d+)?\s*(?:ms|s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?)\b"
 )
+
+# A shared dependency incident (one row for every job waiting on the proxy or gateway) never
+# resolves through one job's recovery. A failure after this long a quiet spell is a new outage:
+# the row re-opens as ``detected`` and pages again, so neither an old alert nor an ack of an
+# earlier outage can silence it.
+DEPENDENCY_OUTAGE_GAP_SECONDS = 3600
 
 _lock = threading.RLock()
 
@@ -211,18 +218,20 @@ def upsert_incident(
 
     with _transaction() as conn:
         row = conn.execute(
-            "SELECT id, state FROM cron_incidents WHERE id=?", (incident_id,)
+            "SELECT id, state, last_seen_at FROM cron_incidents WHERE id=?", (incident_id,)
         ).fetchone()
         if row is not None:
-            reopen = row["state"] == "resolved"
+            reopen = row["state"] == "resolved" or (
+                failure_type == "dependency_unavailable"
+                and _quiet_for(row["last_seen_at"], DEPENDENCY_OUTAGE_GAP_SECONDS))
             conn.execute(
                 """UPDATE cron_incidents
                    SET last_seen_at=?, error=?, output_file=?,
-                       state=CASE WHEN state='resolved' THEN 'detected' ELSE state END,
-                       alerted_at=CASE WHEN state='resolved' THEN NULL ELSE alerted_at END,
-                       closed_at=CASE WHEN state='resolved' THEN NULL ELSE closed_at END
+                       state=CASE WHEN ? THEN 'detected' ELSE state END,
+                       alerted_at=CASE WHEN ? THEN NULL ELSE alerted_at END,
+                       closed_at=CASE WHEN ? THEN NULL ELSE closed_at END
                    WHERE id=?""",
-                (now, stored_error, output_file, incident_id),
+                (now, stored_error, output_file, reopen, reopen, reopen, incident_id),
             )
             return incident_id, reopen
         conn.execute(
@@ -234,6 +243,16 @@ def upsert_incident(
              sig, failure_type, now, now, stored_error, output_file),
         )
         return incident_id, True
+
+
+def _quiet_for(last_seen_at: Optional[str], seconds: float) -> bool:
+    try:
+        from cron.jobs import _elapsed_seconds, _ensure_aware
+
+        last = _ensure_aware(datetime.fromisoformat(str(last_seen_at)))
+    except (TypeError, ValueError):
+        return True  # an unreadable stamp must not keep an outage silent
+    return _elapsed_seconds(_hermes_now(), last) >= seconds
 
 
 def set_incident_state(incident_id: str, state: str) -> bool:
