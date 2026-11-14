@@ -58,6 +58,26 @@ class BackendIdentity:
         )
 
 
+    def connection_domain(self) -> BackendIdentity:
+        """Socket identity for proven pre-response connection failures only.
+
+        Paths, query tokens and wire modes cannot distinguish a refused socket.
+        Keep the existing deployment/endpoint predicates unchanged for other callers.
+        """
+        from urllib.parse import urlsplit, urlunsplit
+        try:
+            parts = urlsplit(self.base_url)
+            host = parts.hostname
+            port = parts.port if parts.port is not None else (443 if parts.scheme == "https" else 80)
+        except ValueError:
+            return BackendIdentity()
+        if not host or parts.scheme not in {"http", "https", "tcp"}:
+            return BackendIdentity()
+        host = f"[{host}]" if ":" in host else host
+        authority = f"{host}:{port}"
+        return BackendIdentity.build(base_url=urlunsplit(("tcp", authority, "", "", "")))
+
+
 def _both_first_class(a: BackendIdentity, b: BackendIdentity) -> bool:
     """True when both providers are distinct registered first-class providers.
 
