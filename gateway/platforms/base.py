@@ -905,7 +905,8 @@ def _credential_home_roots() -> list[Path]:
 
 def _kanban_root() -> Path:
     """Kanban is root-shared across profiles by design (``kanban_db.kanban_home``)."""
-    return Path(os.environ.get("HERMES_KANBAN_HOME", "").strip() or _HERMES_ROOT).expanduser()
+    from hermes_cli.kanban_db import kanban_home
+    return kanban_home()
 
 
 def _kanban_board_dirs() -> list[Path]:

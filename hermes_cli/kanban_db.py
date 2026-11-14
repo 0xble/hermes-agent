@@ -402,8 +402,8 @@ def kanban_home() -> Path:
     """``HERMES_KANBAN_HOME`` else ``get_default_hermes_root()``. Shared across
     profiles BY DESIGN: resolving through the active profile's HERMES_HOME would
     fork the board per profile and break the dispatcher/worker handoff."""
-    override = os.environ.get("HERMES_KANBAN_HOME", "").strip()
-    if override:
+    from agent.delegation_context import is_injected_kanban_home
+    if (override := os.environ.get("HERMES_KANBAN_HOME", "").strip()) and not is_injected_kanban_home():
         return Path(override).expanduser()
     from hermes_constants import get_default_hermes_root
     return get_default_hermes_root()
