@@ -90,6 +90,21 @@ options:
   #       reasoning_effort: medium
 """
 
+# Cron jobs keep Sol as their primary route, then use the same subscription
+# fallback order as delegation without spending the Opus pool by default.
+CRON_FALLBACKS = [
+    {"model": "claude-sonnet-5-5", "provider": "custom:claude-proxy", "reasoning_effort": "medium"},
+    {"model": "muse-wonder-full-1.0", "provider": "custom:openai-proxy", "reasoning_effort": "high"},
+    {"model": "grok-4.7", "provider": "xai-oauth", "reasoning_effort": "medium"},
+]
+
+
+def install_cron_fallbacks(config: dict, changes: list[str]) -> None:
+    cron = config.setdefault("cron", {})
+    if cron.get("fallback_providers") != CRON_FALLBACKS:
+        cron["fallback_providers"] = [dict(route) for route in CRON_FALLBACKS]
+        changes.append("cron.fallback_providers: claude-sonnet-5-5 -> Muse -> Grok (Opus removed from the default cron chain)")
+
 
 def role_settings():
     # Ruamel preserves absolute comment columns when this block is nested in
@@ -104,6 +119,7 @@ def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None
     config["delegation"]["backend"] = "model_map"
     config["delegation"]["inherit_service_tier"] = False
     config["delegation"]["fallback_providers"] = []
+    install_cron_fallbacks(config, changes)
     for option in settings["options"]:
         name = option["name"]
         aliases[name] = {"provider": option["provider"], "model": option["model"]}

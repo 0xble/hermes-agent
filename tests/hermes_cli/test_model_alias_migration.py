@@ -39,6 +39,10 @@ def test_config_retirement_keeps_aliases_and_plugin_policy_without_mutating_inpu
     assert all(o["provider"] == "custom:openai-proxy" and o["service_tier"] == "normal" for o in route["options"])
     assert all("service_tier" not in o["fallback_providers"][0] for o in route["options"])
     assert route["options"][2]["fallback_providers"][0]["provider"] == "xai-oauth"
+    assert [entry["model"] for entry in after["cron"]["fallback_providers"]] == [
+        "claude-sonnet-5-5", "muse-wonder-full-1.0", "grok-4.7"
+    ]
+    assert all(entry["model"] != "claude-opus-5-5" for entry in after["cron"]["fallback_providers"])
     assert "inherit_parent_aliases" not in after["delegation"]
     assert "advanced-delegation" in after["plugins"]["enabled"]
     assert after["model_aliases"]["attended"]["model"] == "opus"
@@ -93,6 +97,16 @@ def test_alias_migration_preserves_proxy_credentials_and_fallback_policy():
     assert after['model_aliases']['delegation-sol']['provider'] == 'custom:openai-proxy'
     assert route['provider'] == 'custom:openai-proxy'
     assert route['fallback_providers'][0]['model'] == 'gpt-6.1-terra'
+
+
+def test_existing_model_map_migration_repairs_cron_opus_default():
+    before, _ = migrate_document(_config())
+    before["cron"] = {"fallback_providers": [{"provider": "custom:claude-proxy", "model": "claude-opus-5-5"}]}
+    after, changes = migrate_document(before)
+    assert [entry["model"] for entry in after["cron"]["fallback_providers"]] == [
+        "claude-sonnet-5-5", "muse-wonder-full-1.0", "grok-4.7"
+    ]
+    assert any("cron.fallback_providers" in change for change in changes)
 
 
 def test_migration_persists_disabled_routes_as_comments_through_config_writer(tmp_path, monkeypatch):
