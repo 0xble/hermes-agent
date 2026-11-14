@@ -99,10 +99,47 @@ def test_alias_migration_preserves_proxy_credentials_and_fallback_policy():
     assert route['fallback_providers'][0]['model'] == 'gpt-6.1-terra'
 
 
+def test_existing_model_map_migration_preserves_explicit_empty_cron_fallbacks():
+    before, _ = migrate_document(_config())
+    before["cron"] = {"fallback_providers": []}
+    after, changes = migrate_document(before)
+    assert after["cron"]["fallback_providers"] == []
+    assert not any("cron.fallback_providers" in change for change in changes)
+
+
+def test_existing_model_map_migration_preserves_custom_cron_fallbacks():
+    custom = [{"provider": "nous", "model": "x"}]
+    before, _ = migrate_document(_config())
+    before["cron"] = {"fallback_providers": custom}
+    after, changes = migrate_document(before)
+    assert after["cron"]["fallback_providers"] == custom
+    assert not any("cron.fallback_providers" in change for change in changes)
+
+
+def test_existing_model_map_migration_preserves_explicit_none_cron_fallbacks():
+    before, _ = migrate_document(_config())
+    before["cron"] = {"fallback_providers": None}
+    after, changes = migrate_document(before)
+    assert after["cron"]["fallback_providers"] is None
+    assert not any("cron.fallback_providers" in change for change in changes)
+
+
 def test_existing_model_map_migration_repairs_cron_opus_default():
     before, _ = migrate_document(_config())
-    before["cron"] = {"fallback_providers": [{"provider": "custom:claude-proxy", "model": "claude-opus-5-5"}]}
+    before["cron"] = {"fallback_providers": [
+        {"provider": "custom:claude-proxy", "model": "claude-opus-5-5"},
+        {"provider": "custom:openai-proxy", "model": "old-fallback"},
+    ]}
     after, changes = migrate_document(before)
+    assert [entry["model"] for entry in after["cron"]["fallback_providers"]] == [
+        "claude-sonnet-5-5", "muse-wonder-full-1.0", "grok-4.7"
+    ]
+    assert after["cron"]["fallback_providers"][-1]["model"] == "grok-4.7"
+    assert any("cron.fallback_providers" in change for change in changes)
+
+
+def test_retirement_installs_missing_cron_fallbacks():
+    after, changes = migrate_document(_config())
     assert [entry["model"] for entry in after["cron"]["fallback_providers"]] == [
         "claude-sonnet-5-5", "muse-wonder-full-1.0", "grok-4.7"
     ]

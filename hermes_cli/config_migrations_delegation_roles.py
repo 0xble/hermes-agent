@@ -99,9 +99,24 @@ CRON_FALLBACKS = [
 ]
 
 
-def install_cron_fallbacks(config: dict, changes: list[str]) -> None:
-    cron = config.setdefault("cron", {})
-    if cron.get("fallback_providers") != CRON_FALLBACKS:
+def install_cron_fallbacks(config: dict, changes: list[str], *, install_missing: bool = False) -> None:
+    cron = config.get("cron")
+    if cron is None:
+        if "cron" not in config and install_missing:
+            cron = config["cron"] = {}
+        else:
+            return
+    if not isinstance(cron, dict):
+        return
+    if "fallback_providers" not in cron:
+        if install_missing:
+            cron["fallback_providers"] = [dict(route) for route in CRON_FALLBACKS]
+            changes.append("cron.fallback_providers: claude-sonnet-5-5 -> Muse -> Grok (Opus removed from the default cron chain)")
+        return
+    current = cron["fallback_providers"]
+    if (isinstance(current, list) and current and isinstance(current[0], dict)
+            and current[0].get("model") == "claude-opus-5-5"
+            and current[0].get("provider") == "custom:claude-proxy"):
         cron["fallback_providers"] = [dict(route) for route in CRON_FALLBACKS]
         changes.append("cron.fallback_providers: claude-sonnet-5-5 -> Muse -> Grok (Opus removed from the default cron chain)")
 
@@ -119,7 +134,7 @@ def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None
     config["delegation"]["backend"] = "model_map"
     config["delegation"]["inherit_service_tier"] = False
     config["delegation"]["fallback_providers"] = []
-    install_cron_fallbacks(config, changes)
+    install_cron_fallbacks(config, changes, install_missing=True)
     for option in settings["options"]:
         name = option["name"]
         aliases[name] = {"provider": option["provider"], "model": option["model"]}
