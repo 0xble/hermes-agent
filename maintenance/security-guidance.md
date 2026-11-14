@@ -48,3 +48,5 @@ released upstream implementation without losing path filtering, warning/block
 semantics, attribution, and tests. Roll back by reverting the logical patch and
 removing any separately installed profile copy only when the active profile no
 longer depends on it.
+
+Contract tests: `tests/plugins/test_security_guidance_plugin.py`.

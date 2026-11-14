@@ -92,3 +92,5 @@ locked transaction observation and compare-and-restore semantics.
 Verification: `scripts/run_tests.sh tests/tools/test_memory_transactions.py
 tests/tools/test_memory_tool.py`. Roll back core and its dependent journal version
 together. Preserve journal history and memory files across code rollback.
+
+Contract tests: `tests/plugins/test_canonical_skill_guard.py`, `tests/tools/test_memory_transactions.py`, `tests/tools/test_memory_tool.py`.

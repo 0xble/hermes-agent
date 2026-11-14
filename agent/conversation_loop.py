@@ -344,8 +344,6 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
     elif visible:
         checkpoint_parts += ["Visible response before the interruption:", visible]
     checkpoint = "\n\n".join(checkpoint_parts)
-    correction = f"[Context from the interrupted assistant response]\n{checkpoint}\n\n{text}"
-
     # The live tail is normally user or tool, so an assistant placeholder + correction
     # keeps strict alternation; if the tail is already assistant, the checkpoint is folded
     # into the user correction instead of creating assistant→assistant. The placeholder
@@ -355,8 +353,8 @@ def _apply_active_turn_redirect(agent: Any, messages: list[dict[str, Any]], text
         # Hidden row with a neutral api_content (#88955). Never _INTERRUPT_SCAFFOLD_MARKER:
         # as assistant text the model echoes it (#81841).
         append_message(messages, {"role": "assistant", "content": visible} if visible else hidden_interrupt_placeholder_row())
-    # Transcript shows the user's own words; the provider replays the scaffolded form.
-    append_message(messages, {"role": "user", "content": text, "api_content": correction})
+    from agent.plugin_live_notes import append_redirect_correction
+    append_redirect_correction(agent, messages, text, checkpoint)
 
     # Stateful scrubber for <memory-context> spans split across stream deltas (#5719).  sanitize_context()
     # alone can't survive chunk boundaries because the block regex needs both tags in one string.
@@ -1782,6 +1780,10 @@ def _run_conversation_turn(
     agent._ephemeral_reasoning_off = False
     agent._auth_pool_refresh_counts = {}
     agent._last_turn_usage = None
+    # The unattended same-provider window is per outage within a turn: a failed turn's expired
+    # outage start must not cancel the next turn's window.
+    from agent.fallback_cooldown import clear_noninteractive_transient_retry
+    clear_noninteractive_transient_retry(agent)
 
     s = _LoopState(
         system_message=system_message, moa_config=moa_config,

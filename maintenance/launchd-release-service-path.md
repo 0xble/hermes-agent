@@ -27,3 +27,5 @@ upstream has no immutable-release guardian.
 Guard: `scripts/run_tests.sh tests/hermes_cli/test_launchd_release_path.py`. Retire with the
 guardian. Rollback reverts this identity's generator change and tests. The next release
 render then takes PATH from the caller again, with no state migration.
+
+Contract tests: `tests/hermes_cli/test_launchd_release_path.py`.

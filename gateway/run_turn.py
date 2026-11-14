@@ -28,6 +28,7 @@ from agent.turn_failure_copy import (
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
+from gateway import loop_completion
 from gateway.config import Platform
 from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
@@ -1315,6 +1316,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 return
             if (event.metadata or {}).get("checkin"):
                 message_text = event.text
+            event._loop_completion_identity = await self._run_in_executor_with_context(
+                loop_completion.capture_loop_identity, _run_start_session_id)
             started, agent_result = await self._invoke_loop_wake_effect(
                 event, self._run_agent,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
@@ -1339,6 +1342,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             if not started:
                 self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
                 return
+            from gateway.session_automation_retry import held_runtime_refusal
+            if held_runtime_refusal(event, agent_result):
+                return None  # The FIFO retries this unexecuted input without a transcript apology.
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -1362,9 +1368,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 if isinstance(agent_result.get("queued_terminal_goal_identity"), dict):
                     # Post-turn goal hooks judge the terminal turn: carry its identity on the head.
                     event._post_turn_goal_identity = agent_result["queued_terminal_goal_identity"]
-                if agent_result.get("queued_chain_loop_tick"):
-                    # The latest loop wake the chain ran owns the loop completion.
-                    event._post_turn_loop_tick = agent_result["queued_chain_loop_tick"]
+                loop_completion.carry_response(agent_result, event)
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -2151,6 +2155,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                                    if reasoning_override is _NO_ATTENDED_ACTIVITY_STAMP else reasoning_override),
             "reasoning_scope": state.conversation.reasoning_override_scope if state is not None else "session",
         }
+        if _cleanup_progress and session_key:
+            turn_ctx._card_recorder = self._progress_card_recorder(turn_ctx)
         turn_runner = TurnRunner(self, turn_ctx, model_assignment=model_assignment)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -3087,6 +3093,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 actor_scope = (scoped_turn_actor(pending_event, self._session_state(next_session_key).turn)
                                if pending_event is not None else nullcontext())
                 with actor_scope:
+                    loop_completion_identity = await self._run_in_executor_with_context(
+                        loop_completion.capture_loop_identity, session_id)
                     followup_result = await self._run_agent(
                         message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                         source=next_source, session_id=session_id, session_key=next_session_key,
@@ -3118,11 +3126,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
-        # The deepest queued loop wake wins (inner recursions fill this first): it is the latest
-        # tick the chain ran, so the chain's single loop completion settles exactly that tick.
-        _pending_loop_tick = self._post_turn_goal_identity(pending_event).get("loop_tick")
-        if isinstance(merged, dict) and _pending_loop_tick and not merged.get("queued_chain_loop_tick"):
-            merged = {**merged, "queued_chain_loop_tick": _pending_loop_tick}
+        merged = loop_completion.carry_followup(
+            merged, loop_completion_identity, self._post_turn_goal_identity(pending_event).get("loop_tick"))
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
         # reply is recorded under the first message's id, so a first reply that was refused (flood
@@ -3262,6 +3267,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 _sk, _streamed, _previewed, _content_delivered,
             )
             response["already_sent"] = True
+        elif _sc is not None and getattr(_sc, "_abandoned_draft_message_id", None):
+            if not turn_ctx._run_still_current() or response.get("interrupted"):
+                return  # Do not fall through to plugin-transformed reconciliation either.
+            # A dead consumer sealed its owned preview: finish that message, never infer
+            # ownership from thread metadata or post a duplicate beside the orphan.
+            await self._run_agent_edit_streamed_message(
+                _sc, source, response, _final, _sk=_sk,
+                ok=("Reconciled abandoned draft for session %s in message %s.", _sk, _sc.message_id),
+                fail_result="Abandoned-draft edit failed for session %s (%s); sending final normally.",
+                fail_exc="Abandoned-draft edit failed for session %s: %s; sending final normally.",
+            )
         elif not _transformed and _stale_finalized and _sc is not None:
             # Stale finalize: edit the streamed message up to the complete response (on failure the
             # normal send delivers). Not for split delivery — message_id is only the LAST chunk.
@@ -3309,6 +3325,39 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 # Last chunk of a split stream: the surviving message a reaction targets.
                 response["_delivered_platform_message_id"] = str(delivered_id)
 
+    def _progress_card_recorder(self, turn_ctx: TurnContext) -> Callable[[str], None]:
+        """Durably record each temporary card as it is sent: the deletion callback below lives only
+        in memory, and a restart before it fires would strand the card (boot deletes orphans).
+        Tracking sites run on the loop or a worker thread, so the write is handed to the loop and
+        then off it."""
+        loop, pending = asyncio.get_running_loop(), turn_ctx._card_writes
+        key, chat_id = turn_ctx.session_key, turn_ctx.source.chat_id
+
+        def spawn(message_id: str) -> None:
+            task = self._retain_background_task(asyncio.ensure_future(
+                self._persist_progress_cards("record_progress_card", key, chat_id, message_id)))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+
+        def record(message_id: str) -> None:
+            with suppress(RuntimeError):  # loop already closed: the card just goes unrecorded
+                loop.call_soon_threadsafe(spawn, message_id)
+        return record
+
+    async def _persist_progress_cards(self, method: str, session_key: str, *args: Any) -> None:
+        try:
+            await getattr(self.async_session_store, method)(session_key, *args)
+        except Exception as exc:
+            logger.warning("Progress card %s failed for session %s: %s", method, session_key, exc)
+
+    async def _forget_turn_progress_cards(self, turn_ctx: TurnContext, message_ids: list[str]) -> None:
+        # A record still in flight would otherwise land after its forget and outlive it.
+        pending = list(turn_ctx._card_writes)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await self._persist_progress_cards(
+            "forget_progress_cards", turn_ctx.session_key, turn_ctx.source.chat_id, message_ids)
+
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Register turn-local deletion, awaited after confirmed final delivery."""
         ids, key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
@@ -3324,6 +3373,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         ):
             if turn_ctx._cleanup_progress and ids and isinstance(response, dict) and response.get("failed"):
                 logger.info("Temp bubble cleanup skipped for session %s: failed run", key)
+                if key:  # failed runs keep their cards on purpose, so boot must not delete them either
+                    self._retain_background_task(asyncio.ensure_future(
+                        self._forget_turn_progress_cards(turn_ctx, list(ids))))
             return
         owner = turn_ctx._post_delivery_adapter or _cleanup_adapter
         chat_id = turn_ctx.source.chat_id
@@ -3358,6 +3410,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                     raise
                 except Exception as error:
                     failures.extend(f"{mid}:{type(error).__name__}" for mid in owned)
+            # Settled after one attempt, as before the record existed: a cancelled cleanup (shutdown)
+            # re-raised above and keeps its record, so the next boot finishes it.
+            await self._forget_turn_progress_cards(turn_ctx, snapshot)
             if failures:
                 logger.warning("Temp bubble cleanup failures for session %s: %s", key,
                                ", ".join(failures[:10]))
@@ -3466,7 +3521,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)
                         if turn_ctx._cleanup_progress:
-                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                            turn_ctx.track_cleanup_id(_heartbeat_msg_id)
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 

@@ -7,6 +7,14 @@ from time import monotonic, time
 from hermes_state_runtime import RuntimeStoreError
 
 logger = logging.getLogger(__name__)
+# Strong references for fenced admissions whose observer was cancelled.
+_SETTLING = set()
+
+
+def _settled(task):
+    _SETTLING.discard(task)
+    if not task.cancelled():
+        task.exception()  # the observer may already have been cancelled
 
 
 def goal_wait_identity(authority, session_id, state):
@@ -162,24 +170,36 @@ async def dispatch_goal_wait(runner, adapter, source, key, sid, manager, prompt,
     reservation = runner._reserve_background_turn(key, event)
     if reservation is None:
         return
-    try:
-        cleared = await runner._clear_stale_resume_pending(key, resume_marker, sid, 'goal wakeup')
-    except BaseException:
-        runner._release_background_turn(reservation)
-        raise
-    if not cleared:
-        runner._release_background_turn(reservation)
-        return
-    # The admission owns the reservation even if its observer is cancelled while
-    # its shielded writer continues. A successful reservation stays until claim.
+
+    # /incognito refuses while this admission is pending (gate.admission_pending), so a privacy
+    # switch cannot land between the private-session check and the durable write. One shielded
+    # task owns the fence from the marker clear through physical settlement; a cancelled
+    # observer returns at once without ending the fence early.
     import asyncio
-    operation = _dispatch_reserved(runner, authority, managed, adapter, source, key, sid,
-                                   manager, prompt, event, identity, reservation)
-    if authority is not None:
-        from gateway.session_runtime_workers import track_mutation
-        task = track_mutation(authority, operation)
-    else:
-        task = asyncio.create_task(operation)
+
+    async def fenced():
+        with runner._get_replay_scheduler().gate.admitting(reservation):
+            try:
+                cleared = await runner._clear_stale_resume_pending(key, resume_marker, sid, 'goal wakeup')
+            except BaseException:
+                runner._release_background_turn(reservation)
+                raise
+            if not cleared:
+                runner._release_background_turn(reservation)
+                return
+            # The admission owns the reservation even if its observer is cancelled while
+            # its shielded writer continues. A successful reservation stays until claim.
+            operation = _dispatch_reserved(runner, authority, managed, adapter, source, key, sid,
+                                           manager, prompt, event, identity, reservation)
+            if authority is not None:
+                from gateway.session_runtime_workers import track_mutation
+                await track_mutation(authority, operation)
+            else:
+                await operation
+
+    task = asyncio.create_task(fenced())
+    _SETTLING.add(task)
+    task.add_done_callback(_settled)
     await asyncio.shield(task)
 
 

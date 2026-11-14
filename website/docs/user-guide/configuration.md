@@ -1502,7 +1502,7 @@ Under `goals.autonomy` the agent cannot resume a goal you paused, including with
 
 `goals.auto_notices` (fork setting) controls whether a goal the agent sets or extends through the `goal_set` tool is announced with its committed text and completion contract. It applies when `goals.notices` is enabled. Turning off `auto_notices` alone does not hide `/goal` replies or judge verdicts.
 
-`goals.autonomy` defaults to `false`, preserving the judge and approval behavior above. When `true`, the supporting `goal_set` plugin can set, revise, replace, pause, resume and complete goals without approval. Clear remains user-only. Completion requires a mapping from every verification criterion to recorded proof, passing quality gates and no recorded hard-limit breach. Refusals leave the goal active and name the gap in history and `/goal status`.
+`goals.autonomy` defaults to `false`, preserving the judge and approval behavior above. When `true`, the supporting `goal_set` plugin can set, revise, replace, pause, resume, clear and complete goals without approval. Clear requires a nonempty `reason` (otherwise `reason_required`) for this session or a resolved target. Clear only an obsolete, superseded, duplicated or handed-off goal; cite verified takeover for a handoff. Never clear to escape unmet criteria or failing checks, and use `complete` for an achieved outcome. The reason and agent/autonomy authority are retained in the goal's existing revision history and control receipt; the applied notice includes the reason (subject to `goals.notices`). Native `/goal clear` is unchanged. Completion requires a mapping from every verification criterion to recorded proof, passing quality gates and no recorded hard-limit breach. Refusals leave the goal active and name the gap in history and `/goal status`.
 
 Autonomous revisions and replacements retain constraints, hard limits and unmet criteria. Removing an item requires the user's current verbatim removal instruction naming it. A blocked route calls for another route or a timed sleep with an automatic wake. Existing blocked/input states migrate on load. A finite `max_turns` becomes a paced checkpoint that records consumed turns, sleeps and starts another continuation span, allowing ongoing model spend. Explicit contract limits still bind, and an explicit pause remains paused.
 
@@ -2229,7 +2229,8 @@ Fast mode asks the provider for faster output at a premium price: OpenAI [Priori
 agent:
   service_tier: ""          # "" / normal | fast | priority | ultrafast | auto | cold
   fast_auto_seconds: 60     # window for auto / cold
-  fast_expiry_seconds: 0    # gateway sessions only: seconds before a fast/ultrafast override switches to normal; 0 disables
+  fast_expiry_seconds: 1800     # gateway session fast: 30 minutes, then normal
+  ultrafast_expiry_seconds: 300 # gateway session ultrafast: 5 minutes, then normal
 ```
 
 | Mode | When fast params are sent | Use it for |
@@ -2239,7 +2240,7 @@ agent:
 | `auto` | Requests in the first `fast_auto_seconds` of **every** turn | Snappy first reply; long tool loops fall back to standard pricing |
 | `cold` | Same window, but only on the **first turn** of a session (no prior history) | Fast onboarding reply, standard pricing afterwards |
 
-`/fast normal|fast|ultrafast|auto|cold` switches the mode for the session. Add `--global` to persist to `config.yaml`. `/fast` alone shows the current mode. `fast_expiry_seconds` applies only to messaging gateway sessions; CLI and TUI sessions do not expire.
+`/fast normal|fast|ultrafast|auto|cold` switches the mode for the session. Add `--global` to persist to `config.yaml`. `/fast` alone shows the current mode. `fast_expiry_seconds` and `ultrafast_expiry_seconds` apply only to messaging gateway session overrides, with defaults of 30 minutes and 5 minutes respectively. Set either to `0` to disable expiry for that tier. On expiry the session switches to explicit normal, even when the configured default is fast. `auto`, `cold`, explicit normal, and global settings do not use these deadlines. CLI and TUI sessions do not expire.
 
 **Cost note:** both providers bill fast requests at a multiplier on standard rates (Anthropic: $8 / $40 per MTok in/out on Opus 5.5, $10 / $50 on Opus 5 and Opus 4.8), stacking with prompt-cache pricing. Hermes prices each Anthropic response from the speed the API reports in `usage.speed`. `auto`/`cold` bound that premium to the window only. Fast params are only sent to the first-party endpoint that supports them (`api.openai.com` / Codex subscription, `api.anthropic.com`, `api.x.ai`); OpenRouter, Nous Portal, Copilot, Azure, Bedrock, and custom `base_url` routes never receive them in any mode, unless a custom provider opts in with `capabilities.fast_mode` (below).
 
@@ -3375,6 +3376,8 @@ delegation:
   orchestrator_enabled: true                # Global kill switch. When false, role="orchestrator" is ignored and every child is forced to leaf regardless of max_spawn_depth.
   oneshot_max_children: 2                   # Total subagents a one-shot run (hermes chat -q / --oneshot) may spawn; 0 = unlimited. Interactive and gateway sessions are never capped by this.
   gateway_mode: auto                        # Gateway sessions: auto | inline | background. auto = join children inside the turn (one answer) on a messaging chat whose display.interim_assistant_messages is off. See Subagent Delegation → Messaging chats without interim messages.
+  fallback:
+    transient_retry_window_seconds: 180     # Subagent/cron/side-agent runs retry transient provider errors on the same provider this long before falling back; 0 = fail over immediately
 ```
 
 **Delegation strategy (`backend`):** `delegation.backend` picks the strategy plugin that decides each subagent's route. `default` follows the keys below (or the parent's route when they are empty). Plugin strategies such as `model_map` (a named model per task) and `profile_routes` (a Hermes profile per task) read their settings from `delegation.backends.<backend name>`. A backend whose plugin is missing or disabled fails closed: `delegate_task` returns a tool error naming it and the fix (`/delegation default`, or `hermes config set delegation.backend default`) instead of running children on another route. A backend route without its own `fallback_providers` uses `delegation.fallback_providers`. See [Subagent Delegation → Delegation strategies](features/delegation.md#delegation-strategies-delegationbackend).
@@ -3413,6 +3416,8 @@ For full profile isolation, use the plugin's `profile_routes` backend.
 **Subagent reasoning and Fast mode:** `delegation.reasoning_effort` sets the children's default thinking level (empty = the parent's level). An explicit session pick on the parent (`/reasoning <level>`, `--reasoning`, `/model … --reasoning`) wins over it, so raising the effort for a hard task also raises it for the subagents that task spawns; a `--global` save is a configured default, not a pick. The level is clamped to what each child's route supports. With `delegation.inherit_service_tier: true`, children also inherit the parent's `/fast` mode (`fast`, `auto` or `cold`), including under a pinned `delegation.provider`: the Fast request field is derived for the child's own route, and a route without a fast mode receives none. An explicit `service_tier`/`speed` in `delegation.request_overrides` wins.
 
 **Subagent fallback chain:** Set `delegation.fallback_providers` to give workers their own chain (same entry shape as the top-level list). An explicitly pinned child (by provider, endpoint, or model) uses that chain only when it is declared; otherwise it fails loudly instead of borrowing the parent agent's route. For an unpinned child, an absent or `null` setting preserves parent-chain inheritance. Use `fallback_providers: []` under `delegation:` to disable child fallback entirely.
+
+**Unattended retry window:** `delegation.fallback.transient_retry_window_seconds` (default `180`) makes subagent, cron and side-agent runs keep retrying the same provider through transient errors (rate limits, overloads, 5xx, timeouts) for that long before taking the fallback chain. `0` restores immediate failover. Interactive sessions and billing errors fail over immediately regardless. See [Fallback Providers](./features/fallback-providers.md#when-fallback-triggers).
 
 **Direct endpoint override:** If you want the obvious custom-endpoint path, set `delegation.base_url`, `delegation.api_key`, and `delegation.model`. That sends subagents directly to that OpenAI-compatible endpoint and takes precedence over `delegation.provider`. If `delegation.api_key` is omitted, Hermes falls back to `OPENAI_API_KEY` only. When `delegation.provider` is set alongside `delegation.base_url`, the explicit endpoint and key still win, but that provider's request settings (`extra_body` overrides and max output tokens from your `custom_providers` entry) are carried into the subagent.
 

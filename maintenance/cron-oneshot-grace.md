@@ -46,3 +46,5 @@ Retire when a selected upstream release honors the same per-job field at every
 one-shot eligibility site with the same 120-second floor and held-payload
 contract. Roll back by reverting commits carrying `Fork-Patch:
 cron-oneshot-grace`.
+
+Contract tests: `tests/cron/test_oneshot_per_job_grace.py`.

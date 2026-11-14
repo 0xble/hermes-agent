@@ -40,6 +40,15 @@ not only the command reply.
   session private. Remove the record to repair that topic.
 - `/new` in a private topic ends the interval, then binds, titles and announces
   the new session as public work. `/topic` is refused while private.
+- A goal is suspended while its topic is private: no judge call, no revive, no
+  wakeup and no continuation. The judge would send the private reply to the
+  auxiliary goal_judge provider, and goal writes are withheld anyway. The goal
+  resumes untouched after `/incognito off`. Background wake admission holds its
+  existing reservation through bookkeeping and physical writes that outlive caller
+  cancellation. `/incognito` refuses while admission is pending, another task owns
+  the adapter guard, or authority work is queued/running before its agent slot exists.
+  The command's own otherwise-idle adapter guard is not foreign work. Do not hold
+  the model-route lock across dispatch, because an inline slash command acquires it itself.
 - The content-free sidecar preserves privacy routing across restart. Model
   overrides pass through the existing sanitizer. Do not persist a private model
   selection or credentials as recovery metadata.
@@ -59,6 +68,20 @@ not only the command reply.
   Private input and plugin injections must stay on the in-process RAM lane, and
   delayed admission, worker, local-mutation and compression writers must carry
   every affected session identity into SQLite admission.
+- Runtime receipts project ownership from their closed operation schema and the
+  owner's actual lineage. A public message, title, tool output or result mentioning
+  a private session ID remains public content. Privacy refusal is `privacy_denied`,
+  never a successful empty receipt, and consumes no sequence or revision.
+- Worker outboxes check producer scope, revoked copied work and typed ownership
+  before their first save, replay or adoption save. Public writes still journal
+  before send. A definite first-send owner privacy refusal releases its uncommitted
+  sequence. Reopened entries and ambiguous lost ACKs retain the exact pending
+  operation for replay, since a later refusal cannot disprove an earlier commit.
+- Entering incognito also waits for registered, running or unknown durable work
+  anywhere in the conversation's logical/physical lineage. It does not cancel
+  workers. The store takes its lock, the owning DB writer lock, then exclusive
+  privacy admission before sidecar/model/registry publication. New assignments
+  refuse private targets. An unavailable or closed DB cannot acknowledge entry.
 - Relay instrumentation, cached public Relay leases and shared metrics must not
   observe a private turn. Refuse instrumentation before discovering or creating
   a host, not after the subscriber has queued its payload.
@@ -137,3 +160,5 @@ Retire this unit with its implementation only after a replacement passes that
 same boundary proof. A source rollback removes the feature, it does not retract
 content already sent to messaging or model providers. Never turn an active
 private lane public merely by ignoring or deleting its routing sidecar.
+
+Contract tests: `tests/agent/test_incognito.py`, `tests/agent/test_incognito_main_sinks.py`, `tests/hermes_cli/test_incognito_plugins.py`, `tests/plugins/platforms/telegram/test_incognito_ingress.py`, `tests/tools/test_delegate_tool.py`, `tests/gateway/test_incognito_turn_e2e.py`, `tests/hermes_state/test_incognito_off_regression.py`.

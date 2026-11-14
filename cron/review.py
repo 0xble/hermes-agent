@@ -190,6 +190,42 @@ def check_contract(text: str, contract: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def check_candidate(
+    original: str, candidate: str, contract: dict[str, Any]
+) -> dict[str, Any]:
+    """Check the envelope and any opt-in immutable visible source lines."""
+    checked = check_contract(candidate, contract)
+    if "preserve_line_patterns" not in contract:
+        return checked
+    patterns = contract["preserve_line_patterns"]
+    violation = None
+    if not isinstance(patterns, list) or not patterns or any(
+        not isinstance(pattern, str) or not pattern.strip() for pattern in patterns
+    ):
+        violation = "preserve_line_patterns must be a non-empty list of non-empty regex strings"
+    else:
+        try:
+            compiled = [re.compile(pattern) for pattern in patterns]
+        except re.error:
+            violation = "preserve_line_patterns contains an invalid regex"
+        else:
+            def protected_lines(text):
+                return [
+                    line for line in _contract_lines(text)
+                    if any(pattern.search(line) for pattern in compiled)
+                ]
+
+            source = protected_lines(original)
+            if not source:
+                violation = "preserve_line_patterns matches no original report lines"
+            elif source != protected_lines(candidate):
+                violation = "candidate changes protected report lines or their order"
+    if violation:
+        checked["violations"].append(violation)
+        checked["passed"] = False
+    return checked
+
+
 def parse_decision(reply: str) -> tuple[str, str]:
     """Parse the strict invisible-review protocol."""
     lines = str(reply or "").strip().splitlines()

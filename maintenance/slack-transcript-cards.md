@@ -17,3 +17,5 @@ The shared echo implementation moves from `gateway/run_inbound.py` into the exis
 ## Verification and Retirement
 
 The behavior proof is `tests/gateway/test_slack_transcript_echo.py`, with existing Slack transport, Telegram voice, and Telegram daily-quota tests as surrounding coverage. Retire this fork unit when released upstream provides the same literal-body, attributed-context contract without regressions in those surfaces. Rollback requires only reverting this patch, no state migration.
+
+Contract tests: `tests/gateway/test_slack_transcript_echo.py`.

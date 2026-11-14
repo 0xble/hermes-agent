@@ -318,3 +318,38 @@ def test_compaction_summary_stays_unstamped_across_real_prune(tmp_path):
         store.close_all_db_handles()
     assert pruned
     assert first[0]["content"] == replay[0]["content"] == summary["content"]
+
+
+def test_runtime_notice_replays_unstamped_after_compaction_and_keeps_steer_provenance(tmp_path):
+    from types import SimpleNamespace
+    from agent.plugin_live_notes import append_continuation_notice, queue_plugin_notice
+    from agent.synthetic_prompt import human_prompt_text
+    from gateway.run import _build_gateway_agent_history
+    from hermes_state import SessionDB
+
+    call = {"id": "probe", "type": "function", "function": {"name": "terminal", "arguments": "{}"}}
+    for steer in (None, "Use the other branch"):
+        agent = SimpleNamespace()
+        messages = [{"role": "user", "content": "run", "timestamp": 1_000_000_000.0},
+                    {"role": "assistant", "content": "", "tool_calls": [call]},
+                    {"role": "tool", "content": "receipt", "tool_call_id": "probe"}]
+        queue_plugin_notice(agent, "plugin", "Use the new tool")
+        append_continuation_notice(agent, messages, steer)
+        sent = messages[-1]
+        messages.append({"role": "assistant", "content": "done"})
+        db = SessionDB(tmp_path / ("steer.db" if steer else "notice.db"))
+        try:
+            db.create_session("room", source="test")
+            db.archive_and_compact("room", messages)
+            first, _ = _build_gateway_agent_history(db.get_messages_as_conversation("room"), inject_timestamps=True)
+            db.archive_and_compact("room", first)
+            replay, _ = _build_gateway_agent_history(db.get_messages_as_conversation("room"), inject_timestamps=True)
+        finally:
+            db.close()
+        for rows in (first, replay):
+            notice = next(m for m in rows if "Use the new tool" in str(m.get("content")))
+            assert notice["content"] == sent["content"]
+            assert notice["display_kind"] == sent["display_kind"]
+            assert notice["display_metadata"] == sent["display_metadata"]
+            assert human_prompt_text(notice["content"], display_kind=notice["display_kind"]) == steer
+            assert rows[0]["content"] != "run"  # ordinary users still get their timestamp

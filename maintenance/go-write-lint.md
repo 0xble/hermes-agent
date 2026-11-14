@@ -20,3 +20,5 @@ Delivery route: an owned-fork PR only. No upstream publication. Activation comes
 ## Adoption and retirement
 
 On upstream sync, keep this patch while upstream's per-file Go linter type-checks a single file. Retire it if upstream switches to a syntax-only or package-aware check that passes both tests.
+
+Contract tests: `tests/agent/lsp/test_shell_linter_lsp_skip.py`.

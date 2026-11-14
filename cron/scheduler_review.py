@@ -285,7 +285,7 @@ def _record_review_progress(job, **fields):
 
 
 def _select_review_candidate(job, content, subject, contract, receipt, deadline_epoch):
-    from cron.review import check_contract, parse_decision
+    from cron.review import check_candidate, parse_decision
 
     if job.get("_review_decision"):
         decision, payload = job["_review_decision"]
@@ -321,7 +321,7 @@ def _select_review_candidate(job, content, subject, contract, receipt, deadline_
     if decision == "PRESENT":
         return decision, content
     if decision == "FIX":
-        checked = check_contract(payload, contract)
+        checked = check_candidate(content, payload, contract)
         receipt["candidates"].append({"kind": "fix", **checked})
         return (
             ("FIX", payload)
@@ -340,7 +340,7 @@ def _select_review_candidate(job, content, subject, contract, receipt, deadline_
         job, min(budget, total_remaining)
     )
     checked = (
-        check_contract(text, contract)
+        check_candidate(content, text, contract)
         if success
         else {"passed": False, "violations": [error or "rerun failed"], "silent": False}
     )

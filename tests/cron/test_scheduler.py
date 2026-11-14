@@ -1245,7 +1245,7 @@ class TestRunJobModelResolution:
              patch("hermes_cli.runtime_provider.resolve_runtime_provider",
                    return_value=self._RUNTIME), \
              patch("run_agent.AIAgent") as mock_agent_cls:
-            success, _, _, error = run_job(job)
+            success, _, _, error = _run_owned_job(job, tmp_path, fake_db)
 
         assert success is False
         assert error is not None

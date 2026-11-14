@@ -70,3 +70,5 @@ barrier", or "goal parked forever" as of 2026-09-26.
 Retire when upstream ships an equivalent idle re-check across gateway and TUI that passes these
 tests. Roll back by reverting this patch's commit. No schema, config, or state migration is
 introduced, and parked goals keep their barriers.
+
+Contract tests: `tests/hermes_cli/test_goal_parked_idle_wake.py`, `tests/gateway/test_goal_continuation_drain.py`, `tests/gateway/test_goal_parked_idle_wake.py`, `tests/tui_gateway/test_goal_parked_idle_wake.py`, `tests/hermes_cli/test_goals.py`, `tests/hermes_cli/test_goal_external_wait_backoff.py`, `tests/hermes_cli/test_goal_dispatch.py`.

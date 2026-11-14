@@ -437,3 +437,5 @@ Retire when a released upstream implementation satisfies the complete contract
 and passes the focused regressions. Rollback is a source revert of every commit
 carrying `Fork-Patch: goal-external-wait-backoff` (production code, tests and this
 record together). The durable fields remain optional, so old rows stay readable.
+
+Contract tests: `tests/hermes_cli/test_goal_readonly_evidence.py`, `tests/gateway/test_goal_parked_idle_wake.py`, `tests/hermes_cli/test_goal_external_wait_backoff.py`, `tests/hermes_cli/test_goal_external_wait_backoff_real_path.py`.

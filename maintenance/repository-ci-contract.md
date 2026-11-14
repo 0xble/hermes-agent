@@ -43,3 +43,6 @@ independent of host timing. CLI children continue to run their real validators.
 
 Fork-Patch-Backfill: 739ced4676c82324042e5b0b8d7e3ba1ed7bf432; repository-ci-contract
 Fork-Patch-Backfill: b1fd9e549fa185d80060a9116fa6b2201162cd0c; repository-ci-contract
+
+
+Contract tests: `tests/scripts/test_fork_patch_trailers.py`.

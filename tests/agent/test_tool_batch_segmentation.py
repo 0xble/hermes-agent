@@ -11,6 +11,7 @@ concurrently, barrier calls sequentially — while preserving:
   * side-effect boundaries (no call starts before an earlier barrier ends).
 """
 
+import copy
 import json
 import threading
 import uuid
@@ -20,11 +21,13 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from run_agent import AIAgent
+from agent.agent_runtime_helpers import sanitize_tool_call_arguments
 from agent.tool_dispatch_helpers import (
     _plan_tool_batch_segments,
     _should_parallelize_tool_batch,
 )
 from agent.prompt_builder import STEER_MARKER_OPEN
+from agent.turn_iteration_prep import prepare_iteration
 from tools.budget_config import BudgetConfig
 from tools.tool_result_storage import PERSISTED_OUTPUT_TAG
 
@@ -377,6 +380,18 @@ def _make_tool_defs(*names: str) -> list:
     ]
 
 
+def _batch_history(calls):
+    """The real pre-request boundary requires each result's assistant call."""
+    return [
+        {"role": "user", "content": "run"},
+        {"role": "assistant", "content": "", "tool_calls": [
+            {"id": call.id, "type": call.type, "function": {
+                "name": call.function.name, "arguments": call.function.arguments,
+            }} for call in calls
+        ]},
+    ]
+
+
 @pytest.fixture()
 def agent():
     with (
@@ -504,15 +519,14 @@ class TestSegmentedDispatchIntegration:
             assert "cancelled" in m["content"] or "skipped" in m["content"]
 
     def test_steer_lands_exactly_once_in_mixed_batch(self, agent):
-        """The whole-batch finalizer drains steer once, so the marker cannot
-        be duplicated by segment boundaries."""
+        """The next request drains steer once after all segments finish."""
         calls = [
             _tc("web_search", '{"query":"a"}', call_id="s1"),
             _tc("web_search", '{"query":"b"}', call_id="s2"),
             _tc("terminal", '{"command":"echo hi"}', call_id="t1"),
         ]
         msg = SimpleNamespace(content="", tool_calls=calls)
-        messages = []
+        messages = _batch_history(calls)
 
         def fake_handle(name, args, task_id, **kwargs):
             return json.dumps({"ok": True})
@@ -521,9 +535,18 @@ class TestSegmentedDispatchIntegration:
         with patch("model_tools.handle_function_call", side_effect=fake_handle):
             agent._execute_tool_calls(msg, messages, "task-1")
 
+        receipts = copy.deepcopy(messages)
+        tool_results = [m for m in receipts if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in tool_results] == [call.id for call in calls]
+        prepare_iteration(agent, messages=messages, api_call_count=2)
+        assert messages[:-1] == receipts
+        assert messages[-1]["role"] == "user"
         contents = [m["content"] for m in messages]
         hits = [c for c in contents if "focus on the tests" in c]
         assert len(hits) == 1
+        delivered = copy.deepcopy(messages)
+        prepare_iteration(agent, messages=messages, api_call_count=3)
+        assert messages == delivered
 
     @pytest.mark.parametrize(
         ("calls", "expected_segment_kinds"),
@@ -564,14 +587,14 @@ class TestSegmentedDispatchIntegration:
     def test_steer_survives_turn_budget_in_every_dispatch_path(
         self, agent, calls, expected_segment_kinds
     ):
-        """A steer must be appended after aggregate budgeting in direct
+        """The next request carries steer after aggregate budgeting in direct
         concurrent, direct sequential, and segmented mixed batches.
 
         The large result forces ``enforce_turn_budget()`` to replace it.
         Before the fix, the per-tool drain consumed the steer first, so that
         replacement silently discarded the canonical marker.
         """
-        messages = []
+        messages = _batch_history(calls)
         msg = SimpleNamespace(content="", tool_calls=calls)
         budget = BudgetConfig(
             default_result_size=10_000,
@@ -594,20 +617,29 @@ class TestSegmentedDispatchIntegration:
             agent._execute_tool_calls(msg, messages, "task-1")
 
         large_result_index = next(i for i, call in enumerate(calls) if call.id.endswith("large"))
-        _assert_budget_replaced(messages[large_result_index]["content"])
+        tool_results = [m for m in messages if m["role"] == "tool"]
+        _assert_budget_replaced(tool_results[large_result_index]["content"])
+        receipts = copy.deepcopy(messages)
+        tool_results = [m for m in receipts if m["role"] == "tool"]
+        assert [m["tool_call_id"] for m in tool_results] == [call.id for call in calls]
+        prepare_iteration(agent, messages=messages, api_call_count=2)
+        assert messages[:-1] == receipts
         steer_messages = [m for m in messages if STEER_MARKER_OPEN in m["content"]]
         assert steer_messages == [messages[-1]]
         assert "preserve this steer after budget enforcement" in steer_messages[0]["content"]
+        delivered = copy.deepcopy(messages)
+        prepare_iteration(agent, messages=messages, api_call_count=3)
+        assert messages == delivered
 
     def test_steer_survives_turn_budget_after_malformed_arguments(self, agent):
-        """Malformed arguments still reach the shared post-budget finalizer.
+        """Malformed arguments still reach the shared pre-request continuation.
 
         The parser error itself can exceed a constrained turn budget.  A steer
         queued before that malformed sequential call must therefore remain
         pending until after the error result is replaced by the budget preview.
         """
         calls = [_tc("terminal", "{not json", call_id="malformed")]
-        messages = []
+        messages = _batch_history(calls)
         msg = SimpleNamespace(content="", tool_calls=calls)
         budget = BudgetConfig(
             default_result_size=10_000,
@@ -621,12 +653,25 @@ class TestSegmentedDispatchIntegration:
         with patch("agent.tool_executor._budget_for_agent", return_value=budget):
             agent._execute_tool_calls(msg, messages, "task-1")
 
-        assert len(messages) == 2
-        _assert_budget_replaced(messages[0]["content"])
-        assert STEER_MARKER_OPEN not in messages[0]["content"]   # tool row untouched
-        assert messages[1]["role"] == "user"                      # steer = new user msg
-        assert messages[1]["content"].count(STEER_MARKER_OPEN) == 1
-        assert "preserve malformed-call steer after budget enforcement" in messages[1]["content"]
+        receipts = copy.deepcopy(messages)
+        assert [m["tool_call_id"] for m in receipts if m["role"] == "tool"] == ["malformed"]
+        expected = copy.deepcopy(receipts)
+        sanitize_tool_call_arguments(expected)
+        prepare_iteration(agent, messages=messages, api_call_count=2)
+        # The existing corruption repair annotates this malformed call even
+        # without steer. Control delivery adds no change to that baseline, and
+        # the complete budgeted receipt remains below its corruption marker.
+        assert messages[:-1] == expected
+        assert messages[-2]["content"].endswith(receipts[-1]["content"])
+        assert len(messages) == 4
+        _assert_budget_replaced(messages[-2]["content"])
+        assert STEER_MARKER_OPEN not in messages[-2]["content"]
+        assert messages[-1]["role"] == "user"
+        assert messages[-1]["content"].count(STEER_MARKER_OPEN) == 1
+        assert "preserve malformed-call steer after budget enforcement" in messages[-1]["content"]
+        delivered = copy.deepcopy(messages)
+        prepare_iteration(agent, messages=messages, api_call_count=3)
+        assert messages == delivered
 
 
 class TestPathCanonicalization:

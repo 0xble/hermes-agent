@@ -99,3 +99,65 @@ def test_a_permanent_marker_an_earlier_release_wrote_for_a_swept_api_session_sta
         assert db.get_meta(RETIRED_PREFIX + "user-42") is not None
         with db._read_ctx() as conn:
             assert create_conflict(conn, "user-42") == ("session_deleted", "Session was deleted; its id cannot be reused")
+
+
+def _seed_expired_tombstones(db, count):
+    import json
+    from hermes_state_mutation_retirement import RETIRED_PREFIX
+    from hermes_state_terminal import WORKER_PREFIX
+    old = time.time() - 8 * 86400
+    db._execute_write(lambda conn: conn.executemany(
+        "INSERT INTO state_meta(key,value) VALUES(?,?)",
+        [(WORKER_PREFIX + str(i), json.dumps({"retired_at": old})) for i in range(count)] +
+        [(RETIRED_PREFIX + "sweep-" + str(i), json.dumps({"retired_at": old, "expires": True}))
+         for i in range(count)],
+    ))
+
+
+def _tombstone_counts(db):
+    from hermes_state_mutation_retirement import RETIRED_PREFIX
+    from hermes_state_terminal import WORKER_PREFIX
+    return tuple(db._read_one("SELECT count(*) FROM state_meta WHERE key GLOB ?", (prefix + "*",))[0]
+                 for prefix in (WORKER_PREFIX, RETIRED_PREFIX))
+
+
+def test_expired_tombstone_backlog_drains_in_one_unbounded_pass(tmp_path, monkeypatch):
+    """A large expired tombstone backlog drains in bounded writer units in one pass."""
+    import hermes_state_mutation_retirement as retirement
+    import hermes_state_prune_budget as budgets
+
+    with SessionDB(tmp_path / "state.db") as db:
+        _seed_expired_tombstones(db, 3000)
+        initial = _tombstone_counts(db)
+        limits, held = [], []
+        real_prune = retirement.prune_retired_tombstones
+        real_check = budgets.check_prune_transaction
+
+        def prune(conn, **kwargs):
+            limits.append(kwargs["limit"])
+            return real_prune(conn, **kwargs)
+
+        def check(seconds):
+            held.append(seconds)
+            return real_check(seconds)
+
+        monkeypatch.setattr(retirement, "prune_retired_tombstones", prune)
+        monkeypatch.setattr(budgets, "check_prune_transaction", check)
+        assert db.prune_sessions(older_than_days=90) == 0
+        assert _tombstone_counts(db) == (0, 0)
+        assert initial == (3000, 3000)
+        assert limits and max(limits) <= 100
+        assert held and max(held) <= budgets.PruneBudget.MIN_UNIT_CEILING_SECONDS
+
+
+def test_expired_tombstone_backlog_respects_short_pass_budget(tmp_path):
+    """A deadline leaves a partial backlog that a later pass resumes."""
+    with SessionDB(tmp_path / "state.db") as db:
+        _seed_expired_tombstones(db, 3000)
+        initial = _tombstone_counts(db)
+        db.prune_sessions(older_than_days=90, max_seconds=0.3)
+        partial = _tombstone_counts(db)
+        assert partial[0] < initial[0] and partial[1] < initial[1]
+        assert partial != (0, 0)
+        db.prune_sessions(older_than_days=90)
+        assert _tombstone_counts(db) == (0, 0)

@@ -1666,6 +1666,26 @@ def test_a_write_the_busy_store_cannot_take_is_deferred_not_lost(tmp_path):
     assert store.counter_snapshot()[0]["value"] == 2
 
 
+def test_a_latch_the_busy_store_cannot_take_is_deferred_not_raised(tmp_path):
+    """The compare-and-set latches share the counters' contention contract: another process holding
+    the store past the short busy timeout defers the latch, which re-runs its compare-and-set with the
+    next write instead of raising ``database is locked`` into the subscriber."""
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    blocker = sqlite3.connect(tmp_path / "metrics.sqlite3")
+    blocker.execute("BEGIN IMMEDIATE")
+    try:
+        assert store.record_client_active(_resource()) is False
+        assert store.record_feature_adoption("memory", "same_day", _resource()) is False
+    finally:
+        blocker.rollback()
+        blocker.close()
+    assert store.counter_snapshot() == []
+    store.drain_deferred()
+    assert sorted(row["value"] for row in store.counter_snapshot()) == [1, 1]
+    assert store.recorded_features() == frozenset({"memory"})
+    assert store.record_client_active(_resource()) is False
+
+
 def test_cross_process_client_active_attempts_record_one_install(tmp_path):
     database_path = tmp_path / "metrics.sqlite3"
     outbox_directory = tmp_path / "outbox"

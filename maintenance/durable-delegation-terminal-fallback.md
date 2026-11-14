@@ -146,3 +146,5 @@ are replaced with synthetic boundaries.
 Retire when upstream persists interim and fallback delegation events durably.
 To roll back, revert the patch commits. Existing `async_delegation_events`
 rows are then ignored.
+
+Contract tests: `tests/tools/test_async_terminal_fallback_ownership.py`, `tests/tools/test_async_batch_task_failure_notice.py`, `tests/tools/test_async_delegation.py`, `tests/tools/test_async_delegation_orphan_sweep.py`, `tests/tools/test_async_delegation_stale_profile_scope.py`, `tests/tools/test_restored_delegation_ownership.py`, `tests/tools/test_process_registry.py`, `tests/hermes_cli/test_session_recovery.py`, `tests/gateway/test_completion_delivery.py`, `tests/gateway/test_background_process_notifications.py`, `tests/gateway/test_autonomous_wake_pacing.py`, `tests/tui_gateway/test_notification_turn_release.py`, `tests/tui_gateway/test_tui_gateway_server.py`, `tests/hermes_cli/test_cli_async_delegation_delivery.py`, `tests/hermes_cli/test_process_notification_display.py`, `tests/hermes_cli/test_quiet_turn_author.py`, `tests/hermes_cli/test_subagent_notification_display.py`, `tests/tui_gateway/test_heartbeat_wakes.py`.

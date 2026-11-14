@@ -109,3 +109,5 @@ replacement admission, completed-child and spent-claim refusal), and canonical
 state reconciliation tests.
 
 Fork patch identity: `delegation-restart-survival`.
+
+Contract tests: `tests/tools/test_async_delegation_checkpoint_completion.py`, `tests/tools/test_async_delegation_restart_cut.py`.

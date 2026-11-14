@@ -1457,6 +1457,8 @@ async def test_startup_claims_ledger_answer_before_resume_snapshot(tmp_path, mon
     runner._finish_startup_restore = AsyncMock()
     runner._schedule_auto_resume_delegations = Mock()
     runner._send_session_db_warning_notifications = AsyncMock()
+    runner._sweep_orphan_progress_cards = AsyncMock()
+    runner._retain_background_task = lambda task: task
     monkeypatch.setattr(run_module, "_startup_restore_drain_timeout_secs", lambda: 0)
     monkeypatch.setattr(startup_module, "recover_pending_shutdown_flush", lambda *args, **kwargs: None,
                         raising=False)
@@ -1556,6 +1558,8 @@ async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monke
     store.mark_resume_pending(entry.session_key, turn_id="turn-marker", human=True)
     marker = store.get_resume_pending_marker(entry.session_key)
     runner = object.__new__(GatewayTurnMixin)
+    runner._run_in_executor_with_context = GatewayRunner._run_in_executor_with_context.__get__(runner)
+    runner._get_executor = lambda: None
     runner.async_session_store = AsyncSessionStore(store)
     runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
     runner._hmwa_prepare_turn = AsyncMock(
@@ -1585,6 +1589,8 @@ async def test_post_delivery_resume_clear_uses_turn_start_marker(tmp_path, monke
 
     event = MessageEvent(text="", message_type=MessageType.TEXT, source=source, internal=True)
     assert await runner._handle_message_with_agent(event, source, entry.session_key, 1) == "done"
+    runner._run_agent.assert_awaited_once()
+    assert event._loop_completion_identity is None
     clear_resume_pending.assert_awaited_once_with(entry.session_key, expected_marker=marker)
 
 
@@ -1600,6 +1606,8 @@ async def test_post_delivery_clear_accepts_same_turn_drain_remark_but_not_succes
     store.mark_resume_pending(entry.session_key, turn_id="turn-interrupted", human=True)
     marker_a = store.get_resume_pending_marker(entry.session_key)
     runner = object.__new__(GatewayTurnMixin)
+    runner._run_in_executor_with_context = GatewayRunner._run_in_executor_with_context.__get__(runner)
+    runner._get_executor = lambda: None
     runner.async_session_store = AsyncSessionStore(store)
     runner._hmwa_resolve_session = AsyncMock(return_value=(source, entry, entry.session_key))
     runner._hmwa_prepare_turn = AsyncMock(
@@ -1634,6 +1642,8 @@ async def test_post_delivery_clear_accepts_same_turn_drain_remark_but_not_succes
 
     runner._hmwa_deliver_turn_response = remark_during_drain
     assert await runner._handle_message_with_agent(event, source, entry.session_key, 1) == "done"
+    runner._run_agent.assert_awaited_once()
+    assert event._loop_completion_identity is None
     assert store._entries[entry.session_key].resume_pending is False
     assert store.get_resume_pending_marker(entry.session_key) is None
 

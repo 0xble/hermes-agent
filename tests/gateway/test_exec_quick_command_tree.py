@@ -25,7 +25,7 @@ def _alive(process):
 
 
 def _pid(path: Path):
-    text = path.read_text().strip() if path.exists() else ''
+    text = path.read_text(encoding='utf-8-sig').strip() if path.exists() else ''
     return int(text) if text else None
 
 
@@ -135,7 +135,8 @@ async def test_cancelled_during_spawn_kills_shell_and_child(tmp_path, monkeypatc
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("cancelled", [False, True])
-async def test_spawn_error_preserves_error_reply_or_cancellation(tmp_path, monkeypatch, cancelled):
+@pytest.mark.parametrize("spawn_error", [None, NotADirectoryError], ids=["native", "not-a-directory"])
+async def test_spawn_error_preserves_error_reply_or_cancellation(tmp_path, monkeypatch, cancelled, spawn_error):
     entered, release = asyncio.Event(), asyncio.Event()
     original_create = asyncio.create_subprocess_shell
     failures = []
@@ -144,6 +145,9 @@ async def test_spawn_error_preserves_error_reply_or_cancellation(tmp_path, monke
         entered.set()
         await release.wait()
         try:
+            if spawn_error is not None:
+                # Windows CreateProcess reports a missing cwd as NotADirectoryError (WinError 267).
+                raise spawn_error(267, 'The directory name is invalid', kwargs['cwd'])
             return await original_create(*args, **kwargs)
         except OSError as error:
             failures.append(error)
@@ -163,7 +167,7 @@ async def test_spawn_error_preserves_error_reply_or_cancellation(tmp_path, monke
         else:
             reply = await asyncio.wait_for(task, timeout=10)
             assert reply == run_inbound_hooks.t('gateway.quick_command.error', error=failures[0])
-        assert len(failures) == 1 and isinstance(failures[0], FileNotFoundError)
+        assert len(failures) == 1 and isinstance(failures[0], OSError)
     finally:
         release.set()
         if not task.done():

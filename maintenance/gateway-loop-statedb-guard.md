@@ -110,6 +110,13 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   ~120 busy agent threads that turned a 10 ms diff of 2,753 rows into 3-17 s holds
   (2026-10-25: 58 holds, 365 s in 2 h; callback CPU ~0.4 s). Keep new writer callbacks
   O(1) in Python round trips where the row count grows with history or sessions.
+- The check-in poll (`gateway/run_checkins.py::poll_checkins`, every 5 s) groups every routed
+  session on the loop. `_standalone_runtime_home` memoizes the resolved parent per DB path, and
+  the scan yields to the loop every `_SCAN_YIELD_EVERY` (512) entries. On 2026-11-14 the live
+  gateway held 36,898 routed sessions; a per-entry realpath made each pass ~150k GIL-releasing
+  lstat calls, and a 150 s Python stack sample showed 39 s of loop time in that scan, in
+  unbroken runs up to 5.1 s (`ws write slow (loop stalled >10s)` under heavier load). Proof:
+  `tests/gateway/test_checkin_poll_loop_budget.py`.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.
@@ -245,6 +252,9 @@ the Telegram and Slack adapters, and `gateway/session_ingress.py` with
 `tests/gateway/test_admission_adapter_reconnect_wait.py`,
 `tests/gateway/test_startup_resume_admission.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
+`test_reaped_classic_slot_is_evicted_so_the_queued_head_runs` in
+`tests/gateway/test_classic_slot_holds_fifo_head.py` (the drain awaits the now-async probe, so a reaped
+classic slot cannot hold the FIFO head until restart),
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
 the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`,
 `test_writers_proceed_while_a_slow_checkpoint_runs` and `test_writers_proceed_while_a_slow_fts_merge_runs`
@@ -268,3 +278,5 @@ gate is installed, with no await in between, or fresh inbound can overtake a cla
 
 **Retire** an offload when upstream moves the same call off the loop. Retire the herd bounds when
 upstream bounds restart replay and cron catch-up itself.
+
+Contract tests: `tests/tools/test_completed_process_results.py`, `tests/hermes_state/test_active_conversation_replay.py`, `tests/gateway/test_lifecycle_state_db_check.py`, `tests/gateway/test_lifecycle_ledger.py`, `tests/gateway/test_admission_adapter_reconnect_wait.py`, `tests/gateway/test_startup_resume_admission.py`, `tests/gateway/test_reaped_eviction_interrupts_run.py`, `tests/gateway/test_classic_slot_holds_fifo_head.py`, `tests/cron/test_scheduler.py`, `tests/agent/test_turn_facade_lease.py`, `tests/hermes_state/test_wal_checkpoint_strategy.py`, `tests/hermes_state/test_generation_checkpoint_durability.py`, `tests/hermes_state/test_hermes_state.py`, `tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`, `tests/hermes_state/test_archive_compact_off_writer_lock.py`, `tests/agent/test_turn_liveness_watchdog.py`, `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`, `tests/gateway/test_turn_state_db_off_loop.py`, `tests/hermes_cli/test_worktree_pushed_tier.py`, `tests/gateway/test_loop_thread_statedb_sites.py`, `tests/gateway/test_loop_thread_statedb_sweep.py`.

@@ -71,8 +71,14 @@ async def test_auto_tts_copy_caption_fallbacks_keep_body_visible_but_never_spoke
 @pytest.mark.parametrize("internal", [False, True])
 async def test_plain_media_captions_render_markers_before_truncating(monkeypatch, tmp_path, operation, internal):
     import plugins.platforms.telegram.adapter as tg
+    import socket
     import telegram
+    from tools import url_safety
 
+    # Exercise the real URL policy without depending on the host's DNS answers.
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lambda host, port=None: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port)),
+    ])
     monkeypatch.setattr(telegram, "InputMediaPhoto", lambda **kw: SimpleNamespace(**kw))
     # Caption rendering has a fake transport. Keep the real URL guard, but give
     # it a deterministic public DNS answer rather than the host's proxy DNS.
@@ -110,3 +116,36 @@ async def test_plain_media_captions_render_markers_before_truncating(monkeypatch
     assert result.success
     assert wire == (f"Before\n{body}\n" + "After" * 30)[:1024]
     assert "\x00" not in wire and "HERMES_COPY_" not in wire
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("internal", [False, True])
+async def test_image_private_dns_still_uses_text_fallback(monkeypatch, caplog, internal):
+    import socket
+
+    from gateway.platforms.base import SendResult
+    from tools import url_safety
+
+    monkeypatch.setattr(url_safety, "_getaddrinfo", lambda host, port=None: [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.4.8", port)),
+    ])
+    adapter = _make_adapter()
+    assert adapter._bot is not None
+    adapter._bot.send_photo = AsyncMock()
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="text"))
+    raw = "Before\n[[copy]]\ncaption\n[[/copy]]\nAfter"
+    caption = copy_free_text_for(adapter, raw) if internal else raw
+    image_url = "https://example.com/image.png"
+
+    result = await adapter.send_image("123", image_url, caption=caption)
+
+    assert result.success
+    assert any(
+        record.name == "tools.url_safety"
+        and record.getMessage() == "Blocked request to private/internal address: example.com -> 198.18.4.8"
+        for record in caplog.records
+    )
+    adapter._bot.send_photo.assert_not_awaited()
+    adapter.send.assert_awaited_once_with(
+        chat_id="123", content=f"{caption}\n{image_url}", reply_to=None, metadata=None,
+    )

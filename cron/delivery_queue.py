@@ -99,14 +99,17 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         row = conn.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)).fetchone()
         required = "'reviewing'" if table == "deliveries" else "'suppressed'"
         if row and required not in row[0]:
+            missing = [state for state in ("suppressed", "reviewing")
+                       if f"'{state}'" not in row[0]
+                       and (state != "reviewing" or table == "deliveries")]
+            sql = row[0].replace("'unknown'", "'unknown'" + "".join(f",'{state}'" for state in missing))
+            if sql == row[0]:
+                # No status CHECK to widen (a queue older than the constraint): a rebuild would
+                # change nothing, so the test above would stay true and rebuild it on every open.
+                continue
             conn.execute("SAVEPOINT notification_disposition")
             try:
                 conn.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
-                sql = row[0]
-                missing = [state for state in ("suppressed", "reviewing")
-                           if f"'{state}'" not in sql
-                           and (state != "reviewing" or table == "deliveries")]
-                sql = sql.replace("'unknown'", "'unknown'" + "".join(f",'{state}'" for state in missing))
                 conn.execute(sql)
                 conn.execute(f"INSERT INTO {table} SELECT * FROM {table}_old")
                 conn.execute(f"DROP TABLE {table}_old")

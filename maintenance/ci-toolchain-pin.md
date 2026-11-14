@@ -80,3 +80,6 @@ portable unit module passed (`.venv/bin/python -m unittest scripts.ci.tests.test
 36 tests, exit 0). A preliminary system-Python run was invalid because it lacked
 `ruamel` and the required SQLite constants; it is not counted as candidate
 verification.
+
+
+Contract tests: `scripts/ci/tests/test_portable.py`.

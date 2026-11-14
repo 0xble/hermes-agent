@@ -64,7 +64,7 @@ from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
-from agent.memory_provider import ctx_bound
+from agent.memory_provider import ctx_bound, spawn_context_thread
 from agent.session_activity import AwakeIdleMeter
 from agent.turn_failure_copy import is_max_iteration_handoff
 
@@ -391,6 +391,9 @@ def _upsert_incident_for_failure(
                           scheduler_failure_copy.agent_failure_type(error) if agent_declared else None))
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
+        # A shared dependency outage follows the same rule: only a notice that actually reached
+        # the operator (``alerted``) quiets the other jobs, and only inside the repeat window.
+        # ``detected`` is never withheld, or an undelivered first notice would silence it for good.
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
         return withheld, incident_id
     except Exception as exc:
@@ -1933,8 +1936,8 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
                 logger.info(
                     "Job '%s': fallback resolved to %s model %s",
                     job_id, runtime.get("provider"), fb_model)
-                # Delivered with the job output (#74349): a cron agent has no status rail, so the
-                # switch would otherwise stay in the scheduler log only. run_job pops it.
+                # Delivered with wrapped job output (#74349): a cron agent has no status rail.
+                # Raw output opts out of decoration, retaining the scheduler logs. run_job pops it.
                 from hermes_cli.fallback_config import pre_agent_fallback_notice
                 runtime["_fallback_notice"] = pre_agent_fallback_notice(
                     requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else ""),
@@ -2589,6 +2592,7 @@ def run_job(
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
     scope = _CronRunScope(job, job_id, execution_id)
+    _dependency_started = time.monotonic()
     try:
         scope.enter()
         # Gate scripts and monitors can acknowledge work. Acquire first so a store outage
@@ -2620,10 +2624,12 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
-        if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
+        if (setup.fallback_notice and _cfg.get("cron", {}).get("wrap_response", True)
+                and final_response.strip() and not _is_cron_silence_response(final_response)
                 and scheduler_failure_copy.cron_failure_marker_error(final_response) is None):
-            # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
-            # agent-declared failure marker keep their first-line/whole-response contract.
+            # Pre-agent switch notices share the response-wrapper opt-out. Raw reports,
+            # silence, and failure markers retain their exact response contract.
+            # Provider selection and its scheduler logs remain unchanged.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -2644,8 +2650,12 @@ def run_job(
     except (Exception, ConfigBackendUnavailable) as e:
         if isinstance(e, CronSessionStoreUnavailable):
             job["_session_store_unavailable"] = True
+        from cron.dependency_timeout import annotate_job_failure
+        named = annotate_job_failure(
+            e, base_url=getattr(agent, "base_url", None) or job.get("base_url"),
+            elapsed=time.monotonic() - _dependency_started)
         error_msg = _merge_script_failure(
-            (False, "", "", f"{type(e).__name__}: {e!s}"), script_error, job=job)[3]
+            (False, "", "", f"{type(named).__name__}: {named!s}"), script_error, job=job)[3]
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
@@ -4407,8 +4417,27 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                completed = run_one_job(job, adapters=None, loop=None, verbose=False,
-                                        hard_wall_fence=watchdog_stop)
+                cancel_event = threading.Event()
+                cancel_stop = threading.Event()
+
+                def watch_cancel() -> None:
+                    from cron.detached_authority import _cancel_path
+
+                    while not cancel_stop.wait(.1):
+                        if _cancel_path(job["id"], execution_id).exists():
+                            cancel_event.set()
+                            return
+
+                cancel_watcher = spawn_context_thread(
+                    watch_cancel, name=f"cron-cancel-{execution_id}")
+                cancel_watcher.start()
+                try:
+                    completed = run_one_job(
+                        job, adapters=None, loop=None, verbose=False,
+                        cancel_event=cancel_event, hard_wall_fence=watchdog_stop)
+                finally:
+                    cancel_stop.set()
+                    cancel_watcher.join(timeout=1)
                 with contextlib.suppress(OSError):
                     ack_path.with_suffix(".stderr").unlink(missing_ok=True)
                 return completed

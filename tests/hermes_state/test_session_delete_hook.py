@@ -100,3 +100,20 @@ def test_raising_callback_never_breaks_deletion(db, hook):
     assert db.set_session_archived("s2", True) is True
     assert db.get_session("s1") is None and db.get_session("s2")["archived"]
     assert [e["session_id"] for e in events] == ["s1", "s2"]  # later observers still ran
+
+
+def test_prune_hook_sessiondb_write_does_not_inherit_prune_budget(db, hook):
+    manager, _ = hook
+    seen = []
+
+    def _write_from_hook(**_):
+        from hermes_state_prune_budget import current_budget
+        seen.append(current_budget())
+        db.set_meta("hook-write", "ok")
+
+    manager._hooks["on_session_delete"].append(_write_from_hook)
+    db.create_session("old", source="cron")
+    db.end_session("old", "done")
+    assert db.prune_sessions(older_than_days=0, max_seconds=60) == 1
+    assert seen == [None]
+    assert db.get_meta("hook-write") == "ok"

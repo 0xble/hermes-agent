@@ -70,3 +70,5 @@ successor ownership, and declined or possible-duplicate guards.
 Retire this patch when an accepted upstream release preserves admitted inputs
 across the same generation-overlap boundary with equivalent serialization and
 restart-replay guarantees. No deployment follows merely from source publication.
+
+Contract tests: `tests/gateway/test_turn_lease_queue.py`, `tests/gateway/test_turn_lease.py`, `tests/gateway/test_queued_followup_processing_hooks.py`, `tests/gateway/test_shutdown_followup_restart.py`.

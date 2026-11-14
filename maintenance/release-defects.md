@@ -21,6 +21,40 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 `production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
 
+## Automation Runtime Refusal Retry
+
+- Fork patch identity: `automation-runtime-refusal-retry`.
+- A producer receipt acknowledges durable FIFO input, not successful inference. Runtime
+  configuration or credential resolution must not consume an internal delegation/process result
+  as a failed reply. Retain proven executor refusals in the existing FIFO, and persist a bounded
+  retry clock in `state_meta`: 10s, 20s, 40s, then 60s between attempts. A long outage does not
+  exhaust and drop the result. Restart uses the same queued identity and deadline. There is no
+  second payload store or new table.
+- Admission checks the persisted deadline only. Resolving a model before choosing the executor
+  blocks inference-free completion notes, resolves managed workers under the wrong runtime, and
+  mutates session model state twice. Each executor remains responsible for its own runtime.
+- The turn runner explicitly stamps resolution failures before agent construction. Native
+  automation skips transcript/error delivery and atomically requeues its same claimed row with
+  the same backoff, fenced by epoch/generation. Only results with no API calls, messages or tools
+  qualify. Executed/unknown work is never replayed.
+- Guards: `tests/gateway/test_automation_runtime_retry.py` drives process and delegation results
+  through real native admission and the FIFO, including an actual conflicting preset config and
+  the turn runner's refusal marker. Claims must not probe runtime credentials. A new authority/epoch
+  resumes the persisted row, waits for the saved deadline, and executes once. Repeated refusals
+  preserve FIFO ordering and the bounded backoff. Reinjecting the producer identity is an ACK,
+  not another turn. Also run completion notes, managed-worker delivery, async delegation, session
+  authority and runtime model-preset tests.
+- v0.23.1 folds a completion into a queued completion at the FIFO tail by cancelling that row
+  and admitting a new one. A refused row holding a retry clock is never a fold target
+  (`_fold_queued` checks `refusal_held` in the same transaction), so a later completion queues
+  behind it and cannot replace it with an undelayed admission.
+- Source: `gateway/session_automation_retry.py`, `gateway/session_authority.py`,
+  `gateway/session_ingress.py`, `gateway/session_automation.py`, `gateway/run_turn.py`,
+  `gateway/run_turn_runner.py`.
+- This does not change legacy rows already marked `delivered` in the delegation outbox. Startup
+  replay cannot infer their lost inference from that receipt. Historical redelivery needs a
+  separately authorized decision and a durable payload.
+
 ## Post-Install Admission Canary
 
 - Fork patch identity: `post-install-admission-canary`.
@@ -192,6 +226,26 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   released-upstream retirement proof, so the fork patch remains active.
 - **Retirement:** Retire only after the selected released upstream contains the
   equivalent behavior and the regression passes there without the local implementation.
+
+## Desktop hand-off timeout test reads a PID file that may never exist
+
+- Fork patch identity: `desktop-handoff-timeout-readiness`.
+- `a timed-out hand-off kills the real script tree it spawned` in
+  `apps/desktop/electron/updater/checkout-handoff.test.ts` started a real
+  `bash` launcher and then read the PID file its background child writes. Nothing
+  ordered that write before the 600 ms claim deadline. On a loaded host the
+  Desktop correctly killed the launcher's process group first, the file was never
+  written, and the test failed with `ENOENT` before either process-death
+  assertion ran. A discriminating probe reproduced the exact failure by delaying
+  shell startup past the deadline while cleanup stayed correct.
+- The spawn stand-in now returns only after the real tree has published its
+  PID. The production deadline, the `updater-spawn-failed` and absent-marker
+  assertions, and both process-death assertions are unchanged. Stubbing
+  `killHandoffTree` still fails the test. Production code is untouched.
+- Guard: run the test through the electron project
+  (`npm run test:desktop:platforms -- electron/updater/checkout-handoff.test.ts`).
+- Retire when upstream's copy of this test establishes the tree before the
+  deadline with equivalent cleanup assertions.
 
 ## Launchd restart tests depend on the host gateway
 
@@ -1352,3 +1406,21 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   bug fix suitable for contribution, with publication outside this local change.
 - Retire when upstream skips unused launcher prefetch or reaps every prefetch
   child before launcher exit. Roll back the commit carrying this patch identity.
+
+Contract tests: `tests/gateway/test_admission_canary.py`, `tests/hermes_cli/test_admission_canary.py`, `tests/gateway/test_automation_upgrade_admission.py`, `tests/gateway/test_legacy_delegation_refusal.py`, `tests/hermes_cli/test_rollback_diagnostics.py`, `tests/gateway/test_automation_rebound_route.py`, `tests/gateway/test_billing_failure_transcript.py`, `tests/agent/test_billing_proxy_error_classification.py`, `tests/agent/test_billing_outage_shared_cooldown.py`, `tests/agent/test_request_client_reuse_abort_races.py`, `tests/hermes_cli/test_gateway_multiplex_lifecycle.py`, `tests/hermes_cli/test_profiles.py`, `tests/agent/test_compaction_prompt_rebuild.py`, `tests/hermes_cli/test_update_launchd_restart_verification.py`, `tests/gateway/test_update_lifecycle_notifications.py`, `tests/gateway/test_cancel_background_drain.py`, `tests/scripts/test_candidate_scripts.py`, `tests/hermes_cli/test_gateway_launchd_supervised_child.py`, `tests/scripts/install/test_dmg_install_driver.py`, `tests/gateway/test_telegram_flood_coherence.py`, `tests/plugins/memory/test_hindsight_provider.py`, `tests/hermes_cli/test_model_alias_credentials.py`, `tests/gateway/test_delivery_ledger.py`, `tests/gateway/test_update_result_heading.py`, `tests/gateway/test_delegation_auto_resume.py`, `tests/gateway/test_telegram_unsupported_link_targets.py`, `tests/hermes_cli/test_gateway.py`, `tests/e2e/core/tenancy/test_two_tenant_gateway.py`, `tests/e2e/core/tenancy/test_two_tenant_desktop_backend.py`, `tests/test_scratch_dir.py`, `tests/gateway/test_agent_update_launcher.py`, `tests/tools/test_shared_container_task_id.py`, `tests/tools/test_vault_shadow_dom_live.py`, `tests/tools/test_browser_supervisor.py`, `tests/hermes_cli/test_kanban_worker_exit_trailer.py`, `tests/hermes_cli/test_gpt6_tiers_registration.py`, `tests/hermes_cli/test_update_parked_branch_guard.py`, `tests/hermes_state/test_state_db_holders.py`, `tests/hermes_cli/test_venv_sync_relaunch.py`, `tests/agent/test_thread_scoped_output.py`, `tests/gateway/test_update_failure_autostash.py`, `tests/gateway/test_update_failure_notice.py`, `tests/gateway/test_update_staging_failure_notice.py`, `tests/hermes_cli/test_update_host_obligation.py`, `tests/gateway/test_shutdown_watchdog.py`, `tests/tui_gateway/test_display_watch.py`, `tests/pm/test_environment_build.py`, `tests/gateway/test_windows_venv_import_guard.py`, `tests/gateway/test_browse_reservation_release_race.py`, `tests/gateway/test_telegram_rich_message_admission.py`, `tests/gateway/test_native_admission_metadata.py`, `tests/gateway/test_watch_automation_admission.py`, `tests/gateway/test_synthetic_native_admission.py`, `tests/gateway/test_multiplex_pending_recovery.py`, `tests/pm/test_extras.py`, `tests/gateway/test_cron_active_work_drain.py`, `tests/cron/test_restart_safe_worker.py`, `tests/tools/test_memory_transactions.py`, `tests/tools/test_memory_tool.py`, `tests/gateway/test_restart_drain.py`, `tests/hermes_cli/test_update_head_moved_gate.py`, `tests/gateway/test_display_null_turn_wiring.py`, `tests/agent/test_voice_turn_route.py`, `tests/hermes_cli/test_update_external_supervisor_sweep.py`, `tests/hermes_cli/test_update_outgoing_gateway_identity.py`, `tests/cron/test_cron_explicit_empty_toolsets.py`, `tests/pm/test_install_states_gc.py`, `tests/hermes_cli/test_gateway_exit_code.py`, `tests/hermes_cli/test_gateway_agent_update_owner.py`, `tests/gateway/test_agent_update_profile_scope.py`, `tests/tools/test_process_registry_owner_chain.py`, `tests/tools/test_terminal_tool_lifecycle.py`, `tests/hermes_cli/test_shared_metrics_install_run.py`, `tests/gateway/test_bot_mailbox_async.py`, `tests/gateway/test_api_drain_owner.py`, `tests/gateway/test_api_admission_off_loop.py`, `tests/tools/test_process_registry_model_not_found.py`, `tests/tools/test_async_delegation.py`, `tests/hermes_cli/test_chat_banner_prefetch.py`, `tests/hermes_cli/test_tui_first_run_routing.py`, `tests/e2e/core/security/test_attach_handshake.py`.
+## Turn worker reset during a concurrent first import
+
+- Fork patch identity: `release-defects`.
+- `gateway/turn_thread_reset.py::reset_reused_thread_state` read
+  `tools.terminal_tool_sudo._sudo_password_cache_lock` straight from `sys.modules`. Another
+  thread's first import publishes the module there before its body finishes, so on every gateway
+  start since at least 2026-11-13 a parked turn worker raised `AttributeError: partially
+  initialized module` and retired its thread. Python's "circular import" wording is a guess:
+  this is a concurrent import, not a cycle.
+- The reset now reads `set_interrupt` and the sudo cache lock with `getattr` and skips a module
+  that has not bound them yet. Both are defined after the state they guard, so no setter has run
+  and there is nothing to drop.
+- Guard: `test_a_reset_during_another_threads_first_import_keeps_the_worker` in
+  `tests/gateway/test_turn_executor_reuse.py`.
+- Upstream-origin (`gateway/turn_thread_reset.py` came with the turn-executor reuse change).
+  Retire when upstream guards the reset against partially imported modules.

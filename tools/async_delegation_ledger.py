@@ -40,22 +40,12 @@ def _connect() -> sqlite3.Connection:
     from agent.runtime_session_store import WorkerPersistenceError, is_worker_process
     if is_worker_process():
         raise WorkerPersistenceError('worker_delegation_ledger_unavailable')
-    from hermes_cli.sqlite_util import open_db
-    # Same state.db as hermes_state.SessionDB -- reuse its owner-only (0600)
-    # hardening so this writer doesn't create/leave the file (and its WAL
-    # sidecars) at the process umask. See hermes_state._secure_state_db_files.
-    from hermes_constants import mkdir_under_hermes_home
-    from hermes_state import _secure_state_db_files
-
-    path = _db_path()
-    # A late replay or writer must not resurrect a removed named profile (#123265).
-    mkdir_under_hermes_home(path.parent)
-    _secure_state_db_files(path, create_main=True)
-    # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
-    conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None, initialize=_initialize_schema)
-    _secure_state_db_files(path)
-    return conn
+    from hermes_cli.sqlite_util import open_shared_state_db
+    # The ledger shares state.db with SessionDB: use its startup lock and tracked
+    # connector, rather than exposing an unprotected empty first-open inode.
+    # wal=False: SessionDB owns the journal mode (_initialize_schema applies the barriers).
+    return open_shared_state_db(_db_path(), db_label="state.db (async_delegation)",
+                                wal=False, initialize=_initialize_schema)
 
 
 def _initialize_schema(conn: sqlite3.Connection) -> None:
@@ -124,7 +114,7 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "route_chain", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
         if key in record}
     if child_sessions := record.get("child_sessions"):
         task_payload["child_execution"] = {

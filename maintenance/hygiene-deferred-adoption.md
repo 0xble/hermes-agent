@@ -75,3 +75,5 @@ prompt count was also stale, so hygiene ran a 93-second compression for a 33-to-
 
 Retire after upstream silences adopted turn-holds and fences lease-less rewrites against a newer summary generation.
 Roll back the patch commits and their regression tests. No persistent-data migration is required.
+
+Contract tests: `tests/gateway/test_session_hygiene_turnhold_adoption.py`, `tests/hermes_state/test_stale_held_generation_guard.py`, `tests/agent/test_micro_compaction.py`, `tests/agent/test_proactive_prune_restart_safety.py`, `tests/gateway/test_replay_entry_fields.py`, `tests/hermes_state/test_compaction_active_uid.py`, `tests/hermes_state/test_compression_watermark_commit.py`, `tests/hermes_state/test_repaired_history_commit_coverage.py`, `tests/hermes_state/test_compression_lease_refresh_before_publish.py`, `tests/hermes_state/test_display_fold_incremental.py`, `tests/hermes_state/test_runtime_worker_compression_annotations.py`, `tests/agent/test_split_turn_compaction.py`, `tests/agent/test_summary_carrier_split_turn.py`, `tests/agent/test_reference_handoff_active_turn.py`, `tests/gateway/test_folded_steer_silence_reprompt.py`.

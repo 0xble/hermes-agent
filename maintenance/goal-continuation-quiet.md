@@ -39,3 +39,5 @@ Stack fit: native Python, existing GoalState/GoalManager, optimistic SQLite stat
 ## Acceptance and lifecycle
 
 Retire this fork correction only when the maintained source replacement preserves continuation identity across re-parks/lifts and restart and honors intentional automatic silence without losing outcome/blocker delivery. Rollback: revert this change's code, regression file and record together; the existing optional serialized fields remain readable by the previous release. Root maintenance inventory and patch manifest integration belong to the parent.
+
+Contract tests: `tests/gateway/test_goal_continuation_notice_dedupe.py`.

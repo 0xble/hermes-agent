@@ -301,3 +301,5 @@ Retire snapshot integrity when upstream verifies quick-snapshot recovery copies;
 timezone when upstream adds one; contention observability when upstream records skips.
 Schema rehearsal and the legacy archive are migration tooling with no retirement. Roll back
 source by reverting the logical patch; installed runtime rollback follows the runtime owner.
+
+Contract tests: `tests/scripts/test_archive_legacy_fork.py`, `tests/hermes_cli/test_quick_snapshot_digests.py`, `tests/hermes_cli/test_quick_snapshot_retention.py`, `tests/hermes_cli/test_config_backups.py`, `tests/hermes_cli/test_config_lkg_backup.py`, `tests/hermes_cli/test_update_receipt_truthfulness.py`, `tests/hermes_cli/test_backup.py`, `tests/cron/test_cron_timezone_migration_catchup.py`, `tests/cron/test_per_job_timezone.py`, `tests/hermes_cli/test_backup_stability.py`, `tests/scripts/test_candidate_scripts.py`, `tests/scripts/test_schema_rehearsal.py`, `tests/scripts/test_fork_patch_trailers.py`, `tests/cron/test_contention_skip_observability.py`, `tests/agent/test_model_metadata.py`, `tests/agent/test_context_compressor.py`, `tests/scripts/test_sync_fork_candidate.py`.

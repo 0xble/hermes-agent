@@ -282,3 +282,44 @@ async def test_turn_end_cancellation_finalizes_without_retry_for_empty_queue(mon
     ]
     state.adapter.send.assert_not_awaited()
     state.adapter.edit_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("turn_state,publishes", [("current", True), ("superseded", False), ("interrupted", False)])
+async def test_turn_end_drain_publishes_only_for_the_current_uninterrupted_run(monkeypatch, turn_state, publishes):
+    """Stops turn cleanup from posting a task card for a run a newer message superseded or the user stopped."""
+    runner, state, client = make_runner(monkeypatch, failure_method="unused", error=TimeoutError())
+    consuming = asyncio.Event()
+    superseded = False
+    agent = SimpleNamespace(is_interrupted=False)
+
+    def run_still_current():
+        consuming.set()
+        return not superseded
+
+    runner._ctx.progress_queue = queue.Queue()
+    runner._ctx._run_still_current = run_still_current
+    runner._ctx.agent_holder = [agent]
+    task = asyncio.create_task(runner._send_native_task_card_progress(state.adapter))
+    try:
+        await asyncio.wait_for(consuming.wait(), timeout=2)
+        # The turn ends with its last tool event still queued: no await separates these steps, so
+        # only the cancellation drain can see the event.
+        superseded = turn_state == "superseded"
+        agent.is_interrupted = turn_state == "interrupted"
+        runner._ctx.progress_queue.put({"type": "tool.started", "tool_call_id": "call-1",
+                                        "tool_name": "terminal", "preview": "pwd"})
+        assert task.cancel()
+        done, _ = await asyncio.wait({task}, timeout=2)
+        assert task in done, "Cancelled consumer did not finalize before the deadline"
+        assert task.result() is None
+    finally:
+        if not task.done():
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=2)
+            assert task in done, "Progress consumer did not finalize during cleanup"
+    assert runner._ctx.progress_queue.empty()
+    started = [c for c in client.api_call.await_args_list if c.args[0] == "chat.startStream"]
+    assert len(started) == (1 if publishes else 0)
+    state.adapter.send.assert_not_awaited()
+    state.adapter.edit_message.assert_not_awaited()

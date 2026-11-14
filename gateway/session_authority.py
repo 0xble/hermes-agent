@@ -666,7 +666,7 @@ class SessionAuthority:
     async def recover_native_sessions(self, bindings):
         """Bind only server-observed native routes; unknown work stays paused."""
         from collections import Counter
-        from gateway.session_envelope import check_native_route
+        from gateway.session_envelope import check_native_route, restore_native_source
         bindings = list(bindings)
         counts = Counter(sid for sid, _, _ in bindings)
         results = {}
@@ -678,6 +678,11 @@ class SessionAuthority:
                 native = [row for row in rows if 'native_text_v1' in row['payload']]
                 if not native:
                     raise RuntimeStoreError('not_found')
+                if adapter is None:
+                    # Origins omit live transport proof. The sealed envelope must still bind
+                    # to the current owned credential before its adapter can be selected.
+                    restored = restore_native_source(native[-1]['payload'], self.runner)
+                    adapter = self.runner._adapter_for_source(restored)
                 target = self.physical_target(SessionRef(self.profile_id, sid))
                 source, route = await check_native_route(self.runner, native[-1]['payload'], target,
                                                     available_source, adapter)
@@ -697,6 +702,10 @@ class SessionAuthority:
                 self.sessions.setdefault(sid, LiveSession(source, route))
                 if any(row['status'] == 'unknown' for row in rows):
                     raise RuntimeStoreError('unknown_execution')
+                prime = getattr(adapter, 'prime_routing_cache', None)
+                if callable(prime):
+                    from gateway.platforms.event import MessageEvent
+                    prime(MessageEvent(text='', source=source))
                 # Recover audio only after all route checks, before the replay can prepare it.
                 if prefetch := getattr(self.runner, '_prefetch_admitted_voice', None):
                     from gateway.session_envelope import restore_native
@@ -980,10 +989,11 @@ class SessionAuthority:
             request_hard_interrupt(agent)
         return self._handle(ref)
 
-    def _classic_turn_holds(self, route):
+    async def _classic_turn_holds(self, route):
         """The route's running slot is held by a turn this FIFO did not claim (the drain is serial:
         its own previous turn released the slot before this claim). Leaked and reaped slots are
-        evicted first, so they never block the FIFO; the reaped check reads state.db at most 1/s."""
+        evicted first, so they never block the FIFO; the reaped check reads state.db at most 1/s,
+        off the loop, so it is awaited: an un-awaited call never evicts and the head waits forever."""
         runner = self.runner
         running = getattr(runner, '_is_session_running', None)
         if running is None or not running(route):
@@ -994,7 +1004,7 @@ class SessionAuthority:
             self._classic_evict_at[route] = now
             runner._hm_evict_idle_stale_agent(route)
             if running(route):
-                runner._hm_evict_reaped_agent(route)
+                await runner._hm_evict_reaped_agent(route)
         return running(route)
 
     def _runs_own_agent(self, ref):
@@ -1174,11 +1184,15 @@ class SessionAuthority:
                 from gateway.session_completion_notes import noted_completion, reopen_for_turn
                 if not noted_completion(first):
                     await reopen_for_turn(self, ref)
-            if first is not None and self._classic_turn_holds(live.route):
+            if first is not None and await self._classic_turn_holds(live.route):
                 # A classic turn (fallback wake, CLI handoff, legacy resume) holds the route's slot:
                 # a claim now would hand this row to its busy path and settle it unrun. The head
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
                 return 'classic_busy', first
+            if first is not None:
+                from gateway.session_automation_retry import retry_ready
+                if not await retry_ready(self, first):
+                    return 'automation_wait', first
             self._require_admission_open()
             from gateway.session_runtime_workers import tracked_write
             live.rescan = False  # a _schedule from here on may not be visible to this claim's read
@@ -1295,17 +1309,18 @@ class SessionAuthority:
                 await asyncio.sleep(backoff)
                 continue
             backoff = 0.0
-            if row != 'classic_busy':
+            if row not in ('classic_busy', 'automation_wait'):
                 return row, first
             if self._drain_stopping(ref, live):
                 return None
-            await asyncio.sleep(_CLAIM_RETRY_MIN_S)
+            await asyncio.sleep(1.0 if row == 'automation_wait' else _CLAIM_RETRY_MIN_S)
 
     async def _execute_claimed(self, ref, live, row):
         """Run the claimed admission: ``(response, outcome)``. The executing stamp clears the moment
         execution returns; a lost managed worker settles an automation turn (``settled_unknown``) or pauses
         the FIFO and re-raises ManagedExecutionUnknown."""
         from gateway.session_finite import execute_finite_admission
+        from gateway.session_automation_retry import AutomationRuntimeDeferred
         from gateway.session_managed_worker import ManagedExecutionUnknown
         try:
             try:
@@ -1321,6 +1336,15 @@ class SessionAuthority:
             finally:
                 with live.event_stream.lock:
                     self.executing.pop(ref.session_id, None)
+        except AutomationRuntimeDeferred:
+            with live.event_stream.lock:
+                live.event_stream.execution = {}
+            self.pending_stops.pop(ref.session_id, None)
+            self.pending_stop_causes.pop(ref.session_id, None)
+            self.pending_steers.pop(ref.session_id, None)
+            self.adopted.pop(ref.session_id, None)
+            self._publish_pending(ref)
+            return None, 'deferred'
         except ManagedExecutionUnknown:
             with live.event_stream.lock:
                 live.event_stream.execution = {}
@@ -1375,7 +1399,7 @@ class SessionAuthority:
             admission_id = row['admission_id']
             try:
                 response, outcome = await self._execute_claimed(ref, live, row)
-                if outcome == 'settled_unknown':
+                if outcome in ('settled_unknown', 'deferred'):
                     self.deferred_resets.pop(live.route, None)  # no settlement follows, as below
                     continue
                 from gateway.session_settlement_recovery import requeue_shutdown_unstarted

@@ -1529,12 +1529,12 @@ def _row_follows_profile(row: dict | None) -> bool:
 
 
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
-    """Runtime fields persisted with a stored session (model column, ``billing_provider``, JSON ``model_config``):
-    resume restores the model/provider/reasoning THAT chat used, not the global pick. Plugin-owned Bot-Mode
+    """Runtime fields persisted with a stored session (model column, ``billing_provider``, JSON ``model_config``): resume restores the model/provider/reasoning THAT chat used, not the global pick. Plugin-owned Bot-Mode
     sessions normally rebuild from the member profile's CURRENT config (a stale provider pin left room bots
     "out of Nous credits" after a profile switch). A canonical Bot Chat may instead restore an explicit
-    composer pick while the profile model it diverged from remains unchanged."""
-    if not row:
+    composer pick while the profile model it diverged from remains unchanged. A fallback's route is turn-scoped (#152333)."""
+    from agent.fallback_session_route import fallback_restored_row
+    if not (row := fallback_restored_row(row)):
         return {}
     model_config = _parse_model_config(row.get("model_config"), quiet=True)
     _row_title = str(row.get("title") or "").strip()

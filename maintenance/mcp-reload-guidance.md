@@ -27,3 +27,6 @@ Remove this patch when upstream corrects the reference to match the user guide.
 ## Rollback
 
 Revert the commit carrying `Fork-Patch: mcp-reload-guidance`.
+
+
+Contract tests: none. Documentation only: the unit keeps the bundled skill reference and the user guide in agreement.

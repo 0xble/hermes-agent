@@ -350,6 +350,36 @@ def _filter_secret_env(
             out[key] = value
 
 
+def _default_profile_home(env: Mapping[str, str]) -> Path | None:
+    """Default home named by *env*, or None for an explicit routed/custom home."""
+    from hermes_constants import _expand_hermes_home, _platform_default_hermes_home
+
+    user_home = str(env.get("HOME") or env.get("USERPROFILE") or "").strip()
+    default = _platform_default_hermes_home(env, lambda: Path(user_home) if user_home else Path.home())
+    raw_home = str(env.get("HERMES_HOME", "")).strip()
+    if not raw_home or _expand_hermes_home(raw_home).resolve() == default.resolve():
+        return default
+    return None
+
+
+def _strip_default_profile_home(env: dict) -> dict:
+    """Keep the live default home out of a terminal shell's inherited environment."""
+    if _default_profile_home(env) is not None:
+        env.pop("HERMES_HOME", None)
+    return env
+
+
+def _replace_default_profile_home(env: dict) -> dict:
+    """Keep executor/descendant shell paths defined without inheriting live state.
+
+    Routed/custom homes remain explicit profile routes. The disposable path is
+    process-owned and not derived from a home variable a cleanup could follow.
+    """
+    if _default_profile_home(env) is not None:
+        env["HERMES_HOME"] = tempfile.mkdtemp(prefix="hermes-child-home-")
+    return env
+
+
 def _finalize_child_env(env: dict) -> dict:
     """Guards shared by every spawn surface: profile-home propagation, session-context
     bridging, Hermes-owned PYTHONPATH + venv-marker strip, MSYS defaults, delegate_task
@@ -360,7 +390,10 @@ def _finalize_child_env(env: dict) -> dict:
     strip_supervised_process_identity(env)
     _apply_windows_msys_bash_env_defaults(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    env = delegated_child_subprocess_env(env)
+    if env.get("HERMES_DELEGATED_CHILD_CONTEXT"):
+        _replace_default_profile_home(env)
+    return env
 
 
 def _scrubbed_env(parts, plugin_strip: frozenset, fix_path) -> dict:
@@ -468,7 +501,10 @@ def build_subprocess_env(
         env.update(extra)
     strip_supervised_process_identity(env)
     from agent.delegation_context import delegated_child_subprocess_env
-    return delegated_child_subprocess_env(env)
+    env = delegated_child_subprocess_env(env)
+    if env.get("HERMES_DELEGATED_CHILD_CONTEXT"):
+        _replace_default_profile_home(env)
+    return env
 
 
 def served_profile_child_env(
@@ -864,7 +900,7 @@ def _make_run_env(env: dict) -> dict:
     if published:
         run_env.update(published)
         run_env.pop("WAYLAND_DISPLAY", None)  # X11 desktop; a leaked Wayland socket flips GTK/Chromium backends
-    return run_env
+    return _strip_default_profile_home(run_env)
 
 
 # --- Hermes venv / repo-root detection (module-level, computed once) ---
@@ -1118,6 +1154,25 @@ class LocalEnvironment(BaseEnvironment):
     # A subclass that confines its commands (a sandbox) sets this False: see BaseEnvironment.
     uses_host_filesystem = True
 
+    def _shell_home_setup(self) -> str:
+        """Default shell paths are local variables, never child-process routing."""
+        from agent.delegation_context import is_delegated_child_process_context
+        if is_delegated_child_process_context() or self.env.get("HERMES_DELEGATED_CHILD_CONTEXT"):
+            return ""
+        env = dict(os.environ | self.env)
+        _apply_profile_home(env)
+        home = _default_profile_home(env)
+        if home is None:
+            return ""
+        quoted = _quote_bash_path(str(home))
+        # Run after login init AND snapshot replay. Old snapshots may export the
+        # live value; explicit user-selected scratch exports must still persist.
+        return (f'if [ -z "${{HERMES_HOME-}}" ]; then HERMES_HOME={quoted}; fi; '
+                f'if [ "$HERMES_HOME" = {quoted} ]; then export -n HERMES_HOME; fi\n')
+
+    def _wrap_command(self, command: str, cwd: str) -> str:
+        return super()._wrap_command(self._shell_home_setup() + command, cwd)
+
     def _additional_profile_scoped_passthrough_names(self) -> tuple[str, ...]:
         """First-party ``BUZZ_*`` names present in the env, excluded from the shared
         session snapshot. env_passthrough can never list them (it refuses blocklisted
@@ -1130,9 +1185,15 @@ class LocalEnvironment(BaseEnvironment):
             if isinstance(name, str) and _matches_terminal_first_party_prefix(name)))
 
     def _snapshot_excluded_passthrough_names(self) -> tuple[str, ...]:
-        """Plus the plugins' session env names: each command gets its own session's values."""
+        """Plus the plugins' session env names: each command gets its own session's values.
+        The bootstrap also keeps a default-profile HERMES_HOME out of the snapshot."""
         from hermes_cli.plugins_session_env import session_env_names
-        return tuple(sorted({*super()._snapshot_excluded_passthrough_names(), *session_env_names()}))
+        names = {*super()._snapshot_excluded_passthrough_names(), *session_env_names()}
+        if not self._snapshot_ready and self._shell_home_setup():
+            names.add("HERMES_HOME")
+        else:
+            names.discard("HERMES_HOME")
+        return tuple(sorted(names))
 
     def __init__(self, cwd: str = "", timeout: int = 60, env: dict | None = None, persistent: bool = True):
         super().__init__(cwd=_resolve_local_initial_cwd(cwd), timeout=timeout, env=env, persist_env=persistent)
@@ -1208,6 +1269,7 @@ class LocalEnvironment(BaseEnvironment):
                   stdin_data: str | None = None) -> subprocess.Popen:
         bash = _find_bash()
         run_env = _make_run_env(self.env)
+        cmd_string = self._shell_home_setup() + cmd_string
         # Login invocations still load shell functions and custom init files. A login
         # profile may reset PATH, so carry the selected toolchain separately through it.
         if login:
