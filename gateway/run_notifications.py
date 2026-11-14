@@ -31,7 +31,6 @@ from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
-from gateway.run_notifications_retry import GatewayDelegationRetrySweepMixin
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
@@ -256,7 +255,7 @@ from gateway.run_notifications_media import GatewayNotificationsMixin as Gateway
 class GatewayNotificationsMixin(
     GatewayMediaNotificationsMixin, GatewayCompletionNotificationsMixin, GatewayDelegationNotificationsMixin,
     GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayProcessEventSourcesMixin,
-    GatewayProcessNotificationsMixin, GatewayDelegationRetrySweepMixin,
+    GatewayProcessNotificationsMixin,
 ):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
