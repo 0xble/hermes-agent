@@ -1710,11 +1710,25 @@ def test_candidate_smoke_blocks_a_plugin_the_running_release_loads_and_the_candi
     (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n")
     source = Path(__file__).resolve().parents[2]
 
+    # The version staging stamped into the candidate, as stage_release passes it. A shallow CI
+    # checkout has no tags, so the candidate cannot be asked for its own version here.
     if blocked:
-        with pytest.raises(RuntimeError, match="enabled plugin needs-newer: requires hermes >=999.0"):
-            releases.smoke_plugins(source, home)
+        with pytest.raises(RuntimeError, match="enabled plugin needs-newer: requires hermes >=999.0, candidate 0.23.1"):
+            releases.smoke_plugins(source, home, candidate_version="0.23.1")
     else:
-        releases.smoke_plugins(source, home)
+        releases.smoke_plugins(source, home, candidate_version="0.23.1")
+
+
+def test_candidate_version_is_read_from_the_stamp_staging_wrote(tmp_path):
+    """stage_release stamps the candidate before smoking it; the version gate reads that stamp,
+    and a release without one (or stamped unknown) is never gated."""
+    release = tmp_path / "release"
+    release.mkdir()
+    assert releases._stamped_base_version(release) == ""
+    (release / "install-stamp.json").write_text(json.dumps({"baseVersion": "unknown"}), encoding="utf-8")
+    assert releases._stamped_base_version(release) == ""
+    (release / "install-stamp.json").write_text(json.dumps({"baseVersion": "0.23.1"}), encoding="utf-8")
+    assert releases._stamped_base_version(release) == "0.23.1"
 
 
 def test_candidate_import_smoke_accepts_enabled_portable_plugin(tmp_path, monkeypatch):
