@@ -43,7 +43,7 @@ from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from agent.interrupt_compat import request_hard_interrupt
 from agent.message_metadata import (
     ABSORBED_MESSAGE_UIDS, DB_ROW_SNAPSHOT, MESSAGE_UID, REPLAY_PERSISTED_CONTENT,
-    copy_identity_fields, is_compaction_scaffolding, scaffolding_replay_fields, replay_metadata_fields,
+    copy_identity_fields, replay_metadata_fields, unstamped_replay_fields,
 )
 from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance, AwakeIdleMeter
@@ -1205,8 +1205,12 @@ def _build_replay_entry(
     # Replay rebuilds the SAME conversation: every role keeps its uid and merge witness, so a context engine sees the
     # uids the store holds. Tool-call uid maps stay on rows that still carry their calls (those pass through whole).
     copy_identity_fields({key: msg[key] for key in (MESSAGE_UID, ABSORBED_MESSAGE_UIDS) if key in msg}, entry)
-    # Compaction provenance must survive replay so summary/restatement rows stay unstamped.
-    entry.update(scaffolding_replay_fields(msg))
+    # Compaction and host-notice provenance must survive replay so those rows stay unstamped; merge
+    # display metadata so the typed-ask stamp above is kept.
+    unstamped = unstamped_replay_fields(msg)
+    if "display_metadata" in unstamped:
+        unstamped["display_metadata"] = {**(entry.get("display_metadata") or {}), **unstamped["display_metadata"]}
+    entry.update(unstamped)
     if msg.get("_db_persisted"):
         entry["_db_persisted"] = True
     snapshot = msg.get(DB_ROW_SNAPSHOT)
@@ -1354,7 +1358,7 @@ def _build_gateway_agent_history(
             # Keep user timestamps for the stale-dangerous-confirmation stripper in agent/replay_cleanup.py.
             entry = _build_replay_entry(role, content, msg, preserve_timestamp=(role == "user"))
             if (inject_timestamps and role == "user" and isinstance(content, str)
-                    and not is_compaction_scaffolding(msg) and not msg.get("_compressed_summary")):
+                    and not unstamped_replay_fields(msg) and not msg.get("_compressed_summary")):
                 rendered = _render_msg_ts(content, replay_timestamp, tz=_msg_tz)
                 # Preserve only a sidecar matching the complete rendered message,
                 # optionally followed by the normal context separator. Cleanup
