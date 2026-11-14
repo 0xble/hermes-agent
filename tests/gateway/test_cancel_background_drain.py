@@ -17,6 +17,7 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionSource, build_session_key
+from tests.waiting import async_wait_until
 
 class _StubAdapter(BasePlatformAdapter):
     async def connect(self, *, is_reconnect: bool = False):
@@ -187,7 +188,8 @@ async def test_cancel_background_tasks_discards_deferred_command_behind_live_own
     await asyncio.wait_for(started.wait(), timeout=2.0)
     adapter.defer_command_until_idle(sk, _event("/undo"))
     await adapter.cancel_background_tasks()
-    await asyncio.sleep(0.05)
+    for _ in range(20):  # give a wrongly scheduled replay every chance to start
+        await asyncio.sleep(0)
     assert ran == ["turn"]
 
 
@@ -221,7 +223,8 @@ async def test_cancel_background_tasks_reports_unrun_deferred_command():
     await asyncio.wait_for(started.wait(), timeout=2.0)
     adapter.defer_command_until_idle(sk, _event("/compress"))
     await adapter.cancel_background_tasks()
-    await asyncio.sleep(0.05)
+    for _ in range(20):  # give a wrongly scheduled replay every chance to start
+        await asyncio.sleep(0)
     assert ran == ["turn"]
     assert _dropped_notices(adapter) == [t("gateway.busy.deferred_dropped", command="compress")]
 
@@ -276,6 +279,6 @@ async def test_completed_deferred_command_gets_no_dropped_notice():
     adapter.defer_command_until_idle(sk, _event("/compress"))
     release.set()
     await asyncio.wait_for(done.wait(), timeout=2.0)
-    await asyncio.sleep(0.05)
+    await async_wait_until(lambda: not adapter._background_tasks, timeout=2.0, what="deferred command settled")
     await adapter.cancel_background_tasks()
     assert _dropped_notices(adapter) == []

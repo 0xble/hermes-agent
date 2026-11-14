@@ -5744,7 +5744,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         try:
             await self._report_unrun_deferred_commands()
         except Exception as exc:  # incl. the 5s bound: reporting never blocks teardown
-            logger.warning("[%s] Reporting unrun deferred commands failed: %r", self.name, exc)
+            logger.warning("[%s] Reporting unrun deferred commands failed: %r", self.name, exc, exc_info=True)
         # The gateway knows each key's runtime profile even when a shared primary bot received it.
         # Its first shutdown pass normally emptied these slots; retry leftovers through the same
         # owner-scoped writer rather than silently depositing them in the launch home's spool.
