@@ -8,8 +8,6 @@ from unittest.mock import Mock
 
 import pytest
 
-from cron import jobs
-from cron import scheduler
 from cron import jobs, scheduler
 import tools.cronjob_tools  # registers the public tool
 from agent.interrupt_scope import track_in_interrupt_scope

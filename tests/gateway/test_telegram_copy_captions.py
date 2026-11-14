@@ -71,7 +71,6 @@ async def test_auto_tts_copy_caption_fallbacks_keep_body_visible_but_never_spoke
 @pytest.mark.parametrize("internal", [False, True])
 async def test_plain_media_captions_render_markers_before_truncating(monkeypatch, tmp_path, operation, internal):
     import plugins.platforms.telegram.adapter as tg
-    import socket
     import telegram
     from tools import url_safety
 
@@ -121,7 +120,6 @@ async def test_plain_media_captions_render_markers_before_truncating(monkeypatch
 @pytest.mark.asyncio
 @pytest.mark.parametrize("internal", [False, True])
 async def test_image_private_dns_still_uses_text_fallback(monkeypatch, caplog, internal):
-    import socket
 
     from gateway.platforms.base import SendResult
     from tools import url_safety

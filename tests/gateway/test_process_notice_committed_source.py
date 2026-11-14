@@ -7,12 +7,13 @@ from gateway.config import Platform, PlatformConfig
 from gateway.platforms.event import MessageEvent
 from gateway.session_identity import replace_source
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
-from tests.gateway.test_admission_canary import refusal_evidence as canary_evidence
 from tests.gateway.test_automation_notification_category import _SOURCE, _authority, _native_owner
+
+pytest_plugins = ["tests.gateway.test_admission_canary"]  # the refusal_evidence fixture
 
 
 @pytest.mark.asyncio
-async def test_process_notice_refuses_stale_origin_on_a_per_user_route(tmp_path, monkeypatch, canary_evidence):
+async def test_process_notice_refuses_stale_origin_on_a_per_user_route(tmp_path, monkeypatch, refusal_evidence):
     from gateway.session_ingress_context import native_callback, register_transport_home
     from plugins.platforms.discord.adapter import DiscordAdapter
 
@@ -55,7 +56,7 @@ async def test_process_notice_refuses_stale_origin_on_a_per_user_route(tmp_path,
     ('adapter', 'admission_conflict', None),
 ])
 async def test_process_notice_prevalidation_refusals_reach_canary(
-        tmp_path, monkeypatch, canary_evidence, drift, reason, field):
+        tmp_path, monkeypatch, refusal_evidence, drift, reason, field):
     from gateway.session_automation import admit_process_notice
     from plugins.platforms.discord.adapter import DiscordAdapter
 

@@ -51,26 +51,31 @@ async def test_final_marker_cannot_override_newer_controls(loop_env, change):
     assert manager.fire_tick()
     event._loop_completion_identity = capture_loop_identity(manager.session_id)
     writer = loops.LoopManager(manager.session_id)
-    if change == "revise":
-        assert writer.revise(reason="Reduce polling", interval_seconds=43200)["ok"]
-    elif change == "replace":
+
+    def replace():
         quote = "Watch the new deployment instead"
         assert writer.replace(prompt=quote, interval_seconds=600, reason="new task", user_quote=quote,
                               user_messages=[quote])["ok"]
-    elif change == "pause":
-        writer.pause()
-    elif change == "resume":
+
+    def resume():
         writer.pause()
         writer.resume()
-    elif change == "clear":
-        writer.clear()
-    elif change == "other_session":
+
+    def other_session():
         other = loops.LoopManager("other")
         other.set("Other task", interval_seconds=300)
         event._loop_completion_identity = capture_loop_identity("other")
+
+    {
+        "revise": lambda: writer.revise(reason="Reduce polling", interval_seconds=43200)["ok"] or pytest.fail("revise"),
+        "replace": replace,
+        "pause": writer.pause,
+        "resume": resume,
+        "clear": writer.clear,
+        "other_session": other_session,
+        "failed": lambda: setattr(event, "_agent_turn_succeeded", False),
+    }[change]()
     before = loops.load_loop(manager.session_id).to_json()
-    if change == "failed":
-        event._agent_turn_succeeded = False
     runner._gateway_started_at = 0
     await runner._run_post_turn_hooks(
         agent_result="Task finished.\nLOOP_COMPLETE", source=event.source,

@@ -963,19 +963,13 @@ def test_round4_runtime_resolution_repros_refuse(tmp_path, case, entry):
     caller = tmp_path / "caller"
     caller.mkdir()
     live = root / "live"
-    extra = {}
-    if case == "missing_dotdot":
-        raw = str(live) + "/missing/.."
-    elif case == "repo_relative":
-        raw = "live"
-    elif case == "tilde":
-        live = tmp_path / "account-home" / ".hermes"
-        raw = "~/.hermes"
-    elif case == "variable":
-        raw = "${LIVE_ROOT}/profiles/dev"
-        extra["LIVE_ROOT"] = str(live)
-    else:
-        raw = "  " + str(live) + "  "
+    live, raw, extra = {
+        "missing_dotdot": (live, str(live) + "/missing/..", {}),
+        "repo_relative": (live, "live", {}),
+        "tilde": (tmp_path / "account-home" / ".hermes", "~/.hermes", {}),
+        "variable": (live, "${LIVE_ROOT}/profiles/dev", {"LIVE_ROOT": str(live)}),
+        "whitespace": (live, "  " + str(live) + "  ", {}),
+    }[case]
     _mark(live, "gateway-state")
     before = _snapshot(live)
     result = _run(root, commands, live, extra_env=extra, home_text=raw,
