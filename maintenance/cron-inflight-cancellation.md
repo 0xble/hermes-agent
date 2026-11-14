@@ -39,7 +39,10 @@ Recurring cancellations do not consume a completed-run repeat or failure budget.
 Listing and tool formatting inspect process-local controls plus the durable execution ledger. A live
 external worker is reported with its execution ID and cancellation marker; the runner watches that
 marker and passes it through the existing script process-tree cancellation path. A concurrent finish
-is harmless and terminal. Remote pause must invalidate heartbeat renewal.
+is harmless and terminal. The lookup is `cancellable_execution`, so a refused Run-now's newer
+`failed` row cannot hide the live run. A worker changing its own job (the row id equals its
+`_HERMES_CRON_EXTERNAL_WORKER`, or the self-removal marker is set) never cancels itself: "do X,
+then remove this job" keeps its result and delivery. Remote pause must invalidate heartbeat renewal.
 Verification must include `tests/cron/test_fire_claim_lost_after_delivery.py` and
 `tests/cron/test_inflight_cancellation.py`; a passing exact-SHA gate alone does not
 prove these paths ran. The bounded integration check is
