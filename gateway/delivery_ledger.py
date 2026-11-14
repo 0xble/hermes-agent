@@ -373,20 +373,23 @@ def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: s
                             thread_id: Optional[str], content: str, since: float,
                             adapter_profile: Optional[str] = None,
                             resume_turn_id: Optional[str] = None, part: bool = False,
-                            supervisor_checkin: bool = False) -> None:
+                            supervisor_checkin: bool = False, boundary: bool = False) -> None:
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
-    redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
-    since *since* (the turn start), and idempotent across boots that die before their sweep."""
+    redelivered once, with the recovered marker. A Hermes-authored turn boundary (``boundary``: an
+    interrupted or failed turn's notice) is never streamed, so it is owed 'pending' and goes out
+    plainly, not as a possible duplicate. A no-op when the same reply was already ledgered since
+    *since* (the turn start), and idempotent across boots that die before their sweep."""
     now = time.time()
     values = (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-              content, now, now, str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id,
+              content, "pending" if boundary else "attempting", now, now,
+              str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id,
               int(supervisor_checkin))
     insert = """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                owner_pid, owner_started_at, adapter_profile, resume_turn_id, supervisor_checkin)
-               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?, ?, ?"""
+               SELECT ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, ?, ?, ?"""
     with _DB_LOCK, _transaction() as conn:
         if part:
             # A copy part the caller already found missing: its per-part id is the only identity,
