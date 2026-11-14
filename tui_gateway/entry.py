@@ -7,6 +7,11 @@ import hermes_bootstrap
 
 hermes_bootstrap.harden_import_path()
 
+from hermes_cli.test_artifact_lifetime import arm_test_artifact_lifetime
+
+if "pytest" not in sys.modules:
+    arm_test_artifact_lifetime()
+
 import json
 import logging
 import signal
