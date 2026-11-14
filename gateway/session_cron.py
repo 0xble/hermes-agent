@@ -317,7 +317,8 @@ async def execute(authority, ref, row, policy):
         from cron.cancellation import CancelRequest, _CombinedCancelEvent
 
         db_path = await asyncio.to_thread(Path(authority.db.db_path).resolve)
-        with _profile_runtime_scope(db_path.parent):
+        from agent.runtime_scope import bind_turn, claim_fence
+        with _profile_runtime_scope(db_path.parent), bind_turn(ref.session_id, row['admission_id'], claim_fence(row)):
             from cron.detached_authority import detached_assignment, observe_detached
             if await asyncio.to_thread(detached_assignment, job['id'], execution_id):
                 observed = await observe_detached(row)

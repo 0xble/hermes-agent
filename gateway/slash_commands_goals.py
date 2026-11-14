@@ -113,15 +113,20 @@ class GatewayGoalCommandsMixin:
             adapter, quick_key = self._adapter_and_key_for(event)
             if text and adapter and quick_key:
                 if kickoff:
+                    media = bool(event.media_urls)
                     turn = MessageEvent(
                         text=text,
-                        message_type=MessageType.TEXT,
+                        message_type=event.message_type if media else MessageType.TEXT,
                         source=event.source,
                         message_id=event.message_id,
-                        edit_revision=event.edit_revision if kickoff else None,  # an edited /goal: own admission id
+                        edit_revision=event.edit_revision,
                         channel_prompt=event.channel_prompt,
                         auto_skill=event.auto_skill,
                         reply_expected=event.reply_expected,
+                        media_urls=list(event.media_urls) if media else [],
+                        media_types=list(event.media_types) if media else [],
+                        media_text_inlined=list(event.media_text_inlined) if media else [],
+                        media_filenames=list(event.media_filenames) if media else [],
                     )
                 else:
                     turn = self._synthetic_prompt_event(

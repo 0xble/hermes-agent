@@ -92,6 +92,7 @@ POST_MOVE_MODULES = (
     "gateway.status",
     "hermes_cli.gateway",
     "hermes_cli.gateway_launchd_runtime",
+    "hermes_cli.gateway_runtime_start",
     "hermes_cli.gateway_windows",
     "hermes_cli.github_api",
     "hermes_cli.plugins_session_env",

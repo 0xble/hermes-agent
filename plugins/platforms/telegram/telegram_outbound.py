@@ -75,10 +75,19 @@ async def send_rich_standalone(bot, extra: dict, chat_id, content: str, *, threa
         _FLOOD_INLINE_WAIT_CAP_SECS, _TEXT_SEND_DEADLINE, _await_with_thread_deadline,
         _normalize_dollar_entities, _redact_telegram_error_text, _telegram_retry_after)
     try:
-        adapter = _standalone_adapter(bot, extra)
+        """The gateway's ``sendRichMessage`` fast-path for an out-of-process send: the same gates
+        (``rich_messages`` opt-in, constructs MarkdownV2 degrades, Desktop crash/garble shapes, size cap
+        per part, capability latch) and routing. ``None`` = not eligible or permanently rejected, so the caller
+        sends legacy MarkdownV2; otherwise the adapter's ``SendResult``. A transient failure is returned,
+        not resent as legacy, because the rich request may have landed."""
+        from gateway.platforms.helpers import send_long_reply_as_file
+        from plugins.platforms.telegram.rich_parts import send_rich_parts
+        adapter, metadata = _standalone_adapter(bot, extra), _metadata(thread_id, notify)
         content = _normalize_dollar_entities(content)
         if not adapter._should_attempt_rich(content):
             return None
+        as_file = await send_long_reply_as_file(adapter, str(chat_id), content, metadata=metadata)
+        return as_file or await send_rich_parts(adapter, str(chat_id), content, None, metadata)
     except Exception as exc:  # health: allow BLE001 -- no request has started; safe legacy fallback
         logger.warning("Telegram rich adapter unavailable, falling back to legacy: %s", _redact_telegram_error_text(exc))
         return None

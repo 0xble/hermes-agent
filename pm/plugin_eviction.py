@@ -35,7 +35,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from pm.environment import BuildFailure, ResolutionConflict
+from pm.environment import BuildFailure, ResolutionConflict  # noqa: TID251
 from pm.environments import install_state_dir, runtime_facts_path
 from pm.filesystem import durable_write_bytes, file_digest, native, read_bytes_or_none
 from pm.package import InstallError
@@ -56,7 +56,7 @@ def _is_bundled_provider(entry: Entry) -> bool:
 
 def _interpreter_version() -> str:
     """The Python the generation is built for; a plugin's requires-python is judged against it."""
-    from pm._uv import _toolchain
+    from pm._uv import _toolchain  # noqa: TID251
 
     tools = _toolchain(explicit=True)
     if tools is None:

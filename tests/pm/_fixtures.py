@@ -20,6 +20,15 @@ import zipfile
 import pytest
 
 
+def windows_account(sid: str) -> str:
+    """How ``icacls`` names a well-known *sid* on this machine: ``BUILTIN\\Users`` is
+    ``VORDEFINIERT\\Benutzer`` on German Windows, so ACL assertions compare against this."""
+    import win32security
+
+    name, domain, _ = win32security.LookupAccountSid(None, win32security.ConvertStringSidToSid(sid))
+    return f"{domain}\\{name}"
+
+
 def _wheel(directory: Path, name: str, version: str = "1.0", requirements=(), extra=None) -> Path:
     """Build a wheel whose bytes depend only on its arguments.
 
@@ -197,7 +206,6 @@ def build_worker(client, isolated_python, monkeypatch):
         for name in names:
             monkeypatch.setattr(importlib.import_module(module), name, caller_engine)
     return client
-
 
 @pytest.fixture
 def offline_build_worker(build_worker, monkeypatch, isolated_python):

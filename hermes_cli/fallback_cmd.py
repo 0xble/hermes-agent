@@ -1,12 +1,14 @@
 """hermes fallback — manage the fallback provider chain (tried in order when the primary fails).
 
-Subcommands: ``list`` (default), ``add`` (same picker as `hermes model`), ``remove``, ``clear``.
+Subcommands: ``list`` (default), ``add`` (same picker as `hermes model`), ``remove``, ``clear``, ``check``
+(readiness, in :mod:`hermes_cli.fallback_check`).
 """
 from __future__ import annotations
 
 import copy
 from typing import Any, Dict, List, Optional
 
+from hermes_cli.fallback_check import cmd_fallback_check
 from hermes_cli.fallback_config import get_fallback_chain
 
 # Normalized fallback chain (merges legacy ``fallback_model``); always a fresh copy.
@@ -302,11 +304,12 @@ def cmd_fallback_cooldowns(args) -> None:
 
 
 def cmd_fallback(args) -> None:
+    
     sub = getattr(args, "fallback_command", None)
     handler = _SUBCOMMANDS.get(sub)
     if handler is None:
         print(f"Unknown fallback subcommand: {sub}")
-        print("Use one of: list, add, remove, clear, status, cooldowns")
+        print("Use one of: list, add, remove, clear, status, cooldowns, check")
         raise SystemExit(2)
     handler(args)
 
@@ -315,4 +318,5 @@ _SUBCOMMANDS = {
     **dict.fromkeys((None, "", "list", "ls"), cmd_fallback_list), "add": cmd_fallback_add,
     **dict.fromkeys(("remove", "rm"), cmd_fallback_remove), "clear": cmd_fallback_clear,
     "status": cmd_fallback_status, "cooldowns": cmd_fallback_cooldowns,
+    "check": cmd_fallback_check,
 }

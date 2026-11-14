@@ -166,4 +166,5 @@ registry.register(
         emoji=args.get("emoji", ""), message_row_id=args.get("message_row_id"),
         messages_back=args.get("messages_back")),
     emoji="👍",
+    self_checked_args=("emoji",),  # no emoji retracts the reaction
 )

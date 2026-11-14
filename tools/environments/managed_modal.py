@@ -11,7 +11,6 @@ import json
 import logging
 import os
 import requests
-import shlex
 import time
 import uuid
 from typing import Any, Dict, Optional
@@ -85,8 +84,8 @@ class ManagedModalEnvironment(BaseEnvironment):
         del rewrite_compound_background, bounded_capture
         exec_command, sudo_stdin = self._prepare_command(command)
         if sudo_stdin is not None:
-            # Feed sudo via a shell pipe: the transport has no direct stdin piping.
-            exec_command = f"printf '%s\\n' {shlex.quote(sudo_stdin.rstrip())} | {exec_command}"
+            # Password lines lead the request's stdin, merged as in BaseEnvironment.execute.
+            stdin_data = sudo_stdin + (stdin_data or "")
         # No shared wrapper here, so carry a delegated child's parent relay address directly.
         from agent.delegation_context import in_process_child_relay_parent_address
         if relay_parent := in_process_child_relay_parent_address():
