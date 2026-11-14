@@ -675,6 +675,10 @@ Fork-Patch: reaction-outbound-identity.
 
 Fork patch identity: `eager-plugin-tools`. Plugin-owned tools may opt into the direct schema surface while explicit user deferral remains authoritative. See [the maintenance unit](maintenance/eager-plugin-tools.md).
 
+## Plugin tool deadline
+
+Fork patch identity: `plugin-tool-deadline`. Plugin-owned tools may declare a finite execution budget that extends the generic tool deadline. See [the maintenance unit](maintenance/plugin-tool-deadline.md).
+
 ## Telegram topic retirement
 
 Fork patch identity: `telegram-topic-retire`. A selected topic deletion reconciles
