@@ -842,7 +842,24 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
                 verdict, reason = RETRY_TERMINAL, f"retry budget exhausted: still failing after 24h ({reason})"
             else:
                 verdict = RETRY_SCHEDULED
-                due = now + max(_backoff(record["retry_attempt"]), (_reset_delay(_texts(record), now) or 0) + 30.0)
+                task = record.get("task") or {}
+                routes = [tuple(route) for route in task.get("route_chain") or [] if isinstance(route, (list, tuple)) and len(route) == 3]
+                available_at = None
+                if routes:
+                    from agent.shared_primary_cooldown import earliest_available
+                    _, available_at = earliest_available(routes, now=now)
+                # A route with no record is unknown: the store only records primary-route
+                # outages in production. Combine every recorded active reset with the provider
+                # hint, then apply the normal exponential backoff floor.
+                candidates = []
+                if available_at is not None and 0 < available_at - now <= MAX_LINEAGE_AGE_S:
+                    candidates.append(available_at - now)
+                if reset_delay := _reset_delay(_texts(record), now):
+                    candidates.append(reset_delay)
+                # Avoid racing the provider's reset, but never park beyond the lineage budget.
+                reset_wait = min(candidates) + 30.0 if candidates else 0.0
+                deadline = float(record["retry_root_started_at"] or now) + MAX_LINEAGE_AGE_S
+                due = min(deadline, now + max(_backoff(record["retry_attempt"]), reset_wait))
         conn.execute(
             """UPDATE async_delegations SET retry_state=?, retry_reason=?, retry_due_at=?, updated_at=?
                WHERE delegation_id=? AND retry_state=?""",
