@@ -57,6 +57,9 @@ def configure(sb: I.Sandbox, base_url: str, extra: str = "", env_extra: str = ""
                      "from hermes_cli.config_defaults import DEFAULT_CONFIG as D; print(D['_config_version'])"]))
     version = int(ver.stdout.strip().splitlines()[-1])
     (sb.hermes_home / "config.yaml").write_text(I.provider_config(base_url, version, extra), encoding="utf-8")
+    # Replacing config drops the install fixture's per-install channel record.
+    # These origins publish main-branch commits, not GitHub stable releases.
+    I.pin_main_channel(sb)
     (sb.hermes_home / ".env").write_text(f"OPENAI_API_KEY={I.FAKE_KEY}\n{env_extra}", encoding="utf-8")
     I.pin_main_channel(sb)
 
