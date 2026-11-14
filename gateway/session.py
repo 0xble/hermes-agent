@@ -967,6 +967,9 @@ class SessionStore(
         self._routing_generation = 0
         self._persisted_routing_generation = 0
         self._fast_persisted_entries: dict[str, tuple[int, str]] = {}
+        # Routing rows this process last persisted (key -> entry_json, None if unknown); full saves
+        # write their diff against it. Guarded by _save_lock.
+        self._routing_baseline: Optional[dict[str, Optional[str]]] = None
         self._inflight_lock = threading.Lock()
         self._inflight_sessions: dict[str, _SessionFlight] = {}
         # Ids a route names before their state.db row is live: a route transition publishes under

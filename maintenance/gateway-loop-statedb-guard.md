@@ -110,6 +110,15 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   ~120 busy agent threads that turned a 10 ms diff of 2,753 rows into 3-17 s holds
   (2026-10-25: 58 holds, 365 s in 2 h; callback CPU ~0.4 s). Keep new writer callbacks
   O(1) in Python round trips where the row count grows with history or sessions.
+- A structural routing save sends state.db only its diff. `_persist_routing_data` keeps
+  `_routing_baseline` (key -> entry JSON this process last persisted, None when a fast
+  single-entry save may have skipped it), diffs the snapshot against it in Python before the
+  writer lock, and writes the changed and removed keys through `apply_gateway_routing_delta`
+  with the same retired-route skip and report. A full replace still runs with no baseline
+  (first save, a failed write, a private interval) and every `_ROUTING_RECONCILE_S` (600 s) to
+  restore rows changed behind the process. On 2026-11-14 the full replace of a 37,670-route
+  index held the writer lock 9-113 s per save and stalled every session's writes. Proof:
+  `tests/gateway/test_routing_save_delta.py`.
 - The check-in poll (`gateway/run_checkins.py::poll_checkins`, every 5 s) groups every routed
   session on the loop. `_standalone_runtime_home` memoizes the resolved parent per DB path, and
   the scan yields to the loop every `_SCAN_YIELD_EVERY` (512) entries. On 2026-11-14 the live
