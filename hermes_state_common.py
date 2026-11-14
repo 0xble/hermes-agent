@@ -631,6 +631,14 @@ CREATE INDEX IF NOT EXISTS session_admissions_pending
 -- The WHERE is built from CRON_PRINCIPAL_ID, the literal the run queries inline, so they cannot drift.
 CREATE INDEX IF NOT EXISTS idx_session_admissions_cron_request
     ON session_admissions(principal_id, request_id, target_session_id) WHERE principal_id = '""" + CRON_PRINCIPAL_ID + """';
+-- Restart recovery (``recover_session_inputs``) settles only the rows a lost owner left in flight.
+-- Without these it scanned the whole wide table at every start (status, outcome and owner_epoch sit
+-- behind the payload and lineage overflow pages), holding the writer ~20 s. Partial: settled history
+-- pays nothing. The query names the same literals, so the planner can prove the index applies.
+CREATE INDEX IF NOT EXISTS idx_session_admissions_started
+    ON session_admissions(owner_epoch) WHERE status = 'started';
+CREATE INDEX IF NOT EXISTS idx_session_admissions_steering
+    ON session_admissions(owner_epoch) WHERE status = 'terminal' AND outcome = 'steering';
 CREATE TABLE IF NOT EXISTS worker_executions (
     execution_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
@@ -645,6 +653,9 @@ CREATE TABLE IF NOT EXISTS worker_executions (
 -- inside the write transaction; without this each probe scanned the whole (only-growing) table.
 CREATE INDEX IF NOT EXISTS idx_worker_executions_session_status
     ON worker_executions(session_id, status);
+-- Restart recovery fences only live executions; terminal history (one per turn) stays out of it.
+CREATE INDEX IF NOT EXISTS idx_worker_executions_live
+    ON worker_executions(owner_epoch) WHERE status != 'terminal';
 CREATE TABLE IF NOT EXISTS worker_receipts (
     execution_id TEXT NOT NULL REFERENCES worker_executions(execution_id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL CHECK (sequence > 0),
