@@ -5657,6 +5657,7 @@ async def _start_gateway_start_control_socket(runner):
         from gateway.session_snapshot import make_session_snapshot_handler
         from gateway import zero_cut_standby as zcs
         from gateway.zero_cut_handover_drain import request_handover, status as handover_status
+        from gateway.writer_census import writer_census
         _cron_review_control = CronReviewControl(runner)
         _control_server = GatewayControlServer(
             home=_hermes_home,
@@ -5674,7 +5675,8 @@ async def _start_gateway_start_control_socket(runner):
                            "reload-plugins": reload_plugins_verb(runner, _main_loop),
                            "promote": lambda: asyncio.run_coroutine_threadsafe(zcs.promote(runner), _main_loop).result(),
                            "handover": lambda: request_handover(runner, _main_loop),
-                           "handover-status": lambda: handover_status(runner)})
+                           "handover-status": lambda: handover_status(runner),
+                           "writer-census": lambda: writer_census(runner)})
         _control_server.ticket_store = runner.session_ticket_store
         from gateway.session_worker_discovery import worker_discovery_handler
         _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)
