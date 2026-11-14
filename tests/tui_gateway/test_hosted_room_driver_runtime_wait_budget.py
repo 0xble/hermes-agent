@@ -44,7 +44,10 @@ def test_wait_for_terminal_sleep_budget_stays_inside_the_renewal_window(db: Path
     identity = _identity()
     _admit(db, identity)
     rpc = FakeSessionRPC(auto_complete=False)
-    runtime = _runtime(db, rpc, turn_timeout_seconds=30)
+    # This test measures the requested wait cap, not lease expiry. Keep the real short TTL so
+    # the cap remains meaningful while freezing only the injected lease clock for setup/renewal.
+    lease_now = time.time()
+    runtime = _runtime(db, rpc, clock=lambda: lease_now, turn_timeout_seconds=30)
     waits: list[float] = []
 
     class RecordingWake(threading.Event):
@@ -57,7 +60,7 @@ def test_wait_for_terminal_sleep_budget_stays_inside_the_renewal_window(db: Path
     runtime._wake = RecordingWake()
     runtime.start()
     try:
-        assert rpc.submitted.wait(timeout=5.0)
+        assert rpc.submitted.wait(timeout=5.0), runtime.status()
         _wait_for(lambda: len([w for w in waits if w >= 0.05]) >= 3, timeout=5.0)
         cap = min(runtime.active_poll_interval_seconds, runtime.lease_ttl_seconds / 4)
         assert all(timeout <= cap + 1e-9 for timeout in waits)
