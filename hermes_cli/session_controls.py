@@ -1299,7 +1299,11 @@ def resolve_request(request_id: str, decision: str, user_id: str) -> Optional[di
         _save_record(record, cursor=conn)
         return record
 
-    return db._execute_write(resolve)
+    record = db._execute_write(resolve)
+    if record is not None and record.get("status") == "failed":
+        # Not persisted: the explanation is for the card that tapped approve, which renders it as-is.
+        record["error_reason"] = control_error_reason(record.get("error"), kind=record.get("kind"))
+    return record
 
 
 def continuation_is_current(request_id: str) -> bool:

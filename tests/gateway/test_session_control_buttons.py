@@ -69,7 +69,8 @@ async def test_control_callback_failed_approval_explains_not_applied_reason():
         from_user=SimpleNamespace(id=99, first_name="Brian"), answer=AsyncMock(),
         message=SimpleNamespace(text="Approval needed"),
     )
-    record = {"kind": "goal", "action": "resume", "status": "failed", "error": "nothing_to_resume"}
+    record = {"kind": "goal", "action": "resume", "status": "failed", "error": "nothing_to_resume",
+              "error_reason": "goal was not paused (already running or cleared)"}
     with patch("hermes_cli.session_controls.resolve_request", return_value=record):
         await adapter._handle_session_control_callback(query, "ctl:a:abc123", {})
 

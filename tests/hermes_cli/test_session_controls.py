@@ -657,6 +657,7 @@ def test_resume_only_active_goals_are_idempotent(state, status):
         assert (resolved["status"], resolved["error"]) == ("applied", None)
     else:
         assert (resolved["status"], resolved["error"]) == ("failed", "nothing_to_resume")
+        assert resolved["error_reason"] == "goal was not paused (already running or cleared)"
     assert load_goal("target").status == status
 
 
