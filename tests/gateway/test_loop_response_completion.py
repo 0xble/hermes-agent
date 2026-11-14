@@ -115,3 +115,54 @@ async def test_queued_turn_carries_its_own_loop_definition(loop_env, terminal):
     )
     runner._run_agent.assert_awaited_once()
     assert result["queued_terminal_loop_completion_identity"] == expected
+
+
+@pytest.mark.asyncio
+async def test_silent_loop_complete_on_a_human_turn_sends_exactly_one_reply(loop_env, monkeypatch):
+    """``[SILENT]`` + LOOP_COMPLETE from a person's turn finishes the loop. The finish notice is
+    the turn's single reply: no "No reply was written" fallback, no second notice, no re-prompt."""
+    from gateway.config import Platform
+    from gateway.run_turn_silence_recovery import _completes_active_loop
+    from gateway.session import SessionSource
+    from gateway.platforms.event import MessageEvent
+
+    runner = _make_runner()
+    notices = AsyncMock()
+    monkeypatch.setattr(runner, "_defer_goal_status_notice_after_delivery", notices, raising=False)
+    monkeypatch.setattr(runner, "_room_allow_silence", lambda _source: None, raising=False)
+
+    async def inline(func, *args):
+        return func(*args)
+
+    monkeypatch.setattr(runner, "_run_in_executor_with_context", inline, raising=False)
+    source = SessionSource(platform=Platform.DISCORD, chat_id="dm-loop", chat_type="dm", user_id="user-loop")
+    event = MessageEvent(text="Is it finished?", source=source, message_id="msg-dm")
+    manager = loops.LoopManager("sid-gateway-loop")
+    manager.set("Check the deployment", interval_seconds=21600, times=12)
+    event._loop_completion_identity = capture_loop_identity(manager.session_id)
+    raw = "[SILENT]\nLOOP_COMPLETE"
+    assert _completes_active_loop(raw, manager.session_id)  # the one-shot silence re-prompt stands down
+
+    session = SimpleNamespace(session_id=manager.session_id, incognito=False)
+    response, silent, _ = await runner._hmwa_shape_agent_response(
+        {"final_response": raw, "messages": [], "api_calls": 1}, source, [], session, None,
+        None, 0, manager.session_id, "discord", 0.0,
+        persist_user_display_kind=None, reply_expected=True,
+        loop_identity=event._loop_completion_identity,
+    )
+    assert silent is False
+    assert response == "✓ Loop finished — task complete."
+    assert loops.load_loop(manager.session_id).status == "done"
+    assert not _completes_active_loop(raw, manager.session_id)
+
+    await runner._run_post_turn_hooks(agent_result=raw, source=source, is_internal=False, event=event)
+    notices.assert_not_awaited()
+
+    # Without an active loop the marker finishes nothing and the existing fallback remains.
+    fallback, _, _ = await runner._hmwa_shape_agent_response(
+        {"final_response": raw, "messages": [], "api_calls": 1}, source, [], session, None,
+        None, 0, manager.session_id, "discord", 0.0,
+        persist_user_display_kind=None, reply_expected=True,
+        loop_identity=event._loop_completion_identity,
+    )
+    assert "No reply was written" in fallback
