@@ -441,7 +441,16 @@ def sweep_orphaned_embedded_drivers(
     return reaped
 
 
+def _names_socket(cmdline: tuple[str, ...], real_socket: str) -> bool:
+    """True when an argument is this socket under any spelling. macOS hands out the temp dir
+    as ``/var/...`` while its real path is ``/private/var/...``, so compare real paths."""
+    name = os.path.basename(real_socket)
+    return any(os.path.basename(arg) == name and _realpath(arg) == real_socket for arg in cmdline)
+
+
 def _remove_stale_sockets(temp_dirs: list[str], live_sockets: set[str]) -> None:
+    # Directory entries below are real paths; the driver cmdlines hold the spelling they were given.
+    live_sockets = {_realpath(path) for path in live_sockets}
     for directory in temp_dirs:
         root = _realpath(directory)
         if not os.path.isdir(root):
@@ -477,9 +486,10 @@ def _remove_stale_sockets(temp_dirs: list[str], live_sockets: set[str]) -> None:
 
 def _socket_in_use(socket_path: str) -> bool:
     """True when a live process still names this socket. Best-effort, never raises."""
+    real_socket = _realpath(socket_path)
     try:
         for proc in scan_processes():
-            if socket_path in proc.cmdline and pid_alive(proc.pid, proc.create_time):
+            if _names_socket(proc.cmdline, real_socket) and pid_alive(proc.pid, proc.create_time):
                 return True
     except Exception:
         return True

@@ -166,6 +166,37 @@ class TestSweepDecisions:
         assert killed == [9]
 
 
+    def test_live_driver_socket_survives_a_symlinked_temp_dir_spelling(self, short_tmp, monkeypatch):
+        """macOS: the driver is started with ``/var/...`` (here ``/tmp/...``) while the sweep lists
+        the real ``/private/...`` directory. A live driver's socket must match either spelling."""
+        link = Path(tempfile.mkdtemp(prefix="hcl", dir="/tmp"))
+        try:
+            spelled = link / "dir"
+            spelled.symlink_to(short_tmp)
+            exe = "/tmp/hct-fake-cua-driver"
+            by_parent = short_tmp / "hc-parented.sock"
+            by_cmdline = short_tmp / "hc-scanned.sock"
+            _unix_socket(by_parent)
+            _unix_socket(by_cmdline)
+            scanned = _proc(66, 1, exe, str(spelled / by_cmdline.name), create_time=1.0)
+            monkeypatch.setattr(life, "scan_processes", lambda: [scanned])
+            monkeypatch.setattr(life, "pid_alive", lambda pid, _created=None: pid == 66)
+            killed = []
+            life.sweep_orphaned_embedded_drivers(
+                executables={exe},
+                processes=[_proc(33, 50, exe, str(spelled / by_parent.name))],
+                temp_dirs=[str(short_tmp)],
+                username="tester",
+                kill=killed.append,
+                grace_seconds=0,
+            )
+            assert killed == []
+            assert by_parent.exists()
+            assert by_cmdline.exists()
+        finally:
+            shutil.rmtree(link, ignore_errors=True)
+
+
 @pytest.mark.live_system_guard_bypass  # these tests kill session-leader and ppid-1 fakes they spawned
 class TestProcessLifetime:
     def test_explicit_terminate_kills_the_driver_group(self, tmp_path, short_tmp):
