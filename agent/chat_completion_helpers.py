@@ -2193,11 +2193,17 @@ def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_mo
         route = route_from_record(record)
         outage_id = str(record["outage_id"])
         if claim_outage_notice(route, outage_id, fallback=target):
-            try:
-                reset_label = datetime.fromtimestamp(float(record["reset_at"])).astimezone().strftime("%H:%M %Z")
-            except (KeyError, TypeError, ValueError, OSError, OverflowError):
-                reset_label = "the cooldown expiry"
             state = "overloaded" if record.get("reason") == FailoverReason.overloaded.value else "rate-limited"
+            try:
+                reset_at = float(record["reset_at"])
+                reset_label = datetime.fromtimestamp(reset_at).astimezone().strftime("%H:%M %Z")
+            except (KeyError, TypeError, ValueError, OSError, OverflowError):
+                reset_at, reset_label = None, "the cooldown expiry"
+            if reset_at is not None and reset_at <= time.time():
+                # The recorded reset already passed (a stale outage record): an "until <past time>"
+                # reads as wrong; the primary is due back and is probed again.
+                return False, (f"⚠️ {old_model} was {state} and is recovering; using {fb_model} via "
+                               f"{fb_provider} until it is back.")
             return False, f"⚠️ {old_model} is {state} until {reset_label}; using {fb_model} via {fb_provider} until then."
         if announced_fallback(route, outage_id) == target:
             return False, None
