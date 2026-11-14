@@ -24,7 +24,10 @@ from pathlib import Path
 from typing import Callable
 
 # Row-carrying tables an initializer reads to decide what to migrate; tiny, and never user data.
+# ``state_meta`` is deliberately absent: it holds gigabytes of values, so a migration gated on one
+# of its markers is probed as on a fresh profile.
 _COPIED_ROWS = ("schema_version",)
+_NOT_CONVERGED = 3  # distinct from an interpreter crash (1) or usage error (2), which prove nothing
 _SHADOW_SUFFIX = re.compile(r"_(data|idx|content|docsize|config)$")
 
 
@@ -73,7 +76,7 @@ def copy_schema(source: Path, target: Path) -> None:
     reader = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30)
     try:
         objects = reader.execute(
-            "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite_%' "
+            "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
             "ORDER BY CASE type WHEN 'table' THEN 0 WHEN 'index' THEN 1 WHEN 'view' THEN 2 ELSE 3 END, rowid"
         ).fetchall()
         virtual = {name for kind, name, sql in objects
@@ -153,7 +156,7 @@ def main(argv: list[str]) -> int:
         print(f"schema smoke skipped {line}", file=sys.stderr)
     for line in failures:
         print(line, file=sys.stderr)
-    return 1 if failures else 0
+    return _NOT_CONVERGED if failures else 0
 
 
 if __name__ == "__main__":

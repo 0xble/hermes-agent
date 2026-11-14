@@ -595,7 +595,10 @@ def main(argv: list[str] | None = None) -> int:
         args.baseline, args.trailer_floor, floor_subject, revision=revision, contract=contract)
     if not pointer_failure:
         failures += check_contract_tests(revision, contract)
-        failures += check_units_are_covered(contract)
+        if args.source_only:
+            # An authoring rule for the tree being changed. A release that shipped before the
+            # rule existed (a rollback target) is not judged by it after the fact.
+            failures += check_units_are_covered(contract)
     if not args.source_only:
         failures += check_extensions(args.home)
         if not args.skip_config:
