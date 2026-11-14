@@ -250,3 +250,49 @@ def test_oneshot_rescheduled_during_stalled_handshake_keeps_the_new_run_time(tmp
         assert current['next_run_at'] == edited['next_run_at']
         assert current['schedule'] == edited['schedule']
         assert 'Not started; occurrence deferred' not in (executions.get_execution(fire)['error'] or '')
+
+
+def test_overlapping_tick_advance_is_not_an_operator_edit(tmp_path, monkeypatch):
+    """Review P1: while a recurring fire is in flight, a later tick's
+    advance_next_runs rewrites next_run_at. That is not an operator edit, so the unstarted
+    occurrence must still be restored, not dropped as superseded."""
+    from cron.scheduler_control import defer_unstarted_fire
+
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1m', deliver='local')
+        claimed, _fire = _claimed_due_fire(job['id'])
+        before = jobs.get_job(job['id'])['next_run_at']
+        later = jobs._hermes_now() + timedelta(seconds=61)
+        monkeypatch.setattr(jobs, '_hermes_now', lambda: later)
+        jobs.get_due_jobs()
+        assert jobs.advance_next_runs([job['id']]) == 1
+        assert jobs.get_job(job['id'])['next_run_at'] != before
+
+        assert defer_unstarted_fire(claimed, 'pre-body handshake timeout') == 'deferred'
+        current = jobs.get_job(job['id'])
+        assert current['pending_slot']['scheduled_at'] == claimed['_scheduled_instant']
+        assert current['fire_claim'] is None
+
+
+def test_operator_next_run_edit_marks_only_a_live_claim(tmp_path, monkeypatch):
+    """update_job's provenance marker: set on a real next_run_at edit of a claimed job, absent
+    for an unchanged write and for a job with no claim."""
+    from cron.scheduler_control import defer_unstarted_fire
+
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        claimed, _fire = _claimed_due_fire(job['id'])
+        stored = jobs.get_job(job['id'])['next_run_at']
+        jobs.update_job(job['id'], {'next_run_at': stored})
+        assert 'superseded_at' not in jobs.get_job(job['id'])['fire_claim']
+        edited = (jobs._hermes_now() + timedelta(hours=5)).replace(microsecond=0).isoformat()
+        jobs.update_job(job['id'], {'next_run_at': edited})
+        assert jobs.get_job(job['id'])['fire_claim']['superseded_at']
+
+        assert defer_unstarted_fire(claimed, 'pre-body handshake timeout') == 'superseded'
+        current = jobs.get_job(job['id'])
+        assert current['next_run_at'] == edited and not current.get('pending_slot')
+
+        other = jobs.create_job(prompt='other', schedule='every 1h', deliver='local')
+        jobs.update_job(other['id'], {'next_run_at': edited})
+        assert not jobs.get_job(other['id']).get('fire_claim')

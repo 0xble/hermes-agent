@@ -2471,6 +2471,13 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
             # left unclaimed — pause/resume/edit must not resurrect a slot from before the edit.
             # A zone edit counts: the unclaimed slot is the old zone's wall clock.
             updated.pop("pending_slot", None)
+        if (isinstance(updated.get("fire_claim"), dict)
+                and any(updated.get(key) != job.get(key) for key in ("schedule", "next_run_at", "timezone"))):
+            # The same edit supersedes an occurrence that is claimed but may not have started.
+            # Mark that exact claim so a never-started fire does not restore its old slot over
+            # the edit. Only a real change counts (a resume that keeps the stored instant is not
+            # an edit), and scheduler advances write next_run_at directly, never through here.
+            updated["fire_claim"] = {**updated["fire_claim"], "superseded_at": _hermes_now().isoformat()}
         _fill_missing_next_run(updated)
         _reject_terminal_activation(job, updated, job_id)
         jobs[i] = updated

@@ -46,28 +46,23 @@ def release_unstarted_claim(job: dict) -> None:
 
 
 def _occurrence_superseded(claimed: dict, current: dict, *, paused_by_recovery: bool = False) -> bool:
-    """True when an operator schedule or lifecycle edit landed after this fire was claimed.
+    """True when an operator edit replaced this claimed occurrence before it started.
 
-    ``update_job`` drops ``pending_slot`` for exactly these fields because the edit supersedes
-    any occurrence the dispatcher left unclaimed. A claimed-but-never-started fire is the same
-    occurrence, so restoring it would revive the old slot and overwrite the operator's
-    ``next_run_at`` (or, for a one-shot, the edited run time). Nothing between the claim and a
-    pre-submit deferral legitimately rewrites these fields, so any difference is an edit.
-
-    The one exception is the uncertainty pause this fire's own recovery recorded: it owns
-    ``enabled``/``state`` and the pause markers, so it is judged as the claimed lifecycle."""
+    ``update_job`` marks the live claim (``superseded_at``) for schedule, timezone and
+    ``next_run_at`` edits. A raw ``next_run_at`` comparison is not evidence, because an
+    overlapping tick's ``advance_next_runs`` rewrites it while the fire is in flight.
+    Schedule and timezone are compared directly for edits outside ``update_job``.
+    """
     from cron.jobs import is_job_runnable
 
+    if (current.get("fire_claim") or {}).get("superseded_at"):
+        return True
     if paused_by_recovery:
         current = dict(current, enabled=claimed.get("enabled"), state=claimed.get("state"),
                        paused_at=None, paused_reason=None)
     if not is_job_runnable(current):
         return True
-    return any(current.get(key) != claimed.get(key) for key in _OCCURRENCE_FIELDS)
-
-
-# The fields whose rewrite ``update_job`` treats as superseding an unclaimed occurrence.
-_OCCURRENCE_FIELDS = ("schedule", "timezone", "next_run_at", "enabled", "state")
+    return any(current.get(key) != claimed.get(key) for key in ("schedule", "timezone"))
 
 
 def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -> str | None:
