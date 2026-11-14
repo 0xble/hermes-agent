@@ -848,11 +848,15 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
                 if routes:
                     from agent.shared_primary_cooldown import earliest_available
                     _, available_at = earliest_available(routes, now=now)
-                # The provider's error hint is only authoritative when the shared store has
-                # no usable route data. Otherwise retry at the earliest eligible route.
-                if available_at is None:
-                    available_at = now + (_reset_delay(_texts(record), now) or 0) + 30.0
-                due = now + max(_backoff(record["retry_attempt"]), available_at - now)
+                # A route with no record is unknown: the store only records primary-route
+                # outages in production. Combine every recorded active reset with the provider
+                # hint, then apply the normal exponential backoff floor.
+                candidates = []
+                if available_at is not None:
+                    candidates.append(max(0.0, available_at - now))
+                if reset_delay := _reset_delay(_texts(record), now):
+                    candidates.append(reset_delay + 30.0)
+                due = now + max(_backoff(record["retry_attempt"]), min(candidates, default=0.0))
         conn.execute(
             """UPDATE async_delegations SET retry_state=?, retry_reason=?, retry_due_at=?, updated_at=?
                WHERE delegation_id=? AND retry_state=?""",

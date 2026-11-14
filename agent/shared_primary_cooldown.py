@@ -351,34 +351,31 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool
 
 
 def earliest_available(routes: list[tuple[str, str, str]], *, now: float | None = None) -> tuple[int | None, float | None]:
-    """Earliest usable route in ``routes`` as ``(index, available_at)``.
+    """Return the earliest *recorded active* route as ``(index, reset_at)``.
 
-    Per route: no record = available now (only counted when the store holds data for some
-    route in the chain); record with a plausible ``reset_at`` = cooling until then (expired =
-    now); unreadable store or implausible record = unknown, skipped. ``(None, None)`` means
-    nothing is known, so callers should use their normal backoff or error hint, never "never".
+    The shared store records the configured primary when it leaves that route; it does not
+    record every fallback a request may later try.  Therefore a missing, malformed, expired,
+    or unreadable record is unknown, not proof that the route is available.  Callers combine
+    the returned active reset with their provider error hint and normal backoff.
     """
     if not routes:
         return None, None
     now = time.time() if now is None else now
     known: dict[int, float] = {}
-    missing: list[int] = []
     for index, route in enumerate(routes):
         try:
             record = read_cooldown(route)
         except OSError:
             continue
         if not isinstance(record, dict):
-            missing.append(index)
             continue
         reset_at = _plausible_reset(record.get("reset_at"), now)
-        if reset_at is not None:
-            known[index] = max(reset_at, now)
-    if known:
-        known.update({index: now for index in missing})
-        index = min(known, key=lambda i: (known[i], i))
-        return index, known[index]
-    return None, None
+        if reset_at is not None and reset_at > now:
+            known[index] = reset_at
+    if not known:
+        return None, None
+    index = min(known, key=lambda i: (known[i], i))
+    return index, known[index]
 
 
 def earliest_route_delay(agent: Any, *, now: float | None = None) -> float | None:
