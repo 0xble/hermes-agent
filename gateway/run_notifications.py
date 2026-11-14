@@ -1,8 +1,5 @@
 """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner.
-
-Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
-``gateway.run`` internals are imported lazily inside method bodies (import cycle),
-so ``patch("gateway.run.X")`` keeps intercepting them at call time.
+``gateway.run`` internals stay lazy for import cycles and facade patches.
 """
 
 from __future__ import annotations
@@ -35,7 +32,7 @@ from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
-from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin, owns_notice_work
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 
@@ -1512,6 +1509,7 @@ class GatewayNotificationsMixin(
                     platform, home, transport, message, "state.db warning notification failed for %s:%s: %s"),
                 platform=platform)
 
+    @owns_notice_work
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume watches in their owning profile, backing off refusals even during drain."""
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
@@ -2517,6 +2515,7 @@ class GatewayNotificationsMixin(
         finally:
             self._detach_batch_flush(tasks, releases, key, current_task, release)
 
+    @owns_notice_work
     async def _enqueue_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
         """Deliver a same-tick group now, or hold routine results per the batch window.
 
@@ -2852,6 +2851,7 @@ class GatewayNotificationsMixin(
                 return source, None
         return source, True
 
+    @owns_notice_work
     async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
         """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
         async with self._completion_event_scope(evt):
@@ -3131,22 +3131,6 @@ class GatewayNotificationsMixin(
         async with self._completion_event_scope(watcher):
             await self._watch_process(watcher)
 
-    async def _process_completion_committed(self, completion_evt: dict, session_id: str) -> bool:
-        """Recheck a possibly lost admission ACK before falling back to a plain notice."""
-        if (getattr(self, 'session_authority', None) is not None
-                and self._completion_delivery_identity(completion_evt) is not None):
-            from gateway.session_automation import completion_admission
-            try:
-                # The owning profile's authority, as on the delivery path.
-                async with self._completion_event_scope(completion_evt):
-                    committed = await asyncio.to_thread(completion_admission, self, completion_evt) is not None
-            except Exception:
-                # Failing open sends the notice; a dead watcher would send nothing.
-                logger.debug("Process watcher: admission recheck failed for %s", session_id,
-                             exc_info=True)
-                committed = False
-            return committed
-        return False
 
     async def _watch_process(self, watcher: dict) -> None:
         """Poll a background process and push updates until it exits. Mode
@@ -3209,6 +3193,7 @@ class GatewayNotificationsMixin(
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
+                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
                         break
                     # Captured before injection: afterwards the key is busy either way (the injected
                     # turn itself installs the guard).

@@ -227,7 +227,7 @@ class SessionAuthority:
                 and source.user_id != actor.subject and 'session:operator' not in actor.capabilities):
             raise RuntimeStoreError('permission_denied')
 
-    def _require_admission_open(self, *, queue_only=False):
+    def _require_admission_open(self, *, queue_only=False, owned_work=False):
         """``queue_only``: the caller only COMMITS a queued row (never claims or runs it). A restart's
         after-turn wait accepts those (#139041): the row is durable FIFO input the next owner runs
         exactly once, while this owner's claim path stays refused."""
@@ -235,14 +235,16 @@ class SessionAuthority:
             raise RuntimeStoreError('runtime_draining')
         if self.runner._draining:
             from gateway.drain_control import restart_wait_open
-            if not (queue_only and restart_wait_open(self.runner)):
+            from gateway.zero_cut_handover_drain import handover_runs_followups
+            if not ((queue_only and restart_wait_open(self.runner))
+                    or (owned_work and handover_runs_followups(self.runner))):
                 raise RuntimeStoreError('runtime_draining')
 
-    def _admission_gate(self, authorize=None, *, queue_only=False):
+    def _admission_gate(self, authorize=None, *, queue_only=False, owned_work=False):
         """The admission gate re-checked inside an off-loop write transaction (with the caller's
         own guard), so a drain that began while the write waited on the writer still refuses it."""
         def guard(conn):
-            self._require_admission_open(queue_only=queue_only)
+            self._require_admission_open(queue_only=queue_only, owned_work=owned_work)
             if authorize is not None:
                 authorize(conn)
         return guard
@@ -493,11 +495,12 @@ class SessionAuthority:
             if waiter is not None and not waiter.done():
                 waiter.set_exception(RuntimeStoreError(reason))
 
-    async def admit_automation(self, adapter, event, identity, replaces=None, *, authorize_write=None):
+    async def admit_automation(self, adapter, event, identity, replaces=None, *, authorize_write=None, owned_work=False):
         from gateway.admission_canary import refusal_evidence
         from gateway.session_automation import admit_automation
         with refusal_evidence('automation', identity):
-            return await admit_automation(self, adapter, event, identity, replaces, authorize_write=authorize_write)
+            return await admit_automation(self, adapter, event, identity, replaces,
+                                          authorize_write=authorize_write, owned_work=owned_work)
 
     async def admit_native(self, event):
         """Await current connector policy, then commit before ACK or scheduling execution."""
@@ -1053,7 +1056,7 @@ class SessionAuthority:
         from gateway.session_automation import check_local_automation
         live = self.sessions.get(ref.session_id)
         await asyncio.to_thread(check_local_automation, self, ref, row, route=route)
-        self._require_admission_open()
+        self._require_admission_open(owned_work=True)
         if self.sessions.get(ref.session_id) is not live or (live is not None and live.route != route):
             raise RuntimeStoreError('admission_conflict')
 
@@ -1129,13 +1132,13 @@ class SessionAuthority:
                 # a claim now would hand this row to its busy path and settle it unrun. The head
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
                 return 'classic_busy', first
-            self._require_admission_open()
+            self._require_admission_open(owned_work=True)
             from gateway.session_runtime_workers import tracked_write
             live.rescan = False  # a _schedule from here on may not be visible to this claim's read
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
-                                                    session_id=ref.session_id, _guard=self._admission_gate(),
+                                                    session_id=ref.session_id, _guard=self._admission_gate(owned_work=True),
                                                     head=first['admission_id'] if first is not None else None),
                                       then=partial(self._stamp_claim, ref, live))
             # Input scheduled while this claim's transaction ran may postdate its read: re-read
@@ -1160,7 +1163,9 @@ class SessionAuthority:
     def _drain_stopping(self, ref, live):
         """A drain about to wait (storage retry, classic slot) exits instead when the runtime drains,
         the profile retires or the live entry was replaced; committed rows stay queued."""
-        if self.runner._draining or self.retiring or self.sessions.get(ref.session_id) is not live:
+        from gateway.zero_cut_handover_drain import handover_runs_followups
+        if ((self.runner._draining and not handover_runs_followups(self.runner))
+                or self.retiring or self.sessions.get(ref.session_id) is not live):
             self._pause(ref, 'runtime_draining')
             return True
         return False

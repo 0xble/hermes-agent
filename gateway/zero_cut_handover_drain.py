@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import threading
+from collections.abc import Mapping
 from typing import Any
 
 from gateway.config import is_zero_cut_handover_enabled
@@ -21,16 +22,111 @@ def _status(runner) -> dict[str, Any]:
             "idle": False, "failed": None,
         }
     active = runner._running_agent_count()
+    required_work = _active_handover_work_count(runner)
     queued = _queued_followups(runner)
     state["active_turns"] = active
-    state["idle"] = bool(state["token_lock_released"] and not state.get("failed") and active == 0 and not queued)
+    state["idle"] = bool(
+        state["token_lock_released"] and not state.get("failed")
+        and required_work == 0 and not queued
+    )
     return dict(state)
+
+
+def _active_handover_work_count(runner) -> int:
+    """Count all work that must settle before a zero-cut owner can stop."""
+    aggregate = getattr(runner, "_active_work_count", None)
+    if callable(aggregate):
+        try:
+            count = aggregate()
+            count = max(0, count) if isinstance(count, int) else 1
+        except Exception:
+            logger.debug("Could not read full handover work count", exc_info=True)
+            count = 1
+    else:
+        count = runner._running_agent_count()
+    return count + _handover_process_work_count() + _handover_notification_work_count(runner)
+
+
+def _queued_process_work_count(process_registry, sessions) -> int:
+    """Count queued process events that the old runner still owns."""
+    queue = process_registry.completion_queue
+    try:
+        with queue.mutex:
+            events = tuple(queue.queue)
+    except Exception:
+        logger.debug("Could not inspect process completion queue", exc_info=True)
+        return 1
+
+    by_session_id = {
+        entry.get("session_id"): entry
+        for entry in sessions
+        if entry.get("session_id")
+    }
+    for event in events:
+        if not isinstance(event, Mapping):
+            return 1
+        # Heartbeats are progress observations, not undelivered results. They may remain
+        # queued while a restart-safe producer continues under the successor.
+        if event.get("type", "completion") == "heartbeat":
+            continue
+        entry = by_session_id.get(event.get("session_id"))
+        if entry is None or not entry.get("survive_restart"):
+            return 1
+    return 0
+
+
+def _handover_process_work_count() -> int:
+    """Count non-restart-safe tool processes and their queued completion notices."""
+    try:
+        from tools.process_registry import process_registry
+
+        sessions = process_registry.list_sessions()
+        active = any(entry.get("status") == "running" and not entry.get("survive_restart")
+                     for entry in sessions)
+        pending = _queued_process_work_count(process_registry, sessions)
+        from tools.process_registry_survival import is_restart_safe
+        # Exit precedes publication, and the watch drain pops ordinary completions
+        # before their watcher admits them. Keep the existing producer ACK as owner.
+        with process_registry._lock:
+            unpublished = any(
+                session.notify_on_complete and not is_restart_safe(session)
+                and (not session._completion_event.is_set()
+                     or (not session._completion_delivered
+                         and session.id not in process_registry._completion_consumed))
+                for store in (process_registry._running, process_registry._finished)
+                for session in store.values())
+        return int(active or pending or unpublished)
+    except Exception:
+        logger.debug("Could not read process handover state", exc_info=True)
+        return 1
+
+
+def _handover_notification_work_count(runner) -> int:
+    """Keep teardown behind in-flight completion ownership, not idle watcher tasks."""
+    for attr in ("_completion_notification_batches", "_async_delegation_batches"):
+        values = getattr(runner, attr, None)
+        if isinstance(values, Mapping) and values:
+            return 1
+    for attr in ("_completion_notification_batch_flush_tasks", "_async_delegation_batch_flush_tasks",
+                 "_notice_delivery_tasks"):
+        tasks = getattr(runner, attr, None)
+        if tasks and any(not task.done() for task in tasks):
+            return 1
+    pending_acks = getattr(runner, "_pending_completion_acks", None)
+    if callable(pending_acks):
+        try:
+            with runner._completion_delivery_lock:
+                return int(bool(pending_acks()))
+        except Exception:
+            logger.debug("Could not read completion ownership", exc_info=True)
+            return 1
+    return 0
 
 
 def _queued_followups(runner) -> int:
     total = 0
     for values in (getattr(runner, "_pending_messages", {}), getattr(runner, "_queued_events", {})):
-        if isinstance(values, dict):
+        if isinstance(values, Mapping):
             total += len(values)
             total += sum(len(value) for value in values.values() if isinstance(value, (list, tuple)))
     # The adapter owns the per-chat session guard and the follow-up merged in mid-turn; the runner's
@@ -40,7 +136,7 @@ def _queued_followups(runner) -> int:
     for adapter in _adapters(runner):
         for name in ("_active_sessions", "_pending_messages"):
             values = getattr(adapter, name, None)
-            if isinstance(values, dict):
+            if isinstance(values, Mapping):
                 total += len(values)
     return total
 
@@ -185,8 +281,25 @@ def handover_runs_followups(runner) -> bool:
     not stopping, so a follow-up that landed mid-turn runs here instead of spooling to disk for a
     successor that only replays the spool at a later restart (found in a real drill)."""
     state = getattr(runner, "_zero_cut_handover_state", None) or {}
-    stopping = getattr(runner, "_zero_cut_stop_task", None) is not None  # the real stop spools as today
+    stopping = (getattr(runner, "_zero_cut_stop_task", None) is not None
+                or getattr(runner, "_stop_task", None) is not None)
     return bool(state.get("token_lock_released") and not state.get("failed") and not stopping)
+
+
+def handover_owns_external_drain(runner) -> bool:
+    """True while an accepted handover owns external quiescence before shutdown takes over."""
+    state = getattr(runner, "_zero_cut_handover_state", None)
+    return bool(state is not None and not state.get("failed") and not getattr(runner, "_draining", False))
+
+
+def handover_runs_admission(runner) -> bool:
+    """Only the existing claimed-FIFO context can cross classic input gates.
+
+    Resolve the handover dynamically: a real stop must close this allowance even
+    when it began after the claim, while route validation was yielding.
+    """
+    from gateway.session_ingress import executing_admission
+    return bool(executing_admission.get() and handover_runs_followups(runner))
 
 
 def handover_accepts_received(runner, source) -> bool:

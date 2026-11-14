@@ -84,6 +84,11 @@ class GatewayProcessNotificationsMixin:
         if not surface:
             # Recheck live ownership next tick: handoff retains notification intent.
             if session.exited:
+                if is_restart_safe(session):
+                    if process_registry._claim_survivor_delivery(session):
+                        process_registry._mark_survivor_delivered(session)
+                else:
+                    acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
                 return None
             return False
         if silent:
@@ -97,6 +102,24 @@ class GatewayProcessNotificationsMixin:
                 return None
             return False
         return True
+
+    async def _process_completion_committed(self, completion_evt: dict, session_id: str) -> bool:
+        """Recheck a possibly lost admission ACK before falling back to a plain notice."""
+        from gateway.run_notifications import logger
+        if (getattr(self, 'session_authority', None) is not None
+                and self._completion_delivery_identity(completion_evt) is not None):
+            from gateway.session_automation import completion_admission
+            try:
+                # The owning profile's authority, as on the delivery path.
+                async with self._completion_event_scope(completion_evt):
+                    committed = await asyncio.to_thread(completion_admission, self, completion_evt) is not None
+            except Exception:  # health: allow BLE001 -- fail-open recheck boundary logs and falls back to the notice
+                # Failing open sends the notice; a dead watcher would send nothing.
+                logger.debug("Process watcher: admission recheck failed for %s", session_id,
+                             exc_info=True)
+                committed = False
+            return committed
+        return False
 
     async def _finish_process_text_notification(
         self, session_id: str, session, notify_mode: str, non_success: bool, watcher: dict, *, route: tuple,
@@ -139,6 +162,11 @@ class GatewayProcessNotificationsMixin:
             if sent is False and is_restart_safe(session):
                 process_registry.release_survivor_completion(session_id)
                 return False
+            if sent is False:
+                # A non-restart-safe completion cannot be replayed by a successor. Settle it even when
+                # transport could not return a receipt, so the released handover does not wait forever.
+                acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
+                return True
         # Presented, or deliberately suppressed by the notification mode: either way the
         # claimed survivor completion is settled and must not replay on a successor.
         if settled:
