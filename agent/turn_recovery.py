@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- earliest-route copy is coupled to the existing recovery response surface.
 """Recovery-branch handlers for the conversation turn's inner retry loop.
 
 When the model call raises, one-shot recovery chains run before the generic retry/backoff
@@ -1149,10 +1150,13 @@ def max_retries_exhausted_result(
     else:
         # Every surface reads final_response (the 💡 lines above are CLI-only), so the chat
         # text carries the plain what-happened + next step itself.
+        from agent.shared_primary_cooldown import earliest_route_delay
         _reset_at = classified.error_context.get("reset_at")
+        _earliest_s = earliest_route_delay(agent, failing_route=(provider, base_url, model))
         _final_response = exhausted_copy(
             classified.reason.value, label=provider_label_for(provider), attempts=attempts, error=api_error,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
+            earliest_route_seconds=_earliest_s,
         )
         if _welcome_hint:
             _final_response = _welcome_tier_guidance(classified, model=model, in_chat=True)
