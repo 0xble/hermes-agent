@@ -1,5 +1,4 @@
 """Quiet cosmetic outcomes must not change durable control admission or recovery."""
-import time
 from unittest.mock import AsyncMock, patch
 
 import pytest
@@ -99,10 +98,11 @@ async def test_quiet_offline_control_recovers_progress_without_cosmetic_retries(
     assert admit.await_count == int(action != "pause")
     assert online.adapter.sends == online.injections == []
     assert controls.pending_outbox() == []
-    # An autonomous pause parks the goal on a timed wake instead of stopping it.
+    # Quiet/offline delivery cannot turn an explicit pause into an automatic wake.
     final = load_goal("target")
-    assert final.status == "active"
-    assert (final.waiting_until > time.time()) is (action == "pause")
+    assert final.status == ("paused" if action == "pause" else "active")
+    assert final.waiting_until == 0
+    assert final.waiting_seconds == 0
     assert controls._load_record(result["record"]["id"])["continuations_cleared"]
 
 

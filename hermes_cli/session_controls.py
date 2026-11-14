@@ -9,7 +9,7 @@ import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Optional
 
 from hermes_cli.goals import (
     _REPLY_QUOTE_RE,
@@ -550,13 +550,8 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     receipt = {"result": result, "state": state}
     if cleared_goal and (authority or {}).get("via") == "autonomy":
         receipt["notice"] = f"Goal cleared autonomously without approval. Reason: {reason}"
-    if (kind, action) == ("goal", "pause") and (authority or {}).get("via") == "autonomy":
-        seconds = state.waiting_seconds
-        duration = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} sec"
-        receipt.update(
-            outcome="timed_wait", wait_seconds=seconds, waiting_until=state.waiting_until,
-            notice=f"Goal waiting {duration} (autonomous timed wait, no approval); still active",
-        )
+    if (kind, action) == ("goal", "pause"):
+        receipt.update(outcome="paused", notice="Goal paused; use /goal resume to continue")
     return receipt
 
 
@@ -1418,12 +1413,10 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
 
     manager = GoalManager(sid, cursor=cursor)
-    if authority.get("via") == "autonomy":
-        if not manager.is_active():
-            return None
-        return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
-                                        reason=reason or "session-control")
-    return manager.pause(reason=reason or "session-control")
+    # Mark explicit controls separately from migratable legacy judge/budget pauses.
+    # Model-supplied reason text must not accidentally opt this pause into migration.
+    return manager.pause(reason="session-control: " + (reason or "paused"))
+
 
 
 def _clear_goal(sid, reason, payload, authority, cursor=None):
