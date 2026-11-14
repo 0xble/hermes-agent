@@ -1,0 +1,14 @@
+{
+  "description": "Close 1 Camofox tab created by this browser task, defaulting to its current tab. Optionally pass a caller-owned tab_id from browser_tabs. Adopted/shared tabs and other tasks' tabs cannot be closed. Success requires server readback confirming the tab is gone. Does not close the browser, account, or other tabs.",
+  "name": "browser_close",
+  "parameters": {
+    "properties": {
+      "tab_id": {
+        "description": "Optional exact caller-owned tab ID. Omit for the current tab.",
+        "type": "string"
+      }
+    },
+    "required": [],
+    "type": "object"
+  }
+}
