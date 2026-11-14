@@ -494,6 +494,22 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
     return missing
 
 
+_SMOKE_RUNNING_VERSION_ENV = "HERMES_PLUGIN_SMOKE_RUNNING_VERSION"
+
+
+def _version_regression(manifest) -> str | None:
+    """Why the candidate would stop loading a plugin the running release loads, else None.
+
+    The loader skips a plugin whose ``requires_hermes`` rejects the running version, so an import
+    probe alone passes a candidate that then boots without it (a mis-stamped v0.23.1 dropped
+    delegation this way). A plugin the running release already rejects is not this update's doing.
+    """
+    from hermes_cli.plugins_manifest import requires_hermes_error, version_satisfies
+    reason = requires_hermes_error(manifest)
+    running = os.environ.get(_SMOKE_RUNNING_VERSION_ENV, "")
+    return reason if reason and running and version_satisfies(manifest.requires_hermes, running) else None
+
+
 def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) -> None:
     """Load enabled plugins with the interpreter the candidate will boot, before promotion.
 
@@ -517,6 +533,11 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
         env = _release_subprocess_env(release)
         env.update({"HERMES_HOME": str(isolated), "PYTHONDONTWRITEBYTECODE": "1"})
         env.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
+        from hermes_cli.version_info import get_version_info
+        running = get_version_info().base_version
+        env.pop(_SMOKE_RUNNING_VERSION_ENV, None)
+        if running != "unknown":
+            env[_SMOKE_RUNNING_VERSION_ENV] = running
         result = subprocess.run(
             [str(python), "-m", "hermes_cli.immutable_releases", "--smoke-imports"],
             cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
@@ -573,6 +594,9 @@ def _smoke_imports() -> None:
             continue
         if gate.action not in {"load", "load_now"}:
             continue
+        regression = _version_regression(manifest)
+        if regression:
+            raise RuntimeError(f"enabled plugin {manifest.name}: {regression}")
         if manifest.source == "entrypoint":
             manager._load_entrypoint_module(manifest)
         else:
