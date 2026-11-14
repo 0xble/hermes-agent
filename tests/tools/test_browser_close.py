@@ -5,7 +5,9 @@ from unittest.mock import patch
 import pytest
 import requests
 
-from tests.tools.test_browser_camofox_tab_reuse import camofox, _dispatch
+from tests.tools.test_browser_camofox_tab_reuse import _dispatch
+
+pytest_plugins = ["tests.tools.test_browser_camofox_tab_reuse"]  # the camofox fixture
 
 
 def _open(c, task="owner", account=None):
@@ -51,33 +53,13 @@ def test_close_only_requested_tab_and_read_back(camofox, explicit):
 def test_close_refuses_unowned_scope_without_mutation(camofox, monkeypatch, refusal, tmp_path):
     c = camofox
     target = _open(c, account="brianle" if refusal == "handoff_kept" else None)
-    task = "owner"
-    args = {}
-    if refusal == "unbound":
-        task = "unbound"
-    elif refusal in {"sibling", "account"}:
-        _open(c, "sibling", "brianle" if refusal == "account" else None)
-        task, args = "sibling", {"tab_id": target}
-    elif refusal == "unknown":
-        args = {"tab_id": "unreserved"}
-    elif refusal == "profile":
-        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "different-profile"))
-    elif refusal == "server":
-        monkeypatch.setenv("CAMOFOX_URL", c.server.url + "/different-origin")
-    elif refusal == "adopted":
-        c.cf._owned_tabs.clear()  # Merely bound, like an adopted user/shared tab.
-    elif refusal == "protected":
-        c.cf.quarantine_current_protected_tab("owner")
-    elif refusal == "live_protection":
-        monkeypatch.setattr("agent.redact.has_vault_date_components", lambda task: True)
-    elif refusal == "unreadable_protection":
-        monkeypatch.setattr(c.cf, "_protected_tabs_on_disk", lambda: None)
-    elif refusal == "lease":
-        from tools import browser_camofox_leases as leases
-        monkeypatch.setattr(leases, "claim", lambda *args: False)
-    elif refusal == "shared_owner":
-        c.cf._sessions["sibling"] = dict(c.cf._sessions["owner"], task_id="sibling")
-    elif refusal == "handoff_kept":
+    from tools import browser_camofox_leases as leases
+
+    def sibling(account):
+        _open(c, "sibling", "brianle" if account else None)
+        return "sibling", {"tab_id": target}
+
+    def handoff_kept():
         c.server.open_tab_ids.append(target)
         handoff = _dispatch("browser_handoff", {"account": "brianle"}, "owner")
         assert handoff["success"] is True and handoff["tabId"] == target, handoff
@@ -85,6 +67,25 @@ def test_close_refuses_unowned_scope_without_mutation(camofox, monkeypatch, refu
         assert record.get("kept") is True
         assert record.get("session_key") != c.cf.SHARED_IDENTITY_GROUP
         assert not c.cf._handoffs_in_flight
+
+    # Each refusal's setup; a setup returning None keeps the owner's own call.
+    setups = {
+        "unbound": lambda: ("unbound", {}),
+        "sibling": lambda: sibling(False),
+        "account": lambda: sibling(True),
+        "unknown": lambda: ("owner", {"tab_id": "unreserved"}),
+        "profile": lambda: monkeypatch.setenv("HERMES_HOME", str(tmp_path / "different-profile")),
+        "server": lambda: monkeypatch.setenv("CAMOFOX_URL", c.server.url + "/different-origin"),
+        "adopted": c.cf._owned_tabs.clear,  # Merely bound, like an adopted user/shared tab.
+        "protected": lambda: c.cf.quarantine_current_protected_tab("owner"),
+        "live_protection": lambda: monkeypatch.setattr("agent.redact.has_vault_date_components", lambda task: True),
+        "unreadable_protection": lambda: monkeypatch.setattr(c.cf, "_protected_tabs_on_disk", lambda: None),
+        "lease": lambda: monkeypatch.setattr(leases, "claim", lambda *args: False),
+        "shared_owner": lambda: c.cf._sessions.__setitem__(
+            "sibling", dict(c.cf._sessions["owner"], task_id="sibling")),
+        "handoff_kept": handoff_kept,
+    }
+    task, args = setups[refusal]() or ("owner", {})
     c.server.calls.clear()
 
     result = _dispatch("browser_close", args, task)

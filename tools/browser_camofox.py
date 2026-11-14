@@ -313,8 +313,8 @@ SHARED_IDENTITY_GROUP = "__shared_identity__"
 _sessions: dict[str, dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
 _sessions_lock = threading.RLock()
 # Cleanup epochs invalidate identity lookups that started before a task was released.
-_task_release_epochs: Dict[str, int] = {}
-_active_identity_lookups: Dict[str, int] = {}
+_task_release_epochs: dict[str, int] = {}
+_active_identity_lookups: dict[str, int] = {}
 # Only successful POST /tabs creates ownership. Bindings may be replaced or carried;
 # keep the exact identity and profile separately until close is confirmed.
 _owned_tabs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -1349,7 +1349,7 @@ def camofox_close_tab(task_id: Optional[str] = None, tab_id: Optional[str] = Non
             # Never follow a redirect to another server for a destructive operation.
             _request("delete", f"/tabs/{quote(target, safe='')}", 10, server=server,
                      params={"userId": user}, allow_redirects=False)
-        except Exception as exc:
+        except requests.RequestException as exc:  # the readback below decides the outcome
             logger.debug("Camofox explicit DELETE needs reconciliation: %s", exc)
         response = _request("get", "/tabs", 10, server=server,
                             params={"userId": user}, allow_redirects=False)
@@ -1363,8 +1363,8 @@ def camofox_close_tab(task_id: Optional[str] = None, tab_id: Optional[str] = Non
             raise RuntimeError("Camofox closure readback did not return a valid tab list")
         if any(tab["tabId"] == target for tab in tabs):
             raise RuntimeError("Camofox still lists the tab after DELETE")
-    except Exception as exc:
-        logger.warning("Camofox explicit closure readback failed: %s", exc)
+    except Exception as exc:  # any failure leaves closure unconfirmed; the lock state below must still settle
+        logger.warning("Camofox explicit closure readback failed: %s", exc, exc_info=True)
         error = "Camofox did not confirm the tab is absent; retry browser_close"
 
     with _sessions_lock:
