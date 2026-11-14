@@ -4,6 +4,33 @@ Load this unit with the root contract when changing session title generation, Te
 DM topics, or title persistence. The three fork patches are coupled: a model title,
 its optional icon, and the durable alias can be observed through one Telegram topic.
 
+## Root-DM auto-transfer initial titles
+
+Opt-in `dm_topic_auto_transfer` passes the opening text to the existing transfer
+hook. Before creating the topic, the gateway uses `agent.title_generator.derive_title`
+(the bounded, deterministic title selector); no auxiliary model or network lookup
+runs on ingress. Empty/media-only or unavailable title input keeps the localized
+default. Creation failure still uses lobby recovery. Identity, session keying and
+reply-anchor behavior are unchanged. This path does not need a later rename to
+show the opening subject; normal subsequent title updates remain supported.
+
+The fork preflight read upstream guidance at
+`ed1afb082eb3e46cf2edae9d8f68fb67b09ee4df`. The independent proposal was to
+preserve the opener across the transfer hook and reuse deterministic derivation.
+Upstream [#141347](https://github.com/NousResearch/hermes-agent/pull/141347)
+(merged) establishes ingress transfer, receiving-bot opt-in and failure recovery;
+related title proposals #17172 and #64021 do not remove this creation placeholder.
+The [Bot API maintainer](https://github.com/tdlib/telegram-bot-api/issues/915#issuecomment-6581241438)
+says affected clients require app updates; this patch only avoids Hermes creating
+an unnecessary placeholder, not a bot-side client-cache repair.
+
+Patch identity: `telegram-topic-initial-title`. Verify with
+`scripts/run_tests.sh tests/gateway/test_telegram_topic_initial_title.py tests/gateway/test_telegram_dm_topic_auto_transfer.py tests/gateway/test_telegram_topic_mode.py`.
+Retire when released upstream creates auto-transfer topics from the opening text
+with equivalent media-only/failure behavior. Roll back the hook and gateway changes
+together; existing topics need no migration. No upstream post or contribution is
+authorized for this change.
+
 ## Required behavior
 
 - `auxiliary.title_generation` controls word budget, casing, trusted instructions,
