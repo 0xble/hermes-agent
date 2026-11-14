@@ -87,13 +87,13 @@ def _replaced_tick_claimed(runner, prepared):
 async def admit_process_notice(runner, authority, adapter, event, evt):
     """Admit a process notice. A completion and the withdrawal of its process's waiting ticks hold
     the heartbeat lock together; a tick already holds it (``deliver_heartbeat``)."""
+    import asyncio
     identity = producer_identity(runner, evt)
     # A trusted process notice recovers a stored origin, not a new sender assertion.
     # Validate its original route and session pin before borrowing committed provenance.
     # Direct automation callers still undergo the strict source comparison below.
     from gateway.session_detached import detached_route_of
     if event.source.platform not in (Platform.LOCAL, Platform.API_SERVER) and not detached_route_of(event.source):
-        import asyncio
         from gateway.session_envelope import restore_native
         from gateway.session_identity import replace_source
 
@@ -115,7 +115,10 @@ async def admit_process_notice(runner, authority, adapter, event, evt):
     if evt.get('type') != 'completion':
         return await authority.admit_automation(adapter, event, identity, owned_work=True)
     async with _heartbeat_lock(runner):
-        receipt = await _admit_folded_completion(authority, adapter, event, evt, identity)
+        # Serialize replay lookup with folding so a retry cannot fold its own committed batch.
+        receipt = await asyncio.to_thread(completion_admission, runner, evt)
+        if receipt is None:
+            receipt = await _admit_folded_completion(authority, adapter, event, evt, identity)
         await withdraw_process_ticks(runner, evt)
         return receipt
 
@@ -132,7 +135,7 @@ async def _admit_folded_completion(authority, adapter, event, evt, identity):
         _fold_completion(event, waiting, identity)
         try:
             return await authority.admit_automation(adapter, event, identity, replaces=waiting['admission_id'],
-                                                    fold=waiting['_skip'])
+                                                    fold=waiting['_skip'], owned_work=True)
         except RuntimeStoreError as exc:
             if exc.reason != 'stale_generation':
                 raise
@@ -781,10 +784,7 @@ async def admit_automation(authority, adapter, event, identity, replaces=None, f
             from gateway.session_envelope import restore_native_source
             source = restore_native_source(payload, authority.runner)
         if sid not in authority.sessions:
-            from gateway.session_route_recovery import moved_local
-            handed_off = await asyncio.to_thread(moved_local, authority, sid, source)
-            authority._require_admission_open(owned_work=owned_work)
-            authority.sessions[sid] = LiveSession(source, entry.session_key, handed_off=handed_off)
+            authority.sessions[sid] = LiveSession(source, entry.session_key)
         return partial(admit_session_input, authority.db, epoch=authority.epoch,
             principal_id='automation:' + entry.session_key, session_id=sid, request_id=identity,
             payload=deepcopy(payload),

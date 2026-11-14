@@ -79,8 +79,11 @@ async def test_released_owner_delivers_followup_and_result_once(monkeypatch, kin
         with pytest.raises(WakeNotAccepted) as refused:
             await deliver_wake(adapter, text='EXTERNAL', source=source)
         assert refused.value.reason == 'runtime_draining'
-        accepted = await runner._inject_watch_notification('RESULT', evt)
-        assert accepted is True, 'the released owner must admit its own stable result'
+        accepted = await asyncio.gather(
+            runner._inject_watch_notification('RESULT', evt),
+            runner._inject_watch_notification('RESULT', dict(evt)),
+        )
+        assert accepted == [True, True], 'the released owner must admit its result and concurrent retry'
         assert await runner._inject_watch_notification('RESULT', evt) is True
         hold.finish.set()
         await asyncio.wait_for(sending.wait(), 10)
