@@ -33,15 +33,10 @@ _SESSIONS_JSON_README = (
 )
 
 
-# A full routing save writes only its diff; this often it replaces the whole index instead, restoring
-# rows another process or a direct row write changed behind this process's baseline.
+# A full routing save writes only its diff against the rows this process last persisted; this often
+# it re-reads the stored rows instead (outside the write lock), restoring rows another process or a
+# direct row write changed behind that baseline.
 _ROUTING_RECONCILE_S = 600.0
-
-
-def _routing_private() -> bool:
-    """Whether a routing write may be skipped or filtered as private."""
-    from agent.incognito import any_incognito_sessions, is_incognito
-    return is_incognito() or any_incognito_sessions()
 
 
 def _is_live_system_guard(exc: BaseException) -> bool:
@@ -651,37 +646,37 @@ class SessionPersistenceMixin:
 
         A full replace parses and checks every route inside the state.db write lock, which held it
         for seconds on a large index and stalled every other session's write. So write only the diff
-        against ``_routing_baseline`` ({key: entry_json} this process last persisted, None meaning
-        unknown). Fall back to the full replace with no baseline (first save, a failed or uncertain
-        write, a private interval), on another store or scope, and every ``_ROUTING_RECONCILE_S`` to
-        restore rows other writers changed.
+        against ``_routing_baseline`` ({key: entry_json} as stored, None meaning unknown). With no
+        trusted baseline (first save, a failed or skipped write, another store or scope) and every
+        ``_ROUTING_RECONCILE_S``, the baseline is the stored rows, read without the write lock, which
+        restores rows other writers changed. Private keys the delta leaves alone stay unknown.
         """
         db = getattr(replacer, "__self__", replacer)
         owner = (id(db), self._routing_scope())
-        baseline = getattr(self, "_routing_baseline", None)
         apply_delta = getattr(db, "apply_gateway_routing_delta", None)
+        loader = getattr(db, "load_gateway_routing_entries", None)
+        if not callable(apply_delta) or not callable(loader):
+            return replacer(encoded, scope=owner[1])
+        baseline = getattr(self, "_routing_baseline", None)
         self._routing_baseline = None  # uncertain until a write below returns
-        if (baseline is not None and callable(apply_delta)
-                and getattr(self, "_routing_baseline_owner", None) == owner
-                and time.monotonic() - getattr(self, "_routing_full_at", 0.0) < _ROUTING_RECONCILE_S):
-            upserts = {k: v for k, v in encoded.items() if baseline.get(k) != v}
-            removed = [k for k in baseline if k not in encoded]
-            retired = apply_delta(upserts, removed, scope=owner[1]) if upserts or removed else set()
-            if retired is not None:
-                for key in removed:
-                    baseline.pop(key, None)
-                baseline.update(upserts)
-                for key in retired:
-                    baseline.pop(key, None)
-                self._routing_baseline = baseline
-                return retired
-        started = time.monotonic()
-        private = _routing_private()
-        retired = replacer(encoded, scope=owner[1])
-        if not private and not _routing_private():
-            self._routing_baseline = {k: v for k, v in encoded.items() if k not in retired}
-            self._routing_baseline_owner = owner
-            self._routing_full_at = started
+        if (baseline is None or getattr(self, "_routing_baseline_owner", None) != owner
+                or time.monotonic() - getattr(self, "_routing_full_at", 0.0) >= _ROUTING_RECONCILE_S):
+            started = time.monotonic()
+            baseline = dict(loader(scope=owner[1]))
+            self._routing_baseline_owner, self._routing_full_at = owner, started
+        upserts = {k: v for k, v in encoded.items() if baseline.get(k) != v}
+        removed = [k for k in baseline if k not in encoded]
+        held: set[str] = set()
+        retired = apply_delta(upserts, removed, scope=owner[1], held=held) if upserts or removed else set()
+        if retired is None:  # a private turn: nothing written, the next save re-reads the rows
+            return set()
+        for key in removed:
+            if key not in held:
+                baseline.pop(key, None)
+        baseline.update({k: None if k in held else v for k, v in upserts.items()})
+        for key in retired:
+            baseline.pop(key, None)
+        self._routing_baseline = baseline
         return retired
 
     def _save_sessions_json(self, data: dict[str, Any]) -> None:
