@@ -99,6 +99,37 @@ def test_native_activity_is_local_only_at_the_admission_envelope_boundary(tmp_pa
     assert fingerprint(canonical_target='s', payload=payload) != fingerprint(canonical_target='s', payload=retry)
 
 
+def test_queued_input_survives_a_hard_kill_and_runs_after_the_lost_turn_is_resolved(tmp_path):
+    """No shutdown flush: the admitted row is the only copy of queued input when the process dies.
+
+    Recovery fences only the turn that had started; input still waiting behind it stays queued with
+    its exact payload and is the replacement owner's next claim once the lost turn is resolved.
+    """
+    db = store(tmp_path)
+    import hermes_state_runtime as rt
+    try:
+        epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
+        args = dict(epoch=epoch, principal_id='human', session_id='s')
+        running = rt.admit_session_input(db, **args, request_id='running', payload={'text': 'long turn'})
+        queued = rt.admit_session_input(db, **args, request_id='queued', payload={'text': 'follow-up'})
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
+        assert claimed['admission_id'] == running['admission_id']
+        db.close()  # killed mid-turn: nothing settles, nothing is spooled
+        db = SessionDB(db_path=tmp_path / 'state.db')
+        new_epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
+        assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
+        survivor = rt.get_session_admission(db, admission_id=queued['admission_id'])
+        assert survivor['status'] == 'queued' and survivor['payload'] == {'text': 'follow-up'}
+        lost = rt.get_session_admission(db, admission_id=running['admission_id'])
+        assert lost['status'] == 'unknown'
+        rt.resolve_unknown_session_input(
+            db, epoch=new_epoch, admission_id=lost['admission_id'], generation=lost['generation'])
+        resumed = rt.claim_session_input(db, epoch=new_epoch, session_id='s')
+        assert resumed['admission_id'] == queued['admission_id'] and resumed['owner_epoch'] == new_epoch
+    finally:
+        db.close()
+
+
 def test_sqlite_failure_never_acknowledges_or_partially_claims(tmp_path):
     db = store(tmp_path)
     import hermes_state_runtime as rt
