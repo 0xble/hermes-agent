@@ -114,10 +114,12 @@ synchronously and supplies it to TurnRunner. Worker initialization and request
 callbacks use that same assignment. Callback-only construction does not read routing
 state. At each real request,
 the current assignment follows fresh model, provider and reasoning config from
-the owning profile through the existing preset loaders. An empty `@attended`
-or deleted preset falls back coherently to the configured channel/default
-route, without triggering automatic attended routing or deferring to a prior
-attended decision. Inherited reasoning is resolved for that destination from
+the owning profile through the alias loaders. Since the v0.23.1 integration a
+stored role whose alias no longer resolves refuses the request with
+`Stored model alias '<role>' is unavailable; request refused` instead of answering
+on the default route: an invalid alias is an operator-visible config error, never a
+silent model change. Restore the alias in `model_aliases` or pick a model in that
+conversation to clear the hold. Inherited reasoning is resolved for that destination from
 the same fresh profile snapshot. Explicit session effort wins over preset
 effort, then destination per-model policy and global effort. Keep the canonical
 reasoning dictionaries until effort normalization so disabled values and
