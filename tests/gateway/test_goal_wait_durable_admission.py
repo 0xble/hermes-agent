@@ -335,7 +335,7 @@ async def test_admitted_goal_lost_head_settles_interrupted_not_human_loss(parked
     from gateway.session_settlement_recovery import recover_failed_settlement
     from gateway.session_unattended_unknown import settle_unattended_unknown
     from hermes_state_runtime import claim_session_input
-    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
+    from gateway.session_unattended_unknown import interrupted_notice
     runner, _adapter, authority, _source, sid, _key, _manager, rows, _ = parked
     await runner._goal_wakeup_fire_one(sid)
     claimed = claim_session_input(authority.db, epoch=authority.epoch, session_id=sid)
@@ -350,7 +350,8 @@ async def test_admitted_goal_lost_head_settles_interrupted_not_human_loss(parked
     assert await settle_unattended_unknown(authority, ref) is False
     notices = [m['content'] for m in authority.db.get_messages(sid)
                if m.get('display_kind') == 'failed_turn']
-    assert notices == [AUTOMATION_INTERRUPTED_NOTICE]
+    assert notices == [interrupted_notice(claimed)]
+    assert notices[0].startswith('The goal continuation for "'), notices
 
 
 @pytest.mark.asyncio

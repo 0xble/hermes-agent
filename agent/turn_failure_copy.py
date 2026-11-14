@@ -111,6 +111,16 @@ AUTOMATION_INTERRUPTED_NOTICE = (
     "An automated delivery was interrupted and was not run again. Some "
     "actions may already have run; verify their effects."
 )
+
+
+def automation_interrupted_notice(name: Optional[str]) -> str:
+    """``AUTOMATION_INTERRUPTED_NOTICE`` naming the automation that stopped (a cron job, goal, loop,
+    process or delegation), so the reader knows which work to check or restart; the generic copy
+    when the admission does not say."""
+    if not name:
+        return AUTOMATION_INTERRUPTED_NOTICE
+    return (f"{name[:1].upper()}{name[1:]} was interrupted and was not run again. Some actions "
+            "may already have run; verify their effects.")
 # Durable tail roles a failed turn leaves open: its accepted ``user`` row, or the ``tool`` row of a
 # call that ran before the failure. An ``assistant`` tail is already closed (a reply or a boundary).
 OPEN_TURN_TAIL_ROLES = frozenset({"user", "tool"})

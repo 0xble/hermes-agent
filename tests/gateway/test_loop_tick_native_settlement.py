@@ -81,8 +81,8 @@ async def test_stamped_loop_reply_settles_through_native_admission(tmp_path, mon
             authority._schedule = lambda ref: None
         await runner._loop_wakeup_fire_one(owner, manager.state, 1e12, set())
         if reply is None:
-            from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
             from gateway.session_contract import SessionRef
+            from gateway.session_unattended_unknown import interrupted_notice
             from gateway.session_settlement_recovery import recover_failed_settlement
             from hermes_state_runtime import claim_session_input
 
@@ -102,7 +102,8 @@ async def test_stamped_loop_reply_settles_through_native_admission(tmp_path, mon
             assert (settled['status'], settled['outcome']) == ('terminal', 'interrupted')
             notices = [m['content'] for m in authority.db.get_messages(owner)
                        if m.get('display_kind') == 'failed_turn']
-            assert notices == [AUTOMATION_INTERRUPTED_NOTICE]
+            assert notices == [interrupted_notice(lost)]
+            assert notices[0].startswith('The /loop wakeup'), notices
             assert settled['payload']['native_text_v1']['absorbed_synthetic'] == []
             assert len(turns) == 1, 'the lost automatic wake must never replay'
             return
