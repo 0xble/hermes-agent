@@ -40,13 +40,28 @@ def _is_macos_backend(backend) -> bool:
     return type(backend).__module__.startswith("keyring.backends.macOS")
 
 
+_macos_probe_ok = False
+
+
+def _stdin_is_tty() -> bool:
+    try:
+        return sys.stdin.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _probe_macos_keychain(backend) -> None:
     """Fail fast when the real macOS keychain would block waiting for an unlock prompt.
 
     Only the native macOS backend is probed: any other keyring (an injected in-memory one) never
-    reaches ``security``.
+    reaches ``security``. A process with an interactive stdin skips the probe: a locked keychain
+    there shows the user an unlock prompt, which is better than refusing. A successful probe is
+    cached for the process.
     """
-    if sys.platform != "darwin" or not _is_macos_backend(backend):
+    global _macos_probe_ok
+    if _macos_probe_ok or sys.platform != "darwin" or not _is_macos_backend(backend):
+        return
+    if _stdin_is_tty():
         return
     try:
         selected = subprocess.run(
@@ -75,6 +90,7 @@ def _probe_macos_keychain(backend) -> None:
         raise
     except (OSError, subprocess.CalledProcessError) as exc:
         raise KeychainUnavailable(f"the macOS keychain is unavailable ({type(exc).__name__})") from exc
+    _macos_probe_ok = True
 
 
 def _is_os_keychain(backend) -> bool:

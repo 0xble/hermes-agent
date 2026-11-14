@@ -186,7 +186,7 @@ jobs:
           security list-keychains -d user </dev/null > "$RUNNER_TEMP/hermes-ci-keychains.before"
           security default-keychain -d user </dev/null > "$RUNNER_TEMP/hermes-ci-default.before"
           security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
-          security set-keychain-settings -lt 0 "$CI_KEYCHAIN" </dev/null
+          security set-keychain-settings "$CI_KEYCHAIN" </dev/null
           security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
           security list-keychains -d user -s "$CI_KEYCHAIN" </dev/null
           security default-keychain -s "$CI_KEYCHAIN" </dev/null

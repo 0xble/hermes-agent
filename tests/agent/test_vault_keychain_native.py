@@ -16,6 +16,41 @@ from cryptography.fernet import Fernet
 from agent import vault_keychain as kc
 from agent.vault_store import VaultStore
 
+
+@pytest.mark.platforms("macos")
+def test_macos_probe_is_cached_after_a_successful_noninteractive_probe(monkeypatch):
+    backend = type("FakeMacBackend", (), {"__module__": "keyring.backends.macOS"})()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["security", "default-keychain"]:
+            return type("Completed", (), {"stdout": '"ci.keychain-db"\n'})()
+        return type("Completed", (), {})()
+
+    monkeypatch.setattr(kc, "_stdin_is_tty", lambda: False)
+    monkeypatch.setattr(kc.subprocess, "run", fake_run)
+    monkeypatch.setattr(kc, "_macos_probe_ok", False)
+
+    kc._probe_macos_keychain(backend)
+    kc._probe_macos_keychain(backend)
+
+    assert calls == [
+        ["security", "default-keychain", "-d", "user"],
+        ["security", "show-keychain-info", "ci.keychain-db"],
+    ]
+
+
+@pytest.mark.platforms("macos")
+def test_macos_probe_skips_interactive_stdin(monkeypatch):
+    backend = type("FakeMacBackend", (), {"__module__": "keyring.backends.macOS"})()
+    monkeypatch.setattr(kc, "_stdin_is_tty", lambda: True)
+    monkeypatch.setattr(kc, "_macos_probe_ok", False)
+    monkeypatch.setattr(kc.subprocess, "run", lambda *args, **kwargs: pytest.fail("probe should be skipped"))
+
+    kc._probe_macos_keychain(backend)
+
+
 _LOGIN = {"identifier_type": "email", "identifier": "ci@example.com", "password": "dummy-pw-not-real-42"}
 
 

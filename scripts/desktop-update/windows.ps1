@@ -169,7 +169,7 @@ if ($DesktopPid -gt 0) {
     $script:DesktopSeenAlive = $desktopProbe.Alive
     $script:DesktopCt = $desktopProbe.Ct
 }
-if (-not $SelfTestUi -and -not $SelfTestPipeDrain) {
+if (-not $SelfTestUi -and -not $SelfTestPipeDrain -and -not $SelfTestLogConcurrency) {
     $script:MarkerClaim = Invoke-MarkerClaim
 }
 
