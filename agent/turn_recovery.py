@@ -1673,20 +1673,29 @@ def route_classified_error(
     messages: list[dict[str, Any]], api_messages: Any, system_message: Any,
     active_system_prompt: Any, conversation_history: Any, retry_count: int, max_retries: int,
     compression_attempts: int, max_compression_attempts: int, api_call_count: int,
-    effective_task_id: Any,
+    effective_task_id: Any, hold_noninteractive_transient: Optional[bool] = None,
 ) -> ClassifiedErrorVerdict:
     """Ordered (load-bearing) recovery steps between classification and overflow handling:
     compaction-disabled overflow → terminal error (output-cap errors exempt); Anthropic
     long-context tier 429 → cap at 200k and compress; eager fallback for rate-limit/billing
     (immediately) and transport failures (after 1 retry) unless credential-pool rotation may
     still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
-    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
+    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once.
+
+    ``hold_noninteractive_transient`` (the caller's once-per-error decision; ``None`` computes
+    it) suppresses the eager transient fallbacks while an unattended route's window is open."""
     from agent.conversation_compression import (
         compression_pool_saturated,
         conversation_history_after_compression,
     )
     from agent.conversation_loop import _arm_fallback_restart, _compression_deferred_result, _ra
     from agent.model_metadata import estimate_request_tokens_rough
+
+    if hold_noninteractive_transient is None:
+        from agent.fallback_cooldown import hold_noninteractive_transient_retry
+        hold_noninteractive_transient = hold_noninteractive_transient_retry(
+            agent, classified, error_message=error_msg,
+        )
 
     _provider_overflow_recovery_pending = False
     is_rate_limited = False
@@ -1835,7 +1844,7 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
-    _should_fallback = (
+    _should_fallback = not hold_noninteractive_transient and (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or _provider_wide_overload
         or (_is_transport_failure and retry_count >= 2)
@@ -1862,6 +1871,7 @@ def route_classified_error(
         classified.is_auth
         and classified.should_fallback
         and not _retry.auth_failover_attempted
+        and not hold_noninteractive_transient
         and agent._fallback_index < len(agent._fallback_chain)
     ):
         _retry.auth_failover_attempted = True
