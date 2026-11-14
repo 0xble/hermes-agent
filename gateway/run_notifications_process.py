@@ -76,6 +76,8 @@ class GatewayProcessNotificationsMixin:
         from tools.process_registry_notifications import acknowledge_survivor_notifications, should_surface_notification
         from tools.process_registry_survival import is_restart_safe
 
+        if getattr(session, "_completion_delivered", False):
+            return None
         async with self._completion_event_scope(watcher):
             surface = should_surface_notification({
                 "owner_task_id": getattr(session, "owner_task_id", ""),
@@ -124,7 +126,7 @@ class GatewayProcessNotificationsMixin:
     async def _finish_process_text_notification(
         self, session_id: str, session, notify_mode: str, non_success: bool, watcher: dict, *, route: tuple,
     ) -> bool:
-        """Settle a plain notice; False retains the existing survivor retry path."""
+        """Settle a plain notice; False retains ownership for the watcher's retry path."""
         from gateway.run_notifications import logger
         from tools.process_registry import process_registry
         from tools.process_registry_notifications import acknowledge_survivor_notifications
@@ -141,7 +143,6 @@ class GatewayProcessNotificationsMixin:
             if is_restart_safe(session):
                 process_registry._mark_survivor_delivered(session)
             return True
-        settled = True
         if notify_mode in {"concise", "all", "result"} or (
             notify_mode == "error" and non_success
         ):
@@ -158,17 +159,11 @@ class GatewayProcessNotificationsMixin:
                 # Non-zero exit is the automatic diagnostic; a clean completion is the requested result.
                 await present_notification(send_final, platform=platform_name,
                                            diagnostic=non_success)
-            settled = sent is not False
-            if sent is False and is_restart_safe(session):
-                process_registry.release_survivor_completion(session_id)
-                return False
             if sent is False:
-                # A non-restart-safe completion cannot be replayed by a successor. Settle it even when
-                # transport could not return a receipt, so the released handover does not wait forever.
-                acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
-                return True
+                if is_restart_safe(session):
+                    process_registry.release_survivor_completion(session_id)
+                return False
         # Presented, or deliberately suppressed by the notification mode: either way the
         # claimed survivor completion is settled and must not replay on a successor.
-        if settled:
-            acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
+        acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
         return True

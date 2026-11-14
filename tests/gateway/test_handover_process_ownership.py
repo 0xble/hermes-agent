@@ -121,8 +121,11 @@ async def test_suppressed_child_completion_is_settled(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_failed_plain_notice_is_settled_for_non_restart_safe_process(monkeypatch):
-    executed = []
+@pytest.mark.parametrize('failure', ['rejected', 'raised'])
+async def test_failed_plain_notice_keeps_handover_owned_until_delivered(monkeypatch, failure):
+    from gateway.platforms.base import SendResult
+
+    executed, delivered = [], []
     runner, adapter, authority, source = await owned_route(monkeypatch, executed)
     await start_human_turn(runner, adapter, authority, source, None)
     await asyncio.gather(*(live.task for live in authority.sessions.values() if live.task))
@@ -130,11 +133,23 @@ async def test_failed_plain_notice_is_settled_for_non_restart_safe_process(monke
     registry = ProcessRegistry()
     monkeypatch.setattr('tools.process_registry.process_registry', registry)
     monkeypatch.setattr(runner, '_load_background_notifications_mode', lambda: 'concise')
+    retry_started, allow_delivery = asyncio.Event(), asyncio.Event()
+    attempts = 0
 
-    async def send_failure(*_args, **_kwargs):
-        return False
+    async def send(chat_id, content, reply_to=None, metadata=None):
+        nonlocal attempts
+        attempts += 1
+        assert attempts <= 2, 'successful completion must not be replayed'
+        if attempts == 1:
+            if failure == 'raised':
+                raise ConnectionError('network down')
+            return SendResult(success=False)
+        retry_started.set()
+        await allow_delivery.wait()
+        delivered.append(content)
+        return SendResult(success=True, message_id='completion')
 
-    monkeypatch.setattr(runner, '_send_watcher_message', send_failure)
+    monkeypatch.setattr(adapter, 'send', send)
     process = owned_process(runner, source)
     registry._running[process.id] = process
     registry._finish_exited(process, 0)
@@ -145,8 +160,23 @@ async def test_failed_plain_notice_is_settled_for_non_restart_safe_process(monke
         'check_interval': .01, 'notify_on_complete': False,
     }
     release_handover(runner)
-    await asyncio.wait_for(runner._run_process_watcher(watcher), 10)
+    await runner._drain_watch_notifications(registry.completion_queue)
+    assert registry.completion_queue.empty(), 'ordinary completions belong to the process watcher'
+    watching = asyncio.create_task(runner._run_process_watcher(watcher))
+    try:
+        await async_wait_until(
+            lambda: retry_started.is_set() or watching.done(), what='failed notice to retry',
+        )
+        assert retry_started.is_set(), 'failed notice was discarded instead of retried'
+        assert not process._completion_delivered
+        assert not drain.status(runner)['idle'], 'handover must retain an undelivered result'
+    finally:
+        allow_delivery.set()
+        await asyncio.wait_for(watching, 10)
+    await async_wait_until(lambda: drain.status(runner)['idle'], what='delivered notice to settle')
     assert process._completion_delivered
+    await asyncio.wait_for(runner._run_process_watcher(watcher), 10)
+    assert attempts == 2 and len(delivered) == 1
 
 
 @pytest.mark.asyncio
