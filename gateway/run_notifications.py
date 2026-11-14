@@ -31,6 +31,7 @@ from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
+from gateway.run_notifications_retry import GatewayDelegationRetrySweepMixin
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
@@ -230,7 +231,7 @@ def _media_send_succeeded(result) -> bool:
 
 class GatewayNotificationsMixin(
     GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayProcessEventSourcesMixin,
-    GatewayProcessNotificationsMixin,
+    GatewayProcessNotificationsMixin, GatewayDelegationRetrySweepMixin,
 ):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
@@ -2732,30 +2733,6 @@ class GatewayNotificationsMixin(
                 continue
             if count:
                 logger.info("%s %d undelivered async completion(s) for profile %r", verb, count, profile_name)
-
-    def _collect_delegation_retry_actions(self) -> list:
-        """Claim due retry notices / terminal settlements from every served profile's ledger (atomic claims)."""
-        from tools.delegation_resume import sweep_retries
-        from hermes_cli.profiles import get_active_profile_name
-        actions = []
-        with _log_suppressed(logging.WARNING, "Delegation retry sweep failed: %s"):
-            primary = get_active_profile_name() or "default"
-            actions += [{**a, "profile": primary} for a in sweep_retries()]
-        profile_homes = (getattr(self, "_served_profile_homes", None) or {}).items()
-
-        def _one(name):
-            found = sweep_retries()
-            actions.extend({**a, "profile": name} for a in found)
-            return len(found)
-
-        from gateway.run import _profile_runtime_scope
-        for profile_name, profile_home in profile_homes:
-            if profile_name in {primary, getattr(self, "_primary_profile_name", None)}:
-                continue
-            with _log_suppressed(logging.WARNING, "Delegation retry sweep failed: %s"):
-                with _profile_runtime_scope(Path(profile_home), {}):
-                    _one(profile_name)
-        return actions
 
     async def _deliver_delegation_retry_action(self, action: dict) -> None:
         """Settle one claimed retry action. A notice wakes the parent to dispatch the retry. Routine
