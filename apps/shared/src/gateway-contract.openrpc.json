@@ -39935,6 +39935,18 @@
             ],
             "default": null,
             "title": "Now"
+          },
+          "max_seconds": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Max Seconds"
           }
         },
         "title": "SessionPruneParams",

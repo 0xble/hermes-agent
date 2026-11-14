@@ -7,6 +7,7 @@ path, which keeps a retained reset child's logical owner. A REAL foreign process
 as the gateway does; the owner end is the production ``AuthorityConnection`` dispatch.
 """
 from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
+import asyncio
 import subprocess
 import sys
 import time
@@ -89,6 +90,7 @@ def test_prune_under_the_live_owner_is_applied_by_the_owner_not_refused(owned_st
         connection = _connection(store.authority, operator=True)
 
         async def rpc(method, _timeout=None, **params):
+            assert params["max_seconds"] == 2.0
             frame = await connection.dispatch({'id': 1, 'method': method, 'params': params})
             if 'error' in frame:
                 raise rpc_error(frame['error'])
@@ -103,7 +105,7 @@ def test_prune_under_the_live_owner_is_applied_by_the_owner_not_refused(owned_st
     monkeypatch.setattr(gateway_client, 'connect_gateway', owner_socket)
     monkeypatch.setattr(hermes_state, 'SessionDB', recording_db)
     args = Namespace(sessions_action='prune', dry_run=False, yes=True, force=False, never_active=False,
-                     include_archived=False, include_pinned=False, now=True,
+                     include_archived=False, include_pinned=False, now=True, max_seconds=2.0,
                      **{name: None for name in sessions_cmd._FILTER_ARGS})
     args.older_than = '90'
     try:
@@ -136,3 +138,32 @@ async def test_owner_prune_is_local_operator_only(owned_store, grant):
         await connection.close()
     assert refused['error']['message'] == 'permission_denied', refused
     assert owned_store.db.get_session('old-cli') is not None
+
+
+@pytest.mark.asyncio
+async def test_disconnected_prune_client_cannot_leave_unbounded_owner_work(owned_store, monkeypatch):
+    import hermes_time
+    import hermes_cli.maintenance_window as window
+    from datetime import datetime
+    from tests.hermes_state.test_prune_sql_deadline import _slow_delete
+    monkeypatch.setattr(window, "deletion_window_spec", lambda: "05:00-06:00")
+    monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 11, 10, 5, 1))
+    _slow_delete(owned_store.db)
+    connection = _connection(owned_store.authority, operator=True)
+    request = asyncio.create_task(connection.dispatch({
+        'id': 1, 'method': 'session.prune',
+        'params': {'filters': {'older_than_days': 90}, 'max_seconds': 0.15}}))
+    # The owner has admitted a separately tracked operation, not just a client coroutine.
+    for _ in range(100):
+        if getattr(owned_store.authority, '_mutation_tasks', ()):
+            break
+        await asyncio.sleep(0.001)
+    tasks = list(owned_store.authority._mutation_tasks)
+    assert tasks
+    request.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await request
+    await connection.close()
+    await asyncio.wait_for(asyncio.gather(*tasks), timeout=2)
+    assert not owned_store.authority._mutation_tasks
+    owned_store.db.set_meta('foreground-after-client-disconnect', 'ok')

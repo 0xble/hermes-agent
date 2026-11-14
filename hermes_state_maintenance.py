@@ -351,15 +351,18 @@ class SessionMaintenanceMixin:
         segment is in the same transaction, so a batch boundary between them would keep it forever
         once the pacer shrinks batches."""
         from hermes_state_local import local_conversation_ids
+        from hermes_state_prune_budget import prune_sql, check_prune_budget
         groups: dict[str, list[str]] = {}
-        with self._read_ctx() as conn:
+        with self._read_ctx() as conn, prune_sql(conn):
             for sid in candidate_ids:
+                check_prune_budget()
                 groups.setdefault(local_conversation_ids(conn, sid)[0], []).append(sid)
         return list(groups.values())
 
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,
                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
                        deleted_ids: Optional[list] = None, within_deletion_window: bool = False,
+                       max_seconds: Optional[float] = None,
                        **filters) -> int:
         """Delete ended sessions inactive for ``older_than_days`` (an explicit ``started_before`` /
         ``last_active_before`` overrides it; None = no implicit bound) matching the filters.
@@ -369,23 +372,42 @@ class SessionMaintenanceMixin:
         or compression lock while expired/dead holders are reclaimed and fenced.  A compression
         ancestor is deleted only together with every continuation after it (``whole_lineages``).
         ``within_deletion_window`` refuses to start outside ``maintenance.deletion_window`` and stops
-        between transactions once it closes; the remaining candidates wait for the next run. One
+        inside SQLite VM work and between transactions once it closes. ``max_seconds`` adds a
+        runtime cap; a deadline-interrupted page rolls back and resumes next run. One
         pass per store runs at a time in this process (:func:`prune_pass`)."""
         if filters.get("include_open"):
             raise ValueError("prune_sessions() never deletes open sessions: include_open is archive-only")
         from hermes_cli.maintenance_window import deletion_window_open
         if within_deletion_window and not deletion_window_open():
             raise DeletionWindowClosedError("session prune refused: maintenance.deletion_window is closed")
-        with prune_pass(self.db_path):
-            return self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
-                                             deleted_ids, within_deletion_window, filters)
+        from hermes_state_prune_budget import PruneBudget, PruneBudgetExpired, PruneWriteContended, prune_budget
+        from hermes_state_transactions import finish_prune_maintenance
+        removed_ids = []
+        budget = PruneBudget(within_deletion_window, max_seconds, db_path=self.db_path)
+        try:
+            with prune_pass(self.db_path), prune_budget(budget):
+                result = self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
+                                                   removed_ids, within_deletion_window, filters)
+                finish_prune_maintenance(self)
+                return result
+        except PruneBudgetExpired as exc:
+            logger.info("%s", exc)
+            return len(removed_ids)
+        except PruneWriteContended as exc:
+            # A read or a write outside the retry runner can still observe a
+            # foreground writer. The next maintenance pass can resume safely.
+            logger.info("%s", exc)
+            return len(removed_ids)
+        finally:
+            if deleted_ids is not None:
+                deleted_ids.extend(removed_ids)
 
     def _prune_sessions_pass(self, older_than_days, source, sessions_dir, exclude_active_write_guards,
                              deleted_ids, within_deletion_window, filters) -> int:
         from hermes_cli.maintenance_window import deletion_window_open
+        from hermes_state_prune_budget import run_prune_write
         finish_pending_deletes(self)
         where, where_params = self._prune_where(older_than_days, source, filters, whole_lineages=True)
-        removed_ids: list[str] = []
         # Select outside the write transaction.  The old implementation selected and deleted every
         # victim inside one BEGIN IMMEDIATE, so a large FTS cascade could hold every foreground writer
         # out for minutes.  Each short transaction rechecks the full predicate and the active guards;
@@ -398,8 +420,31 @@ class SessionMaintenanceMixin:
         candidate_ids = [str(row["id"]) for row in candidate_rows]
         # Tombstones are retained on a separate retry horizon from transcript retention.  A
         # prune pass must advance that horizon even when no session row matches its age window.
-        from hermes_state_mutation_retirement import prune_retired_tombstones
-        self._execute_write(lambda conn: prune_retired_tombstones(conn))
+        from hermes_state_mutation_retirement import (
+            RETIRED_PREFIX, ROUTE_FENCE_PREFIX, prune_retired_tombstones,
+        )
+        from hermes_state_terminal import ADMISSION_PREFIX, WORKER_PREFIX
+        tombstone_pacer = PrunePacer(max_size=100)
+        tombstone_prefixes = (ADMISSION_PREFIX, WORKER_PREFIX, RETIRED_PREFIX, ROUTE_FENCE_PREFIX)
+        while True:
+            unit_limit = [tombstone_pacer.size]
+
+            def prune_tombstones():
+                return self._execute_write(
+                    lambda conn: prune_retired_tombstones(conn, limit=unit_limit[0]), skip_result={},
+                )
+
+            def shrink_tombstones():
+                changed = tombstone_pacer.shrink()
+                unit_limit[0] = tombstone_pacer.size
+                return changed
+
+            started = time.monotonic()
+            reclaimed = run_prune_write(prune_tombstones, shrink=shrink_tombstones,
+                                        label="retired tombstones", skip_result={}) or {}
+            if not reclaimed or all(reclaimed.get(prefix, 0) < unit_limit[0] for prefix in tombstone_prefixes):
+                break
+            tombstone_pacer.pause(time.monotonic() - started)
         removed_count = 0
 
         # Keep each transaction small enough that message/FTS triggers release the WAL write lock
@@ -413,19 +458,28 @@ class SessionMaintenanceMixin:
                 logger.info("session prune stopped: maintenance.deletion_window closed with %d candidate(s) "
                             "left for the next run", sum(map(len, groups[position:])))
                 break
+            batch_start = position
             requested = []
-            while position < len(groups) and (not requested or len(requested) + len(groups[position]) <= pacer.size):
-                requested += groups[position]
-                position += 1
 
-            def _do(conn, requested=requested):
+            def attempt():
+                nonlocal requested, position
+                position, requested = batch_start, []
+                while position < len(groups) and (not requested or len(requested) + len(groups[position]) <= pacer.size):
+                    requested += groups[position]
+                    position += 1
+                return self._execute_write(_do, skip_result=[]) or []
+
+            def shrink():
+                return pacer.shrink(len(requested)) if position - batch_start > 1 else False
+
+            def _do(conn):
                 started = time.monotonic()
                 try:
                     return _batch(conn, requested)
                 finally:
                     held[0] = time.monotonic() - started
 
-            def _batch(conn, requested):
+            def _select(conn, requested):
                 ph = _placeholders(requested)
                 rows = conn.execute(
                     f"SELECT s.id FROM sessions s WHERE {where} AND s.id IN ({ph})",
@@ -455,22 +509,30 @@ class SessionMaintenanceMixin:
                         str(row["root"]) for row in lineage_rows if str(row["id"]) in guarded
                     }
                     session_ids = [sid for sid in session_ids if sid not in guarded_roots]
-                from hermes_state_mutation_retirement import prune_retired_tombstones, retire_prunable
+                return session_ids
+
+            def _batch(conn, requested):
+                from hermes_state_mutation_retirement import retire_prunable
+                session_ids = _select(conn, requested)
                 session_ids = retire_prunable(conn, sorted(session_ids), defer_messages=True)
-                prune_retired_tombstones(conn)
                 if not session_ids:
                     return []
                 stage_delete(conn, session_ids, sessions_dir)
-                removed_ids.extend(session_ids)
                 return session_ids
 
-            batch_removed = self._execute_write(_do, skip_result=0) or []
+            def defer():
+                from hermes_state_deletion import defer_retirement
+                return defer_retirement(self, lambda conn: _select(conn, requested), sessions_dir,
+                                        label=lambda: requested or groups[batch_start])
+
+            batch_removed = run_prune_write(attempt, shrink=shrink, defer=defer,
+                                             label=lambda: requested or groups[batch_start]) or []
             removed_count += len(batch_removed)
+            deleted_ids.extend(batch_removed)
             if batch_removed:
                 emit_session_deleted(self, batch_removed, reason="prune", sessions_dir=sessions_dir)
             finish_pending_deletes(self, required_ids=batch_removed)
-            for sid in batch_removed:
-                self._remove_session_files(sessions_dir, sid)
+            # finish_pending_deletes removes transcript files before clearing its marker.
             if position < len(groups):
                 pacer.pause(held[0])
 
@@ -480,11 +542,8 @@ class SessionMaintenanceMixin:
                     lambda conn: self._delete_unreferenced_system_prompts(conn, limit=100), skip_result=0)
                 if not deleted_prompts or deleted_prompts < 100:
                     break
-        if removed_count:
-            from hermes_state_media import collect_retired_media
-            collect_retired_media(self)
-        if deleted_ids is not None:
-            deleted_ids.extend(removed_ids)
+        from hermes_state_media import collect_retired_media_bounded
+        collect_retired_media_bounded(self)
         return removed_count
 
     def maybe_auto_archive(
@@ -647,6 +706,9 @@ class SessionMaintenanceMixin:
             result["pruned"] = pruned = self.prune_sessions(
                 older_than_days=retention_days, sessions_dir=sessions_dir, exclude_active_write_guards=True,
                 within_deletion_window=True)
+            if not deletion_window_open():
+                result["deadline_reached"] = True
+                return result
             report_startup_progress(900.0, phase="state_db_auto_sweep")
             closed = self.sweep_orphaned_sessions(
                 max_idle_seconds=float(retention_days) * 86400.0,
