@@ -23,7 +23,10 @@ async def test_failed_autonomy_outcome_uses_visibility_policy(state, notices):
     from hermes_cli import session_controls as controls
     from hermes_cli.goals import GoalManager
     _policy(notices=notices)
-    GoalManager("target").set("already active")
+    # Resuming a finished goal fails (an active one is an idempotent success since #676).
+    manager = GoalManager("target")
+    manager.set("already finished")
+    manager.mark_done("finished")
     result = controls.apply_control("goal", "resume", "target", requester_sid="requester")
     assert result["status"] == "failed"
     runner = _runner(state)
