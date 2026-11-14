@@ -305,3 +305,16 @@ import error, so an import-only probe would activate a release that boots withou
 the running release already rejects is left to the loader and never blocks an update.
 
 Contract tests: `tests/hermes_cli/test_update_release_tag_fetch.py::test_a_fork_is_named_by_its_recorded_baseline_when_the_release_tag_is_missing`, `tests/hermes_cli/test_immutable_releases.py::test_candidate_smoke_blocks_a_plugin_the_running_release_loads_and_the_candidate_would_not`.
+
+## Schema Convergence Smoke
+
+Staging also runs `hermes_cli.schema_smoke` in the candidate's interpreter. It copies the
+schema, never the rows, of the profile's execution ledger, delivery queue, notepad, gateway
+outbox and `state.db` into a disposable home, opens each twice with the candidate's code, and
+fails staging when a schema is still changing on the second open. The first open may migrate.
+The shapes that break an upstream migration exist only in the installed profile, which is why
+the v0.23.1 status migration passed every test and then rebuilt the fork's execution ledger on
+every open. A probe that cannot run is printed and skipped, and a rollback target from before
+the probe existed is not probed. Add a database to `DATABASES` when a new one gains a migration.
+
+Contract tests: `tests/hermes_cli/test_schema_smoke.py`.
