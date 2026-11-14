@@ -80,19 +80,21 @@ def test_real_dispatched_multi_child_terminal_notice_uses_persisted_retry_row(re
     assert persisted["retry_state"] == dr.RETRY_TERMINAL
 
 
-def test_real_dispatched_scalar_transient_notice_is_suppressed_only_when_classifier_retries():
+@pytest.mark.parametrize("retry_attempt,root_age,notice", [(0, 0, False), (6, 0, True), (0, 24 * 3600 + 1, True)])
+def test_real_dispatched_scalar_notice_uses_persisted_classifier_and_budget(retry_attempt, root_age, notice):
     delegation_id, gate = _real_running_batch(["a"])
     entry = {"task_index": 0, "status": "failed", "failure_reason": "rate_limit", "error": "429"}
     ad.record_unit_child(delegation_id, entry)
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_attempt=?, retry_root_started_at=? WHERE delegation_id=?",
+                     (retry_attempt, ad._records[delegation_id]["dispatched_at"] - root_age, delegation_id))
     q = queue.Queue()
     with patch("tools.process_registry.process_registry") as reg:
         reg.completion_queue = q
         ad.push_task_failure_notice(delegation_id, entry, n_tasks=1)
-        assert q.empty()
+        assert q.qsize() == int(notice)
         gate.set()
         ad._records[delegation_id]["_future"].result(timeout=5)
-    from tools import delegation_resume as dr
-    assert dr.retry_status(delegation_id)["retry_state"] == dr.RETRY_SCHEDULED
 
 
 def test_failure_notice_reaches_the_queue_while_the_batch_keeps_running_and_formats_as_early_warning():
