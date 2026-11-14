@@ -38,6 +38,7 @@ from gateway.run_notifications_ledger import (
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
+from gateway.watch_match_coalesce import coalesce_pending_watch_matches
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -58,28 +59,6 @@ def _local_completion_card(evt: dict) -> dict[str, str]:
         from tools.process_registry_notifications import heartbeat_display_text
         return {"display_kind": INTERNAL_NOTIFICATION_DISPLAY_KIND, "display_text": heartbeat_display_text(evt)}
     return {}
-
-
-def _coalesce_pending_watch_matches(events):
-    """Keep one held match per process incarnation and destination, preserving its retry clock."""
-    result, pending = [], {}
-    for evt in events:
-        if evt.get("type") != "watch_match" or not evt.get("session_id"):
-            result.append(evt)
-            continue
-        key = tuple(evt.get(field) for field in (
-            "session_id", "started_at", "session_key", "parent_session_id", "origin_hermes_home"))
-        held = pending.get(key)
-        if held is None:
-            pending[key] = evt
-            result.append(evt)
-            continue
-        # The producer bounds output. Absorb newer matches without resetting the old refusal
-        # deadline or identity, otherwise fresh process output bypasses admission backoff.
-        held["suppressed"] = int(held.get("suppressed") or 0) + int(evt.get("suppressed") or 0) + 1
-        held["output"] = evt.get("output", "")
-        held["pattern"] = evt.get("pattern", held.get("pattern", ""))
-    return result
 
 
 def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
@@ -1551,7 +1530,7 @@ class GatewayNotificationsMixin(
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume watches in their owning profile, backing off refusals even during drain."""
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = _coalesce_pending_watch_matches(_drain_gateway_watch_events(completion_queue))
+        watch_events = coalesce_pending_watch_matches(_drain_gateway_watch_events(completion_queue))
         for evt in watch_events:
             next_retry_at = evt.get("_watch_next_retry_at")
             draining = getattr(self, "_draining", False)
@@ -1561,8 +1540,7 @@ class GatewayNotificationsMixin(
             # Offer a held event once per drain for spooling, not on every refused tick.
             if (next_retry_at is not None and next_retry_at > time.monotonic()
                     and (not draining or drain_offered)):
-                # Backoff between refused injections: hold the event for a later drain tick
-                # instead of re-attempting admission every 2 s (#140899).
+                # Refused injections back off to a later drain tick, not every 2 s (#140899).
                 completion_queue.put(evt)
                 continue
             async with self._completion_event_scope(evt):
