@@ -37,8 +37,10 @@ def test_config_retirement_keeps_aliases_and_plugin_policy_without_mutating_inpu
         ("coder", "gpt-6.1-sol", "high"),
     ]
     assert all(o["provider"] == "custom:openai-proxy" and o["service_tier"] == "normal" for o in route["options"])
-    assert all("service_tier" not in o["fallback_providers"][0] for o in route["options"])
-    assert route["options"][2]["fallback_providers"][0]["provider"] == "xai-oauth"
+    assert all("service_tier" not in entry for o in route["options"] for entry in o["fallback_providers"])
+    assert [entry["model"] for entry in route["options"][2]["fallback_providers"]] == [
+        "claude-sonnet-5-5", "muse-wonder-full-1.0", "grok-4.7"
+    ]
     assert [entry["model"] for entry in after["cron"]["fallback_providers"]] == [
         "claude-sonnet-5-5", "muse-wonder-full-1.0", "grok-4.7"
     ]

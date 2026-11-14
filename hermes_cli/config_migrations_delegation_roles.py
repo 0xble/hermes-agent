@@ -34,6 +34,12 @@ options:
     reasoning_effort: high
     service_tier: normal
     fallback_providers:
+      - provider: custom:claude-proxy
+        model: claude-sonnet-5-5
+        reasoning_effort: high
+      - provider: custom:openai-proxy
+        model: muse-wonder-full-1.0
+        reasoning_effort: high
       - provider: xai-oauth
         model: grok-4.7
         reasoning_effort: high
