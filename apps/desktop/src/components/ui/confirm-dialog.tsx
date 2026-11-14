@@ -61,6 +61,7 @@ export function ConfirmDialog({
   const { t } = useI18n()
   const confirmRef = useRef<HTMLButtonElement>(null)
   const closeTimerRef = useRef<null | number>(null)
+  const lifetimeRef = useRef({ active: true })
   const [status, setStatus] = useState<'done' | 'idle' | 'saving'>('idle')
   const [error, setError] = useState<null | string>(null)
   const busy = status === 'saving' || status === 'done'
@@ -76,17 +77,16 @@ export function ConfirmDialog({
     }
   }, [open])
 
-  // Cancel the pending close timer on unmount. The timer below holds the
-  // "done" beat visible for 600ms, and an unmount inside that window used to
-  // leave it armed. It then called onClose on a tree that is gone, which
-  // reaches setState in the parent. Under vitest the environment can be torn
-  // down first, and React then reads `window` during the update and throws
-  // ReferenceError.
-  // The write below is a timer handle, and not a mirror of a reactive value.
-  // It happens on unmount only, and it clears the handle this component owns.
+  // Confirmation can itself unmount the dialog. Retire that invocation before
+  // its promise settles, as well as cancelling a close timer already armed.
   // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
+    const lifetime = { active: true }
+    lifetimeRef.current = lifetime
+
     return () => {
+      lifetime.active = false
+
       if (closeTimerRef.current !== null) {
         window.clearTimeout(closeTimerRef.current)
         closeTimerRef.current = null
@@ -100,12 +100,19 @@ export function ConfirmDialog({
     }
 
     setError(null)
+    const lifetime = lifetimeRef.current
 
     if (dismissOnConfirm) {
       try {
         await onConfirm()
+        if (!lifetime.active) {
+          return
+        }
         onClose()
       } catch (err) {
+        if (!lifetime.active) {
+          return
+        }
         setError(err instanceof Error ? err.message : t.errors.genericFailure)
       }
 
@@ -116,12 +123,18 @@ export function ConfirmDialog({
 
     try {
       await onConfirm()
+      if (!lifetime.active) {
+        return
+      }
       setStatus('done')
       closeTimerRef.current = window.setTimeout(() => {
         closeTimerRef.current = null
         onClose()
       }, 600)
     } catch (err) {
+      if (!lifetime.active) {
+        return
+      }
       setStatus('idle')
       setError(err instanceof Error ? err.message : t.errors.genericFailure)
     }
