@@ -4,7 +4,8 @@
   "parameters": {
     "properties": {
       "focus": {
-        "description": "Optional decisions, open items, paths, and IDs the summary must preserve.",
+        "description": "Optional decisions, open items, paths, and IDs to preserve, at most 1500 characters. Keep identifiers exact and omit narration. Oversized focus is refused, never silently truncated.",
+        "maxLength": 1500,
         "type": "string"
       },
       "reason": {
