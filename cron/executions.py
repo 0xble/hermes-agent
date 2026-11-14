@@ -47,6 +47,7 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import subprocess
 import sqlite3
 import threading
@@ -182,6 +183,25 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     _initialize_coverage(conn, existing_ledger=existing_ledger)
 
 
+_STATUS_CHECK_RE = re.compile(r"(CHECK\s*\(\s*status\s+IN\s*)\(([^)]*)\)", re.IGNORECASE)
+
+
+def _widened_table_sql(old_sql: str) -> Optional[str]:
+    """Return ``old_sql`` with its status CHECK widened to the union of the statuses it already
+    allows and :data:`_STATUS_CHECK`, or ``None`` when it has no status CHECK to widen.
+
+    Keeping the old values matters: a fork ledger may allow statuses this build no longer writes
+    (``deferred``), and narrowing would make the copy fail. The result always names ``missed``,
+    so a rebuild happens once rather than on every open."""
+    match = _STATUS_CHECK_RE.search(old_sql)
+    if match is None:
+        return None
+    statuses = list(dict.fromkeys(
+        re.findall(r"'([^']*)'", match.group(2)) + re.findall(r"'([^']*)'", _STATUS_CHECK)))
+    widened = ",".join(f"'{status}'" for status in statuses)
+    return old_sql[:match.start()] + f"{match.group(1)}({widened})" + old_sql[match.end():]
+
+
 def _widen_status_check(conn: sqlite3.Connection) -> None:
     """Rebuild a ledger created before ``cancelled``/``missed`` existed: SQLite cannot alter a
     CHECK constraint in place. Copies every column the old table has; runs once per file, and
@@ -193,14 +213,17 @@ def _widen_status_check(conn: sqlite3.Connection) -> None:
 
     if "'missed'" in (current_sql() or "'missed'"):
         return
+    if _widened_table_sql(current_sql() or "") is None:
+        return
     conn.commit()
     conn.execute("BEGIN IMMEDIATE")
     try:
         old_sql = current_sql() or "'missed'"
-        if "'missed'" not in old_sql:
+        new_sql = None if "'missed'" in old_sql else _widened_table_sql(old_sql)
+        if new_sql is not None:
             columns = ", ".join(r[1] for r in conn.execute("PRAGMA table_info(executions)"))
             conn.execute("ALTER TABLE executions RENAME TO executions_pre_widen")
-            conn.execute(old_sql.replace("'unknown')", "'unknown','cancelled','missed')", 1))
+            conn.execute(new_sql)
             conn.execute(
                 f"INSERT INTO executions ({columns}) SELECT {columns} FROM executions_pre_widen")
             conn.execute("DROP TABLE executions_pre_widen")

@@ -6,6 +6,7 @@ Real store, real execution ledger, real cancel markers under a temp HERMES_HOME.
 from __future__ import annotations
 
 import sqlite3
+from contextlib import closing
 from datetime import timedelta
 
 import pytest
@@ -162,6 +163,61 @@ def test_a_pre_existing_ledger_is_widened_without_losing_rows(home):
 
     record_missed_occurrences("j1", count=2, first_instant=None, detail="test")
     assert sorted(r["status"] for r in _ledger("j1")) == ["completed", "missed"]
+
+
+def test_a_fork_ledger_that_allows_deferred_is_widened_once_and_keeps_its_indexes(home):
+    """A fork ledger whose CHECK ends in ``'deferred')`` must widen to the union, keep its
+    ``deferred`` rows, and stop rebuilding: replacing only ``'unknown')`` left the CHECK unchanged,
+    so every open copied the whole table and dropped the indexes the retention queries name."""
+    db = home / "cron" / "executions.db"
+    db.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db)
+    conn.execute(
+        """CREATE TABLE executions (
+             id TEXT PRIMARY KEY, job_id TEXT NOT NULL, source TEXT NOT NULL,
+             process_id TEXT NOT NULL, pid INTEGER NOT NULL, process_started_at INTEGER,
+             status TEXT NOT NULL CHECK(status IN
+               ('claimed','running','completed','failed','unknown','deferred')),
+             claimed_at TEXT NOT NULL, started_at TEXT, finished_at TEXT, error TEXT)""")
+    for row_id, status in (("old", "completed"), ("parked", "deferred")):
+        conn.execute(
+            "INSERT INTO executions (id, job_id, source, process_id, pid, status, claimed_at) "
+            "VALUES (?, 'j1', 'builtin', 'p', 1, ?, ?)",
+            (row_id, status, jobs._hermes_now().isoformat()))
+    conn.commit()
+    conn.close()
+
+    from cron.executions import record_missed_occurrences
+
+    record_missed_occurrences("j1", count=2, first_instant=None, detail="test")
+    statuses = sorted(r["status"] for r in _ledger("j1"))
+    assert statuses == ["completed", "deferred", "missed"]
+
+    with closing(sqlite3.connect(db)) as check:
+        table_sql = check.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'").fetchone()[0]
+        indexes = {r[0] for r in check.execute(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='executions'")}
+        rootpage = check.execute(
+            "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='executions'"
+        ).fetchone()[0]
+    assert "'deferred'" in table_sql and "'missed'" in table_sql and "'cancelled'" in table_sql
+    assert {"idx_executions_terminal_age", "idx_executions_job_instant",
+            "idx_executions_status_claimed"} <= indexes
+
+    # A second open must not rebuild: the table keeps its pages.
+    _ledger("j1")
+    with closing(sqlite3.connect(db)) as check:
+        assert check.execute(
+            "SELECT rootpage FROM sqlite_master WHERE type='table' AND name='executions'"
+        ).fetchone()[0] == rootpage
+
+
+def test_a_ledger_without_a_status_check_is_never_rebuilt(home):
+    from cron.executions import _widened_table_sql
+
+    assert _widened_table_sql(
+        "CREATE TABLE executions (id TEXT PRIMARY KEY, status TEXT NOT NULL)") is None
 
 
 # --- stopping a live run --------------------------------------------------------------------
