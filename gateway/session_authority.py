@@ -980,7 +980,7 @@ class SessionAuthority:
             request_hard_interrupt(agent)
         return self._handle(ref)
 
-    def _classic_turn_holds(self, route):
+    async def _classic_turn_holds(self, route):
         """The route's running slot is held by a turn this FIFO did not claim (the drain is serial:
         its own previous turn released the slot before this claim). Leaked and reaped slots are
         evicted first, so they never block the FIFO; the reaped check reads state.db at most 1/s."""
@@ -994,7 +994,7 @@ class SessionAuthority:
             self._classic_evict_at[route] = now
             runner._hm_evict_idle_stale_agent(route)
             if running(route):
-                runner._hm_evict_reaped_agent(route)
+                await runner._hm_evict_reaped_agent(route)
         return running(route)
 
     def _runs_own_agent(self, ref):
@@ -1174,7 +1174,7 @@ class SessionAuthority:
                 from gateway.session_completion_notes import noted_completion, reopen_for_turn
                 if not noted_completion(first):
                     await reopen_for_turn(self, ref)
-            if first is not None and self._classic_turn_holds(live.route):
+            if first is not None and await self._classic_turn_holds(live.route):
                 # A classic turn (fallback wake, CLI handoff, legacy resume) holds the route's slot:
                 # a claim now would hand this row to its busy path and settle it unrun. The head
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
