@@ -93,6 +93,10 @@ def _spill_full_stdout(stdout_text: str) -> Optional[str]:
         from tools.spill_safety import write_text_exclusive
         from agent.incognito_private_dir import private_subdir_for_current_session
         private_dir = private_subdir_for_current_session("exec")
+        if private_dir is None:
+            from agent.incognito import is_incognito
+            if is_incognito():
+                return None
         if len(stdout_text) > MAX_SPILLED_STDOUT_BYTES:
             stdout_text = (stdout_text[:MAX_SPILLED_STDOUT_BYTES]
                            + f"\n\n[... spill capped at {MAX_SPILLED_STDOUT_BYTES:,} bytes ...]")
@@ -798,6 +802,10 @@ def execute_code(
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
+    if env_type != "local":
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return tool_error("execute_code is unavailable in incognito mode on remote execution backends.")
     # Arbitrary Python never passes through terminal()/DANGEROUS_PATTERNS, so guard the whole
     # script before either dispatch path spawns it — in this (tool-executor) thread, which holds
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.

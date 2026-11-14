@@ -8,11 +8,9 @@ restart) no file under the run's temp root, the Hermes home or the private-direc
 contain it.
 
 This is a recording probe rather than an xfail. ``scripts/run_tests.sh`` drops the environment
-and hides passing output, so the mode switch and the result travel through
-``HERMES_E2E_ARTIFACTS``, which the runner forwards: an ``incognito-leak-scan.baseline`` marker
-there selects report-only mode (for code that predates the private directory), and each test
-writes ``incognito-leak-scan-<name>.json`` there (digest prefix, booleans, counts and relative
-paths only).
+and hides passing output, so the result travels through ``HERMES_E2E_ARTIFACTS``, which the
+runner forwards. Each test writes ``incognito-leak-scan-<name>.json`` there (digest prefix,
+booleans, counts and relative paths only).
 """
 from __future__ import annotations
 
@@ -44,18 +42,12 @@ def _artifacts() -> Path | None:
     return Path(value) if value else None
 
 
-def _baseline() -> bool:
-    root = _artifacts()
-    return (os.environ.get("HERMES_INCOGNITO_LEAK_SCAN_BASELINE") == "1"
-            or bool(root and (root / "incognito-leak-scan.baseline").exists()))
-
-
 def _report(name: str, payload: dict) -> None:
     root = _artifacts()
     if root is None:
         return
     root.mkdir(parents=True, exist_ok=True)
-    body = {"mode": "baseline" if _baseline() else "final", **payload}
+    body = {"mode": "final", **payload}
     (root / f"incognito-leak-scan-{name}.json").write_text(json.dumps(body, indent=2, sort_keys=True), encoding="utf-8")
 
 
@@ -227,7 +219,6 @@ def test_private_interval_leaves_no_canary_after_exit(rig):
     drv, gw, director = rig.drv, rig.gw, rig.director
     parent = rig.private_parent
     assert parent is not None
-    baseline = _baseline()
     chat = str(drv.user_id)
     _configure_media(rig)
     director.script(f"txt-{tag}", C.answer(f"A-txt-{tag}", "text ok"))
@@ -274,8 +265,6 @@ def test_private_interval_leaves_no_canary_after_exit(rig):
     })
     assert gw.alive(), gw.tail()
     assert stored, "a public turn after the interval was not stored"
-    if baseline:
-        return
     assert transcribed and voice_answered, f"the caption-less voice memo was not transcribed and answered\n{rig.ctx()}"
     assert audio_sent, f"the spoken reply never reached the chat\n{drv.describe()}"
     assert intervals, "no private interval directory was created"
@@ -292,7 +281,6 @@ def test_hard_kill_keeps_topic_private_and_sweeps_the_interval(rig):
     drv, gw, director = rig.drv, rig.gw, rig.director
     parent = rig.private_parent
     assert parent is not None
-    baseline = _baseline()
     user = rig.fresh_user()  # its own private chat: independent of the other test's topic
     _configure_media(rig)
     director.script(f"k1-{tag}", ToolCall("terminal", {"command": _scratch_command(canary)}),
@@ -317,8 +305,6 @@ def test_hard_kill_keeps_topic_private_and_sweeps_the_interval(rig):
         "restart_line_seen": restart_line_seen, "leftover_private_dirs_after_off": _leftovers(parent),
     })
     assert gw.alive(), gw.tail()
-    if baseline:
-        return
     assert old, "no private interval directory existed before the kill"
     assert before_kill, "the canary never reached disk before the kill, so the sweep proves nothing"
     assert not survivors, f"the startup sweep left {len(survivors)} interval directories from the killed life"

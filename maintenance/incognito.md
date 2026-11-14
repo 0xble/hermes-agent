@@ -83,12 +83,13 @@ not only the command reply.
   `socket_safe_tmpdir()` because deep private paths exceed the OS socket-path limit.
   Socket nodes contain no persisted payload and are unlinked on kernel teardown.
   Resolver identity is `agent.incognito_private_dir`: a bound public session is never
-  redirected into another topic's directory. A thread with no bound identity, while any
-  private interval is active, uses a shared `unattributed` disposable directory under the
-  same parent, removed when the last interval ends and by the startup sweep. Durable
-  plugin data redirects only on a positive private identity. Cleanup that cannot delete
-  a directory records a content-free failure through `log_private_failure` and does not
-  fail `/incognito off`; the startup sweep reports how many directories it removed.
+  redirected into another topic's directory. A call with no bound identity receives no
+  shared private directory and private cache writers fail closed rather than landing in a
+  public path. Durable plugin data redirects only on a positive private identity. Legacy
+  `unattributed` directories are removed by cleanup and startup sweep, but new work never
+  creates one. Cleanup that cannot delete a directory records a content-free failure
+  through `log_private_failure` and does not fail `/incognito off`; the startup sweep
+  reports how many directories it removed.
 - Picker dispatch and ingress share 1 callback-family registry. Only exact chat
   and sent-message IDs may resolve existing RAM prompt state and its session lane.
   Stale buttons cannot run or consume a newer prompt. Unmatched pickers remain

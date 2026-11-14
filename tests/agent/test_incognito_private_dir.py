@@ -48,6 +48,15 @@ def test_unparseable_config_uses_default_parent(tmp_path, monkeypatch):
     assert private_dirs._configured_root() == _default_root()
 
 
+def test_non_mapping_incognito_config_uses_default_parent(tmp_path, monkeypatch):
+    home = tmp_path / "invalid-home"
+    home.mkdir()
+    (home / "config.yaml").write_text("incognito: true\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(private_dirs, "_configured_root", _default_root)
+    assert private_dirs._configured_root() == _default_root()
+
+
 def test_private_subprocess_tmpdir_overrides_launchd_tmp(tmp_path, isolated_paths):
     register_session("private-a")
     private_env = {"TMPDIR": "/var/folders/x", "HERMES_HOME": str(isolated_paths)}
@@ -61,6 +70,12 @@ def test_private_subprocess_tmpdir_overrides_launchd_tmp(tmp_path, isolated_path
     with incognito_scope(False, "public-b"):
         assert apply_scratch_tmp_env(public_env) is False
     assert public_env["TMPDIR"] == "/var/folders/x"
+
+
+def test_private_cache_resolution_fails_closed_without_bound_identity():
+    with incognito_scope(True, "unregistered-private"):
+        with pytest.raises(RuntimeError, match="No private interval"):
+            get_hermes_dir("cache/audio", "audio_cache")
 
 
 def test_public_voice_cache_and_plugin_data_survive_private_off(isolated_paths):

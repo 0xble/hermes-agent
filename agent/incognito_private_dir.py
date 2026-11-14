@@ -15,8 +15,6 @@ import sys
 import threading
 from typing import Mapping
 
-from ruamel.yaml.error import YAMLError
-
 PRIVATE_DIR_PREFIX = "hermes-incognito-"
 logger = logging.getLogger(__name__)
 _lock = threading.RLock()
@@ -36,16 +34,24 @@ def _configured_root() -> Path:
     from hermes_constants import get_process_hermes_home
     home = get_process_hermes_home()
     config_path = home / "config.yaml"
+    config_errors: tuple[type[BaseException], ...] = (OSError, UnicodeDecodeError, ModuleNotFoundError)
+    try:
+        import importlib
+        yaml_error = getattr(importlib.import_module("ruamel.yaml.error"), "YAMLError")
+    except ModuleNotFoundError:
+        pass
+    else:
+        config_errors += (yaml_error,)
     try:
         from hermes_cli.config_backend import config_exists
         if config_exists(config_path):
             from hermes_cli.config import load_config_readonly
             data = load_config_readonly() or {}
-            value = ((data.get("incognito") or {}).get("private_dir")
-                     if isinstance(data, Mapping) else None)
+            section = data.get("incognito") if isinstance(data, Mapping) else None
+            value = section.get("private_dir") if isinstance(section, Mapping) else None
             if isinstance(value, str) and value.strip():
                 return Path(value).expanduser()
-    except (OSError, UnicodeDecodeError, YAMLError):
+    except config_errors:
         logger.debug("Could not read incognito private-dir configuration")
     if sys.platform == "darwin":
         cache = Path.home() / "Library" / "Caches"

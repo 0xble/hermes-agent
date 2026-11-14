@@ -415,7 +415,6 @@ class PluginManifest:
     # Conversation content reaches callbacks only with an explicit YAML boolean opt-in.
     # An omitted declaration is fail-closed, including plugin tools.
     incognito_safe: bool = False
-    incognito_safe_declared: bool = False
     provides_locales: list[str] = field(default_factory=list)
     locale_metadata: dict[str, dict[str, Any]] = field(default_factory=dict)
     # Dotted paths in Hermes' own config sections the plugin reads (``memory.retaindb``), so
@@ -573,7 +572,6 @@ def parse_manifest_file(
         provides_locales, locale_metadata = parse_provides_locales(data.get("provides_locales"), key)
         return PluginManifest(
             name=name, version=str(data.get("version", "")), incognito_safe=data.get("incognito_safe") is True,
-            incognito_safe_declared="incognito_safe" in data,
             description=data.get("description", ""), author=_display_author(data.get("author", "")),
             requires_env=data.get("requires_env", []),
             provides_tools=data.get("provides_tools", []),

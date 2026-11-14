@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from agent import provider_media
+from agent.incognito import incognito_scope
 
 
 def _save_video(url: str, **kwargs):
@@ -33,6 +34,13 @@ def _stub_fetch(monkeypatch, handler):
         "tools.url_safety.create_ssrf_safe_client",
         lambda **kw: httpx.Client(transport=httpx.MockTransport(handler), **kw),
     )
+
+
+def test_cache_dir_fails_closed_without_bound_private_interval(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / ".hermes"))
+    with incognito_scope(True, "unregistered-private"):
+        with pytest.raises(RuntimeError, match="No private interval"):
+            provider_media.cache_dir("generated")
 
 
 def test_save_url_forwards_headers_and_streams_to_cache(monkeypatch, tmp_path):

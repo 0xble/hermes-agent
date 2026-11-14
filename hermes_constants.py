@@ -507,10 +507,13 @@ def get_hermes_dir(new_subpath: str, old_name: str, *, home: Path | None = None)
     """
     home = home or get_hermes_home()
     if new_subpath.startswith("cache/"):
+        from agent.incognito import is_incognito
         from agent.incognito_private_dir import disposable_path_for_current_session
         private_root = disposable_path_for_current_session()
         if private_root is not None:
             return private_root / new_subpath
+        if is_incognito():
+            raise RuntimeError("No private interval is bound to the current incognito session")
     old_path = home / old_name
     return old_path if _legacy_path_has_content(old_path) else home / new_subpath
 

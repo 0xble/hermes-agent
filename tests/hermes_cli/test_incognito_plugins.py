@@ -132,7 +132,7 @@ class IncognitoPluginTests(unittest.TestCase):
     def test_explicit_false_plugin_tool_stays_refused(self):
         from tools.registry import registry
         denied = PluginContext(
-            PluginManifest(name="declared-unsafe", incognito_safe=False, incognito_safe_declared=True), self.manager,
+            PluginManifest(name="declared-unsafe", incognito_safe=False), self.manager,
         )
         callback = mock.Mock(return_value='{"ok": true}')
         handle = denied.register_tool(
