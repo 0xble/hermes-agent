@@ -1352,3 +1352,20 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   bug fix suitable for contribution, with publication outside this local change.
 - Retire when upstream skips unused launcher prefetch or reaps every prefetch
   child before launcher exit. Roll back the commit carrying this patch identity.
+
+## Turn worker reset during a concurrent first import
+
+- Fork patch identity: `release-defects`.
+- `gateway/turn_thread_reset.py::reset_reused_thread_state` read
+  `tools.terminal_tool_sudo._sudo_password_cache_lock` straight from `sys.modules`. Another
+  thread's first import publishes the module there before its body finishes, so on every gateway
+  start since at least 2026-11-13 a parked turn worker raised `AttributeError: partially
+  initialized module` and retired its thread. Python's "circular import" wording is a guess:
+  this is a concurrent import, not a cycle.
+- The reset now reads `set_interrupt` and the sudo cache lock with `getattr` and skips a module
+  that has not bound them yet. Both are defined after the state they guard, so no setter has run
+  and there is nothing to drop.
+- Guard: `test_a_reset_during_another_threads_first_import_keeps_the_worker` in
+  `tests/gateway/test_turn_executor_reuse.py`.
+- Upstream-origin (`gateway/turn_thread_reset.py` came with the turn-executor reuse change).
+  Retire when upstream guards the reset against partially imported modules.
