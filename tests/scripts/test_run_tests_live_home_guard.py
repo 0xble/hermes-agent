@@ -35,8 +35,12 @@ def _snapshot(home: Path) -> dict[str, str]:
     return found
 
 
-def _checkout(tmp_path: Path) -> tuple[Path, Path]:
-    root = tmp_path / "checkout"
+def _guard_checkout(root: Path) -> Path:
+    """A copy of this checkout's runner and guard whose ``.venv`` interpreter is this one.
+
+    The source-only predicates run only the checkout's own ``.venv`` interpreter, never a PATH
+    python. Hosted CI provisions its test environment in the PM store, so the real checkout has
+    no ``.venv``; a probe sourced from it would test the missing interpreter, not the guard."""
     scripts = root / "scripts"
     scripts.mkdir(parents=True)
     for name in ("run_tests.sh", "run-in-hermes-env", "_activation.sh", "_setup_guard.sh", "setup_guard.py"):
@@ -49,6 +53,12 @@ def _checkout(tmp_path: Path) -> tuple[Path, Path]:
     python.parent.mkdir(parents=True)
     python.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
     python.chmod(0o755)
+    return scripts / "run_tests.sh"
+
+
+def _checkout(tmp_path: Path) -> tuple[Path, Path]:
+    root = tmp_path / "checkout"
+    _guard_checkout(root)
     setup = root / "setup-hermes.sh"
     setup.write_text(
         "#!/bin/bash\n"
@@ -268,7 +278,7 @@ def test_account_default_match_is_live_without_touching_that_home(tmp_path):
     The second argument is the already-resolved account default, so this does
     not read or write the OS account's real Hermes home.
     """
-    script = ROOT / "scripts" / "run_tests.sh"
+    script = _guard_checkout(tmp_path / "checkout")
     text = script.read_text(encoding="utf-8")
     assert "hermes_runtime_home_is_live" in text
     assert 'BASH_SOURCE[0]' in text and '"$0"' in text
@@ -402,7 +412,7 @@ def test_profile_under_quiet_custom_root_still_sets_up(tmp_path):
 @pytest.mark.platforms("posix")
 def test_descendant_of_account_default_is_live_without_markers(tmp_path):
     """A profile under the account-default root is live even with no markers of its own."""
-    script = ROOT / "scripts" / "run_tests.sh"
+    script = _guard_checkout(tmp_path / "checkout")
     account = tmp_path / "account-default"
     profile = account / "profiles" / "dev"
     sibling = tmp_path / "account-default-extra" / "profiles" / "dev"
@@ -475,7 +485,7 @@ def _passwd_account_home() -> Path:
 @pytest.mark.platforms("posix")
 def test_account_default_home_matches_passwd_lookup_and_suffix(tmp_path):
     """The printed path comes from the password database, never $HOME, and is not created."""
-    script = ROOT / "scripts" / "run_tests.sh"
+    script = _guard_checkout(tmp_path / "checkout")
     account = _passwd_account_home()
     pinned = tmp_path / "pinned-home"
     env = {"PATH": os.environ["PATH"], "HOME": str(pinned)}
@@ -496,7 +506,7 @@ def test_account_default_home_matches_passwd_lookup_and_suffix(tmp_path):
 @pytest.mark.platforms("posix")
 def test_account_default_tilde_fallback_ignores_pinned_home(tmp_path):
     """Without getent or dscl, ~user still comes from the password database."""
-    script = ROOT / "scripts" / "run_tests.sh"
+    script = _guard_checkout(tmp_path / "checkout")
     account = _passwd_account_home()
     commands = tmp_path / "bin"
     commands.mkdir()
@@ -516,8 +526,8 @@ def test_account_default_tilde_fallback_ignores_pinned_home(tmp_path):
 
 
 @pytest.mark.platforms("posix")
-def test_account_default_lookup_does_not_invoke_usr_bin_python3():
-    script = ROOT / "scripts" / "run_tests.sh"
+def test_account_default_lookup_does_not_invoke_usr_bin_python3(tmp_path):
+    script = _guard_checkout(tmp_path / "checkout")
     probe = subprocess.run(
         ["bash", "-x", "-c", "source \"$1\"; hermes_account_default_home >/dev/null", "probe", str(script)],
         capture_output=True,
@@ -663,7 +673,7 @@ def _resolution_input(tmp_path: Path, name: str) -> tuple[str, Path | None]:
 
 
 def _shell_resolve(raw: str, cwd: Path | None, scratch: Path) -> str:
-    script = ROOT / "scripts" / "run_tests.sh"
+    script = _guard_checkout(scratch / "checkout")
     env = {
         "PATH": os.environ["PATH"],
         "HOME": str(scratch),
