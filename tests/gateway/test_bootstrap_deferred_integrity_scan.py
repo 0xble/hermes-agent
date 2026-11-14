@@ -1,4 +1,5 @@
 """start_gateway runs the unclean-exit state.db scan off the event loop, after the runner is live."""
+import asyncio
 import threading
 from unittest.mock import AsyncMock
 
@@ -46,6 +47,8 @@ def _startup(monkeypatch, tmp_path):
             self._session_db = SessionDB(get_hermes_home() / "state.db")
             self.session_store._db = self._session_db
             self._draining = False
+            self._restart_requested = False
+            self._shutdown_event = asyncio.Event()
             self._running = False
             self._closed = False
             self.config = config
@@ -117,6 +120,43 @@ async def test_unclean_exit_scan_starts_after_the_runner_and_does_not_hold_start
     # The scan is still blocked: startup reached READY and the runtime wait without it.
     assert events == ["runner_started", "scan_launched", "ready", ("runtime_waited", False)]
     assert scan_entered.wait(5) and state["scanned"] is evidence
+
+
+@pytest.mark.asyncio
+async def test_stray_runtime_cancellation_exits_with_failure_after_stop(_startup, monkeypatch):
+    from gateway import run as facade, run_runtime
+    from gateway.config import GatewayConfig
+    from gateway.run_process_exit import run_gateway_process
+
+    waiting = asyncio.Event()
+    stopped = asyncio.Event()
+    observed = []
+    original_stop = facade.GatewayRunner.stop
+
+    async def wait_runtime(runner):
+        # stop() always sets this event, even when no stop was requested.
+        runner._shutdown_event = asyncio.Event()
+        waiting.set()
+        await asyncio.Event().wait()
+
+    async def stop(runner):
+        runner._shutdown_event.set()
+        await original_stop(runner)
+        stopped.set()
+
+    monkeypatch.setattr(run_runtime, "wait_gateway_runtime", wait_runtime)
+    monkeypatch.setattr(facade.GatewayRunner, "stop", stop)
+    monkeypatch.setattr(facade, "_exit_after_graceful_shutdown", observed.append)
+    operation = asyncio.create_task(run_gateway_process(run_bootstrap.start_gateway, config=GatewayConfig()))
+    try:
+        await asyncio.wait_for(waiting.wait(), 5)
+    finally:
+        operation.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await operation
+
+    assert stopped.is_set()
+    assert observed == [1]
 
 
 @pytest.mark.asyncio

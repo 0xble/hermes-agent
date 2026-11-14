@@ -334,7 +334,7 @@ async def test_undeliverable_notice_reuses_logged_readiness_across_restarts(tmp_
     for attempt in range(3):
         gateway = runner()
         if delivery == "no-transport":
-            gateway._served_home_channel_transports = lambda: []
+            gateway._served_home_channel_transports = list
         await runtime_health.check_memory_health(gateway)
         gateway._send_home_channel_message.assert_not_awaited()
         if attempt == 0:
@@ -361,7 +361,7 @@ async def test_saved_notice_is_resolved_if_readiness_recovers_before_delivery(tm
         (home / "config.yaml").write_text(
             "memory: {provider: hindsight}\ndisplay: {suppress_warning_notifications: true}\n", encoding="utf-8")
     else:
-        gateway._served_home_channel_transports = lambda: []
+        gateway._served_home_channel_transports = list
     await runtime_health.check_memory_health(gateway)
     marker = runtime_health._marker(home)
     assert marker.with_suffix(".logged").exists()

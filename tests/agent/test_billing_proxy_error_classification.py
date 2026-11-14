@@ -1,6 +1,7 @@
 """Classified account failures persist long turns and outrank generic proxy 5xx verdicts."""
 from __future__ import annotations
 
+import time
 from unittest.mock import Mock
 
 import pytest
@@ -22,6 +23,8 @@ class _ProxyError(Exception):
     [
         ("invalid_request_error: You're out of extra usage", FailoverReason.billing),
         ("rate_limit_error: This request would exceed your account's rate limit", FailoverReason.rate_limit),
+        ("Rate limit exceeded", FailoverReason.rate_limit),
+        ("usage_limit_reached: The usage limit has been reached", FailoverReason.billing),
     ],
 )
 def test_proxy_auth_unavailable_uses_named_upstream_reason(status, upstream, reason):
@@ -36,6 +39,28 @@ def test_proxy_auth_unavailable_uses_named_upstream_reason(status, upstream, rea
     if "out of extra usage" in upstream:
         assert classified.error_context["billing_unverified"] is True
         assert classified.error_context["possible_content_filter"] is True
+
+
+def test_proxy_codex_rate_limit_detail_uses_shared_fallback_route():
+    error = _ProxyError(
+        "auth_unavailable: no auth available (providers=codex, model=gpt-6.1-sol; "
+        'last upstream error: {"detail":"Rate limit exceeded"})',
+    )
+    classified = classify_api_error(error, provider="openai-codex", model="gpt-6.1-sol")
+    assert classified.reason is FailoverReason.rate_limit
+    assert classified.should_rotate_credential is True
+    assert classified.should_fallback is True
+
+
+def test_proxy_rate_limit_detail_carries_reset_window():
+    error = _ProxyError(
+        "auth_unavailable: no auth available (providers=codex; last upstream error: "
+        '{"detail":"Rate limit exceeded", "retry_after": 30})',
+    )
+    error.body = {"detail": "Rate limit exceeded", "retry_after": 30}
+    classified = classify_api_error(error, provider="openai-codex", model="gpt-6.1-sol")
+    assert classified.reason is FailoverReason.rate_limit
+    assert classified.error_context["reset_at"] > time.time()
 
 
 @pytest.mark.parametrize(
@@ -136,18 +161,25 @@ class _Agent:
     [FailoverReason.billing, FailoverReason.auth, FailoverReason.rate_limit,
      FailoverReason.content_policy_blocked],
 )
-def test_classified_nonoverflow_400_persists_a_large_failed_session(reason):
+def test_classified_nonoverflow_400_preserves_only_accepted_session_history(reason):
     error = _ProxyError("HTTP 400 rejected request", 400)
     classified = ClassifiedError(reason=reason, status_code=400, retryable=False)
     agent = _Agent()
     agent._persist_session = Mock()
-    nonretryable_client_error_result(
+    history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "ok"}]
+    messages = history + [{"role": "user", "content": "continue"}]
+    result = nonretryable_client_error_result(
         agent, error, classified, status_code=400, api_kwargs=None, api_messages=[{}] * 81,
-        messages=[{"role": "user", "content": "continue"}], conversation_history=[{}] * 60,
+        messages=messages, conversation_history=list(messages), current_turn_user_idx=len(history),
         api_call_count=1, approx_tokens=100_000, provider="custom:claude-proxy",
         base_url="http://127.0.0.1:8317/v1", model="claude-opus-5-5",
     )
-    agent._persist_session.assert_called_once()
+    if reason is FailoverReason.content_policy_blocked:
+        # Upstream drops refused turns so the next request cannot replay the same refusal.
+        agent._persist_session.assert_not_called()
+        assert result["messages"] == history
+    else:
+        agent._persist_session.assert_called_once()
 
 
 @pytest.mark.parametrize(

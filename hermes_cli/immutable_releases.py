@@ -47,7 +47,7 @@ class ReleasePaths:
     previous: Path
 
     @classmethod
-    def for_home(cls, home: str | Path) -> "ReleasePaths":
+    def for_home(cls, home: str | Path) -> ReleasePaths:
         home = Path(home).expanduser().resolve()
         return cls(home, home / "releases", home / "current", home / "previous")
 
@@ -520,7 +520,7 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
         result = subprocess.run(
             [str(python), "-m", "hermes_cli.immutable_releases", "--smoke-imports"],
             cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
-        )
+         check=False)
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
             raise RuntimeError(f"candidate plugin smoke failed: {detail}")
@@ -635,20 +635,18 @@ def _build_candidate_web(staging: Path) -> None:
     web = staging / "web"
     if not (web / "package.json").is_file():
         return
+    from hermes_cli.source_build import build_source_web, prepare_source_dependencies
     from pm import prepare_tools
     from pm.build_operations import verified_tools
     from pm.store import current_target
     target = current_target()
-    store = prepare_tools(["node", "npm"], out=staging.parent / ".build-tools", target=target)
-    tools = verified_tools(["node", "npm"], source_store=store, target=target)
-    npm = str(tools.entries["npm"].binary)
+    names = ["node", "pnpm"]
+    store = prepare_tools(names, out=staging.parent / ".build-tools", target=target)
+    tools = verified_tools(names, source_store=store, target=target)
     env = tools.environment(_release_subprocess_env())
-    workspaces = ["--workspace", "web", "--include-workspace-root"]
-    if (staging / "ui-tui" / "package.json").is_file():
-        workspaces[:0] = ["--workspace", "ui-tui"]
-    subprocess.run([npm, "ci", "--no-audit", "--no-fund", *workspaces],
-                   cwd=staging, env=env, check=True)
-    subprocess.run([npm, "run", "build", "--workspace", "web"], cwd=staging, env=env, check=True)
+    workspaces = ("ui-tui", "web") if (staging / "ui-tui" / "package.json").is_file() else ("web",)
+    prepare_source_dependencies(staging, workspaces, env=env, explicit=True)
+    build_source_web(staging, env=env)
     if not (staging / "hermes_cli" / "web_dist" / "index.html").is_file():
         raise RuntimeError("candidate web build did not produce hermes_cli/web_dist/index.html")
 
@@ -1104,7 +1102,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
             # service; ordinary recovery is strictly observation-only.
             assert plist is not None and "intended_sha256" in plist
             record["reload_issued"] = {
-                "at": datetime.now(timezone.utc).isoformat(),
+                "at": datetime.now(UTC).isoformat(),
                 "plist_sha256": plist["intended_sha256"],
                 "attempt": 1,
             }
@@ -1331,7 +1329,7 @@ def _source_python_valid(python: Path, source: Path) -> bool:
     try:
         return subprocess.run([str(python), "-c", probe, str(source)],
                               capture_output=True, timeout=15,
-                              env=_release_subprocess_env()).returncode == 0
+                              env=_release_subprocess_env(), check=False).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 

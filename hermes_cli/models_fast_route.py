@@ -26,7 +26,7 @@ CAPABILITY = "fast_mode"
 _ANTHROPIC_TRANSPORT = "anthropic_messages"
 
 
-def _entries() -> List[Dict[str, Any]]:
+def _entries() -> list[dict[str, Any]]:
     from hermes_cli.config import get_compatible_custom_providers, load_config_readonly
 
     try:
@@ -35,11 +35,11 @@ def _entries() -> List[Dict[str, Any]]:
         return []
 
 
-def _carries_model_family(entry: Dict[str, Any], anthropic_model: bool) -> bool:
+def _carries_model_family(entry: dict[str, Any], anthropic_model: bool) -> bool:
     return (str(entry.get("api_mode") or "").strip() == _ANTHROPIC_TRANSPORT) == anthropic_model
 
 
-def _opted_in(entry: Dict[str, Any]) -> bool:
+def _opted_in(entry: dict[str, Any]) -> bool:
     return (entry.get("capabilities") or {}).get(CAPABILITY) is True
 
 

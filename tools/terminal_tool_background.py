@@ -55,8 +55,8 @@ _AUTO_BACKGROUND_NOTE = (
 
 _ASYNC_UNSUPPORTED_NOTE = (
     'notify_on_complete / watch_patterns are not available in this session — it cannot receive '
-    'an async completion after the turn ends (a one-shot runner such as `hermes -z`, a cron '
-    'job, a Kanban worker, or a stateless HTTP endpoint). The process is running in the '
+    'an async completion after the turn ends (a one-shot runner such as `hermes -z`, a /bg '
+    'background task, a cron job, a Kanban worker, or a stateless HTTP endpoint). The process is running in the '
     "background; retrieve its result with process(action='poll') or process(action='wait')."
 )
 
@@ -102,8 +102,13 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
     if env_type == "local":
         return process_registry.spawn_local(
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
-            survive_restart=survive_restart, **common)
-    return process_registry.spawn_via_env(env=env, **common)
+            survive_restart=survive_restart,
+            restore_login_path=True, **common)
+    from tools.process_registry_ssh import SSHLaunchUncertain
+    try:
+        return process_registry.spawn_via_env(env=env, **common)
+    except SSHLaunchUncertain as exc:
+        return exc.session  # Reconcile this handle, never launch the command again.
 
 
 def _apply_async_support(proc_session, result_data, notify_on_complete, watch_patterns):
@@ -293,10 +298,15 @@ def spawn_background_process(
         if watch_patterns:
             proc_session.watch_patterns = list(watch_patterns)
             result_data["watch_patterns"] = proc_session.watch_patterns
-        if survive_restart:
+        if survive_restart or getattr(proc_session, "ssh_binding", None) is not None:
             # Spawn checkpoints before notification routing is available. Persist the final
             # owner/route/notify metadata before returning the restart-survival contract.
             process_registry._write_checkpoint()
+        if getattr(proc_session, "ssh_binding", None) is not None and proc_session.remote_error:
+            result_data.update(output="", exit_code=-1, status="unknown", remote_status="unavailable",
+                               error=_redact_terminal_error_text(proc_session.remote_error),
+                               hint="Launch outcome is unknown. Do not re-run the command. Poll this session_id to reconcile it.")
+            result_data.pop("notify_unsupported", None)
         return json.dumps(result_data, ensure_ascii=False)
     except Exception as e:
         return json.dumps({

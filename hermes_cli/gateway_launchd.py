@@ -27,6 +27,7 @@ from hermes_cli import gateway_service_owner
 from hermes_cli.gateway_launchd_lifetime import (
     configured_launchd_domain, migrate_launchd_domain, uninstall_launchd_lifetime,
 )
+from agent.deadline import poll_until
 
 
 def _gw():
@@ -288,37 +289,6 @@ def _gateway_run_command(*, interpreter: str | None = None) -> list[str]:
                            python=interpreter or _gw().get_python_path())
 
 
-def launchd_program_arguments(command: list[str], stdout_log: Path, stderr_log: Path) -> list[str]:
-    """launchd ``ProgramArguments`` that run ``command`` with a Local Network identity macOS accepts (#71206).
-
-    macOS Local Network Privacy attributes a socket to the process launchd spawned for the job. A bare
-    venv Python has no application ID and is not platform-entitled, so every LAN connect from the
-    launchd gateway dies with ``EHOSTUNREACH`` while the same code works from Terminal (whose grant it
-    inherits). An ad-hoc-signed helper .app does not help: nehelper never prompts for it and denies
-    (#57812 dead-end table, re-verified live on macOS 26.3). ``/usr/bin/osascript`` spawning the child
-    makes it osascript-responsible — an Apple platform binary — so the child is exempt; ``/bin/sh -c
-    exec …`` and ``/usr/bin/time`` wrappers are NOT (the launchd job identity is the non-entitled first
-    executable).
-
-    Standard Additions' ``do shell script`` polls WindowServer for a user-cancel event while it waits.
-    That is appropriate for a short interactive script but, for the gateway's process lifetime, burns CPU
-    and keeps a WindowServer event connection busy (external-display wake stalls ~10s on macOS 27, #123595).
-    JXA calling libc ``system()`` waits in the kernel instead while retaining osascript as the responsible
-    process. The shell's ``exec`` keeps the gateway in the launchd job's process group, so ``launchctl
-    bootout`` / ``kickstart -k`` still deliver SIGTERM to it. stdout/stderr are appended inside the shell
-    command because ``system()`` otherwise inherits osascript's plist log handles. The encoded wait status
-    is translated back to a process exit code so KeepAlive's ``SuccessfulExit`` semantics are preserved.
-    """
-    shell = f"exec {shlex.join(command)} >> {shlex.quote(str(stdout_log))} 2>> {shlex.quote(str(stderr_log))}"
-    javascript = (
-        'ObjC.import("stdlib"); '
-        f"const status=$.system({json.dumps(shell)}); "
-        "const signal=status & 127; "
-        "$.exit(status === -1 ? 1 : signal === 0 ? (status >> 8) & 255 : 128 + signal);"
-    )
-    return ["/usr/bin/osascript", "-l", "JavaScript", "-e", javascript]
-
-
 def _timestamped_stderr_gateway_command(error_log: Path, *, external_supervisor: bool = False,
                                         interpreter: str | None = None,
                                         release_root: Path | None = None) -> list[str]:
@@ -380,6 +350,7 @@ def _spawn_detached_gateway() -> bool:
                 _timestamped_stderr_gateway_command(log_dir / "gateway.error.log"),
                 stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.DEVNULL,
                 env=child_env,
+                # detached-spawn: ok — foreground-less gateway launch, a service meant to outlive the CLI
                 **windows_detach_popen_kwargs(),
             )
     except OSError:
@@ -499,6 +470,7 @@ def generate_launchd_plist(release_target: Path | None = None, *, slot: str = "a
     command = _timestamped_stderr_gateway_command(
         stderr_log, external_supervisor=True, interpreter=interpreter,
         release_root=release_target)
+    from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
     prog_args_xml = "\n        ".join(
         f"<string>{escape(part)}</string>" for part in launchd_program_arguments(command, stdout_log, stderr_log)
     )
@@ -1056,14 +1028,11 @@ def _wait_for_launchd_service_pid(
 ) -> bool:
     """Poll ``domain/label`` (0.5s) until it runs on a fresh PID or ``timeout`` passes — KeepAlive respawn
     isn't instantaneous. launchctl ``TimeoutExpired`` propagates; callers own failure accounting."""
-    deadline = time.monotonic() + max(timeout, 0.5)
-    while True:
-        _loaded, pid = _gw()._launchd_print_service_pid(domain, label)
-        if pid is not None and pid > 0 and pid != old_pid:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(0.5)
+    def _fresh_pid() -> bool:
+        pid = _gw()._launchd_print_service_pid(domain, label)[1]
+        return pid is not None and pid > 0 and pid != old_pid
+
+    return poll_until(_fresh_pid, max(timeout, 0.5), 0.5)
 
 
 def launchd_restart():
@@ -1205,14 +1174,11 @@ def wait_for_launchd_gateway_supervision(
         return True
 
     label = label or _gw().get_launchd_label()
-    deadline = time.monotonic() + max(timeout, 0.0)
-    while True:
+    def _supervised() -> bool:
         pid = _gw()._launchctl_supervised_pid(label)
-        if pid is not None and pid != old_pid:
-            return True
-        if time.monotonic() >= deadline:
-            return False
-        time.sleep(max(poll_interval, 0.01))
+        return pid is not None and pid != old_pid
+
+    return poll_until(_supervised, max(timeout, 0.0), max(poll_interval, 0.01))
 
 
 def launchd_status(deep: bool = False):
@@ -1316,3 +1282,36 @@ def bootout_launchd_label(label: str, *, domain: str | None = None, runner=None)
     """Boot out exactly ``label`` from one launchd domain."""
     runner = runner or (lambda argv: subprocess.run(["launchctl", *argv], check=True, timeout=30))
     runner(["bootout", f"{domain or _default_launchd_gui_domain()}/{label}"])
+
+
+def _rewrite_stale_launchd_plist() -> bool:
+    """Write the generated plist over a stale installed one this home owns; True when written."""
+    plist_path = _gw().get_launchd_plist_path()
+    if not plist_path.exists() or _gw().launchd_plist_is_current():
+        return False
+    # Runs on every gateway start/restart: a plist pinning another home is another install's gateway.
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home
+    if not definition_belongs_to_home(plist_path, _gw().get_hermes_home(), "rewrite"):
+        return False
+
+    new_plist = _gw().generate_launchd_plist()
+    if gateway_service_owner.refuse_temp_home_service_write(new_plist, "launchd plist"):
+        return False
+
+    _gw()._prepare_service_launcher()
+    plist_path.write_text(new_plist, encoding="utf-8")
+    return True
+
+
+
+def refresh_unloaded_launchd_plist() -> bool:
+    """Rewrite a stale plist of a job launchd does not hold; the next bootstrap reads it.
+
+    A loaded job is left to ``refresh_launchd_plist_if_needed`` (its restart path), which must
+    still see the file stale to reload the job."""
+    if _gw()._locate_launchd_gateway_service(_gw().get_launchd_label())[0] is not None:
+        return False
+    if not _rewrite_stale_launchd_plist():
+        return False
+    print(f"  ↻ Updated {_gw().get_launchd_plist_path().name} to match the current Hermes install")
+    return True

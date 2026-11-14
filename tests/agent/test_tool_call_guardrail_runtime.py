@@ -208,6 +208,97 @@ def test_same_tool_failure_warning_tells_model_to_recover_with_tools():
 
     content = messages[0]["content"]
     assert "same_tool_failure_warning" in content
+    assert "Try different arguments" not in content
+    assert "change strategy" in content
+
+
+def test_unattended_guardrail_block_returns_to_model_instead_of_false_halt():
+    """A background turn must keep working after a guardrail blocks one endpoint."""
+    agent = _make_agent("web_search", max_iterations=10, config=_hard_stop_config(), platform="telegram")
+    same_args = {"query": "same"}
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps(same_args), f"c{i}")],
+        )
+        for i in range(1, 4)
+    ]
+    responses.append(_mock_response(content="done", finish_reason="stop", tool_calls=None))
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("model_tools.handle_function_call", return_value=json.dumps({"error": "boom"})) as mock_hfc,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly", turn_origin="goal_loop")
+
+    assert mock_hfc.call_count == 2
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "done"
+    assert "continue" not in result["final_response"].lower()
+
+
+def test_unattended_guardrail_still_hard_stops_dead_endpoint_without_asking_user():
+    agent = _make_agent("web_search", max_iterations=20, config=_hard_stop_config())
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("web_search", json.dumps({"query": "same"}), f"c{i}")],
+        )
+        for i in range(1, 20)
+    ]
+    agent._disable_streaming = True
+    with (
+        patch("model_tools.handle_function_call", return_value=json.dumps({"error": "boom"})),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("search repeatedly", turn_origin="cron")
+
+    assert result["turn_exit_reason"] == "guardrail_halt"
+    assert result["api_calls"] < 10
+    final = result["final_response"].lower()
+    assert "continue" not in final and "tell me" not in final
+    assert "web_search" in final
+
+
+def test_unattended_streak_halt_can_recover_by_switching_tools():
+    agent = _make_agent("terminal", "read_file", max_iterations=12, config=_hard_stop_config(), platform="telegram")
+    responses = [
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("terminal", json.dumps({"command": "printf stable"}), f"terminal-{i}")],
+        )
+        for i in range(1, 6)
+    ]
+    responses.extend([
+        _mock_response(
+            content="",
+            finish_reason="tool_calls",
+            tool_calls=[_mock_tool_call("read_file", json.dumps({"path": "/tmp/recovery"}), "read-1")],
+        ),
+        _mock_response(content="recovered", finish_reason="stop", tool_calls=None),
+    ])
+    agent.client.chat.completions.create.side_effect = responses
+
+    with (
+        patch("model_tools.handle_function_call", side_effect=[
+            json.dumps({"stdout": "stable"}),
+        ] * 5 + ["recovered contents"]),
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("check and recover", turn_origin="goal_loop")
+
+    assert result["turn_exit_reason"].startswith("text_response")
+    assert result["final_response"] == "recovered"
 
 
 def test_config_enabled_hard_stop_concurrent_path_does_not_submit_blocked_calls_and_preserves_result_order():
@@ -510,3 +601,80 @@ def test_guardrail_halt_emits_final_response_through_stream_delta_callback():
     assert halt_text in text_deltas, (
         f"halt message was never streamed; callback only saw {deltas!r}"
     )
+
+
+@pytest.mark.parametrize("tool_name,cap_field,code", [
+    ("web_search", "max_web_searches", "loop_web_search_cap"),
+    ("delegate_task", "max_subagents", "loop_subagent_cap"),
+])
+@pytest.mark.parametrize("max_iterations", [1, 10])
+def test_loop_cap_batch_gets_final_answer_from_collected_results(
+    tool_name, cap_field, code, max_iterations,
+):
+    agent = _make_agent(tool_name, max_iterations=max_iterations, config={
+        "tool_loop_guardrails": {"loop_caps": {cap_field: 1}},
+    })
+    field = "query" if tool_name == "web_search" else "goal"
+    calls = [_mock_tool_call(tool_name, json.dumps({field: f"distinct {i}"}), f"cap-{i}")
+             for i in range(3)]
+    answer = "Based on the collected evidence, here is the answer."
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("", "tool_calls", calls), _mock_response(answer),
+    ]
+    deltas = []
+    agent.stream_delta_callback = deltas.append
+    agent._disable_streaming = True
+    with (
+        patch("model_tools.handle_function_call", return_value='{"evidence":"collected"}') as dispatch,
+        patch.object(agent, "_dispatch_delegate_task", return_value='{"evidence":"collected"}') as delegate,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Research and answer.")
+    assert (dispatch if tool_name == "web_search" else delegate).call_count == 1
+    assert agent.client.chat.completions.create.call_count == 2
+    assert result["final_response"] == answer
+    assert result["turn_exit_reason"] == "tool_cap_answer"
+    assert answer in deltas
+    assert [m["content"] for m in result["messages"] if m.get("role") == "user"] == ["Research and answer."]
+    tool_results = [m for m in result["messages"] if m.get("role") == "tool"]
+    assert {m["tool_call_id"] for m in tool_results} == {tc.id for tc in calls}
+    # Concurrent searches may acquire the cap in any order; all results retain their IDs.
+    assert sum("collected" in m["content"] for m in tool_results) == 1
+    assert sum(code in m["content"] for m in tool_results) == 2
+    final_request = agent.client.chat.completions.create.call_args.kwargs
+    assert any("collected" in str(m.get("content")) for m in final_request["messages"])
+    assert final_request["messages"][0]["content"] == agent._cached_system_prompt
+
+
+@pytest.mark.parametrize("tool_name,cap_field", [
+    ("web_search", "max_web_searches"), ("delegate_task", "max_subagents"),
+])
+def test_loop_cap_repeated_calls_in_final_completion_never_execute_or_loop(tool_name, cap_field):
+    agent = _make_agent(tool_name, config={
+        "tool_loop_guardrails": {"loop_caps": {cap_field: 1}},
+    })
+    field = "query" if tool_name == "web_search" else "goal"
+    def batch(prefix):
+        return [_mock_tool_call(tool_name, json.dumps({field: f"{prefix} {i}"}), f"{prefix}-{i}")
+                for i in range(3)]
+    agent.client.chat.completions.create.side_effect = [
+        _mock_response("", "tool_calls", batch("first")),
+        _mock_response("", "tool_calls", batch("again")),
+    ]
+    with (
+        patch("model_tools.handle_function_call", return_value='{"evidence":"collected"}') as dispatch,
+        patch.object(agent, "_dispatch_delegate_task", return_value='{"evidence":"collected"}') as delegate,
+        patch.object(agent, "_persist_session"),
+        patch.object(agent, "_save_trajectory"),
+        patch.object(agent, "_cleanup_task_resources"),
+    ):
+        result = agent.run_conversation("Research and answer.")
+    assert (dispatch if tool_name == "web_search" else delegate).call_count == 1
+    assert agent.client.chat.completions.create.call_count == 2
+    assert result["turn_exit_reason"] == "tool_cap_answer"
+    assert "per-turn limit" in result["final_response"]
+    assert "without making progress" not in result["final_response"]
+    assert all(not str(m.get("tool_call_id", "")).startswith("again-")
+               for m in result["messages"])

@@ -8,7 +8,9 @@ import importlib.util
 from pathlib import Path
 from types import SimpleNamespace
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
+from hermes_cli._startup_fast import project_root_str
+
+PROJECT_ROOT = Path(project_root_str())
 
 from hermes_cli.auth import AuthError, resolve_provider
 from hermes_cli.colors import Colors, color
@@ -63,7 +65,7 @@ def _first_env_value(names) -> str:
 
 def _configured_model_label(config: dict) -> str:
     """Return the configured default model, resolving a preset reference."""
-    from hermes_cli.model_preset_runtime import resolve_default_route
+    from hermes_cli.model_alias_runtime import resolve_default_route
     route = resolve_default_route(config)
     if route.model:
         return route.model

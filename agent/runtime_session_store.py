@@ -52,6 +52,17 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+class GatewayHandshakeTimeout(TimeoutError):
+    """A timeout during the pre-send gateway handshake, with its phase typed."""
+
+    def __init__(self, phase, detail=None):
+        self.phase = phase
+        message = f"gateway handshake timed out ({phase})"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -137,6 +148,16 @@ def _owner_transition_error(exc):
     }
 
 
+def _handshake_call(phase, call):
+    """Name a pre-send gateway handshake timeout before owner retry classification."""
+    try:
+        return call()
+    except TimeoutError as exc:
+        if isinstance(exc, GatewayHandshakeTimeout):
+            raise
+        raise GatewayHandshakeTimeout(phase, str(exc)) from exc
+
+
 class WorkerRPC:
     """Bounded authenticated calls to an existing owner; never starts a daemon.
 
@@ -183,11 +204,18 @@ class WorkerRPC:
         from websockets.sync.client import connect
         # A served secondary has no socket; its multiplexer's descriptor names it.
         from hermes_cli.gateway_runtime import discover_gateway_endpoint
-        discovery = discover_gateway_endpoint(self.home, timeout=_connection_budget(deadline))
+        discovery = _handshake_call(
+            "discover",
+            lambda: discover_gateway_endpoint(self.home, timeout=_connection_budget(deadline)),
+        )
         if discovery.reason_code == 'client_owned':
             from hermes_cli.gateway_worker_discovery import discover_worker_gateway_endpoint
-            discovery = discover_worker_gateway_endpoint(self.home, self.worker_scope,
-                                                         timeout=_connection_budget(deadline))
+            discovery = _handshake_call(
+                "discover",
+                lambda: discover_worker_gateway_endpoint(
+                    self.home, self.worker_scope, timeout=_connection_budget(deadline)
+                ),
+            )
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
@@ -202,16 +230,38 @@ class WorkerRPC:
             raise WorkerPersistenceError('owner_unavailable')
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
-        descriptor = query_identify(control_home_for(self.home, endpoint), timeout=_connection_budget(deadline))
+        descriptor = _handshake_call(
+            "identify",
+            lambda: query_identify(
+                control_home_for(self.home, endpoint), timeout=_connection_budget(deadline)
+            ),
+        )
         if descriptor.get('pid') == os.getpid():
             raise WorkerPersistenceError('synchronous_self_rpc')
-        ticket = _session_ticket(self.home, endpoint, purpose='worker-adoption', timeout=_connection_budget(deadline))
+        ticket = _handshake_call(
+            "ticket",
+            lambda: _session_ticket(
+                self.home, endpoint, purpose='worker-adoption', timeout=_connection_budget(deadline)
+            ),
+        )
         url, protocols = gateway_ws_target(endpoint, ticket)
         # The owner is loopback, like connect_gateway's peer: an inherited HTTPS_PROXY must not carry it.
         # No library keepalive: its pong deadline would run independently of (and could fail) a call
         # inside its receipt budget; that budget and the observed close are the liveness checks.
-        self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=_connection_budget(deadline), close_timeout=1,
-                                       max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
+        self.link = _OwnerLink(
+            _handshake_call(
+                "connect",
+                lambda: connect(
+                    url,
+                    subprotocols=protocols,
+                    open_timeout=_connection_budget(deadline),
+                    close_timeout=1,
+                    max_size=8 * 1024 * 1024,
+                    proxy=None,
+                    ping_interval=None,
+                ),
+            )
+        )
         return self.link
 
     def _drop(self):

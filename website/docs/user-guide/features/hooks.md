@@ -383,7 +383,7 @@ def register(ctx):
     ctx.register_hook("post_llm_call", my_sync_callback)
     ctx.register_hook("on_session_start", my_init_callback)
     ctx.register_hook("on_session_end", my_cleanup_callback)
-    # Kanban board lifecycle (dependency-wait blocking may fire inside its transaction):
+    # Kanban board lifecycle (each fires after its board write commits):
     ctx.register_hook("kanban_task_claimed", my_claim_callback)     # dispatcher process
     ctx.register_hook("kanban_task_completed", my_done_callback)    # worker process
     ctx.register_hook("kanban_task_blocked", my_blocked_callback)   # worker process
@@ -396,6 +396,7 @@ def register(ctx):
 - If a Python plugin callback on a **timeout-bounded** hook (hot-path observers such as `post_tool_call` / `pre_llm_call`, plus the policy hook `pre_tool_call`) **blocks** longer than `plugins.hook_callback_timeout` (default 30s, set `0` to disable, max 600), it is abandoned without joining the worker so the agent loop continues. Timed-out or still-running `pre_tool_call` callbacks **fail closed** (block the tool); other bounded hooks fail open (skip). Hooks with a documented caller-thread contract (`subagent_stop`) are never moved onto a timeout worker. Shell hooks keep their own per-entry `timeout`.
 - The catalog below is descriptive: **observers** ignore returns, **transforms** accept the first valid string replacement, and **directive/control** hooks consume documented return shapes. Plugin middleware is a separate registry and surface, not another hook category.
 - Correlation fields such as `turn_id`, `api_request_id`, `task_id`, `session_id`, and `api_call_count` are hook-specific and may be absent. Treat IDs as opaque.
+- Tool hooks also carry `conversation_id`: the conversation's first session id, which stays the same when a rotating compression replaces `session_id`, and which a delegated subagent shares with its delegator. Key per-conversation state on it.
 - Runtime event-name validity comes from `hermes_cli.plugins.VALID_HOOKS`. `hermes hooks list` lists configured shell/outbound hooks, not every available event; `hermes hooks test <event>` reports the valid set only when an invalid event is supplied.
 
 ### Cache-safe system prompt sections
@@ -424,8 +425,11 @@ The contract is deliberately narrow:
 - `after_memory` is the only placement anchor. Sections are sorted by ID,
   rendered after memory/profile context and before session metadata; plugins
   cannot reorder or replace core prompt content.
-- A callable receives a read-only mapping with `session_id`, `model`,
-  `provider`, `platform`, `profile_name`, and `cwd`. It runs **once for a new
+- A callable receives a read-only mapping with `session_id`, `conversation_id`,
+  `model`, `provider`, `platform`, `profile_name`, `cwd`, `client` and `client_version`
+  (`client`/`client_version`: the name and version the creating client declared on
+  `session.create`, `""` when it sent none; a self-declared label, so never grant
+  anything on it). It runs **once for a new
   session**. Its rendered bytes are frozen on compression and recovered from
   the already-persisted full system prompt after a process restart/resume;
   plugin state is not re-read for an existing session.
@@ -448,12 +452,12 @@ Payload fields below are the exact event-specific fields supplied by each call s
 
 | Hook | Category | Exact timing and return behavior | Explicit payload fields | Privacy / sensitivity |
 |---|---|---|---|---|
-| [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; any valid `block` wins over any `approve` (then the first valid `approve`), and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
-| `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
-| `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
+| [`pre_tool_call`](#pre_tool_call) | Directive/control | Once before execution; any valid `block` wins over any `approve` (then the first valid `approve`), and `modify` returns are shallow-merged into the tool arguments. | `tool_name`, `args`, `task_id`, `session_id`, `conversation_id`, `tool_call_id`, `turn_id`, `api_request_id`, `middleware_trace` | Raw arguments may contain user content, paths, commands, or secrets. |
+| `post_tool_call` | Observer | After blocked, error, or successful result; return ignored. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `conversation_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message`, `middleware_trace` | Result/error text may contain arbitrary tool or user content and secrets. |
+| `transform_tool_result` | Transform | After `post_tool_call`, before conversation append; first string replaces the result. | `tool_name`, `args`, `result`, `task_id`, `session_id`, `conversation_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, `error_message` | Exposes the full model-bound result and arguments. |
 | `transform_terminal_output` | Transform | After bounded foreground process capture, before final output limiting; first string replaces output. | `command`, `output`, `returncode`, `task_id`, `env_type` | Command/output may contain credentials. |
 | `pre_transcription` | Transform | Fired by the STT dispatcher after provider resolution and before any backend (built-in, command-type, or plugin-registered) is invoked; dict results are applied in registration order, last-writer-wins per field (`prompt`, `language`, `model`; `file_path` is read-only). | `file_path`, `provider`, `model`, `language`, `prompt`, `source` | The final prompt is uploaded to the configured STT provider with the audio — keep secrets out of hook returns. |
-| `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
+| `pre_llm_call` | Directive/control | Once per turn before the loop; all valid string/`{"context": ...}` returns are joined and injected into the user message; the first valid `{"action": "block", "message": ...}` ends the turn before any inference request. | `session_id`, `task_id`, `turn_id`, `user_message`, `conversation_history`, `is_first_turn`, `model`, `platform`, `parent_session_id`, `sender_id` | Full user message and conversation history. |
 | [`post_steer_delivered`](#post_steer_delivered) | Observer | After native mid-turn steer-row insertion at either drain site; return ignored, timeout fails open. | `session_id`, `turn_id`, `platform`, `text`, `delivery_id`, `ordinal` | `text` is raw user text and may contain private content or secrets; it is not redacted. |
 | `post_llm_call` | Observer | Successful, non-interrupted turn finalization; return ignored. | `session_id`, `task_id`, `turn_id`, `user_message`, `assistant_response`, `conversation_history`, `model`, `platform`, `side_question_token` | Full prompt, response, and history. |
 | `transform_llm_output` | Transform | Before `post_llm_call` and final delivery; first non-empty string replaces the response. | `response_text`, `session_id`, `model`, `platform` | Full final assistant text. |
@@ -469,11 +473,13 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_interim_message` | Observer | Dispatched when a mid-loop assistant message is surfaced before the final answer (streaming or non-streaming); return ignored. | `text`, `already_streamed`, `turn_id`, `iteration`, `session_id`, `model`, `provider`, `surface` | Full interim assistant text. |
 | `transform_api_error_classification` | Transform | On each failed provider attempt, at the top of the built-in classifier; all callbacks run, then the first dict with a valid `reason` wins (run-all-then-pick-first), and skipped valid results log a runtime warning. Python plugins only. | `provider`, `model`, `status_code`, `error_type`, `error_code`, `error_message`, `error_body`, `error`, `approx_tokens`, `context_length`, `num_messages` | `error_message` and `error_body` may contain raw provider/user data. |
 | `on_session_start` | Observer | First turn of a new session; return ignored. | `session_id`, `model`, `platform` | Identifiers and routing metadata only. |
+| `on_session_open` | Observer | Once each time a client creates or opens a local session (CLI, TUI, Desktop, ACP, kanban/A2A workers), in the gateway under the session's profile, before its first turn; never for messaging chats. Timeout-bounded; return ignored. | `session_id`, `platform`, `reason` (`create` or `resume`) | Session identifiers only. |
 | `on_session_end` | Observer | Canonically at each turn finalization; CLI/TUI exits have additional reduced legacy shapes. Return ignored. | Canonical: `session_id`, `task_id`, `turn_id`, `completed`, `failed`, `interrupted`, `turn_exit_reason`, `model`, `platform`; exit paths may add `reason`/`api_request_id` and omit fields. | IDs, model/platform, and outcome; canonical payload has no message body. |
 | `on_session_finalize` | Observer | CLI/TUI/gateway teardown through `finalize_session`; gateway shutdown may finalize without a reset. Return ignored. | Surface-dependent `session_id`, `platform`, optionally `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
 | `on_session_reset` | Observer | CLI/TUI session boundary and gateway after the replacement session exists; return ignored. | CLI: `session_id`, `platform`, `reason`; TUI: `session_id`, `platform`; gateway: those plus `reason`, `old_session_id`, `new_session_id` | Session and routing identifiers. |
 | `on_session_delete` | Observer | After a session delete or deliberate archive commits (CLI, TUI, Desktop/dashboard, gateway API, sweeps, prune); return ignored. | `session_id`, `reason`, `profile`, optional `deleted_ids` (full set when more than one row went), `sessions_dir` | Session identifiers only; no message content. |
 | `post_compaction` | Observer | Once per committed compaction, on every path: automatic and manual compaction in the agent loop (CLI, TUI, Desktop, gateway hygiene, overflow recovery), the gateway's `/compress` (`session.mutate compress`), Codex app-server compactions, micro-compaction and proactive tool-result pruning. Not fired for attempts that changed nothing (aborted, blocked, refused). Timeout-bounded; return ignored. | `session_id`, `old_session_id`, `kind`, `reason`, `before_tokens`, `after_tokens`, `messages_removed` | Identifiers and counts only. |
+| `post_curator_run` | Observer | After a curator pass wrote its per-run report (`logs/curator/<run>/run.json` + `REPORT.md`), in the process that ran the pass. Return ignored. | `run_dir`, `run_json_path`, `report_md_path`, `dry_run` | Local filesystem paths; the report names skills. |
 | `agent_loop_stopped` | Observer | Immediately after a real running agent is interrupted — gateway `_interrupt_and_clear_session` or TUI/desktop `session.interrupt`; return ignored. | `session_key`, `platform`, `reason`, `invalidation_reason` | Session/routing identifiers and interruption reasons; no message body. |
 | `on_skill_lifecycle` | Observer | After an authoritative skill-usage state change; return ignored. | `action`, `skill_name`, `provenance`, `task_id`, `session_id`, `use_count`, `reused`, `reuse_after_patch` | Exposes the local skill name and provenance. |
 | `subagent_start` | Observer | Child constructed and about to run; return ignored. | `parent_session_id`, `parent_turn_id`, `parent_subagent_id`, `child_session_id`, `child_subagent_id`, `child_role`, `child_goal` | Child goal may contain user/project content. |
@@ -481,7 +487,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `subagent_failure_notice` | Directive | A child ended `failed`/`error`/`timeout`, before the user-facing failure notice (gateway chat notice, CLI tree line). Return `{"action": "suppress"}` when the plugin recovers the failure itself, for example by retrying on another route; the child result and `subagent_stop` are unchanged. Errors keep the notice. | `child_session_id`, `child_goal`, `child_status`, `error`, `failure_reason` | Error text may contain provider details. |
 | `pre_gateway_dispatch` | Directive/control | Once per incoming non-internal message, at ingress: platform-adapter messages before auth/pairing/dispatch; webhook and relay deliveries after their authorization, before the admission commits; never for local CLI/TUI/Desktop or API turns, a retry of a committed delivery, or a queued admission when it executes. First valid `skip`, `rewrite`, or `allow` controls flow. | `event`, `gateway`, `session_store` | Extremely privileged in-process objects expose inbound user/routing data and host handles. |
 | `post_gateway_admission` | Directive/control (fail-open) | Admitted non-internal message after auth, pause/drain, pending-reply, running-session and slash-command lanes, inside the claimed session slot and the routed profile's scope; first `handled` result skips the agent turn, anything else (including a raise or timeout) runs it. | `session_key`, `platform`, `source` (dict snapshot), `message_id`, `text` | Inbound text is untrusted user data; no runner or session-store handles are passed. |
-| `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
+| `gateway_platform_event` | Observer | After the gateway's profile-scoped authorization succeeds, when a supported platform-native event is normalized at the gateway boundary (Telegram: reactions, message edits; Slack: reactions; Discord: message edits/deletes, thread created/renamed); return ignored. | `platform`, `event_type`, `payload` (event-type-specific dict — see the per-event contracts below) | Normalized plain-dict envelope only; raw SDK objects, adapter handles, and bot clients are never exposed. |
 | `pre_command` | Observer | Recognized slash command about to be dispatched, before the handler runs, on CLI and gateway cold-path dispatch; return ignored in v1 (directive-shaped dicts are logged at debug). A command the classic CLI, TUI or Desktop sends to the gateway through `slash.exec` or `command.dispatch` fires it once, in the gateway, with `surface` and `platform` both `"cli"` as before (Ink and Desktop fired it through the CLI slash worker) and `session_key` the session id. A recognized command the classic CLI runs itself is reported to the gateway (`command.observe`) once it has run, and so are these TUI commands: `/help`, `/history`, `/clear`, `/new`, `/tools` (not `enable`/`disable`), `/usage` and `/reasoning` (a level once the gateway accepts it). The gateway fires it there after replying, so neither client loads plugin code; a command either client refuses fires nothing. This is a deliberate change from the classic CLI before the unified gateway, which fired it for every recognized command just before dispatch: now a command fires it only if it runs, so one that is refused or that the client has no handler for (`/handoff` in a gateway session, `/start`) fires nothing. A TUI change the gateway applies, such as `/reasoning high`, fires it once the gateway accepts the change, so after the change has taken effect. A gateway older than the client fires no hook for those commands (the classic CLI prints a one-time notice). Known gap: Desktop's own pickers, actions and dedicated RPCs (commands it answers without `slash.exec`) fire nothing yet, and neither do the other commands the TUI answers itself or through a dedicated gateway call, such as `/title`, `/undo`, `/retry`, `/model`, `/compress`, `/branch`, `/save`, `/copy`, `/queue`, `/steer`, `/bg`, `/btw`, `/skin`, `/yolo`, `/busy`, `/fast`, `/verbose`, `/rollback`, `/reload-mcp`, `/quit` and `/reasoning --global`. During a local session's turn every command that still runs fires it except `/stop`, `/approve` and `/deny`; a command that is refused (rejected while busy, or named as unavailable on the gateway) fires nothing. Each callback is timeout-bounded (`plugins.hook_callback_timeout`); each delivery waits on a thread of its own, never a worker shared with other sessions or the event loop's executor. One session's commands reach it in order, and a callback still running for that session (hung) is skipped for its later commands instead of running out of order, without holding up other sessions. Gateway running-agent intercept commands (`/stop`, `/approve` during an active run) are deliberately excluded — control-plane escape hatches must stay outside plugin reach. | `surface` (`"cli"` \| `"gateway"`), `command` (canonical name), `alias_used`, `args_raw`, `session_key`, `platform` | `args_raw` may contain user content or secrets typed after the command. |
 | `pre_approval_request` | Observer | Before prompted or smart approval; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id` | Command may contain secrets; smart observer preparation force-redacts, but surfaces do not all have identical redaction. |
 | `post_approval_response` | Observer | After a decision, timeout, or gateway notification failure; return ignored. | `command`, `description`, `pattern_key`, `pattern_keys`, `session_key`, `surface`, `turn_id`, `tool_call_id`, `choice`; smart path may add `decided_by` | Same command sensitivity plus decision metadata. |
@@ -490,7 +496,7 @@ Payload fields below are the exact event-specific fields supplied by each call s
 | `on_room_member_activity` | Observer | While a hosted Group Chat member turn runs on the Bot Mode gateway, once per runtime event the member session emits (tool start/complete, approval request, message/reasoning deltas, errors); queued per consumer off the token path; return ignored. | `room_id`, `thread_id`, `member_id`, `turn_id`, `task_id`, `execution_generation`, `kind`, `seq`, `payload` | `payload` is the client-safe session event body: tool args and results, redacted approval commands, streamed member text. |
 | `kanban_task_claimed` | Observer | After claim commit, in dispatcher process before worker spawn; return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id` | Board/task/profile/assignee identifiers. |
 | `kanban_task_completed` | Observer | After completion and cleanup, usually in worker process; return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `summary` | Summary may contain project/user content. |
-| `kanban_task_blocked` | Observer | After a blocked transition; the dependency-wait path fires before its transaction exits. Return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `reason` | Reason may contain project/user content. |
+| `kanban_task_blocked` | Observer | After a blocked transition commits, dependency waits included. Return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `reason` | Reason may contain project/user content. |
 | `on_kanban_worker_spawned` | Observer | After `spawn_fn` returns and the worker PID is persisted; runs inside the dispatch lock, keep callbacks fast. Return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `worker_pid`, `workspace_path` | `workspace_path` is a filesystem path and may reveal project layout or usernames. |
 | `on_kanban_worker_exited` | Observer | Tick-derived: after `detect_crashed_workers` reclaims a dead-PID task and the reclaim commits. Return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `worker_pid`, `exit_kind`, `exit_code`, `outcome`, `retry_status` | Identifiers and exit metadata only. |
 | `on_kanban_worker_stale_claim` | Observer | After a TTL-expired claim is reclaimed; live-PID extensions don't fire. Return ignored. | `task_id`, `profile_name`, `board`, `assignee`, `run_id`, `worker_pid`, `heartbeat_stale`, `retry_status` | Identifiers and claim metadata only. |
@@ -746,6 +752,12 @@ def my_callback(session_id: str, user_message: str, conversation_history: list,
 
 **Return value:** If the callback returns a dict with a `"context"` key, or a plain non-empty string, the text is appended to the current turn's user message. Return `None` for no injection.
 
+A `{"action": "block", "message": "..."}` return vetoes the turn **before any inference request**: the message is shown to the user in place of a model reply and saved as the assistant reply (so the transcript keeps a normal `user → assistant` pair and `--resume` works), the turn makes zero model calls, and the result carries `turn_exit_reason: "blocked_by_plugin_pre_llm_call"`. The first block wins; a block without a message is ignored.
+
+The blocked prompt is stored as `[Message withheld: a pre_llm_call policy hook blocked it.]`. That placeholder is what later turns replay and what compaction summaries, `session_search`, external memory providers and the background memory review read, so the prompt never reaches a model in this turn or a later one. What the user typed is kept only as display metadata, so the CLI `--resume` recap, the TUI, the desktop app and the dashboard still show it. The hook runs before turn-start compaction, and a blocked turn skips compaction, titling and external-memory prefetch/sync.
+
+A block applies only when a callback returns it. A callback that raises, or runs past `plugins.hook_callback_timeout` (30 s by default), is logged and skipped, and the turn goes ahead. A policy hook should therefore catch its own errors and return a block when it can't decide. Model metadata lookups (such as a `/models` context-length probe on a fresh session) can still run before the hook; they carry no message content.
+
 ```python
 # Inject context
 return {"context": "Recalled memories:\n- User likes Python\n- Working on hermes-agent"}
@@ -993,6 +1005,38 @@ def register(ctx):
 
 ---
 
+### `on_session_open`
+
+Fires when a client **creates or opens** a local session: a new chat in `hermes`, the TUI or Desktop, or `hermes --resume` / the session picker reopening a stored one. Use it to get ready for a conversation before the model sees it, for example a memory plugin pre-loading recent context or a status bar showing the session as open. Distinct from [`on_session_start`](#on_session_start), which fires during the first agent turn and never on a reopen.
+
+**Callback signature:**
+
+```python
+def my_callback(session_id: str, platform: str, reason: str, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `session_id` | `str` | The session that opened |
+| `platform` | `str` | The surface that created it: `cli`, `tui`, `desktop`, `acp`, ... |
+| `reason` | `str` | `create` while the session has no messages yet (a new chat), `resume` once it has a conversation (a stored chat being reopened) |
+
+**Fires:** In the gateway (`gateway/session_open.py`), when a client connection attaches to a local session it was not already attached to. Once per open: a client re-reading a session it already has open, or reconnecting after a dropped socket, does not fire it again. Two clients opening the same session fire it twice. It runs in the profile that owns the session, so on a gateway serving several profiles each profile's plugins see only their own sessions. The callback runs on its own thread: opening the session never waits for it, but the session's next turn does, for up to 5 s or `plugins.hook_callback_timeout` if that is longer; past that the turn proceeds and the callback keeps running. While a callback for a session is still running, further opens of that session wait behind it as a single call: they fire once when it ends, with the latest open's details. `--safe-mode` / `--ignore-user-config` sessions fire nothing. Messaging chats (Telegram, Discord, ...) do not fire it: their first message starts the session, so use `on_session_start` there.
+
+**Return value:** Ignored.
+
+**Example — pre-load memory before the first turn:**
+
+```python
+def warm(session_id, platform, reason, **kwargs):
+    _cache[session_id] = load_recent_notes(limit=20)
+
+def register(ctx):
+    ctx.register_hook("on_session_open", warm)
+```
+
+---
+
 ### `on_session_end`
 
 Fires at the **very end** of every `run_conversation()` call, regardless of outcome. Also fires from the CLI's exit handler if the agent was mid-turn when the user quit.
@@ -1187,6 +1231,27 @@ def my_callback(session_id: str, kind: str, reason: str, **kwargs):
 **Return value:** Ignored. A callback that raises is logged and skipped; the compaction is already committed and is unaffected. Callbacks are bounded by `plugins.hook_callback_timeout`.
 
 **Use cases:** Re-inject session context after compaction, refresh an external index, count compactions.
+
+### `post_curator_run`
+
+Fires once after a curator pass has written its per-run report directory, so a plugin or shell hook can react to what the curator changed (route new skills to another profile, override an archival, write an audit log) instead of polling `logs/curator/`.
+
+**Callback signature:**
+
+```python
+def my_callback(run_dir: str, run_json_path: str, report_md_path: str, dry_run: bool, **kwargs):
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `run_dir` | `str` | The run's report directory under the profile's `logs/curator/`. |
+| `run_json_path` | `str` | `run.json`, the machine-readable record (added, archived, consolidated, pruned, state transitions, cron rewrites). |
+| `report_md_path` | `str` | `REPORT.md`, the human-readable report. |
+| `dry_run` | `bool` | `True` for a preview (`hermes curator run --dry-run`): the report lists what WOULD change and nothing was archived or rewritten. Check it before acting on the report. |
+
+**Fires:** in the process that ran the pass (the gateway's scheduled curator tick, or `hermes curator run`), under that profile, after both files are written. A pass whose report directory could not be created fires nothing.
+
+**Return value:** Ignored. A callback that raises is logged and skipped; the curator pass is unaffected.
 
 ### `agent_loop_stopped`
 
@@ -1431,7 +1496,7 @@ def register(ctx):
 
 Fires for supported platform-native events only **after** the gateway's normal, profile-scoped authorization check succeeds. The callback receives plain dictionaries; raw SDK objects, adapter handles, bot clients, and callback contexts are never part of this stable contract.
 
-Telegram message reactions were the first supported event; message edits, deletes, and thread lifecycle events followed:
+Telegram and Slack reactions, Telegram message edits, and Discord message edits, deletes, and thread lifecycle events use the same envelope:
 
 ```python
 def on_platform_event(platform, event_type, payload, **kwargs):
@@ -1456,7 +1521,7 @@ Every payload is additive and event-specific; there is no monolithic gateway pay
 
 | `event_type` | Platforms | Payload fields |
 |--------------|-----------|----------------|
-| `reaction` | telegram | `emojis: list[str]`, `custom_emoji_ids: list[str]`, `chat_id: str`, `message_id: str`, `thread_id: str \| None` (Telegram reaction updates carry no topic id, so currently always `None`). |
+| `reaction` | telegram, slack | Telegram: `emojis`, `custom_emoji_ids`, `chat_id`, `message_id`, `thread_id` (always None), `user_id`, `is_bot`. Slack: `reaction`, `action` (`added` or `removed`), `user_id`, `is_bot`, `item_user_id`, `chat_id`, `message_id`, `thread_id` (item `thread_ts` when present, otherwise the message ts in a DM), `team_id`, `event_ts`. The bot's own Slack reaction is dropped before this hook. |
 | `message_edited` | telegram, discord | `chat_id: str`, `message_id: str`, `thread_id: str \| None`, `text: str \| None` (edited text or caption, bounded; `None` for media-only edits or when uncached), `edited_at: str \| None` (ISO 8601). |
 | `message_deleted` | discord | `chat_id: str`, `message_id: str`, `thread_id: str \| None`, `author_id: str \| None`. Discord's delete event does not identify the deleter; the authorized source is the deleted message's author, and uncached deletions never fire. |
 | `thread_created` | discord | `thread_id: str`, `parent_chat_id: str \| None`, `name: str \| None`, `owner_id: str \| None`. |
@@ -1726,7 +1791,7 @@ Fires **after** a tool returns and **before** the result is appended to the conv
 def my_callback(tool_name: str, args: dict, result: str, task_id: str, **kwargs) -> str | None:
 ```
 
-The full payload also includes `session_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, and `error_message`. `result` is the final result returned by tool dispatch; it and `args` can contain arbitrary user/tool content and secrets.
+The full payload also includes `session_id`, `conversation_id`, `tool_call_id`, `turn_id`, `api_request_id`, `duration_ms`, `status`, `error_type`, and `error_message`. `result` is the final result returned by tool dispatch; it and `args` can contain arbitrary user/tool content and secrets.
 
 **Return value:** The first `str` replaces the result (including an empty string); `None` leaves it unchanged.
 
@@ -1907,7 +1972,7 @@ Fires after completion and cleanup, usually in the worker process. Its `summary`
 
 #### `kanban_task_blocked`
 
-Fires after a normal blocked transition. The dependency-wait path invokes it before that write transaction exits. Its `reason` can contain project or user content.
+Fires after a blocked transition commits, dependency waits included, so the callback can read and write the board. Its `reason` can contain project or user content.
 
 All three kanban hooks are observer-only and carry `task_id`, `profile_name`, `board`, `assignee`, and `run_id`; completed adds `summary`, and blocked adds `reason`.
 
@@ -1997,6 +2062,14 @@ Each time the event fires, Hermes spawns a subprocess for every matching hook (m
 script can serve every profile behind a multiplexed gateway; the subprocess also runs with that
 profile's `HERMES_HOME`. `tool_name` and `tool_input` are `null` for non-tool events (`pre_llm_call`, `subagent_stop`, session lifecycle). The `extra` dict carries all event-specific kwargs (`user_message`, `conversation_history`, `child_role`, `duration_ms`, …). Unserialisable values are stringified rather than omitted.
 
+`extra.kanban_task_id` identifies the board task owned by the execution firing the
+hook. It is empty for ordinary sessions, delegated children and in-process cron
+runs, even if their process inherited a worker environment. `extra.task_id` keeps
+its existing turn/session meaning. Use the board identity in a policy hook instead
+of inferring it from workspace paths. The hook subprocess still has its worker
+identity environment stripped; payload metadata does not grant worker authority.
+The same field is included by the shared outbound-webhook payload builder.
+
 **stdout — optional response:**
 
 ```jsonc
@@ -2014,6 +2087,10 @@ profile's `HERMES_HOME`. `tool_name` and `tool_input` are `null` for non-tool ev
 
 // Inject context for pre_llm_call:
 {"context": "Today is Friday, 2026-04-17"}
+
+// Block the turn before any inference request (pre_llm_call); both shapes accepted:
+{"action": "block", "message": "Blocked by policy: prompt contains a customer ID"}
+{"decision": "block", "reason": "Blocked by policy: prompt contains a customer ID"}
 
 // Keep the agent going at the verify gate (pre_verify); both shapes accepted:
 {"action": "continue", "message": "Run the formatter, then finish."}

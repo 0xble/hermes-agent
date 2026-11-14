@@ -9,10 +9,10 @@ from hermes_state import SessionDB
 from tests.gateway.conftest import _ensure_telegram_mock
 
 _ensure_telegram_mock()
-from gateway.config import GatewayConfig, Platform, PlatformConfig  # noqa: E402
+from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.delivery import DeliveryRouter, DeliveryTarget
 from gateway.platforms.base import SendResult
-from plugins.platforms.telegram.adapter import TelegramAdapter  # noqa: E402
+from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
 @pytest.fixture

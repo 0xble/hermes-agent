@@ -88,6 +88,14 @@ def transcript_append_kwargs(session_id: str, message: dict[str, Any], *, fallba
         "display_kind": message.get("display_kind"),
         "display_metadata": message.get("display_metadata"),
     }
+    # Identity the caller already stamped. Omitting it makes append_message mint a
+    # new uid, so delivery later cannot find the row it named. Only a non-empty
+    # string is forwarded: append_message treats anything else as absent and mints.
+    # idx_messages_session_uid is not unique, so a second append of the same dict
+    # (a spool replay after a committed write) is another physical row, not an error.
+    uid = message.get("message_uid")
+    if isinstance(uid, str) and uid:
+        kwargs["message_uid"] = uid
     for key in _BOUND_TEXT_KEYS:
         kwargs[key] = _bindable_text(kwargs[key])
     return kwargs
@@ -454,7 +462,12 @@ class SessionTranscriptMixin:
             # into the ambient store.
             raise RuntimeError(
                 f"no owning session store for {session_id}; deferring transcript write")
+        pending = self._lazy("_pending_outbound_platform_messages", dict)
+        key = (session_id, str(message.get("message_uid") or "")) if message.get("role") == "assistant" else None
+        if key in pending:
+            message = {**message, "platform_message_id": message.get("platform_message_id") or pending[key]}
         _db.append_message(**transcript_append_kwargs(session_id, message))
+        pending.pop(key, None)  # Consume only after the exact row was successfully written.
 
     @staticmethod
     def _is_fts_corruption_error(exc: Exception) -> bool:
@@ -511,9 +524,41 @@ class SessionTranscriptMixin:
 
     def _clear_dirty_transcript(self, session_id: str) -> None:
         """Drop queued pending messages so a rewrite/rewind doesn't re-insert them."""
-        with self._transcript_retry_lock:
+        with self._get_transcript_drain_lock(), self._transcript_retry_lock:
             self._dirty_transcripts.pop(session_id, None)
             self._transcript_append_failures.pop(session_id, None)
+            pending = self._lazy("_pending_outbound_platform_messages", dict)
+            for key in tuple(pending):
+                if key[0] == session_id:
+                    pending.pop(key, None)
+
+    def record_outbound_platform_message(
+        self, session_key: str, platform_message_id: str, content: str,
+        message_uid: str | None = None,
+    ) -> bool:
+        """Record a delivered reply, or retain its UID receipt until the row is appended.
+
+        Queued gateway-written turns deliver before transcript persistence. Serialize that
+        rendezvous with append so either ordering binds the same exact session/assistant UID.
+        The caller runs this after ledger finalization; no send waits for this lock or DB work.
+        """
+        if not message_uid:
+            return False
+        with self._get_transcript_drain_lock():
+            with self._lock:
+                entry = self._entry_locked(session_key)
+                session_id = getattr(entry, "session_id", None)
+            if not session_id:
+                return False
+            db = self._db_for_session_id(session_id)
+            if db is None:
+                return False
+            if db.record_outbound_platform_message(
+                    session_id, platform_message_id, content, message_uid=message_uid):
+                return True
+            self._lazy("_pending_outbound_platform_messages", dict).setdefault(
+                (session_id, str(message_uid)), str(platform_message_id))
+            return False
 
     def has_platform_message_id(self, session_id: str, platform_message_id: str) -> bool:
         """Whether a message with this platform_message_id is persisted (False without a DB).
@@ -696,11 +741,37 @@ class SessionTranscriptMixin:
                 "empty: %s", session_id, e, exc_info=True)
             raise TranscriptReadError(session_id) from e
 
+    def retain_refused_turn_for_display(
+        self, session_id: str, *, notice: str, boundary_row_id: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Take the newest (safety-refused) user turn out of the MODEL context — exactly as
+        :meth:`rewind_session` does — while KEEPING the user's message visible in the chat as a
+        greyed refused notice (``SessionDB.retain_refused_turn_for_display``). The owner (gateway /
+        Bot Chat) calls this after the turn lease releases. ``boundary_row_id`` is the refused run's
+        original durable boundary (captured by the refusal handler); without it the target is guessed
+        from the newest user turn. Returns ``{\"retained\": True}`` on success, or ``None`` (no DB / no
+        rewindable turn / persistence failure); best-effort, so a refusal never crashes turn teardown.
+        """
+        db = self._db_for_session_id(session_id)
+        if not db:
+            return None
+        with self._get_transcript_drain_lock():
+            try:
+                retained = db.retain_refused_turn_for_display(
+                    session_id, notice=notice, boundary_row_id=boundary_row_id)
+            except Exception as e:  # health: allow BLE001 -- best-effort; a refusal must never crash teardown
+                logger.debug("retain_refused_turn_for_display: failed: %s", e)
+                return None
+            if not retained:
+                return None
+            self._clear_dirty_transcript(session_id)
+            return {"retained": True}
+
     def rewind_session(
         self, session_id: str, n: int = 1, *, require_retryable_composite: bool = False,
     ) -> Optional[dict[str, Any]]:
         """Back up ``n`` user turns via soft-delete (``active=0``), mirroring CLI ``/undo [N]``.
-        Returns ``{"rewound_count", "turns_undone", "target_text"}`` or ``None`` (no DB / no rewindable
+        Returns ``{"rewound_count", "turns_undone", "target_text", "undo_since"}`` or ``None`` (no DB / no rewindable
         turn / persistence failure); ``n`` clamps to the oldest user turn. ``require_retryable_composite``
         is the gateway ``/retry`` guard: the selected turn must be a composite carrier whose live payload
         is losslessly replayable as text — that replay-policy ``ValueError`` propagates so /retry can
@@ -723,5 +794,7 @@ class SessionTranscriptMixin:
                 logger.debug("rewind_session: rewind failed: %s", e)
                 return None
             self._clear_dirty_transcript(session_id)
+            from tools.checkpoint_undo_hint import undo_span_start
             return {"rewound_count": outcome.rewound_count, "turns_undone": outcome.turns_undone,
-                    "target_text": outcome.live_text}
+                    "target_text": outcome.live_text,
+                    "undo_since": undo_span_start(outcome.live_view.get("timestamp"), outcome.prefix)}

@@ -16,6 +16,7 @@ from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id, normalize_provider_tool_call_ids
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
+from agent.turn_tool_guardrails import handle_tool_cap_answer
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -24,6 +25,9 @@ _HOUSEKEEPING_TOOLS = frozenset({"memory", "todo_list", "skill_manage", "session
 # Rounds whose visible line is the turn's reply if the follow-up is empty (no empty-response nudge):
 # housekeeping, and setup_beat, whose card already blocked for the user's answer.
 _LINE_IS_REPLY_TOOLS = _HOUSEKEEPING_TOOLS | {"setup_beat"}
+# Turns with no fresh user message. A guardrail halt there must not ask anyone to "continue".
+_UNATTENDED_TURN_ORIGINS = frozenset({"relay", "process", "goal_loop", "cron"})
+_UNATTENDED_HALT_LIMIT = 3
 
 
 @dataclass
@@ -43,7 +47,45 @@ class ToolRoundVerdict:
     _turn_exit_reason: Any
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
+    interrupted: bool = False
     result: Optional[dict[str, Any]] = None
+
+
+def _end_turn_on_guardrail_halt(agent: Any, messages: Any) -> Optional[str]:
+    """Handle a pending guardrail halt; returns the halt reply when the turn must end, else None.
+
+    An unattended turn (no fresh user message, or nobody reading) keeps working after the first
+    blocks: the blocked call already has a synthetic tool result, so the model can switch tools.
+    It still hard-stops on the ``_UNATTENDED_HALT_LIMIT``-th halt so a dead endpoint stays bounded,
+    and that reply states what failed without asking anyone to respond."""
+    from agent.session_source import is_attended
+
+    decision = agent._tool_guardrail_halt_decision
+    provenance = getattr(agent, "_turn_provenance", "unknown")
+    unattended = provenance in _UNATTENDED_TURN_ORIGINS or (provenance != "user" and not is_attended(agent))
+    if unattended:
+        agent._unattended_guardrail_halts = getattr(agent, "_unattended_guardrail_halts", 0) + 1
+        if agent._unattended_guardrail_halts < _UNATTENDED_HALT_LIMIT:
+            agent._tool_guardrail_halt_decision = None
+            clear_halt = getattr(agent._tool_guardrails, "clear_halt_decision", None)
+            if clear_halt is not None:
+                clear_halt(decision)
+            agent._emit_diagnostic_status(
+                f"⚠️ Tool guardrail blocked {decision.tool_name}: {decision.code}; continuing turn"
+            )
+            return None
+    final_response = agent._toolguard_controlled_halt_response(decision, unattended=unattended)
+    agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
+    append_message(messages, {"role": "assistant", "content": final_response})
+    # Emit the halt so it isn't mistaken for a crash; the stream callback is still
+    # alive, so SSE/TUI clients see the explanation. A held turn shows it as the final only.
+    if final_response:
+        agent._safe_print(f"\n{final_response}\n")
+        if agent.stream_delta_callback and not getattr(agent, "_hold_stream", False):
+            with suppress(Exception):
+                agent.stream_delta_callback(final_response)
+                agent.stream_delta_callback(None)
+    return final_response
 
 
 def run_tool_round(
@@ -52,6 +94,7 @@ def run_tool_round(
     system_message: Any, active_system_prompt: Any, compression_attempts: Any,
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
     truncated_tool_call_retries: Any, current_turn_user_idx: Any,
+    interrupted: bool = False,
 ) -> ToolRoundVerdict:
     """Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
@@ -65,7 +108,7 @@ def run_tool_round(
             active_system_prompt=active_system_prompt, compression_attempts=compression_attempts,
             final_response=final_response, failed=failed, _turn_exit_reason=_turn_exit_reason,
             truncated_tool_call_retries=truncated_tool_call_retries,
-            current_turn_user_idx=current_turn_user_idx, result=result,
+            current_turn_user_idx=current_turn_user_idx, interrupted=interrupted, result=result,
         )
 
     if not agent.quiet_mode:
@@ -188,19 +231,17 @@ def run_tool_round(
 
     if agent._tool_guardrail_halt_decision is not None:
         decision = agent._tool_guardrail_halt_decision
-        _turn_exit_reason = "guardrail_halt"
-        final_response = agent._toolguard_controlled_halt_response(decision)
-        agent._emit_diagnostic_status(f"⚠️ Tool guardrail halted {decision.tool_name}: {decision.code}")
-        append_message(messages, {"role": "assistant", "content": final_response})
-        # Emit the halt so it isn't mistaken for a crash; the stream callback is still
-        # alive, so SSE/TUI clients see the explanation. A held turn shows it as the final only.
-        if final_response:
-            agent._safe_print(f"\n{final_response}\n")
-            if agent.stream_delta_callback and not getattr(agent, "_hold_stream", False):
-                with suppress(Exception):
-                    agent.stream_delta_callback(final_response)
-                    agent.stream_delta_callback(None)
-        return _verdict("break")
+        if decision.code in {"loop_web_search_cap", "loop_subagent_cap"}:
+            cap_verdict = handle_tool_cap_answer(agent, messages, api_call_count, decision)
+            final_response = cap_verdict.final_response
+            interrupted = cap_verdict.interrupted
+            _turn_exit_reason = cap_verdict.turn_exit_reason
+            return _verdict("break")
+        halt_reply = _end_turn_on_guardrail_halt(agent, messages)
+        if halt_reply is not None:
+            final_response = halt_reply
+            _turn_exit_reason = "guardrail_halt"
+            return _verdict("break")
 
     # Reset per-turn retry counters so one truncation can't poison the turn.
     truncated_tool_call_retries = 0

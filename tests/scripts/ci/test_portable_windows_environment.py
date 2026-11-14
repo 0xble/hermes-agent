@@ -54,7 +54,7 @@ def test_explicitly_empty_module_path_still_autoloads_builtin_cmdlets(tmp_path, 
     result = subprocess.run(
         [executable, "-NoLogo", "-NoProfile", "-NonInteractive", "-Command", _AUTOLOAD_PROBE],
         env=env, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=45,
-    )
+     check=False)
 
     output = result.stdout + result.stderr
     assert result.returncode == 0, output

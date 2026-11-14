@@ -7,6 +7,36 @@ bounded priority scheduler. Its ordering, long-turn opening window, profile scop
 and shutdown-source durability contract live in
 [Shared Replay Admission](restart-continuation.md#shared-replay-admission).
 
+## Process shutdown exit boundary
+
+Signal stops use the same short cleanup/finalization deadlines as explicit
+restarts, independently of how the stop is classified. Preserve the configured
+drain (including zero), pending-input spool, transcript flush, session-DB
+quiesce, receipts and lifecycle writes before exit. The shutdown watchdog stays
+armed as a backstop; it is not the normal exit timer.
+
+Both process entrypoints call the existing flushed hard-exit path **inside**
+their main coroutine, after `start_gateway` completes all teardown/finally blocks.
+Calling it after `asyncio.run` is too late: `Runner.close` first cancels tasks
+and joins the default executor, whose abandoned network/cleanup jobs may never
+return. Embedded coroutine callers retain their existing lifecycle.
+
+A cancelled process exits successfully only for recorded stop intent, not merely
+because teardown set `_shutdown_event`. Stray runtime cancellation exits 1 so the
+service manager revives the gateway. A cancelled restart with no explicit exit
+code uses 75 only for a service restart; detached/in-place restarts retain code 0.
+The interrupted-cron mark and tool sweep share the existing shutdown bound;
+bounded stops reserve up to 0.5 seconds (half a smaller bound) for the sweep so a
+held cron fire fence cannot detach it immediately with a zero timeout.
+
+The stop task carries `tools.environments.local.process_exit_cleanup` into its
+workers. Local cleanup unlinks its known snapshot/cwd files without scanning
+the shared temp directory for orphan atomic snapshots; ordinary session teardown
+still removes those immediately. The managed default terminal cache is pruned by
+housekeeping, while an explicitly configured `TMPDIR` remains caller-owned.
+Verify `tests/gateway/test_process_exit_after_stop.py`, gateway process-exit,
+bounded-adapter and shutdown-kill tests, plus `tests/tools/test_local_temp_dir.py`.
+
 ## Shutdown Notice Routing
 
 Use upstream's `_delivery_target_key` for active chats, served home channels,

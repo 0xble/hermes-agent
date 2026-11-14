@@ -36,7 +36,7 @@ def _sweep(registry: Path) -> None:
         if not label.startswith(_PREFIXES) or not path.name == f"{label}.plist":
             continue
         target = f"gui/{os.getuid()}/{label}"
-        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15, check=False)
 
 
 def register_disposable_label(request, label: str, plist: Path) -> None:
@@ -57,7 +57,7 @@ def register_disposable_label(request, label: str, plist: Path) -> None:
 def _sweep_missing_plists(base: Path) -> None:
     """Recover disposable jobs after pytest has removed their registry and plist."""
     domain = f"gui/{os.getuid()}"
-    listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=15)
+    listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=15, check=False)
     if listing.returncode:
         return
     for row in listing.stdout.splitlines():
@@ -66,7 +66,7 @@ def _sweep_missing_plists(base: Path) -> None:
             continue
         label = columns[2]
         detail = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
-                                capture_output=True, text=True, timeout=15)
+                                capture_output=True, text=True, timeout=15, check=False)
         if detail.returncode:
             continue
         paths = [line.strip().removeprefix("path = ") for line in detail.stdout.splitlines()
@@ -85,7 +85,7 @@ def _sweep_missing_plists(base: Path) -> None:
                 or not relative.parts[2].startswith("pytest-")):
             continue
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"],
-                       capture_output=True, timeout=15)
+                       capture_output=True, timeout=15, check=False)
 
 
 def sweep_prior_sessions(request) -> None:

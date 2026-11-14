@@ -262,12 +262,12 @@ class TestCleanupFailedWorktreeAdd:
         # Availability means git actually translates, not merely that locale -a lists it.
         baseline = {**os.environ, "LC_ALL": "C", "LANGUAGE": "C"}
         english = subprocess.run(["git", "worktree", "-h"], cwd=repo, env=baseline,
-                                 capture_output=True, text=True).stdout
+                                 capture_output=True, text=True, check=False).stdout
         for candidate in ("de_DE.UTF-8", "fr_FR.UTF-8", "es_ES.UTF-8", "zh_CN.UTF-8"):
             env = {**os.environ, "LC_ALL": candidate, "LANG": candidate,
                    "LANGUAGE": candidate.split("_")[0]}
             translated = subprocess.run(["git", "worktree", "-h"], cwd=repo, env=env,
-                                        capture_output=True, text=True).stdout
+                                        capture_output=True, text=True, check=False).stdout
             if translated and translated != english:
                 break
         else:

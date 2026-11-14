@@ -174,7 +174,7 @@ async def test_recovery_failure_restores_cached_prompt(cached_harness, monkeypat
     h = cached_harness
     from run_agent import AIAgent
 
-    import tools.approval as approval
+    from tools import approval
 
     original_run = AIAgent.run_conversation
 

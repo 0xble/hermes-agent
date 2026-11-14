@@ -13,7 +13,7 @@ from agent.secret_sources._cache import CachedFetch
 @pytest.mark.parametrize("limit,age,expected", [(86400, 3600, True), (86400, 31536000, False),
                                                (0, 3600, False), (float('inf'), 31536000, False)])
 def test_source_bounds_transient_fallback_without_refreshing_cache(monkeypatch, tmp_path, limit, age, expected):
-    monkeypatch.setattr(op, 'get_source_environment', lambda: {})
+    monkeypatch.setattr(op, 'get_source_environment', dict)
     monkeypatch.setattr(op, 'find_op', lambda _: Path('/synthetic/op'))
     monkeypatch.setattr(op, '_rate_limit_cooldown_active', lambda *a: True)
     store = Mock()

@@ -210,7 +210,7 @@ class GatewayInboundHooksMixin:
                 env=build_subprocess_env(), cwd=cwd,
                 # Its own process group, so cleanup can reach what the shell started (POSIX;
                 # Windows ignores it and _stop_exec_tree walks the tree with taskkill /T).
-                start_new_session=True,
+                start_new_session=True,  # detached-spawn: ok — awaited; the timeout/cancel path kills its group
             ))
             proc = await asyncio.shield(spawn_task)
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=_EXEC_QUICK_COMMAND_TIMEOUT)

@@ -6,6 +6,7 @@ and only then: the store never decides on its own that an explicit close is stal
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import os
 import threading
 import time
@@ -89,7 +90,7 @@ def turn_env(monkeypatch, tmp_path, db):
         "_drain_queued_prompt": lambda *_a: False, "_voice_tts_enabled": lambda: False, "_get_db": lambda: db,
     }.items():
         monkeypatch.setattr(server, name, stub)
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     yield monkeypatch
     for sid in [s for s in server._sessions if s.startswith("ui-106459-")]:
         server._sessions.pop(sid, None)

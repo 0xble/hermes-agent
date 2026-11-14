@@ -3198,7 +3198,7 @@ class TestRunConversation:
 
         assert result["final_response"] == "Recovered on fallback"
         assert result["completed"] is True
-        mock_try_activate_fallback.assert_called_once_with()
+        mock_try_activate_fallback.assert_called_once_with(reason=FailoverReason.content_policy_blocked)
         assert mock_run_codex_stream.call_count == 2
         assert hook_events[0]["error_type"] == "ContentPolicyBlocked"
         assert hook_events[0]["retryable"] is False
@@ -6348,7 +6348,7 @@ class TestStreamingApiCall:
         # The builder must route it through the partial-stream-stub path
         # (id=PARTIAL_STREAM_STUB_ID, tool_calls=None so it can't execute,
         # finish_reason=length so the loop's continuation machinery fires with
-        # chunking guidance) rather than stamping a normal 'length' truncation.
+        # transport guidance) rather than stamping a normal 'length' truncation.
         from hermes_constants import PARTIAL_STREAM_STUB_ID
         chunks = [
             _make_chunk(tool_calls=[_make_tc_delta(0, "call_1", "write_file", '{"path":"x.txt","content":"hel')]),

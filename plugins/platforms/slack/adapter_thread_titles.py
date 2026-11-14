@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import html
+import inspect
 import logging
 import re
 from typing import Any, Optional
@@ -190,9 +191,14 @@ class SlackThreadTitlesMixin:
         agent._on_session_title = on_title
         return True
 
-    def _reserve_title_upgrade(self, source, title: str, current) -> Optional[str]:
+    async def _reserve_title_upgrade(self, source, title: str, current) -> Optional[str]:
         """Reserve before I/O: an ambiguous API failure must not retry over a manual rename."""
-        if not self._app or not self._thread_titles_enabled(source) or not current():
+        if not self._app or not self._thread_titles_enabled(source):
+            return None
+        current_result = current()
+        if inspect.isawaitable(current_result):
+            current_result = await current_result
+        if not current_result:
             return None
         key = self._workspace_thread_key(source.scope_id or "", source.chat_id, source.thread_id)
         if not key or key in self._upgraded_assistant_threads:
@@ -207,7 +213,7 @@ class SlackThreadTitlesMixin:
 
     async def _upgrade_assistant_thread_title(self, source, title: str, current) -> None:
         try:
-            title = self._reserve_title_upgrade(source, title, current)
+            title = await self._reserve_title_upgrade(source, title, current)
             if title:
                 await self._rename_thread(source.chat_id, source.thread_id, title, source.scope_id or "")
         except Exception:
@@ -216,12 +222,12 @@ class SlackThreadTitlesMixin:
     async def _title_channel_thread_root(self, source, title: str, current) -> None:
         """Show the generated title on a channel thread's root.
 
-        agents.sessions.rename covers channel threads only when Slack holds an agent session for
-        them (else session_not_found); Hermes never opens one there, so channels do not use it.
+        The visible channel heading stays on the root, independent of native session availability.
+        A session rename alone does not replace that first-line heading.
         """
         try:
             from slack_sdk.errors import SlackApiError
-            title = self._reserve_title_upgrade(source, title, current)
+            title = await self._reserve_title_upgrade(source, title, current)
             if not title:
                 return
             team_id = source.scope_id or ""

@@ -8,12 +8,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import re
 from dataclasses import replace
 from hermes_platform.resolver import locate_command
 
 from gateway.telegram_retire import save
 from gateway.telegram_retire_context import authored_definition, context_identity, task_context
+
+
+logger = logging.getLogger(__name__)
 
 
 def address(source, session_id):
@@ -67,7 +71,7 @@ class WorkInProgress(RuntimeError):
 
 def open_control(raw):
     """Use the inventory's terminal semantics for successor admission too."""
-    return raw is not None and json.loads(raw).get("status") not in {"cleared", "done", "completed", "stopped"}
+    return raw is not None and json.loads(raw).get("status") not in {"cleared", "done", "completed", "stopped", "cancelled"}
 
 
 async def inventory(runner, source, state) -> list[dict]:
@@ -575,6 +579,75 @@ async def settle_handoffs(runner, source, state):
             await save(runner, source, state)
 
 
+async def reconcile_controls(runner, source, state, items, *, confirmed_absent=False):
+    """A selected delete retires session controls, never claims or other obligations."""
+    if not state.get("reason") or state.get("target"):
+        return items
+    from gateway.telegram_retire import RetirementSuperseded, state_key
+    from hermes_cli.goals import GoalManager
+    from hermes_cli.loops import LoopManager
+
+    controls = [item for item in items if item["kind"] in {"goal", "loop"}
+                and item["id"] not in state["handoffs"] and not state.get("owners", {}).get(item["id"])
+                and (confirmed_absent or prepared_control(state, item))]
+    # Clearing is the last settlement step, not a way to make a blocked
+    # retirement look idle. External inventories cannot share this DB's lock.
+    if not controls or len(controls) != len(items):
+        return items
+    db = runner._session_db._db
+
+    def cancel(conn):
+        row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (state_key(source),)).fetchone()
+        stored = json.loads(row[0]) if row else None
+        if (not stored or stored["generation"] != state["generation"]
+                or stored["phase"] not in {"pending", "waiting", "failed"}
+                or stored.get("target") or stored.get("owners", {}) != state.get("owners", {})
+                or stored.get("reason") != state.get("reason")):
+            raise RetirementSuperseded
+        receipts = stored.setdefault("cancelled_controls", {})
+        current_controls = []
+        for kind in ("goal", "loop"):
+            key = f"{kind}:{state['session_id']}"
+            row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
+            before = row[0] if row else None
+            if before is None or not open_control(before):
+                continue
+            item = next((item for item in controls if item["kind"] == kind), None)
+            if item is None:
+                raise WorkInProgress("A new source control needs an owner decision before retirement.")
+            record = json.loads(before)
+            if _handoff_definition(record) != _handoff_definition(item["record"]):
+                raise RuntimeError(f"Cannot cancel {kind}: its definition changed during retirement")
+            if kind == "loop" and record.get("awaiting_response"):
+                raise WorkInProgress("The loop's execution must settle before its topic retires.")
+            current_controls.append((kind, key, before, record))
+        for kind, key, before, record in current_controls:
+            manager = (GoalManager if kind == "goal" else LoopManager)(state["session_id"], cursor=conn)
+            manager.clear()
+            after = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()[0]
+            if open_control(after):
+                raise RuntimeError(f"Retirement {kind} cancellation did not read back")
+            control_id = record.get("mutation_id") or hashlib.sha256(before.encode("utf-8")).hexdigest()
+            receipts[f"{kind}:{control_id}"] = {"kind": kind, "control_id": control_id,
+                "before": before, "after": after, "generation": state["generation"],
+                "reason": state["reason"], "action": "clear"}
+        db.set_meta(state_key(source), json.dumps(stored), cursor=conn)
+        return receipts
+
+    state["cancelled_controls"] = await asyncio.to_thread(db._execute_write, cancel)
+    for receipt in state["cancelled_controls"].values():
+        logger.info("Topic retirement %s cleared %s for session %s: selected topic deletion",
+                    state["generation"], receipt.get("kind", "control"), state["session_id"])
+    # Cancellation cannot turn a failed or incomplete inventory into permission to delete.
+    return await inventory(runner, source, state)
+
+
+def prepared_control(state, item):
+    """A changed authored control needs a fresh owner choice, not an old omission."""
+    record = state.get("prepared_controls", {}).get(item["id"])
+    return record is not None and _handoff_definition(record) == _handoff_definition(item["record"])
+
+
 async def prepare(runner, source, state):
     from gateway.telegram_retire_prepare import queue_preparation
     await settle_handoffs(runner, source, state)
@@ -606,6 +679,8 @@ async def prepare(runner, source, state):
             raise RuntimeError(f"Previously handed-off work still targets this topic: {item['id']}")
         selector = owners.get(item["id"]) or state.get("target")
         if not selector:
+            if item["kind"] in {"goal", "loop"} and prepared_control(state, item):
+                continue  # The preparation decision left this control unowned for deletion.
             # An exact-title hit is a candidate, not proof of subject ownership.
             # The normal session turn verifies the context and records a choice.
             unresolved.append(item)
@@ -637,6 +712,11 @@ async def prepare(runner, source, state):
         return await queue_preparation(runner, source, state, unresolved)
     # Repeating discovery catches work created by a final tool call and stale
     # destinations. Nothing can be deleted on an incomplete/failed inventory.
-    if await inventory(runner, source, state):
+    try:
+        remaining = await inventory(runner, source, state)
+        remaining = await reconcile_controls(runner, source, state, remaining)
+    except WorkInProgress as exc:
+        return await queue_preparation(runner, source, state, [], busy=str(exc))
+    if remaining:
         raise RuntimeError("Open work still points at this topic after handoff")
     return True

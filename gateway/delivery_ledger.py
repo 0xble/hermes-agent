@@ -247,7 +247,8 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             resume_marker_session_id TEXT,
             resume_marker_token TEXT,
             resume_marker_marked_at TEXT,
-            resume_turn_id TEXT
+            resume_turn_id TEXT,
+            supervisor_checkin INTEGER NOT NULL DEFAULT 0
         )"""
     )
     if "adapter_profile" not in {row[1] for row in conn.execute("PRAGMA table_info(delivery_obligations)")}:
@@ -258,6 +259,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         ("resume_marker_token", "resume_marker_token TEXT"),
         ("resume_marker_marked_at", "resume_marker_marked_at TEXT"),
         ("resume_turn_id", "resume_turn_id TEXT"),
+        ("supervisor_checkin", "supervisor_checkin INTEGER NOT NULL DEFAULT 0"),
     ):
         if name not in columns:
             add_column_if_missing(conn, "delivery_obligations", name, definition)
@@ -346,7 +348,8 @@ def _resume_marker_values(marker: Optional[tuple]) -> tuple:
 def record_obligation(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                       thread_id: Optional[str], content: str, adapter_profile: Optional[str] = None,
                       resume_marker: Optional[tuple] = None,
-                      resume_turn_id: Optional[str] = None) -> None:
+                      resume_turn_id: Optional[str] = None,
+                      supervisor_checkin: bool = False) -> None:
     """Record a final response as owed to the platform (state='pending')."""
     now, (pid, started) = time.time(), _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -355,11 +358,12 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
                 owner_pid, owner_started_at, adapter_profile,
-                resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id,
+                supervisor_checkin)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
              content, now, now, pid, started, str(adapter_profile).strip() if adapter_profile else "default",
-             *(_resume_marker_values(resume_marker)), resume_turn_id))
+             *(_resume_marker_values(resume_marker)), resume_turn_id, int(supervisor_checkin)))
         # Same transaction, same connection: the cron ledgers prune this way too
         # (cron/delivery_queue._prune_terminal_unlocked, cron/executions._prune_unlocked).
         _prune_unlocked(conn, now)
@@ -368,19 +372,21 @@ def record_obligation(*, obligation_id: str, session_key: str, platform: str, ch
 def record_crash_left_reply(*, obligation_id: str, session_key: str, platform: str, chat_id: str,
                             thread_id: Optional[str], content: str, since: float,
                             adapter_profile: Optional[str] = None,
-                            resume_turn_id: Optional[str] = None, part: bool = False) -> None:
+                            resume_turn_id: Optional[str] = None, part: bool = False,
+                            supervisor_checkin: bool = False) -> None:
     """Adopt a reply a killed process persisted but never ledgered. Unowned, so this boot's sweep
     claims it, and 'attempting', because a streamed reply may already be on screen: it is
     redelivered once, with the recovered marker. A no-op when the same reply was already ledgered
     since *since* (the turn start), and idempotent across boots that die before their sweep."""
     now = time.time()
     values = (obligation_id, session_key, platform, str(chat_id), str(thread_id) if thread_id else None,
-              content, now, now, str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id)
+              content, now, now, str(adapter_profile).strip() if adapter_profile else "default", resume_turn_id,
+              int(supervisor_checkin))
     insert = """INSERT OR IGNORE INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, adapter_profile, resume_turn_id)
-               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?, ?"""
+               owner_pid, owner_started_at, adapter_profile, resume_turn_id, supervisor_checkin)
+               SELECT ?, ?, ?, ?, ?, ?, 'attempting', 0, ?, ?, NULL, NULL, ?, ?, ?"""
     with _DB_LOCK, _transaction() as conn:
         if part:
             # A copy part the caller already found missing: its per-part id is the only identity,
@@ -415,6 +421,11 @@ def mark_delivered(obligation_id: str, result: Any = None) -> None:
     raw = getattr(result, "raw_response", None)
     fallback = isinstance(raw, dict) and raw.get("thread_fallback")
     _update_state(obligation_id, "delivered", error="thread_fallback_root" if fallback else "")
+
+
+def abandon_obligation(obligation_id: str, reason: str) -> None:
+    """Retire output that its owning policy no longer permits, without claiming a send ACK."""
+    _update_state(obligation_id, "abandoned", error=reason)
 
 
 def mark_failed(obligation_id: str, error: str = "") -> None:
@@ -462,7 +473,7 @@ def _update_state(obligation_id: str, state: str, error: str = "") -> None:
 def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attempts, profile, *,
                  needs_marker: bool, runtime: bool = False, flood: bool = False,
                  last_error: Optional[str] = None, resume_marker: Optional[tuple] = None,
-                 resume_turn_id: Optional[str] = None) -> dict[str, Any]:
+                 resume_turn_id: Optional[str] = None, supervisor_checkin: bool = False) -> dict[str, Any]:
     """Claimed-row dict handed back for redelivery. A marked row names its own cause: ``flood`` (a reply
     the rate limit refused, possibly after accepting part of it) gets FLOOD_MARKER at boot or at runtime;
     other ambiguous redeliveries get the neutral duplicate hint. ``last_error`` is the row's pre-claim
@@ -476,6 +487,7 @@ def _claimed_row(oid, session_key, platform, chat_id, thread_id, content, attemp
            **({"last_error": last_error} if last_error else {}), "attempts": attempts + 1}
     row["resume_marker"] = resume_marker
     row["resume_turn_id"] = resume_turn_id
+    row["supervisor_checkin"] = bool(supervisor_checkin)
     return row
 
 
@@ -506,14 +518,15 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
                       owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
-                      resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id
+                      resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id,
+                      supervisor_checkin
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')
                ORDER BY created_at, rowid"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state, attempts, created_at,
              owner_pid, owner_started_at, adapter_profile, last_error, updated_at,
-             marker_session_id, marker_token, marker_marked_at, resume_turn_id) in rows:
+             marker_session_id, marker_token, marker_marked_at, resume_turn_id, supervisor_checkin) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:  # exhausted -> abandoned
@@ -543,7 +556,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                         "last_error": last_error,
                         "resume_marker": _resume_marker_from_row(
                             marker_session_id, marker_token, marker_marked_at),
-                        "resume_turn_id": resume_turn_id})
+                        "resume_turn_id": resume_turn_id,
+                        "supervisor_checkin": bool(supervisor_checkin)})
                 continue
             # Every claim starts a send, so the row leaves 'pending'/'failed' for 'attempting' in the same
             # CAS: a boot killed inside the redelivery then leaves proof the platform may have it (next boot
@@ -566,7 +580,8 @@ def sweep_recoverable(now: Optional[float] = None, *, deliverable_platforms: Opt
                                             flood=flood_row,
                                             resume_marker=_resume_marker_from_row(
                                                 marker_session_id, marker_token, marker_marked_at),
-                                            resume_turn_id=resume_turn_id))
+                                            resume_turn_id=resume_turn_id,
+                                            supervisor_checkin=supervisor_checkin))
     return claimed
 
 
@@ -592,7 +607,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, attempts, created_at, owner_pid,
                       owner_started_at, last_error, adapter_profile, updated_at,
-                      resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id
+                      resume_marker_session_id, resume_marker_token, resume_marker_marked_at, resume_turn_id,
+                      supervisor_checkin
                       , state
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed') AND platform=?
@@ -604,7 +620,7 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
         held_chats: set = set()
         for (oid, session_key, row_platform, chat_id, thread_id, content, attempts, created_at,
              owner_pid, owner_started_at, last_error, adapter_profile, updated_at,
-             marker_session_id, marker_token, marker_marked_at, resume_turn_id, state) in rows:
+             marker_session_id, marker_token, marker_marked_at, resume_turn_id, supervisor_checkin, state) in rows:
             if adapter_profile != expected_profile:
                 continue  # another bot identity: its own order, its own sweep
             chat_key = (chat_id, thread_id)
@@ -659,7 +675,8 @@ def sweep_failed_for_runtime(platform: str, now: Optional[float] = None, *,
                                             flood=is_flood_error(last_error), last_error=last_error,
                                             resume_marker=_resume_marker_from_row(
                                                 marker_session_id, marker_token, marker_marked_at),
-                                            resume_turn_id=resume_turn_id))
+                                            resume_turn_id=resume_turn_id,
+                                            supervisor_checkin=supervisor_checkin))
     return claimed
 
 

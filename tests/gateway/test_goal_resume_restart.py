@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import queue
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -128,7 +128,7 @@ _GW_KEY = "agent:main:discord:channel:goal-resume"
 
 class _FakeSessionStore:
     def __init__(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.entry = SessionEntry(_GW_KEY, _GW_SID, now, now)
 
     def get_or_create_session(self, source, **_kwargs):

@@ -33,6 +33,8 @@ _BUDGET_TOOL_NAME = "__budget_enforcement__"
 _MCP_ENVELOPE_KEYS = frozenset({"result", "structuredContent", "_meta"})
 _ENVELOPE_METADATA_TAG = "<mcp-result-metadata>"
 _ENVELOPE_METADATA_CLOSING_TAG = "</mcp-result-metadata>"
+_TOOL_METADATA_TAG = "<tool-result-metadata>"
+_TOOL_METADATA_CLOSING_TAG = "</tool-result-metadata>"
 _UNSAFE_RESULT_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9_.-]+")
 _MAX_RESULT_FILENAME_STEM = 120
 
@@ -282,34 +284,59 @@ def generate_preview(content: str, max_chars: int = DEFAULT_PREVIEW_SIZE_CHARS) 
     return content[:last_nl + 1 if last_nl > max_chars // 2 else max_chars], True
 
 
+def _tool_metadata_block(fields: dict) -> str:
+    metadata = json.dumps(fields, ensure_ascii=False, indent=1, sort_keys=True, default=str)
+    return f"{_TOOL_METADATA_TAG}\n{metadata}\n{_TOOL_METADATA_CLOSING_TAG}"
+
+
+def _pageable_tool_json(content: str, payload: dict) -> str:
+    strings = [(key, value) for key, value in payload.items() if isinstance(value, str)]
+    if not strings:
+        return content
+    key, text = strings[0]
+    for name, value in strings[1:]:
+        if len(value) > len(text):
+            key, text = name, value
+    if "\n" not in text or "\x00" in text or len(text) < len(content) / 2:
+        return content
+    header, trailer = {"text_field": key}, {}
+    for name, value in payload.items():
+        if name != key:
+            (trailer if isinstance(value, (dict, list)) else header)[name] = value
+    pageable = f"{_tool_metadata_block(header)}\n\n{text}"
+    return f"{pageable}\n\n{_tool_metadata_block(trailer)}\n" if trailer else pageable
+
+
 def _pageable_text(content: str) -> str:
-    """Rewrite an MCP handler result envelope into the text it wraps, else return *content*.
+    """Rewrite a JSON tool result into the text it wraps, else return *content*.
 
-    ``tools/mcp_tool_handlers.py::_render_call_tool_result`` hands the model a JSON string
-    (``{"result": <text>, ...}``) so structured metadata survives inline delivery. Persisting
-    that string verbatim put a multi-hundred-KB document on ONE line with escaped newlines, so
-    the ``read_file`` offset/limit pagination the ``<persisted-output>`` block recommends could
-    not be used at all (#90426).
+    Persisting a JSON result verbatim put the whole document on ONE line with escaped newlines,
+    so the ``read_file`` offset/limit pagination the ``<persisted-output>`` block recommends could
+    not be used (#90426 for MCP envelopes; built-in tools such as terminal, execute_code,
+    read_file and skill_view return JSON objects with the same problem).
 
-    Recognized by SHAPE, not by tool name: the envelope is the only JSON object in the codebase
-    whose keys are a subset of ``{"result", "structuredContent", "_meta"}`` with a non-empty
-    string ``result``. That keeps opaque JSON from any other tool verbatim, and it also covers
-    the aggregate path (``enforce_turn_budget`` persists under ``_BUDGET_TOOL_NAME``, so a
-    ``mcp__``-prefix test would miss exactly the results it has to fix).
-
-    Sibling members are appended after the text in a delimited metadata block instead of being
-    dropped: they are the structured payloads ``_render_call_tool_result`` deliberately keeps
-    for the model (#115430), and the spill file is the only copy left once the envelope is
-    replaced by the preview. Anything unrecognized — unparseable JSON, a non-object, an unknown
-    key, a missing/empty/non-string ``result`` (e.g. a structuredContent-only result, which has
-    no pageable text) — is persisted verbatim, exactly as before.
+    Recognized by SHAPE, not by tool name: ``enforce_turn_budget`` persists under
+    ``_BUDGET_TOOL_NAME``, so a tool-name test would miss exactly the results it has to fix.
+    The MCP envelope (keys a subset of ``{"result", "structuredContent", "_meta"}``) unwraps
+    ``result`` and appends its sibling members after the text, because they are the structured
+    payloads ``_render_call_tool_result`` deliberately keeps for the model (#115430). Any other
+    JSON object unwraps its longest string only when that string is multi-line, NUL-free (a NUL
+    makes ``read_file`` treat the file as binary) and at least half the payload, so small or
+    opaque JSON stays verbatim. Its scalar keys (``status``, ``exit_code``, ``error``, notes,
+    paths) go in a metadata block BEFORE the text, so they stay in the inline preview; its lists
+    and dicts go in a second block AFTER it, so they cannot push the text out of the preview (a
+    ``skill_view`` result's ``linked_files`` and ``metadata`` filled all of it). Either way
+    nothing is dropped: the spill file is the only copy left once the result is replaced by the
+    preview.
     """
     try:
         payload = json.loads(content)
     except (TypeError, ValueError):
         return content
-    if not isinstance(payload, dict) or not payload or not set(payload) <= _MCP_ENVELOPE_KEYS:
+    if not isinstance(payload, dict) or not payload:
         return content
+    if "result" not in payload or not set(payload) <= _MCP_ENVELOPE_KEYS:
+        return _pageable_tool_json(content, payload)
     text = payload.get("result")
     if not isinstance(text, str) or not text:
         return content
@@ -414,7 +441,11 @@ def maybe_persist_tool_result(content: str, tool_name: str, tool_use_id: str, en
     def _persisted(path: str, host_suffix: str = "") -> str:
         logger.info("Persisted large tool result: %s (%s, %d chars -> %s%s)",
                     tool_name, tool_use_id, len(persisted_content), path, host_suffix)
-        return _build_persisted_message(preview, has_more, len(persisted_content), path)
+        message = _build_persisted_message(preview, has_more, len(persisted_content), path)
+        node = getattr(env, "_hermes_node", None)
+        if node is not None:
+            message = message.replace("Use the read_file tool", f"Use the read_file tool with node={node.name!r}")
+        return message
 
     # Always persist host-side first: cache/spillover is the single canonical home.
     host_path = _write_to_spillover(persisted_content, filename)
@@ -462,7 +493,7 @@ def _spill_largest_text_part(parts: list, tool_use_id: str, env, config: BudgetC
 
 
 def enforce_turn_budget(tool_messages: list[dict], env=None,
-                        config: BudgetConfig = DEFAULT_BUDGET) -> list[dict]:
+                        config: BudgetConfig = DEFAULT_BUDGET, env_for_message=None) -> list[dict]:
     """Layer 3: persist the largest non-persisted results first until the turn's aggregate is
     under budget. Mutates the list in-place and returns it. A multimodal result (part list) counts its
     text characters and spills its largest text part; its images stay inline."""
@@ -477,9 +508,10 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
         if total_size <= config.turn_budget:
             break
         content = tool_messages[idx]["content"]
+        result_env = env_for_message(tool_messages[idx], env) if env_for_message else env
         tool_use_id = tool_messages[idx].get("tool_call_id", f"budget_{idx}")
         if isinstance(content, list):
-            parts, saved = _spill_largest_text_part(content, tool_use_id, env, config)
+            parts, saved = _spill_largest_text_part(content, tool_use_id, result_env, config)
             if saved:
                 total_size -= saved
                 tool_messages[idx]["content"] = parts
@@ -487,7 +519,7 @@ def enforce_turn_budget(tool_messages: list[dict], env=None,
             continue
         replacement = maybe_persist_tool_result(
             content=content, tool_name=_BUDGET_TOOL_NAME, tool_use_id=tool_use_id,
-            env=env, config=config, threshold=0)
+            env=result_env, config=config, threshold=0)
         if replacement != content:
             total_size += len(replacement) - size
             tool_messages[idx]["content"] = replacement

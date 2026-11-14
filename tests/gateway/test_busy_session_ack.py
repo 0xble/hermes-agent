@@ -97,6 +97,20 @@ def _make_adapter(platform_val="telegram"):
 class TestBusySessionAck:
     """User sends a message while agent is running — should get acknowledgment."""
 
+    @pytest.mark.asyncio
+    async def test_busy_ack_is_not_sent_to_a_bot_peer(self):
+        """Regression for #137027: runtime acknowledgements must not restart bot loops."""
+        from gateway.run import GatewayRunner
+
+        runner, _sentinel = _make_runner()
+        event = _make_event()
+        event.source.is_bot = True
+        adapter = _make_adapter()
+
+        await GatewayRunner._send_busy_ack_reply(runner, event, adapter, "⚡ Interrupting current task")
+
+        adapter._send_with_retry.assert_not_awaited()
+
 
     @pytest.mark.asyncio
     async def test_telegram_grace_followups_respect_queue_fifo(self, monkeypatch):
@@ -412,6 +426,52 @@ class TestBusySessionAck:
         content = call_kwargs.kwargs.get("content", "")
         assert content
         assert str(sys.maxsize) not in content
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("boundary", ["adapter", "priority", "durable"])
+@pytest.mark.parametrize("protection", ["unauthorized", "internal", "passive-fyi", "compression", "drain", "non-text"])
+async def test_meeting_lane_preserves_busy_protections(monkeypatch, boundary, protection):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "0")
+    monkeypatch.setenv("HERMES_GATEWAY_BUSY_ACK_ENABLED", "false")
+    runner, _sentinel = _make_runner()
+    runner._busy_input_mode = runner._busy_text_mode = "queue"
+    runner._session_has_compression_in_flight = AsyncMock(return_value=protection == "compression")
+    event = _make_event()
+    event.source.platform = Platform.TELEGRAM
+    event.source.thread_id = "topic-1"
+    event.auto_skill = "meetings"
+    runner._is_user_authorized = lambda source, **_kwargs: protection != "unauthorized"
+    event.internal = protection == "internal"
+    event.text = (
+        "📨 Relay title\n\nA status update.\n\nFrom: Source Agent · FYI, no action requested\n[relay from=hermes:default/source receipt=r1]"
+        if protection == "passive-fyi" else event.text
+    )
+    runner._relay_fyi_passive_enabled = lambda source=None: protection == "passive-fyi"
+    runner._draining = runner._restart_requested = protection == "drain"
+    event.message_type = MessageType.DOCUMENT if protection == "non-text" else MessageType.TEXT
+    event.media_urls = ["/not-a-real-file.pdf"] if protection == "non-text" else []
+    event.media_types = ["application/pdf"] if protection == "non-text" else []
+    key = runner._session_key_for_source(event.source)
+    adapter = _make_adapter()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    agent = MagicMock()
+    agent.steer.return_value = True
+    runner._session_state(key).turn.agent = agent
+    runner._session_state(key).turn.event = _make_event()
+    if boundary == "adapter":
+        await runner._handle_active_session_busy_message(event, key)
+    elif boundary == "priority":
+        await runner._handle_message(event)
+    elif protection != "unauthorized":  # durable admission is after the authorization gate
+        monkeypatch.setattr("gateway.session_authorities.active_authority", lambda _runner: SimpleNamespace())
+        monkeypatch.setattr("gateway.session_ingress.admit_message", AsyncMock(return_value=None))
+        runner._hm_post_admission_consume = AsyncMock(return_value=(False, None))
+        await runner._hm_authority_admission(event, event.source, key, event.internal)
+    agent.steer.assert_not_called()
+    agent.interrupt.assert_not_called()
 
 
 class TestBusySessionOnboardingHint:

@@ -50,7 +50,7 @@ if sys.argv[1] == 'gateway':
     import gateway.config
     import agent.auxiliary_client
 elif sys.argv[1] == 'request-metadata':
-    for name in ('agent.gemini_native_adapter', 'plugins.platforms.yuanbao.adapter',
+    for name in ('agent.gemini_native_adapter',
                  'hermes_cli.model_catalog', 'hermes_cli.models',
                  'hermes_cli.doctor_connectivity', 'hermes_cli.models_pricing',
                  'hermes_cli.models_local', 'hermes_cli.models_reasoning_caps',
@@ -93,7 +93,7 @@ assert not Path(sys.argv[3]).exists(), Path(sys.argv[3]).read_text()
     result = subprocess.run(
         [sys.executable, "-c", probe, entry, str(tmp_path), str(calls)],
         cwd=repo, env=env, capture_output=True, text=True, timeout=30,
-    )
+     check=False)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -135,47 +135,6 @@ def _check_native_gemini(monkeypatch, module, expected):
     with module.GeminiNativeClient(api_key="probe-key", default_headers={"User-Agent": "configured"}) as client:
         client.chat.completions.create(model="header-probe", messages=[{"role": "user", "content": "hi"}])
     assert observed[-1]["user-agent"] == "configured"
-
-
-def _check_yuanbao(monkeypatch, module, expected):
-    import asyncio
-    import httpx
-    from plugins.platforms.yuanbao import yuanbao_proto as proto
-
-    observed, frames = [], []
-    real_client = httpx.AsyncClient
-
-    def respond(request):
-        observed.append(dict(request.headers))
-        return httpx.Response(200, json={"code": 0, "data": {"token": "probe"}})
-
-    monkeypatch.setattr(module.httpx, "AsyncClient", lambda **kwargs: real_client(
-        **kwargs, transport=httpx.MockTransport(respond)))
-    ack = proto._conn_request(proto.CMD_TYPE["Response"], "auth-bind", "ack", "ConnAccess",
-                              proto._encode_parts([(1, "v", 0), (3, "s", "probe-connect")]))
-
-    class Socket:
-        async def send(self, frame):
-            frames.append(frame)
-
-        async def recv(self):
-            return ack
-
-    async def authenticate():
-        data = await module.SignManager.fetch("key", "secret", "https://yuanbao.invalid", "probe-route")
-        manager = module.ConnectionManager(SimpleNamespace(_bot_id="probe-bot", _route_env="probe-route", name="probe"))
-        manager._ws = Socket()
-        assert await manager._authenticate(data)
-
-    asyncio.run(authenticate())
-    assert observed[0]["x-appversion"] == expected
-    assert observed[0]["x-bot-version"] == expected
-    assert observed[0]["x-route-env"] == "probe-route"
-    decoded = proto.decode_conn_msg(frames[0])
-    request = proto._fields_to_dict(proto._parse_fields(decoded["data"]))
-    device = proto._fields_to_dict(proto._parse_fields(proto._get_bytes(request, 3)))
-    assert proto._get_string(device, 1) == expected
-    assert proto._get_string(device, 24) == expected
 
 
 def _check_manifest(monkeypatch, module, expected):
@@ -242,7 +201,7 @@ def _check_cli_sibling_consumers(monkeypatch, module, expected):
     assert observed[-1]["x-api-key"] == "probe-key"
     assert observed[-1]["anthropic-version"] == "2023-06-01"
     monkeypatch.setattr(config, "get_env_value", lambda name: "probe-key" if name == "GITHUB_TOKEN" else "")
-    monkeypatch.setattr(config, "load_env", lambda: {})
+    monkeypatch.setattr(config, "load_env", dict)
     assert not doctor_connectivity._probe_github_token().issues
     assert observed[-1]["user-agent"] == expected
     assert observed[-1]["authorization"] == "Bearer probe-key"
@@ -325,7 +284,6 @@ def _check_perplexity(monkeypatch, module, expected):
 
 _REQUEST_CONSUMERS = {
     "native-gemini": ("agent.gemini_native_adapter", "hermes-agent", _check_native_gemini),
-    "yuanbao": ("plugins.platforms.yuanbao.adapter", "", _check_yuanbao),
     "manifest": ("hermes_cli.model_catalog", "hermes-cli", _check_manifest),
     "cli-catalogs": ("hermes_cli.models", "hermes-cli", _check_cli_catalogs),
     "telegram-onboarding": ("hermes_cli.web_server_messaging", "HermesDashboard", _check_telegram_onboarding),
@@ -343,7 +301,7 @@ def test_versioned_headers_reach_client_and_catalog_boundaries(monkeypatch, prov
 
         module_name, _, check = _REQUEST_CONSUMERS[provider]
         module = importlib.import_module(module_name)
-        version_owner = module if provider == "yuanbao" else importlib.import_module("hermes_cli.version_info")
+        version_owner = importlib.import_module("hermes_cli.version_info")
         monkeypatch.setattr(version_owner, "get_version_info", lambda: SimpleNamespace(base_version="2099.1.1"))
         check(monkeypatch, module, f"{prefix}/2099.1.1" if prefix else "2099.1.1")
         return

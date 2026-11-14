@@ -107,8 +107,9 @@ class TestKernelLifecycle(unittest.TestCase):
     def test_kernel_exits_when_its_backend_parent_dies(self):
         """A kernel must not outlive the host that spawned it, even when the
         host dies without cleanup (SIGKILL/OOM/crash). Windows: inherited
-        SYNCHRONIZE handle; POSIX: inherited death pipe. Both are proven the
-        same way — kill the host mid-cell, the kernel is gone within seconds."""
+        SYNCHRONIZE handle; POSIX: the kernel's group is registered with the
+        owner-death supervisor. Both are proven the same way — kill the host
+        mid-cell, the kernel is gone within seconds."""
         import psutil
 
         repo_root = str(Path(__file__).resolve().parents[2])
@@ -474,7 +475,7 @@ class TestKernelOwnershipAndLifecycle(unittest.TestCase):
         self.assertEqual([r["status"] for r in results], ["success"] * 6)
         self.assertEqual(len(_KERNELS), 1)
         runners = [proc for proc, args in spawned
-                   if len(args) == 2 and Path(args[1]).name == "hermes_kernel_runner.py"]
+                   if len(args) == 3 and Path(args[1]).name == "hermes_kernel_runner.py"]
         self.assertEqual(len(runners), 1, "parallel cells spawned an unowned kernel")
         kernel = next(iter(_KERNELS.values()))
         self.assertIs(kernel.proc, runners[0])

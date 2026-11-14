@@ -63,7 +63,7 @@ def test_empty_slots_skip_but_media_only_reaches_the_transcript(tmp_path, monkey
 
 
 def test_reply_context_and_inline_contract_survive_replay(tmp_path, monkeypatch):
-    runner, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner, source, key, _db = _spooled_runner(tmp_path, monkeypatch)
     reply = MessageEvent(text="what about this?", message_type=MessageType.DOCUMENT, source=source,
                          user_id="u1", message_id="103", media_urls=["/media/a.txt"],
                          media_types=["text/plain"], media_text_inlined=[False],
@@ -82,7 +82,7 @@ def test_reply_context_and_inline_contract_survive_replay(tmp_path, monkeypatch)
 
 
 def test_legacy_spool_without_new_keys_still_replays(tmp_path, monkeypatch):
-    runner, _source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner, _source, key, _db = _spooled_runner(tmp_path, monkeypatch)
     path = tmp_path / "pending_messages" / "pending-legacy.json"
     path.parent.mkdir()
     path.write_text(json.dumps({"session_key": key, "ts": int(datetime.now().timestamp()), "data": {

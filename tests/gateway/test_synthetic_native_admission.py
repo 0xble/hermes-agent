@@ -115,7 +115,7 @@ async def test_lifted_goal_barrier_drives_real_native_admission(native_chat):
 @pytest.mark.asyncio
 async def test_watch_match_drives_real_process_notice_admission(native_chat):
     from tools.process_registry import ProcessRegistry, ProcessSession
-    runner, adapter, authority, source, sent, turns = native_chat
+    runner, _adapter, authority, source, sent, turns = native_chat
     key = runner._session_key_for_source(source)
     entry = runner.session_store.lookup_by_session_key(key)
     registry = ProcessRegistry()
@@ -138,7 +138,7 @@ async def test_watch_match_drives_real_process_notice_admission(native_chat):
 
 @pytest.mark.asyncio
 async def test_internal_entry_can_use_native_codec_without_losing_metadata(native_chat):
-    runner, adapter, authority, source, sent, turns = native_chat
+    runner, _adapter, authority, source, _sent, turns = native_chat
     event = MessageEvent(text='process notice', source=source, internal=True,
                          metadata={'gateway_session_key': runner._session_key_for_source(source),
                                    'notification_origin': 'process_registry_synthetic'})
@@ -162,7 +162,7 @@ async def test_internal_entry_can_use_native_codec_without_losing_metadata(nativ
 
 @pytest.mark.asyncio
 async def test_foreign_user_metadata_still_refuses(native_chat):
-    runner, adapter, authority, source, sent, turns = native_chat
+    _runner, _adapter, authority, source, _sent, turns = native_chat
     for metadata in ({'foreign': 'value'}, {'gateway_session_key': 'forged'},
                      {'goal_continuation': True}, {'_native_synthetic': True}, ['foreign']):
         with pytest.raises(RuntimeStoreError) as refused:
@@ -174,7 +174,7 @@ async def test_foreign_user_metadata_still_refuses(native_chat):
 @pytest.mark.asyncio
 @pytest.mark.parametrize('shape', ['internal', 'goal', 'cron', 'process'])
 async def test_internal_refusal_has_no_reply_and_one_operator_warning(native_chat, monkeypatch, caplog, shape):
-    runner, adapter, authority, source, sent, turns = native_chat
+    _runner, _adapter, authority, source, _sent, turns = native_chat
     fields = {'internal': {'internal': True},
               'goal': {'metadata': {'goal_continuation': True}},
               'cron': {'metadata': {'cron_delivery': True}},
@@ -261,7 +261,7 @@ async def test_refused_gateway_prompt_never_sends_a_transport_reply(native_chat,
 @pytest.mark.asyncio
 async def test_rewritten_gateway_prompt_keeps_private_producer_provenance(native_chat):
     from gateway.session_ingress_context import carry_callback, native_callback
-    runner, adapter, authority, source, sent, turns = native_chat
+    runner, _adapter, authority, source, _sent, turns = native_chat
     original = goal_prompt(runner, source, 'original')
     rewritten = replace(original, text='rewritten')
     carry_callback(original, rewritten)

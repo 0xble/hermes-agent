@@ -48,6 +48,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "pre_llm_call", "post_llm_call", "pre_api_request", "post_api_request", "api_request_error",
     "pre_auxiliary_call", "post_auxiliary_call", "pre_verify", "on_session_start", "on_session_end",
     "post_steer_delivered",
+"on_session_open",
     # Fail-open consumer on every inbound gateway message: a hung plugin must not stall the profile.
     "post_gateway_admission",
     # Observer on every local session's commands, fired by the gateway (gateway/session_commands.py).
@@ -58,7 +59,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
 _HOOK_CALL_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
-    "pre_command": ("session_key",), "post_compaction": ("session_id",),
+    "pre_command": ("session_key",), "post_compaction": ("session_id",), "on_session_open": ("session_id",),
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
@@ -199,11 +200,7 @@ def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
     t = plugins._background_discovery_thread
     if t is None or t is threading.current_thread() or plugins.in_plugin_load_worker():
         return
-    if not t.is_alive():
-        if timeout is None and (plugins._background_discovery_error is not None
-                                or not getattr(plugins.get_plugin_manager(), "_discovery_complete", False)):
-            error = plugins._background_discovery_error
-            raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+    if not t.is_alive() and timeout is not None:
         return
     if timeout is None:
         while t.is_alive():
@@ -217,8 +214,13 @@ def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
     if plugins._background_discovery_error is not None:
         error = plugins._background_discovery_error
         raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
-    if timeout is None and not getattr(plugins.get_plugin_manager(), "_discovery_complete", False):
-        raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
+    if timeout is None:
+        manager = plugins.get_plugin_manager()
+        # The control listener can force-reload before gateway startup finishes. Its
+        # transient false flag is not a failed background sweep; await the verdict.
+        with manager._discovery_lock:
+            if not manager._discovery_complete:
+                raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
 
 
 def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:
@@ -467,7 +469,8 @@ class PluginDispatchMixin:
         what they declare. Each callback is isolated. Bounded hooks and ``pre_tool_call`` run under
         ``plugins.hook_callback_timeout`` (worker abandoned, never joined); ``pre_tool_call`` fails
         closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
-        caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
+        caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject, or
+        ``{"action": "block", "message": "..."}`` to end the turn before any inference request.
         """
         from agent.safe_worker_policy import safe_worker_enabled
 
@@ -983,7 +986,7 @@ class PluginDispatchMixin:
                 call_kwargs = {**kwargs, _payload_key: _safe_copy(kwargs[_payload_key]),
                                original_key: _safe_copy(kwargs[original_key])}
             try:
-                ret = cb(**call_kwargs)
+                ret = cb(**self._hook_callback_kwargs(cb, call_kwargs))  # narrow signatures, as hooks
                 if ret is not None:
                     results.append(ret)
                     if _payload_key and isinstance(ret, dict) and isinstance(ret.get(_payload_key), dict):

@@ -46,7 +46,7 @@ def test_first_migration_failure_retries_without_ready_candidate(tmp_path, monke
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
-    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", list)
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
     calls = []
     monkeypatch.setattr(update_cmd, "_activate_immutable_release", lambda **kw: calls.append(kw) or True)
@@ -61,7 +61,7 @@ def test_opted_in_already_current_checkout_stages_first_migration(tmp_path, monk
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
-    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", list)
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
     calls = []
     monkeypatch.setattr(update_cmd, "_activate_immutable_release", lambda **kw: calls.append(kw) or True)
@@ -76,7 +76,7 @@ def test_deferred_first_migration_stages_but_does_not_activate(tmp_path, monkeyp
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd, "_updates_config", lambda: {"immutable_releases": True})
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
-    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", list)
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
     calls = []
     monkeypatch.setattr(update_cmd, "_activate_immutable_release", lambda **kw: calls.append(kw) or True)

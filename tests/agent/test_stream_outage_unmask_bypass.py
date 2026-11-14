@@ -15,6 +15,17 @@ from tests.agent import _shared_cooldown_stub as harness
 from tests.agent.test_stream_unmask_5xx import _make_call, _StreamErr, _ProbeErr
 
 
+def _child_at(now, child):
+    # Wall time drives the durable breaker; monotonic time still drives real request
+    # deadlines. Both processes must observe an active window regardless of startup
+    # latency on a contended CI runner.
+    return (
+        'from unittest.mock import patch\n'
+        f'patch("time.time", return_value={now!r}).start()\n'
+        + child
+    )
+
+
 @pytest.mark.parametrize(
     ("status", "message", "reason"),
     [
@@ -42,10 +53,12 @@ def test_stream_outage_falls_back_after_one_primary_call(tmp_path, monkeypatch, 
     assert classify_api_error(error, provider="custom").reason.value == reason
     monkeypatch.setattr(
         harness, "CHILD",
-        'from unittest.mock import patch\n'
-        'patch("agent.turn_api_error.interruptible_backoff_sleep", '
-        'side_effect=AssertionError("provider-wide outage entered local backoff")).start()\n'
-        + harness.CHILD,
+        _child_at(1_900_000_000.0,
+            'from unittest.mock import patch\n'
+            'patch("agent.turn_api_error.interruptible_backoff_sleep", '
+            'side_effect=AssertionError("provider-wide outage entered local backoff")).start()\n'
+            + harness.CHILD,
+        ),
     )
     with harness.StubProvider() as stub:
         stub.failure_status = status
@@ -62,6 +75,39 @@ def test_stream_outage_falls_back_after_one_primary_call(tmp_path, monkeypatch, 
     assert all_primary == first_primary, "a fresh process must not call the cooled primary"
     (record,) = json.loads((home / "state" / "model_cooldowns.json").read_text(encoding="utf-8-sig"))["routes"].values()
     assert record["reason"] == reason
+
+
+def test_transient_stream_outage_allows_one_primary_probe_after_short_window(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "agent:\n  api_max_retries: 3\ncompression:\n  enabled: false\n", encoding="utf-8",
+    )
+    child = harness.CHILD
+    now = 1_900_000_000.0
+    with harness.StubProvider() as stub:
+        stub.failure_status = 429
+        stub.retry_after = None
+        monkeypatch.setattr(harness, "CHILD", _child_at(now, child))
+        first = harness.run_turn(home, stub.url, "stream")
+        (initial,) = json.loads((home / "state" / "model_cooldowns.json").read_text(encoding="utf-8-sig"))["routes"].values()
+        assert initial["reset_at"] - initial["recorded_at"] == 15
+        assert stub.primary_requests() == [{"model": "primary-model", "status": 429, "stream": True}]
+
+        # A slow startup can legitimately cross the first window. That fresh
+        # process owns a recovery probe, not a duplicate non-streaming unmask call.
+        monkeypatch.setattr(harness, "CHILD", _child_at(now + 16, child))
+        second = harness.run_turn(home, stub.url, "stream")
+        assert stub.primary_requests() == [
+            {"model": "primary-model", "status": 429, "stream": True},
+            {"model": "primary-model", "status": 429, "stream": True},
+        ]
+    assert first["final_response"] == second["final_response"] == "OK from fallback-model"
+    assert first["failed"] is second["failed"] is False
+    (rearmed,) = json.loads((home / "state" / "model_cooldowns.json").read_text(encoding="utf-8-sig"))["routes"].values()
+    assert rearmed["outage_id"] == initial["outage_id"]
+    assert rearmed["backoff_count"] == 2
+    assert rearmed["reset_at"] == now + 16 + 120
 
 
 @pytest.mark.parametrize(("status", "upstream_limit"), [(500, False), (502, False), (503, False), (503, True)])

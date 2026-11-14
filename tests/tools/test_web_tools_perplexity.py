@@ -63,7 +63,8 @@ def test_search_dispatch_maps_search_api_shape():
 
 def test_extract_dispatch_snippets_per_url_and_missing_key(monkeypatch):
     """web_extract on backend=perplexity posts every URL to /sdk/content/snippets;
-    a URL the backend failed carries ``error`` instead of content; no key → error, no HTTP."""
+    a URL the backend failed carries ``error`` instead of content; no key → error, no HTTP.
+    ``public_dns`` serves the SSRF guard's lookups of tokio.rs / docs.rs."""
     def public_dns(host, port, *args, **kwargs):
         assert host in ['tokio.rs', 'docs.rs']
         return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port or 443))]

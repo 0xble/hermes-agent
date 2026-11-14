@@ -12,6 +12,20 @@ from pathlib import Path
 from contextlib import suppress
 from typing import Optional
 
+from hermes_cli.home_data_layout import SECRET_CACHE_STORES
+
+
+def _named_remote():
+    from tools.node_execution import current_execution
+    return current_execution() is not None
+
+
+def _realpath(path) -> str:
+    if _named_remote():
+        from tools.file_backend_state import policy_realpath
+        return policy_realpath(path)
+    return os.path.realpath(path)
+
 
 def _constants_path(getter_name: str) -> Path:
     """Call ``hermes_constants.<getter_name>()`` (local import avoids cycles); ``~/.hermes`` on any failure."""
@@ -39,15 +53,21 @@ def _hermes_dirs() -> list[Path]:
     Both are checked so credential stores at <root>/... stay guarded when
     running under a profile (HERMES_HOME = <root>/profiles/<name>).
     """
+    if _named_remote():
+        from tools.file_backend_state import remote_home
+        return [Path(_realpath(Path(remote_home()) / ".hermes"))]
     return list(dict.fromkeys(_resolve_each((_hermes_home_path(), _hermes_root_path()))))
 
 
 def _resolve_each(paths) -> list[Path]:
-    """``p.resolve()`` for each path, skipping ones that fail to resolve."""
+    """Resolve anchors, retaining local best-effort but failing closed remotely."""
     out: list[Path] = []
     for p in paths:
-        with suppress(Exception):
-            out.append(p.resolve())
+        if _named_remote():
+            out.append(Path(_realpath(p)))
+        else:
+            with suppress(Exception):
+                out.append(p.resolve())
     return out
 
 
@@ -64,6 +84,9 @@ def _is_under(resolved: str | Path, base: str | Path) -> bool:
 
 def _resolve_target(path: str) -> Optional[Path]:
     """``Path(expanduser(path)).resolve()``, or None when resolution fails."""
+    if _named_remote():
+        from tools.file_backend_state import remote_path
+        return Path(remote_path(path))
     with suppress(OSError, RuntimeError):
         return Path(os.path.expanduser(str(path))).resolve()
     return None
@@ -78,6 +101,9 @@ def _guard_homes(path: str = "") -> set[str]:
     home). Deny/approval lists are built over the union: process home, real home,
     subprocess home, and the profile home. A ``~name/...`` input resolves to a named
     account's home, which joins the set so ``~root/.ssh/authorized_keys`` stays denied."""
+    if _named_remote():
+        from tools.file_backend_state import remote_home
+        return {remote_home()}
     homes = {os.path.expanduser("~")}
     with suppress(Exception):
         from hermes_constants import get_real_home, get_subprocess_home, _profile_home_path
@@ -91,12 +117,15 @@ def _guard_homes(path: str = "") -> set[str]:
         expanded = os.path.expanduser(f"~{name}")
         if not expanded.startswith("~"):
             homes.add(expanded)
-    return {os.path.realpath(h) for h in homes}
+    return {_realpath(h) for h in homes}
 
 
 def _homes_and_resolved(path: str) -> tuple[set[str], str]:
     """``(guard homes, realpath(expanduser(path)))`` — the write-guard coordinate pair."""
-    return _guard_homes(path), os.path.realpath(os.path.expanduser(str(path)))
+    if _named_remote():
+        from tools.file_backend_state import remote_path
+        return _guard_homes(path), remote_path(path)
+    return _guard_homes(path), _realpath(os.path.expanduser(str(path)))
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +146,7 @@ def _homes_and_resolved(path: str) -> tuple[set[str], str]:
 # built on resolved paths can fire.
 #
 # Consequently this check MUST run on the *raw* path string before any
-# ``Path.resolve()`` / ``os.path.realpath()`` call, and it does — it is the
+# ``Path.resolve()`` / ``_realpath()`` call, and it does — it is the
 # first check in both :func:`get_read_block_error` and the write-denial
 # classifier.
 #
@@ -186,7 +215,7 @@ def build_write_denied_paths(home: str) -> set[str]:
     # root: overwriting the root .env leaks credentials across every profile that
     # inherits it, and the root Anthropic PKCE store is still read by default /
     # non-profile sessions when a profile is active. google_oauth.json is an OAuth
-    # token store; both Bitwarden caches hold Secrets Manager material.
+    # token store; SECRET_CACHE_STORES hold secret values and the Photon sidecar token.
     #
     # auth.json, auth.lock, config.yaml and webhook_subscriptions.json are
     # deliberately NOT here: #45947 freed those control files on purpose
@@ -195,15 +224,14 @@ def build_write_denied_paths(home: str) -> set[str]:
     hermes_files = (
         ".env", ".anthropic_oauth.json",
         os.path.join("auth", "google_oauth.json"),
-        os.path.join("cache", "bws_cache.json"),
-        os.path.join("cache", "bws_cache.enc.json"),
+        *SECRET_CACHE_STORES,
     )
     paths = [
         *(os.path.join(home, *f) for f in home_files),
-        *(str(base / f) for f in hermes_files for base in (_hermes_home_path(), _hermes_root_path())),
+        *(str(base / f) for f in hermes_files for base in _hermes_dirs()),
         "/etc/sudoers", "/etc/passwd", "/etc/shadow",
     ]
-    return {os.path.realpath(p) for p in paths}
+    return {_realpath(p) for p in paths}
 
 
 # Home-relative credential directories (POSIX paths). Also dropped from profile exports (hermes_cli.profiles).
@@ -216,7 +244,7 @@ def build_write_denied_prefixes(home: str) -> list[str]:
         *(os.path.join(home, *d.split("/")) for d in HOME_CREDENTIAL_DIRS),
         "/etc/sudoers.d", "/etc/systemd",
     ]
-    return [os.path.realpath(p) + os.sep for p in paths]
+    return [_realpath(p) + os.sep for p in paths]
 
 
 def get_safe_write_roots() -> set[str]:
@@ -224,7 +252,7 @@ def get_safe_write_roots() -> set[str]:
     roots: set[str] = set()
     for path in filter(None, os.getenv("HERMES_WRITE_SAFE_ROOT", "").split(os.pathsep)):
         with suppress(OSError, ValueError):
-            roots.add(os.path.realpath(os.path.expanduser(path)))
+            roots.add(_realpath(os.path.expanduser(path)))
     return roots
 
 
@@ -236,7 +264,7 @@ def build_write_approval_paths(home: str) -> set[str]:
     (approve-once/session/always, like the terminal tool's ``~/.ssh`` gate);
     non-interactive callers (ACP shims, background jobs) fail closed.
     """
-    return {os.path.realpath(os.path.join(home, ".ssh", "config"))}
+    return {_realpath(os.path.join(home, ".ssh", "config"))}
 
 
 # HERMES_HOME / root subpaths that the agent's generic file tools must not
@@ -269,13 +297,14 @@ def _classify_write_denial(path: str, *, entry: bool = False) -> Optional[str]:
     # BEFORE the approval-gated allow so ~/.ssh-style gating cannot re-open it.
     from agent.runtime_self_protection import is_protected_path, split_entry
 
-    if is_protected_path(path) or (entry and is_protected_path(path, follow=False)):
+    if not _named_remote() and (is_protected_path(path) or (entry and is_protected_path(path, follow=False))):
         return "credential"
     denial = _classify_resolved_write_denial(homes, resolved)
     if denial or not entry:
         return denial
-    parent, leaf = split_entry(os.path.expanduser(str(path)))
-    entry_path = os.path.join(os.path.realpath(parent or "."), leaf)
+    # A named node expands ``~`` in its own home during resolution, never the controller's.
+    parent, leaf = split_entry(str(path) if _named_remote() else os.path.expanduser(str(path)))
+    entry_path = os.path.join(_realpath(parent or "."), leaf)
     return _classify_resolved_write_denial(homes, entry_path)
 
 
@@ -295,9 +324,14 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
 
     for base in _hermes_dirs():
         for sub in _HERMES_PROTECTED_SUBPATHS:
-            with suppress(Exception):
-                if _is_under(resolved, os.path.realpath(os.path.join(str(base), sub))):
+            anchor = os.path.join(str(base), sub)
+            if _named_remote():
+                if _is_under(resolved, _realpath(anchor)):
                     return "credential"
+            else:
+                with suppress(Exception):
+                    if _is_under(resolved, _realpath(anchor)):
+                        return "credential"
 
     safe_roots = get_safe_write_roots()
     if safe_roots and not any(_is_under(resolved, root) for root in safe_roots):
@@ -344,10 +378,9 @@ _DID_SUFFIX = (
 
 # Exact-file credential stores under HERMES_HOME / <root>. The agent never
 # needs these directly — provider tools consume them through internal channels.
-# bws_cache.json is the Bitwarden Secrets Manager disk cache: plaintext secret values.
 _CREDENTIAL_FILE_NAMES = (
     "auth.json", "auth.lock", ".anthropic_oauth.json", ".env", "webhook_subscriptions.json",
-    os.path.join("auth", "google_oauth.json"), os.path.join("cache", "bws_cache.json"),
+    os.path.join("auth", "google_oauth.json"), *SECRET_CACHE_STORES,
 )
 
 # Directory-prefix read denies under HERMES_HOME / <root>: (subdir, message for
@@ -392,7 +425,9 @@ def get_read_block_error(path: str) -> Optional[str]:
     nt_error = get_nt_namespace_error(path, verb="Read")
     if nt_error:
         return nt_error
-    resolved = Path(path).expanduser().resolve()
+    resolved = _resolve_target(path)
+    if resolved is None:
+        return f"Access denied: cannot resolve {path}"
     hermes_dirs = _hermes_dirs()
     reason = None
     if any(_is_under(resolved, hd / "skills" / ".hub") for hd in hermes_dirs):

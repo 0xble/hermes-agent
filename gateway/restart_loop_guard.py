@@ -74,7 +74,7 @@ def consume_planned_exit(
         return False
 
 
-def _load_state() -> tuple[List[float], List[float]]:
+def _load_state() -> tuple[list[float], list[float]]:
     """``(counted boots, exempt planned boots)``; a file without ``planned`` is all counted."""
     try:
         # utf-8-sig: our BOM-tolerant read fix for the persisted boot log.
@@ -92,11 +92,11 @@ def _load_state() -> tuple[List[float], List[float]]:
         return [], []
 
 
-def _load_boots() -> List[float]:
+def _load_boots() -> list[float]:
     return _load_state()[0]
 
 
-def _save_state(boots: list[float], planned: List[float]) -> None:
+def _save_state(boots: list[float], planned: list[float]) -> None:
     with contextlib.suppress(OSError):
         path = _state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,7 +130,7 @@ def _chain_ending_at(boots: list[float], ts: float, gap: float) -> list[float]:
     return chain[::-1]
 
 
-def _current_chain(ts: float, gap: float) -> tuple[List[float], List[float]]:
+def _current_chain(ts: float, gap: float) -> tuple[list[float], list[float]]:
     """Split the ONE chain over every recorded boot (counted and exempt) into its counted and
     exempt parts.  Chaining each kind separately would double the apparent gap whenever planned
     and unplanned boots alternate, letting a loop slower than ``gap / 2`` evade the breaker."""

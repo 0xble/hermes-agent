@@ -71,7 +71,7 @@ PRESSURE_NONE = 0
 PRESSURE_COSMETIC = 1
 PRESSURE_NOTICES = 2
 
-from gateway.platforms.base import (  # noqa: E402
+from gateway.platforms.base import (
     OUTBOUND_FINAL, OUTBOUND_NOTICE, OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS, current_outbound_class, outbound_class)
 
 # Endpoints that create a message in the chat. A media group creates one message per item.
@@ -98,11 +98,11 @@ def messages_created(endpoint: str, data: Any) -> int:
 @dataclass
 class _Window:
     start: float
-    calls: Dict[str, int] = field(default_factory=dict)
+    calls: dict[str, int] = field(default_factory=dict)
     messages: int = 0
-    dirty: Dict[str, int] = field(default_factory=dict)
+    dirty: dict[str, int] = field(default_factory=dict)
     dirty_messages: int = 0
-    edit_classes: Dict[str, int] = field(default_factory=dict)
+    edit_classes: dict[str, int] = field(default_factory=dict)
 
 
 class DailyQuota:
@@ -119,9 +119,9 @@ class DailyQuota:
         self._profile_dir = Path(profile_dir) if profile_dir is not None else None
         self._wall = wall
         self._flush_interval = flush_interval
-        self._windows: Dict[str, _Window] = {}
-        self._anchors: Dict[str, float] = {}
-        self._penalized_at: Dict[str, float] = {}
+        self._windows: dict[str, _Window] = {}
+        self._anchors: dict[str, float] = {}
+        self._penalized_at: dict[str, float] = {}
         self._loaded: set[str] = set()
         self._last_flush = wall()
         self._last_log = wall()
@@ -165,7 +165,7 @@ class DailyQuota:
     def messages(self, chat_key: str) -> int:
         return self._window(chat_key).messages
 
-    def calls(self, chat_key: str) -> Dict[str, int]:
+    def calls(self, chat_key: str) -> dict[str, int]:
         return dict(self._window(chat_key).calls)
 
     def pressure(self, chat_key: str) -> int:
@@ -434,6 +434,6 @@ def quota_from_platform_extra(extra: Any, *, profile_dir: Optional[Path], label:
         call_soft_ceiling=_extra_int(extra, "daily_call_soft_ceiling", DEFAULT_CALL_SOFT_CEILING, label),
         profile_dir=profile_dir)
 
-def _top(calls: Dict[str, int], n: int = 6) -> str:
+def _top(calls: dict[str, int], n: int = 6) -> str:
     items = sorted(calls.items(), key=lambda kv: -kv[1])[:n]
     return json.dumps(dict(items), separators=(",", ":"))

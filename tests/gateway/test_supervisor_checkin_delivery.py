@@ -1,14 +1,18 @@
 """Execution attempts never masquerade as acknowledged supervisor output."""
 import asyncio
+import logging
+from unittest.mock import AsyncMock
 
 import pytest
 
-from gateway import run_checkins
+from gateway import delivery_ledger, run_checkins
+from gateway.checkin_delivery import delivery_metadata, fence_local_settlement, permits_metadata
 from gateway.platforms.base import SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.session_results import execution_result
 from hermes_cli.checkins import CheckinConfig, CheckinManager
-from tests.gateway.test_supervisor_checkins import fixture as fixture
+from tests.gateway.test_supervisor_checkins import fixture as _fixture_fixture  # noqa: PLC0414 -- fixture parameter intentionally shadows the imported pytest fixture
+fixture = _fixture_fixture
 
 
 @pytest.mark.asyncio
@@ -184,3 +188,125 @@ async def test_supervisor_preserves_written_advisory_and_handoff_status(fixture,
     for work in (list(f.work), []):
         f.work[:] = work
         assert await run_checkins.silence_fallback(f.runner, event, f.entry, result) is result
+
+
+@pytest.mark.asyncio
+async def test_storage_failure_uses_checkin_fallback_and_keeps_result_shape(request, monkeypatch):
+    f = request.getfixturevalue("fixture")
+    event = MessageEvent(text="tick", source=f.source, internal=True,
+                         metadata={"checkin": ["owner", 1300], "display_kind": "supervisor_checkin"})
+    event._checkin_fallback = "Roster storage is unavailable. Supervision will retry."
+    result = {"completed": False, "final_response": "", "failed": True}
+    monkeypatch.setattr("gateway.checkin_delivery.retain_policy",
+                        lambda *args: (_ for _ in ()).throw(OSError("busy")))
+
+    recovered = await run_checkins.silence_fallback(f.runner, event, f.entry, result)
+
+    assert recovered["final_response"] == event._checkin_fallback
+    assert recovered["delivery_text"] == event._checkin_fallback
+    assert recovered["already_sent"] is False
+
+
+@pytest.mark.asyncio
+async def test_retention_failure_restores_scope_for_result_and_live_fence(fixture, monkeypatch):
+    f = fixture
+    f.work.clear()
+    event = MessageEvent(text="tick", source=f.source, internal=True,
+                         metadata={"checkin": ["owner", 1300], "display_kind": "supervisor_checkin"})
+    event._gateway_active_turn_token = "turn-token"
+    result = {"completed": True, "final_response": "NO_REPLY", "failed": False}
+    captured = {"result": dict(result)}
+    token = execution_result.set(captured)
+
+    def fail_write(_write):
+        raise OSError("busy")
+
+    monkeypatch.setattr(f.db, "_execute_write", fail_write)
+    try:
+        recovered = await run_checkins.silence_fallback(f.runner, event, f.entry, result)
+        assert event._checkin_pending_root == "owner"
+        assert captured["result"]["checkin_pending_root"] == "owner"
+        assert recovered["checkin_pending_root"] == "owner"
+
+        monkeypatch.setattr(CheckinConfig, "load", classmethod(
+            lambda cls: CheckinConfig(only_roots=("other",))))
+        metadata = delivery_metadata(event, {})
+        assert metadata["_checkin_scope"]["root"] == "owner"
+        assert not await permits_metadata(f.runner, metadata)
+        f.authority.runner = f.runner
+        live = type("Live", (), {"source": f.source})()
+        fenced = await fence_local_settlement(
+            f.authority, live, {"payload": {"local_automation_v1": {"display_kind": "supervisor_checkin"}}},
+            "pending", captured)
+        assert fenced == ""
+    finally:
+        execution_result.reset(token)
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", ["raise", "none"])
+async def test_unavailable_db_holds_known_supervisor_but_allows_ordinary(fixture, failure):
+    f = fixture
+    from gateway.delivery_recovery import _recover_obligation_policy
+
+    def unavailable(_route):
+        if failure != "none":
+            raise OSError("transient open failure")
+
+    f.runner.session_store._db_for_key = unavailable
+    f.runner._release_runtime_claim_quiet = AsyncMock()
+    blocked = {}
+    supervisor = {"session_key": f.entry.session_key, "resume_turn_id": "token",
+                  "obligation_id": "supervisor", "last_error": "send_path_degraded",
+                  "supervisor_checkin": True}
+    ordinary = {**supervisor, "obligation_id": "ordinary", "supervisor_checkin": False}
+
+    assert await _recover_obligation_policy(f.runner, supervisor, "chat", blocked) is None
+    assert "chat" in blocked
+    assert await _recover_obligation_policy(f.runner, ordinary, "other-chat", {}) == {}
+
+
+@pytest.mark.asyncio
+async def test_non_resumable_supervisor_does_not_hold_later_reply(fixture, caplog):
+    from gateway.delivery_recovery import RuntimeDeliveryRecoveryMixin
+
+    f = fixture
+    f.adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="later-ack"))
+    f.runner._obligation_adapter = AsyncMock(return_value=f.adapter)
+    f.runner._redelivery_restart_note_event = AsyncMock(return_value=None)
+    f.runner._arm_flood_timers_for_waiting_rows = AsyncMock()
+    rows = [
+        {"obligation_id": "supervisor", "session_key": f.entry.session_key,
+         "platform": "telegram", "profile": "default", "chat_id": "42", "thread_id": "3",
+         "content": "stale supervisor status", "attempts": 1, "resume_turn_id": None,
+         "supervisor_checkin": True},
+        {"obligation_id": "later", "session_key": f.entry.session_key,
+         "platform": "telegram", "profile": "default", "chat_id": "42", "thread_id": "3",
+         "content": "later reply", "attempts": 1, "resume_turn_id": "later-turn",
+         "supervisor_checkin": False},
+    ]
+    for row in rows:
+        delivery_ledger.record_obligation(
+            obligation_id=row["obligation_id"], session_key=row["session_key"],
+            platform=row["platform"], chat_id=row["chat_id"], thread_id=row["thread_id"],
+            content=row["content"], resume_turn_id=row["resume_turn_id"],
+            supervisor_checkin=row["supervisor_checkin"])
+        delivery_ledger.mark_attempting(row["obligation_id"])
+
+    with caplog.at_level(logging.WARNING):
+        redelivered = await RuntimeDeliveryRecoveryMixin._redeliver_claimed_obligations(
+            f.runner, rows)
+
+    assert redelivered == 1
+    assert [call.kwargs["content"] for call in f.adapter.send.await_args_list] == ["later reply"]
+    assert any("no resume_turn_id" in record.getMessage() for record in caplog.records)
+    with delivery_ledger._connect() as conn:
+        states = {
+            obligation_id: conn.execute(
+                "SELECT state, last_error FROM delivery_obligations WHERE obligation_id=?",
+                (obligation_id,),
+            ).fetchone()
+            for obligation_id in ("supervisor", "later")
+        }
+    assert states["supervisor"] == ("abandoned", "supervisor_checkin_missing_resume_turn_id")
+    assert states["later"][0] == "delivered"
+    assert delivery_ledger.sweep_recoverable(deliverable_platforms={"telegram"}) == []

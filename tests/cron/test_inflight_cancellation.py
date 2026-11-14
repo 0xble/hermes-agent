@@ -8,8 +8,8 @@ from unittest.mock import Mock
 
 import pytest
 
-import cron.jobs as jobs
-import cron.scheduler as scheduler
+from cron import jobs
+from cron import scheduler
 import tools.cronjob_tools  # registers the public tool
 from agent.interrupt_scope import track_in_interrupt_scope
 from tools.registry import registry
@@ -284,7 +284,9 @@ def test_remote_cancel_names_cause_and_preserves_budget(isolated_store, monkeypa
         assert not control.is_set()
         assert future.result(timeout=5)
     execution = scheduler.get_execution(claimed["execution_id"])
-    assert execution["error"] == scheduler._CANCELLED_INTERRUPTED
+    expected_error = "job removed while running" if action == "remove" else scheduler._CANCELLED_INTERRUPTED
+    assert execution["status"] == ("cancelled" if action == "remove" else "failed")
+    assert execution["error"] == expected_error
     delivery.assert_not_called()
     if action in {"pause", "disable"}:
         current = jobs.get_job(job["id"])

@@ -438,6 +438,13 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     _not_main = threading.Thread(name="not-main")  # real Thread, created before Thread is faked
+    real_thread = threading.Thread
+
+    def boot_thread(*args, **kwargs):
+        if kwargs.get("target") is gateway_run._run_planned_stop_watcher:
+            return NoopThread(*args, **kwargs)
+        return real_thread(*args, **kwargs)
+
     monkeypatch.setattr(gateway_run, "GatewayRunner", FakeRunner)
     monkeypatch.setattr(gateway_run, "_host_attach_or_none", host_attach)
     monkeypatch.setattr(gateway_run, "_claim_host_gateway_role", lambda *a, **k: calls.append("claim"))
@@ -455,7 +462,9 @@ async def test_start_gateway_skips_host_seams_on_standby_and_keeps_them_active(m
     monkeypatch.setattr(gateway_run, "_shutdown_gateway_health_export", lambda *a: None)
     monkeypatch.setattr(gateway_run, "_settle_and_shutdown_mcp", settle)
     monkeypatch.setattr(gateway_run, "_best_effort", lambda fn, *a, **k: fn())
-    monkeypatch.setattr(gateway_run.threading, "Thread", NoopThread)
+    monkeypatch.setattr(gateway_run.threading, "Thread", boot_thread)
+    monkeypatch.setattr("gateway.run_runtime.initialize_gateway_runtime", settle)
+    monkeypatch.setattr("gateway.run_runtime.pin_launch_store", lambda: None)
     # Not the main thread (so no signal handlers), but a real thread so logging records still build.
     monkeypatch.setattr(gateway_run.threading, "current_thread", lambda: _not_main)
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)

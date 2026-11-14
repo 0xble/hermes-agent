@@ -1,3 +1,4 @@
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import contextlib
 import json
 import logging
@@ -13,6 +14,7 @@ from unittest.mock import Mock, patch
 
 import pytest
 
+from gateway.owner_identity import host_owner_subject as _owner
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
@@ -22,15 +24,7 @@ from tui_gateway.transport import bind_transport, reset_transport
 
 
 def _dispatch_sync(req: dict, transport=None) -> dict | None:
-    """Run one RPC to completion synchronously, regardless of pool routing.
-
-    Voice RPCs (voice.toggle/record/tts) are in ``_LONG_HANDLERS`` so they run
-    on the RPC pool and ``server.dispatch`` returns None — the pool worker
-    writes the response via the bound transport. These tests exercise the
-    handler's business logic, not the routing, so they drive the handler
-    inline while preserving the transport-binding semantics ``dispatch``
-    applies around a real request.
-    """
+    """Drive pooled RPC business logic inline while preserving transport context."""
     token = bind_transport(transport)
     try:
         return server.handle_request(req)
@@ -394,7 +388,7 @@ def test_prompt_submit_fails_open_inline_when_compute_host_dispatch_breaks(monke
         "_run_prompt_submit",
         lambda rid, sid, _session, text, **_kwargs: inline_calls.append((rid, sid, text)),
     )
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
 
     try:
         resp = server.handle_request(
@@ -665,7 +659,7 @@ def test_prompt_submit_golden_transcript_matches_flag_off_and_on(monkeypatch):
 
     fixed_info = {"model": "gold-model", "provider": "gold-provider", "usage": {"total": 15}}
     usage = server._get_usage(_Agent())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server, "_ensure_session_db_row", lambda _session: None)
     monkeypatch.setattr(server, "_persist_branch_seed", lambda _session: None)
     monkeypatch.setattr(server, "_session_info", lambda _agent, _session=None: dict(fixed_info))
@@ -1413,7 +1407,7 @@ def test_run_prompt_submit_never_ticks_after_message_complete(monkeypatch):
         "_start_usage_ticker",
         lambda sid, agent, interval=1.0: real_ticker(sid, agent, interval=0.01),
     )
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
     monkeypatch.setattr(server, "_get_db", lambda: None)
@@ -4665,18 +4659,17 @@ def _capture_make_agent_kwargs(monkeypatch) -> dict:
 
 
 @pytest.mark.parametrize("identity, user_id", [
-    ({"user_id": "oidc|abc123", "provider": "oidc"}, "oidc:oidc|abc123"),
-    ({"user_id": "alice", "provider": "basic"}, "basic:alice"),
-    ({"user_id": "alice", "provider": "oidc"}, "oidc:alice"),
+    ({"user_id": "oidc|abc123", "provider": "oidc"}, _owner()),
+    ({"user_id": "alice", "provider": "basic"}, _owner()),
+    ({"user_id": "alice", "provider": "oidc"}, _owner()),
     (None, None),
     ({"user_id": "server-internal", "provider": "server-internal"}, None),
     ({"user_id": "", "provider": "oidc"}, None),
     ({"user_id": "abc", "provider": ""}, None),
 ])
 def test_make_agent_passes_the_authenticated_dashboard_user_as_user_id(monkeypatch, identity, user_id):
-    """WSTransport.auth_identity reaches the agent as ``user_id`` prefixed with the login provider, so a
-    basic-auth ``alice`` and an OIDC ``alice`` stay two memory peers. The legacy token, stdio and the PTY
-    child's server-internal credential name no human, so the agent gets no user id for them."""
+    """A signed-in login is the machine owner (gateway.owner_identity): the agent gets native Desktop's OS subject
+    as ``user_id``. The legacy token, stdio and the PTY child's server-internal credential stay unstamped."""
     captured = _capture_make_agent_kwargs(monkeypatch)
     transport = types.SimpleNamespace(auth_identity=identity)
     monkeypatch.setitem(server._sessions, "sid-auth", {"session_key": "k", "transport": transport})
@@ -4723,11 +4716,11 @@ def test_make_agent_keeps_the_login_after_a_second_window_attaches_and_detaches(
 
     assert server._attach_session_transport(record, popout)
     server._make_agent("sid-popout", "k")
-    assert captured["user_id"] == "basic:alice"
+    assert captured["user_id"] == _owner()
 
     server._detach_session_transport(record, popout)
     server._make_agent("sid-popout", "k")
-    assert captured["user_id"] == "basic:alice"
+    assert captured["user_id"] == _owner()
 
 
 def test_build_branch_agent_carries_the_parent_login(monkeypatch, tmp_path):
@@ -4750,8 +4743,8 @@ def test_build_branch_agent_carries_the_parent_login(monkeypatch, tmp_path):
     finally:
         reset_transport(token)
 
-    assert captured["user_id"] == "basic:alice"
-    assert server._sessions["sid-branch"]["auth_user_id"] == "basic:alice"
+    assert captured["user_id"] == _owner()
+    assert server._sessions["sid-branch"]["auth_user_id"] == _owner()
 
 
 def test_deferred_session_record_stamps_the_creating_login():
@@ -4762,8 +4755,8 @@ def test_deferred_session_record_stamps_the_creating_login():
     finally:
         reset_transport(token)
 
-    assert record["auth_user_id"] == "oidc:carol"
-    assert server._session_auth_user_id(record) == "oidc:carol"
+    assert record["auth_user_id"] == _owner()
+    assert server._session_auth_user_id(record) == _owner()
 
 
 def test_compute_host_turn_frame_carries_the_session_login(monkeypatch):
@@ -4773,7 +4766,7 @@ def test_compute_host_turn_frame_carries_the_session_login(monkeypatch):
 
     frame = server._compute_host_turn_frame("rid", "sid-host", record, "hello")
 
-    assert frame["auth_user_id"] == "basic:alice"
+    assert frame["auth_user_id"] == _owner()
 
 
 def test_attaching_a_different_login_keeps_the_creator_and_warns_once(monkeypatch):
@@ -4785,7 +4778,7 @@ def test_attaching_a_different_login_keeps_the_creator_and_warns_once(monkeypatc
     assert server._attach_session_transport(record, other)
     assert server._attach_session_transport(record, other)
 
-    assert server._session_auth_user_id(record) == "basic:alice"
+    assert server._session_auth_user_id(record) == _owner()
 
 
 def test_background_agent_kwargs_preserves_full_fallback_chain(monkeypatch):
@@ -7809,7 +7802,7 @@ def _configure_immediate_prompt_run(
             return False
 
     if immediate_threads:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda _cols: None)
     monkeypatch.setattr(server, "render_message", lambda _raw, _cols: None)
@@ -8058,7 +8051,7 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
                     raise TimeoutError("notification turn was not released")
             return {"final_response": "", "messages": []}
 
-    monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    patch_server_threads(monkeypatch, server, _recording_thread)
     session = _session(
         session_key="session-a",
         agent=_BlockingNotificationAgent(turns),
@@ -8729,7 +8722,7 @@ def test_session_create_drops_pending_title_on_valueerror(monkeypatch):
     monkeypatch.setattr(
         server, "_sync_session_key_after_compress", lambda *a, **kw: None
     )
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
 
     try:
         server.handle_request(
@@ -11618,7 +11611,7 @@ def test_prompt_submit_sets_approval_session_key(monkeypatch):
             self._target()
 
     server._sessions["sid"] = _session(agent=_Agent())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -11671,7 +11664,7 @@ def test_prompt_submit_expands_context_refs(monkeypatch):
     fake_meta.get_model_context_length = lambda *args, **kwargs: 100000
 
     server._sessions["sid"] = _session(agent=_Agent())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -13237,7 +13230,7 @@ def test_prompt_submit_history_version_mismatch_surfaces_warning(monkeypatch):
     session_ref["s"] = server._sessions["sid"]
     emits: list[tuple] = []
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
@@ -13342,7 +13335,7 @@ def test_prompt_submit_merges_on_model_switch_marker(monkeypatch):
         session_ref["s"] = server._sessions["sid"]
         emits: list[tuple] = []
         try:
-            monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+            patch_server_threads(monkeypatch, server, _ImmediateThread)
             monkeypatch.setattr(server, "_get_usage", lambda _a: {})
             monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
             monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
@@ -13432,7 +13425,7 @@ def test_prompt_submit_merges_on_personality_pivot_marker(monkeypatch):
     session_ref["s"] = server._sessions["sid"]
     emits: list[tuple] = []
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
@@ -13498,7 +13491,7 @@ def test_prompt_submit_sanitizes_bracketed_paste_before_agent(monkeypatch):
     corrupted = "hello[" + "~[[e" * 8
     server._sessions["sid"] = _session(agent=_Agent())
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
@@ -13539,7 +13532,7 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
     server._sessions["sid"] = _session(agent=_Agent())
     emits: list[tuple] = []
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
@@ -13600,7 +13593,7 @@ def test_prompt_submit_snapshots_history_after_pending_model_switch(monkeypatch)
     server._sessions["sid"]["pending_model_switch"] = {"raw": "new-model"}
     emits = []
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_apply_pending_model_switch", _apply_pending)
         monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
@@ -13674,7 +13667,7 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
     stub_db = _StubDb()
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
@@ -13900,7 +13893,7 @@ def test_prompt_submit_truncate_ordinal_skips_display_kind_rows(monkeypatch):
     stub_db = _StubDb()
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
@@ -14011,7 +14004,7 @@ def test_prompt_submit_truncate_translates_display_prefix_ordinal(monkeypatch):
     stub_db = _StubDb()
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
@@ -14412,7 +14405,7 @@ def test_run_prompt_submit_registers_turn_thread_for_interrupt(monkeypatch):
     server._sessions["sid"] = session
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        patch_server_threads(monkeypatch, server, _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
 
         server._run_prompt_submit("1", "sid", session, "hello")
@@ -14481,7 +14474,7 @@ def test_interrupt_before_agent_ready_prevents_late_turn_start(monkeypatch):
     server._sessions["sid"] = session
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        patch_server_threads(monkeypatch, server, _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
@@ -14551,7 +14544,7 @@ def test_cancelled_turn_before_agent_ready_emits_error_event(monkeypatch):
     server._sessions["sid"] = session
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        patch_server_threads(monkeypatch, server, _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
@@ -14623,7 +14616,7 @@ def test_session_not_running_before_agent_ready_emits_error_event(monkeypatch):
     server._sessions["sid"] = session
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        patch_server_threads(monkeypatch, server, _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
@@ -14709,7 +14702,7 @@ def test_slow_agent_build_delivers_prompt_instead_of_timing_out(monkeypatch):
     session["agent_ready"] = _SlowReady()
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        patch_server_threads(monkeypatch, server, _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
@@ -14782,7 +14775,7 @@ def test_slow_agent_build_emits_keyed_progress_notice(monkeypatch):
     session["agent_ready"] = _SlowReady()
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        patch_server_threads(monkeypatch, server, _FakeThread)
         # Every wait slice lands past the slow threshold.
         monkeypatch.setattr(server, "_AGENT_BUILD_SLOW_NOTICE_AFTER", 0.0)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
@@ -14856,7 +14849,7 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
         session["agent_ready"].set()
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _FakeThread)
+        patch_server_threads(monkeypatch, server, _FakeThread)
         monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: emitted.append(args))
         monkeypatch.setattr(server, "_ensure_session_db_row", lambda session: None)
         monkeypatch.setattr(server, "_persist_branch_seed", lambda session: None)
@@ -17286,7 +17279,7 @@ def test_prompt_submit_releases_old_history_before_heap_trim(monkeypatch, tmp_pa
     del old
     server._sessions["sid_trim"] = session
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
@@ -17342,7 +17335,7 @@ def test_prompt_submit_wires_live_title_rename_callback(monkeypatch):
     agent = _Agent()
     server._sessions["sid"] = _session(agent=agent)
     emitted = []
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(
         server, "_emit", lambda kind, sid, payload=None, **kw: emitted.append((kind, payload))
     )
@@ -17392,7 +17385,7 @@ def test_prompt_submit_surfaces_backend_error_as_visible_text(monkeypatch):
             }
 
     server._sessions["sid"] = _session(agent=_Agent())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
 
     emitted: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -17436,7 +17429,7 @@ def test_prompt_submit_preserves_empty_response_without_error(monkeypatch):
             }
 
     server._sessions["sid"] = _session(agent=_Agent())
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
 
     emitted: list[tuple[str, str, dict]] = []
     monkeypatch.setattr(
@@ -18179,7 +18172,7 @@ def test_notification_poller_delivers_completion(monkeypatch):
 
     sess = _session(agent=_Agent())
     server._sessions["sid_poll"] = sess
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: emitted.append(a))
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -18247,7 +18240,7 @@ def test_notification_poller_skips_consumed(monkeypatch):
 
     sess = _session(agent=_Agent())
     server._sessions["sid_skip"] = sess
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server, "_emit", lambda *a, **kw: None)
     monkeypatch.setattr(server, "make_stream_renderer", lambda cols: None)
     monkeypatch.setattr(server, "render_message", lambda raw, cols: None)
@@ -18796,43 +18789,6 @@ def test_sniff_image_ext_magic_and_filename():
     assert server._sniff_image_ext(b"\x89PNG", "photo.jpeg") == ".jpeg"
 
 
-def test_slash_worker_close_reaps_zombie_and_closes_fds():
-    """A hung worker is SIGKILLed, the zombie reaped, all pipes closed — once."""
-    calls = {k: 0 for k in ("terminate", "kill", "wait", "stdin", "stdout", "stderr")}
-
-    class FakeStream:
-        def __init__(self, name):
-            self.name = name
-
-        def close(self):
-            calls[self.name] += 1
-
-    class FakeProc:
-        stdin, stdout, stderr = (FakeStream(n) for n in ("stdin", "stdout", "stderr"))
-
-        def poll(self):
-            return None  # always alive -> forces terminate then kill
-
-        def terminate(self):
-            calls["terminate"] += 1
-
-        def kill(self):
-            calls["kill"] += 1
-
-        def wait(self, timeout=None):
-            calls["wait"] += 1
-            raise subprocess.TimeoutExpired(cmd="x", timeout=timeout)
-
-    worker = object.__new__(server._SlashWorker)
-    worker.proc = FakeProc()
-
-    worker.close()
-    worker.close()  # idempotent
-
-    assert calls["terminate"] == 1
-    assert calls["kill"] == 1
-    assert calls["wait"] >= 2  # reaped after both terminate and kill
-    assert calls["stdin"] == calls["stdout"] == calls["stderr"] == 1
 
 
 def test_close_session_by_id_is_idempotent_and_full(monkeypatch):
@@ -20738,7 +20694,7 @@ def test_prompt_submit_passes_persist_user_message_to_agent(monkeypatch):
 
     server._sessions["sid"] = _session(agent=_Agent())
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
@@ -21135,7 +21091,7 @@ def test_personality_marker_does_not_shift_truncate_ordinal(monkeypatch):
         history_before = list(session["history"])
         third_index = history_before.index({"role": "user", "content": "third"})
 
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_get_db", lambda: stub_db)
@@ -21231,7 +21187,7 @@ def test_prompt_submit_truncation_archives_instead_of_deleting(monkeypatch):
     )
 
     try:
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
         monkeypatch.setattr(server, "_session_info", lambda *a, **k: {})
         monkeypatch.setattr(server, "_emit", lambda *a: None)
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})

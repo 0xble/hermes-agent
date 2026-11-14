@@ -657,6 +657,69 @@ def test_runtime_provenance_is_independent_of_aliases_and_virtual_env(child_env,
 
 
 @pytest.mark.usefixtures("child_env")
+def test_all_pm_generation_site_packages_are_removed_without_trusting_escaping_links(
+    tmp_path, monkeypatch,
+):
+    """A running gateway must strip old and new PM generations, but not user paths."""
+    from pm import environments
+
+    installs_root = tmp_path / "hermes" / "installs"
+    install_state = installs_root / "install-a"
+    generations = install_state / "environments"
+
+    def make_generation(name, version="3.14"):
+        venv = generations / name / "venv"
+        site = venv / ("Lib/site-packages" if os.name == "nt" else
+                       f"lib/python{version}/site-packages")
+        site.mkdir(parents=True)
+        (venv / "pyvenv.cfg").write_text(f"version = {version}\n", encoding="utf-8")
+        return venv, site
+
+    _, old_site = make_generation("old-generation", version="3.12")
+    new_venv, new_site = make_generation("new-generation")
+    outside_venv = tmp_path / "outside-installs" / "venv"
+    outside_site = outside_venv / ("Lib/site-packages" if os.name == "nt" else
+                                   "lib/python3.14/site-packages")
+    outside_site.mkdir(parents=True)
+    (outside_venv / "pyvenv.cfg").write_text("version = 3.14\n", encoding="utf-8")
+    escaping = generations / "escaping" / "venv"
+    escaping.parent.mkdir(parents=True)
+    _make_directory_link(escaping, outside_venv)
+    escaping_site = escaping / ("Lib/site-packages" if os.name == "nt" else
+                                "lib/python3.14/site-packages")
+    facts = install_state / "facts.json"
+    facts.parent.mkdir(parents=True, exist_ok=True)
+    facts.write_text(json.dumps({"packages": {"venv": {"environment": str(new_venv)}}}),
+                     encoding="utf-8")
+    user_venv = tmp_path / "user-venv"
+    user_site = user_venv / ("Lib/site-packages" if os.name == "nt" else
+                             "lib/python3.14/site-packages")
+    user_site.mkdir(parents=True)
+    (user_venv / "pyvenv.cfg").write_text("version = 3.14\n", encoding="utf-8")
+    unrelated = tmp_path / "nix/plugin/lib/python3.14/site-packages"
+    unrelated.mkdir(parents=True)
+    monkeypatch.setattr(environments, "installs_root", lambda: installs_root)
+    monkeypatch.setattr(environments, "install_state_dir", lambda repo: install_state)
+    monkeypatch.setattr(local, "_in_venv", False)
+    monkeypatch.setattr(local, "_hermes_site_packages", None)
+    env = {"VIRTUAL_ENV": str(user_venv), "PYTHONPATH": os.pathsep.join(
+        [str(old_site), "", str(new_site), str(user_site), str(unrelated),
+         str(escaping_site), str(outside_site)])}
+
+    result = local._sanitize_subprocess_env(env)
+
+    assert result["PYTHONPATH"].split(os.pathsep) == [
+        "", str(user_site), str(unrelated), str(escaping_site), str(outside_site)]
+    assert "VIRTUAL_ENV" not in result
+    assert env["VIRTUAL_ENV"] == str(user_venv)
+
+    _, later_site = make_generation("later-generation")
+    later = {"VIRTUAL_ENV": str(user_venv), "PYTHONPATH": os.pathsep.join(
+        [str(later_site), str(user_site)])}
+    assert local._sanitize_subprocess_env(later)["PYTHONPATH"] == str(user_site)
+
+
+@pytest.mark.usefixtures("child_env")
 def test_sealed_payload_venv_is_runtime_provenance_without_facts(tmp_path, monkeypatch):
     """A sealed payload boots its store interpreter (not a venv) on its shipped venv
     before PM commits a generation; that venv's site-packages must never reach a child."""

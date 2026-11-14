@@ -53,7 +53,7 @@ async def test_retry_after_lost_submit_ack_is_one_admission(tmp_path, monkeypatc
     runner = SimpleNamespace(_session_db=store._db, session_store=store, _draining=False,
                              _handle_message=answer, _adapter_for_source=lambda source: None)
     store._db.create_session('s', source='telegram')
-    authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner')
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
     authority.sessions['s'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='retry'), 's')
     wire = Wire(asyncio.get_running_loop())
     wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor'})
@@ -107,7 +107,7 @@ async def test_repeated_prompt_after_other_work_is_new_work(tmp_path, monkeypatc
     runner = SimpleNamespace(_session_db=store._db, session_store=store, _draining=False,
                              _handle_message=answer, _adapter_for_source=lambda source: None)
     store._db.create_session('s', source='telegram')
-    authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner')
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
     authority.sessions['s'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='repeat'), 's')
     wire = Wire(asyncio.get_running_loop())
     wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor'})

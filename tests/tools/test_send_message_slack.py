@@ -205,3 +205,18 @@ def test_standalone_disabled_rich_mode_stays_text(monkeypatch, _standalone_send)
     result = asyncio.run(_standalone_send(pconfig, "D1", "![Photo](https://example.com/p.png)"))
     assert result["success"]
     assert "blocks" not in fake.calls[0][1]
+def test_slack_dm_resolution_error_never_echoes_the_proxy_password(monkeypatch):
+    """aiohttp's InvalidURL text is the raw proxy URL; the surfaced tool error must not carry it."""
+    import asyncio
+
+    from tools.send_message_senders import _resolve_slack_user_target
+
+    for key in ("HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy", "ALL_PROXY", "all_proxy",
+                "NO_PROXY", "no_proxy", "SLACK_PROXY"):
+        monkeypatch.delenv(key, raising=False)
+    monkeypatch.setenv("HTTPS_PROXY", "http://bob:S3cretPW@127.0.0.1:notaport")
+    chat_id, error = asyncio.run(_resolve_slack_user_target("xoxb-test", "user:U123"))
+    assert chat_id is None
+    assert error["error"].startswith("Slack DM resolution failed: ")
+    assert "S3cretPW" not in error["error"]
+    assert "InvalidURL" in error["error"]

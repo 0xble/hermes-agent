@@ -11,11 +11,14 @@ from tests.e2e.core.upgrade.test_upgrade_path import (
     _update,
     _upgrade_prerequisites,
     install_cache,
-    leg as leg,
-    provider as provider,
+    leg as _leg,
+    provider as _provider,
     snapshot_state,
     template_home,
 )
+
+leg = _leg
+provider = _provider
 
 pytestmark = U.pytestmark
 

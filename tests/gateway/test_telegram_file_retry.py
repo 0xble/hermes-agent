@@ -89,7 +89,7 @@ async def test_voice_download_retries_timed_out_and_lands(adapter, sleeps, caplo
     handled = await adapter._cache_inbound_av(
         SimpleNamespace(), event, source, "voice message", "voice", ".ogg", "audio/ogg")
 
-    assert handled is False
+    assert handled is None
     assert source.calls == 3
     assert sleeps == [2.0, 5.0]
     assert len(event.media_urls) == 1 and event.media_types == ["audio/ogg"]
@@ -105,7 +105,7 @@ async def test_bad_request_is_not_retried(adapter, sleeps):
     handled = await adapter._cache_inbound_av(
         SimpleNamespace(), event, source, "voice message", "voice", ".ogg", "audio/ogg")
 
-    assert handled is False
+    assert handled is None
     assert source.calls == 1
     assert sleeps == []
     assert event.media_urls == []
@@ -136,7 +136,7 @@ async def test_three_timeouts_keep_the_old_failure_path(adapter, sleeps, caplog)
     handled = await adapter._cache_inbound_av(
         SimpleNamespace(), event, source, "voice message", "voice", ".ogg", "audio/ogg")
 
-    assert handled is False
+    assert handled is None
     assert source.calls == 3
     assert sleeps == [2.0, 5.0]
     assert event.media_urls == []

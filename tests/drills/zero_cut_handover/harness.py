@@ -29,7 +29,7 @@ _CHAT_POLL_S = 2.0  # MTProto chat reads are FLOOD_WAIT-limited; poll the observ
 ACK = "reply exactly ACK"
 
 
-def _final_re(tag: str, kinds: str = "ACK|DONE") -> "re.Pattern[str]":
+def _final_re(tag: str, kinds: str = "ACK|DONE") -> re.Pattern[str]:
     """One answer for ``tag``; a reply may carry several (folded mid-turn inbound), on one line or many.
     Anchored to a line of answers, so the observer's own "... reply exactly DONE <tag>" never counts."""
     return re.compile(rf"(?im)^\s*(?:(?:ACK|DONE)\s+\S+\s+)*(?:{kinds})\s+{re.escape(tag)}(?=\s|$)")
@@ -174,7 +174,7 @@ def _config(home: Path) -> Mapping[str, Any]:
         value = yaml.safe_load(text)
         return value if isinstance(value, Mapping) else {}
     except (ImportError, ValueError):
-        enabled = bool(re.search(r"(?m)^\s*enabled:\s*true\s*(?:#.*)?$", text, re.I))
+        enabled = bool(re.search(r"(?m)^\s*enabled:\s*true\s*(?:#.*)?$", text, re.IGNORECASE))
         return {"gateway": {"zero_cut_handover": {"enabled": enabled}}}
 
 
@@ -342,7 +342,7 @@ def _pid_from_launchctl(result: CommandResult) -> int | None:
 
 
 def _kill_slot(effects: Effects, label: str) -> int | None:
-    domain, result = _launchctl_label(effects, label)
+    _domain, result = _launchctl_label(effects, label)
     pid = _pid_from_launchctl(result)
     if pid is not None:
         effects.kill(pid)

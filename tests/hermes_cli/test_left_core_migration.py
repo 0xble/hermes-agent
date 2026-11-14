@@ -479,3 +479,38 @@ def test_old_langfuse_plugin_key_keeps_naming_the_catalog_plugin(tmp_path, monke
     # The old key in plugins.disabled still names the plugin, so with the new key enabled both lists do.
     assert gate_manifest(manifest, {"observability/langfuse"}, {"langfuse"}).error == IN_BOTH_LISTS
     assert gate_manifest(manifest, {"observability/langfuse"}, None).error == "disabled via config"
+
+
+@pytest.mark.parametrize(("delegation", "expected"), [
+    ("backend: model_map", True),
+    ("backend: profile_routes", True),
+    ("model_preset: delegation-sol", True),
+    ("by_parent: {'@uncensored': inherit}", True),
+    ("subagents: {research: {model: old-role}}", True),
+    ("backend: default", False),
+    ("max_concurrent_children: 4", False),
+])
+def test_advanced_delegation_install_detection_covers_both_migration_orders(tmp_path, delegation, expected):
+    home = _home(tmp_path, config="delegation:\n  " + delegation + "\n")
+    assert lcm.advanced_delegation_in_use(home) is expected
+
+
+def test_migrated_delegation_gets_its_plugin_once_and_honours_later_removal(tmp_path):
+    import shutil
+
+    home = _home(tmp_path, config="delegation:\n  backend: model_map\n")
+    calls, notices = [], []
+    plugin = home / "plugins" / "advanced-delegation"
+
+    def install(name):
+        calls.append(name)
+        (home / "plugins" / name).mkdir(parents=True)
+        return {"ok": True}
+
+    assert lcm.migrate_home(home, install=install, say=notices.append) == ["advanced-delegation"]
+    assert plugin.is_dir() and calls == ["advanced-delegation"]
+    assert any("Advanced Delegation" in notice for notice in notices)
+    assert lcm.migrate_home(home, install=install, say=notices.append) == []
+    shutil.rmtree(plugin)
+    assert lcm.migrate_home(home, install=install, say=notices.append) == []
+    assert calls == ["advanced-delegation"] and not plugin.exists()

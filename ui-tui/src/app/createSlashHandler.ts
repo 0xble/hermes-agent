@@ -1,13 +1,13 @@
+import type { SlashExecResponse } from '@hermes/shared/gateway-types'
 import { parseCommandDispatch, parseSlashCommand } from '@hermes/shared/slash'
+import { scoreSlashMenuItem } from '@hermes/shared/slash-score'
 
 import type { GatewayClient } from '../gatewayClient.js'
-import type { SlashExecResponse } from '../gatewayTypes.js'
 import { rpcErrorMessage } from '../lib/rpc.js'
 import { launchWidget } from '../sdk/host.js'
 import { getWidgetApp } from '../sdk/registry.js'
 
 import type { SlashHandler, SlashHandlerContext, SlashSubmission } from './interfaces.js'
-import { scoreSlashMenuItem } from './slash/fuzzyScore.js'
 import { findSlashCommand } from './slash/registry.js'
 import type { SlashRunCtx } from './slash/types.js'
 import { captureDestination, isCurrentDestination } from './submissionDestination.js'
@@ -192,7 +192,13 @@ export function createSlashHandler(ctx: SlashHandlerContext): SlashHandler {
           // The gateway has already associated the pending MoA state with this
           // prompt. Keep the prompt in the Ink queue so steer/interrupt modes
           // cannot inject it into the still-running turn.
-          return moaToken ? ctx.composer.enqueue(message, shown, moaToken) : ctx.composer.enqueue(message, shown)
+          if (moaToken) {
+            ctx.composer.enqueue(message, shown, moaToken)
+          } else {
+            ctx.composer.enqueue(message, shown)
+          }
+
+          return
         }
         if (submission) {
           return send(message, true, shown || undefined, submission.expand, { attachments: submission.attachments })

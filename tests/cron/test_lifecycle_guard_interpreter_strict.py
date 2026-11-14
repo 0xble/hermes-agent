@@ -44,7 +44,7 @@ def test_interpreter_named_python3_by_shell_symlink_is_strict(tmp_path_factory, 
         result = subprocess.run(
             [str(tool)], capture_output=True, text=True, timeout=10,
             env={**os.environ, "HOME": str(root)},
-        )
+         check=False)
         assert result.returncode == 0, result.stderr
         assert result.stdout == "child-ran\n"
     unsafe, refusal = scan_gateway_lifecycle(str(tool))

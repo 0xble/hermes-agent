@@ -9,6 +9,7 @@ with ``running`` still True, the prompt vanished and the session stayed "busy" (
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 import types
 
@@ -47,7 +48,7 @@ def _session(agent, **extra):
 
 def _turn_env(monkeypatch, tmp_path) -> list:
     emitted: list[tuple] = []
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_emit", lambda event_type, sid, payload=None: emitted.append((event_type, sid, payload)))
     monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
@@ -86,7 +87,7 @@ def test_turn_without_agent_is_refused_with_retryable_frame(monkeypatch, tmp_pat
 
 def test_replaced_record_build_records_reason_and_leaves_agent_unset(monkeypatch, tmp_path):
     """A build whose record was swapped mid-flight sets ``agent_ready`` AND records why nothing attached."""
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_await_resume_history", lambda sid, current: False)
 
     sid = "replaced-record"
@@ -107,7 +108,7 @@ def test_build_finishing_after_close_records_reason_and_closes_orphan(monkeypatc
     records why nothing attached, exactly like the replaced-before-attach exit (#49852)."""
     from tui_gateway import entry
 
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(entry, "ensure_mcp_discovery_started", lambda: None)
     closed: list[str] = []
     sid = "closed-mid-build"

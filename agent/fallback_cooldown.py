@@ -75,13 +75,45 @@ def _arm_rate_limit_cooldown(
     """
     if reason not in _SHARED_COOLDOWN_REASONS:
         return None
+    if getattr(agent, "_shared_primary_probe_token", None):
+        from agent.shared_primary_cooldown import primary_probe_is_owned
+        if primary_probe_is_owned(agent):
+            return 0
+    request_id = str(getattr(agent, "_current_api_request_id", "") or "").strip()
+    if not request_id:
+        sequence = int(getattr(agent, "_cooldown_failure_sequence", 0) or 0) + 1
+        agent._cooldown_failure_sequence = sequence
+        request_id = f"fallback:{id(agent)}:{sequence}"
+    failed_outage_id = str(getattr(agent, "_shared_primary_probe_failed_outage_id", "") or "")
+    record = getattr(agent, "_shared_primary_cooldown_record", None)
+    if (failed_outage_id and isinstance(record, dict)
+            and str(record.get("outage_id") or "") == failed_outage_id
+            and not getattr(agent, "_fallback_activated", False)):
+        # A failed half-open probe already re-armed this outage.  Preserve the
+        # signal that permits a long fallback turn to retry the primary.
+        agent._fallback_episode_cooled = True
+        return max(0, math.ceil(float(record.get("reset_at", 0) or 0) - time.time()))
+    backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     if getattr(agent, "_fallback_activated", False):
         # Compare the whole route: a same-provider fallback (another model or endpoint) failing
         # says nothing about the primary and must not arm the primary's shared window.
-        from agent.shared_primary_cooldown import live_route_from_agent, route_from_agent
-        if live_route_from_agent(agent) != route_from_agent(agent):
+        from agent.shared_primary_cooldown import canonical_route, live_route_from_agent, route_from_agent
+        live_route = canonical_route(live_route_from_agent(agent))
+        primary_route = canonical_route(route_from_agent(agent))
+        if live_route != primary_route:
+            # Fallback routes have their own breaker. A fallback failure is never evidence that
+            # the primary recovered, and the reason is deliberately rate_limit-only.
+            from agent.shared_primary_cooldown import arm_cooldown
+            fallback_record = arm_cooldown(
+                live_route, reason=FailoverReason.rate_limit, reset_at=reset_at,
+                backoff_count=0, request_id=request_id,
+                request_started_at=getattr(agent, "_current_api_request_started_at", None),
+                short_window=(reset_at is None and reason != FailoverReason.overloaded
+                              and (live_route[0] == "custom" or live_route[0].startswith("custom:"))),
+            )
+            if fallback_record:
+                agent._shared_fallback_cooldown_record = fallback_record
             return None
-    backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     agent._rate_limit_backoff_count = backoff_count + 1
     provider_delay = _provider_reset_delay(reset_at)
     if provider_delay is not None:
@@ -96,11 +128,27 @@ def _arm_rate_limit_cooldown(
     # across gateway agent eviction, delegated children, cron workers and restarts.
     agent._shared_primary_cooldown_record = None
     try:
-        from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+        from agent.shared_primary_cooldown import arm_cooldown, read_cooldown, route_from_agent
+        primary_route = route_from_agent(agent)
+        existing = read_cooldown(primary_route)
+        if (getattr(agent, "_shared_primary_probe_failed_outage_id", None)
+                and (not isinstance(existing, dict)
+                     or str(existing.get("outage_id") or "") != str(agent._shared_primary_probe_failed_outage_id))):
+            agent._shared_primary_probe_failed_outage_id = None
+        owner = str(existing.get("probe_owner") or "") if isinstance(existing, dict) else ""
+        from agent.shared_primary_cooldown import _probe_token_value
+        token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))
+        if owner and owner != token:
+            logger.info("Ignoring stale primary failure while another probe owns the lease")
+            return None
         record = arm_cooldown(
-            route_from_agent(agent), reason=reason,
+            primary_route, reason=reason,
             reset_at=_provider_reset_epoch(reset_at),
             backoff_count=backoff_count,
+            request_id=request_id,
+            request_started_at=getattr(agent, "_current_api_request_started_at", None),
+            short_window=(backoff_count == 0 and reset_at is None and reason != FailoverReason.overloaded
+                          and (primary_route[0] == "custom" or primary_route[0].startswith("custom:"))),
         )
     except Exception:
         record = None

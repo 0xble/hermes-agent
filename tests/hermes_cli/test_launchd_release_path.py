@@ -61,7 +61,7 @@ def test_guardian_rollback_render_keeps_the_installed_user_path(service, monkeyp
 
 @pytest.mark.platforms("macos")
 def test_shell_and_launchd_renders_of_one_target_agree(service, monkeypatch):
-    home, old, _, user = service
+    _home, old, _, user = service
     monkeypatch.setenv("PATH", LAUNCHD_DEFAULT_PATH)
     from_launchd = _path(old)
     monkeypatch.setenv("PATH", ":".join(user))

@@ -74,16 +74,52 @@ The terminal tool can execute commands in different environments:
 | `docker` | Isolated containers | Security, reproducibility |
 | `ssh` | Remote server | Sandboxing, keep agent away from its own code |
 | `singularity` (plugin) | HPC containers | Cluster computing, rootless |
+| `sprites` (plugin) | Stateful Fly.io cloud sandbox | Persistent cloud environments with checkpoint & restore |
 | `modal` | Cloud execution | Serverless, scale |
 | `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
 | `vercel_sandbox` | Vercel Sandbox cloud microVM | Cloud execution with snapshot-backed filesystem persistence |
+
+### Named Execution Nodes
+
+`terminal`, `read_file`, `write_file`, `patch` and `search_files` accept `node` from the shared root `nodes` registry. `process` accepts it as an optional identity check on an existing handle or a filter for `list`.
+
+```yaml
+nodes:
+  default: macstudio
+  hosts:
+    macstudio:
+      ssh: macstudio
+      platform: macos
+    macbook:
+      ssh: macbook
+      platform: macos
+```
+
+The `ssh` values are existing SSH aliases. Named terminal/file execution uses the existing SSH backend with profile-file synchronization disabled. It does not copy the controller's profile to either Mac, create a remote service, or change the profile's terminal backend. Targets need Bash and Python 3, with remote search tools such as `rg` available for the operations that use them.
+
+Example tool arguments:
+
+```json
+{"command": "pwd", "node": "macbook"}
+{"path": "~/notes.txt", "node": "macbook"}
+{"path": "~/notes.txt", "content": "Revised notes\n", "node": "macbook"}
+{"action": "poll", "session_id": "<returned handle>", "node": "macbook"}
+```
+
+Omitting `node` uses `nodes.default`. With no configured default or explicit selection, the existing terminal/file behavior is unchanged. Unknown nodes, denied scopes, conflicting sandbox overrides and connection failures refuse rather than run locally or on a sibling. Results identify the node and SSH alias.
+
+Cwd, exports, shell snapshots, file caches and read-before-overwrite authorization are isolated by profile, caller session and node. A full read of a MacBook file does not authorize overwriting the same path on the Studio or controller. Metadata, hashes, path resolution and write verification run on the selected target as well as content access. Partial reads do not authorize full overwrites.
+
+A background process handle retains its original node, SSH alias and unique remote run identity, including through controller checkpoint recovery. `process` without `node` follows that handle, not the current default. An explicit conflicting node refuses before probing the backend. Disconnected polling reports `remote_status: unavailable`, preserving the last known process state instead of claiming an exit. Killing uses the original command's target-side supervisor, never a controller PID or a fresh bare-PID signal. If launch acknowledgement is lost, the returned handle is for reconciliation, not permission to replay the command.
+
+Current limits: named execution supports macOS/Linux SSH targets, not remote PTY or stdin interaction. ACP named-node edits refuse before preparing a controller-local diff. Rich document/image extraction is not routed through the controller for named paths. Foreground transport failures have an unknown outcome and must be inspected before retrying. This selector does not route browser tools, `execute_code`, connectors or messaging.
 
 ### Configuration
 
 ```yaml
 # In ~/.hermes/config.yaml
 terminal:
-  backend: local    # or: docker, ssh, modal, daytona, vercel_sandbox, or a plugin backend (singularity)
+  backend: local    # or: docker, ssh, modal, daytona, vercel_sandbox, or a plugin backend (singularity, sprites)
   cwd: "."          # Working directory
   timeout: 180      # Command timeout in seconds
 ```
@@ -154,6 +190,16 @@ apptainer build ~/python.sif docker://python:3.11-slim
 # Configure
 hermes config set terminal.backend singularity
 hermes config set terminal.singularity_image ~/python.sif
+```
+
+### Sprites
+
+A plugin ([`sprites`](https://github.com/NousResearch/hermes-plugin-sprites)) that runs commands in a stateful [Sprite](https://fly.io/sprites) on Fly.io. See [Sprites Backend](../configuration.md#sprites-backend).
+
+```bash
+hermes plugins install NousResearch/hermes-plugin-sprites --enable
+hermes config set terminal.backend sprites
+# Add SPRITES_TOKEN to ~/.hermes/.env
 ```
 
 ### Modal (Serverless Cloud)

@@ -3,7 +3,7 @@ import asyncio
 import json
 import sys
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -268,7 +268,7 @@ def test_final_success_requires_completed_matching_receipt_and_runtime(tmp_path,
     if case == "missing":
         path.unlink()
     elif case == "stale":
-        receipt["started_at"] = receipt["finished_at"] = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        receipt["started_at"] = receipt["finished_at"] = (datetime.now(UTC) - timedelta(days=1)).isoformat()
         path.write_text(json.dumps(receipt))
     elif case == "pending_restart":
         (tmp_path / "fleet_restart_pending").write_text("native updater obligation")
@@ -440,7 +440,7 @@ async def test_notice_retry_honors_flood_delay_and_prior_result(tmp_path):
     with patch("gateway.run._hermes_home", tmp_path):
         assert not await runner._send_update_notification()
         marker, deferred = read_pending(tmp_path)
-        assert deferred["notice_retry_at"] - datetime.now(timezone.utc).timestamp() > 7100
+        assert deferred["notice_retry_at"] - datetime.now(UTC).timestamp() > 7100
         before = adapter.send.call_count
         runner._retry_update_notice_if_due()
         await asyncio.sleep(0)
@@ -523,7 +523,7 @@ async def test_post_deadline_delivery_exception_persists_retry_backoff(tmp_path,
     runner._update_notification_task.set_result(None)
 
     class Clock(datetime):
-        instant = datetime.now(timezone.utc)
+        instant = datetime.now(UTC)
 
         @classmethod
         def now(cls, tz=None):
@@ -535,19 +535,19 @@ async def test_post_deadline_delivery_exception_persists_retry_backoff(tmp_path,
         first = read_pending(tmp_path)[1]
         assert adapter.send.call_count == 1
         assert first["notice_attempts"] == 1
-        assert first["notice_retry_at"] > Clock.now(timezone.utc).timestamp()
+        assert first["notice_retry_at"] > Clock.now(UTC).timestamp()
         assert first.get("output_offset", 0) == 0
         for _ in range(3):
             runner._retry_update_notice_if_due()
             await asyncio.sleep(0)
         assert adapter.send.call_count == 1
-        Clock.instant = datetime.fromtimestamp(first["notice_retry_at"] + 1, timezone.utc)
+        Clock.instant = datetime.fromtimestamp(first["notice_retry_at"] + 1, UTC)
         runner._retry_update_notice_if_due()
         await runner._update_notice_retry_task
         second = read_pending(tmp_path)[1]
         assert adapter.send.call_count == 2
         assert second["notice_attempts"] == 2
-        assert second["notice_retry_at"] - Clock.now(timezone.utc).timestamp() >= 120
+        assert second["notice_retry_at"] - Clock.now(UTC).timestamp() >= 120
         assert second.get("output_offset", 0) == 0
 
 
@@ -560,7 +560,7 @@ async def test_missing_adapter_retries_then_expires_without_success_claim(tmp_pa
         assert await runner._send_update_notification() is False
         assert read_pending(tmp_path) is not None
         marker, data = read_pending(tmp_path)
-        data["timestamp"] = (datetime.now(timezone.utc) - timedelta(hours=2)).isoformat()
+        data["timestamp"] = (datetime.now(UTC) - timedelta(hours=2)).isoformat()
         marker.write_text(json.dumps(data), encoding="utf-8")
         assert await runner._send_update_notification() is True
     assert read_pending(tmp_path) is None
@@ -598,7 +598,7 @@ async def test_slash_update_final_outcome_follows_the_detached_wrapper(tmp_path)
     outcome = None
     while outcome is None and time.monotonic() < deadline:
         outcome = final_outcome(home, record)
-        time.sleep(.05)
+        await asyncio.sleep(.05)
     assert outcome is not None and outcome[0] is False and "code 7" in outcome[1]
 
 
@@ -642,7 +642,7 @@ async def test_inflight_old_notice_cannot_mutate_superseding_request(tmp_path, s
             result = launch_native_update(
                 home=tmp_path, hermes_cmd=["hermes"],
                 pending={**old, "reason": "second request",
-                         "timestamp": datetime.now(timezone.utc).isoformat()}, spawn=Mock(),
+                         "timestamp": datetime.now(UTC).isoformat()}, spawn=Mock(),
             )
             assert result["started"] is True
         return SimpleNamespace(success=True)
@@ -673,8 +673,8 @@ def _overwrite_latest_with_pm_sync(home):
     path = home / "logs" / "update_receipts" / "latest.json"
     path.write_text(json.dumps({
         "schema": 1, "kind": "sync", "outcome": "ok", "update_id": None,
-        "started_at": datetime.now(timezone.utc).isoformat(),
-        "finished_at": datetime.now(timezone.utc).isoformat(),
+        "started_at": datetime.now(UTC).isoformat(),
+        "finished_at": datetime.now(UTC).isoformat(),
     }))
 
 
@@ -690,7 +690,7 @@ def test_final_outcome_reads_the_update_receipt_after_a_pm_sync_overwrites_lates
 def _unroutable_pending(home):
     """A request_update from cron or the CLI has no chat to report back to."""
     launch_native_update(home=home, hermes_cmd=["hermes"], spawn=Mock(), pending={
-        "reason": "Promote the merged fix.", "timestamp": datetime.now(timezone.utc).isoformat()})
+        "reason": "Promote the merged fix.", "timestamp": datetime.now(UTC).isoformat()})
     return read_pending(home)[1]
 
 
@@ -729,7 +729,7 @@ async def test_legacy_unroutable_marker_waits_for_the_real_process_exit(tmp_path
     may still be running, so it must not release the admission on its own."""
     marker = tmp_path / ".update_pending.json"
     marker.write_text(json.dumps({"reason": "Legacy CLI update.",
-                                  "timestamp": datetime.now(timezone.utc).isoformat()}))
+                                  "timestamp": datetime.now(UTC).isoformat()}))
     (tmp_path / ".update_exit_code").write_text("0")
     if process_exited:
         (tmp_path / ".update_process_exit_code").write_text("0")

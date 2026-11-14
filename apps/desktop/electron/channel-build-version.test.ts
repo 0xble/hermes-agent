@@ -403,7 +403,14 @@ test('actual MSIX manifest writer consumes the channel quad across rollover inst
       fs.symlinkSync(path.join(repo, tree), path.join(root, tree), 'junction')
     }
 
-    fs.symlinkSync(path.join(repo, 'node_modules'), path.join(root, 'node_modules'), 'junction')
+    // Mirror both install trees so the copied desktop files resolve their
+    // dependencies exactly as they do in the checkout, hoisted or not.
+    for (const dir of ['', 'apps/desktop']) {
+      if (fs.existsSync(path.join(repo, dir, 'node_modules'))) {
+        fs.symlinkSync(path.join(repo, dir, 'node_modules'), path.join(root, dir, 'node_modules'), 'junction')
+      }
+    }
+
     const assets: string = path.join(app, 'assets/appx')
     fs.mkdirSync(assets)
 
@@ -418,8 +425,9 @@ test('actual MSIX manifest writer consumes the channel quad across rollover inst
     )
     const builds: ChannelBuildRequest[] = [65535, 65536, 65537, 0xffffffff].map(sequence => request(sequence))
     const script: string = `
-        const { AppInfo } = require('./node_modules/app-builder-lib/dist/appInfo.js');
-        const Msix = require('./node_modules/app-builder-lib/dist/targets/win/MsixTarget.js').default;
+        const builderEntry = require.resolve('app-builder-lib', { paths: [require('node:path').resolve('apps/desktop')] });
+        const { AppInfo } = require(builderEntry);
+        const Msix = require(require('node:path').join(builderEntry, '../targets/win/MsixTarget.js')).default;
         const { withChannelBuildRequestBatch } = require('./scripts/msix-shared.mjs');
         module.exports = async (builds) => {
         const environments = builds.map(build => ({ ...process.env,

@@ -7,6 +7,10 @@ failures are fail-OPEN (``continue``); the turn budget is the backstop.
 """
 
 from __future__ import annotations
+from hermes_cli.goals_relay_receipts import (
+    _relay_sender, _relay_receipt_id
+)
+
 
 import asyncio
 import hashlib
@@ -38,10 +42,10 @@ from hermes_cli.goals_contract_items import (
     _migrate_legacy_revision_requirements, contract_remove_aliases, goal_remove_usage, render_removable_contract_items,
 )
 from hermes_cli.goal_evidence import (
-    JUDGE_EVIDENCE_BLOCK_TEMPLATE as JUDGE_EVIDENCE_BLOCK_TEMPLATE,
-    _READ_ONLY_STATUS_CALL_RE as _READ_ONLY_STATUS_CALL_RE,
-    _READ_ONLY_STATUS_TOOLS as _READ_ONLY_STATUS_TOOLS,
-    _read_only_status_call as _read_only_status_call,
+    JUDGE_EVIDENCE_BLOCK_TEMPLATE,
+    _READ_ONLY_STATUS_CALL_RE,
+    _READ_ONLY_STATUS_TOOLS,
+    _read_only_status_call,
     _evidence_only_read_only_status,
     _evidence_scan_truncated_for_turn,
     _goal_progress_fingerprint,
@@ -54,6 +58,10 @@ from hermes_cli.goals_autonomy import (
 )
 from hermes_cli.goals_status import GoalStatusMixin
 from hermes_cli.goals_peers import GoalPeersMixin, parse_pending_peers, validate_peer_completion
+from hermes_cli.goals_authoring_refs import (
+    _goal_authoring_is_labeled_reference, _goal_authoring_is_ordinal_hash,
+    _goal_authoring_is_ordinary_identifier, _goal_authoring_text_is_path,
+)
 from hermes_cli.lifecycle_snapshot import snapshot_control
 from hermes_time import safe_strftime
 from hermes_cli.heartbeat import SILENCE_MARKER, is_intentional_silence_response
@@ -250,31 +258,6 @@ def _goal_authoring_values(goal: Any, contract: Any) -> dict[str, str]:
     }}
 
 
-def _goal_authoring_text_is_path(text: str, start: int, end: int) -> bool:
-    """Do not call a plan/file path a stale identifier merely because it has digits."""
-    token_start = max(text.rfind(" ", 0, start), text.rfind("\n", 0, start), text.rfind("\t", 0, start)) + 1
-    token_end_candidates = [index for index in (text.find(" ", end), text.find("\n", end), text.find("\t", end)) if index >= 0]
-    token_end = min(token_end_candidates, default=len(text))
-    token = text[token_start:token_end].strip(".,;:!?()[]{}<>\"'")
-    # owner/repo#N is a PR/issue reference, not a file path, even though it has a slash.
-    if re.fullmatch(r"[\w.-]+/[\w.-]+#\d+", token):
-        return False
-    return "/" in token or "\\" in token or bool(
-        re.search(r"\.(?:md|markdown|txt|yaml|yml|json|toml)\b", token, re.IGNORECASE)
-    )
-
-
-def _goal_authoring_is_ordinal_hash(text: str, start: int) -> bool:
-    """Allow ordinal rankings such as ``Ranked #1`` while rejecting bare receipts."""
-    return bool(re.search(r"(?i)\b(?:ranked|top)\s*$", text[max(0, start - 24):start]))
-
-
-def _goal_authoring_is_ordinary_identifier(text: str, start: int, end: int) -> bool:
-    """Allow human identifiers such as ``cafe5678`` when clearly naming a table."""
-    context = text[max(0, start - 32):min(len(text), end + 32)]
-    return bool(re.search(r"(?i)\b(?:table|column|record|dataset)\b", context))
-
-
 def goal_authoring_findings(
     goal: Any,
     contract: Any = None,
@@ -332,7 +315,7 @@ def goal_authoring_findings(
             token = match.group(1)
             if not (any(char.isdigit() for char in token) and any(char in "abcdef" for char in token)):
                 continue
-            if _goal_authoring_text_is_path(value, match.start(), match.end()) or _goal_authoring_is_ordinary_identifier(value, match.start(), match.end()):
+            if _goal_authoring_text_is_path(value, match.start(), match.end()) or _goal_authoring_is_labeled_reference(value, match.start()) or _goal_authoring_is_ordinary_identifier(value, match.start(), match.end()):
                 continue
             findings.append(GoalAuthoringFinding(
                 "stale_identifier", field_name,
@@ -374,17 +357,21 @@ def goal_authoring_findings(
 
     verification = values["verification"] if "verification" in checked else ""
     if verification:
-        checklist = bool(_GOAL_AUTHORING_BULLET_RE.search(verification) or
-                          _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification) or
-                          re.search(r"(?i)\b(?:step|item|check)\s*\d+", verification))
+        checklist_span = ""
+        m = (_GOAL_AUTHORING_BULLET_RE.search(verification) or _GOAL_AUTHORING_NUMBERED_STEP_RE.search(verification)
+             or re.search(r"(?i)\b(?:step|item|check)\s*\d+", verification))
+        if m:
+            checklist_span = verification[m.start():m.start() + 60].strip()
         separators = len(re.findall(r"[,;]", verification))
-        if separators >= 3 and re.search(r"(?i)\b(?:and|or)\b", verification) and _GOAL_AUTHORING_RECEIPT_RE.search(verification):
-            checklist = True
-        if checklist:
+        if (not checklist_span and separators >= 3 and re.search(r"(?i)\b(?:and|or)\b", verification)
+                and _GOAL_AUTHORING_RECEIPT_RE.search(verification)):
+            checklist_span = f"{separators + 1} separated items: {verification[:60].strip()}"
+        if checklist_span:
             findings.append(GoalAuthoringFinding(
                 "verification_checklist", "verification",
-                "is a step/receipt checklist rather than one live end-state outcome",
-                "state one observable result and put per-step checks in the plan file",
+                f"is a step/receipt checklist ({checklist_span!r}) rather than one live end-state outcome",
+                "replace the list with one observable end state (for example 'X and Y are consistent'), "
+                "and put the per-item checks in the plan file",
             ))
     return findings
 
@@ -414,7 +401,7 @@ def normalize_goal_max_turns(value: Any, default: int = DEFAULT_MAX_TURNS) -> in
     return parsed if parsed >= 0 else int(default)
 
 
-def is_continuation_gap_wait(state: Optional["GoalState"]) -> bool:
+def is_continuation_gap_wait(state: Optional[GoalState]) -> bool:
     """True when the active barrier is only the minimum-gap hold between autonomous turns."""
     return bool(
         state is not None and state.waiting_until and state.waiting_on_pid is None
@@ -932,7 +919,7 @@ def _normalize_item_text(value: Any) -> str:
     return " ".join(str(value or "").split())
 
 
-def _split_text_units(text: str) -> List[str]:
+def _split_text_units(text: str) -> list[str]:
     """Split a text contract field into independently removable items."""
     items = (_normalize_item_text(part.strip().rstrip(";").strip())
              for part in re.split(r"\n+|(?<=[.!?;])(?=\s|$)", text or ""))
@@ -940,7 +927,7 @@ def _split_text_units(text: str) -> List[str]:
     return [item for item in items if item]
 
 
-def contract_items(field_name: str, value: Any) -> List[str]:
+def contract_items(field_name: str, value: Any) -> list[str]:
     """Return the canonical atomic items for one contract or subgoal field.
 
     Contract text is sentence/separator-delimited; each subgoal list entry is already
@@ -956,7 +943,7 @@ def contract_items(field_name: str, value: Any) -> List[str]:
     return [item for raw in values for item in _split_text_units(str(raw or ""))]
 
 
-def _render_extra_criteria(subgoals: List[str]) -> str:
+def _render_extra_criteria(subgoals: list[str]) -> str:
     return "\n".join(f"- Extra criterion {i}: {text}" for i, text in enumerate(subgoals, start=1))
 
 
@@ -1073,7 +1060,7 @@ class GoalState:
     # finished (or unknown) is stale state, not a fresh event wake when observed by an idle surface.
     waiting_on_session_live_at_park: Optional[bool] = None
     # Verified by the parent, independent of ephemeral process/time barriers.
-    pending_peers: List[Dict[str, str]] = field(default_factory=list)
+    pending_peers: list[dict[str, str]] = field(default_factory=list)
     waiting_on_user_message: bool = False
     waiting_until: float = 0.0
     # Live delegation batches when a timed WAIT was set because of them; the barrier lifts as soon
@@ -1086,12 +1073,12 @@ class GoalState:
     waiting_since: float = 0.0
     contract: GoalContract = field(default_factory=GoalContract)
     # /goal gate add <cmd>: ALL must pass before the judge may declare done.
-    gates: List[GoalGate] = field(default_factory=list)
+    gates: list[GoalGate] = field(default_factory=list)
     # Every durable mutation gets a new token, including pause/resume with equal values.
     mutation_id: str = ""
     # Contract edits and completion events are an audit trail. Recorded hard-limit breaches
     # remain binding under autonomy, even after a replacement.
-    revisions: List[Dict[str, Any]] = field(default_factory=list)
+    revisions: list[dict[str, Any]] = field(default_factory=list)
     # Stable identity of the last parked state announced to the user. This is durable so repeated
     # internal wakes and gateway restarts do not replay an unchanged wait notice.
     last_wait_notice_key: Optional[str] = None
@@ -1177,7 +1164,7 @@ class GoalState:
             default=-1,
         )
 
-    def resume_override_reasons(self) -> List[str]:
+    def resume_override_reasons(self) -> list[str]:
         """The block reasons a user-command resume waived since the latest replacement.
 
         Only the exact structured ``user_command`` field grants the waiver. Agent prose,
@@ -1408,7 +1395,7 @@ def load_goal(session_id: str, *, cursor=None, db=None) -> Optional[GoalState]:
         # GoalManager believe there is no goal, so a following /goal <text> can overwrite the
         # unrestored durable row. Keep the migrated in-memory state and mark it so ordinary
         # mutations retry the migration transaction; set() explicitly refuses to replace it.
-        setattr(state, "_legacy_migration_pending", True)
+        state._legacy_migration_pending = True
         logger.warning("GoalManager: legacy requirement migration failed for %s: %s", session_id, exc, exc_info=True)
         return state
 
@@ -1436,7 +1423,7 @@ def save_goal(session_id: str, state: GoalState, *, cursor=None) -> None:
         logger.debug("GoalManager: set_meta failed: %s", exc)
 
 
-def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> Tuple[bool, Optional[GoalState]]:
+def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> tuple[bool, Optional[GoalState]]:
     """Atomically clear the wait barrier iff the durable row is still the active wait parked at
     ``waiting_since``. Read, compare and write run in one ``BEGIN IMMEDIATE`` transaction, so a
     concurrent re-park, pause or clear (resumed turn, goal command) can never be overwritten by a
@@ -1446,7 +1433,7 @@ def clear_goal_wait_if_since(session_id: str, waiting_since: float) -> Tuple[boo
         return False, None
     key = _meta_key(session_id)
 
-    def _txn(conn) -> Tuple[bool, Optional[GoalState]]:
+    def _txn(conn) -> tuple[bool, Optional[GoalState]]:
         row = conn.execute("SELECT value FROM state_meta WHERE key = ?", (key,)).fetchone()
         if row is None or not row[0]:
             return False, None
@@ -1567,7 +1554,7 @@ def _session_waiting(session_id: str) -> bool:
         return False
 
 
-def _process_outcome(session_id: str) -> Optional[Dict[str, Any]]:
+def _process_outcome(session_id: str) -> Optional[dict[str, Any]]:
     """Terminal facts for a process_registry session: the live registry first, then the durable
     receipt under ``logs/process-results``. None when neither knows it (outcome unknown)."""
     try:
@@ -1631,7 +1618,7 @@ def _completion_notice_pending(session_id: str) -> bool:
 GOAL_WAIT_LIFTED_NOTE_OPEN = "[Goal wait lifted: "
 
 
-def _barrier_lift_note(state: Optional["GoalState"]) -> str:
+def _barrier_lift_note(state: Optional[GoalState]) -> str:
     """One factual line appended to an idle-woken continuation, so the agent does not assume the
     awaited work succeeded. Never asks for a rerun: interrupted work may have side effects."""
     if state is None:
@@ -1663,13 +1650,13 @@ def _barrier_lift_note(state: Optional["GoalState"]) -> str:
     return ""
 
 
-def list_parked_goals() -> List[Tuple[str, "GoalState"]]:
+def list_parked_goals() -> list[tuple[str, GoalState]]:
     """``[(session_id, GoalState)]`` for every ACTIVE goal carrying a wait barrier in the current
     profile's store; ``[]`` on any DB error. Used by the gateway's idle wakeup ticker."""
     db = _get_session_db()
     if db is None:
         return []
-    out: List[Tuple[str, GoalState]] = []
+    out: list[tuple[str, GoalState]] = []
     try:
         rows = db.list_meta_prefix("goal:")
     except Exception as exc:
@@ -1768,20 +1755,20 @@ _BLOCKED_PAUSE_RE = re.compile(
     # A completed action next to a prohibition is a breach; the prohibition alone is not.
     r"|\b(?:merged|sent|deleted|published|posted|paid|pushed|removed|dropped|wiped)\b[^.;]{0,80}"
     r"\b(?:forbid\w*|prohibit\w*|constraints?|must not)\b",
-    re.I,
+    re.IGNORECASE,
 )
 # BLOCKED reasons that only need the user's answer, approval or decision.
 _BLOCKED_ON_USER_RE = re.compile(
     r"\b(?:brian|user|you|owner|operator)\b|\b(?:approv\w*|permission|sign-?off|decision|decide|"
     r"confirm\w*|answer|input|credentials?|login|consent)\b",
-    re.I,
+    re.IGNORECASE,
 )
 
 def _parse_wait_until(raw: str) -> Optional[float]:
     """Epoch for an ISO-8601 ``wait_until``. A timestamp without an offset is the host's local
     wall-clock time (the judge prompt shows local time), not UTC."""
     try:
-        when = datetime.fromisoformat(raw.strip().replace("Z", "+00:00"))
+        when = datetime.fromisoformat(raw.strip())
     except (TypeError, ValueError):
         return None
     if when.tzinfo is None:
@@ -1789,7 +1776,7 @@ def _parse_wait_until(raw: str) -> Optional[float]:
     return when.timestamp()
 
 
-def _parse_judge_response(raw: str) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
+def _parse_judge_response(raw: str) -> tuple[str, str, bool, Optional[dict[str, Any]]]:
     """Parse the judge's reply, fail-open. Returns ``(verdict, reason, parse_failed, wait_directive)``.
 
     ``wait_directive`` is ``{"session_id"}`` / ``{"pid"}`` / ``{"seconds"}`` / ``{"until"}``
@@ -1894,13 +1881,13 @@ def _tail(text: str, limit: int) -> str:
 class _EvidenceRows(list):
     """Evidence entries plus whether the bounded SessionDB scan omitted rows."""
 
-    def __init__(self, entries: List[Dict[str, Any]], *, truncated: bool = False):
+    def __init__(self, entries: list[dict[str, Any]], *, truncated: bool = False):
         super().__init__(entries)
         self.truncated = truncated
 
 
 def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
-                          max_entries: Optional[int] = _EVIDENCE_MAX_ENTRIES) -> List[Dict[str, Any]]:
+                          max_entries: Optional[int] = _EVIDENCE_MAX_ENTRIES) -> list[dict[str, Any]]:
     """Recent tool results from ``session_id`` recorded at or after ``since`` (oldest first).
 
     Each entry is ``{"tool", "call", "output", "timestamp"}``: the tool name, its arguments (from the
@@ -1920,7 +1907,7 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
     scan_truncated = len(rows) > _EVIDENCE_SCAN_ROWS
     if scan_truncated:
         rows = rows[-_EVIDENCE_SCAN_ROWS:]
-    calls: Dict[str, Tuple[str, str]] = {}
+    calls: dict[str, tuple[str, str]] = {}
     for row in rows:
         for call in (row.get("tool_calls") or []) if row.get("role") == "assistant" else []:
             try:
@@ -1932,7 +1919,7 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
         from agent.redact import redact_sensitive_text
     except Exception:  # pragma: no cover - redaction module is part of the runtime
         redact_sensitive_text = None
-    entries: List[Dict[str, Any]] = []
+    entries: list[dict[str, Any]] = []
     for row in rows:
         if row.get("role") != "tool" or float(row.get("timestamp") or 0.0) < since:
             continue
@@ -1956,7 +1943,7 @@ def collect_goal_evidence(session_id: Optional[str], since: float = 0.0, *,
 
 
 
-def _evidence_for_turn(evidence: Optional[List[Dict[str, Any]]], previous_turn_at: float) -> List[Dict[str, Any]]:
+def _evidence_for_turn(evidence: Optional[list[dict[str, Any]]], previous_turn_at: float) -> list[dict[str, Any]]:
     """Keep only evidence recorded since the previous completed turn."""
     rows = []
     for item in evidence or []:
@@ -1981,17 +1968,17 @@ def _judge_response_window(text: str) -> str:
     return f"{text[:head]}\n… [{omitted} chars omitted] …\n{text[-tail:]}"
 
 
-def extract_citations(text: str) -> List[str]:
+def extract_citations(text: str) -> list[str]:
     """Exact identifiers a response cites: backtick spans, quoted strings, URLs, SHAs and long ids.
 
     Ordered by first appearance, deduplicated, bounded; the closing evidence section is scanned
     first so a long response's proof survives the cap."""
     text = text or ""
-    hits: List[Tuple[int, str]] = []
+    hits: list[tuple[int, str]] = []
     for regex, group in ((_CITATION_BACKTICK_RE, 1), (_CITATION_QUOTED_RE, 1),
                          (_CITATION_URL_RE, 0), (_CITATION_TOKEN_RE, 0), (_CITATION_COUNT_RE, 0)):
         hits += [(m.start(group), m.group(group)) for m in regex.finditer(text)]
-    found: List[str] = []
+    found: list[str] = []
     # Latest first: a closeout's Evidence section sits at the end, so it survives the cap.
     for _pos, value in sorted(hits, key=lambda h: -h[0]):
         value = value.strip()
@@ -2005,7 +1992,7 @@ def extract_citations(text: str) -> List[str]:
     return found[:_CITATION_MAX_NEEDLES]
 
 
-def _citation_variants(needle: str) -> List[str]:
+def _citation_variants(needle: str) -> list[str]:
     """Lookups for an exact citation, a key/value citation, or a safe shortened shape.
 
     An ellipsis needs an eight-character prefix; commit URLs can fall back to their
@@ -2045,7 +2032,7 @@ _RUNTIME_NOTICE_KINDS = frozenset({"internal_notification", "async_delegation_co
 _USER_TYPED_KINDS = frozenset({"", "steer"})
 
 
-def _runtime_notice_label(row: Dict[str, Any]) -> str:
+def _runtime_notice_label(row: dict[str, Any]) -> str:
     """Label for a runtime-delivered notice row, or "" when its provenance is not runtime-owned.
 
     The persisted ``display_kind`` authenticates the row; the text prefix only picks the label.
@@ -2089,13 +2076,13 @@ def last_visible_report(session_id: Optional[str], since: float = 0.0) -> str:
     return ""
 
 
-def resolve_cited_evidence(session_id: Optional[str], response: str, since: float = 0.0) -> Dict[str, Any]:
+def resolve_cited_evidence(session_id: Optional[str], response: str, since: float = 0.0) -> dict[str, Any]:
     """Locate each identifier the response cites in tool results recorded since ``since``.
 
     Returns ``{"cited": [{needle, tool, excerpt, timestamp, message_id}], "unresolved": [...],
     "evidence_ids": [message ids]}``. Only tool-layer rows count, so the agent cannot cite its own prose into
     evidence. Excerpts are secret-redacted and bounded. Fail-safe: any error yields no citations."""
-    empty: Dict[str, Any] = {"cited": [], "unresolved": [], "evidence_ids": []}
+    empty: dict[str, Any] = {"cited": [], "unresolved": [], "evidence_ids": []}
     needles = extract_citations(response)
     if not session_id or not needles:
         return empty
@@ -2108,14 +2095,14 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
         from agent.redact import redact_sensitive_text
     except Exception:  # pragma: no cover - redaction module is part of the runtime
         redact_sensitive_text = None
-    cited: List[Dict[str, Any]] = []
-    unresolved: List[str] = []
+    cited: list[dict[str, Any]] = []
+    unresolved: list[str] = []
     # Excerpted ranges per result row: a citation inside an already-shown range points at it,
     # while a citation elsewhere in the same long result still gets its own excerpt.
-    shown: Dict[Any, List[Tuple[int, int]]] = {}
+    shown: dict[Any, list[tuple[int, int]]] = {}
     half = _CITATION_CONTEXT_CHARS // 2
     for needle in needles:
-        matches: List[Tuple[Dict[str, Any], str, bool]] = []
+        matches: list[tuple[dict[str, Any], str, bool]] = []
         variants = _citation_variants(needle)
         if not variants:
             unresolved.append(needle)
@@ -2192,7 +2179,7 @@ def resolve_cited_evidence(session_id: Optional[str], response: str, since: floa
     return {"cited": cited, "unresolved": unresolved, "evidence_ids": evidence_ids}
 
 
-def _render_cited_block(citations: Optional[Dict[str, Any]], now: Optional[float] = None) -> str:
+def _render_cited_block(citations: Optional[dict[str, Any]], now: Optional[float] = None) -> str:
     if not citations:
         return ""
     now = time.time() if now is None else now
@@ -2233,12 +2220,12 @@ def judge_goal(
     background_processes: Optional[list[dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
     active_delegations: int = 0,
-    evidence: Optional[List[Dict[str, Any]]] = None,
-    citations: Optional[Dict[str, Any]] = None,
+    evidence: Optional[list[dict[str, Any]]] = None,
+    citations: Optional[dict[str, Any]] = None,
     last_visible_report: str = "",
     user_messages_block: str = "",
-    resume_override: Union[bool, List[str]] = False,
-) -> Tuple[str, str, bool, Optional[Dict[str, Any]], bool]:
+    resume_override: bool | list[str] = False,
+) -> tuple[str, str, bool, Optional[dict[str, Any]], bool]:
     """Ask the auxiliary model whether the goal is satisfied.
 
     ``evidence`` is the ledger from :func:`collect_goal_evidence`: tool results the runtime recorded,
@@ -2451,28 +2438,7 @@ _USER_MESSAGES_MAX = 20
 _USER_MESSAGES_MAX_CHARS = 8000
 
 
-def _relay_sender(content: str) -> Optional[Tuple[str, str]]:
-    """Return ``(profile, session_id)`` from a Hermes relay header on the first or last non-empty line."""
-    if not isinstance(content, str):
-        return None
-    lines = [line.strip() for line in _unwrap_steer(content).splitlines() if line.strip()]
-    for line in (lines[-1:] + lines[:1]) if lines else []:
-        match = _RELAY_HEADER_RE.fullmatch(line)
-        if match:
-            return match.group("profile"), match.group("session")
-    return None
-
-
-def _relay_receipt_id(content: str) -> str:
-    lines = [line.strip() for line in _unwrap_steer(str(content or "")).splitlines() if line.strip()]
-    for line in (lines[-1:] + lines[:1]) if lines else []:
-        match = re.search(r"\breceipt=([^\s\]]+)", line) if _RELAY_HEADER_RE.fullmatch(line) else None
-        if match:
-            return match.group(1)
-    return ""
-
-
-def _relay_ledger_receipts(receipt_ids: Iterable[str]) -> Dict[str, Dict[str, Any]]:
+def _relay_ledger_receipts(receipt_ids: Iterable[str]) -> dict[str, dict[str, Any]]:
     """Newest receipt row per wanted id from relay's own ledger, read once.
 
     The header in a transcript is plain text any agent can write; the ledger is written by the relay
@@ -2482,7 +2448,7 @@ def _relay_ledger_receipts(receipt_ids: Iterable[str]) -> Dict[str, Dict[str, An
         return {}
     state_dir = os.environ.get("RELAY_STATE_DIR") or os.path.join(os.path.expanduser("~"), ".local/state/relay")
     path = os.path.join(state_dir, "receipts.jsonl")
-    found: Dict[str, Dict[str, Any]] = {}
+    found: dict[str, dict[str, Any]] = {}
     try:
         with open(path, "r", encoding="utf-8-sig", errors="replace") as handle:
             for line in handle:
@@ -2503,8 +2469,8 @@ def _relay_ledger_receipts(receipt_ids: Iterable[str]) -> Dict[str, Dict[str, An
 _NON_HUMAN_SESSION_SOURCES = frozenset({"subagent", "cron", "tool", "kanban", "oneshot", "dryrun"})
 
 
-def _authenticated_relay_sender(db: Any, relay: Dict[str, Any], goal_session_id: str,
-                                profile: str, receipts: Dict[str, Dict[str, Any]]) -> Optional[str]:
+def _authenticated_relay_sender(db: Any, relay: dict[str, Any], goal_session_id: str,
+                                profile: str, receipts: dict[str, dict[str, Any]]) -> Optional[str]:
     """The sender session of a relay row when relay's ledger proves this exact delivery, else None.
 
     Requires a typed-shaped row (no runtime display_kind, not a synthetic/continuation prompt), a
@@ -2597,7 +2563,7 @@ def _active_profile_name() -> str:
 
 
 def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
-                       limit: int = 500) -> List[Dict[str, Any]]:
+                       limit: int = 500) -> list[dict[str, Any]]:
     """Newest-first typed user rows in ``[since, until)`` (``until`` 0 means now). Page raw rows
     until the typed bound is satisfied, so runtime rows cannot evict an approval from the window."""
     db = _get_session_db()
@@ -2608,9 +2574,9 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
         wanted = max(int(limit), 1)
         page_size = 500
         before_id = 0
-        typed: List[Dict[str, Any]] = []
+        typed: list[dict[str, Any]] = []
         while len(typed) < wanted:
-            kwargs: Dict[str, Any] = {"since": since, "limit": page_size, "before_id": before_id,
+            kwargs: dict[str, Any] = {"since": since, "limit": page_size, "before_id": before_id,
                                     "current_only": True}
             if until > 0:
                 kwargs["until"] = until
@@ -2625,7 +2591,7 @@ def _user_message_rows(session_id: str, since: float, *, until: float = 0.0,
         return []
 
 
-def _relay_rows(db: Any, session_id: str, since: float, *, limit: Optional[int] = None) -> List[Dict[str, Any]]:
+def _relay_rows(db: Any, session_id: str, since: float, *, limit: Optional[int] = None) -> list[dict[str, Any]]:
     """Keyset-page relay deliveries in the goal window, scanning all rows by default.
 
     Relay deliveries are sparse among user rows, so a raw-row cap can hide an older valid delivery
@@ -2634,7 +2600,7 @@ def _relay_rows(db: Any, session_id: str, since: float, *, limit: Optional[int] 
     wanted = None if limit is None else max(int(limit), 1)
     page_size = 500
     before_id = 0
-    relays: List[Dict[str, Any]] = []
+    relays: list[dict[str, Any]] = []
     while wanted is None or len(relays) < wanted:
         try:
             page = db.messages_by_role(session_id, "user", since=since, limit=page_size,
@@ -2656,8 +2622,8 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
     db = _get_session_db()
     if db is None:
         return ""
-    entries: List[Tuple[float, int, str]] = []
-    seen: set[Tuple[str, Any]] = set()
+    entries: list[tuple[float, int, str]] = []
+    seen: set[tuple[str, Any]] = set()
     current_rows = _user_message_rows(session_id, since)
     for row in current_rows:
         content = row.get("content")
@@ -2702,7 +2668,7 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
     entries.sort(key=lambda item: (item[0], item[1]), reverse=True)
     # Pack newest-first and stop at the first message that does not fit: skipping it could keep an
     # older approval while dropping a newer refusal. Never excerpt an authority message.
-    kept: List[str] = []
+    kept: list[str] = []
     chars = 0
     for _timestamp, _id, text in entries[:_USER_MESSAGES_MAX]:
         if chars + len(text) > _USER_MESSAGES_MAX_CHARS:
@@ -2759,7 +2725,7 @@ def _judge_outage_notice(*, failed: bool) -> str:
         return JUDGE_OUTAGE_NOTICE
 
 
-def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> Dict[str, Any]:
+def _decision(status, should_continue: bool, prompt: Optional[str], verdict: str, reason: str, message: str) -> dict[str, Any]:
     return {"status": status, "should_continue": should_continue, "continuation_prompt": prompt,
             "verdict": verdict, "reason": reason, "message": ContextNotice(message) if verdict == "done" else message}
 
@@ -2885,7 +2851,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
                 save_goal(self.session_id, self._state)   # warns on a dropped write
             return result
         key = _meta_key(self.session_id)
-        seen: List[Optional[GoalState]] = []
+        seen: list[Optional[GoalState]] = []
 
         def _txn(conn):
             seen.clear()
@@ -3401,18 +3367,16 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
     def _wait_notice_decision(
         self, state: GoalState, *, verdict: str, message: str, notify: bool = True,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         key = self._wait_notice_key(state)
-        if not notify:
-            message = ""
-        elif state.last_wait_notice_key == key:
+        if not notify or state.last_wait_notice_key == key:
             message = ""
         else:
             state.last_wait_notice_key = key
             self._save()
         return _decision("active", False, None, verdict, state.waiting_reason or self._waiting_target(state), message)
 
-    def _waiting_decision(self, state: GoalState, *, notice: Optional[str] = None) -> Dict[str, Any]:
+    def _waiting_decision(self, state: GoalState, *, notice: Optional[str] = None) -> dict[str, Any]:
         tgt = self._waiting_target(state)
         reason = state.waiting_reason or tgt
         if notice is None:
@@ -3436,9 +3400,9 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             self._staging_internal = prior
 
     def _apply_wait_directive_impl(
-        self, wait_directive: Dict[str, Any], reason: str, *, active_delegations: int = 0,
+        self, wait_directive: dict[str, Any], reason: str, *, active_delegations: int = 0,
         automatic: bool = False, min_seconds: int = 0,
-    ) -> Optional[Dict[str, Any]]:
+    ) -> Optional[dict[str, Any]]:
         """Judge said WAIT: set the barrier and park. The counted turn stands (the judge ran) but no
         continuation fires; the loop resumes once the barrier clears. ``None`` = the barrier is
         unobservable here, so the caller continues instead."""
@@ -3471,7 +3435,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
                 return None
             until = min(until, time.time() + _MAX_TIMED_WAIT_S)
             self._park(reason, waiting_until=until, waiting_seconds=max(0, int(until - time.time())))
-            tgt = datetime.fromtimestamp(until, tz=timezone.utc).isoformat()
+            tgt = datetime.fromtimestamp(until, tz=UTC).isoformat()
         elif wait_directive.get("user_message"):
             self._park(reason, waiting_on_user_message=True)
             tgt = "your next message"
@@ -3500,7 +3464,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
     def _no_progress_wait_impl(
         self, state: GoalState, reason: str, *, active_delegations: int = 0, min_seconds: int = 0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Park after an automatic no-progress turn as a quiet, durable backoff."""
         level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
         state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
@@ -3521,7 +3485,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
     def _delegation_no_progress_wait_impl(
         self, state: GoalState, reason: str, active_delegations: int, *, min_seconds: int = 0,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Park immediately when live delegations leave an automatic turn with no action."""
         level = min(max(0, state.backoff_level), len(_NO_PROGRESS_BACKOFF_S) - 1)
         seconds = max(10 * 60, _NO_PROGRESS_BACKOFF_S[level], min_seconds)
@@ -3545,10 +3509,10 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         self, last_response: str, *, user_initiated: bool = True,
         external_event: bool = False,
         turn_started_at: Optional[float] = None,
-        background_processes: Optional[List[Dict[str, Any]]] = None,
+        background_processes: Optional[list[dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Evaluate an isolated snapshot and atomically commit against its durable state.
 
         ``external_event`` marks a watched-process/delegation notification. These
@@ -3567,10 +3531,10 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         self, last_response: str, *, user_initiated: bool = True,
         external_event: bool = False,
         turn_started_at: Optional[float] = None,
-        background_processes: Optional[List[Dict[str, Any]]] = None,
+        background_processes: Optional[list[dict[str, Any]]] = None,
         active_delegations: int = 0,
         evidence_session_id: Optional[str] = None,
-    ) -> Dict[str, Any]:
+    ) -> dict[str, Any]:
         """Run gates + judge and update state. Return a decision dict (``status``, ``should_continue``,
         ``continuation_prompt``, ``verdict``, ``reason``, ``message``). Both real user prompts and our
         own continuations increment ``turns_used`` — both consume model budget.
@@ -3726,7 +3690,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         if verdict == "done":
             return self._finish_judged_goal(reason)
 
-        def _with_outage(decision: Dict[str, Any]) -> Dict[str, Any]:
+        def _with_outage(decision: dict[str, Any]) -> dict[str, Any]:
             if outage_notice and decision.get("status") == "active":
                 decision["message"] = outage_notice
             return decision
@@ -3787,7 +3751,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         return self._current_continuation_prompt(s)
 
     @staticmethod
-    def _current_continuation_prompt(s: "GoalState") -> str:
+    def _current_continuation_prompt(s: GoalState) -> str:
         if goal_autonomy_enabled():
             return AUTONOMY_CONTINUATION_TEMPLATE.format(
                 goal=s.goal, contract_block=s.contract.render_block(), subgoals_block=s.render_subgoals_block())
@@ -3974,11 +3938,28 @@ def run_kanban_goal_loop(
 
 
 __all__ = [
-    "GoalState", "GoalContract", "GoalGate", "GoalManager", "parse_contract", "draft_contract", "run_gate",
-    "CONTINUATION_PROMPT_TEMPLATE", "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
-    "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE", "JUDGE_USER_PROMPT_TEMPLATE",
-    "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE", "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
-    "DRAFT_CONTRACT_SYSTEM_PROMPT", "KANBAN_GOAL_CONTINUATION_TEMPLATE", "KANBAN_GOAL_FINALIZE_TEMPLATE",
-    "DEFAULT_MAX_TURNS", "load_goal", "save_goal", "clear_goal", "migrate_goal_to_session", "judge_goal",
-    "run_kanban_goal_loop", "normalize_goal_max_turns",
+    "CONTINUATION_PROMPT_TEMPLATE",
+    "CONTINUATION_PROMPT_WITH_CONTRACT_TEMPLATE",
+    "CONTINUATION_PROMPT_WITH_SUBGOALS_TEMPLATE",
+    "DEFAULT_MAX_TURNS",
+    "DRAFT_CONTRACT_SYSTEM_PROMPT",
+    "JUDGE_USER_PROMPT_TEMPLATE",
+    "JUDGE_USER_PROMPT_WITH_CONTRACT_TEMPLATE",
+    "JUDGE_USER_PROMPT_WITH_SUBGOALS_TEMPLATE",
+    "KANBAN_GOAL_CONTINUATION_TEMPLATE",
+    "KANBAN_GOAL_FINALIZE_TEMPLATE",
+    "GoalContract",
+    "GoalGate",
+    "GoalManager",
+    "GoalState",
+    "clear_goal",
+    "draft_contract",
+    "judge_goal",
+    "load_goal",
+    "migrate_goal_to_session",
+    "normalize_goal_max_turns",
+    "parse_contract",
+    "run_gate",
+    "run_kanban_goal_loop",
+    "save_goal",
 ]

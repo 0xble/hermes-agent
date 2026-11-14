@@ -91,6 +91,10 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        # This is the start of this physical transport attempt.  Retry attempts
+        # within one logical API call must not reuse the outer call timestamp
+        # when guarding a recovery tombstone.
+        agent._current_api_request_started_at = time.time()
         from agent import relay_llm
         from agent.turn_usage import log_response_service_tier
 
@@ -189,6 +193,11 @@ def handle_api_interrupt(
     from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
+    from agent.shared_primary_cooldown import _probe_token_value
+    token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", None))
+    if token:
+        from agent.shared_primary_probe_runtime import release_primary_probe
+        release_primary_probe(agent, token)
     # redirect() cancelled only this request: keep the correction queued, clear the
     # cancellation bit, let the outer loop rebuild. Never materialize incomplete
     # signed/encrypted reasoning items.
@@ -273,6 +282,7 @@ def nous_rate_limit_guard(
                 agent._buffer_vprint(f"⏳ {_nous_msg} Trying fallback...")
                 agent._buffer_diagnostic_status(f"⏳ {_nous_msg}")
                 if agent._try_activate_fallback():
+                    logger.warning("%sNous rate limit recorded (resets in %s) — switched to fallback", agent.log_prefix, reset)
                     active_system_prompt = _arm_fallback_restart(
                         agent, api_messages, active_system_prompt, _retry)
                     retry_count = 0

@@ -25,7 +25,7 @@ import re
 import subprocess
 import sys
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 
 TAG_RE = re.compile(r"^v(\d{4})\.(\d{1,2})\.(\d{1,2})$")
@@ -78,11 +78,11 @@ def verify_candidate(repo: Path, python: str = sys.executable, baseline: str | N
         return {"exit": 1, "paths": sorted(paths), "summary": "missing maintained proof paths",
                 "output": "\n".join(missing)}
     run = subprocess.run(["bash", "scripts/run_tests.sh", *sorted(paths)], cwd=repo,
-                         capture_output=True, text=True, timeout=3600)
+                         capture_output=True, text=True, timeout=3600, check=False)
     output = run.stdout + run.stderr
     if run.returncode == 0:
         ownership = subprocess.run([python, "scripts/check_fork_patches.py", "--repo", str(repo),
-                                    "--source-only", *(["--baseline", baseline] if baseline else [])], cwd=repo, capture_output=True, text=True, timeout=120)
+                                    "--source-only", *(["--baseline", baseline] if baseline else [])], cwd=repo, capture_output=True, text=True, timeout=120, check=False)
         output += ownership.stdout + ownership.stderr
         if ownership.returncode:
             return {"exit": ownership.returncode, "paths": sorted(paths), "output": output[-16000:],
@@ -134,10 +134,10 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--result", type=Path, help="write the JSON result here as well as stdout")
     args = ap.parse_args(argv)
     repo = args.repo.expanduser().resolve()
-    result: dict = {"started_at": datetime.now(timezone.utc).isoformat()}
+    result: dict = {"started_at": datetime.now(UTC).isoformat()}
 
     def finish(status: str, code: int, **extra) -> int:
-        result.update(status=status, finished_at=datetime.now(timezone.utc).isoformat(), **extra)
+        result.update(status=status, finished_at=datetime.now(UTC).isoformat(), **extra)
         payload = json.dumps(result, indent=2, sort_keys=True)
         if code:
             print("[CRON_FAILURE] fork sync: " + status)

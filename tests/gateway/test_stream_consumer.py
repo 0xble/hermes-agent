@@ -1609,7 +1609,7 @@ class TestCopyBlocksInlineContext:
             side_effect=lambda **kw: SimpleNamespace(success=True, message_id=next(msg_ids)))
         adapter.edit_message = AsyncMock(
             return_value=SimpleNamespace(success=True, message_id="msg_x"))
-        setattr(adapter, "MAX_MESSAGE_LENGTH", 700)
+        adapter.MAX_MESSAGE_LENGTH = 700
         config = StreamConsumerConfig(edit_interval=0.01, buffer_threshold=5, cursor=" ▉")
         consumer = GatewayStreamConsumer(adapter, "chat_copy", config)
         body = "SECRET line\n" * 120

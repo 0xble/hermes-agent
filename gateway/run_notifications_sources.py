@@ -12,6 +12,17 @@ from gateway.session import SessionSource
 logger = logging.getLogger("gateway.run")
 
 
+def _raw_process_event_session_id(evt: dict) -> str:
+    """Recognize API routes, not malformed structured or partial messaging routes."""
+    session_key = str(evt.get("session_key") or "").strip()
+    platform = str(evt.get("platform") or "").strip().lower()
+    if session_key.startswith("agent:") or platform not in {"", "api_server"}:
+        return ""
+    if not platform and any(evt.get(field) for field in ("chat_id", "chat_type", "thread_id")):
+        return ""
+    return str(evt.get("origin_session_id") or session_key or "").strip()
+
+
 class GatewayProcessEventSourcesMixin:
     def _build_process_event_source(self, evt: dict):
         """Bound failed recovery work without discarding a process or its completion."""
@@ -44,7 +55,6 @@ class GatewayProcessEventSourcesMixin:
         Prefer the persisted session-store origin; the active foreground event causes cross-topic bleed.
         """
         from gateway.run import _parse_session_key
-        from gateway.run_notifications import _raw_process_event_session_id
         session_key = str(evt.get("session_key") or "").strip()
         event_profile = str(evt.get("profile") or "").strip() or None
 
@@ -70,7 +80,8 @@ class GatewayProcessEventSourcesMixin:
                     return self._restored_source(entry)
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
-            cached_source = self._get_cached_session_source(session_key)
+            from gateway.session_detached import detached_live_source
+            cached_source = detached_live_source(self, session_key) or self._get_cached_session_source(session_key)
             if cached_source is not None:
                 return _stamp_profile(cached_source)
             derived = _parse_session_key(session_key) or {}

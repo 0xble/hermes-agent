@@ -347,7 +347,7 @@ def test_invalid_update_config_exits_cleanly_with_failed_receipt(receipt_home, m
     monkeypatch.setattr(hermes_main, "_update_preflight_handled", lambda args: False)
     monkeypatch.setattr(hermes_main, "_install_hangup_protection", lambda **kw: None)
     monkeypatch.setattr(hermes_main, "_finalize_update_output", lambda state: None)
-    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", list)
     monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "test")
     class FakeLock:
         holder = None
@@ -382,7 +382,7 @@ def test_unreadable_update_config_fails_cleanly(receipt_home, monkeypatch, capsy
     monkeypatch.setattr(hermes_main, "_update_preflight_handled", lambda args: False)
     monkeypatch.setattr(hermes_main, "_install_hangup_protection", lambda **kw: None)
     monkeypatch.setattr(hermes_main, "_finalize_update_output", lambda state: None)
-    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", lambda: [])
+    monkeypatch.setattr(hermes_main, "_capture_active_lazy_features", list)
     monkeypatch.setattr(update_cmd, "_read_project_version", lambda: "test")
     monkeypatch.setattr(hermes_config, "load_config", lambda: (_ for _ in ()).throw(OSError("unreadable config")))
     exit_codes = []

@@ -19,9 +19,10 @@ class ProcessCheckpointMixin:
 
     # ----- Checkpoint (crash recovery) -----
 
-    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None):
+    def _write_checkpoint(self, extra_entries: Optional[list[dict[str, Any]]] = None, *, required: bool = False):
         """Write running process metadata to the checkpoint file atomically."""
         from tools.process_registry import _checkpoint_path, _CHECKPOINT_FIELDS
+        from tools.process_registry_ssh import binding_record
 
         try:
             with self._lock:
@@ -44,6 +45,7 @@ class ProcessCheckpointMixin:
                     # Recovery uses command only for display (adoption re-validates the
                     # PID, never re-runs it), so masking is lossless.
                     # See #77484.
+                    entry["ssh_binding"] = binding_record(s.ssh_binding)
                     entry["command"] = redact_sensitive_text(s.command, code_file=True)
                     entry["handoff_note"] = redact_sensitive_text(s.handoff_note, code_file=True)
                     entry["owner_task_id"] = s.owner_task_id or s.task_id
@@ -62,6 +64,8 @@ class ProcessCheckpointMixin:
                 entries.extend(self._foreign_handoffs(path, known))
                 atomic_json_write(path, entries)
         except Exception as e:
+            if required:
+                raise RuntimeError("Cannot persist process run identity, no remote command was launched") from e
             logger.debug("Failed to write checkpoint file: %s", e, exc_info=True)
 
     def _foreign_handoffs(self, path, known) -> list[dict[str, Any]]:
@@ -74,9 +78,35 @@ class ProcessCheckpointMixin:
         except (OSError, ValueError):
             return []
         return [entry for entry in on_disk if isinstance(entry, dict) and entry.get("session_id") not in known
-                and (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
-                and (_exit_path(log).exists() or self._detached_host_fate(
-                    entry.get("pid"), entry.get("host_start_time")) == "running")]
+                and (entry.get("pid_scope") == "ssh" or (
+                    (log := adoptable_log(entry.get("output_log"))) and Path(log).exists()
+                    and (_exit_path(log).exists() or self._detached_host_fate(
+                        entry.get("pid"), entry.get("host_start_time")) == "running")))]
+
+    @staticmethod
+    def _checkpoint_identity_missing(pid, survivor, pid_scope) -> bool:
+        return not pid and not survivor and pid_scope != "ssh"
+
+    def _recover_nonhost_entry(self, entry, unresolved) -> int:
+        from tools.process_registry import _WATCHER_ROUTE_KEYS
+        if entry.get("pid_scope") != "ssh":
+            logger.info("Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
+                        entry.get("command", "unknown")[:60], entry.get("pid"), entry.get("pid_scope"))
+            return 0
+        try:
+            session = self._recover_ssh(entry)
+        except (KeyError, TypeError, ValueError) as exc:
+            logger.warning("Cannot recover SSH process %s: %s", entry.get("session_id"), exc)
+            unresolved.append(entry)
+            return 0
+        if session.watcher_interval > 0:
+            self.pending_watchers.append({
+                "session_id": session.id, "check_interval": session.watcher_interval,
+                "session_key": session.session_key, "parent_session_id": session.parent_session_id,
+                **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
+                "notify_on_complete": session.notify_on_complete,
+            })
+        return 1
 
     def recover_from_checkpoint(self) -> int:
         """On gateway startup, probe PIDs from the checkpoint file; returns how many
@@ -91,6 +121,10 @@ class ProcessCheckpointMixin:
         from tools.process_registry_output_log import adoptable_log
 
         self._prune_delivered_survivor_runs()
+        # This host adopts what a crashed predecessor left running, so the jobs it starts must
+        # survive its own crash for the next one: they stay out of the owner-death supervisor.
+        self._jobs_outlive_host = True
+
         checkpoint_path = _checkpoint_path()
         if not checkpoint_path.exists():
             return 0
@@ -104,7 +138,11 @@ class ProcessCheckpointMixin:
             pid, pid_scope = entry.get("pid"), entry.get("pid_scope", "host")
             # Exit collection is independent of dispatch, PID identity and delivery.
             restart_safe = is_restart_safe(entry)
-            if not pid and not restart_safe and not has_exit_marker(entry):
+            survivor = restart_safe or has_exit_marker(entry)
+            # Keep the upstream receipt-aware survivor semantics while allowing
+            # named SSH handles, which have no local PID, to recover through the
+            # node-bound process registry.
+            if self._checkpoint_identity_missing(pid, survivor, pid_scope):
                 continue
             # The registry is process-global, so every profile's checkpoint carries every live
             # process; a multiplexer recovering several homes must adopt each session once.
@@ -113,10 +151,8 @@ class ProcessCheckpointMixin:
                                    or entry.get("session_id") in self._finished)
             if already_tracked:
                 continue
-            if pid_scope != "host":  # in-sandbox PIDs mean nothing once the env handle is gone
-                logger.info(
-                    "Skipping recovery for non-host process: %s (pid=%s, scope=%s)",
-                    entry.get("command", "unknown")[:60], pid, pid_scope)
+            if pid_scope != "host":
+                recovered += self._recover_nonhost_entry(entry, unresolved_scope_entries)
                 continue
             # Alive and still ours: re-attach. A start-time probe that cannot
             # be read is not proof the PID was reused — dropping it would leave

@@ -322,8 +322,8 @@ def fire_overdue_jobs(
         return 0
 
     from cron.jobs import (
-        ONESHOT_GRACE_SECONDS, _elapsed_seconds, _ensure_aware, _hermes_now,
-        is_job_runnable, load_jobs,
+        _elapsed_seconds, _ensure_aware, _hermes_now, is_job_runnable, load_jobs,
+        oneshot_grace_seconds,
     )
 
     if now is None:
@@ -344,12 +344,12 @@ def fire_overdue_jobs(
         if overdue_seconds < grace_minutes * 60:
             continue
         job_id = str(job.get("id") or "")
-        # One-shots past ONESHOT_GRACE_SECONDS "will never fire"; don't resurrect them hours late.
-        # One-shot jobs share the module-wide policy: more than ONESHOT_GRACE_SECONDS past their run time
-        # means "will never fire" (create/update/resume/recovery and, since #89571, the due-scan all enforce
-        # it). The misfire backstop must not resurrect them hours late after downtime — that's #93526.
+        # One-shots past their effective allowance "will never fire"; don't resurrect them hours late.
+        # Create/update/resume still use the fixed 120-second scheduling guard, while this recovery
+        # path honors a widened per-job catch-up allowance.
         schedule = job.get("schedule") or {}
-        if str(schedule.get("kind") or "") == "once" and overdue_seconds > ONESHOT_GRACE_SECONDS:
+        allowance = oneshot_grace_seconds(job) if schedule.get("kind") == "once" else None
+        if allowance is not None and overdue_seconds > allowance:
             logger.warning(
                 "Misfire catch-up: one-shot job %s (%s) was due %s "
                 "(%.0f min overdue) — outside the %ss one-shot grace "
@@ -358,7 +358,7 @@ def fire_overdue_jobs(
                 job.get("name") or "unnamed",
                 next_run_at,
                 overdue_seconds / 60,
-                ONESHOT_GRACE_SECONDS,
+                allowance,
             )
             continue
         logger.warning(
@@ -467,6 +467,7 @@ class InProcessCronScheduler(CronScheduler):
         from hermes_constants import get_process_hermes_home
 
         from cron.oneshot_retirement import record_ticker_start
+        from cron.dispatch_hold import note_dispatching, note_held
 
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
 
@@ -517,7 +518,9 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                    note_held()
                 else:
+                    note_dispatching()
                     stores.run(get_process_hermes_home(), cron_tick,
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
@@ -580,6 +583,7 @@ class InProcessCronScheduler(CronScheduler):
         )
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
+        from cron.dispatch_hold import note_dispatching, note_held_profiles
 
         initial_homes = _existing_profile_homes(profile_homes)
         register_ticked_homes([_profile_entry(entry)[1] for entry in initial_homes])
@@ -657,10 +661,12 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                    note_held_profiles(cycle_homes)
                 else:
                     for _pname, home in cycle_homes:
                         try:
                             with _profile_cron_scope(home):
+                                note_dispatching()
                                 stores.run(home, cron_tick,
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,

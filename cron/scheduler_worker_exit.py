@@ -105,7 +105,7 @@ def _terminal_execution_result(
     wait_for_process_exit: bool,
 ) -> bool:
     current = scheduler.get_execution(execution_id)
-    if not current or current.get("status") not in ("completed", "failed"):
+    if not current or current.get("status") not in scheduler.FIRER_FINISHED_STATES:
         return False
     if returncode is not None and returncode < 0 and wait_for_process_exit:
         raise ExternalWorkerExitTimeout(
@@ -126,7 +126,7 @@ def _recover_dead_worker(scheduler, execution_id: str, returncode: int, stderr_p
     if not scheduler.terminalize_dead_owner(execution_id, reason=reason):
         scheduler.recover_interrupted_executions()
         current = scheduler.get_execution(execution_id)
-        if current and current.get("status") in ("completed", "failed"):
+        if current and current.get("status") in scheduler.FIRER_FINISHED_STATES:
             return True
     stderr_tail = ""
     if stderr_path is not None:

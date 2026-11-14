@@ -31,7 +31,7 @@ def _isolate_gateway_home(tmp_path, monkeypatch):
     monkeypatch.setattr(run_mod, "_hermes_home", tmp_path)
 
 
-async def _deliver_sigterm(monkeypatch):
+async def _deliver_sigterm(monkeypatch, received_signal=signal.SIGTERM, *, deliver_signal=None):
     """Drive the real SIGTERM handler through a full stop with one agent that outlives the drain."""
     runner, adapter = make_restart_runner()
     adapter.disconnect = AsyncMock()
@@ -64,7 +64,11 @@ async def _deliver_sigterm(monkeypatch):
     monkeypatch.setattr(run_mod.asyncio, "create_task", _record)
     signal_initiated = [False]
     with patch("gateway.status.remove_pid_file"), patch("gateway.status.publish_runtime_status"):
-        bootstrap._start_gateway_make_shutdown_signal_handler(runner, signal_initiated)(signal.SIGTERM)
+        handler = bootstrap._start_gateway_make_shutdown_signal_handler(runner, signal_initiated)
+        if deliver_signal is None:
+            handler(received_signal)
+        else:
+            await deliver_signal(handler, received_signal)
         await asyncio.wait_for(created[0], timeout=10)
     return runner, sweeps, signal_initiated[0]
 
@@ -91,10 +95,26 @@ async def test_sigterm_without_marker_keeps_signal_shutdown_exit_1(monkeypatch):
     runner, sweeps, signal_initiated = await _deliver_sigterm(monkeypatch)
 
     assert not runner._restart_requested
-    assert ("post-interrupt", None, False) in sweeps
+    # Cleanup bounds apply to signal stops too, independently of restart intent.
+    post_interrupt = [timeout for phase, timeout, _restart in sweeps if phase == "post-interrupt"]
+    assert len(post_interrupt) == 1 and 0 < post_interrupt[0] <= 2.0
+    assert all(not restart for _phase, _timeout, restart in sweeps)
     assert signal_initiated is True
     # False => start_gateway's caller exits 1 so the service manager revives the gateway.
     assert _resolve_gateway_exit_verdict(runner, signal_initiated) is False
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("received_signal", [signal.SIGTERM, signal.SIGINT])
+async def test_planned_signal_stop_bounds_sweeps_without_restart(monkeypatch, received_signal):
+    if received_signal == signal.SIGTERM:
+        assert status.write_planned_stop_marker(os.getpid())
+    runner, sweeps, signal_initiated = await _deliver_sigterm(monkeypatch, received_signal)
+    assert runner._stop_requested_by_signal
+    assert not signal_initiated and not runner._restart_requested
+    assert {phase for phase, _timeout, _restart in sweeps} == {"post-interrupt", "final-cleanup"}
+    assert all(timeout is not None and 0 < timeout <= 2.0 for _phase, timeout, _restart in sweeps)
+    assert _resolve_gateway_exit_verdict(runner, signal_initiated) is True
 
 
 def test_marker_for_another_pid_is_ignored_and_stale_marker_cleared(monkeypatch):

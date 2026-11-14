@@ -16,7 +16,7 @@ import sys
 import time
 import uuid
 import hermes_yaml as yaml
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -75,7 +75,7 @@ def intent_path(home: Path) -> Path:
 def set_intent(home: Path, *, stopped: bool) -> None:
     path = intent_path(home)
     if stopped:
-        path.write_text(datetime.now(timezone.utc).isoformat() + "\n", encoding="utf-8")
+        path.write_text(datetime.now(UTC).isoformat() + "\n", encoding="utf-8")
     else:
         path.unlink(missing_ok=True)
 
@@ -83,7 +83,7 @@ def set_intent(home: Path, *, stopped: bool) -> None:
 def receipt(home: Path, action: str, outcome: str, **detail: object) -> Path:
     directory = home / "logs" / "guardian"
     directory.mkdir(parents=True, exist_ok=True)
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     cutoff = now.timestamp() - 3600
     payload = {"at": now.isoformat(), "action": action, "outcome": outcome, **detail}
     for prior in directory.glob("*.json"):
@@ -123,7 +123,7 @@ def _switch(home: Path, *, grace: float) -> tuple[str, dict | None]:
         issued = record.get("reload_issued")
         if not isinstance(issued, dict) or not isinstance(issued.get("at"), str):
             return "none", None
-        age = datetime.now(timezone.utc).timestamp() - datetime.fromisoformat(issued["at"]).timestamp()
+        age = datetime.now(UTC).timestamp() - datetime.fromisoformat(issued["at"]).timestamp()
         if age < grace:
             return "waiting", None
         return "expired", record
@@ -174,7 +174,7 @@ def _sleep_within(seconds: float, deadline: float) -> None:
 
 def _launch_state(domain: str, label: str, *, deadline: float | None = None) -> str:
     result = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
-                            capture_output=True, text=True, encoding="utf-8", timeout=_bounded_timeout(5, deadline))
+                            capture_output=True, text=True, encoding="utf-8", timeout=_bounded_timeout(5, deadline), check=False)
     if result.returncode == 0:
         # A loaded job with no live PID whose last exit was clean is parked: KeepAlive's
         # SuccessfulExit=false will never relaunch it (exit 0, or EX_CONFIG 78 mapped to 0).
@@ -307,7 +307,7 @@ def rollback_switch(home: Path, plist: Path, label: str, old: Path, *, domain: s
                 raise RuntimeError('cannot mark the rollback gateway for planned restart')
         touched.append(True)
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
-                       timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline))
+                       timeout=_bounded_timeout(ROLLBACK_SECONDS, deadline), check=False)
         _reap_rollback_owners(owners, deadline, home=home)
         # The exact remaining budget: flooring it to a whole second would hand the bootstrap a fresh
         # second past the rollback deadline.
@@ -517,7 +517,7 @@ def _run(home: Path, plist: Path, label: str, *, grace: float, domain: str | Non
         # is an unintended clean exit. Bootstrap would fail on a still-loaded label: boot it
         # out first and prove it unloaded. MAX_REPAIRS bounds a config-fatal relaunch loop.
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"], capture_output=True,
-                       timeout=_bounded_timeout(10, deadline))
+                       timeout=_bounded_timeout(10, deadline), check=False)
         if _launch_state(domain, label, deadline=deadline) != "unloaded":
             receipt(home, "bootstrap", "failed", label=label, reason="parked label bootout did not read back unloaded")
             return "failed"
@@ -650,13 +650,12 @@ def cli(argv: list[str] | None = None) -> int:
     target = args.gateway_plist or gateway.get_launchd_plist_path()
     label = args.gateway_label or gateway.get_launchd_label()
     args.domain = args.domain or _domain(GUARDIAN_LABEL if args.action == "uninstall" else label)
-    import pwd
-    path = Path(pwd.getpwuid(getattr(os, 'getuid')()).pw_dir) / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
+    path = gateway._launchd_account_home() / "Library/LaunchAgents" / f"{GUARDIAN_LABEL}.plist"
     if args.action == "status":
         print(f"enabled={enabled(home)} installed={path.is_file()} intent_stopped={intent_path(home).exists()} domain={args.domain}")
         return 0
     if args.action == "uninstall":
-        subprocess.run(["launchctl", "bootout", f"{args.domain}/{GUARDIAN_LABEL}"], capture_output=True, timeout=10)
+        subprocess.run(["launchctl", "bootout", f"{args.domain}/{GUARDIAN_LABEL}"], capture_output=True, timeout=10, check=False)
         path.unlink(missing_ok=True)
         print("Guardian uninstalled")
         return 0

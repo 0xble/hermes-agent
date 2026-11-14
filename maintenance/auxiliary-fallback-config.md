@@ -11,18 +11,17 @@ is a delegation subagent, not an auxiliary side-LLM consumer.
 
 Absent and empty chains keep existing request behavior. Config check and
 migration must not backfill these fields into a sparse current-version file.
-Unrelated config saves must preserve model-preset references, including when
-all defaults are saved. The shared reference-restoration path removes matched
-inert fallback defaults, never an edited nonempty chain.
+Unrelated config saves preserve authored `model_aliases` and bare alias references.
+The old preset reference-restoration path and its exclusive tests are retired
+with [model presets](model-presets.md). Current consumers use upstream configuration.
 
 ## Verification And Retirement
 
 Run `tests/hermes_cli/test_auxiliary_fallback_config.py`, the config CLI suites,
-`tests/agent/test_auxiliary_client.py`, and the model-preset persistence and
-consumer suites. Exercise actual config set/readback without unknown-key
-warnings, sparse-config byte preservation, and default-inclusive preset
-save/reload with and without preset fallbacks.
+`tests/agent/test_auxiliary_client.py`, and
+`tests/hermes_cli/test_model_alias_migration.py`. Exercise actual config
+set/readback without unknown-key warnings and sparse-config preservation.
 
 Upstream proposal: NousResearch/hermes-agent#122364. Retire when upstream
-registers these runtime-read keys with equivalent sparse-config and preset
+registers these runtime-read keys with equivalent sparse-config and authored-alias
 round-trip behavior. Revert commits carrying this patch identity to roll back.

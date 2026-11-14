@@ -6,6 +6,7 @@ from collections.abc import Callable
 from markdown_it import MarkdownIt
 from markdown_it.rules_inline.emphasis import tokenize
 from markdown_it.rules_inline.escape import escape as tokenize_escape
+import itertools
 
 
 def _asterisks_only(state, silent):
@@ -31,12 +32,19 @@ def protect_asterisk_emphasis(
     parser.block.parse(block_source, parser, {}, blocks)
     lines = text.splitlines(keepends=True)
     boundaries = {0, len(lines)}
+    # Telegram ends a quote when the next physical line is not quoted, even when
+    # CommonMark treats that line as a lazy continuation of the same paragraph.
+    from .telegram_markdown import _EXPANDABLE_QUOTE
+    quote_line = re.compile(rf"^(?:{_EXPANDABLE_QUOTE})?>{{1,3}} ")
+    for index in range(1, len(lines)):
+        if bool(quote_line.match(lines[index - 1])) != bool(quote_line.match(lines[index])):
+            boundaries.add(index)
     for block in blocks:
         if block.type == "inline" and block.map:
             boundaries.update(block.map)
     boundaries = sorted(boundaries)
     parts = []
-    for start, end in zip(boundaries, boundaries[1:]):
+    for start, end in itertools.pairwise(boundaries):
         tokens = []
         parser.inline.parse("".join(lines[start:end]), parser, {}, tokens)
         depth = {"*": 0, "**": 0}

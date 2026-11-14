@@ -3,7 +3,7 @@
 from typing import Any, Dict
 
 
-def session_control_outcome(record: Dict[str, Any], who: str) -> tuple[str, str]:
+def session_control_outcome(record: dict[str, Any], who: str) -> tuple[str, str]:
     """Return resolution text that explains stale approvals instead of hiding them."""
     status = str(record.get("status") or "failed")
     kind, action = str(record.get("kind") or "goal"), str(record.get("action") or "")
