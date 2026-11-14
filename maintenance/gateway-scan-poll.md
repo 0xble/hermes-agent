@@ -24,3 +24,6 @@ paths that already had an in-process result cache. The cache key was a fresh
 filesystem signature, so the cache never avoided the stat. Upstream has the
 same uncached signature checks. No upstream submission. Roll back by reverting
 the commit carrying `Fork-Patch: gateway-scan-poll`.
+
+
+Contract tests: `tests/agent/test_gateway_scan_poll.py`.

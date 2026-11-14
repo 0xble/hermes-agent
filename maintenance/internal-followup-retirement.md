@@ -73,3 +73,5 @@ successor result propagation.
 ## Rollback
 
 Revert the commit carrying `Fork-Patch: internal-followup-retirement`.
+
+Contract tests: `tests/gateway/test_shutdown_followup_restart.py`, `tests/gateway/test_proxy_mode.py`.

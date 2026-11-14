@@ -41,3 +41,5 @@ private URLs; private incident replay is not a source fixture dependency.
 Retire when the selected upstream release preserves meaningful summary/type
 metadata at both producer completion paths. Rollback reverts the commits bearing
 `Fork-Patch: cron-agent-failure-metadata`, without editing historical records.
+
+Contract tests: `tests/cron/test_agent_failure_metadata.py`, `tests/cron/test_canonical_receipt_bookkeeping.py`.

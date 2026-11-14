@@ -19,3 +19,5 @@ Fork-only default change. The deterministic pruning implementation is already sh
 ## Retirement and rollback
 
 Retire the fork default change when released upstream enables an equivalent nonzero default; remove the fork-only default/doc/test adaptation while retaining equivalent upstream-owned coverage. Roll back by reverting the commit that changes `compression.proactive_prune_tokens` from `0` to `48000` and its default-specific documentation and regression test; no persistent-data migration is required.
+
+Contract tests: `tests/agent/test_proactive_prune_config.py`, `tests/agent/test_proactive_tool_result_pruning.py`, `tests/agent/test_proactive_prune_rearm_threshold.py`, `tests/agent/test_proactive_prune_loop_wiring.py`.

@@ -54,3 +54,5 @@ commits, the sync should merge cleanly. **Retire B** when upstream merges #13255
 fork sync includes it. If upstream changes B before merging, take upstream's version.
 
 **Rollback:** revert the six backport commits. Each touches only the files above.
+
+Contract tests: `tests/agent/test_turn_facade_lease.py`, `tests/agent/test_turn_finalizer_interrupt_alternation.py`.

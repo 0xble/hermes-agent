@@ -101,3 +101,5 @@ patch does not change footer argument parsing or other platforms' behavior.
 Retire when upstream has equivalent producer-owned metadata classification and
 context rendering across sends and status edits. Never replace classification
 with text matching in the Slack adapter.
+
+Contract tests: `tests/hermes_state/test_storage_import_boundary.py`, `tests/gateway/test_slack_context_notices.py`, `tests/gateway/test_slack_notice_coverage.py`, `tests/gateway/test_telegram_ingress_nonblocking.py`, `tests/gateway/test_restart_resume_admission_identity.py`.

@@ -22,3 +22,5 @@ The observed gateway log on September 26 recorded multiple active-topic sends to
 ## Retirement and rollback
 
 Retire only after a released upstream version satisfies the private-parent deduplication, interim streaming semantics, and continuation-policy-aware wording together; otherwise preserve the fork-only remainder. Roll back this patch commit and remove this unit and its table row; no schema or configuration change is involved. Activation is separately authorized, not implied by source publication.
+
+Contract tests: `tests/gateway/test_restart_resume_pending.py`, `tests/gateway/test_restart_notification.py`, `tests/gateway/test_gateway_shutdown.py`, `tests/gateway/test_interim_send_lanes.py`, `tests/gateway/test_stream_final_contract.py`.

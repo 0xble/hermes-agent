@@ -27,3 +27,5 @@ Both current fork main and current upstream main failed the queued-handoff callb
 ## Retirement and rollback
 
 Retire when a selected upstream release preserves both generations' callbacks across queued handoff and awaits per-turn progress cleanup before follow-ups, including failure and adapter replacement, with the regression passing on that release. Revert the scoped patch and remove its tests and this unit; no persisted schema or config changes are involved. Source publication does not restart or promote the live gateway.
+
+Contract tests: `tests/gateway/test_post_delivery_callback_chaining.py`, `tests/gateway/test_run_cleanup_progress.py`, `tests/gateway/test_status_command.py`, `tests/gateway/test_run_progress_topics.py`, `tests/gateway/test_active_session_text_merge.py`, `tests/gateway/test_turn_bubble_cleanup.py`, `tests/gateway/test_drain_post_delivery_cleanup.py`.

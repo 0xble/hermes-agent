@@ -9,3 +9,5 @@ Reproduction: without the opt-in entry, `build_environment(all_extras=True)` ins
 Proof surfaces: `tests/pm/test_extras.py` checks that declared gates match dependency selection on every target and that anchors name declared extras. `tests/pm/test_environment_build.py` checks that all-extras builds skip opt-in extras. `uv lock --check` verifies the lock against `pyproject.toml`.
 
 Retire when upstream ships an equivalent opt-in document extra, or when no deployed host selects `documents`. Rollback removes the extra, its exclude-newer exemptions, its opt-in and platform entries, its anchors and the packages it added to the lock.
+
+Contract tests: `tests/pm/test_extras.py`, `tests/pm/test_environment_build.py`.

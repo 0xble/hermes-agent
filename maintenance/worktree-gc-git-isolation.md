@@ -156,3 +156,5 @@ Retire when a released upstream tag isolates the production GC Git calls from
 host config and archives NUL-parsed paths with fail-safe reclaim, with
 equivalent real-Git coverage. Roll back by reverting the logical patch and this
 unit together. No persistent state changes.
+
+Contract tests: `tests/hermes_cli/test_worktree_gc.py`, `tests/hermes_cli/test_worktree.py`.

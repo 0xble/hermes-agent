@@ -22,3 +22,5 @@ Run `python scripts/check-windows-footguns.py --all` and
 Retire this correction when the selected upstream release opens this writable
 lock without a BOM-emitting encoding. Revert the commit carrying
 `Fork-Patch: cron-jobs-lock-hold` to roll back the correction.
+
+Contract tests: `tests/cron/test_jobs_crossprocess_lock.py`.

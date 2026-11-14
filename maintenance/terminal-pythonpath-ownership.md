@@ -21,3 +21,5 @@ A running gateway's own imported modules stay on its boot generation until the n
 ## Verification
 
 `tests/tools/test_local_env_blocklist.py`: the stale-generation regression strips old and new generation site-packages, keeps user and unrelated paths in order, owns a generation created after the first call, and rejects a venv symlink that escapes the installs root.
+
+Contract tests: `tests/tools/test_local_env_blocklist.py`.

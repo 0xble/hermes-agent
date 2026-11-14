@@ -36,3 +36,5 @@ Load this unit when changing Camofox task bindings, end-of-turn browser cleanup,
 ## Retirement and rollback
 
 Retire when upstream ships per-turn binding retention and safe adoption for managed Camofox identities with handoff continuity. Roll back by reverting this patch's commit. No server, profile, credential or state migration occurs. Quarantine is removed only when tab destruction is confirmed.
+
+Contract tests: `tests/tools/test_browser_camofox_tab_reuse.py`, `tests/tools/test_browser_camofox_capabilities.py`, `tests/agent/test_browser_output_egress.py`, `tests/tools/test_browser_vault.py`.

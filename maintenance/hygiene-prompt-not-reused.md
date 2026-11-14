@@ -48,3 +48,5 @@ Source adoption does not assert that any production historical row has been repa
 
 Drop the restore guard only after upstream prevention and historical repair have both
 been verified on the selected release. A prevention fix alone does not repair old rows.
+
+Contract tests: `tests/agent/test_system_prompt_restore.py`, `tests/gateway/test_hygiene_compaction_keeps_seeded_prompt.py`, `tests/hermes_cli/test_sessions_repair_prompts.py`, `tests/hermes_cli/test_sessions_repair_prompt_race.py`.

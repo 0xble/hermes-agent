@@ -27,3 +27,5 @@ provider-resolution checks.
 
 Retire this unit when models.dev and the provider plugin use the same canonical
 credential name and the focused contract passes without the overlay.
+
+Contract tests: `tests/plugins/model_providers/test_commandcode_profile.py`.

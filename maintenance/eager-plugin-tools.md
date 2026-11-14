@@ -20,3 +20,5 @@ The first consumers are the agents-repository goal and loop lifecycle plugins. T
 Run `scripts/run_tests.sh tests/tools/test_tool_search.py tests/tools/test_registry.py tests/hermes_cli/test_plugins.py`. Cover eager visibility, ordinary plugin deferral, explicit user override, and describe/call rejection. Run the agents lifecycle plugin registration tests and fresh-session automation routing Cases with normal tool search.
 
 Retire this patch when upstream offers an equivalent plugin-owned direct-tool registration contract. Rollback restores default plugin deferral without a stored-state migration.
+
+Contract tests: `tests/tools/test_tool_search.py`, `tests/tools/test_registry.py`, `tests/hermes_cli/test_plugins.py`.

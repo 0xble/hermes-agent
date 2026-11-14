@@ -113,3 +113,6 @@ clock remains provenance only and never refreshes activity.
 Remove after upstream implements the private synthetic classification and both
 merge-order human-veto regressions pass on the replacement. Never remove merely
 because the older automation-only precedent is upstream.
+
+
+Contract tests: `tests/gateway/test_loop_tick_native_settlement.py`, `tests/gateway/test_synthetic_provenance_retry.py`, `tests/gateway/test_unknown_synthetic_settles.py`.

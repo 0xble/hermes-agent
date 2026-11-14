@@ -25,3 +25,5 @@ set/readback without unknown-key warnings and sparse-config preservation.
 Upstream proposal: NousResearch/hermes-agent#122364. Retire when upstream
 registers these runtime-read keys with equivalent sparse-config and authored-alias
 round-trip behavior. Revert commits carrying this patch identity to roll back.
+
+Contract tests: `tests/hermes_cli/test_auxiliary_fallback_config.py`, `tests/agent/test_auxiliary_client.py`, `tests/hermes_cli/test_model_alias_migration.py`.

@@ -23,3 +23,5 @@ Run `HERMES_PYTHON=.venv/bin/python bash scripts/run_tests.sh tests/gateway/test
 ## Retirement and rollback
 
 Retire when released upstream exposes equivalent default-deny turn provenance to plugins and session context with merged human-input precedence. Roll back by reverting the commits carrying `Fork-Patch: turn-origin-provenance`.
+
+Contract tests: `tests/gateway/test_turn_origin.py`, `tests/agent/test_turn_origin.py`, `tests/gateway/test_session_context_inheritance.py`.

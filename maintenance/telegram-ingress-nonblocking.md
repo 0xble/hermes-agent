@@ -95,3 +95,5 @@ commit. It makes no state, schema or configuration change.
 
 **Retirement:** Retire this once a deaf-dispatcher stall has been attributed to a root cause and
 fixed, or upstream ships an equivalent dispatcher diagnostic.
+
+Contract tests: `tests/gateway/test_telegram_ingress_nonblocking.py`, `tests/plugins/test_telegram_ingress_consumer_ptb.py`, `tests/gateway/test_telegram_ingress_delivery_gap.py`.

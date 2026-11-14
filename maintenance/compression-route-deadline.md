@@ -19,3 +19,5 @@ Ported from archived HERMES-107 (archived commit `4dcb30f6bd62`) after reproduci
 ## Retirement and rollback
 
 Retire after a released upstream version makes fallback independent of equal-deadline scheduling and preserves concurrent transcript tails. Roll back the patch commit and focused deadline regressions; no persistent-data migration is required.
+
+Contract tests: `tests/agent/test_compression_stall_fallback.py`, `tests/agent/test_compression_attempt_lifecycle.py`, `tests/agent/test_compression_stall_deterministic_fallback.py`.

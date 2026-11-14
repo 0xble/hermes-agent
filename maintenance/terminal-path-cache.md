@@ -22,3 +22,5 @@ Callers get a copy, never the cached list. Startup activation (`activate`, `stor
 ## Verification
 
 `tests/pm/test_store_path_dirs_cache.py`: on main, 6 terminal compositions take 6 full composes. Here they take 1. A PM write, a new runtime dir, or TTL expiry recomposes, and activation stays live. The root `tests/conftest.py` clears the cache per test.
+
+Contract tests: `tests/pm/test_store_path_dirs_cache.py`.

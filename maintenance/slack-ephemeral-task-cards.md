@@ -25,3 +25,5 @@ After workspace authentication, connect schedules a background sweep of recorded
 The behavior contract is `tests/plugins/platforms/slack/test_task_card_cleanup.py`, with the native task-card cases in `tests/gateway/test_slack.py` and `tests/gateway/test_task_card_destination_preflight.py`.
 
 Retire this patch only when upstream offers equivalent end-of-turn removal and durable restart/retry recovery. Revert the owned files to roll back, or set the config key to `false` without a code change.
+
+Contract tests: `tests/plugins/platforms/slack/test_task_card_cleanup.py`, `tests/gateway/test_slack.py`, `tests/gateway/test_task_card_destination_preflight.py`.

@@ -17,3 +17,5 @@ Run `scripts/run_tests.sh tests/gateway/test_session_policy.py tests/tools/test_
 ## Rollback and Retirement
 
 Revert the rename as one unit, including generated artifacts. No reaction storage or configuration migration. Retire this divergence when upstream's registration, progress icon and consumers satisfy the contract.
+
+Contract tests: `tests/gateway/test_session_policy.py`, `tests/tools/test_react_tool.py`, `tests/tools/test_reaction_session_identity.py`, `tests/tools/test_display_toggles.py`, `tests/tui_gateway/test_gui_surface_toolsets.py`, `tests/hermes_cli/test_shared_metrics_signals.py`, `tests/hermes_cli/test_shared_metrics_harness.py`, `tests/hermes_cli/test_shared_metrics_efficiency.py`.

@@ -43,3 +43,5 @@ Observed on macOS/Python 3.14 with 10,000 messages and 64 simultaneous search th
 `python scripts/benchmark_session_search.py --messages 10000 --workers 64` creates and deletes only its own temporary store. Rerun it through the source checkout's normal PM activation. Compare the returned plans and completion counts, not only average latency.
 
 Retire when released upstream satisfies the complete reader-only, honest-error and stage-log contract without this divergence. Reverting this patch changes no persisted schema or transcript data, but restores writer fallback and potentially hidden search failures.
+
+Contract tests: `tests/hermes_state/test_search_isolation.py`, `tests/hermes_state/test_search_isolation_review.py`, `tests/hermes_state/test_search_query_budget.py`.

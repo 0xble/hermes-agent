@@ -51,3 +51,5 @@ routes, and a prior human obligation surviving a later leftover.
   every turn. Retire this when upstream distinguishes autonomous turns in busy
   admission.
 - Rollback: revert the commit; behavior returns to plain queue semantics.
+
+Contract tests: `tests/gateway/test_busy_human_preempts_autonomous.py`, `tests/gateway/test_late_steer_reply_obligation.py`.

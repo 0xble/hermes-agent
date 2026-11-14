@@ -33,3 +33,5 @@ The regression must fail on the fork base with the old description, then pass
 with updated descriptions and parameters, no removed tool, one tools/list call,
 and an unchanged previously returned snapshot. Roll back the shared helper,
 reconnect call site and regression together if publication must be reverted.
+
+Contract tests: `tests/tools/test_mcp_reconnect_manifest.py`.
