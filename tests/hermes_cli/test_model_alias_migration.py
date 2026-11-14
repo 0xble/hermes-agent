@@ -193,9 +193,10 @@ def test_review_chains_replace_opus_with_sonnet_and_keep_grok_last():
     before["auxiliary"] = {
         "review": {"model": "gpt-6.1-sol", "fallback_chain": _review_chain("claude-opus-5-5", "high")},
         "background_review": {"model": "gpt-6.1-sol", "fallback_chain": _review_chain("claude-opus-5-5", "low")},
+        "vision": {"model": "gpt-6.1-sol", "fallback_chain": _review_chain("claude-opus-5-5", "medium")},
     }
     after, changes = migrate_document(before)
-    for name, effort in (("review", "high"), ("background_review", "low")):
+    for name, effort in (("review", "high"), ("background_review", "low"), ("vision", "medium")):
         chain = after["auxiliary"][name]["fallback_chain"]
         assert [e["model"] for e in chain] == ["claude-sonnet-5-5", "muse-wonder-full-1.0", "grok-4.7"]
         assert all(e["reasoning_effort"] == effort for e in chain)

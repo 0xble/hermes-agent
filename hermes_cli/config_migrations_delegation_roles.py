@@ -129,7 +129,7 @@ def install_cron_fallbacks(config: dict, changes: list[str], *, install_missing:
 
 # Review routes keep their own effort per entry. Only the Opus head becomes Sonnet,
 # so the Muse then Grok tail and every other key on the entry are left as authored.
-REVIEW_ROUTES = ("review", "background_review")
+REVIEW_ROUTES = ("review", "background_review", "vision")
 
 
 def retire_opus_review_fallbacks(config: dict, changes: list[str]) -> None:
