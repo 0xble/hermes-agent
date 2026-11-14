@@ -811,6 +811,44 @@ async def test_followup_spool_whose_input_is_already_durable_without_resume_mark
     assert list((tmp_path / "pending_messages").glob("*.bad"))
 
 
+@pytest.mark.asyncio
+async def test_followup_already_durable_in_compression_continuation_is_not_replayed(
+        tmp_path, monkeypatch, caplog):
+    """Compression rotated the session after the follow-up's turn admitted it into the continuation.
+
+    The routing map still names the compressed parent (the mapping heals lazily), so recovery
+    resolves the spool to the parent. The durability probe must follow the compression chain;
+    probing only the parent would replay an input whose turn already ran.
+    """
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="do the side effect", source=source, user_id=source.user_id, message_id="m-tip")
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    db = runner.session_store._db_for_session_id(entry.session_id)
+    db.end_session(entry.session_id, "compression")
+    db.create_session("continuation-1", "telegram", parent_session_id=entry.session_id)
+    assert db.get_compression_tip(entry.session_id) == "continuation-1"
+    runner.session_store.append_to_transcript("continuation-1", {
+        "role": "user", "content": event.text, "platform_message_id": event.message_id})
+    assert not db.has_platform_message_id(entry.session_id, event.message_id)
+    claimed = []
+
+    async def handle(recovered):
+        claimed.append(recovered.text)
+        recovered._agent_turn_succeeded = True
+
+    adapter.handle_message = handle
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert recover_pending_to_db(
+            Mock(), session_resolver=runner.session_store.resolve_session_id_for_key,
+            deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+        assert await runner._drain_startup_restore_queue() == 0
+        await asyncio.gather(*list(runner._background_tasks))
+    assert claimed == []
+    assert len(adapter.sent) == 1 and "may already have been handled" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
+
+
 def test_reconnect_followup_with_missing_origin_is_retained_without_attribute_error(tmp_path, monkeypatch):
     runner, _adapter, entry, _source = _setup(tmp_path, monkeypatch)
     entry.origin = None

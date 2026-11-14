@@ -179,6 +179,46 @@ contention, required-checkpoint failure and unfittable mandatory context must
 pause intact. A late summarizer cannot overwrite an admitted recovery boundary.
 Do not rewrite global/saved model selections or auxiliary settings.
 
+### Acceptance targets
+
+These describe tests the deferred design must add. None of them exists on `main`;
+the mechanisms they name (pre-acknowledgement queue checkpoints,
+`admit_before_compaction`, `_same_trigger_content`) are not implemented. Busy
+messaging input is already durable through the session authority's FIFO (see
+Verification), so the spool targets apply to input that stays outside it.
+
+Ordinary FIFO acceptance writes the native private pending spool with file and
+directory fsync before memory acknowledgement. Such a spool is not expired or
+consumed by restart replay as a naked transcript row; it transfers to the native
+transcript only after the matching platform id is durably admitted. A platform id
+is admission dedupe, never proof of a completed reply or effect. A turn reuses a
+historical trigger row only for an identical retry (same id and content); new
+content under a reused id is new input. Gateway persistence accesses this lookup
+through `AsyncSessionStore`, so its content-aware result must be awaited; the
+underlying SessionDB query is synchronous. A truthy unawaited coroutine is not
+an admission receipt.
+Durable checkpoint refreshes stage under a non-eligible name and preserve the
+previous accepted payload until the replacement's directory entry is fsynced. A
+failed admission leaves no eligible replay file; a failed refresh leaves the
+prior accepted checkpoint intact. Use the shared `_same_trigger_content`
+normalization helper for every restart-admission comparison; never dedupe by
+platform id alone.
+Also exercise native preflight, in-place/commit rollback, tail watermark,
+compression fallback/attempt lifecycle, pending-input dedupe and isolated
+loopback-provider/kill9 compaction suites. Local recording fake-provider traffic
+is simulated provider evidence, not authenticated fallback or real Telegram.
+A combined gateway crash test should kill after a giant observation is archived and
+the answer is persisted, but before platform acceptance. It queues an input
+before that kill and verifies full native archive retrieval, in-place session
+identity, one reply per input in the original topic, unchanged manual title/icon
+and model settings, consumed goal budgets, a stopped control lane and one
+completed effect.
+The same harness also makes the pending publish location unavailable
+after a real `/queue` admission. It verifies no queued provider work starts,
+the input survives, and one queued reply arrives after storage recovery and
+restart. Expiry regressions verify byte-for-byte preservation outside automatic
+replay for accepted checkpoints and legacy drain payloads.
+
 ## Independent diagnosis and prior art
 
 Fork-Patch identity: `session-compression-recovery`.
@@ -212,6 +252,8 @@ MCP excerpts. None is proof of released equivalent behavior.
 
 ## Verification
 
+Use `bash scripts/run_tests.sh`; no direct pytest or machine-slot bypass.
+
 The implemented exhaustion boundary is exercised by
 `tests/gateway/test_compression_exhaustion_keeps_context.py`,
 `tests/gateway/test_native_fifo_context_exhaustion.py`,
@@ -219,55 +261,32 @@ The implemented exhaustion boundary is exercised by
 role-retention case in `tests/gateway/test_model_role_lifecycle.py`.
 `tests/gateway/test_auto_reset_clean_context.py` continues to verify that an
 explicit reset creates an empty context without destroying the old transcript.
+`tests/agent/test_native_preflight_estimate.py` covers the preflight estimate that
+decides whether a turn may compact.
 
-The focused tests below are acceptance targets for the deferred recovery design,
-not current proof of lossless input admission or mechanical same-session recovery.
-Do not claim these additional files or mechanisms exist on `main`.
+Queued input reaches durable storage on `main` through the session authority's
+canonical FIFO, not through this unit's proposed spool checkpoints: busy messaging
+input commits a `session_admissions` row (`hermes_state_runtime.admit_session_input`
+via `gateway/session_authority.py`) before it is accepted. After a hard kill, the
+replacement runtime's `recover_session_inputs` marks only the started turn `unknown`
+(never replayed) and leaves queued rows with their payloads; once the lost turn is
+resolved, the next claim runs them. `tests/hermes_state/test_runtime_admission.py`
+covers that recovery, including queued input surviving a kill with no shutdown flush.
 
-Use `bash scripts/run_tests.sh`; no direct pytest or machine-slot bypass.
-Focused tests: `tests/agent/test_same_session_recovery.py`,
-`tests/gateway/test_auto_reset_clean_context.py`,
-`tests/agent/test_same_session_recovery_gaps.py`,
-`tests/gateway/test_same_session_queue_checkpoint.py`,
-`tests/gateway/test_queue_checkpoint_retirement.py`,
-`tests/gateway/test_proxy_queue_checkpoint.py`,
-`tests/agent/test_native_preflight_estimate.py`,
-`tests/e2e/core/compaction/test_same_session_recovery.py` and
-`tests/e2e/core/compaction/test_recovery_gateway_crash.py`.
-Ordinary FIFO acceptance writes the native private pending spool with file and
-directory fsync before memory acknowledgement. Such a spool is not expired or
-consumed by restart replay as a naked transcript row; it transfers to the native
-transcript only after the matching platform id is durably admitted. A platform id
-is admission dedupe, never proof of a completed reply or effect. A turn reuses a
-historical trigger row only for an identical retry (same id and content); new
-content under a reused id is new input. Gateway persistence accesses this lookup
-through `AsyncSessionStore`, so its content-aware result must be awaited; the
-underlying SessionDB query is synchronous. A truthy unawaited coroutine is not
-an admission receipt.
-Durable checkpoint refreshes stage under a non-eligible name and preserve the
-previous accepted payload until the replacement's directory entry is fsynced. A
-failed admission leaves no eligible replay file; a failed refresh leaves the
-prior accepted checkpoint intact. Use the shared `_same_trigger_content`
-normalization helper for every restart-admission comparison; never dedupe by
-platform id alone.
-Also exercise native preflight, in-place/commit rollback, tail watermark,
-compression fallback/attempt lifecycle, pending-input dedupe and isolated
-loopback-provider/kill9 compaction suites. Local recording fake-provider traffic
-is simulated provider evidence, not authenticated fallback or real Telegram.
-The combined gateway crash test kills after a giant observation is archived and
-the answer is persisted, but before platform acceptance. It queues an input
-before that kill and verifies full native archive retrieval, in-place session
-identity, one reply per input in the original topic, unchanged manual title/icon
-and model settings, consumed goal budgets, a stopped control lane and one
-completed effect.
+Input held in an adapter's in-process slot instead (internal events, one-turn model
+turns such as `/moa`, runners without an authority) survives a restart only through the shutdown flush: graceful
+shutdown spools it under `<HERMES_HOME>/pending_messages/` (`gateway/shutdown_flush.py`)
+and startup replays or declines each payload (`gateway/run_pending_recovery.py`). A hard
+kill loses it. Replay dedupe probes the spooled session and its compression
+continuation by platform or recovery id (`input_already_durable`).
+`tests/gateway/test_shutdown_followup_restart.py` covers that path, including a
+follow-up already admitted into a compression continuation while the routing map still
+names the compressed parent; `tests/gateway/test_shutdown_flush_recovery.py` and
+`tests/gateway/test_pending_queue_spool.py` cover spool writing and replay.
+
 The parent owns candidate review, exact merge, native source updater, live
 adoption and Telegram inbound/send/readback/restart canary. Source or a healthy
 process alone is not end-to-end completion.
-The same process harness also makes the pending publish location unavailable
-after a real `/queue` admission. It verifies no queued provider work starts,
-the input survives, and one queued reply arrives after storage recovery and
-restart. Expiry regressions verify byte-for-byte preservation outside automatic
-replay for accepted checkpoints and legacy drain payloads.
 
 ## Retirement and rollback
 
