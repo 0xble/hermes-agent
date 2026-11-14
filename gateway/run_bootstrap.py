@@ -801,8 +801,8 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     try:
         from tools.computer_use.cua_driver_lifetime import sweep_on_startup
         sweep_on_startup()
-    except Exception:
-        pass
+    except ImportError:  # sweep_on_startup itself never raises; only an unimportable module reaches here
+        logger.debug("cua-driver startup sweep unavailable", exc_info=True)
     _start_gateway_resolve_terminal_cwd()
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit

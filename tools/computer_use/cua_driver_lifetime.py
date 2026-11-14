@@ -30,6 +30,14 @@ from typing import Any
 
 logger = logging.getLogger("tools.computer_use.cua_driver_lifetime")
 
+try:
+    from psutil import Error as _PsutilError
+except ImportError:  # psutil is optional on some platforms; each probe imports it lazily
+    _PsutilError = OSError
+# What a lazy psutil probe of another process can raise: the module missing, the process gone,
+# denied or a zombie (psutil.Error), or an OS-level failure. Each probe treats these as "unknown".
+_PROBE_ERRORS: tuple[type[BaseException], ...] = (ImportError, OSError, _PsutilError)
+
 _OWNER_GRACE_SECONDS = 5.0
 _KILL_WAIT_SECONDS = 0.3
 _SOCKET_PREFIX = "hc-"
@@ -65,13 +73,13 @@ class OwnerWatch:
             return
         try:
             process.wait(timeout=1.0)
-        except Exception:
+        except (subprocess.TimeoutExpired, OSError):
             kill = getattr(process, "kill", None)
             if callable(kill):
                 try:
                     kill()
-                except Exception:
-                    pass
+                except OSError:
+                    logger.debug("cua-driver watchdog kill failed", exc_info=True)
 
 
 def owner_record_path(socket_path: str) -> str:
@@ -89,7 +97,7 @@ def _current_username() -> str:
     try:
         import psutil
         return psutil.Process().username()
-    except Exception:
+    except _PROBE_ERRORS:
         return ""
 
 
@@ -97,7 +105,7 @@ def _process_create_time(pid: int) -> float | None:
     try:
         import psutil
         return float(psutil.Process(pid).create_time())
-    except Exception:
+    except _PROBE_ERRORS:
         return None
 
 
@@ -117,7 +125,7 @@ def pid_alive(pid: int, create_time: float | None = None) -> bool:
         if create_time is not None and abs(float(proc.create_time()) - float(create_time)) > 0.05:
             return False
         return True
-    except Exception:
+    except (*_PROBE_ERRORS, TypeError, ValueError):
         return False
 
 
@@ -228,7 +236,7 @@ def driver_executables() -> set[str]:
     if os.path.isdir(home_tools):
         try:
             names = os.listdir(home_tools)
-        except Exception:
+        except OSError:
             names = []
         for name in names:
             if name.startswith("cua-driver-"):
@@ -248,7 +256,8 @@ def _selected_driver() -> str | None:
     try:
         from tools.computer_use.cua_backend_driver import resolve_cua_driver_cmd
         return resolve_cua_driver_cmd()
-    except Exception:
+    except Exception:  # the package manager's lookup is outside this module: never fail the sweep on it
+        logger.debug("cua-driver selection lookup failed", exc_info=True)
         return None
 
 
@@ -294,7 +303,7 @@ def scan_processes() -> list[EmbeddedProcess]:
             if socket_from_argv(cmdline):
                 try:
                     exe = str(proc.exe() or "")
-                except Exception:
+                except _PROBE_ERRORS:
                     exe = cmdline[0] if cmdline and os.path.isabs(cmdline[0]) else ""
             found.append(EmbeddedProcess(
                 pid=int(info["pid"]),
@@ -304,7 +313,7 @@ def scan_processes() -> list[EmbeddedProcess]:
                 cmdline=cmdline,
                 create_time=float(info.get("create_time") or 0.0),
             ))
-        except Exception:
+        except (*_PROBE_ERRORS, KeyError, TypeError, ValueError):
             continue
     return found
 
@@ -491,8 +500,8 @@ def _socket_in_use(socket_path: str) -> bool:
         for proc in scan_processes():
             if _names_socket(proc.cmdline, real_socket) and pid_alive(proc.pid, proc.create_time):
                 return True
-    except Exception:
-        return True
+    except _PROBE_ERRORS:
+        return True  # cannot tell: keep the socket
     return False
 
 

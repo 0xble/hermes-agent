@@ -3438,8 +3438,8 @@ def main():
     try:
         from tools.computer_use.cua_driver_lifetime import sweep_on_startup
         sweep_on_startup()
-    except Exception:
-        pass
+    except ImportError:  # sweep_on_startup itself never raises; only an unimportable module reaches here
+        logger.debug("cua-driver startup sweep unavailable", exc_info=True)
 
     # Checkout changed since last launch → sweep stale __pycache__ once so no
     # process resolves fresh source against old bytecode. Never raises.

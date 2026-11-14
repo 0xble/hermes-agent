@@ -253,9 +253,11 @@ class TestProcessLifetime:
             start_new_session=True,
         )
         watch = life.arm_owner(str(sock), str(binary))
+        watchdog = watch.process
         try:
             watch.close()
-            time.sleep(0.4)
+            # close() waits for the watchdog: once it exits on its own, its kill decision is final.
+            assert watchdog.returncode == 0
             assert _alive(driver.pid)
             assert sock.exists()
         finally:
