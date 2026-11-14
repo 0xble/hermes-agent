@@ -3579,7 +3579,7 @@ explainer:
     partial_stream_recovery: "串流提前中止，只復原了部分回應。傳送 `continue` 可從中斷處繼續。"
     fallback_prior_turn_content: "這一輪沒有產生新內容；顯示的是復原的先前上下文。傳送 `continue` 重試。"
     redirect_restart_limit_exceeded: "每次嘗試都被新的修正訊息取消，因此這一輪已停止，不再無限重試。你最後一則修正已排入佇列，將作為下一則訊息。"
-    rebuilt_restart_limit_exceeded: "備援鏈中的每個提供方都持續故障轉移，因此這一輪已停止，不再無限重試。傳送 `continue` 或切換提供方。"
+    rebuilt_restart_limit_exceeded: "已達路由切換上限。已請求的路由：{routes}。其他已設定的路由可能尚未嘗試。請傳送 `continue` 或切換提供者。"
     budget_exhausted: "在得出最終答案前，本輪的迭代／費用預算已耗盡。傳送 `continue` 繼續。"
     ollama_runtime_context_too_small: "本機模型的上下文視窗太小，無法完成。請加大上下文大小或改用更大的模型。"
     pending_tool_result: "這一輪在工具結果仍待處理時停止，且模型沒有產生後續文字。傳送 `continue` 讓它做總結。"
@@ -3606,6 +3606,9 @@ explainer:
     failed: "失敗"
   shared:
     and_more: "  • … 還有 {count} 個"
+    no_routes_requested: "未記錄"
+    attempted_routes: "已請求的路由：{routes}。"
+    chain_exhausted: "備援鏈已用盡，沒有可用的路由。"
     the_model: "模型"
 tips:
   t001: "/bg <prompt> 會在獨立的工作階段執行任務，讓你目前的工作階段保持空閒；/btw <question> 則會回答關於此對話的附帶問題，而不會中斷對話。"

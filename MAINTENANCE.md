@@ -65,6 +65,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
+| Shared fallback endpoint domain | Skip aliases of a proven dead socket for one turn while preserving one bounded independent-domain request at the switch cap | Fallback identity, connection classification, restart limits, terminal copy | [Shared fallback endpoint domain](maintenance/fallback-endpoint-domain.md) |
 | Named remote computer use | Keep shared node identities, no fallback, native images and node-bound terminal/file/process state | Shared node resolution, named execution/file safety, remote process persistence, computer-use provider dispatch, doctor or CuaDriver transport changes | [Named remote computer use](maintenance/remote-computer-use.md) |
 | Completed Responses images | Completed hosted image results become cached assistant media or truthful attachment failures, not empty turns | Codex Responses normalization, provider media caching, or image-only final responses | [Completed Responses images](maintenance/codex-native-images.md) |
 | Reaction tool name | Expose `react` with a thumbs-up progress icon, retaining silent rendering of saved legacy calls | Reaction tool registration, progress identity or desktop classification changes | [Reaction tool name](maintenance/react-tool-name.md) |
