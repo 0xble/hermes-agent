@@ -148,13 +148,13 @@ DEFAULT_CONFIG = {
             # drops from 3 to 1. Unknown pricing / missing usage leaves it untouched.
             "cost_threshold_usd": 0.25,
         },
-        # Fast mode: "" / "normal" (off), "fast" (always), "auto" (first fast_auto_seconds of every
-        # turn), "cold" (first turn of a session only). Messaging gateway sessions only:
-        # agent.fast_expiry_seconds is the seconds before a session fast/ultrafast override switches
-        # to normal; 0 disables. CLI/TUI sessions do not expire.
+        # Fast: ""/normal (off), fast (always), auto (first fast_auto_seconds each turn),
+        # cold (first turn only). Gateway sessions expire per tier: Fast 30m, Ultrafast 5m.
+        # Zero disables that tier's expiry. CLI/TUI sessions do not expire.
         "service_tier": "",
         "fast_auto_seconds": 60,
-        "fast_expiry_seconds": 0,
+        "fast_expiry_seconds": 1800,
+        "ultrafast_expiry_seconds": 300,
         # Responses-only `text.verbosity` (never chat_completions): "" = not sent, or low | medium | high.
         "text_verbosity": "",
         "daybreak": False,  # opt-in; only catalog-listed Codex models (agent/codex_service_tiers.py)
