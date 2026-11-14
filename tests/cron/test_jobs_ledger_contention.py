@@ -245,7 +245,6 @@ def test_prefetch_preserves_base_notice_save_and_recovery_order(store, monkeypat
         return real_save(*args, **kwargs)
 
     monkeypatch.setattr(jobs, "save_jobs", save)
-    monkeypatch.setattr(jobs, "_write_retired_oneshot_diagnostic", lambda *args: event("retired_notice"))
     monkeypatch.setattr(jobs, "save_job_output", lambda *args: event("output"))
     monkeypatch.setattr(owner_alerts, "queue_owner_failure", lambda *args, **kwargs: event("missed_notice"))
     monkeypatch.setattr(jobs.store_health, "outage_covers", lambda *args: scenario == "outage")
