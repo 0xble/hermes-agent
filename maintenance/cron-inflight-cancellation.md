@@ -60,3 +60,5 @@ Upstream candidates: NousResearch/hermes-agent issue #133057 and PR #133169
 (`hermes cron cancel`); inspect their semantics before adoption. Retire this patch
 only when upstream also covers remove/pause, tool receipts, and running visibility
 with the same regressions green. Source landing is not live gateway deployment.
+
+Contract tests: `tests/cron/test_inflight_cancellation.py`, `tests/cron/test_fire_claim_lost_after_delivery.py`, `tests/tools/test_cronjob_tools.py`, `tests/cron/test_cancellation_registration_fencing.py`, `tests/cron/test_autopause_delivery.py`.

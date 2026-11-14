@@ -37,3 +37,5 @@ an equivalent upstream implementation only after the dispatch tests pass without
 the fork code. Never turn approximate replace-all refusal into an automatic edit.
 Retire this unit when those recovery contracts are upstream-equivalent. Rollback
 reverts the logical patch; there is no persisted state to migrate.
+
+Contract tests: `tests/tools/test_file_recovery_diagnostics.py`.

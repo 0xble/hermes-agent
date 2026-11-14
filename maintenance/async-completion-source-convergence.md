@@ -23,3 +23,5 @@ Run `scripts/run_tests.sh tests/gateway/test_completion_delivery.py tests/gatewa
 A simultaneous failed drop and failed defer/refund still requires shared claim-lifecycle recovery: the next claim can report the existing lease as owned and consume an unsettled queue copy. Do not treat the focused drop-only recovery tests as proof of that stronger guarantee.
 
 Rollback is a source revert. Do not repair live delivery rows as part of this patch.
+
+Contract tests: `tests/gateway/test_completion_delivery.py`, `tests/gateway/test_delegation_auto_resume.py`.

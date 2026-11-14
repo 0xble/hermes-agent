@@ -143,3 +143,5 @@ Retire when the selected upstream release provides shared primary cooldown state
 fresh-agent adoption, atomic outage notices, recovery ownership, and the CLI
 inspection controls. Roll back by reverting the commits carrying
 `Fork-Patch: shared-primary-cooldown`.
+
+Contract tests: `tests/agent/test_shared_primary_cooldown.py`, `tests/agent/test_shared_primary_probe_review.py`, `tests/hermes_cli/test_fallback_cmd.py`.
