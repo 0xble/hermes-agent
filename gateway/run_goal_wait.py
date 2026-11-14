@@ -227,7 +227,12 @@ async def _dispatch_reserved(runner, authority, managed, adapter, source, key, s
         forget_goal_wait(runner, sid)
         logger.info('goal wakeup: continuation for session %s admitted', sid)
     except _TerminalGoalWait as exc:
-        _refuse_wait(runner, sid, key, identity, exc.detail)
+        if exc.detail == 'incognito':
+            # A privacy switch that raced past the watcher's suspend check: the goal is only
+            # suspended while private (#1033), so retry instead of parking the wait until restart.
+            _retry_later(runner, sid, identity)
+        else:
+            _refuse_wait(runner, sid, key, identity, exc.detail)
     except Exception as exc:
         # A producer can lose its receipt after commit. Keep capacity for that row,
         # not for a failed attempt, while the stable identity prevents another row.

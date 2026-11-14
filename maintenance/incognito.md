@@ -49,6 +49,10 @@ not only the command reply.
   the adapter guard, or authority work is queued/running before its agent slot exists.
   The command's own otherwise-idle adapter guard is not foreign work. Do not hold
   the model-route lock across dispatch, because an inline slash command acquires it itself.
+  A reservation the gate prunes before the admission task's first step (a claim on the
+  key, or expiry) is restored by `admitting`, so the fence holds and no KeyError escapes.
+  A privacy switch that races past the watcher's suspend check is refused by the durable
+  route snapshot and retried, not parked as a terminal wait until restart.
 - The content-free sidecar preserves privacy routing across restart. Model
   overrides pass through the existing sanitizer. Do not persist a private model
   selection or credentials as recovery metadata.

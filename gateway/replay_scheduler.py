@@ -51,6 +51,15 @@ class _Reservation:
     released: bool = False
 
 
+class _Token:
+    """An opaque reservation handle that still names its reservation after the gate prunes it."""
+
+    __slots__ = ("reservation",)
+
+    def __init__(self, reservation: _Reservation):
+        self.reservation = reservation
+
+
 class BackgroundTurnGate:
     """Room for one more background turn while fewer than ``limit`` run.
 
@@ -121,7 +130,13 @@ class BackgroundTurnGate:
         An admitted turn can finish before its caller's bookkeeping does. Neither a turn claim
         nor the ordinary reservation timeout may release this privacy fence early.
         """
-        reservation = self._reserved[token]
+        reservation = self._reserved.get(token)
+        if reservation is None:
+            # Pruned between reserve and this first step (a turn claimed the key, or the hold
+            # expired). The admission is about to write, so its fence and capacity come back.
+            reservation = token.reservation
+            if not reservation.released:
+                self._reserved[token] = reservation
         reservation.admitting = True
         try:
             yield
@@ -159,14 +174,13 @@ class BackgroundTurnGate:
     def release(self, token: object) -> None:
         """Return a reservation whose admission was refused before any turn claimed it."""
         reservation = self._reserved.get(token)
-        if reservation is not None and reservation.admitting:
-            reservation.released = True
-        else:
+        token.reservation.released = True  # a later admitting() must not restore it
+        if reservation is None or not reservation.admitting:
             self._reserved.pop(token, None)
 
     def _reserve(self, key: Any) -> object:
-        token = object()
-        self._reserved[token] = _Reservation(key, time.time(), time.monotonic() + self._reservation_s)
+        token = _Token(_Reservation(key, time.time(), time.monotonic() + self._reservation_s))
+        self._reserved[token] = token.reservation
         return token
 
 
