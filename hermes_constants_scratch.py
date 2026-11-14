@@ -3,7 +3,9 @@
 Deleting an idle ``cache/scratch/<entry>`` is not enough on its own: a lane's e2e run leaves
 headless browsers whose cwd was inside the tree (they survived for days with a ``(deleted)``
 cwd), and a repo whose linked worktree lived in the tree keeps a dangling registration until
-someone runs ``git worktree prune``. Both are reaped here, right before ``rmtree``.
+someone runs ``git worktree prune``. Both are reaped here, right before the entry is moved
+into a 7-day holding directory. The move is a same-volume rename: it does not follow
+symlinks, and a cross-device copy is never used as a fallback.
 
 A process Hermes itself started is never an orphan, though: an idle entry a registered live
 process still works inside is kept, not reaped (#132401). Ownership comes from the two
@@ -12,9 +14,12 @@ registries Hermes writes, not from a marker file a lane must remember to drop.
 from __future__ import annotations
 
 import contextlib
+import datetime
+import errno
 import json
 import logging
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -42,6 +47,17 @@ _KEEP_MARKER = ".keep"
 _INPUT_PINS = "input-pins.json"
 # Package fixtures under these trees are not user keep markers.
 _KEEP_SCAN_SKIP = frozenset({"node_modules", ".venv", "venv"})
+# Expired entries are renamed here, never unlinked. Sibling of the real scratch target, so
+# symlinked scratch stays on-volume and a scratch walk cannot select its own holding dir.
+# entries live below ``entries`` so no user entry name can collide with the holding manifest.
+_TRASH_DIR_NAME = ".scratch-trash"
+_TRASH_HOLD_SECONDS = 7 * 24 * 3600
+_TRASH_MANIFEST = "manifest.jsonl"
+# Literal scratch paths in an enabled cron job. Same field set and token shape as the Fleet
+# pin generator (scripts PR #691): prompt, script, script_args, args, command. Matched as
+# text against this scratch root — not realpath'd — so a symlink is not followed out of scratch.
+_JOB_FIELDS = ("prompt", "script", "script_args", "args", "command")
+_JOB_TOKEN_TAIL = r"[/\\][^\s'\"`)\],;<]+"
 
 
 class UnreadableRetention(Exception):
@@ -588,6 +604,452 @@ def retained_entries(root: Path, entries: list[Path], candidates: list[Path]) ->
     return {c.name for c in candidates if c.name in reached or _has_keep_marker(c)}
 
 
+def _lexically_within(path: Path, root: Path) -> bool:
+    """True when *path* is *root* or a lexical child of it. Does not resolve symlinks."""
+    path_s = os.path.abspath(os.fspath(path))
+    root_s = os.path.abspath(os.fspath(root))
+    return path_s == root_s or path_s.startswith(root_s + os.sep)
+
+
+def _is_dir_link(path: Path) -> bool:
+    """A symlink or Windows junction. ``Path.is_dir()`` follows both; this does not."""
+    if os.path.islink(path):
+        return True
+    isjunction = getattr(os.path, "isjunction", None)
+    return bool(isjunction and isjunction(path))
+
+
+def holding_dir(scratch_root: Path) -> Path:
+    """A sibling of the real scratch target, on the volume that holds scratch."""
+    return Path(os.path.realpath(scratch_root)).parent / _TRASH_DIR_NAME
+
+
+def _utc_stamp(now: float) -> tuple[str, str]:
+    moment = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    return moment.strftime("%Y-%m-%d"), moment.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _parse_pruned_at(value: object) -> float | None:
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        return float(value)
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def _ensure_real_dir(path: Path, *, home: Path) -> bool:
+    """Create *path* only when it is this user's private 0700 directory.
+
+    Holding directories are security boundaries, not ordinary Hermes-home directories: they may
+    never be shared with another uid or a group. Existing directories are deliberately refused
+    when their mode or owner is wrong instead of being repaired underneath a concurrent writer.
+    """
+    if not hasattr(os, "getuid"):
+        return False
+    created = False
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        try:
+            path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            created = True
+        except OSError:
+            return False
+    except OSError:
+        return False
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if not stat.S_ISDIR(st.st_mode) or stat.S_ISLNK(st.st_mode) or _is_dir_link(path):
+        return False
+    if created:
+        try:
+            os.chmod(path, 0o700)
+            st = os.lstat(path)
+        except OSError:
+            return False
+    return st.st_uid == os.getuid() and stat.S_IMODE(st.st_mode) == 0o700
+
+
+def _unique_hold_dest(dest: Path) -> Path:
+    if not os.path.lexists(dest):
+        return dest
+    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%H%M%S")
+    candidate = dest.with_name(f"{dest.name}-{stamp}")
+    n = 0
+    while os.path.lexists(candidate):
+        n += 1
+        candidate = dest.with_name(f"{dest.name}-{stamp}-{n}")
+    return candidate
+
+
+def _append_manifest(manifest: Path, line: dict) -> None:
+    payload = json.dumps(line, ensure_ascii=True) + "\n"
+    fd = os.open(manifest, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    try:
+        os.write(fd, payload.encode("utf-8"))
+    finally:
+        os.close(fd)
+
+
+def hold_expired_entry(entry: Path, scratch_root: Path, size: int, now: float) -> Path | None:
+    """Rename *entry* into the holding dir. None if it did not leave scratch.
+
+    Same-volume ``os.rename`` only: an ``EXDEV`` error is not copied across, and a symlink
+    entry is renamed as a link. The destination is never a path outside the holding dir.
+    """
+    if not _lexically_within(entry, scratch_root) or os.path.abspath(entry) == os.path.abspath(scratch_root):
+        raise OSError(errno.EINVAL, "refusing to hold a path that is not a scratch entry")
+    try:
+        rel = entry.relative_to(scratch_root)
+    except ValueError as exc:
+        raise OSError(errno.EINVAL, "entry is not inside scratch") from exc
+    if rel.is_absolute() or ".." in rel.parts or not rel.parts:
+        raise OSError(errno.EINVAL, "entry relative path escapes scratch")
+    trash = holding_dir(scratch_root)
+    home = scratch_root.parent.parent
+    if not _ensure_real_dir(trash, home=home):
+        raise OSError(errno.EINVAL, "holding dir is missing or a symlink")
+    day, pruned_at = _utc_stamp(now)
+    day_dir = trash / day
+    if not _ensure_real_dir(day_dir, home=home) or not _lexically_within(day_dir, trash):
+        raise OSError(errno.EINVAL, "holding day dir is missing or a symlink")
+    entries_dir = day_dir / "entries"
+    if not _ensure_real_dir(entries_dir, home=home):
+        raise OSError(errno.EINVAL, "holding entries dir is missing or a symlink")
+    dest = _unique_hold_dest(entries_dir / rel)
+    if not _lexically_within(dest, trash):
+        raise OSError(errno.EINVAL, "holding destination escapes the holding dir")
+    try:
+        original_mtime = os.lstat(entry).st_mtime
+    except OSError:
+        original_mtime = None
+    try:
+        os.rename(entry, dest)
+    except OSError as exc:
+        if exc.errno == errno.EXDEV:
+            raise OSError(errno.EXDEV, "cross-device hold is not copied") from exc
+        raise
+    try:
+        os.lstat(entry)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        # The rename is atomic; an inspection failure after it must not lose the audit record.
+        # Continue as if the source were absent, and let the manifest be the purge clock.
+        pass
+    else:
+        return None
+    try:
+        os.utime(dest, (now, now), follow_symlinks=False)
+    except (OSError, NotImplementedError):
+        pass
+    try:
+        _append_manifest(day_dir / _TRASH_MANIFEST, {
+            "original": os.fspath(entry),
+            "size": size,
+            "mtime": original_mtime,
+            "pruned_at": pruned_at,
+            "held": os.fspath(dest),
+        })
+    except OSError:
+        pass
+    return dest
+
+
+def _walk_bottom_up_nofollow(path: Path, onerror):
+    """An explicit stack also supports deep trees on Python 3.11 (whose os.walk recurses)."""
+    pending = [(path, False)]
+    while pending:
+        current, visited = pending.pop()
+        if visited:
+            yield current
+            continue
+        try:
+            current_st = os.lstat(current)
+            if stat.S_ISLNK(current_st.st_mode) or _is_dir_link(current) or not stat.S_ISDIR(current_st.st_mode):
+                yield current
+                continue
+            with os.scandir(current) as children:
+                child_paths = [Path(child.path) for child in children]
+        except OSError as exc:
+            onerror(exc)
+            continue
+        pending.append((current, True))
+        pending.extend((child, False) for child in child_paths)
+
+
+def _remove_nofollow(path: Path) -> list[str]:
+    """Delete *path* iteratively without following links; return directories that blocked removal."""
+    blockers: list[str] = []
+
+    def failed(exc: BaseException, directory: Path) -> None:
+        if isinstance(exc, FileNotFoundError):
+            return
+        blocker = os.fspath(directory)
+        if blocker not in blockers:
+            blockers.append(blocker)
+
+    def remove_one(candidate: Path, parent: Path) -> None:
+        try:
+            st = os.lstat(candidate)
+            if stat.S_ISLNK(st.st_mode) or _is_dir_link(candidate) or not stat.S_ISDIR(st.st_mode):
+                os.unlink(candidate)
+            else:
+                os.rmdir(candidate)
+        except OSError as exc:
+            failed(exc, parent)
+
+    try:
+        root_st = os.lstat(path)
+    except OSError as exc:
+        failed(exc, path.parent)
+        return blockers
+    if stat.S_ISLNK(root_st.st_mode) or _is_dir_link(path) or not stat.S_ISDIR(root_st.st_mode):
+        remove_one(path, path.parent)
+        return blockers
+
+    def onerror(exc: OSError) -> None:
+        failed(exc, Path(exc.filename) if exc.filename else path)
+
+    try:
+        for current in _walk_bottom_up_nofollow(path, onerror):
+            remove_one(current, current.parent)
+    except (OSError, RecursionError) as exc:
+        failed(exc, path)
+    remove_one(path, path.parent)
+    return blockers
+
+
+def _manifest_ages(text: str) -> dict[str, float]:
+    ages: dict[str, float] = {}
+    for line in text.splitlines():
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(item, dict):
+            continue
+        held = item.get("held")
+        pruned = _parse_pruned_at(item.get("pruned_at"))
+        if isinstance(held, str) and pruned is not None:
+            ages[os.path.abspath(held)] = pruned
+    return ages
+
+
+def _day_start(name: str) -> float | None:
+    try:
+        day = datetime.datetime.strptime(name, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return day.replace(tzinfo=datetime.timezone.utc).timestamp()
+
+
+def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -> int:  # health: allow CC -- explicit no-follow retention purge phases
+    """Delete held entries older than 7 days; append purge records without rewriting the manifest."""
+    trash = holding_dir(scratch_root)
+    try:
+        st = os.lstat(trash)
+    except FileNotFoundError:
+        return 0
+    except OSError as exc:
+        audit.info("scratch prune: holding dir not purged (%s)", exc)
+        return 0
+    if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or _is_dir_link(trash):
+        audit.info("scratch prune: holding dir %r is a symlink; not followed", os.fspath(trash))
+        return 0
+    purged = 0
+    repos: set[str] = set()
+    try:
+        children = list(os.scandir(trash))
+    except OSError as exc:
+        audit.info("scratch prune: holding dir not purged (%s)", exc)
+        return 0
+    for child in children:
+        day_dir = Path(child.path)
+        if not _lexically_within(day_dir, trash):
+            continue
+        try:
+            child_st = child.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if stat.S_ISLNK(child_st.st_mode) or _is_dir_link(day_dir):
+            if now - child_st.st_mtime > _TRASH_HOLD_SECONDS:
+                with contextlib.suppress(OSError):
+                    os.unlink(day_dir)
+                    purged += 1
+            continue
+        if not stat.S_ISDIR(child_st.st_mode):
+            continue
+        manifest = day_dir / _TRASH_MANIFEST
+        manifest_text: str | None = None
+        try:
+            if not os.path.lexists(manifest):
+                # Older/incomplete holds may have no manifest. The UTC day directory is
+                # still an authoritative seven-day purge clock for every entry below it.
+                pass
+            elif manifest.is_file() and not manifest.is_symlink():
+                manifest_text = manifest.read_text(encoding="utf-8-sig")
+            else:
+                continue
+        except OSError:
+            # A manifest that exists but cannot be read is an audit-integrity failure: keep
+            # the day untouched rather than purging from an unknown record set.
+            continue
+        ages = _manifest_ages(manifest_text or "")
+        day_age = _day_start(day_dir.name)
+        if day_age is None:
+            continue
+        entries_dir = day_dir / "entries"
+        try:
+            entries_st = os.lstat(entries_dir)
+        except OSError:
+            continue
+        if stat.S_ISLNK(entries_st.st_mode) or not stat.S_ISDIR(entries_st.st_mode) or _is_dir_link(entries_dir):
+            continue
+        try:
+            held_children = list(os.scandir(entries_dir))
+        except OSError:
+            continue
+        skip_names = stuck.load_skips(entries_dir, state_dir=day_dir)
+        for held in held_children:
+            held_path = Path(held.path)
+            if held_path.name in skip_names or not _lexically_within(held_path, trash):
+                continue
+            try:
+                held_st = held.stat(follow_symlinks=False)
+            except OSError:
+                continue
+            pruned_at = ages.get(os.path.abspath(held_path))
+            age_from = pruned_at if pruned_at is not None else day_age
+            if now - age_from <= _TRASH_HOLD_SECONDS:
+                continue
+            held_repos = _linked_worktree_repos(held_path) if stat.S_ISDIR(held_st.st_mode) else set()
+            blockers = _remove_nofollow(held_path)
+            try:
+                os.lstat(held_path)
+            except FileNotFoundError:
+                pass
+            except OSError:
+                blockers.append(os.fspath(held_path))
+            if blockers:
+                if stuck.tracking_supported():
+                    stuck.record(entries_dir, held_path, blockers, audit, state_dir=day_dir)
+                else:
+                    audit.info("scratch prune: could not purge %r (%s)", os.fspath(held_path), blockers[0])
+                continue
+            purged += 1
+            repos |= held_repos
+            if manifest_text is not None:
+                try:
+                    _append_manifest(manifest, {
+                        "held": os.fspath(held_path), "purged": _utc_stamp(now)[1],
+                    })
+                except OSError:
+                    pass
+        try:
+            with os.scandir(entries_dir) as day_entries:
+                empty = next(day_entries, None) is None
+            if empty:
+                os.rmdir(entries_dir)
+        except OSError:
+            pass
+    # Registrations of linked worktrees are dropped only now that the held tree is really gone.
+    release_git_worktrees(repos)
+    if purged:
+        audit.info("scratch prune: purged %d holding-dir entr%s older than 7 days",
+                   purged, "y" if purged == 1 else "ies")
+    return purged
+
+
+def _job_path(scratch_root: Path) -> Path:
+    return scratch_root.parent.parent / "cron" / "jobs.json"
+
+
+def _job_spellings(scratch_root: Path) -> list[str]:
+    """Scratch prefixes a job may spell, longest first. No realpath: a symlink is not followed."""
+    spellings = {os.path.abspath(os.fspath(scratch_root))}
+    home_scratch = os.path.abspath(os.path.expanduser("~/.hermes/cache/scratch"))  # health: allow HX001 -- literal job-text spelling, not a profile path
+    if home_scratch == os.path.abspath(os.fspath(scratch_root)):
+        spellings.add(os.path.expanduser("~/.hermes/cache/scratch"))  # health: allow HX001 -- literal job-text spelling, not a profile path
+        spellings.add("~/.hermes/cache/scratch")
+        home = os.environ.get("HOME")
+        if home:
+            spellings.add(os.path.join(home, ".hermes", "cache", "scratch"))
+            spellings.add("$HOME/.hermes/cache/scratch")
+    return sorted(spellings, key=len, reverse=True)
+
+
+def _entry_named_by_token(scratch_root: Path, token: str, spellings: list[str]) -> str | None:
+    token = token.rstrip(".:")
+    for prefix in spellings:
+        if token != prefix and not token.startswith(prefix + "/") and not token.startswith(prefix + "\\"):
+            continue
+        rest = token[len(prefix):].lstrip("/\\")
+        if not rest or rest.startswith("../") or rest == "..":
+            return None
+        name = rest.replace("\\", "/").split("/", 1)[0]
+        if not name or name in {".", ".."} or "/" in name or name.startswith(".."):
+            return None
+        return name
+    return None
+
+
+def job_referenced_entries(scratch_root: Path, candidates: list[Path]) -> set[str]:
+    """Names of *candidates* spelled literally in an enabled job's prompt or script fields.
+
+    Field set and token shape match the Fleet pin generator (scripts PR #691). A missing
+    jobs file holds nothing. An unreadable or unparseable one raises :class:`UnreadableRetention`.
+    """
+    path = _job_path(scratch_root)
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return set()
+    except OSError as exc:
+        raise UnreadableRetention(os.fspath(path)) from exc
+    if not stat.S_ISREG(st.st_mode):
+        raise UnreadableRetention(os.fspath(path))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError) as exc:
+        raise UnreadableRetention(os.fspath(path)) from exc
+    jobs = data.get("jobs") if isinstance(data, dict) else data
+    if not isinstance(jobs, list):
+        raise UnreadableRetention(os.fspath(path))
+    spellings = _job_spellings(scratch_root)
+    pattern = re.compile("(?:" + "|".join(re.escape(s) for s in spellings) + ")" + _JOB_TOKEN_TAIL)
+    wanted = {c.name for c in candidates}
+    held: set[str] = set()
+    for job in jobs:
+        if not isinstance(job, dict) or not job.get("enabled", True):
+            continue
+        for field in _JOB_FIELDS:
+            for text in _raw_job_strings(job.get(field)):
+                for token in pattern.findall(text):
+                    name = _entry_named_by_token(scratch_root, token, spellings)
+                    if name in wanted:
+                        held.add(name)
+    return held
+
+
+def _raw_job_strings(value: object):
+    """Yield strings from a cron field without JSON re-encoding path separators."""
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, dict):
+        for child in value.values():
+            yield from _raw_job_strings(child)
+    elif isinstance(value, (list, tuple)):
+        for child in value:
+            yield from _raw_job_strings(child)
+
+
 def _retention_filter(root: Path, skip_names: frozenset[str], doomed: list[Path],
                       audit: logging.Logger) -> list[Path]:
     """*doomed* minus every entry a retention declaration holds, read fresh from *root*. An
@@ -605,8 +1067,19 @@ def _retention_filter(root: Path, skip_names: frozenset[str], doomed: list[Path]
         audit.info("scratch prune: kept all %d idle entries, retention scan failed: %r", len(doomed),
                    str(exc))
         return []
+    try:
+        job_held = job_referenced_entries(root, doomed)
+    except UnreadableRetention as exc:
+        audit.info("scratch prune: kept all %d idle entries, unreadable jobs.json: %r",
+                   len(doomed), str(exc))
+        return []
+    held |= job_held
     for entry in doomed:
-        if entry.name in held:
+        if entry.name not in held:
+            continue
+        if entry.name in job_held and entry.name not in held - job_held:
+            audit.info("scratch prune: kept %r, referenced by an enabled cron job", os.fspath(entry))
+        else:
             audit.info("scratch prune: kept %r, held by a retention declaration", os.fspath(entry))
     return [e for e in doomed if e.name not in held]
 
@@ -614,25 +1087,31 @@ def _retention_filter(root: Path, skip_names: frozenset[str], doomed: list[Path]
 
 def prune_idle_entries(
     root: Path, max_idle_hours: float, skip_names: frozenset[str], log_file: Path | None = None,
+    *, restorable_hold: bool = False,
 ) -> int:
-    """Delete top-level entries of *root* with no write anywhere in their subtree for
-    *max_idle_hours*, reaping processes and worktree registrations rooted in them first.
-    Each removal, each signalled process and each entry rescued mid-prune (touched
-    again after selection) is recorded in *log_file*. Returns the count actually
-    removed."""
+    """Prune idle entries, optionally moving them to a private seven-day hold.
+
+    ``restorable_hold`` is enabled only by the real Hermes scratch path. Test and other
+    temporary roots retain the historical direct-delete behavior and never create a shared
+    ``.scratch-trash`` beside ``/var/tmp``.
+    """
     audit = _open_prune_log(log_file)
     try:
-        return _prune_idle_entries(root, max_idle_hours, skip_names, audit)
+        return _prune_idle_entries(root, max_idle_hours, skip_names, audit, restorable_hold=restorable_hold)
     finally:
         if audit is not logger:
             for handler in audit.handlers:
                 handler.close()
 
 
-def _prune_idle_entries(
+def _prune_idle_entries(  # health: allow CC -- preserves ordered fail-closed prune gates
     root: Path, max_idle_hours: float, skip_names: frozenset[str], audit: logging.Logger,
+    *, restorable_hold: bool = False,
 ) -> int:
-    cutoff = time.time() - max_idle_hours * 3600
+    now = time.time()
+    cutoff = now - max_idle_hours * 3600
+    if restorable_hold:
+        purge_expired_holds(root, now, audit)
     # Entries already known to hold files this user cannot read or delete are skipped before
     # any walk, until that is fixed (hermes_constants_scratch_stuck).
     skip_names = skip_names | stuck.load_skips(root) | {stuck.STUCK_STATE_NAME, stuck.STUCK_LOCK_NAME}
@@ -710,23 +1189,34 @@ def _prune_idle_entries(
                     os.fspath(entry),
                 )
             continue
+        held_at: Path | None = None
         denied: list[str] = []
-        try:
-            if entry.is_dir() and not entry.is_symlink():
-                denied = stuck.rmtree_collecting_permission_errors(entry)
-            else:
-                entry.unlink()
-        except OSError as exc:
-            audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
-            continue
-        # rmtree ignores errors, so only a path that is really gone counts as removed.
-        # Only an explicit lstat proves absence: lexists() swallows OSError from lstat,
-        # so an entry that stayed (rmtree left residue) but cannot be inspected would be
-        # counted and recorded as removed — the same invented reason the vanish rule
-        # above refuses to invent (P2 on #134173).
+        if restorable_hold:
+            try:
+                held_at = hold_expired_entry(entry, root, size, time.time())
+            except PermissionError as exc:
+                if stuck.tracking_supported():
+                    stuck.record(root, entry, [os.fspath(entry)], audit)
+                else:
+                    audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
+                continue
+            except OSError as exc:
+                audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
+                continue
+        else:
+            try:
+                if entry.is_dir() and not entry.is_symlink():
+                    denied = stuck.rmtree_collecting_permission_errors(entry)
+                else:
+                    entry.unlink()
+            except OSError as exc:
+                audit.info("scratch prune: could not remove %r: %s", os.fspath(entry), exc)
+                continue
+        # A rename or direct removal is counted only after an explicit lstat proves the
+        # entry left scratch. lstat errors are not treated as absence.
         try:
             os.lstat(entry)
-            if denied and stuck.tracking_supported():
+            if not restorable_hold and denied and stuck.tracking_supported():
                 stuck.record(root, entry, denied, audit)
             else:
                 audit.info("scratch prune: could not fully remove %r", os.fspath(entry))
@@ -736,7 +1226,13 @@ def _prune_idle_entries(
         except OSError:
             audit.info("scratch prune: could not confirm removal of %r", os.fspath(entry))
             continue
-        audit.info("scratch prune: removed %r (%d bytes)", os.fspath(entry), size)
+        if restorable_hold:
+            assert held_at is not None
+            audit.info("scratch prune: removed %r (%d bytes), held at %r",
+                       os.fspath(entry), size, os.fspath(held_at))
+        else:
+            audit.info("scratch prune: removed %r (%d bytes)", os.fspath(entry), size)
         removed += 1
-    release_git_worktrees(repos)
+    if not restorable_hold:
+        release_git_worktrees(repos)
     return removed
