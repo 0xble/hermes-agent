@@ -42,3 +42,5 @@ and these regressions pass there. Roll back by reverting this patch and its
 maintenance row; there is no persisted schema migration or runtime mutation.
 Activation belongs to the main session's normal Hermes promotion path; this
 change does not update or restart a running Hermes instance.
+
+Contract tests: `tests/cron/test_tool_requirements.py`.
