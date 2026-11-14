@@ -19,6 +19,58 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 `production-unused-imports` is a mechanical fork-only hygiene patch. Ruff's `F401` check is the guard for the four removed imports in `agent/agent_init.py`, `agent/codex_runtime.py`, and `agent/memory_manager.py`; retire this record if the imports return or upstream carries the equivalent cleanup.
 
+## Fail-Closed MCP Config Reconciliation
+
+- Fork patch identity: `mcp-config-fail-closed`.
+- A config read/parse/preset validation failure is not an empty `mcp_servers`
+  document. Strict reconciliation retains live, lazy and connecting servers,
+  logs once per config revision, and resumes normal removal after repair.
+- Owner: `tools/mcp_tool_config.py` and `tools/mcp_tool_discovery.py`.
+- Guard: `tests/tools/test_mcp_invalid_config_reconcile.py` runs the real gateway
+  housekeeping callback against invalid on-disk documents and a repaired file.
+- Retire when upstream distinguishes unreadable config from an intentional empty
+  desired set and the same regression passes.
+
+## Distinct Config Error Notice
+
+- Fork patch identity: `config-error-notice`.
+- Typed config/preset validation failures produce `Hermes config is invalid;
+  fix config.yaml`, not a provider sign-in notice. Arbitrary validation details
+  stay in the operator log, never in the transport reply. Pre-turn and in-turn
+  handlers log once per profile config revision. Unrelated failures retain
+  existing classification, failed-turn bookkeeping and sanitized messages.
+- Owner: `hermes_cli/config_errors.py`, `gateway/run_turn_runner.py`,
+  `gateway/run_turn.py` and `gateway/run_turn_persistence.py`.
+- Config load failures use generic `ConfigIssue.message` text and keep operator detail in
+  `local_detail` for config show, doctor and stderr. Unknown-provider replies in model switching
+  and auth do not copy structural issue messages or hints either, since those can quote authored
+  values. The generic repair hint is enough for transport callers.
+- Guard: `tests/gateway/test_config_error_notice.py` covers chained pre-turn
+  errors, both in-turn handlers, repeated turns and a changed config mtime.
+  `tests/gateway/test_model_config_diagnostics.py` crosses the real model-switch reply boundary
+  with private preset and authored-value markers, and checks both unknown-provider hint builders.
+- Retire when upstream provides the same typed classification and log dedupe.
+
+## Config Changes During Failed Cron Runs
+
+- Fork patch identity: `cron-config-change-audit`.
+- The actual cron execution owner snapshots config mtime and SHA-256 around
+  agent and no-agent runs. A failed run with a changed document emits 1 warning
+  naming the job and its ID. A successful run observing an invalid changed config
+  also warns, without replacing its real outcome or final response. Warnings stay
+  in operator logs and saved output. Failed runs also use the existing incident lane.
+- This is an observation of the run interval, not attribution of a concurrent
+  edit to that job. Successful valid edits and unchanged failures stay quiet.
+- Owner: `cron/config_audit.py` and `cron/scheduler.py`.
+- Guard: `tests/cron/test_config_change_failure.py` runs real config-mutating
+  scripts through canonical bookkeeping and checks actual exit status, the
+  warning text and its once-only log, plus a successful valid edit.
+  `tests/cron/test_config_audit_result_preservation.py` retains real output and
+  final responses in both agent and no-agent runs. Document-shape regressions
+  reject non-mapping YAML roots rather than silently auditing an empty mapping.
+- Retire when upstream observes config mutations at the same execution boundary
+  with equivalent status and operator visibility.
+
 ## Post-Install Admission Canary
 
 - Fork patch identity: `post-install-admission-canary`.

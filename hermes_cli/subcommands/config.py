@@ -22,7 +22,10 @@ def build_config_parser(subparsers, *, cmd_config: Callable) -> None:
     add_json_flag(config_get, "Print value as JSON")
     config_get.add_argument(
         "--raw", action="store_true",
-        help="Print credential values unmasked (default masks api_key/token/secret-shaped values)")
+        help="Print the authored value without defaults, preset/env expansion or secret masking")
+    config_get.add_argument(
+        "--expanded", action="store_true",
+        help="Print the resolved runtime view (the default). With --raw, keep expansion but unmask secrets")
 
     config_set = config_subparsers.add_parser("set", help="Set a configuration value")
     config_set.add_argument(

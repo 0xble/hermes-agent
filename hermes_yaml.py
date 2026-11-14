@@ -9,6 +9,7 @@ from typing import Any, IO, overload
 
 from ruamel.yaml import YAML
 from ruamel.yaml.error import YAMLError
+from ruamel.yaml.representer import SafeRepresenter
 from ruamel.yaml.resolver import VersionedResolver
 
 
@@ -70,6 +71,9 @@ def safe_dump(
     yaml.width = width
     yaml.sort_base_mapping_type_on_output = sort_keys
     yaml.indent(mapping=2, sequence=4, offset=2)
+    # Configure before accessing the lazy representer, which copies the options
+    # on construction. Snapshot metadata never becomes YAML object tags.
+    yaml.representer.add_multi_representer(dict, SafeRepresenter.represent_dict)
     if stream is not None:
         yaml.dump(data, stream)
         return None

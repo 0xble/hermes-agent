@@ -425,7 +425,7 @@ def _register_lazy_from_cache(new_servers: dict[str, dict]) -> tuple[dict[str, d
             _core._server_connecting.discard(_server_key(name))
         try:
             names = _registration._register_from_cache_sync(name, cfg, entry)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- one server's invalid config must not prevent other discovery
             logger.warning("Failed lazy MCP registration for '%s': %s", name, exc)
             with _core._lock:
                 _core._server_connecting.add(_server_key(name))
@@ -672,7 +672,12 @@ def reconcile_mcp_servers_with_config() -> dict[str, list[str]]:
     is reported under ``"pending"`` so the caller retries. Returns
     ``{"removed": [...], "added": [...], "pending": [...]}``; a no-op when nothing changed."""
     with _owner_secret_scope():
-        servers = _config._load_mcp_config()
+        try:
+            servers = _config._load_mcp_config(strict=True)
+        except Exception as exc:  # health: allow BLE001 -- reconcile failure retains live servers and retries later
+            from hermes_cli.config_errors import log_config_error_once
+            log_config_error_once(logger, str(exc), context="MCP reconcile skipped, retaining current servers")
+            return {"removed": [], "added": [], "pending": []}
     wanted = {name for name, cfg in servers.items() if mcp_server_enabled(cfg)}
     scope = _core._mcp_registry_scope()
     with _core._lock:

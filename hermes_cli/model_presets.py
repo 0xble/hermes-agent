@@ -10,6 +10,8 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from hermes_cli.config_errors import ConfigValidationError
+
 
 _ROUTE_KEYS = frozenset({"provider", "model", "reasoning_effort", "fallbacks"})
 _MAIN_FORBIDDEN_REFERENCE_FIELDS = frozenset({
@@ -35,7 +37,7 @@ def preset_ref_name(value: Any) -> str | None:
     return match.group(1) if match else None
 
 
-class ModelPresetError(ValueError):
+class ModelPresetError(ConfigValidationError):
     """A model preset cannot be expanded safely."""
 
 

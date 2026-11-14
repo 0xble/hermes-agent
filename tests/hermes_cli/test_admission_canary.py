@@ -70,8 +70,11 @@ def receipts(home):
     return [json.loads(p.read_text()) for p in (home / "logs/guardian").glob("*.json")]
 
 
-def test_spike_rolls_back_healthy_gateway_once_and_fails_update(switched):
+@pytest.mark.parametrize("runtime_error", ["", "timezone: NOT/A_ZONE\n", "model: '@missing'\n"])
+def test_spike_rolls_back_healthy_gateway_once_and_fails_update(switched, runtime_error):
     home, plist, label, old, candidate, clock, rollbacks = switched
+    path = home / "config.yaml"
+    path.write_text(runtime_error + path.read_text(), encoding="utf-8")
     clock[0] = 1001
     signal(home, candidate, [[1001, "metadata"]] * 9 + [[1001, "text"]])
     with pytest.raises(canary.AdmissionCanaryError, match="10 refusals.*dominant clause=metadata"):
@@ -156,10 +159,11 @@ def test_below_threshold_is_healthy(switched):
 @pytest.mark.parametrize("field,value", [("enabled", "yes"), ("window_seconds", 0),
     ("window_seconds", 301), ("window_seconds", float("nan")),
     ("refusal_threshold", True), ("refusal_threshold", 1001)])
-def test_invalid_settings_fail_closed(switched, monkeypatch, field, value):
+def test_invalid_settings_fail_closed(switched, field, value):
+    import hermes_yaml as yaml
     home, *_ = switched
-    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective",
-                        lambda *a, **kw: {"gateway": {"guardian": {"admission_canary": {field: value}}}})
+    (home / "config.yaml").write_text(yaml.safe_dump({"gateway": {"guardian": {
+        "admission_canary": {field: value}}}}), encoding="utf-8")
     with pytest.raises(ValueError, match="admission_canary"):
         canary.settings(home)
 

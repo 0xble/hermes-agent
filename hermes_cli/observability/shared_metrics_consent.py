@@ -104,11 +104,16 @@ def save_consent(enabled: bool, send: bool, config: dict | None = None) -> None:
         return
     send = enabled and send
     config_path = get_config_path()
-    user_config = require_readable_config_before_write(config_path)
-    set_answer(user_config, enabled, send)
-    _write_user_config(config_path, user_config)
-    if config is not None:
-        set_answer(config, enabled, send)
+    from hermes_cli.config_write_guards import config_write_lock
+
+    # The wizard keeps editing its snapshot after this immediate write. Check it
+    # before writing and advance only that object, not independent stale copies.
+    with config_write_lock(config_path, config):
+        user_config = require_readable_config_before_write(config_path)
+        set_answer(user_config, enabled, send)
+        _write_user_config(config_path, user_config)
+        if config is not None:
+            set_answer(config, enabled, send)
     # Unconditional: a send key already false may still have an open consent window.
     _record_send_consent_change(enabled=send)
     if not enabled:

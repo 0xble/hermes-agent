@@ -38,6 +38,44 @@ acceptance of the design. Reassess this divergence before adopting upstream work
   credentials. Derive the full state from raw config and merge through the
   shared round-trip writer, not a blind replacement of the `model:` block.
 - Unrelated saves preserve authored references, even after defaults merge.
+- Single-field platform writers round-trip raw YAML, not the runtime-expanded
+  dict. The shared config write boundary validates a disposable expansion before
+  replacing any bytes, including `config set --force`, `save_config`, and schema
+  migrations. A preset plus inline route fields must fail without changing the
+  file or stamping a newer schema version.
+- Every managed atomic config write admits the final serialized bytes through the complete
+  runtime normalization/defaults/preset/managed-overlay pipeline. `--force` cannot bypass it.
+  The shared auth advisory-lock primitive serializes writers by resolved path, including CLI
+  read-modify-write cycles. Raw and expanded snapshots carry an out-of-band revision and reject
+  stale rollbacks. A final revision check catches external edits during serialization.
+  Every shared raw-cache producer retains revision metadata. Wizard subflows checkpoint pending
+  settings before independent writes and refresh values and revisions together afterward.
+  Generic atomic I/O applies admission only to owned home/profile configs or explicit config
+  transactions, never to an unrelated application/template file by basename alone.
+- Credential mirror admission precedes environment and pool changes. A rejected mirror
+  candidate leaves those stores unchanged, rather than splitting a rotation/removal. Broken YAML
+  without the old credential text requires no mirror write and must not block env-only changes.
+  An unreadable possible mirror refuses with a generic repair-hint `ValueError` (dashboard 400),
+  never parser detail or a 500. `tests/hermes_cli/test_credential_broken_config.py` covers both
+  outcomes for rotation and removal through the real dashboard routes.
+- Strict runtime reads never serve stale semantic values. Local config display and structure
+  diagnostics retain repair details without admitting invalid runtime data. Guardian canary
+  reads validate their own policy independently of unrelated runtime fields, retaining managed
+  overlays. Consent readers accept revision-bearing mappings but reject failed-read sentinels.
+- Guard: cache-revision, credential-admission, wizard-subflow, write-ownership, scoped-canary,
+  update-consent and operational-recovery regressions under `tests/hermes_cli/` cross the actual
+  file-backed consumer paths, preserving stale-write rejection and full write validation.
+- Good backups and in-memory last-good state accept only semantic successes. Recovery scans
+  past invalid good snapshots and expands the first valid authored candidate. Snapshot copying
+  uses the exact admitted bytes, not a later reread of the source path.
+- `config get --raw` means authored YAML, without defaults, overlay or expansion. Keep
+  `--raw --expanded` for the historical unmasked runtime view. `.env` routing stays unchanged.
+- Guard: `tests/hermes_cli/test_config_write_transactions.py` covers force/unset/save and
+  low-level writers, byte preservation, stale expanded/raw/missing-file snapshots, 2-process
+  contention, lock ownership, external edits, valid-only retention and real raw CLI output.
+- Guard: `tests/hermes_cli/test_config_write_guards.py` exercises raw round-trip,
+  every conflicting delegation field through the CLI setter, all shared writers,
+  and an invalid schema-step result.
 - Carry resolved main fallback entries to auxiliary request planning. Re-reading
   config per candidate can lose the selected route's reasoning effort.
 - `get_fallback_chain` is the shared preset-aware fallback boundary. Feed it the

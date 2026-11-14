@@ -400,8 +400,8 @@ def setup_model_provider(config: dict, *, quick: bool = False):
     # Re-sync from disk in place: cmd_model saved via its own load/save cycle and the wizard's
     # final save_config(config) must not clobber it with stale values. Rotation, vision and TTS
     # keep safe defaults (configure via `hermes auth add` / `hermes setup tts`).
-    config.clear()
-    config.update(load_config())
+    from hermes_cli.config_write_guards import replace_snapshot
+    replace_snapshot(config, load_config())
     save_config(config)
 
 
@@ -603,7 +603,7 @@ def run_setup_wizard(args):
         try:
             return _run_setup_wizard_impl(args)
         except _SetupCancelled:
-            _info(None, "Setup cancelled. Remaining sections were not changed.")
+            _info(None, "Setup cancelled. Settings saved at earlier checkpoints are kept.")
             return None
 
 

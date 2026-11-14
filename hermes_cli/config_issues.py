@@ -8,10 +8,11 @@ from dataclasses import dataclass
 
 @dataclass
 class ConfigIssue:
-    """A detected config structure problem."""
+    """A config problem, with optional operator-only diagnostic detail."""
     severity: str  # "error", "warning"
     message: str
     hint: str
+    local_detail: str = ""
 
 
 def _issue(issues: list[ConfigIssue], severity: str, message: str, hint: str) -> None:

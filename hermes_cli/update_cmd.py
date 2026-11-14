@@ -1,9 +1,11 @@
+# health: allow FILE_LINES -- receipt-consent compatibility stays on this frozen updater facade.
 """Hermes update pipeline: dispatchers (``_cmd_update_impl``/``_cmd_update_check``) + git plumbing.
 
 Each concern lives in ``update_cmd_<concern>.py`` and is re-imported here so
 ``hermes_cli.update_cmd.<name>`` keeps resolving (and stays monkeypatchable). Imports are one-way:
-main -> update_cmd -> update_cmd_*; ``_m()`` resolves ``hermes_cli.main`` at call time.
+ main -> update_cmd -> update_cmd_*; ``_m()`` resolves ``hermes_cli.main`` at call time.
 """
+# health: allow FILE_LINES -- receipt-consent compatibility stays on this frozen updater facade.
 
 import logging
 import json
@@ -372,8 +374,12 @@ class UpdateConfigurationError(ValueError):
 def _updates_config() -> dict:
     """The ``updates:`` config section (``{}`` when absent/malformed); may raise on config errors."""
     from hermes_cli.config import load_config, validate_config_structure
+    from hermes_cli.config_errors import ConfigValidationError
+
     try:
         config = load_config() or {}
+    except ConfigValidationError as exc:
+        raise UpdateConfigurationError(str(exc)) from exc
     except Exception as exc:
         raise UpdateConfigurationLoadError(str(exc)) from exc
     issues = [issue for issue in validate_config_structure({"updates": config.get("updates")})

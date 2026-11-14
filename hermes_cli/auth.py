@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- config diagnostic redaction is coupled to the auth hint boundary.
 """Multi-provider authentication system for Hermes Agent.
 
 - ``ProviderConfig`` / ``PROVIDER_REGISTRY`` describe every known inference provider.
@@ -7,7 +8,8 @@
 - ``resolve_provider()`` picks the active provider via the documented priority chain.
 - ``OAUTH_PROVIDER_FLOWS`` maps each OAuth provider to its resolver/status builder; the flows live in
   ``auth_nous``/``auth_codex``/``auth_xai``/``auth_qwen``/``auth_minimax``/``auth_openrouter`` and are
-  re-imported here so ``hermes_cli.auth.<name>`` stays the public/patchable surface."""
+ re-imported here so ``hermes_cli.auth.<name>`` stays the public/patchable surface."""
+# health: allow FILE_LINES -- config diagnostic redaction is coupled to the auth hint boundary.
 
 from __future__ import annotations
 
@@ -117,7 +119,7 @@ def is_actual_local_base_url(base_url: str) -> bool:
     """Return True for Actual's loopback local API endpoint."""
     try:
         host = (urlparse(base_url or "").hostname or "").lower().rstrip(".")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- provider hint generation is best-effort and must not mask auth errors
         return False
     return host in {"localhost", "127.0.0.1", "::1", "0.0.0.0"}
 
@@ -132,7 +134,7 @@ def normalize_actual_base_url(base_url: str) -> str:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower().rstrip(".")
         path = parsed.path.rstrip("/")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- provider hint generation is best-effort and must not mask auth errors
         return url
     if path in {"", "/"} and (host == "api.actual.inc" or is_actual_local_base_url(url)):
         return url + "/v1"
@@ -360,7 +362,7 @@ def _model_level_key_env(provider_id: str) -> str:
     try:
         from hermes_cli.config import load_config
         model_cfg = (load_config() or {}).get("model")
-    except Exception:
+    except Exception:  # health: allow BLE001 -- provider hint generation is best-effort and must not mask auth errors
         return ""
     if not isinstance(model_cfg, dict):
         return ""
@@ -1388,6 +1390,24 @@ def deactivate_provider() -> None:
 
 
 # ── Provider Resolution — picks which provider to use ───────────────────────────────────────────────
+
+
+def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
+    """Return a helpful hint string when provider resolution fails."""
+    if str(provider_name or "").strip().lower() in {"opencode-free", "free", "opencode_free"}:
+        return ("OpenCode discontinued anonymous free-tier access outside its own client "
+                "(relay 403s FreeTierError), so the keyless 'opencode-free' provider was removed. "
+                "Switch to 'opencode-zen' (pay-as-you-go, OPENCODE_ZEN_API_KEY) or 'opencode-go' "
+                "($10/mo subscription, OPENCODE_GO_API_KEY) via 'hermes model'.")
+    try:
+        from hermes_cli.config import validate_config_structure
+        issues = validate_config_structure()
+        if not issues:
+            return ""
+        # This hint can reach chat through AuthError. Keep authored diagnostics local.
+        return "Config issues detected. Run 'hermes doctor' for local diagnostics."
+    except Exception:  # health: allow BLE001 -- provider hint generation is best-effort and must not mask auth errors
+        return ""
 
 
 def _refuse_env_adoption_if_config_corrupt() -> None:

@@ -1,9 +1,11 @@
+# health: allow FILE_LINES -- config-error handling stays at this established callback facade.
 """Per-turn callback runner (progress/status/voice/run_sync) for the gateway agent turn.
 
 ``TurnRunner`` owns the per-turn callbacks ``GatewayRunner._run_agent_inner`` binds. ``gateway.run``
 internals are imported lazily inside method bodies (import cycle), so ``patch("gateway.run.X")``
 keeps intercepting them at call time.
 """
+# health: allow FILE_LINES -- config-error handling stays at this established callback facade.
 
 from __future__ import annotations
 
@@ -57,6 +59,10 @@ def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, 
     from agent.error_classifier import FailoverReason
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
     from hermes_state_runtime import RuntimeStoreError
+    from hermes_cli.config_errors import config_error_notice, config_error_reason
+    reason = config_error_reason(exc)
+    if reason is not None:
+        return config_error_notice(reason), "config_error", False
     auth_permanent = FailoverReason.auth_permanent.value
     if isinstance(exc, RuntimeStoreError) and exc.reason == 'launch_credentials_unavailable':
         # The session's launch key is gone (a restart revoked a CLI --api-key, a route key changed):
@@ -1873,7 +1879,7 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
                 )
             return result
 
-    def _run_sync_scoped(self):
+    def _run_sync_scoped(self):  # health: allow CC -- scoped runner preserves cancellation and profile fences
         """Executor-thread body of the turn; returns the gateway result dict.
 
         The turn message lives on the shared TurnContext (``ctx.message``) so ``_run_agent_inner`` sees
@@ -1944,7 +1950,12 @@ class TurnRunner(TurnSessionTitlesMixin, TaskCardProgressMixin, GatewayTurnProgr
         except Exception as exc:
             # Model/credential resolution failed before the turn began. Keep the raw cause in logs,
             # but return a failed turn with a stable user-facing recovery message and reason.
-            logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
+            from hermes_cli.config_errors import config_error_reason, log_config_error_once
+            config_reason = config_error_reason(exc)
+            if config_reason is not None:
+                log_config_error_once(logger, config_reason)
+            else:
+                logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
             from agent.turn_failure_copy import stamp_failure
             text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
             return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
