@@ -65,6 +65,32 @@ def test_retry_follows_earliest_route_not_last_fallback():
     assert now + 600 <= plan["due_at"] < now + 600 + dr.BASE_BACKOFF_S + 1
 
 
+def test_cooldown_read_runs_outside_the_ledger_writer_transaction(monkeypatch):
+    """The cooldown read takes a blocking file lock; it must not hold the ledger's writer lock."""
+    now = time.time()
+    _store((PRIMARY, now + 600))
+    did = _failed_delegation("deleg_outside_txn", now)
+    real = spc.earliest_available
+    observed = []
+
+    def probe(routes, *, now=None):
+        conn = ad._connect()
+        try:
+            conn.execute("PRAGMA busy_timeout=0")
+            conn.execute("BEGIN IMMEDIATE")  # raises "database is locked" inside a writer txn
+            conn.execute("ROLLBACK")
+        finally:
+            conn.close()
+        observed.append(ad._DB_LOCK.locked())
+        return real(routes, now=now)
+
+    monkeypatch.setattr(spc, "earliest_available", probe)
+    plan = dr.schedule_retry(did, now=now)
+
+    assert observed == [False]
+    assert now + 600 <= plan["due_at"] < now + 600 + dr.BASE_BACKOFF_S + 1
+
+
 @pytest.mark.parametrize("reset_hours", [48, 10])
 def test_recorded_reset_obeys_lineage_delay_cap_without_a_provider_hint(reset_hours):
     now = time.time()
