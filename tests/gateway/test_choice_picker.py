@@ -111,11 +111,11 @@ class TestFastChoicePicker:
     def _patch_fast_support(self, monkeypatch, tmp_path):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
         monkeypatch.setattr(gateway_run, "_load_gateway_config", dict)
-        monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: "gpt-5.6")
+        monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: "gpt-6-astra")
         # ``/fast`` now resolves the effective session model through
         # ``_resolve_session_agent_runtime``; with no session override that path
         # calls runtime provider resolution, so stub it (no real credentials in CI).
-        monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", dict)
+        monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"provider": "openai-api"})
         import hermes_cli.models as models_mod
         monkeypatch.setattr(models_mod, "model_supports_fast_mode", lambda m: True)
 
@@ -148,23 +148,28 @@ class TestFastChoicePicker:
         assert not (tmp_path / "config.yaml").exists()
 
     @pytest.mark.asyncio
-    async def test_fast_picker_title_includes_human_readable_expiry(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("word, seconds, remaining", [("fast", 7200, "1h 59m"), ("ultrafast", 300, "4m")])
+    async def test_fast_picker_title_includes_human_readable_expiry(self, tmp_path, monkeypatch, word, seconds, remaining):
         self._patch_fast_support(monkeypatch, tmp_path)
         monkeypatch.setattr(
             gateway_run,
             "_load_gateway_config",
-            lambda: {"agent": {"fast_expiry_seconds": 2 * 60 * 60}},
+            lambda: {"agent": {"fast_expiry_seconds": 7200, "ultrafast_expiry_seconds": 300}},
         )
         clock = {"now": 100.0}
         monkeypatch.setattr("gateway.run_config_loaders.time.time", lambda: clock["now"])
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
 
-        await runner._handle_fast_command(_make_event("/fast fast"))
+        event = _make_event("/fast")
+        await runner._handle_fast_command(event)
+        assert word in [choice["value"] for choice in adapter.calls[-1]["choices"]]
+        await adapter.calls[-1]["on_choice_selected"](event.source.chat_id, word)
+        assert runner._session_service_tier_expiry(runner._session_key_for_source(event.source)) == (100.0 + seconds, seconds)
         clock["now"] = 101.0
         await runner._handle_fast_command(_make_event("/fast"))
 
-        assert "Expires in: 1h 59m" in adapter.calls[-1]["title"]
+        assert f"Expires in: {remaining}" in adapter.calls[-1]["title"]
         assert "s" not in adapter.calls[-1]["title"].split("Expires in:", 1)[1]
 
 
