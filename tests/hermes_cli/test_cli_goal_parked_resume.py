@@ -6,7 +6,7 @@ from unittest.mock import patch
 import pytest
 
 # Boot before the real-home guard, matching the CLI entry point used below.
-import hermes_bootstrap  # noqa: F401
+import hermes_bootstrap
 
 from hermes_cli import goals
 from hermes_cli.cli_loops_mixin import CLILoopsMixin

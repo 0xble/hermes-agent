@@ -3,9 +3,9 @@ import json
 from types import SimpleNamespace
 
 import pytest
-import hermes_bootstrap  # noqa: F401 -- initialize dependencies before the real-home I/O guard
+import hermes_bootstrap
 
-from tests.gateway.test_session_viewer_automation import owner  # noqa: F401
+from tests.gateway.test_session_viewer_automation import owner
 
 
 @pytest.mark.asyncio

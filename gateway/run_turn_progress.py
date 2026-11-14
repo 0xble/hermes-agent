@@ -19,6 +19,7 @@ from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.platforms.typing_state import call_typing_with_metadata, typing_metadata_for_source
 from gateway.run_turn_runner_progress import _ToolProgressLine, edit_progress_message, send_progress_text
+from gateway.platforms.helpers import typing_metadata_for_turn
 from gateway.turn_context import TurnContext
 from hermes_cli.config import cfg_get
 from utils import is_truthy_value
@@ -478,6 +479,8 @@ class GatewayTurnProgressMixin:
     def _reset_progress_bubble(self, st) -> None:
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
+        if st.dirty and st.can_edit and st.progress_msg_id is not None:
+            st.owed_bubbles.append((st.progress_msg_id, self._progress_text(st.progress_lines)))
         st.progress_msg_id, st.progress_lines = None, []
         st.dirty = False
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
@@ -495,7 +498,20 @@ class GatewayTurnProgressMixin:
         st.dirty = True
         return raw
 
+    async def _flush_owed_progress(self, st) -> bool:
+        """Retry the original bubble after a reset, without sending into its refusal window."""
+        if not st.owed_bubbles or self._progress_deferred(st):
+            return False
+        if not self._ctx._run_still_current() or self._agent_interrupted():
+            return False
+        result = await self._edit_progress_message(st, *st.owed_bubbles[0])
+        if not (result.raw_response or {}).get("skipped"):
+            if result.success or not self._edit_failure_is_deferrable(st, result):
+                st.owed_bubbles.pop(0)
+        return True
+
     async def _flush_progress_edit(self, st) -> None:
+        await self._flush_owed_progress(st)
         # A deferred bubble may still hold an unsplit, over-limit buffer: never send that as one edit.
         if st.dirty and st.can_edit and st.progress_lines and st.progress_msg_id and not self._progress_deferred(st):
             with suppress(Exception):
@@ -540,7 +556,9 @@ class GatewayTurnProgressMixin:
         ctx = self._ctx
         await asyncio.sleep(0.3)
         if ctx._run_still_current():
-            await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+            # On this turn's own message, as its refresh: the chat's latest may be a newer one.
+            await st.adapter.send_typing(ctx.source.chat_id, metadata=typing_metadata_for_turn(
+                st.adapter, ctx.source.chat_id, ctx.event_message_id, ctx._progress_metadata))
 
     async def _progress_send_or_edit(self, st, msg) -> bool:
         """Deliver this tick's bubble. Returns False on a transient edit failure (retry next tick).
@@ -582,8 +600,10 @@ class GatewayTurnProgressMixin:
         """Keep refused edits buffered without spending calls on every consumer tick."""
         floor = cls._progress_edit_interval(st.adapter)
         if cls._is_flood_refusal(result):
+            from gateway.delivery_ledger import flood_wait_seconds
             st.retry_wait = 0.0
-            wait = max(float(getattr(result, "retry_after", None) or 0.0), floor)
+            stated = flood_wait_seconds(str(getattr(result, "error", "") or ""), default=floor)
+            wait = max(float(getattr(result, "retry_after", None) or stated), floor)
             st.defer_until = time.monotonic() + wait
             logger.info("[%s] Progress edit flood control, deferring edits for %.1fs", st.adapter.name, wait)
             return True
@@ -628,7 +648,7 @@ class GatewayTurnProgressMixin:
         while self._ctx.progress_queue.empty():
             if not self._ctx._run_still_current():
                 return None
-            if st.defer_until and st.progress_lines and not self._agent_interrupted():
+            if (st.owed_bubbles or (st.defer_until and st.progress_lines)) and not self._agent_interrupted():
                 return None  # Retry a refused batch even if no further tool event arrives.
             await asyncio.sleep(0.3)
         return self._ctx.progress_queue.get_nowait()
@@ -675,6 +695,11 @@ class GatewayTurnProgressMixin:
                 if not ctx._run_still_current():
                     return
                 if self._agent_interrupted():
+                    continue
+                if await self._flush_owed_progress(st):
+                    last_edit_ts = time.monotonic()
+                    if st.progress_lines:
+                        st.defer_until = max(st.defer_until, last_edit_ts + self._progress_interval_for_chat(st.adapter))
                     continue
                 if not st.progress_lines:
                     continue
@@ -767,7 +792,7 @@ class GatewayTurnProgressMixin:
         payload = _tool_complete_payload(call_id, tool_name, args, result, is_error=is_error, verbose=verbose)
         if local_viewer_turn(self):
             from gateway import local_viewer_events
-            payload.update(local_viewer_events.complete_fields(self, call_id, tool_name, args, result))
+            payload.update(local_viewer_events.complete_fields(self, call_id, tool_name, args, result, is_error=is_error))
         self._publish_execution("tool.complete", payload)
         if local_viewer_turn(self) and isinstance(payload.get("todos"), list):
             # Task state is application data, not tool chrome: the full snapshot, as the TUI gateway emits it.
@@ -835,7 +860,10 @@ class GatewayTurnProgressMixin:
                 and bool(ctx._status_adapter) and ctx._run_still_current())
 
     def _send_status_text(self, text: str, metadata, log_message: str) -> None:
+        from gateway.bot_peer_notices import automatic_notices_allowed
         ctx = self._ctx
+        if not automatic_notices_allowed(ctx.source):
+            return
         self._schedule(ctx._status_adapter.send(ctx._status_chat_id, text, metadata=metadata), log_message)
 
     def _status_callback_sync(self, event_type: str, message: str) -> None:
@@ -845,7 +873,14 @@ class GatewayTurnProgressMixin:
         ctx = self._ctx
         if ctx.mute_notification_reply or not self._status_live():
             return
-        prepared = _prepare_gateway_status_message(ctx.source.platform, event_type, message)
+        # Lifecycle diagnostics (including provider fallback notices) are UI affordances for a
+        # human caller. Sending them to a known bot peer can create a new inbound turn and a loop.
+        from gateway.bot_peer_notices import automatic_notices_allowed
+        if not automatic_notices_allowed(ctx.source):
+            logger.debug("status_callback suppressed for bot-authored message: %s", event_type)
+            return
+        prepared = _prepare_gateway_status_message(
+            ctx.source.platform, event_type, message, getattr(ctx.source, "chat_type", "dm"))
         if prepared is None:
             logger.debug(
                 "status_callback suppressed for %s/%s: %s",
@@ -871,9 +906,11 @@ class GatewayTurnProgressMixin:
 
 def local_viewer_turn(runner) -> bool:
     """A local route's viewers read the canonical event stream; ``LocalSessionAdapter.send``
-    publishes nothing, so status and notices go to that stream instead."""
-    return (getattr(runner, "_approval_owner", None) is not None
-            and getattr(getattr(runner._ctx, "source", None), "platform", None) == Platform.LOCAL)
+    publishes nothing, so status and notices go to that stream instead. So does a conversation its
+    chat moved past (gateway/session_detached.py): it delivers through that same adapter."""
+    source = getattr(runner._ctx, "source", None) if getattr(runner, "_approval_owner", None) is not None else None
+    from gateway.session_detached import detached_route_of
+    return getattr(source, "platform", None) == Platform.LOCAL or detached_route_of(source) is not None
 
 
 def _viewer_status_kind(kind, text):

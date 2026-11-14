@@ -105,7 +105,7 @@ async def test_queue_mode_in_turn_drain_takes_text_before_deferred_moa():
     runner._promote_queued_event = lambda _key, _adapter, pending: pending
     runner._pending_event_audio_paths = lambda _event: []
 
-    pending_event, pending = await runner._run_agent_drain_pending(
+    _pending_event, pending = await runner._run_agent_drain_pending(
         {"final_response": "done"}, adapter, moa.source, key)
     assert pending == "plain follow-up"
     assert adapter._pop_deferred_command(key) is moa

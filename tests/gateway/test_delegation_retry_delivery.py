@@ -429,7 +429,7 @@ async def test_terminal_notice_is_interim_and_never_seals_an_open_stream(private
     runner._thread_metadata_for_source = Mock(return_value={"thread_id": "t1"})
     source = SimpleNamespace(platform=Platform.TELEGRAM, chat_id="c1", user_id="u1")
     assert await runner._deliver_platform_notice(source, "Background task stopped: x — y.") is True
-    (kind, chat_id, content, metadata) = sends[0]
+    (kind, _chat_id, _content, metadata) = sends[0]
     assert kind == ("private" if private else "send")
     assert metadata.get("_interim_send") is True
     assert metadata.get("thread_id") == "t1"

@@ -122,7 +122,7 @@ async def test_retry_admits_native_input_once(locked_lane, monkeypatch, probe):
 
 @pytest.mark.asyncio
 async def test_retry_has_one_pending_adapter_lifecycle(locked_lane):
-    runner, adapter, event, key, db, sid = locked_lane
+    runner, adapter, event, _key, db, sid = locked_lane
     adapter.on_processing_start = AsyncMock()
     adapter.on_processing_complete = AsyncMock()
     dispatched = []

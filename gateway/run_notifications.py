@@ -16,7 +16,7 @@ import logging
 import math
 import time
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -223,12 +223,37 @@ def _mark_internal_notification(text: str) -> str:
     return text + "\n\n" + INTERNAL_NOTIFICATION_FOOTER
 
 
+def _held_reason(source, platform: str, multiplexed: bool) -> str:
+    """Why a completion has no transport, naming what is actually missing: the saved receiving bot
+    is down, or the route never saved one (a row older than the column), which no reconnect fixes."""
+    from gateway.session_identity import identity_of
+    identity = identity_of(source)
+    runtime = getattr(source, "profile", None) or "default"
+    if identity is not None and identity.multiplexed and not identity.transport_inferred:
+        return (f"the {platform} bot of profile {identity.transport_profile!r} that received this chat "
+                f"(runtime profile {runtime!r}) is not connected; the row stays pending until it reconnects")
+    if multiplexed:
+        return (f"the {platform} route of profile {runtime!r} has no saved receiving bot and no shared bot "
+                f"covers it; the row stays pending until a new message in that chat records the bot")
+    return f"no live {platform} transport for profile {runtime!r}; the row stays pending until it connects"
+
+
 def _media_send_succeeded(result) -> bool:
     """A media send counts as delivered only on an explicit successful SendResult."""
     return bool(getattr(result, "success", False))
 
 
+from gateway.run_notifications_delegation import GatewayNotificationsMixin as GatewayDelegationNotificationsMixin
+
+
+from gateway.run_notifications_completion import GatewayNotificationsMixin as GatewayCompletionNotificationsMixin
+
+
+from gateway.run_notifications_media import GatewayNotificationsMixin as GatewayMediaNotificationsMixin
+
+
 class GatewayNotificationsMixin(
+    GatewayMediaNotificationsMixin, GatewayCompletionNotificationsMixin, GatewayDelegationNotificationsMixin,
     GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayProcessEventSourcesMixin,
     GatewayProcessNotificationsMixin,
 ):
@@ -392,23 +417,12 @@ class GatewayNotificationsMixin(
         if releases.get(key) is release:
             releases.pop(key, None)
 
-    @dataclasses.dataclass
-    class _CompletionClaim:
-        """Pre-flight outcome for one completion delivery."""
-
-        delegation_id: str = ""
-        claim_id: str = ""
-        proceed: bool = True
-        early_result: Optional[bool] = None
-        settled: bool = False
-        owner_session_id: str = ""  # owning session the pre-flight proved for the completion's pin
-        proven_session_id: str = ""  # session the pre-flight proved delivery reaches (a compression tip included)
-        defer: bool = False  # unadmitted retry: settle without spending a delivery attempt
 
     async def _deliver_platform_notice(self, source, content: str, *, notice_style: Optional[str] = None) -> bool:
         """Deliver with platform privacy rules; return only an affirmative send receipt."""
+        from gateway.bot_peer_notices import automatic_notices_allowed
         from gateway.run import _is_slack_ignored_channel
-        adapter = self._delivery_adapter_for(source)
+        adapter = self._delivery_adapter_for(source) if automatic_notices_allowed(source) else None
         if not adapter:
             return False
         config = getattr(self, "config", None)
@@ -707,7 +721,7 @@ class GatewayNotificationsMixin(
         watcher = getattr(self, "_update_notification_task", None)
         if (watcher is not None and not watcher.done()) or getattr(self, "_update_final_send_active", False):
             return
-        now = datetime.now(timezone.utc).timestamp()
+        now = datetime.now(UTC).timestamp()
         try:
             due = float(current[1].get("notice_retry_at", 0))
         except (TypeError, ValueError):
@@ -728,7 +742,7 @@ class GatewayNotificationsMixin(
         if retry_after is None:
             retry_after = flood_wait_seconds(getattr(result, "error", None), default=0)
         pending["notice_attempts"] = attempts
-        pending["notice_retry_at"] = datetime.now(timezone.utc).timestamp() + max(
+        pending["notice_retry_at"] = datetime.now(UTC).timestamp() + max(
             60, min(3600, 60 * 2 ** (attempts - 1)), float(retry_after or 0))
         save_pending(marker, pending)
 
@@ -821,13 +835,13 @@ class GatewayNotificationsMixin(
         )
 
     @staticmethod
-    def _current_update(paths: "_UpdatePaths", original: dict) -> Optional[tuple[Path, dict]]:
+    def _current_update(paths: _UpdatePaths, original: dict) -> Optional[tuple[Path, dict]]:
         """A notice must not adopt state belonging to a later admission."""
         from gateway.update_notifications import read_pending, same_update
         current = read_pending(paths.pending.parent)
         return current if current and same_update(current[0], original) else None
 
-    async def _watch_update_completion_only(self, paths: "_UpdatePaths", deadline: float, poll_interval: float,
+    async def _watch_update_completion_only(self, paths: _UpdatePaths, deadline: float, poll_interval: float,
                                             original: dict) -> None:
         loop = asyncio.get_running_loop()
         while paths.any_pending() and loop.time() < deadline:
@@ -891,7 +905,7 @@ class GatewayNotificationsMixin(
             return b"", len(data)
         return data[offset:], len(data)
 
-    async def _send_update_output(self, target: "_UpdateTarget", data: bytes, original: dict,
+    async def _send_update_output(self, target: _UpdateTarget, data: bytes, original: dict,
                                   *, trailer: str = "") -> int:
         """Return the exact raw byte prefix delivered (or blank), even on partial failure.
 
@@ -907,7 +921,7 @@ class GatewayNotificationsMixin(
             current = self._current_update(self._update_paths(), original)
             if not current:
                 return consumed
-            if float(current[1].get("notice_retry_at", 0)) > datetime.now(timezone.utc).timestamp():
+            if float(current[1].get("notice_retry_at", 0)) > datetime.now(UTC).timestamp():
                 return consumed
             end = min(pos + 3500, len(raw))
             while len(raw[pos:end].encode("utf-8", errors="surrogateescape")) > 3500:
@@ -941,7 +955,7 @@ class GatewayNotificationsMixin(
             pos = end
         return consumed
 
-    async def _forward_update_prompt(self, target: "_UpdateTarget", prompt_text: str, default: str, original: dict) -> None:
+    async def _forward_update_prompt(self, target: _UpdateTarget, prompt_text: str, default: str, original: dict) -> None:
         """Forward an update prompt: platform-native buttons first (Discord, Telegram), else text."""
         sent_buttons = False
         adapter = target.adapter
@@ -966,7 +980,7 @@ class GatewayNotificationsMixin(
         self._session_state(target.session_key).persistent.update_prompt_pending = True
         logger.info("Forwarded update prompt to %s: %s", target.session_key, prompt_text[:80])
 
-    def _clear_update_markers(self, paths: "_UpdatePaths", session_key: Optional[str], pending: dict) -> bool:
+    def _clear_update_markers(self, paths: _UpdatePaths, session_key: Optional[str], pending: dict) -> bool:
         from gateway.update_notifications import locked_update_marker, read_pending, same_update
         with locked_update_marker(paths.pending.parent):
             current = read_pending(paths.pending.parent)
@@ -1099,7 +1113,7 @@ class GatewayNotificationsMixin(
         flag = phase + "_notified"
         if pending.get(flag):
             return True
-        if float(pending.get("notice_retry_at", 0)) > datetime.now(timezone.utc).timestamp():
+        if float(pending.get("notice_retry_at", 0)) > datetime.now(UTC).timestamp():
             return False
         if phase == "restarting":
             heading = "🔄 Restarting"
@@ -1175,7 +1189,7 @@ class GatewayNotificationsMixin(
                 return False
             legacy_marker = pending.get("notification_version") != 2
             if (not legacy_marker and target is not None and
-                    float(pending.get("notice_retry_at", 0)) > datetime.now(timezone.utc).timestamp()):
+                    float(pending.get("notice_retry_at", 0)) > datetime.now(UTC).timestamp()):
                 return False
             outcome = final_outcome(paths.pending.parent, pending)
             if outcome is None:
@@ -1224,7 +1238,7 @@ class GatewayNotificationsMixin(
             if success:
                 heading, detail = self._update_result_heading(paths.pending.parent, pending, 0)
             else:
-                heading, detail = "❌ Update Failed", detail
+                heading = "❌ Update Failed"
             detail = _bounded_previous_update_detail(detail, pending)
             text = _bounded_update_notice(notice(heading, pending, detail))
             result = await target.send(ContextNotice(text) if success else text)
@@ -1598,7 +1612,7 @@ class GatewayNotificationsMixin(
             fail = "Async delegation delivery persist failed for session %s: %s"
             # This route is persist-only: the client owns the next model turn, so
             # keep the durable row's content exactly as produced.
-            deliver = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)  # noqa: E731
+            deliver = lambda: persist_delegation_delivery(adapter, text=synth_text, session_id=raw_sid, evt=evt)
         else:
             info = "Watch pattern notification — waking api_server session %s via self-post"
             fail = "Watch notification self-post wake failed for session %s: %s"
@@ -1653,21 +1667,33 @@ class GatewayNotificationsMixin(
         Platform.RELAY adapter fronts N logical platforms; native wins), literal ``p.value`` scan as
         fallback for minimal runner stubs / exotic platform strings when the resolver can't run."""
         from gateway.delivery import resolve_delivery_transport
+        from gateway.session_detached import detached_route_of
+        if detached_route_of(source):  # an old conversation's app viewers (gateway/session_detached.py)
+            return self._delivery_adapter_for(source)
         if source is not None:
             owner = self._transport_owner(source)
             if owner is not None:
                 return owner[0]
             if getattr(source, "delivered_via_upstream_relay", False) is True:
                 return self.adapters.get(Platform.RELAY)
-        # One resolver with authz/kanban/cron: a secondary's own map, or the primary's for a
-        # shared-bot satellite; a disconnected secondary fails closed to ``{}``.
-        adapters = self._adapters_for_profile(getattr(source, "profile", None))
+        # A pinned identity names the bot that received the conversation: it answers, as
+        # ``_delivery_adapter_for`` rules (a ``bot_profile`` route's runtime may own no adapter for this
+        # platform, #139726). Otherwise one resolver with authz/kanban/cron: a secondary's own map, or the
+        # primary's for a shared-bot satellite; a disconnected bot fails closed to ``{}``.
+        from gateway.session_identity import identity_of
+        identity = identity_of(source)
+        pinned = (identity is not None and identity.multiplexed and not identity.transport_inferred
+                  and self._restored_transport_trusted(source, identity))
+        adapters = self._adapters_for_profile(
+            identity.transport_profile if pinned else getattr(source, "profile", None))
         try:
             _transport = resolve_delivery_transport(Platform(platform_name), self.config, adapters)
         except Exception:
             _transport = None
         if _transport is not None:
             return _transport.adapter
+        if not pinned and source is not None and (borrowed := self._routed_primary_adapter(source)) is not None:
+            return borrowed
         if source is not None and (relay := self._committed_relay_adapter(source)) is not None:
             return relay
         return next((a for p, a in adapters.items() if p.value == platform_name), None)
@@ -1756,14 +1782,16 @@ class GatewayNotificationsMixin(
         gateway route or a refused notice pinned to a permanently-gone session (``_watch_pin_gone``).
         Not transactional: a crash after acceptance can replay (at-least-once).
         """
+        from gateway.session_detached import follow_detached_pin
         from gateway.session_local_recovery import restore_completion_route
         from gateway.wake import WakeNotAccepted, adapter_supports_push, admit_internal_event
-        restore_completion_route(self, str(evt.get("session_key") or ""))  # watch notices and heartbeats too
+        await restore_completion_route(self, str(evt.get("session_key") or ""))  # watch notices and heartbeats too
         if self._completion_held_by_stop(evt):
             # Retryable, not refused: the event stays queued until the user's next turn.
             if raise_not_accepted:
                 raise WakeNotAccepted("session stopped by the user; holding the wake")
             return False
+        queued, evt = evt, await follow_detached_pin(self, evt)  # the drain reads its verdict off *queued*
         source = await asyncio.to_thread(self._build_process_event_source, evt)
         if not source:
             # API-server sessions bind the RAW X-Hermes-Session-Id key, not a structured ``agent:...`` key.
@@ -1898,7 +1926,7 @@ class GatewayNotificationsMixin(
             if pin_gone and not raise_not_accepted:
                 return None
             if not raise_not_accepted:
-                evt["_refusal_permanent"] = exc.permanent  # the drain counts only permanent refusals
+                queued["_refusal_permanent"] = exc.permanent  # the drain counts only permanent refusals
             from gateway.session_refusals import log_internal_refusal
             cause = exc.__cause__
             log_internal_refusal(self, source, exc.reason or str(exc), getattr(cause, 'field', None))
@@ -1910,1085 +1938,8 @@ class GatewayNotificationsMixin(
             logger.error("Watch notification injection error: %s", e)
             return False
 
-    def _completion_held_by_stop(self, evt: dict) -> bool:
-        """True while the event's session is stopped (``/stop``) and the user has not sent a turn."""
-        metadata_key = ""
-        with suppress(Exception):
-            metadata_key = str((evt.get("metadata") or {}).get("gateway_session_key") or "")
-        return self._user_stop_latched(str(evt.get("session_key") or "").strip(), metadata_key.strip())
-
-    @staticmethod
-    def _completion_delivery_identity(evt: dict) -> Optional[tuple[str, str, object]]:
-        """Return a producer-stable identity when one is available.
-
-        Delegation UUIDs identify one producer completion. Process session IDs include the
-        persisted spawn epoch so a reused ID is a distinct incarnation; legacy events without
-        ``started_at`` are delivered undeduplicated rather than risk suppressing a real completion.
-        """
-        evt_type = str(evt.get("type") or "")
-        if evt_type in {"delegation_retry", "delegation_auto_resume"}:
-            producer_id = str(evt.get("delegation_id") or "").strip()
-            claim = (str(evt.get("retry_notice_claim") or "").strip()
-                     if evt_type == "delegation_retry" else "boot")
-            if not producer_id or not claim:
-                return None
-            return (evt_type, producer_id, claim)
-        if evt_type == "async_delegation":
-            producer_id = str(evt.get("delegation_id") or "")
-            if not producer_id:
-                return None
-            if evt.get("task_failure_notice"):
-                # An interim per-task notice is its own producer event: it must not mark the
-                # batch's final result as already delivered, nor a sibling's notice.
-                task_idx = ((evt.get("results") or [{}])[0] or {}).get("task_index", "")
-                return (evt_type, producer_id, f"task_failure:{task_idx}")
-            return (evt_type, producer_id, "")
-        # A liveness tick is one watch event like a match: without an identity the session authority
-        # refuses it and the drain requeues it forever.
-        if evt_type in {"watch_match", "watch_disabled", "heartbeat"} and evt.get("event_id"):
-            return (evt_type, str(evt["session_id"]), str(evt["event_id"]))
-        if evt_type == "completion":
-            producer_id = str(evt.get("session_id") or "")
-            started_at = evt.get("started_at")
-            if producer_id and started_at is not None:
-                return (evt_type, producer_id, started_at)
-        return None
-
-    def _mark_completions_delivered_locked(self, identities) -> None:
-        """Move identities inflight -> delivered and trim retention. Caller holds ``_completion_delivery_lock``."""
-        for identity in identities:
-            self._completion_deliveries_inflight.discard(identity)
-            self._completion_deliveries_delivered[identity] = None
-        while len(self._completion_deliveries_delivered) > self._completion_delivery_retention:
-            self._completion_deliveries_delivered.popitem(last=False)
-
-    def _completion_identity_state(self, identity, *, claim: bool = False) -> str | None:
-        """``"delivered"`` (admitted earlier this gateway lifecycle), ``"inflight"`` (another delivery
-        holds it), else ``None``. With ``claim`` an unseen identity is atomically marked inflight under
-        the same lock hold and ``"claimed"`` is returned, so two callers never both own it."""
-        with self._completion_delivery_lock:
-            if identity in self._completion_deliveries_delivered:
-                return "delivered"
-            if identity in self._completion_deliveries_inflight:
-                return "inflight"
-            if claim:
-                self._completion_deliveries_inflight.add(identity)
-            return "claimed" if claim else None
-
     # Ledger transitions write state.db: run them off the loop (see ``gateway.run_notifications_ledger``).
     _settle_durable_claim = staticmethod(settle_durable_claim)
-
-    async def _settle_durable_claims(self, operations, *, on_settled=None) -> bool:
-        return await settle_durable_claims(operations, self._settle_durable_claim, on_settled=on_settled)
-
-    async def _drop_completion_claim(self, claim, reason: str) -> None:
-        # Mark FIRST: cancellation must not release a claim whose shielded drop is still running.
-        claim.proceed, claim.settled = False, True
-        if await self._settle_durable_claims([("drop", claim.delegation_id, claim.claim_id)]) is False:
-            claim.settled, claim.defer, claim.early_result = False, True, False
-        else:
-            logger.warning("Dropping async delegation %s: %s (result remains queryable).",
-                           claim.delegation_id or "<legacy>", reason)
-
-    async def _completion_delivery_ready(self, evt: dict) -> Optional[bool]:
-        """True: routable, False: retry, None: no route exists to recover.
-
-        Unavailable owners/transports must not spend a durable delivery attempt.
-        """
-        from gateway.wake import adapter_supports_push
-
-        parent_session_id = str(evt.get("parent_session_id") or "").strip()
-        if parent_session_id:
-            verdict = await self._classify_completion_target(parent_session_id, str(evt.get("session_key") or ""))
-            if verdict != "deliver":
-                # Definitively closed targets still need the normal terminal disposition.
-                return verdict == "terminal"
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
-        if source is not None:
-            platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-            adapter = self._resolve_injection_adapter(platform, source)
-        else:
-            raw_sid = _raw_process_event_session_id(evt)
-            profile = str(evt.get("profile") or "").strip() or None
-            adapters = self._adapters_for_profile(profile)
-            adapter = adapters.get(Platform.API_SERVER) if raw_sid else None
-            if adapter is not None and adapter_supports_push(adapter):
-                return False
-            if not raw_sid and not any(str(evt.get(key) or "").strip() for key in (
-                "session_key", "parent_session_id", "platform", "chat_id", "user_id",
-            )):
-                return None
-        if adapter is None:
-            return False
-        if not adapter_supports_push(adapter):
-            ensure = getattr(adapter, "_ensure_session_db", None)
-            try:
-                if not callable(ensure) or await asyncio.to_thread(ensure) is None:
-                    return False
-            except Exception:
-                logger.debug("Async-completion delivery DB unavailable", exc_info=True)
-                return False
-        return True
-
-    async def _preflight_completion_delivery(self, evt: dict, claim=None) -> "_CompletionClaim":
-        """Claim the durable row (async delegations) and verify the target before adapter acceptance.
-
-        Adapter acceptance is not proof of delivery: the inner resolver can still fail closed inside
-        the pipeline after acceptance, falsely acking the durable row. Verifying first gives drops an
-        honest durable disposition. ``claim`` is the caller's record, filled in place so the caller's
-        cleanup sees a claim taken before a cancellation interrupts the pre-flight.
-        """
-        claim = self._CompletionClaim() if claim is None else claim
-        evt_type = evt.get("type")
-        readiness = await self._completion_delivery_ready(evt) if evt_type == "async_delegation" else True
-        if readiness is False:
-            claim.proceed, claim.early_result = False, False
-            return claim
-        terminal_reason = "no messaging route or raw API session" if readiness is None else ""
-        # Every tagged async event owns its delivery identity. Outbox events (interim notices and
-        # terminal fallbacks) must claim that exact event row; legacy untagged finals retain their
-        # delegation lifecycle-row claim for compatibility. An untagged legacy interim notice returns
-        # an empty claim and remains process-local, as it predates durable outbox delivery.
-        if evt_type == "async_delegation":
-            claim.delegation_id = str(evt.get("delegation_id") or "")
-            if claim.delegation_id:
-                try:
-                    from tools.async_delegation import claim_event_delivery, defer_completion_delivery
-                    claim_id = f"gateway:{id(self)}:{__import__('uuid').uuid4().hex}"
-                    def _defer_claim(token):
-                        if token:
-                            defer_completion_delivery(claim.delegation_id, token)
-                    claimed = await claim_off_loop(
-                        lambda: claim_event_delivery(evt, claim_id),
-                        _defer_claim,
-                    )
-                    if claimed is None:
-                        claim.proceed = False
-                        return claim
-                    # Empty tokens are the compatibility result for legacy in-memory notices; only
-                    # a real claim needs durable settlement in the caller's finally block.
-                    claim.claim_id = claimed or ""
-                except Exception as exc:
-                    logger.warning("Could not claim durable async completion %s: %s", claim.delegation_id, exc)
-                    claim.proceed, claim.early_result = False, False
-                    return claim
-        elif evt_type != "completion":
-            return claim
-        # Background completions carry only session_key, so after /new the OLD session's notification
-        # would land in the NEW one. Stamped events get the async-delegation pre-flight; unstamped deliver.
-        if terminal_reason:
-            await self._drop_completion_claim(claim, terminal_reason)
-            return claim
-        parent_session_id = str(evt.get("parent_session_id") or "").strip()
-        if not parent_session_id:
-            return claim
-        # Pre-flight (#65838-class): adapter acceptance is NOT proof of delivery — the inner #55578 resolver
-        # can still fail closed inside the message pipeline AFTER the adapter accepted, which would falsely
-        # acknowledge the durable row as delivered. Verify the target here, before acceptance, and give
-        # drops an honest durable disposition.
-        verdict, claim.owner_session_id, claim.proven_session_id = await self._classify_completion_owner(
-            parent_session_id, str(evt.get("session_key") or ""))
-        if verdict == "terminal":
-            if evt_type == "async_delegation":
-                await self._drop_completion_claim(claim, f"permanently-gone session {parent_session_id}")
-            else:
-                logger.warning(
-                    "Background process %s completion targets "
-                    "permanently-gone session %s (user boundary such as "
-                    "/new); dropping notification (output remains available via process(action='log')).",
-                    evt.get("session_id") or "<unknown>", parent_session_id,
-                )
-            claim.proceed = False
-        elif verdict == "retry":
-            # Transient uncertainty before admission: re-poll without spending a delivery attempt.
-            claim.proceed, claim.early_result, claim.defer = False, False, True
-        return claim
-
-    @contextlib.asynccontextmanager
-    async def _completion_event_scope(self, evt: dict):
-        # Scope setup reads the routing store too; entering the context itself must
-        # stay on-loop so the target profile's contextvars cover the awaited body.
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
-        async with self._completion_event_context(evt, source):
-            yield
-
-    def _completion_event_context(self, evt: dict, source):
-        """Profile runtime scope of the session a completion event targets (a no-op context when the
-        event is the default profile's or the scope is already installed).
-
-        The pre-flight (``_classify_completion_target`` → ``_session_db``) and every durable-ledger op
-        (``tools.async_delegation`` → ``get_hermes_home()/state.db``) resolve from the ambient scope.
-        The supervised ``_async_delegation_watcher`` and startup-recovered process watchers run under
-        the ROOT scope, so a secondary profile's completion was looked up in the DEFAULT profile's
-        state.db — classified ``terminal`` and dropped, its ledger row stranded ``pending`` forever."""
-        from gateway.run import _async_profile_runtime_scope
-        from hermes_constants import get_hermes_home_override
-        profile_name = getattr(source, "profile", None) if source is not None else None
-        profile_name = str(profile_name or evt.get("profile") or "").strip() or None
-        if source is None and profile_name and profile_name != "default":
-            try:
-                from hermes_cli.profiles import get_profile_dir, profile_exists
-                if profile_exists(profile_name):
-                    profile_home = get_profile_dir(profile_name)
-                else:
-                    logger.warning("Completion event references unknown profile %r; leaving ambient scope", profile_name)
-                    return contextlib.nullcontext()
-            except Exception:
-                logger.warning("Could not resolve completion event profile %r", profile_name, exc_info=True)
-                return contextlib.nullcontext()
-        elif source is None or not profile_name:
-            raw_sid = _raw_process_event_session_id(evt)
-            if raw_sid and getattr(getattr(self, "config", None), "multiplex_profiles", False):
-                return self._served_api_server_event_scope(evt, raw_sid)
-            from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
-            return async_launch_profile_scope_if_multiplexed()
-        else:
-            profile_home = self._resolve_profile_home_for_source(source)
-        if get_hermes_home_override() == str(profile_home):
-            return contextlib.nullcontext()  # already inside this profile's scope
-        return _async_profile_runtime_scope(profile_home)
-
-    @contextlib.asynccontextmanager
-    async def _served_api_server_event_scope(self, evt: dict, raw_sid: str):
-        """Scope of the served profile whose own store holds a raw api_server session (its events name no
-        profile), else the launch profile's, as for any unrouted event."""
-        from gateway.run import _async_profile_runtime_scope
-        from tui_gateway.launch_profile_policy import async_launch_profile_scope_if_multiplexed
-        served = await asyncio.to_thread(self._served_api_server_wake_profile, evt, raw_sid)
-        if served:
-            source = SessionSource(platform=Platform.API_SERVER, chat_id=raw_sid, profile=served)
-            scope = _async_profile_runtime_scope(self._resolve_profile_home_for_source(source))
-        else:
-            scope = async_launch_profile_scope_if_multiplexed()
-        async with scope:
-            yield
-
-    async def _deliver_completion_notification(
-        self, synth_text: str, evt: dict, *, sibling_claims=(), cleanup_state=None,
-    ) -> Optional[bool]:
-        """Acknowledge one admitted batch, refund refusals, or release failed deliveries.
-
-        True means adapter admission, not model execution; None means deduplicated or
-        terminal. False remains retryable. Claims are settled together for every sibling.
-        """
-        async with self._completion_event_scope(evt):
-            return await self._deliver_completion_notification_scoped(
-                synth_text, evt, sibling_claims=sibling_claims, cleanup_state=cleanup_state)
-
-    async def _deliver_completion_notification_scoped(
-        self, synth_text: str, evt: dict, *, sibling_claims=(), cleanup_state=None,
-    ) -> Optional[bool]:
-        from gateway.session_local_recovery import restore_completion_route
-        from gateway.wake import WakeNotAccepted
-        from tools.process_registry_notifications import should_surface_notification
-        if not should_surface_notification(evt):
-            return None  # Suppressed noise is terminal, not a consumed process result.
-        if cleanup_state is not None:
-            # Transfer responsibility synchronously, before the first await. If cancellation is
-            # delivered before this coroutine starts, the batching caller still owns the claims.
-            cleanup_state["owner"] = "delivery"
-        restore_completion_route(self, str(evt.get("session_key") or ""))
-        if self._completion_held_by_stop(evt):
-            # Before the primary's durable claim, so holding spends no delivery attempt; refund any
-            # sibling the batch already claimed so it is not stranded until its lease expires.
-            await self._settle_durable_claims(
-                [("defer", sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims])
-            return False
-        identity = self._completion_delivery_identity(evt)
-        claim = self._CompletionClaim()
-        accepted = identity_claimed = refused = cancelled = False
-        ack_claims: list[tuple[str, str]] = []
-        try:
-            claim = await self._preflight_completion_delivery(evt, claim)
-            if not claim.proceed:
-                return claim.early_result
-            if getattr(self, 'session_authority', None) is not None:
-                from gateway.session_automation import completion_admission
-                if await asyncio.to_thread(completion_admission, self, evt) is not None:
-                    accepted = True  # Lost ACK: finish durable claims, never infer again.
-                    return True
-            if identity is not None:
-                if self._completion_identity_state(identity, claim=True) != "claimed":
-                    return None
-                identity_claimed = True
-            if claim.owner_session_id:
-                # Admission settles the durable claim, so the resolver starts from the owner proven here.
-                evt = {**evt, "parent_session_id": claim.owner_session_id,
-                       "proven_session_id": claim.proven_session_id}
-            # The rows this admission settles: a turn that cannot confirm the owner offers them again.
-            completion_ids = [claim.delegation_id] if claim.claim_id else []
-            completion_ids += [sibling["delegation_id"] for sibling, claim_id in sibling_claims if claim_id]
-            evt = {**evt, "completion_ids": completion_ids}
-            # Publish the admission claims before the turn can start; it may resolve ownership while
-            # the acknowledgement below is still in flight (see ``_requeue_uncertain_completion``).
-            ack_claims = [(claim.delegation_id, claim.claim_id)] if claim.claim_id else []
-            ack_claims += [(sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims if claim_id]
-            with self._completion_delivery_lock:
-                self._pending_completion_acks().update(ack_claims)
-            injection_result = await self._inject_watch_notification(synth_text, evt, raise_not_accepted=True)
-            if injection_result is not True:
-                return injection_result
-            accepted = True
-            # Before the awaited acknowledgement: a turn that requeues meanwhile must find these
-            # marks to clear, not have them restored after it ran.
-            if identity is not None:
-                with self._completion_delivery_lock:
-                    self._mark_completions_delivered_locked((identity,))
-            if sibling_claims:
-                self._record_coalesced_completion_siblings([event for event, _claim_id in sibling_claims])
-            return True
-        except asyncio.CancelledError:
-            # Cancellation is a shutdown/retry boundary, not a failed delivery. Refund every
-            # claim taken by this delivery so repeated shutdowns cannot spend sibling attempts.
-            cancelled = True
-            raise
-        except WakeNotAccepted as exc:
-            # A proven-permanent refusal spends its durable attempt, so the row converges to
-            # ``dropped`` across restarts too (#141153); any other (restart wait, full FIFO, an owner
-            # not yet proven) is refunded and never drops a completion the owner will take later.
-            refused = not exc.permanent
-            return False
-        finally:
-            if identity_claimed and not accepted:
-                with self._completion_delivery_lock:
-                    self._completion_deliveries_inflight.discard(identity)
-            operations = []
-            operation = "complete" if accepted else "defer" if refused or cancelled or claim.defer else "release"
-            if not claim.settled:
-                operations.append((operation, claim.delegation_id, claim.claim_id))
-            # A primary that never proceeds past pre-flight with no result (its claim was lost, or it
-            # was dropped) makes the batching caller requeue every sibling unattempted: refund their
-            # attempts. Siblings of an attempted delivery keep the ordinary failed-delivery release.
-            sibling_operation = operation
-            if not accepted and not claim.proceed and claim.early_result is None:
-                sibling_operation = "defer"
-            operations.extend(
-                (sibling_operation, sibling["delegation_id"], claim_id) for sibling, claim_id in sibling_claims
-            )
-            # Unpublish only once the settle worker has actually finished: cancellation of this
-            # coroutine must not orphan an acknowledgement that is still running, or an owner
-            # retry meanwhile would lose the claim it needs to reopen the pending row.
-            if not ack_claims:
-                await self._settle_durable_claims(operations)
-            else:
-                await self._settle_durable_claims(
-                    operations, on_settled=lambda: self._unpublish_completion_acks(ack_claims))
-
-    async def _flush_process_completion_batch(
-        self, key: tuple[str, ...], delay: float, release: asyncio.Event,
-    ) -> None:
-        """Deliver one route's held completions as one turn and resolve every waiter."""
-        current_task = asyncio.current_task()
-        tasks, releases = self._completion_notification_batch_tasks, self._completion_notification_batch_releases
-        entries: list[tuple[str, dict, asyncio.Future]] = []
-        claimed_identities: list = []
-        delivered: Optional[bool] = False
-        try:
-            await self._wait_batch_window(delay, release)
-            entries = self._completion_notification_batches.pop(key, [])
-            # Detach before delivery so a completion arriving mid-flight can schedule the next flush.
-            self._detach_batch_flush(tasks, releases, key, current_task, release)
-            # The agent may have read a held result with process(wait/log) during the window: that
-            # consumed it, so it no longer wakes anyone (the watcher's own pre-enqueue rule).
-            from tools.process_registry import process_registry
-            consumed = [e for e in entries if process_registry.is_completion_consumed(str(e[1].get("session_id") or ""))]
-            if consumed:
-                self._settle_batch_waiters(consumed, None)
-                entries = [e for e in entries if e not in consumed]
-            # Claim every identity, primary included, before the slow delivery: a copy arriving meanwhile
-            # is deduplicated, and an already-delivered one (True) never stands in for a fresh sibling.
-            for entry in list(entries):
-                identity = self._completion_delivery_identity(entry[1])
-                if identity is None:
-                    continue
-                identity_state = self._completion_identity_state(identity, claim=True)
-                if identity_state != "claimed":
-                    self._settle_batch_waiters([entry], True if identity_state == "delivered" else None)
-                    entries.remove(entry)
-                else:
-                    claimed_identities.append(identity)
-            if not entries:
-                return
-            synth_text = entries[0][0] if len(entries) == 1 else self._format_coalesced_process_completions(entries)
-            # None is now a terminal/routeless carrier, not a delivered duplicate: try the next entry.
-            delivered = None
-            for _text, candidate_evt, _future in entries:
-                candidate_identity = self._completion_delivery_identity(candidate_evt)
-                if candidate_identity in claimed_identities:
-                    # Promoted to carrier: it claims its own identity in the delivery seam.
-                    claimed_identities.remove(candidate_identity)
-                    with self._completion_delivery_lock:
-                        self._completion_deliveries_inflight.discard(candidate_identity)
-                delivered = await self._deliver_completion_notification(synth_text, candidate_evt)
-                if delivered is not None:
-                    break
-            if delivered is True:  # only a real adapter admission covers the coalesced siblings
-                self._record_coalesced_completion_siblings([evt for _text, evt, _future in entries])
-        except asyncio.CancelledError:
-            # Shutdown cancellation: recover undetached entries and resolve every waiter as retryable.
-            delivered = False
-            if not entries:
-                entries = self._completion_notification_batches.pop(key, [])
-            raise
-        except Exception:
-            logger.exception("Coalesced process completion delivery failed")
-            delivered = False
-        finally:
-            if claimed_identities and delivered is not True:
-                with self._completion_delivery_lock:
-                    for identity in claimed_identities:
-                        self._completion_deliveries_inflight.discard(identity)
-            # A failure while stopping has no watcher retry left: spool it rather than drop it.
-            if delivered is False and self._completion_notification_batches_stopping:
-                self._preserve_undelivered_batch(entries)
-            # Never strand watcher futures: False = watcher retry path; None = ordinary dedupe result.
-            self._settle_batch_waiters(entries, delivered)
-            self._detach_batch_flush(tasks, releases, key, current_task, release)
-
-    @staticmethod
-    def _settle_batch_waiters(entries, result) -> None:
-        for _text, _evt, future in entries:
-            if not future.done():
-                future.set_result(result)
-
-    def _spool_completion_for_restart(self, synth_text: str, evt: dict) -> bool:
-        """Last resort while stopping: a process completion has no durable copy and its watcher
-        stops retrying, so write its wake straight to the drain spool (replayed on next boot)."""
-        try:
-            source = self._build_process_event_source(evt)
-            if source is None:
-                return False
-            if getattr(source, "message_id", None):
-                from gateway.session_identity import replace_source
-                source = replace_source(source, message_id=None)
-            metadata = {"notification_origin": "process_registry_synthetic"}
-            session_key = str(evt.get("session_key") or "").strip()
-            if session_key.startswith("agent:"):
-                metadata["gateway_session_key"] = session_key
-            if str(evt.get("parent_session_id") or "").strip():
-                metadata["gateway_session_id"] = str(evt["parent_session_id"]).strip()
-            event = MessageEvent(text=_mark_internal_notification(synth_text), message_type=MessageType.TEXT,
-                                 source=source, internal=True, metadata=metadata)
-            return bool(self._preserve_drain_event(self._session_key_for_source(source), event))
-        except Exception:
-            logger.warning("Could not spool completion %s for restart", evt.get("session_id"), exc_info=True)
-            return False
-
-    async def _deliver_completion_while_stopping(self, synth_text: str, evt: dict) -> Optional[bool]:
-        """Teardown has started and the watcher gets no further retries: spool the completion, or
-        when it has no spool form (raw API-server routes) try direct delivery while adapters live."""
-        if self._spool_completion_for_restart(synth_text, evt):
-            return True
-        try:
-            return await self._deliver_completion_notification(synth_text, evt)
-        except Exception:
-            logger.warning("Completion %s could not be delivered during shutdown", evt.get("session_id"), exc_info=True)
-            return False
-
-    def _preserve_undelivered_batch(self, entries) -> None:
-        """Stopping: spool each undelivered entry and settle its waiter; True once preserved."""
-        for synth_text, evt, future in entries:
-            if future.done():
-                continue
-            preserved = self._spool_completion_for_restart(synth_text, evt)
-            if not preserved:
-                logger.error("Background completion %s could not be preserved across shutdown",
-                             evt.get("session_id"))
-            future.set_result(True if preserved else False)
-
-    def _preserve_held_process_completion_batches(self) -> None:
-        """Synchronously spool held process completions when cancellable teardown was interrupted."""
-        self._ensure_completion_batch_state()
-        self._completion_notification_batches_stopping = True
-        for release in self._completion_notification_batch_releases.values():
-            release.set()
-        for entries in list(self._completion_notification_batches.values()):
-            self._preserve_undelivered_batch(entries)
-        self._completion_notification_batches.clear()
-
-    @staticmethod
-    def _requeue_completion_events(events: list[dict]) -> None:
-        from tools.process_registry import process_registry
-        for evt in events:
-            process_registry.completion_queue.put(evt)
-
-    async def _cancel_process_completion_batch_tasks(self) -> None:
-        """Before adapter teardown: release every held batch for delivery now, then settle the rest.
-
-        Process completions have no durable copy, so a held batch is delivered (into the drain
-        spool while stopping) rather than cancelled. Delegation rows stay pending in their ledger
-        and are requeued if their flush cannot finish within the bound.
-        """
-        self._ensure_completion_batch_state()
-        self._completion_notification_batches_stopping = True
-        for releases in (self._completion_notification_batch_releases, self._async_delegation_batch_releases):
-            for release in list(releases.values()):
-                release.set()
-        tasks = {
-            task for task in (self._completion_notification_batch_flush_tasks
-                              | self._async_delegation_batch_flush_tasks)
-            if not task.done()
-        }
-        if tasks:
-            _done, stuck = await asyncio.wait(tasks, timeout=self._COMPLETION_SHUTDOWN_FLUSH_S)
-            for task in stuck:
-                task.cancel()
-            if stuck:
-                await asyncio.gather(*stuck, return_exceptions=True)
-        # Defensive cleanup for an orphaned queue with no live flush task.
-        for entries in self._completion_notification_batches.values():
-            self._preserve_undelivered_batch(entries)
-        for group in self._async_delegation_batches.values():
-            self._requeue_completion_events(group)
-        for attr in ("_completion_notification_batches", "_completion_notification_batch_tasks",
-                     "_completion_notification_batch_releases", "_completion_notification_batch_flush_tasks",
-                     "_async_delegation_batches", "_async_delegation_batch_tasks",
-                     "_async_delegation_batch_releases", "_async_delegation_batch_flush_tasks"):
-            getattr(self, attr).clear()
-
-    async def _enqueue_process_completion_notification(
-        self, synth_text: str, evt: dict, *, session_busy: bool = False,
-    ) -> Optional[bool]:
-        """Fan in one conversation's completions; hold routine successes per the batch window."""
-        # Filter each event before it can contaminate (or suppress) a foreground batch.
-        # The shared queue may be drained outside the owning profile's runtime scope.
-        async with self._completion_event_scope(evt):
-            from tools.process_registry_notifications import should_surface_notification
-            if not should_surface_notification(evt):
-                return None
-        self._ensure_completion_batch_state()
-        if self._completion_notification_batches_stopping:
-            return await self._deliver_completion_while_stopping(synth_text, evt)
-        hold = await self._completion_hold_seconds(evt, session_busy=session_busy)
-        if self._completion_notification_batches_stopping:
-            return await self._deliver_completion_while_stopping(synth_text, evt)
-        if hold <= 0:
-            self._release_held_completions(str(evt.get("session_key") or ""))
-        # A route key alone is not ownership: /new can leave old and new pins
-        # in the same queue. Never settle one pin on another pin's acceptance.
-        key = self._event_route_key(
-            evt, (*self._COMPLETION_BATCH_KEY_FIELDS, "parent_session_id", "origin_session_id"),
-        )
-        future = asyncio.get_running_loop().create_future()
-        self._completion_notification_batches.setdefault(key, []).append((synth_text, evt, future))
-        self._schedule_batch_flush(
-            self._completion_notification_batch_tasks, self._completion_notification_batch_releases,
-            self._completion_notification_batch_flush_tasks, key, hold, self._flush_process_completion_batch,
-        )
-        return await future
-
-    def _enrich_async_delegation_routing(self, evt: dict) -> None:
-        """Fill platform/chat_id/thread_id/chat_type on an async-delegation event.
-
-        Such events only carry ``session_key`` (the daemon worker lacks per-message routing
-        metadata). Best-effort: a CLI-origin event (empty session_key) is left as-is and won't route.
-        """
-        from gateway.run import _parse_session_key
-        if evt.get("platform"):
-            return  # already enriched
-        parsed = _parse_session_key(evt.get("session_key", "") or "")
-        if not parsed:
-            return
-        evt["platform"] = parsed.get("platform", "")
-        evt["chat_type"] = parsed.get("chat_type", "")
-        evt["chat_id"] = parsed.get("chat_id", "")
-        if parsed.get("thread_id"):
-            evt["thread_id"] = parsed["thread_id"]
-
-    async def _flush_async_delegation_batch(
-        self, key: tuple[str, ...], delay: float, release: asyncio.Event,
-    ) -> None:
-        """Deliver one route's held delegation results as one turn; requeue them on failure."""
-        current_task = asyncio.current_task()
-        tasks, releases = self._async_delegation_batch_tasks, self._async_delegation_batch_releases
-        group: list[dict] = []
-        try:
-            await self._wait_batch_window(delay, release)
-            group = self._async_delegation_batches.pop(key, [])
-            self._detach_batch_flush(tasks, releases, key, current_task, release)
-            if group and await self._deliver_async_delegation_group(group) is False:
-                self._requeue_completion_events(group)
-        except asyncio.CancelledError:
-            self._requeue_completion_events(group or self._async_delegation_batches.pop(key, []))
-            raise
-        except Exception:
-            logger.exception("Coalesced async delegation delivery failed")
-            self._requeue_completion_events(group or self._async_delegation_batches.pop(key, []))
-        finally:
-            self._detach_batch_flush(tasks, releases, key, current_task, release)
-
-    async def _enqueue_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
-        """Deliver a same-tick group now, or hold routine results per the batch window.
-
-        True while held: the rows stay unclaimed and pending in the durable ledger until delivery.
-        """
-        self._ensure_completion_batch_state()
-        if self._completion_notification_batches_stopping:
-            return False
-        hold = min([await self._completion_hold_seconds(evt) for evt in group] or [0.0])
-        key = self._event_route_key(group[0], self._ASYNC_GROUP_KEY_FIELDS)
-        if hold <= 0:
-            self._release_held_completions(str(group[0].get("session_key") or ""))
-        if hold <= 0 and key not in self._async_delegation_batch_tasks:
-            return await self._deliver_async_delegation_group(group)
-        self._async_delegation_batches.setdefault(key, []).extend(group)
-        self._schedule_batch_flush(
-            self._async_delegation_batch_tasks, self._async_delegation_batch_releases,
-            self._async_delegation_batch_flush_tasks, key, hold, self._flush_async_delegation_batch,
-        )
-        return True
-
-    async def _deliver_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
-        """Deliver a same-session batch of async completions as ONE turn: the primary carries the
-        consolidated text of every sibling THIS runner claimed (siblings owned elsewhere are excluded;
-        their claims are acked only after adapter acceptance). True after acceptance, False to requeue
-        the group, None when nothing is deliverable here (retry siblings requeued)."""
-        # The group shares one session_key, hence one profile: scope the pre-checks and sibling claims too.
-        # A retirement can move a subset while this batch waits. Re-resolve the
-        # durable routes and regroup before taking any delivery claim.
-        from tools.async_delegation import refresh_retirement_route
-        buckets = {}
-        for evt in group:
-            async with self._completion_event_scope(evt):
-                await asyncio.to_thread(refresh_retirement_route, evt)
-            self._enrich_async_delegation_routing(evt)
-            route = self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS)
-            buckets.setdefault(route, []).append(evt)
-        if len(buckets) > 1:
-            retry = []
-            for subgroup in buckets.values():
-                async with self._completion_event_scope(subgroup[0]):
-                    result = await self._deliver_async_delegation_group_scoped(subgroup)
-                if result is False:
-                    retry.extend(subgroup)
-            group[:] = retry
-            return False if retry else True
-        original = list(group)
-        async with self._completion_event_scope(group[0]):
-            outcome = await self._deliver_async_delegation_group_scoped(group)
-        if outcome is not False:
-            group[:] = original  # Only a failed/aborted batch becomes the narrowed retry payload.
-        return outcome
-
-    async def _deliver_completion_with_sibling_cleanup(
-        self, consolidated: str, primary_evt: dict, siblings: list[tuple[dict, str]],
-    ) -> Optional[bool]:
-        sibling_cleanup = {"owner": "batch"}
-        try:
-            # The delivery coroutine takes over the sibling claims once it starts. If shutdown
-            # cancellation lands in the gap before that, this caller still owns and refunds them.
-            return await self._deliver_completion_notification(
-                consolidated, primary_evt, sibling_claims=siblings, cleanup_state=sibling_cleanup,
-            )
-        except asyncio.CancelledError:
-            if sibling_cleanup["owner"] == "batch":
-                await self._settle_durable_claims([
-                    ("defer", event["delegation_id"], claim_id) for event, claim_id in siblings])
-            raise
-
-    async def _deliver_async_delegation_group_scoped(self, group: list[dict]) -> Optional[bool]:
-        from gateway.run import _format_gateway_process_notification
-        from gateway.session_local_recovery import restore_completion_route
-        restore_completion_route(self, str(group[0].get("session_key") or ""))
-        if any(self._completion_held_by_stop(evt) for evt in group):
-            return False  # requeued whole; no sibling claim is taken while the session is stopped
-
-        def forget(evt):
-            group[:] = [pending for pending in group if pending is not evt]
-
-        async def deliver_one(text, evt):
-            outcome = await self._deliver_completion_notification(text, evt)
-            if outcome is not False:
-                forget(evt)
-            return outcome
-
-        # API delivery does not start a model turn, so there is nothing to coalesce.
-        # Keep each unit's stable identity with its row across partial delivery/retry.
-        if group and group[0].get("origin_session_id"):
-            outcomes = []
-            for evt in list(group):
-                text = _format_gateway_process_notification(evt)
-                if text:
-                    outcomes.append(await deliver_one(text, evt))
-                else:
-                    forget(evt)
-            return False if False in outcomes else True
-        deliverable: list[tuple[dict, str]] = []
-        acknowledged = False
-        retry_needed = False
-        for evt in list(group):
-            synth_text = _format_gateway_process_notification(evt)
-            if not synth_text:
-                forget(evt)
-                continue
-            if getattr(self, 'session_authority', None) is not None:
-                from gateway.session_automation import completion_admission
-                if await asyncio.to_thread(completion_admission, self, evt) is not None:
-                    outcome = await deliver_one(synth_text, evt)
-                    acknowledged = outcome is True or acknowledged
-                    retry_needed = outcome is False or retry_needed
-                    continue
-            readiness = await self._completion_delivery_ready(evt)
-            parent = str(evt.get("parent_session_id") or "")
-            if readiness is None or (parent and await self._classify_completion_target(parent, str(evt.get("session_key") or "")) == "terminal"):
-                # Classification is not settlement: a failed claim/drop must stay queued.
-                if await deliver_one(synth_text, evt) is False:
-                    retry_needed = True
-                continue
-            identity = self._completion_delivery_identity(evt)
-            if identity is not None and self._completion_identity_state(identity):
-                forget(evt)
-                continue
-            deliverable.append((evt, synth_text))
-        if not deliverable:
-            return False if retry_needed else (True if acknowledged else None)
-        if len(deliverable) == 1:
-            evt, synth_text = deliverable[0]
-            outcome = await deliver_one(synth_text, evt)
-            return False if retry_needed else outcome
-        # Check the entire group before claiming ANY row: an unavailable sibling must
-        # not exhaust its budget just because the primary has a usable route.
-        for evt, _text in deliverable:
-            if await self._completion_delivery_ready(evt) is False:
-                return False
-        primary_evt, primary_text = deliverable[0]
-        claimed = await claim_siblings_off_loop(deliverable[1:], f"gateway-batch:{id(self)}")
-        blocks = [primary_text]
-        siblings: list[tuple[dict, str]] = []
-        unclaimed: list[dict] = []
-        for evt, synth_text, claim_id in claimed:
-            if claim_id is None:
-                # Another consumer owns this row, or its ownership is unproven: keep it out of our text so
-                # it is never double-injected. It stays in a failed batch's retry payload only.
-                unclaimed.append(evt)
-                continue
-            siblings.append((evt, claim_id))
-            blocks.append(synth_text)
-        if not siblings:
-            outcome = await deliver_one(primary_text, primary_evt)
-            if outcome is not False:
-                for evt in unclaimed:
-                    forget(evt)
-            return False if retry_needed or group else outcome
-        from tools.process_registry_notifications import PROCESS_NOTICE_OPEN
-        header = (
-            f"{PROCESS_NOTICE_OPEN}{len(blocks)} background subagent delegations "
-            "completed for this session. Treat these results as one "
-            "completion batch and send at most one consolidated user-facing "
-            "response. If a result does not change the current conclusion, absorb it silently.]"
-        )
-        consolidated = "\n\n".join([header, *blocks])
-        admission_evt = primary_evt
-        if getattr(self, 'session_authority', None) is not None:
-            from gateway.session_automation import producer_identity
-            admission_evt = dict(primary_evt, _automation_identities=[
-                producer_identity(self, event) for event in [primary_evt, *(e for e, _ in siblings)]])
-        delivered = await self._deliver_completion_with_sibling_cleanup(consolidated, admission_evt, siblings)
-        if delivered is not False:
-            forget(primary_evt)
-            for evt in unclaimed:
-                forget(evt)
-            if delivered is True:
-                for evt, _claim_id in siblings:
-                    forget(evt)
-            # A dropped/owned primary refunded its unadmitted siblings in the delivery finally.
-            # The watcher requeues only the remaining group, never an already-settled sibling.
-        return False if group else delivered
-
-    def _restore_secondary_completion_ledgers(self, profile_homes) -> None:
-        """Re-queue undelivered async completions from every SECONDARY profile's ledger. The process
-        registry's ``restore_completions()`` covers only the launch profile's ``state.db``; a
-        secondary's rows would otherwise never be replayed after a restart."""
-        from tools.async_delegation import restore_undelivered_completions
-        from tools.process_registry import process_registry as _pr
-        self._each_secondary_ledger(profile_homes, lambda: restore_undelivered_completions(_pr.completion_queue),
-                                    "Restored")
-
-    def _sweep_orphaned_completion_ledgers(self) -> None:
-        """Offer completions whose owner process died while this gateway runs (#97202): the launch
-        ledger in the launch scope, each served secondary under its own. Startup replay only covers
-        owners that were already gone when the gateway started."""
-        from tools.async_delegation import sweep_orphaned_completions
-        from tools.process_registry import process_registry as _pr
-        sweep = lambda: sweep_orphaned_completions(_pr.completion_queue)
-        with _log_suppressed(logging.DEBUG, "Orphaned async completion sweep failed: %s"):
-            if count := sweep():
-                logger.info("Re-offered %d orphaned async completion(s)", count)
-        self._each_secondary_ledger((getattr(self, "_served_profile_homes", None) or {}).items(), sweep,
-                                    "Re-offered orphaned")
-
-    def _each_secondary_ledger(self, profile_homes, fn, verb: str) -> None:
-        """Run ``fn`` (returns a completion count) once per SECONDARY profile, bound to that profile."""
-        from gateway.run import _profile_runtime_scope
-        primary = getattr(self, "_primary_profile_name", None)
-        for profile_name, profile_home in profile_homes:
-            if profile_name == primary:
-                continue
-            try:
-                with _profile_runtime_scope(Path(profile_home), {}):
-                    count = fn()
-            except Exception:
-                logger.warning("Could not replay async completions for profile %r", profile_name, exc_info=True)
-                continue
-            if count:
-                logger.info("%s %d undelivered async completion(s) for profile %r", verb, count, profile_name)
-
-    def _collect_delegation_retry_actions(self) -> list:
-        """Claim due retry notices / terminal settlements from every served profile's ledger (atomic claims)."""
-        from tools.delegation_resume import sweep_retries
-        from hermes_cli.profiles import get_active_profile_name
-        actions = []
-        with _log_suppressed(logging.WARNING, "Delegation retry sweep failed: %s"):
-            primary = get_active_profile_name() or "default"
-            actions += [{**a, "profile": primary} for a in sweep_retries()]
-        profile_homes = (getattr(self, "_served_profile_homes", None) or {}).items()
-
-        def _one(name):
-            found = sweep_retries()
-            actions.extend({**a, "profile": name} for a in found)
-            return len(found)
-
-        from gateway.run import _profile_runtime_scope
-        for profile_name, profile_home in profile_homes:
-            if profile_name in {primary, getattr(self, "_primary_profile_name", None)}:
-                continue
-            with _log_suppressed(logging.WARNING, "Delegation retry sweep failed: %s"):
-                with _profile_runtime_scope(Path(profile_home), {}):
-                    _one(profile_name)
-        return actions
-
-    async def _deliver_delegation_retry_action(self, action: dict) -> None:
-        """Settle one claimed retry action. A notice wakes the parent to dispatch the retry. Routine
-        terminal actions settle quietly; only a completed result whose parent session is gone is sent
-        straight to the user's chat, after the live authorization gate."""
-        from tools import delegation_resume as dr
-        delegation_id, claim = action["delegation_id"], action["claim"]
-        async with self._completion_event_scope(action):
-            if not await asyncio.to_thread(dr.retry_action_is_current, action):
-                return  # /stop invalidated this collected action before delivery
-            if action["kind"] == "terminal":
-                from gateway.run import _redact_gateway_user_facing_secrets
-
-                parent_session_id = str(action.get("parent_session_id") or "").strip()
-                if not action.get("text"):
-                    # Routine stops are durable ledger state, not user notifications.
-                    await asyncio.to_thread(dr.mark_terminal_reported, delegation_id, claim)
-                    return
-                # A completed result is user-visible only when no parent conversation can receive it.
-                verdict = (await self._classify_completion_target(parent_session_id, settle_ended_tip=True)
-                           if parent_session_id else "terminal")
-                if verdict != "terminal":
-                    settle = dr.mark_terminal_reported if verdict == "deliver" else dr.release_terminal_report
-                    await asyncio.to_thread(settle, delegation_id, claim)
-                    return
-                sent = suppressed = False
-                try:
-                    source, authorized = await self._authorized_completion_notice_target(action)
-                    suppressed = authorized is None
-                    if source is not None and authorized is True:
-                        # Scrub before any display cut; failure must leave the report owed, never send raw text.
-                        line = _redact_gateway_user_facing_secrets(action["text"])
-                        line = " ".join(line.split())[:360]
-                        sent = await self._deliver_platform_notice(source, line)
-                except Exception:
-                    logger.warning("Delegation %s: undeliverable-result notice send failed", delegation_id, exc_info=True)
-                settle = (dr.suppress_terminal_report if suppressed else
-                          dr.mark_terminal_reported if sent else dr.release_terminal_report)
-                await asyncio.to_thread(settle, delegation_id, claim)
-                if sent:
-                    logger.info("Delegation %s: reported undeliverable result to the user", delegation_id)
-                return
-            parent_session_id = str(action.get("parent_session_id") or "").strip()
-            if parent_session_id and await self._classify_completion_target(parent_session_id) == "terminal":
-                # The owning conversation is gone (/new, closed): nobody can dispatch; settle it terminal.
-                await asyncio.to_thread(dr.mark_retry_terminal, delegation_id, claim,
-                                        "its conversation ended before the retry could run")
-                return
-            accepted = suppressed = False
-            try:
-                # Internal wakes bypass the inbound authorization gate, so re-check it live here.
-                _, authorized = await self._authorized_completion_notice_target(action, check_delivery_ready=True)
-                suppressed = authorized is None
-                if authorized is True:
-                    accepted = await self._inject_watch_notification(
-                        action["text"], {**action, "type": "delegation_retry", "retry_notice_claim": claim}) is True
-            except Exception:
-                logger.debug("Delegation %s: retry notice injection failed", delegation_id, exc_info=True)
-            settle = (dr.suppress_retry_notice if suppressed else
-                      dr.mark_notice_accepted if accepted else dr.release_notice)
-            await asyncio.to_thread(settle, delegation_id, claim)
-
-    async def _drive_delegation_retries(self) -> None:
-        for action in await asyncio.to_thread(self._collect_delegation_retry_actions):
-            try:
-                await self._deliver_delegation_retry_action(action)
-            except Exception:
-                logger.warning("Delegation retry action failed for %s", action.get("delegation_id"), exc_info=True)
-
-    async def _authorized_completion_notice_target(self, evt: dict, *, check_delivery_ready: bool = False):
-        """Shared boot/terminal route and live authorization gate: None means terminal suppression;
-        False means a disconnected transport (still owed). Terminal reports can outlive the parent session."""
-        source = await asyncio.to_thread(self._build_process_event_source, evt)
-        if source is not None:
-            platform = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
-            if self._resolve_injection_adapter(platform, source) is None:
-                return source, False
-        if check_delivery_ready:
-            readiness = await self._completion_delivery_ready(evt)
-            if readiness is None:
-                logger.warning("Dropping %s %s: no messaging route or raw API session.",
-                               evt.get("type"), evt.get("delegation_id"))
-                return source, None
-            if readiness is False:
-                return source, False
-        if source is not None:
-            try:
-                authorized = self._is_user_authorized_for_source(source)
-            except Exception:
-                logger.warning("Could not authorize completion notice target; suppressing notice", exc_info=True)
-                authorized = False
-            if not authorized:
-                logger.warning("Suppressing completion notice to an unauthorized target")
-                return source, None
-        return source, True
-
-    async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
-        """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
-        async with self._completion_event_scope(evt):
-            parent_session_id = str(evt.get("parent_session_id") or "").strip()
-            from tools.delegation_resume import (
-                claim_auto_resume_trigger, complete_auto_resume_trigger,
-                inspect_resumable, release_auto_resume_trigger,
-            )
-
-            delegation_id = str(evt.get("delegation_id") or "")
-
-            def _claim_and_consume() -> None:
-                record, reason = claim_auto_resume_trigger(delegation_id)
-                if reason is None and record is not None:
-                    complete_auto_resume_trigger(delegation_id, str(record.get("auto_resume_claim") or ""))
-
-            async def _suppress_claimed_notice() -> bool:
-                """Terminally consume a notice that must not be retried (claim and consume in one hop)."""
-                await asyncio.to_thread(_claim_and_consume)
-                return True
-
-            if parent_session_id:
-                verdict = await self._classify_completion_target(parent_session_id)
-                if verdict == "terminal":
-                    # Closed owners are terminal even if their transport is disconnected.
-                    return await _suppress_claimed_notice()
-                if verdict != "deliver":
-                    return False
-            _, authorized = await self._authorized_completion_notice_target(evt, check_delivery_ready=True)
-            if authorized is False:
-                return False
-            if authorized is None:
-                return await _suppress_claimed_notice()
-            def _release_abandoned(claimed) -> None:
-                record, reason = claimed
-                if reason is None and record is not None:
-                    release_auto_resume_trigger(delegation_id, str(record.get("auto_resume_claim") or ""))
-
-            record, reason = await claim_off_loop(lambda: claim_auto_resume_trigger(delegation_id),
-                                                  _release_abandoned)
-            if reason is not None or record is None:
-                # Includes an explicit resume claim racing this notice, or another gateway
-                # already owning/finishing the boot notice.
-                return True
-            claim_id = str(record.get("auto_resume_claim") or "")
-            accepted = False
-            try:
-                # Cheap guard for a row resumed or pruned between the claim above and
-                # injection. It narrows that window but cannot close it; a notice that
-                # still slips through is refused safely by claim_resume. Inside the try so
-                # the finally releases the claim on this path and on cancellation alike.
-                _, eligibility_reason = await asyncio.to_thread(inspect_resumable, delegation_id)
-                if eligibility_reason is not None:
-                    return True
-                injected = await self._inject_watch_notification(
-                    str(evt.get("text") or ""), evt, raise_not_accepted=True,
-                )
-                accepted = injected is True
-                return injected
-            except Exception:
-                logger.debug("Boot auto-resume notice injection failed", exc_info=True)
-                return False
-            finally:
-                settle = complete_auto_resume_trigger if accepted else release_auto_resume_trigger
-                await asyncio.to_thread(settle, delegation_id, claim_id)
-
-    async def _async_delegation_watcher(self, interval: float = 2.0) -> None:
-        """Drain async completions and pattern notifications even while sessions are idle.
-
-        Background subagents and process pattern events have no per-process notification
-        consumer; both must progress without a later foreground turn.
-        """
-        await asyncio.sleep(3)  # let platforms finish connecting
-        from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
-        from tools.process_registry import process_registry as _pr
-        last_orphan_sweep = None
-        while self._running:
-            with _log_suppressed(logging.DEBUG, "Async delegation watcher error: %s"):
-                # Completions whose owner process died while this gateway runs (#97202).
-                if last_orphan_sweep is None or time.monotonic() - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_S:
-                    last_orphan_sweep = time.monotonic()
-                    await asyncio.to_thread(self._sweep_orphaned_completion_ledgers)
-                    # Durable delegation retries share the cadence: due notices, re-prompts and
-                    # terminal settlements are claimed atomically from state.db, so restarts lose nothing.
-                    await self._drive_delegation_retries()
-                # Pattern events also need an idle consumer; foreground turns are optional.
-                await self._drain_watch_notifications(_pr.completion_queue)
-                # Process completions remain owned by their per-process watchers.
-                requeue = []
-                async_events = []
-                auto_resume_events = []
-                while not _pr.completion_queue.empty():
-                    try:
-                        evt = _pr.completion_queue.get_nowait()
-                    except Exception:
-                        break
-                    if evt.get("type") == "async_delegation":
-                        async_events.append(evt)
-                    elif evt.get("type") == "delegation_auto_resume":
-                        auto_resume_events.append(evt)
-                    else:
-                        requeue.append(evt)
-                for evt in requeue:
-                    _pr.completion_queue.put(evt)
-                # A fan-out finishing together yields N completions for one session; group by full route +
-                # parent session so each group becomes ONE consolidated turn.
-                # A same-tick drain often carries several completions for the SAME originating session (a
-                # fan-out of background subagents finishing together). Events for different sessions never
-                # coalesce. See #70300.
-                groups: dict[tuple[str, ...], list[dict]] = {}
-                for evt in async_events:
-                    self._enrich_async_delegation_routing(evt)
-                    groups.setdefault(self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS), []).append(evt)
-                for group in groups.values():
-                    if any(evt.get("_watch_next_retry_at", 0) > time.monotonic() for evt in group):
-                        for evt in group:
-                            _pr.completion_queue.put(evt)
-                        continue
-                    try:
-                        delivered = await self._enqueue_async_delegation_group(group)
-                        if delivered is False:
-                            self._back_off_refused_completions(group)
-                            for evt in group:
-                                _pr.completion_queue.put(evt)
-                    except Exception as e:
-                        for evt in group:
-                            _pr.completion_queue.put(evt)
-                        logger.error("Async delegation injection error: %s", e)
-                for evt in auto_resume_events:
-                    try:
-                        delivered = await self._deliver_auto_resume_notice(evt)
-                        if delivered is False:
-                            _pr.completion_queue.put(evt)
-                    except Exception:
-                        _pr.completion_queue.put(evt)
-                        logger.debug("Boot auto-resume notice error", exc_info=True)
-            await asyncio.sleep(interval)
 
     @staticmethod
     def _back_off_refused_completions(group: list[dict]) -> None:

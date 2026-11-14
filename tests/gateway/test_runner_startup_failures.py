@@ -542,13 +542,15 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
     and s6 crash-looped anyway (#51228)."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
+    from hermes_state import SessionDB
+    session_db = await asyncio.to_thread(SessionDB, tmp_path / "state.db")
+
     class _FatalConfigRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
+            self._session_db = session_db
             self.session_store._db = self._session_db
             self._draining = False
             self.config = config

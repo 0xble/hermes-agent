@@ -255,7 +255,6 @@ def _attach_worker(rpc, scope):
                 return f'gateway handshake timed out ({phase})'
             current = current.__cause__
         return None
-
     for attempt in range(4):
         operation = 'register'
         try:

@@ -176,8 +176,6 @@ def _mirror_config_to_env(defaults, _file_has_terminal_config):
     # Session-search index knobs (hermes_state reads the env carriers).
     sessions_config = defaults.get("sessions", {})
     if isinstance(sessions_config, dict):
-        if "cjk_fts" in sessions_config:
-            os.environ["HERMES_CJK_FTS"] = str(sessions_config["cjk_fts"])
         if "search_slow_ms" in sessions_config:
             os.environ["HERMES_SEARCH_SLOW_MS"] = str(sessions_config["search_slow_ms"])
 
@@ -227,10 +225,9 @@ def _cli_config_defaults():
 
 def _merge_file_config(defaults: dict[str, Any], file_config: dict[str, Any]) -> None:
     """Overlay a parsed config file onto *defaults* in place (model normalization, deep merge, legacy keys)."""
-    from hermes_cli.model_presets import expand_model_presets
+
     # Expand the whole user route before merging loses its authored identity.
     # Resolving only the primary model here drops its implicit fallback policy.
-    file_config = expand_model_presets(file_config)
     # model: string (new format) or dict (old format with default/base_url).
     if "model" in file_config:
         if isinstance(file_config["model"], str):
@@ -263,7 +260,7 @@ def _merge_file_config(defaults: dict[str, Any], file_config: dict[str, Any]) ->
 
 
 def load_cli_config() -> dict[str, Any]:
-    """~/.hermes/config.yaml (else ./cli-config.yaml) over built-in defaults; env vars win.
+    """~/.hermes/config.yaml over built-in defaults; env vars win.
 
     ``HERMES_IGNORE_USER_CONFIG=1`` skips the user config entirely (``.env`` still loads).
     """
@@ -278,15 +275,13 @@ def load_cli_config() -> dict[str, Any]:
         live_path = get_hermes_home() / 'config.yaml'
         if config_exists(live_path):
             config_path = live_path
-    if not config_exists(config_path) or os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1":
-        config_path = Path(__file__).parent / 'cli-config.yaml'
 
     defaults = _cli_config_defaults()
 
     # Only a file's terminal section may overwrite terminal env vars already set by .env.
     _file_has_terminal_config = False
 
-    if config_exists(config_path):
+    if os.environ.get("HERMES_IGNORE_USER_CONFIG") != "1" and config_exists(config_path):
         try:
             from hermes_cli.config import _normalize_root_model_keys
 
@@ -295,10 +290,7 @@ def load_cli_config() -> dict[str, Any]:
             _file_has_terminal_config = "terminal" in file_config
             _merge_file_config(defaults, file_config)
         except Exception as e:
-            from hermes_cli.model_presets import ModelPresetError
-            if isinstance(e, ModelPresetError):
-                raise
-            logger.warning("Failed to load cli-config.yaml: %s", e)
+            logger.warning("Failed to load %s: %s", config_path, e, exc_info=True)
 
     # Expand ${ENV_VAR} references before bridging to env vars.
     from hermes_cli.config import _expand_env_vars

@@ -718,7 +718,7 @@ class BaseEnvironment(ABC):
         command: str,
         cwd: str = "",
         *,
-        timeout: int | float | None = None,
+        timeout: float | None = None,
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,

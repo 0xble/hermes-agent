@@ -9,6 +9,7 @@ backend permanently serves the wrong profile's state.db.
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import pytest
 
 import hermes_state_registry as registry
@@ -150,8 +151,8 @@ def test_prompt_background_turn_survives_parent_close(launch_db_env, tmp_path, m
     monkeypatch.setattr(server, "_load_cfg", lambda: {"max_turns": 25})
     monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: ["file"])
     monkeypatch.setattr(server, "_load_reasoning_config", lambda *_a, **_kw: None)
-    with patch("tui_gateway.server.threading.Thread", InlineThread), \
-            patch("run_agent.AIAgent", FakeAgent), \
+    patch_server_threads(monkeypatch, server, InlineThread)
+    with patch("run_agent.AIAgent", FakeAgent), \
             patch("tui_gateway.server._sess", return_value=(session, None)), \
             patch("tui_gateway.server._set_session_context", return_value=None), \
             patch("tui_gateway.server._clear_session_context"), \

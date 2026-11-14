@@ -56,7 +56,7 @@ def _build_inspection_agent(platform: str) -> Any:
     from agent.skill_utils import parse_config_string_list
 
     cfg = load_config()
-    from hermes_cli.model_preset_runtime import resolve_default_route
+    from hermes_cli.model_alias_runtime import resolve_default_route
     route = resolve_default_route(cfg)
     agent_cfg = cfg.get("agent") or {}
     return AIAgent(

@@ -25,7 +25,9 @@ def isolated_ledger(monkeypatch):
         monkeypatch.setattr(lifecycle, name, value)
         if hasattr(transport, name):
             monkeypatch.setattr(transport, name, value)
-    monkeypatch.setattr("tools.mcp_tool._update_death_supervisor", lambda *args: None)
+    monkeypatch.setattr(transport, "own_process_groups", lambda *args: None)
+    monkeypatch.setattr(transport, "release_process_groups", lambda *args: None)
+    monkeypatch.setattr(lifecycle, "release_process_groups", lambda *args: None)
 
 
 @pytest.mark.parametrize("ledger", ["empty", "dead", "reused", "unverifiable", "exits_during_scan"])
@@ -122,10 +124,11 @@ def test_recycled_pgid_with_unrelated_session_is_not_signalled(monkeypatch):
     monkeypatch.setattr(lifecycle.os, "getsid", lambda _: 200, raising=False)
     monkeypatch.setattr(lifecycle.os, "killpg", Mock(), raising=False)
     calls = []
-    monkeypatch.setattr(
-        "tools.mcp_tool._update_death_supervisor",
-        lambda verb, pgids: calls.append((verb, set(pgids))),
-    )
+    def record_release(pgids):
+        calls.append(("unregister", set(pgids)))
+
+    monkeypatch.setattr(lifecycle, "release_process_groups", record_release)
+    monkeypatch.setattr(transport, "release_process_groups", record_release)
 
     lifecycle._kill_orphaned_mcp_children()
 
@@ -196,10 +199,11 @@ def test_exited_replacement_leader_cannot_authorize_unwitnessed_survivor(monkeyp
     monkeypatch.setattr(lifecycle.os, "killpg", killpg)
     monkeypatch.setattr(psutil, "wait_procs", wait)
     calls = []
-    monkeypatch.setattr(
-        "tools.mcp_tool._update_death_supervisor",
-        lambda verb, pgids: calls.append((verb, set(pgids))),
-    )
+    def record_release(pgids):
+        calls.append(("unregister", set(pgids)))
+
+    monkeypatch.setattr(lifecycle, "release_process_groups", record_release)
+    monkeypatch.setattr(transport, "release_process_groups", record_release)
     server = SimpleNamespace(name="test")
 
     transport.MCPServerTransportMixin._release_spawned_children(server, {pid})
@@ -233,10 +237,11 @@ def test_active_group_without_spawn_witness_is_not_signalled(monkeypatch):
     monkeypatch.setattr(lifecycle.os, "killpg", killpg)
     monkeypatch.setattr(psutil, "wait_procs", wait)
     calls = []
-    monkeypatch.setattr(
-        "tools.mcp_tool._update_death_supervisor",
-        lambda verb, pgids: calls.append((verb, set(pgids))),
-    )
+    def record_release(pgids):
+        calls.append(("unregister", set(pgids)))
+
+    monkeypatch.setattr(lifecycle, "release_process_groups", record_release)
+    monkeypatch.setattr(transport, "release_process_groups", record_release)
 
     lifecycle._kill_orphaned_mcp_children(include_active=True)
 
@@ -259,10 +264,11 @@ def test_unverifiable_live_group_is_not_unregistered(monkeypatch):
     monkeypatch.setattr(lifecycle.os, "getpgid", lambda _: pid, raising=False)
     monkeypatch.setattr(psutil, "process_iter", lambda: [proc])
     calls = []
-    monkeypatch.setattr(
-        "tools.mcp_tool._update_death_supervisor",
-        lambda verb, pgids: calls.append((verb, set(pgids))),
-    )
+    def record_release(pgids):
+        calls.append(("unregister", set(pgids)))
+
+    monkeypatch.setattr(lifecycle, "release_process_groups", record_release)
+    monkeypatch.setattr(transport, "release_process_groups", record_release)
 
     lifecycle._kill_orphaned_mcp_children()
 

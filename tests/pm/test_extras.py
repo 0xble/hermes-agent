@@ -12,6 +12,7 @@ import pytest
 import pm
 from pm import client
 from pm import extras
+from tests.fakes.main_era_venv import main_era_venv
 
 
 # ---- per-extra platform gates ([tool.hermes.extras-platforms]) ----
@@ -149,6 +150,37 @@ def test_runtime_marker_environment_includes_platform_release(monkeypatch):
     monkeypatch.setattr(packaging.markers, "Marker", Recorder)
     assert extras.extra_supported("probe", importable=lambda _: False) is True
     assert "platform_release" in seen
+def test_faster_whisper_carriers_pin_av_below_pyav19():
+    """faster-whisper 1.2.1 passes ``metadata_errors`` to ``av.open()``, a kwarg
+    PyAV 19 removed, so the pair fails every local transcription with a TypeError
+    (#135245; fixed upstream in SYSTRAN/faster-whisper#1495, unreleased as of 1.2.1).
+    faster-whisper only declares ``av>=11``, so every extra carrying 1.2.1 must
+    exact-pin a pre-19 ``av`` under the same platform marker, or the next lock
+    refresh resolves the broken pair.
+    """
+    import tomllib
+    from pathlib import Path
+    from packaging.requirements import Requirement
+
+    root = Path(__file__).resolve().parents[2]
+    pyproject = tomllib.loads((root / "pyproject.toml").read_text(encoding="utf-8"))
+    optional = pyproject["project"]["optional-dependencies"]
+    carriers = {
+        extra: [Requirement(req) for req in reqs]
+        for extra, reqs in optional.items()
+        if any(req.name == "faster-whisper" for req in map(Requirement, reqs))
+    }
+    assert carriers, "no extra carries faster-whisper: retire this pin and test"
+    for extra, reqs in carriers.items():
+        fw = next(r for r in reqs if r.name == "faster-whisper")
+        if not fw.specifier.contains("1.2.1"):
+            continue  # a newer faster-whisper may carry the upstream fix
+        av_reqs = [req for req in reqs if req.name == "av"]
+        assert len(av_reqs) == 1, f"{extra} must pin av alongside faster-whisper 1.2.1"
+        (spec,) = av_reqs[0].specifier
+        assert spec.operator == "==", f"{extra}: av must be exact-pinned"
+        assert int(spec.version.split(".")[0]) < 19, f"{extra}: av must exclude PyAV 19"
+        assert av_reqs[0].marker == fw.marker, f"{extra}: av must share faster-whisper's marker"
 
 
 @pytest.fixture
@@ -215,6 +247,32 @@ def test_ensure_import_respects_terminal_decline_without_installing(monkeypatch,
     assert synced == []
 
 
+def test_ensure_import_scoped_prompt_suppression_is_process_wide_and_restores(monkeypatch, synced):
+    import builtins
+
+    monkeypatch.setattr(extras, "available", lambda _: False)
+    monkeypatch.setattr(sys, "stdin", SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(sys, "stdout", SimpleNamespace(isatty=lambda: True))
+    prompts = []
+    monkeypatch.setattr(
+        builtins,
+        "input",
+        lambda text: prompts.append(text) or "n",
+    )
+
+    with extras.suppress_interactive_install_prompts():
+        assert extras.interactive_install_prompts_suppressed() is True
+        extras.ensure_import("fal")
+
+    assert synced == [["fal"]]
+    assert prompts == []
+    assert extras.interactive_install_prompts_suppressed() is False
+
+    with pytest.raises(pm.InstallError, match="declined"):
+        extras.ensure_import("fal")
+    assert len(prompts) == 1
+
+
 def test_ensure_import_propagates_install_error(monkeypatch):
     def boom(x=None):
         raise pm.InstallError("venv", "lazy installs are disabled")
@@ -260,9 +318,7 @@ def test_legacy_selection_carries_extras_the_main_era_venv_lazily_installed(monk
     image generation, a messaging SDK), or the first PM launch prompts to
     reinstall them. Umbrella and gated-off extras are never carried."""
     monkeypatch.setattr(extras, "_PLATFORM_GATES", {"piper": "python_version < '0'"})
-    site = tmp_path / "venv" / "lib" / "python3.11" / "site-packages"
-    (site / "fal_client").mkdir(parents=True)
-    (site / "telegram").mkdir()
+    site = main_era_venv(tmp_path, "fal_client", "telegram")
     (site / "piper").mkdir()
     (site / "google").mkdir()
     (site / "google" / "auth").mkdir()
@@ -282,8 +338,9 @@ def test_legacy_selection_carries_extras_the_main_era_venv_lazily_installed(monk
 
 
 @pytest.mark.parametrize("provider_source", ["bundled", "catalog", "bundled-with-user-copy"])
+@pytest.mark.parametrize("install_kind", ["legacy-release", "immutable-release", "sealed-payload"])
 def test_immutable_release_first_generation_keeps_provider_deps_without_extra(
-    monkeypatch, tmp_path, provider_source,
+    monkeypatch, tmp_path, provider_source, install_kind,
 ):
     """First-generation selection keeps leaf extras; the selected plugin owns its deps."""
     import json
@@ -343,6 +400,17 @@ def test_immutable_release_first_generation_keeps_provider_deps_without_extra(
     site = site_packages(candidate / ".venv")
     for module in ("fal_client", "hindsight_client", "telegram"):
         (site / module).mkdir(parents=True)
+    if install_kind != "legacy-release":
+        from pm.environment import PM_BUILT_KEY
+
+        (candidate / ".venv" / "pyvenv.cfg").write_text(f"{PM_BUILT_KEY} = true\n", encoding="utf-8")
+    if install_kind == "immutable-release":
+        for name in (".release-ready", ".hermes_build_sha"):
+            (candidate / name).write_text(candidate.name + "\n", encoding="utf-8")
+    elif install_kind == "sealed-payload":
+        (candidate / "manifest.json").write_text(
+            json.dumps({"repo": ".", "venv": ".venv"}), encoding="utf-8",
+        )
     facts = Facts(runtime_facts_path(candidate), strict=True)
     assert facts.get("venv") is None, "this must exercise a brand-new install key"
     package = Venv(candidate)
@@ -379,6 +447,7 @@ def test_immutable_release_first_generation_keeps_provider_deps_without_extra(
 
 def test_core_dependency_anchors_do_not_infer_optional_extras(monkeypatch, tmp_path):
     """Core fastapi/Pillow in a payload must not manufacture web/vision selections."""
+    import json
     site = tmp_path / "venv" / "lib" / "python3.11" / "site-packages"
     (site / "fastapi").mkdir(parents=True)
     (site / "PIL").mkdir()
@@ -392,7 +461,9 @@ def test_core_dependency_anchors_do_not_infer_optional_extras(monkeypatch, tmp_p
         encoding="utf-8",
     )
     monkeypatch.setattr(extras, "_PLATFORM_GATES", {})
-    monkeypatch.setattr("pm.environments.base_venv", lambda _root: tmp_path / "venv")
+    (tmp_path / "manifest.json").write_text(
+        json.dumps({"repo": ".", "venv": "venv"}), encoding="utf-8",
+    )
     monkeypatch.setattr("pm.environments.site_packages", lambda _venv: site)
 
     assert "web" not in extras.installed_selection(tmp_path)

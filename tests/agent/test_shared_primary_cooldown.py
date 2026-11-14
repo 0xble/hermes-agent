@@ -2,11 +2,15 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import subprocess
 import time
+from datetime import UTC, datetime
 import sys
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -178,15 +182,16 @@ def test_primary_success_after_reset_clears_outage_with_one_recovery_notice(tmp_
     assert result["final_response"] == "OK from primary-model"
     assert result["model"] == "primary-model"
     assert [r["status"] for r in primary] == [429, 200]
-    assert not _record_path(home).exists(), "a real primary success must clear the outage"
+    state = json.loads(_record_path(home).read_text(encoding="utf-8-sig"))
+    assert any(entry.get("state") == "tombstone" for entry in state["routes"].values())
     assert len([n for n in result["notices"] if "restored" in n]) == 1, result["notices"]
 
 
 # ── Notice ownership (P2): never silently drop a rate-limit fallback notice ─────────────────
 
-from unittest.mock import MagicMock, patch  # noqa: E402
+from unittest.mock import MagicMock, patch
 
-from agent.error_classifier import FailoverReason  # noqa: E402
+from agent.error_classifier import FailoverReason
 
 
 def _agent_with_chain(chain):
@@ -242,7 +247,6 @@ def test_rate_limit_notice_survives_shared_write_failure(failure):
     def _broken(*_args, **_kwargs):
         if failure == "raises":
             raise OSError("read-only state dir")
-        return None
 
     with patch("agent.shared_primary_cooldown.arm_cooldown", side_effect=_broken):
         _activate(agent, reset_at=time.time() + 7200)
@@ -366,7 +370,7 @@ print(json.dumps(arm_cooldown(route_from_record({short!r}), reason="rate_limit",
 
 # ── Stale outages (review round 2, P2-1) ─────────────────────────────────────────────────────
 
-from agent import shared_primary_cooldown as spc  # noqa: E402
+from agent import shared_primary_cooldown as spc
 
 _ROUTE = ("custom:fixture", "http://127.0.0.1:8317/v1", "primary")
 
@@ -715,3 +719,662 @@ def test_arm_ignores_a_non_finite_provider_reset():
     assert entry is not None
     assert 59 <= entry["reset_at"] - entry["recorded_at"] <= 61
     assert entry["source"] == "backoff"
+
+
+# ── Shared cooldown v2 probe and identity contracts ─────────────────────────────────────────
+
+def test_expired_readers_claim_exactly_one_probe():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        tokens = list(pool.map(lambda _: spc.claim_probe(_ROUTE, entry["outage_id"]), range(8)))
+    assert [token for token in tokens if token] and sum(bool(token) for token in tokens) == 1
+
+
+def test_probe_lease_expiry_allows_takeover_and_wall_clock_is_clamped(monkeypatch):
+    now = 1_900_000_000.0
+    monkeypatch.setattr(spc.time, "time", lambda: now)
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = now - 1
+        spc._write_state(path, state)
+    first = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert first
+    row = spc.read_cooldown(_ROUTE)
+    assert row["probe_until"] <= now + spc._PROBE_LEASE_SECONDS
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["probe_until"] = now - 1
+        spc._write_state(path, state)
+    second = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert second and second != first
+
+
+def test_failed_probe_uses_the_same_backoff_formula_as_rearming():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert spc._settle_probe(_ROUTE, entry["outage_id"], token, success=False)
+    failed = spc.read_cooldown(_ROUTE)
+    assert failed["backoff_count"] == 2
+    assert 119 <= failed["reset_at"] - failed["recorded_at"] <= 121
+
+
+def test_stale_probe_owner_cannot_clear_or_escalate_newer_outage():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["outage_id"] = "new-outage"
+        row["probe_owner"] = "new-owner"
+        spc._write_state(path, state)
+    assert not spc._settle_probe(_ROUTE, entry["outage_id"], token, success=True)
+    assert spc.read_cooldown(_ROUTE)["outage_id"] == "new-outage"
+
+
+def test_probe_success_clears_alias_spellings_and_tombstone_prevents_flap(monkeypatch):
+    monkeypatch.setattr(spc, "_custom_provider_for_url", lambda _url: "custom:proxy")
+    route = ("custom", _ROUTE[1], _ROUTE[2])
+    entry = spc.arm_cooldown(route, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider="custom:proxy", base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(("custom:proxy", _ROUTE[1], _ROUTE[2]), entry["outage_id"])
+    assert spc._settle_probe(route, entry["outage_id"], token, success=True)
+    assert spc.read_cooldown(route) is None
+
+
+def test_custom_alias_merges_only_when_owner_is_unambiguous(monkeypatch):
+    monkeypatch.setattr(spc, "_custom_provider_for_url", lambda _url: "custom:proxy")
+    first = {**dict(provider="custom", base_url=_ROUTE[1], model="m", reset_at=time.time() + 60,
+                      recorded_at=time.time(), backoff_count=1, outage_id="a", notice_claimed=False),
+             "reason": "rate_limit"}
+    second = {**first, "provider": "custom:proxy", "reset_at": time.time() + 120,
+              "backoff_count": 3, "notice_claimed": True, "outage_id": "b"}
+    path = spc._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "routes": {"old-a": first, "old-b": second}}))
+    merged = spc.read_cooldown(("custom", _ROUTE[1], "m"))
+    assert merged["provider"] == "custom:proxy"
+    assert merged["backoff_count"] == 3 and merged["notice_claimed"] is True
+
+
+def test_merged_loser_outage_can_still_settle_or_clear(monkeypatch):
+    monkeypatch.setattr(spc, "_custom_provider_for_url", lambda _url: "custom:proxy")
+    route = ("custom", _ROUTE[1], "merge-model")
+    now = time.time()
+    first = {**dict(provider="custom", base_url=_ROUTE[1], model=route[2], reset_at=now + 60,
+                      recorded_at=now, backoff_count=1, outage_id="loser", notice_claimed=False),
+             "reason": "rate_limit"}
+    second = {**first, "provider": "custom:proxy", "reset_at": now + 120,
+              "outage_id": "winner"}
+    path = spc._state_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({"version": 1, "routes": {"old-a": first, "old-b": second}}))
+    assert spc.clear_if_current(route, "loser")
+    assert spc.read_cooldown(route) is None
+
+
+def test_reset_hint_precedence_and_malformed_values():
+    from agent.error_classifier import _rate_limit_reset_seconds
+    assert _rate_limit_reset_seconds("retry after 7s", {"resets_in_seconds": 30}, None) == 30
+    assert _rate_limit_reset_seconds("retry after nonsense", {"reset_at": "bad"}, None) is None
+
+
+def test_fallback_route_gets_independent_breaker_without_clearing_primary():
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)
+    primary = spc.read_cooldown(spc.route_from_agent(agent))
+    assert primary is not None
+    agent._fallback_activated = True
+    agent._provider_fallback_active = True
+    agent._rate_limit_backoff_count = 0
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) is None
+    assert spc.read_cooldown(spc.route_from_agent(agent))["outage_id"] == primary["outage_id"]
+    fallback = getattr(agent, "_shared_fallback_cooldown_record", None)
+    assert fallback and fallback["reason"] == "rate_limit"
+
+
+def test_fallback_success_clears_only_the_live_fallback_breaker():
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)
+    primary_route = spc.route_from_agent(agent)
+    primary = spc.read_cooldown(primary_route)
+    agent._fallback_activated = True
+    agent._provider_fallback_active = True
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) is None
+    fallback_route = spc.live_route_from_agent(agent)
+    fallback = spc.read_cooldown(fallback_route)
+    assert fallback is not None
+    assert spc.complete_primary_recovery(agent)
+    assert spc.read_cooldown(fallback_route) is None
+    assert spc.read_cooldown(primary_route)["outage_id"] == primary["outage_id"]
+    fresh = spc.arm_cooldown(fallback_route, reason="rate_limit")
+    assert fresh["backoff_count"] == 1
+
+
+def test_healthy_fallback_is_not_skipped_after_success(monkeypatch):
+    from agent.chat_completion_helpers import _should_skip_fallback_candidate
+    route = ("custom:healthy", "https://healthy.invalid/v1", "healthy-model")
+    record = spc.arm_cooldown(route, reason="rate_limit")
+    agent = SimpleNamespace(provider=route[0], model=route[2], base_url=route[1],
+                            _fallback_activated=True, _shared_fallback_cooldown_record=record)
+    assert spc.complete_primary_recovery(agent)
+    entry = {"provider": route[0], "model": route[2], "base_url": route[1]}
+    monkeypatch.setattr("agent.chat_completion_helpers._candidate_pool_exhausted", lambda *_args: False)
+    monkeypatch.setattr("agent.chat_completion_helpers._fallback_entry_unavailable_without_network", lambda *_args: None)
+    monkeypatch.setattr("agent.backend_identity.should_skip_candidate", lambda *_args: False)
+    assert not _should_skip_fallback_candidate(agent, entry, (route[0], route[2]), route[0], route[2], set())
+
+
+def test_fresh_adopters_share_one_primary_probe_lease():
+    """Fresh agents claim an expired outage before either is allowed to probe primary."""
+    from agent import shared_primary_cooldown_runtime as shared_runtime
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+
+    def fresh():
+        return SimpleNamespace(
+            _fallback_chain=[{"provider": "openai", "model": "fallback"}],
+            provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2], _primary_runtime=None,
+        )
+
+    first, second = fresh(), fresh()
+    with patch("agent.chat_completion_helpers.try_activate_fallback", return_value=True) as activate:
+        assert shared_runtime._adopt_shared_primary_cooldown(first) is False
+        assert shared_runtime._adopt_shared_primary_cooldown(second) is True
+    assert getattr(first, "_shared_primary_probe_token", None)
+    activate.assert_called_once()
+    assert activate.call_args.kwargs["_shared_cooldown_record"]["outage_id"] == entry["outage_id"]
+
+
+@pytest.mark.parametrize(
+    ("hint_kind", "expected_source"),
+    [
+        ("float", "provider_reset"),
+        ("milliseconds", "provider_reset"),
+        ("iso8601", "provider_reset"),
+        ("past", "backoff"),
+        ("implausible", "backoff"),
+    ],
+)
+def test_probe_failure_with_provider_reset_arms_until_reset(hint_kind, expected_source):
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(
+        provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2], _primary_runtime=None,
+        _shared_primary_cooldown_record=entry, _shared_primary_probe_token=token,
+        _fallback_activated=False, _rate_limit_backoff_count=1,
+    )
+    reset_at = time.time() + 3600
+    hints = {
+        "float": reset_at,
+        "milliseconds": str(round(reset_at * 1000)),
+        "iso8601": datetime.fromtimestamp(reset_at, UTC).isoformat(),
+        "past": str(time.time() - 1),
+        "implausible": str(time.time() + spc._MAX_PROVIDER_RESET_SECONDS + 1),
+    }
+    hint = hints[hint_kind]
+    assert spc._fail_agent_probe(agent, FailoverReason.rate_limit, hint)
+    armed = _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit, reset_at=hint)
+    current = spc.read_cooldown(_ROUTE)
+    assert current["source"] == expected_source
+    if expected_source == "provider_reset":
+        assert abs(current["reset_at"] - reset_at) < 1
+        assert armed is not None and 3500 < armed <= 3600
+    else:
+        assert 110 < current["reset_at"] - current["recorded_at"] < 130
+        assert armed is not None and 110 < armed < 130
+    assert agent._shared_primary_probe_token is None
+
+
+def test_probe_failure_without_reset_keeps_exponential_backoff():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit", backoff_count=0)
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(
+        _shared_primary_cooldown_record=entry, _shared_primary_probe_token=token,
+    )
+    started = time.time()
+    assert spc._fail_agent_probe(agent, FailoverReason.rate_limit)
+    current = spc.read_cooldown(_ROUTE)
+    assert current["source"] == "backoff"
+    assert 110 < current["reset_at"] - started < 130
+
+
+def test_release_probe_accepts_a_merged_outage_id():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["merged_outage_ids"] = [entry["outage_id"]]
+        row["outage_id"] = "canonical-outage"
+        spc._write_state(path, state)
+    assert spc._release_probe(_ROUTE, entry["outage_id"], token)
+    released = spc.read_cooldown(_ROUTE)
+    assert released["state"] == "expired"
+    assert "probe_owner" not in released
+
+
+def test_rearm_preserves_merged_outage_and_probe_metadata():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["merged_outage_ids"] = ["merged-loser"]
+        row["probe_owner"] = "probe-token"
+        row["probe_until"] = time.time() + 60
+        row["state"] = "probing"
+        spc._write_state(path, state)
+    rearmed = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    assert rearmed["outage_id"] == entry["outage_id"]
+    assert rearmed["merged_outage_ids"] == ["merged-loser"]
+    assert rearmed["probe_owner"] == "probe-token"
+    assert rearmed["probe_until"] > time.time()
+    assert rearmed["state"] == "probing"
+
+
+def test_claim_probe_accepts_a_merged_outage_id():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        row["outage_id"] = "canonical-outage"
+        row["merged_outage_ids"] = [entry["outage_id"]]
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert token
+
+
+def test_claim_probe_distinguishes_tombstone_from_owned_probe():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    first = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert first
+    assert spc.claim_probe(_ROUTE, entry["outage_id"]).kind is spc.ProbeClaimKind.OWNED_ELSEWHERE
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["state"] = "tombstone"
+        row.pop("probe_owner", None)
+        row.pop("probe_until", None)
+        spc._write_state(path, state)
+    assert spc.claim_probe(_ROUTE, entry["outage_id"]).kind is spc.ProbeClaimKind.CLEARED
+
+
+def test_builtin_fallback_lookup_uses_provider_default_base_url():
+    from agent.shared_primary_probe_runtime import fallback_route_is_active
+    with patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+               side_effect=AssertionError("fallback lookup must not resolve credentials")):
+        spc.arm_cooldown(("openrouter", "https://openrouter.ai/api/v1", "x/model"), reason="rate_limit")
+        assert fallback_route_is_active("openrouter", None, "x/model")
+
+
+def test_configured_fallback_url_requires_matching_model():
+    from agent.shared_primary_probe_runtime import _configured_base_url
+
+    config = {
+        "model": {
+            "provider": "openrouter",
+            "model": "primary-model",
+            "base_url": "https://stale-model-url.invalid/v1",
+        },
+        "providers": {
+            "openrouter": {"api": "https://provider-default.invalid/v1"},
+        },
+    }
+    with patch("hermes_cli.config.load_config_readonly", return_value=config):
+        assert _configured_base_url("openrouter", "fallback-model") == "https://provider-default.invalid/v1"
+
+
+def test_probe_failure_flag_is_scoped_to_its_outage():
+    """A later outage on the same agent must arm after an earlier probe failure."""
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(
+        provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2], _primary_runtime=None,
+        _shared_primary_cooldown_record=entry, _shared_primary_probe_token=token,
+        _fallback_activated=False, _rate_limit_backoff_count=0, _fallback_episode_cooled=False,
+    )
+    assert spc._fail_agent_probe(agent)
+    agent._fallback_episode_cooled = False
+    first = _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit)
+    assert first is not None
+    assert agent._fallback_episode_cooled is True
+    old_outage = agent._shared_primary_cooldown_record["outage_id"]
+    spc.clear_if_current(_ROUTE, old_outage)
+    agent._shared_primary_cooldown_record = None
+    second = _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit)
+    assert second is not None
+    assert agent._shared_primary_cooldown_record["outage_id"] != old_outage
+
+
+def test_fallback_breaker_does_not_inherit_primary_backoff_count():
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)
+    agent._fallback_activated = True
+    agent._provider_fallback_active = True
+    agent._rate_limit_backoff_count = 7
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) is None
+    assert agent._shared_fallback_cooldown_record["backoff_count"] == 1
+
+
+@pytest.mark.parametrize("hint_kind", ["float", "milliseconds", "iso8601"])
+def test_fallback_breaker_normalizes_provider_reset_hints(hint_kind, monkeypatch):
+    """Fallback-route arming accepts every provider reset representation."""
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)
+    # Millisecond hints round up by up to 0.5 ms; do not race that precision
+    # against a sub-millisecond cached-config arming path.
+    monkeypatch.setattr(time, "time", lambda: 1_900_000_000.0)
+    reset_at = time.time() + 3600
+    hints = {
+        "float": reset_at,
+        "milliseconds": str(round(reset_at * 1000)),
+        "iso8601": datetime.fromtimestamp(reset_at, UTC).isoformat(),
+    }
+    agent._fallback_activated = True
+    agent._provider_fallback_active = True
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit, reset_at=hints[hint_kind]) is None
+    record = agent._shared_fallback_cooldown_record
+    assert record["source"] == "provider_reset"
+    assert 3500 < record["reset_at"] - record["recorded_at"] <= 3600
+
+
+def test_fallback_cooldown_lookup_uses_resolved_base_url():
+    from agent.shared_primary_probe_runtime import fallback_route_is_active
+    with patch("hermes_cli.config.load_config_readonly", return_value={
+        "providers": {"resolved": {"base_url": "https://resolved.invalid/v1"}},
+    }), patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+              side_effect=AssertionError("fallback cooldown lookup must not resolve credentials")):
+        spc.arm_cooldown(("custom:resolved", "https://resolved.invalid/v1", "model"), reason="rate_limit")
+        assert fallback_route_is_active("custom:resolved", None, "model")
+
+
+def test_non_outage_probe_error_releases_without_escalating():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(_shared_primary_cooldown_record=entry, _shared_primary_probe_token=token)
+    assert spc._fail_agent_probe(agent, FailoverReason.context_overflow)
+    released = spc.read_cooldown(_ROUTE)
+    assert released["state"] == "expired"
+    assert released["backoff_count"] == entry["backoff_count"]
+
+
+def test_interrupt_releases_probe_without_escalating():
+    from agent.turn_api_call import handle_api_interrupt
+    agent = SimpleNamespace(
+        _shared_primary_probe_token="probe-token", thinking_callback=None,
+        _has_pending_redirect=lambda: True,
+        clear_interrupt=lambda preserve_redirect: True,
+    )
+    retry = SimpleNamespace()
+    with patch("agent.shared_primary_probe_runtime.release_primary_probe") as release:
+        verdict = handle_api_interrupt(
+            agent, _retry=retry, thinking_spinner=None, messages=[], conversation_history=[],
+            api_start_time=time.time(), interrupted=False, final_response=None,
+        )
+    assert verdict.action == "break"
+    release.assert_called_once_with(agent, "probe-token")
+
+
+def test_adoption_claim_race_rechecks_the_surviving_record():
+    from agent import shared_primary_cooldown_runtime as shared_runtime
+    record = {**spc.arm_cooldown(_ROUTE, reason="rate_limit"), "state": "expired", "reset_at": time.time() - 1}
+    agent = SimpleNamespace(_fallback_chain=[{"provider": "openai", "model": "fallback"}],
+                            provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])
+    current = {**record, "outage_id": "new-outage"}
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=spc.ProbeClaimOutcome(spc.ProbeClaimKind.REPLACED, record=current)), \
+         patch("agent.chat_completion_helpers.try_activate_fallback", return_value=True) as activate:
+        # The first read is the adoption snapshot, the second is the race re-read.
+        with patch("agent.shared_primary_cooldown.read_cooldown", side_effect=[record, current]):
+            assert shared_runtime._adopt_shared_primary_cooldown(agent)
+    assert activate.call_args.kwargs["_shared_cooldown_record"]["outage_id"] == "new-outage"
+
+
+def test_adoption_clears_stale_record_and_probe_token_when_state_is_gone():
+    from agent import shared_primary_cooldown_runtime as shared_runtime
+
+    agent = SimpleNamespace(
+        _fallback_chain=[{"provider": "openai", "model": "fallback"}],
+        provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2],
+        _shared_primary_cooldown_record={"outage_id": "stale"},
+        _shared_primary_probe_token="stale-token",
+    )
+    with patch("agent.shared_primary_cooldown.read_cooldown", return_value=None):
+        assert shared_runtime._adopt_shared_primary_cooldown(agent) is False
+    assert agent._shared_primary_cooldown_record is None
+    assert agent._shared_primary_probe_token is None
+
+
+def test_primary_probe_distinguishes_cleared_state_from_owned_probe():
+    from agent.shared_primary_probe_runtime import claim_primary_probe
+
+    record = {"provider": _ROUTE[0], "base_url": _ROUTE[1], "model": _ROUTE[2], "outage_id": "outage"}
+    agent = SimpleNamespace(_shared_primary_cooldown_record=record, _shared_primary_probe_token="old-token")
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=spc.ProbeClaimOutcome(spc.ProbeClaimKind.OWNED_ELSEWHERE)):
+        assert claim_primary_probe(agent, "expired").kind is spc.ProbeClaimKind.OWNED_ELSEWHERE
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=spc.ProbeClaimOutcome(spc.ProbeClaimKind.CLEARED)):
+        assert claim_primary_probe(agent, "expired").kind is spc.ProbeClaimKind.CLEARED
+    assert agent._shared_primary_cooldown_record is None
+    assert agent._shared_primary_probe_token is None
+
+
+@pytest.mark.parametrize(
+    ("kind", "allows_primary"),
+    [
+        (spc.ProbeClaimKind.CLAIMED, True),
+        (spc.ProbeClaimKind.OWNED_ELSEWHERE, False),
+        (spc.ProbeClaimKind.STILL_COOLING, False),
+        (spc.ProbeClaimKind.REPLACED, False),
+        (spc.ProbeClaimKind.CLEARED, True),
+        (spc.ProbeClaimKind.UNAVAILABLE, False),
+    ],
+)
+def test_restore_primary_runtime_handles_every_probe_outcome(kind, allows_primary):
+    agent = _agent_with_chain(_CHAIN)
+    _activate(agent)
+    agent._rate_limited_until = 0
+    agent._fallback_activated = True
+    agent._provider_fallback_active = True
+    _age_record(spc.route_from_agent(agent), reset_ago=1, window=60)
+    outcome = spc.ProbeClaimOutcome(
+        kind, token="probe-token" if kind is spc.ProbeClaimKind.CLAIMED else None,
+        record=agent._shared_primary_cooldown_record if kind is spc.ProbeClaimKind.REPLACED else None,
+    )
+    with patch("agent.shared_primary_cooldown.claim_probe", return_value=outcome), \
+         patch("agent.route_binding.reinstall_primary_runtime"), \
+         patch("agent.fallback_notice.finish_fallback_restore"):
+        restored = agent._restore_primary_runtime()
+    assert restored is allows_primary
+
+
+def test_claim_probe_reports_still_cooling_and_unavailable_explicitly():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit", reset_at=time.time() + 3600)
+    assert spc.claim_probe(_ROUTE, entry["outage_id"]).kind is spc.ProbeClaimKind.STILL_COOLING
+    with patch("agent.shared_primary_cooldown._locked_state", side_effect=OSError("unreadable")):
+        outcome = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert outcome.kind is spc.ProbeClaimKind.UNAVAILABLE
+
+
+def test_same_primary_recovery_keeps_probe_lease_and_settles_once():
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    claimed = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(
+        provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2], _primary_runtime=None,
+        _shared_primary_cooldown_record=entry, _shared_primary_probe_token=claimed.token,
+        _fallback_activated=False,
+    )
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) == 0
+    assert spc.claim_probe(_ROUTE, entry["outage_id"]).kind is spc.ProbeClaimKind.OWNED_ELSEWHERE
+    assert spc.settle_primary_probe_on_exit(agent, reason="success")
+    assert spc.settle_primary_probe_on_exit(agent, reason="success") is False
+    assert spc.read_cooldown(_ROUTE) is None
+
+
+def test_429_after_credential_rotation_does_not_double_shared_backoff():
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown
+
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    claimed = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(
+        _shared_primary_cooldown_record=entry, _shared_primary_probe_token=claimed.token,
+        _fallback_activated=False,
+    )
+    assert _arm_rate_limit_cooldown(agent, FailoverReason.rate_limit) == 0
+    assert spc.settle_primary_probe_on_exit(agent, reason=FailoverReason.rate_limit)
+    failed = spc.read_cooldown(_ROUTE)
+    assert failed["backoff_count"] == entry["backoff_count"] + 1
+    assert spc.settle_primary_probe_on_exit(agent, reason=FailoverReason.rate_limit) is False
+    assert spc.read_cooldown(_ROUTE)["backoff_count"] == failed["backoff_count"]
+
+
+def test_context_overflow_compression_retry_keeps_probe_lease_from_second_agent():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    first = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert first.kind is spc.ProbeClaimKind.CLAIMED
+    second = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert second.kind is spc.ProbeClaimKind.OWNED_ELSEWHERE
+    assert spc._release_probe(_ROUTE, entry["outage_id"], first.token)
+
+
+def test_each_transport_attempt_refreshes_tombstone_timestamp(monkeypatch):
+    from agent.turn_api_call import perform_api_call
+    times = iter((10.0, 20.0))
+    monkeypatch.setattr("agent.turn_api_call.time.time", lambda: next(times))
+    attempts = []
+    agent = SimpleNamespace(
+        _interruptible_streaming_api_call=lambda _kwargs, on_first_delta: attempts.append(agent._current_api_request_started_at) or object(),
+        _interruptible_api_call=None, _get_transport=lambda: None, _is_codex_backend=lambda: False,
+        _has_stream_consumers=lambda: True, api_mode="chat_completions", base_url="https://primary.invalid/v1",
+        provider="custom", model="primary", session_id="s", platform="cli", _model_request_active=None,
+        thinking_callback=None, _pending_redirect_lock=None, _pending_redirect=False,
+        _has_pending_redirect=lambda: False,
+    )
+    with patch("agent.turn_api_call._should_stream", return_value=True), \
+         patch("hermes_cli.middleware.run_llm_execution_middleware",
+               side_effect=lambda _request, next_call, **_kwargs: (next_call(_request), next_call(_request))[1]):
+        perform_api_call(
+            agent, api_kwargs={}, _original_api_kwargs={}, _llm_middleware_trace=[],
+            _moa_prepared_request=None, _retry=SimpleNamespace(), thinking_spinner=None,
+            retry_count=0, api_call_count=1, api_request_id="r", effective_task_id="t",
+            turn_id="turn", interrupted=False,
+        )
+    assert attempts == [10.0, 20.0]
+
+
+def test_local_probe_release_does_not_escalate_backoff():
+    from agent.shared_primary_probe_runtime import release_primary_probe
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    agent = SimpleNamespace(_shared_primary_cooldown_record=entry, _shared_primary_probe_token=token)
+    release_primary_probe(agent, token)
+    released = spc.read_cooldown(_ROUTE)
+    assert released["state"] == "expired"
+    assert released["backoff_count"] == entry["backoff_count"]
+
+
+def test_probe_release_logs_suppressed_exception(caplog):
+    from agent.shared_primary_probe_runtime import release_primary_probe
+
+    entry = {"provider": _ROUTE[0], "base_url": _ROUTE[1], "model": _ROUTE[2], "outage_id": "outage"}
+    agent = SimpleNamespace(_shared_primary_cooldown_record=entry, _shared_primary_probe_token="token")
+    with patch("agent.shared_primary_cooldown._release_probe", side_effect=RuntimeError("release failed")):
+        with caplog.at_level(logging.DEBUG, logger="agent.shared_primary_probe_runtime"):
+            release_primary_probe(agent, "token")
+    assert "Could not release primary cooldown probe" in caplog.text
+
+
+def test_fresh_recovery_tombstone_rejects_late_failure():
+    entry = spc.arm_cooldown(_ROUTE, reason="rate_limit")
+    with spc._locked_state() as (path, state):
+        row = state["routes"][spc.route_key(provider=_ROUTE[0], base_url=_ROUTE[1], model=_ROUTE[2])]
+        row["reset_at"] = time.time() - 1
+        spc._write_state(path, state)
+    token = spc.claim_probe(_ROUTE, entry["outage_id"])
+    assert spc._settle_probe(_ROUTE, entry["outage_id"], token, success=True)
+    assert spc.arm_cooldown(_ROUTE, reason="rate_limit", request_started_at=entry["recorded_at"]) is None
+
+
+def test_stream_first_delta_does_not_announce_recovery():
+    from agent.turn_api_call import perform_api_call
+    with patch("agent.turn_api_call._should_stream", return_value=True), \
+         patch("agent.shared_primary_cooldown.complete_primary_recovery") as recovered:
+        agent = SimpleNamespace(
+            _interruptible_streaming_api_call=lambda _kwargs, on_first_delta: (
+                on_first_delta(), (_ for _ in ()).throw(RuntimeError("late stream failure"))
+            ),
+            _interruptible_api_call=None, _get_transport=lambda: None, _is_codex_backend=lambda: False,
+            _has_stream_consumers=lambda: True, api_mode="chat_completions", base_url="https://primary.invalid/v1",
+            provider="custom", model="primary", session_id="s", platform="cli", _model_request_active=None,
+            thinking_callback=None,
+            _pending_redirect_lock=None, _pending_redirect=False, _has_pending_redirect=lambda: False,
+        )
+        with pytest.raises(RuntimeError, match="late stream failure"):
+            perform_api_call(
+                agent, api_kwargs={}, _original_api_kwargs={}, _llm_middleware_trace=[],
+                _moa_prepared_request=None, _retry=SimpleNamespace(), thinking_spinner=None,
+                retry_count=0, api_call_count=1, api_request_id="r", effective_task_id="t",
+                turn_id="turn", interrupted=False,
+            )
+    recovered.assert_not_called()

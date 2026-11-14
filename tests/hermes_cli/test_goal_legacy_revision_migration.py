@@ -210,7 +210,7 @@ def test_migration_write_failure_leaves_legacy_row_retryable_without_partial_per
         patch.setattr(db, "_execute_write", failed_write)
         loaded = goals.load_goal("legacy")
         assert loaded is not None
-        assert getattr(loaded, "_legacy_migration_pending") is True
+        assert loaded._legacy_migration_pending is True
         manager = goals.GoalManager("legacy")
         with pytest.raises(goals.GoalPersistenceError, match="refusing to overwrite"):
             manager.set("a replacement goal")

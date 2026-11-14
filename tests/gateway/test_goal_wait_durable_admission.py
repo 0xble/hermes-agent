@@ -289,6 +289,8 @@ async def test_fast_drain_reparks_without_old_ack_erasing_new_wait(parked, monke
 
 @pytest.mark.asyncio
 async def test_duplicate_watchers_and_new_wait_generation_admit_once_each(parked, monkeypatch):
+    from gateway.run_goals import post_turn_bookkeeping_pending
+
     runner, _adapter, authority, _source, sid, key, _manager, rows, adapter_calls = parked
     await asyncio.gather(*(runner._goal_wakeup_fire_one(sid) for _ in range(3)))
     assert len(rows()) == 1
@@ -300,6 +302,7 @@ async def test_duplicate_watchers_and_new_wait_generation_admit_once_each(parked
     authority._schedule(SessionRef(authority.profile_id, sid))
     await async_wait_until(lambda: rows()[0]['status'] == 'terminal'
                            and not runner._is_session_running(key)
+                           and not post_turn_bookkeeping_pending(runner, key)
                            and (authority.sessions[sid].task is None or authority.sessions[sid].task.done()),
                            timeout=20, what='first wait generation fully released')
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)

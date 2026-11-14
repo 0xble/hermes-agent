@@ -229,9 +229,11 @@ async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify
     caplog.set_level(logging.INFO)
     provider.replies = ["OK"]
     first = await turn(f"{canary}: reply with just OK", "private-1")
+    assert store.lookup_by_session_key(key).last_prompt_tokens > 0
     agent = runner._cached_agent_for(key)
     provider.replies = ["Second OK"]
     second = await turn("Private follow-up", "private-2")
+    assert store.lookup_by_session_key(key).last_prompt_tokens > 0
     # A 429 runs the real private path through the credential pool, whose status is persisted.
     limited = RuntimeError(f"rate limited while reading {canary}")
     limited.status_code = 429
@@ -249,7 +251,10 @@ async def test_resolver_built_private_turns_compact_reuse_the_agent_and_classify
     from agent import incognito_private_dir as private_dirs
     assert agent.session_id == sid and store.lookup_by_session_key(key).session_id == sid
     assert len(list(private_dirs._configured_root().glob(private_dirs.PRIVATE_DIR_PREFIX + "*"))) == 1
-    assert store.lookup_by_session_key(key).last_prompt_tokens > 0
+    prompt_tokens = store.lookup_by_session_key(key).last_prompt_tokens
+    assert prompt_tokens == agent.context_compressor.last_prompt_tokens
+    assert prompt_tokens > 0 or (prompt_tokens == -1
+                                and agent.context_compressor.awaiting_real_usage_after_compression)
     records = [record.getMessage() for record in caplog.records]
     assert not any(canary in text for text in records)
     assert any(text.startswith("Incognito agent turn failed:") for text in records), records

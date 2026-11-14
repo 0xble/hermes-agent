@@ -10,6 +10,7 @@ const runner = resolve(dirname(fileURLToPath(import.meta.url)), '../../run-works
 const fixture = mkdtempSync(join(tmpdir(), 'workspace-checks-'))
 after(() => rmSync(fixture, { recursive: true, force: true }))
 writeFileSync(join(fixture, 'package.json'), JSON.stringify({ private: true, workspaces: ['packages/*'] }))
+writeFileSync(join(fixture, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n')
 for (const [name, code] of [['pass', 0], ['fail', 7]]) {
   const dir = join(fixture, 'packages', name)
   mkdirSync(dir, { recursive: true })
@@ -18,9 +19,9 @@ for (const [name, code] of [['pass', 0], ['fail', 7]]) {
   }))
   writeFileSync(join(dir, 'check.mjs'), `console.log('executed-${name}'); process.exitCode = ${code}`)
 }
-const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-const install = spawnSync(npm, ['install', '--offline', '--ignore-scripts', '--package-lock=false', '--no-audit', '--no-fund'], {
-  cwd: fixture, encoding: 'utf8', shell: process.platform === 'win32',
+const pnpm = process.platform === 'win32' ? 'pnpm.exe' : 'pnpm'
+const install = spawnSync(pnpm, ['install', '--offline', '--ignore-scripts'], {
+  cwd: fixture, encoding: 'utf8', env: { ...process.env, CI: 'false' },
 })
 assert.equal(install.status, 0, install.stdout + install.stderr)
 function run(...args) {
@@ -54,6 +55,7 @@ test('defaults to a bounded per-job budget and honors explicit concurrency', () 
   const budgetFixture = mkdtempSync(join(tmpdir(), 'workspace-budget-'))
   try {
     writeFileSync(join(budgetFixture, 'package.json'), JSON.stringify({ private: true, workspaces: ['packages/*'] }))
+    writeFileSync(join(budgetFixture, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n')
     for (let index = 0; index < 6; index++) {
       const dir = join(budgetFixture, 'packages', `unit-${index}`)
       mkdirSync(dir, { recursive: true })
@@ -61,8 +63,8 @@ test('defaults to a bounded per-job budget and honors explicit concurrency', () 
         name: `unit-${index}`, version: '1.0.0', scripts: { check: `node -e "console.log('executed-${index}')"` },
       }))
     }
-    const setup = spawnSync(npm, ['install', '--offline', '--ignore-scripts', '--package-lock=false', '--no-audit', '--no-fund'], {
-      cwd: budgetFixture, encoding: 'utf8', shell: process.platform === 'win32',
+    const setup = spawnSync(pnpm, ['install', '--offline', '--ignore-scripts'], {
+      cwd: budgetFixture, encoding: 'utf8', env: { ...process.env, CI: 'false' },
     })
     assert.equal(setup.status, 0, setup.stdout + setup.stderr)
     for (const [workers, args, expected] of [
@@ -92,4 +94,44 @@ test('defaults to a bounded per-job budget and honors explicit concurrency', () 
 test('unmatched or all-unit skips cannot report success', () => {
   assert.equal(run('--skip', 'missing').status, 1)
   assert.equal(run('--skip', 'packages/').status, 1)
+})
+
+test('drops vitest history before checks while retaining installed packages and Vite transforms', () => {
+  const root = mkdtempSync(join(tmpdir(), 'workspace-history-'))
+  try {
+    writeFileSync(join(root, 'package.json'), JSON.stringify({ private: true }))
+    writeFileSync(join(root, 'pnpm-workspace.yaml'), 'packages:\n  - packages/*\n')
+    const unit = join(root, 'packages', 'probe')
+    mkdirSync(unit, { recursive: true })
+    writeFileSync(join(unit, 'package.json'), JSON.stringify({
+      name: 'probe', version: '1.0.0', scripts: { check: 'node check.mjs' },
+    }))
+    const setup = spawnSync(pnpm, ['install', '--offline', '--ignore-scripts'], {
+      cwd: root, encoding: 'utf8', env: { ...process.env, CI: 'false' },
+    })
+    assert.equal(setup.status, 0, setup.stdout + setup.stderr)
+    for (const base of [root, unit]) {
+      for (const rel of ['.vite/vitest/results.json', '.vite/deps/_metadata.json', 'left-pad/package.json']) {
+        const file = join(base, 'node_modules', rel)
+        mkdirSync(dirname(file), { recursive: true })
+        writeFileSync(file, '{}')
+      }
+    }
+    writeFileSync(join(unit, 'check.mjs'), `
+      import assert from 'node:assert/strict'
+      import { existsSync } from 'node:fs'
+      import { join } from 'node:path'
+      for (const base of [process.cwd(), '../..']) {
+        assert.equal(existsSync(join(base, 'node_modules/.vite/vitest')), false)
+        assert.ok(existsSync(join(base, 'node_modules/.vite/deps/_metadata.json')))
+        assert.ok(existsSync(join(base, 'node_modules/left-pad/package.json')))
+      }
+      console.log('history cleared before check')
+    `)
+    const result = spawnSync(process.execPath, [runner], { cwd: root, encoding: 'utf8' })
+    assert.equal(result.status, 0, result.stdout + result.stderr)
+    assert.match(result.stdout, /history cleared before check/)
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
 })

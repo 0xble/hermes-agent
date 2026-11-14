@@ -179,7 +179,7 @@ def _optimize_args(**flags):
 
 def test_cli_records_request_beside_a_live_holder(bloated_db, capsys):
     """The live gateway always holds the store; recording intent must not hit the held-store refusal."""
-    import hermes_cli.sessions_cmd as sessions_cmd
+    from hermes_cli import sessions_cmd
 
     holder = subprocess.Popen([sys.executable, "-c", _HOLDER, str(bloated_db)],
                               stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -202,7 +202,7 @@ def test_cli_records_request_beside_a_live_holder(bloated_db, capsys):
 def test_cli_parser_exposes_the_flags():
     import argparse
 
-    import hermes_cli.sessions_cmd as sessions_cmd
+    from hermes_cli import sessions_cmd
     from hermes_cli.subcommands.sessions import build_sessions_parser
 
     parser = argparse.ArgumentParser()
@@ -228,7 +228,7 @@ def test_gateway_hook_compacts_the_active_home_store(bloated_db):
 @pytest.mark.asyncio
 async def test_start_gateway_compacts_after_pid_claim_before_anything_opens_the_store(monkeypatch, tmp_path):
     """The rewrite runs only in the authoritative gateway, before the control socket and runner.start()."""
-    import gateway.run as run
+    from gateway import run
     from gateway.config import GatewayConfig
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -252,7 +252,6 @@ async def test_start_gateway_compacts_after_pid_claim_before_anything_opens_the_
 
     async def _control_socket(runner):
         order.append("control_socket")
-        return None
 
     monkeypatch.setattr(run, "_host_attach_or_none", AsyncMock(return_value=None))
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)

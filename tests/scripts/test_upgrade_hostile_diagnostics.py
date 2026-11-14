@@ -28,7 +28,7 @@ def test_watchdog_reports_an_unavailable_owned_log_without_masking_other_logs(tm
 
 def test_diagnostics_fixture_uses_original_stderr_and_closes_its_watchdog(request):
     # Exercise the real fixture lifetime without waiting for its 180s watchdog.
-    diagnostics = getattr(D.hostile_diagnostics, "__wrapped__")(request)
+    diagnostics = D.hostile_diagnostics.__wrapped__(request)
     next(diagnostics)
     stream = D._STREAM
     try:

@@ -33,7 +33,7 @@ def _quiet(log_message: Optional[str], *log_args: Any, exc_info: bool = False):
             log_args = log_args + (exc,)
         logger.debug(log_message, *log_args, exc_info=exc_info)
 
-def _list_observation(parent_agent: Any, payload: Dict[str, Any]) -> Dict[str, Any]:
+def _list_observation(parent_agent: Any, payload: dict[str, Any]) -> dict[str, Any]:
     if parent_agent is None:
         return payload
     # Elapsed time is not progress. Keep just the last meaningful observation on

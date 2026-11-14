@@ -27,7 +27,7 @@ _READ_ONLY_STATUS_CALL_RE = re.compile(
     r"git\s+branch(?:\s+(?:--show-current|--list|-a|--all))?\s*\Z|"
     r"(?:ls|pwd|rg|grep|cat|head|tail)(?:\s+.*)?|"
     r"find(?:\s+.*)?)\Z",
-    re.I,
+    re.IGNORECASE,
 )
 _READ_ONLY_STATUS_TOOLS = frozenset({
     "browser_get_images", "browser_snapshot", "read_file", "search_files",
@@ -35,7 +35,7 @@ _READ_ONLY_STATUS_TOOLS = frozenset({
 })
 
 
-def _goal_progress_fingerprint(evidence: Optional[List[dict[str, Any]]]) -> Optional[str]:
+def _goal_progress_fingerprint(evidence: Optional[list[dict[str, Any]]]) -> Optional[str]:
     """Return a stable identity for recorded tool progress, or ``None`` when there is no signal.
 
     Tool-result timestamps and content are runtime-owned, unlike the agent's prose. Hashing the
@@ -53,7 +53,7 @@ def _goal_progress_fingerprint(evidence: Optional[List[dict[str, Any]]]) -> Opti
     return hashlib.sha256(payload).hexdigest()
 
 
-def _evidence_scan_truncated_for_turn(evidence: Optional[List[dict[str, Any]]], previous_turn_at: float) -> bool:
+def _evidence_scan_truncated_for_turn(evidence: Optional[list[dict[str, Any]]], previous_turn_at: float) -> bool:
     """Whether the bounded evidence scan may have omitted rows from this turn.
 
     A long transcript alone is not enough: older rows can fill the scan while the current
@@ -110,7 +110,7 @@ def _read_only_status_call(call: Any) -> str:
     return command.strip() if isinstance(command, str) else ""
 
 
-def _evidence_only_read_only_status(evidence: Optional[List[dict[str, Any]]]) -> bool:
+def _evidence_only_read_only_status(evidence: Optional[list[dict[str, Any]]]) -> bool:
     """Whether current-turn evidence consists only of bounded status/read operations."""
     from hermes_cli.goals import _READ_ONLY_STATUS_CALL_RE, _READ_ONLY_STATUS_TOOLS, _read_only_status_call
     rows = [item for item in (evidence or []) if isinstance(item, dict)]
@@ -131,7 +131,7 @@ def _evidence_only_read_only_status(evidence: Optional[List[dict[str, Any]]]) ->
     return True
 
 
-def _render_evidence_block(evidence: Optional[List[dict[str, Any]]], now: Optional[float] = None) -> str:
+def _render_evidence_block(evidence: Optional[list[dict[str, Any]]], now: Optional[float] = None) -> str:
     """Judge prompt block for the evidence ledger; empty when there is none."""
     from hermes_cli.goals import JUDGE_EVIDENCE_BLOCK_TEMPLATE
     lines: list[str] = []

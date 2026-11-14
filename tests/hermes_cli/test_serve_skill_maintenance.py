@@ -14,7 +14,7 @@ async def test_removed_sessions_keep_profile_idle_watermark(tmp_path, monkeypatc
     from types import SimpleNamespace
 
     import tui_gateway.server as gateway
-    import hermes_cli.web_server_sessions as web_server_sessions
+    from hermes_cli import web_server_sessions
     from agent.curator import load_state, save_state
     from hermes_cli.web_server_sessions import _auto_archive_ticker_loop, _skill_maintenance_idle_for
 

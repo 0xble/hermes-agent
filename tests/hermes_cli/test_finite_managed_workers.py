@@ -80,7 +80,7 @@ def test_finite_cli_managed_worker_and_delegated_child(tmp_path, safe_mode):
             proc = subprocess.run(hermes_argv(*args), cwd=ph.project,
                                   env={**ph.env(), "OPENAI_BASE_URL": server.base_url, "OPENAI_API_KEY": "fixture"},
                                   stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                                  encoding="utf-8", timeout=65)
+                                  encoding="utf-8", timeout=65, check=False)
             logs = '\n'.join(p.read_text(encoding="utf-8", errors="replace")[-8000:]
                              for p in ph.hermes_home.rglob("*.log"))
             assert proc.returncode == 0, (proc.stdout, proc.stderr, logs)

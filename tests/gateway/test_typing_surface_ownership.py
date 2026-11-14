@@ -44,9 +44,10 @@ async def test_telegram_approval_button_resumes_its_topic(monkeypatch):
     a._callback_authorized = AsyncMock(return_value=True)
     a._edit_md_quiet = AsyncMock()
     monkeypatch.setattr("tools.approval.resolve_gateway_approval", lambda *args: 1)
+    monkeypatch.setattr("tools.approval.resolve_gateway_approval_card", lambda *args, **kwargs: 1)
     query = SimpleNamespace(from_user=SimpleNamespace(first_name="Tester", id=1),
                             answer=AsyncMock(),
-                            message=SimpleNamespace(chat_id=123, message_thread_id=11,
+                            message=SimpleNamespace(chat_id=123, message_id=7, message_thread_id=11,
                                                     chat=SimpleNamespace(type="supergroup")))
     cb = a._callback_ctx(query)
     await a._handle_exec_approval_callback(query, f"ea:once:{approval_id}", cb)

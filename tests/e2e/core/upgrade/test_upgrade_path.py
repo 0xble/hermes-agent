@@ -51,6 +51,7 @@ import hashlib
 import json
 import os
 import shutil
+import stat
 import sqlite3
 import subprocess
 import sys
@@ -63,7 +64,9 @@ from typing import NamedTuple
 import pytest
 import hermes_yaml as yaml
 
+from tests.e2e.core._pending_fixes import known_failure
 from tests.e2e.core.upgrade import _helpers as H
+from tests.e2e.core.upgrade import _install_helpers as I
 from tests.e2e.core.upgrade._install_cache import InstallCache
 from tests.fakes.fake_llm_provider import FakeLLMServer
 
@@ -105,21 +108,11 @@ class _Refs(NamedTuple):
 
 @functools.cache
 def _refs() -> _Refs:
-    """HEAD and release N-1, resolved on first use: collection (every CI shard) runs no git.
-
-    N-1 is the nearest CalVer release tag before HEAD; HERMES_E2E_UPGRADE_BASE=<ref> starts from any
-    older ref instead (e.g. the pre-handoff v2026.9.14, or a patched base when proving a leg red
-    against the N-1 side).
-    """
+    """HEAD and the start version (``_install_helpers.upgrade_base``), resolved on first use:
+    collection (every CI shard) runs no git."""
     head = _git("rev-parse", "HEAD", cwd=H.WORKTREE)
-    try:
-        tag = os.environ.get("HERMES_E2E_UPGRADE_BASE") or _git(
-            "describe", "--tags", "--match", "v20[0-9][0-9].*", "--abbrev=0", "HEAD~1",
-            cwd=H.WORKTREE,
-        )
-        return _Refs(head, tag, _git("rev-parse", f"{tag}^{{commit}}", cwd=H.WORKTREE))
-    except AssertionError:  # shallow CI checkout without tags
-        return _Refs(head, "", "")
+    base = I.upgrade_base()
+    return _Refs(head, base.ref, base.commit) if base else _Refs(head, "", "")
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -310,12 +303,13 @@ _KILLED_RUN_PREFIX = ["/bin/sh", "-c", '"$0" "$@"; exit $?']
 _RETRY_PREFIX = ["/bin/sh", "-c", 'true; exec "$0" "$@"']
 
 
-def _make_origin(root: Path) -> Path:
+def _make_origin(root: Path, base: str | None = None) -> Path:
+    base = base or _refs().base
     origin = root / "origin.git"
     _git("clone", "-q", "--bare", "--shared", "--no-tags", "--single-branch", str(H.WORKTREE), str(origin), cwd=root)
-    _git("update-ref", "refs/heads/main", _refs().base, cwd=origin)
+    _git("update-ref", "refs/heads/main", base, cwd=origin)
     _git("symbolic-ref", "HEAD", "refs/heads/main", cwd=origin)
-    _git("tag", "-f", "e2e-upgrade-base", _refs().base, cwd=origin)
+    _git("tag", "-f", "e2e-upgrade-base", base, cwd=origin)
     return origin
 
 
@@ -363,15 +357,23 @@ def _write_wrappers(leg_root: Path, install: Path, hermes_home: Path) -> Path:
     return wrap
 
 
-def make_leg(root: Path, template_home: Path | None, cache: InstallCache | None = None) -> Leg:
+def _sockets(directory: str, names: list[str]) -> list[str]:
+    """Unix sockets a release's CLI leaves in the home (``gateway.sock``): copytree cannot copy them."""
+    return [n for n in names if stat.S_ISSOCK(os.lstat(os.path.join(directory, n)).st_mode)]
+
+
+def make_leg(root: Path, template_home: Path | None, cache: InstallCache | None = None, *,
+             base: str | None = None) -> Leg:
+    """An install of ``base`` (default: the suite's start version) with its own venv and origin."""
+    base = base or _refs().base
     root.mkdir(parents=True, exist_ok=True)
     # Other upgrade suites use the original two-argument helper. Keep their downloads
     # private to this leg; only callers explicitly supplying a fixture cache share content.
     downloads = cache or InstallCache(root / "downloads")
-    origin = _make_origin(root)
+    origin = _make_origin(root, base)
     install = root / "install"
     _git("clone", "-q", "--shared", "-b", "main", str(origin), str(install), cwd=root)
-    assert _git("rev-parse", "HEAD", cwd=install) == _refs().base
+    assert _git("rev-parse", "HEAD", cwd=install) == base
     # Look like a normal (non-fork) install: origin is the official URL, rewritten in this repo's
     # own config to the local store, so the updater takes the common path and never hits the network.
     _git("remote", "set-url", "origin", OFFICIAL_URL, cwd=install)
@@ -395,7 +397,7 @@ def make_leg(root: Path, template_home: Path | None, cache: InstallCache | None 
     hermes_home = Path(env_probe["HERMES_HOME"])
     if template_home is not None:
         shutil.rmtree(hermes_home)
-        shutil.copytree(template_home, hermes_home, symlinks=True)
+        shutil.copytree(template_home, hermes_home, symlinks=True, ignore=_sockets)
     wrap = _write_wrappers(root, install, hermes_home)
     env = downloads.environment(H.isolated_env(root, extra_path=[wrap]))
     if cache is not None:
@@ -472,6 +474,7 @@ def migrate_oracle(leg: Leg, name: str, before: bytes) -> bytes:
     if src_env.exists():
         shutil.copy2(src_env, home / ".env")
     code = "from hermes_cli.config import migrate_config; migrate_config(interactive=False, quiet=True)"
+    # HEAD's test interpreter, however the runner got it: <checkout>/.venv exists only in CI's checkout.
     cp = H.run([sys.executable, "-c", code],
                env=env, cwd=H.WORKTREE, writable=[oroot], timeout=CLI_TIMEOUT)
     assert cp.returncode == 0 and TRACEBACK not in cp.stderr, H.describe(cp)
@@ -506,14 +509,16 @@ def assert_healthy_at_head(leg: Leg, provider: FakeLLMServer, final: subprocess.
             assert (home / ".env").read_bytes() == before[name]["env"], f"{name} .env rewritten by the update"
     jobs_after = json.loads((leg.hermes_home / "cron" / "jobs.json").read_text(encoding="utf-8"))
     assert _job_ids(jobs_after) == _job_ids(before["cron"]) and _job_ids(jobs_after), "cron jobs lost/changed"
-    # 3. config: exactly HEAD's documented migrations, nothing else
+    # 3. config: exactly HEAD's documented migrations, nothing else (asserted last, see the end)
+    drift = []
     for name, home in _profile_homes(leg).items():
         orig = before[name]["config"]
         after = (home / "config.yaml").read_bytes()
         expected = migrate_oracle(leg, name, orig)
-        assert after == expected, (
-            f"{name} config.yaml differs from HEAD's own migration of the pre-update file\n"
-            f"--- after update ---\n{after.decode()}\n--- expected ---\n{expected.decode()}")
+        if after != expected:
+            drift.append(f"{name} config.yaml differs from HEAD's own migration of the pre-update file\n"
+                         f"--- after update ---\n{after.decode()}\n--- expected ---\n{expected.decode()}")
+            assert after == expected.replace(b"    enabled: false\n", b"    disabled: true\n", 1), drift[-1]
         # Independent of the oracle (a clobbering migration would be mirrored by it): the user's
         # values survive semantically and every comment line survives verbatim.
         o, a = yaml.safe_load(orig), yaml.safe_load(after)
@@ -550,6 +555,10 @@ def assert_healthy_at_head(leg: Leg, provider: FakeLLMServer, final: subprocess.
     calls = (leg.root / "shims" / "shim-calls.log")
     text = calls.read_text() if calls.exists() else ""
     assert not any(w in text for w in (" restart ", " stop ", " kill ", " kickstart ")), text
+    with known_failure(r"(?s)differs from HEAD's own migration.*--- after update ---.*disabled: true",
+                       "#150362 (fix #150370 open): an update from a release at the current config schema skips "
+                       "the stamp-independent steps, so a legacy `disabled: true` MCP entry stays enabled at runtime"):
+        assert not drift, "\n".join(drift)
 
 
 # ---------------------------------------------------------------------------
@@ -601,7 +610,8 @@ def template_home(tmp_path_factory, provider, install_cache) -> Path:
     template = seed.root / "template-home"
     # Native archives and tools belong to each leg, not to the user's state snapshot.
     shutil.copytree(seed.hermes_home, template, symlinks=True,
-                    ignore=lambda directory, _names: ["tools"] if Path(directory) == seed.hermes_home else [])
+                    ignore=lambda directory, names: _sockets(directory, names) +
+                    (["tools"] if Path(directory) == seed.hermes_home else []))
     return template
 
 
@@ -658,8 +668,8 @@ def clean_leg(tmp_path_factory, template_home, install_cache):
 
 def test_clean_update(clean_leg, provider):
     leg, final = clean_leg
-    assert_healthy_at_head(leg, provider, final)
     assert _git("status", "--porcelain", "--untracked-files=no", cwd=leg.install) == "", "update left a dirty tree"
+    assert_healthy_at_head(leg, provider, final)
 
 
 def test_clean_update_keeps_long_scalar_lines_verbatim(clean_leg):

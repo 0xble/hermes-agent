@@ -9,6 +9,7 @@ fallback → terminal result) and the interruptible backoff. Nothing here import
 from __future__ import annotations
 
 from dataclasses import dataclass
+import contextlib
 import json
 import logging
 import ssl
@@ -17,6 +18,7 @@ from typing import Any, Dict, Optional
 
 from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+from agent.route_verdicts import route_visit
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, free_tier_cooldown_ends_turn,
@@ -112,6 +114,9 @@ def handle_api_error(
             "during API call #%d (%s)",
             agent.log_prefix, api_call_count, api_error,
         )
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(agent, reason="shutdown", reset_at=None)
         _shutdown_summary = "Turn abandoned: the process was shutting down before the model call could complete."
         return _verdict("return", {
             "final_response": _shutdown_summary, "messages": messages, "api_calls": api_call_count,
@@ -165,8 +170,14 @@ def handle_api_error(
         # Preserve a pending redirect: the user is steering, not stopping — rebuild the
         # turn from the correction instead of aborting.
         if agent.clear_interrupt(preserve_redirect=True):
+            with contextlib.suppress(Exception):
+                from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+                settle_primary_probe_on_exit(agent, reason="interrupt")
             _retry.restart_with_redirected_messages = True
             return _verdict("break")
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(agent, reason="interrupt")
         return _verdict("return", abort_turn_on_interrupt(
             agent, messages, conversation_history, api_call_count,
             abort_message="Interrupt detected during error handling, aborting retries.",
@@ -297,6 +308,14 @@ def settle_unrecovered_error(
             compression_attempts=compression_attempts, result=result,
         )
 
+    def _settle_primary_exit() -> None:
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(
+                agent, reason=classified.reason,
+                reset_at=error_context.get("reset_at") if isinstance(error_context, dict) else None,
+            )
+
     # ``FailoverReason.billing`` (402) is deliberately NOT excluded: pool rotation and
     # eager fallback already gave up, so retrying only burns paid requests on a depleted
     # balance. Mirrors 401/403.
@@ -313,8 +332,9 @@ def settle_unrecovered_error(
     # so a second reasoning-field rejection means the route refuses the configured reasoning
     # controls themselves — nothing left to drop, so take the fallback chain now instead of
     # replaying the identical request ``max_retries`` times (#114460).
-    reasoning_spent = classified.reason == FailoverReason.reasoning_mandatory and bool(
-        getattr(_retry, "reasoning_mandatory_retry_attempted", False)
+    reasoning_spent = (
+        classified.reason == FailoverReason.reasoning_mandatory
+        and getattr(_retry, "reasoning_mandatory_retry_visit", None) == route_visit(agent)
     )
     is_client_error = (
         is_local_validation_error
@@ -372,12 +392,13 @@ def settle_unrecovered_error(
                 retry_count = compression_attempts = 0
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
+        _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", nonretryable_client_error_result(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
-            base_url=_base, model=_model, delivered=_delivered,
+            base_url=_base, model=_model, delivered=_delivered, current_turn_user_idx=current_turn_user_idx,
         ))
 
     over_wait_cap = exceeds_retry_wait_cap(agent, api_error)
@@ -434,7 +455,10 @@ def settle_unrecovered_error(
         if _ladder is not None:
             if _ladder["action"] == "continue":
                 retry_count = 0
+            elif _ladder["action"] == "return":
+                _settle_primary_exit()
             return _verdict(_ladder["action"], _ladder.get("result"))
+        _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", max_retries_exhausted_result(
             agent, api_error, classified, attempts=attempts_made, is_rate_limited=is_rate_limited,

@@ -117,7 +117,7 @@ async def test_restore_local_session_yields_while_store_lock_is_held(monkeypatch
 
     lock = threading.Lock()
     entered, release = threading.Event(), threading.Event()
-    sid, live, prepared, adapter = "sid", object(), object(), object()
+    sid, live, prepared, adapter = "sid", SimpleNamespace(source=object()), object(), object()
     seen_threads = []
     authority = object.__new__(SessionAuthority)
     authority.sessions = {sid: live}

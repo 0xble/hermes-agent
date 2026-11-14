@@ -5,7 +5,7 @@ import queue
 from types import SimpleNamespace
 
 import pytest
-import hermes_bootstrap  # noqa: F401 -- initialize dependencies before the real-home I/O guard
+import hermes_bootstrap
 
 from hermes_cli import goals
 

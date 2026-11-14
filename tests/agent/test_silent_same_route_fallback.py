@@ -70,7 +70,7 @@ def test_resolved_fallback_retry_notice_contract(tmp_path, monkeypatch, caplog, 
     agent._disable_streaming = True
     agent.status_callback = lambda _kind, message: emitted.append(message)
 
-    def request(_kwargs):
+    def request(_kwargs, **_stream_callbacks):
         requested.append((agent.provider, agent.model, agent.base_url, agent.api_mode))
         if agent.provider == "custom" and len(requested) <= 3:
             response = httpx.Response(500, request=httpx.Request("POST", endpoint))
@@ -86,6 +86,7 @@ def test_resolved_fallback_retry_notice_contract(tmp_path, monkeypatch, caplog, 
         with (
             caplog.at_level("INFO"),
             patch.object(agent, "_interruptible_api_call", side_effect=request),
+            patch.object(agent, "_interruptible_streaming_api_call", side_effect=request),
             patch("agent.turn_api_error.interruptible_backoff_sleep", return_value=None),
             patch("agent.turn_recovery_autorecover.auto_recover_after_exhaustion", return_value=None),
             patch("agent.anthropic_adapter.build_anthropic_client", return_value=MagicMock()),

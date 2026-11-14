@@ -80,6 +80,8 @@ def recovery_batch(tmp_path, monkeypatch):
     runner.async_session_store = SimpleNamespace(
         load_transcript=AsyncMock(side_effect=lambda sid: histories[sid]),
         clear_turn_active=AsyncMock(side_effect=clear),
+        # Fork per-room silence (33cf2037) reads the room decision before judging the reply.
+        get_session_metadata=AsyncMock(return_value={}),
         recover_interrupted_turns=AsyncMock(side_effect=lambda **_: len(active)))
     try:
         yield SimpleNamespace(runner=runner, adapter=adapter, rows=rows, dbs=dbs, active=active)

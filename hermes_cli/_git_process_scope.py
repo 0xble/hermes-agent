@@ -196,9 +196,7 @@ def _process_repository_dirs(proc: Path) -> set[Path]:
             git_dir = next(args)
         elif arg.startswith("--git-dir="):
             git_dir = arg.partition("=")[2]
-        elif arg == "-c" and _neutral_config(next(args, "")):
-            continue
-        elif arg.startswith("-c") and arg != "-c" and _neutral_config(arg[2:]):
+        elif arg == "-c" and _neutral_config(next(args, "")) or arg.startswith("-c") and arg != "-c" and _neutral_config(arg[2:]):
             continue
         elif arg == "-c" or arg.startswith(("-c", "--config-env", "--work-tree", "--bare")):
             raise ValueError("explicit Git configuration")
@@ -267,9 +265,7 @@ def _unplaced_pack_owner(proc: Path, target: set[Path], repo_root: Path) -> bool
         if arg == "-c":
             if not _neutral_config(next(args, "")):
                 return True
-        elif arg.startswith("-c") and not _neutral_config(arg[2:]):
-            return True
-        elif arg.startswith(("--config", "--work-tree", "--bare", "--git-dir", "--separate-git-dir")):
+        elif arg.startswith("-c") and not _neutral_config(arg[2:]) or arg.startswith(("--config", "--work-tree", "--bare", "--git-dir", "--separate-git-dir")):
             return True
     env = proc.joinpath("environ").read_bytes().split(b"\0")
     for entry in env:

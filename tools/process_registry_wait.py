@@ -53,7 +53,7 @@ def completion_reaches_session(session) -> bool:
     return not parent_session_id and not session_key
 
 
-def plan_for(session, max_timeout: int) -> Tuple[int, str]:
+def plan_for(session, max_timeout: int) -> tuple[int, str]:
     """``wait_plan`` for a registry process session."""
     return wait_plan(bool(session.notify_on_complete), max_timeout,
                      completion_reaches_session=completion_reaches_session(session))
@@ -64,7 +64,7 @@ def wait_plan(
     max_timeout: int,
     *,
     completion_reaches_session: bool = True,
-) -> Tuple[int, str]:
+) -> tuple[int, str]:
     """The single decision for a wait: (default window, guidance after it elapses).
 
     Deferring is safe only when a completion notice will actually arrive: the

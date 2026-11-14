@@ -211,7 +211,7 @@ def test_completion_wins_and_persists_result_before_wall(tmp_path):
 
 @pytest.mark.platforms("macos")
 def test_terminal_commit_survives_worker_death_before_delivery_call(tmp_path):
-    code, row, queued, stored, outputs, recovered, out, err, marker = _run(
+    code, row, queued, _stored, _outputs, recovered, _out, err, marker = _run(
         tmp_path, "delivery-in-flight")
     assert code == 0, (code, row["status"], row["error"], err)
     assert row["status"] == "completed" and row["error"] is None
@@ -244,7 +244,7 @@ def test_watchdog_commit_wins_before_delivery_and_does_not_mark_job_success(tmp_
 
 @pytest.mark.platforms("macos")
 def test_output_persistence_hang_before_commit_times_out(tmp_path):
-    code, row, queued, stored, outputs, recovered, out, err, marker = _run(
+    code, row, queued, _stored, outputs, recovered, _out, err, marker = _run(
         tmp_path, "completion-in-flight")
     assert code == 124, (code, row["status"], row["error"], err)
     assert row["status"] == "failed" and "hard wall-clock timeout" in row["error"]
@@ -255,7 +255,7 @@ def test_output_persistence_hang_before_commit_times_out(tmp_path):
 
 @pytest.mark.platforms("macos")
 def test_completion_not_committed_at_cap_timeout_wins(tmp_path):
-    code, row, queued, stored, outputs, recovered, out, err, marker = _run(
+    code, row, queued, _stored, outputs, recovered, _out, err, marker = _run(
         tmp_path, "commit-in-flight")
     assert code == 124, (code, row["status"], row["error"], err)
     assert row["status"] == "failed" and "hard wall-clock timeout" in row["error"]
@@ -275,7 +275,7 @@ def test_completion_not_committed_at_cap_timeout_wins(tmp_path):
 
 @pytest.mark.platforms("macos")
 def test_timeout_result_is_immutable_across_later_recovery(tmp_path):
-    code, row, queued, stored, outputs, recovered, out, err, _ = _run(tmp_path, "timeout")
+    code, row, queued, stored, _outputs, recovered, out, err, _ = _run(tmp_path, "timeout")
     assert code == 124, (code, row, stored, queued, out, err)
     token = set_hermes_home_override(tmp_path / "profile")
     try:

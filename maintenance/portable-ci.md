@@ -400,7 +400,7 @@ The bounded smoke manifest remains partial. It is never substituted for these
 full Python roots. Historical outcomes in `fork-ci.md` remain historical, not
 current qualification. No installed Hermes runtime is checked or promoted here.
 
-The documentation environment bootstrap preserves its existing checkout-local venv with `uv venv --allow-existing`, so running setup before gate or repeating gate does not fail merely because `.ci/docs-venv` exists. Pinned documentation packages are installed on every setup.
+The v0.23.1 setup uses upstream `scripts/ci/setup_toolchain.py` for verified PM tools and the locked dev/test side environment. Existing local mise pins are bootstrap inputs only. Actual Python, uv, Node, npm and pnpm come from `pm/lock.json`; lane checks validate those exact versions. `scripts/build/node-deps.mjs` prepares every selected pnpm workspace with its frozen lock and native dependency receipt. The standalone website retains `npm ci`. Documentation tools use a PM-owned isolated dependency generation, with its interpreter recorded under `.ci/`, rather than raw uv mutations. Repeated setup reuses only validated generations and dependency receipts. The root npm guard is preserved, and no root npm lockfile is generated.
 
 
 ## Pre-Tip Checkpoint Adaptation (2026-09-30)
@@ -422,3 +422,23 @@ Release-publication corruption tests call the actual `scripts.bundles.release_ar
 Host-specific cases use one native `platforms` marker. Real profile and adapter constructors, explicit selected-payload ownership, an empty completion-parent venv, interpreter-reported base prefixes, and event-controlled probes replace obsolete environment assumptions. Concurrent local transfer fixtures use a threaded HTTP server, preserving the production resolver's IPv4/IPv6 connection behavior. Memory tests exercise actual provider SDK admission and the Hindsight no-install hot-path contract instead of removed dependency bookkeeping. These are fixture adaptations, not waivers of the portable gate or native qualification.
 
 The startup-gate config read uses the repository-required `utf-8-sig` decoding policy. Its safe YAML parser already accepts a BOM, so this correction is a source-policy alignment, not a reproduced runtime decoding failure. The existing public A→B→A startup invariant exercises BOM and BOM-less configurations. Mutable startup-gate fixtures use upstream's `hermes_yaml` owner rather than the removed PyYAML dependency. The historical frozen outbox fixture remains unchanged and its child receives the actual `pyyaml==6.0.3` dependency from that release in a disposable local dependency directory. It does not restore PyYAML to the current runtime or substitute a fake module.
+
+Exact-SHA `bin/ci gate` runs the same bounded static/Node partition locally and
+hosted. Full Python and E2E coverage comes from the hosted shard matrix, which
+`qualification` requires, and landing requires both that check and the local
+receipt, so a receipt never stands in for the matrix. Running every source lane
+locally cannot finish inside the heavy slot's 5400-second hold on this host, so it
+would block every exact-head receipt. Complete local coverage stays available
+through `bin/ci full` and `bin/ci nightly`.
+
+The v0.23.1 reusable `repo-guards.yml` had no caller after the fork replaced upstream `ci.yaml`. The fork gate calls it on the exact PR head with every guard lane enabled, and qualification requires its success. It uses the same standard Ubuntu runner and pinned checkout action as the fork gate, without an external runner service. The reusable-workflow caller regression remains. Static also invokes upstream's lazy-dependency-import and blob-size guards. Two tests of lane orchestration isolate bootstrap-tool lookup while preserving real lane aggregation/retry assertions; dedicated resolver tests still exercise exact, missing and mismatched pins. PM docs generations sit under `.ci/environments/docs`, keeping PM's stable parent lock inside ignored checkout state instead of creating `.locks/.ci.lock` in source.
+
+## v0.23.1 boundary ratchet adoption
+
+The v0.23.1 boundary checker defines its baseline as existing coupling and blocks increases by importing file and target. The frozen fork at `0199aa805a9344e390408ba14672fc458a9ef603` had no repository boundary checker or baseline. Its private-import validator emitted plugin admission warnings. The release introduces that enforced ratchet and its published API registry. The registry removes none of the fork validator's prior public names, and the merged checker and API are unchanged from v0.23.1.
+
+The adoption adds exactly 76 existing fork keys to the release baseline. Running the release's unchanged private-import comparator, import-target resolution and tally rules against the frozen fork's source and module metadata proves every retained key at equal or higher occurrence counts in the same importing files. Telegram standalone sending now belongs to its platform plugin and is reached through the platform registry. That consolidation retires 6 former crossing keys with 16 occurrences, including the old adapter-to-core callback. Two more private crossing keys use the published `gateway.platforms.base` exports of the same reaction and copy-restoration helper objects. These 8 retired keys and their 18 occurrences are absent from the final baseline. No candidate-only coupling is enrolled.
+
+This is the initial accounting of retained fork debt under upstream's existing grandfather rule, not a zero-debt claim or a changed pass condition. The checker, API registry, regression assertions and upstream baseline entries remain intact. Later additions, target substitutions and occurrence increases still fail. Reductions can lower the recorded debt through the checker's normal update route. Each retained behavior remains owned by its maintenance record, including privacy and Hindsight provenance, Telegram delivery and handover, Slack delivery, skill ownership and provider route/cache identity.
+
+Verification uses `python scripts/boundary_lint.py --check` and `scripts/run_tests.sh --file-retries 0 tests/scripts/test_boundary_lint.py`, followed by the full exact-head source gate. The frozen-source comparator evidence is retained with the v0.23.1 preparation result outside Git.

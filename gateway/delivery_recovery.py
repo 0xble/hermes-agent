@@ -253,13 +253,16 @@ class RuntimeDeliveryRecoveryMixin:
             text = None
             supervisor_checkin = False
             try:
+                decision = await self.async_session_store.get_session_metadata(
+                    key, "room_silence_decision", {})
                 history = await self.async_session_store.load_transcript(session_id)
                 visible = [message for message in history if isinstance(message, dict)
                            and message.get("role") not in ("session_meta", "system")]
                 prompt = next((message for message in reversed(visible[:-1])
                                if message.get("role") == "user"), {})
                 supervisor_checkin = prompt.get("display_kind") == DISPLAY_KIND
-                text = self._crash_left_reply(history, started, origin)
+                text = self._crash_left_reply(history, started, origin,
+                                              silence_decision=decision, active_token=token)
                 if text is None or (text and not ledger_on):
                     continue  # no final reply to deliver: the turn resumes
                 if text and not await permits_recovery(

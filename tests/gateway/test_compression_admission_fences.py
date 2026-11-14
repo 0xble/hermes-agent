@@ -12,7 +12,7 @@ from tests.gateway.test_compression_admission_retry import _cleanup, _owner, _ro
 @pytest.mark.asyncio
 @pytest.mark.parametrize('fence', ['restart', 'new-epoch'])
 async def test_compression_release_rechecks_fences(monkeypatch, tmp_path, fence):
-    runner, adapter, owner, source, ref, key = await _owner(monkeypatch, tmp_path)
+    runner, adapter, owner, source, ref, _key = await _owner(monkeypatch, tmp_path)
     sid, db = ref.session_id, owner.db
     assert db.try_acquire_compression_lock(sid, 'fixture-compressor')
     deferred, checking, release = asyncio.Event(), asyncio.Event(), asyncio.Event()

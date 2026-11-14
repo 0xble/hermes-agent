@@ -34,7 +34,7 @@ class GatewayStartupSecretsMixin:
         """A platform connected, so the backend recovered; forget the retry budget."""
         try:
             self._transient_exit_streak_path().unlink(missing_ok=True)
-        except Exception:  # noqa: BLE001 — bookkeeping never blocks startup
+        except Exception:
             pass
 
     @staticmethod
@@ -75,5 +75,5 @@ class GatewayStartupSecretsMixin:
             # This gateway's OWN home: secondary-profile hydration runs between the connect
             # results and this decision, and answers only for the home it hydrated.
             return last_apply_had_transient_failure(get_hermes_home())
-        except Exception:  # noqa: BLE001 — never let this probe block the exit path
+        except Exception:
             return False

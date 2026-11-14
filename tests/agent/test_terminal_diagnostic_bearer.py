@@ -28,7 +28,7 @@ def _run_isolated(enabled, script):
             capture_output=True,
             text=True,
             timeout=30,
-        )
+         check=False)
         assert result.returncode == 0, result.stdout + result.stderr
 
 

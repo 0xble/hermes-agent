@@ -142,7 +142,16 @@ so neither satisfies this delivery contract. The selected correction reuses the
 native policy and payload, not a new flag or renderer. No new upstream PR was
 opened; this is an upstreamable, fork-first consumer fix.
 
-**Retirement:** remove the adaptation when a released upstream standalone sender
+**v0.23.1 adoption:** upstream now owns standalone dispatch through the platform registry and
+`plugins/platforms/telegram/standalone.py`, with `telegram_outbound.py` sharing its rich and
+album policy. The duplicate core sender and adapter-to-core wrapper are retired. The fork
+keeps only uncovered behavior at that plugin owner: short bounded rich flood retries,
+stale-topic removal across fallback, rich text with attachments, accepted-text receipts after
+attachment failure, plain/intact copy blocks, durable metering and the MarkdownV2 indicator
+reserve. Upstream's notification, invisible-text, proxy/server, HTML and album behavior stays
+in place. Direct tests patch the plugin owner and pass rich options through `extra`.
+
+**Retirement:** remove the remaining adaptation when a released upstream standalone sender
 passes the same mode, routing, no-duplicate, and budget regressions.
 **Rollback:** revert this patch; no config or data migration is required.
 

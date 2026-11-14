@@ -27,7 +27,7 @@ from typing import Any, Callable, Optional, TYPE_CHECKING
 from hermes_cli._subprocess_compat import windows_hide_flags
 
 if TYPE_CHECKING:
-    from cron.scheduler_cancel import _CancelEventLike
+    from cron.cancellation import _CancelEventLike
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
@@ -148,14 +148,20 @@ def _posix_cron_script_argv(script: Path) -> tuple[list[str], dict[str, str]]:
     Lazy installs are off for the script's process tree: a script importing ``hermes_bootstrap``
     could otherwise complete a source update and ``execv`` itself onto the bare store Python."""
     from hermes_cli._launchers import resolve_store_python
-    from pm.environments import project_python
+    from pm.environments import project_python, venv_python
 
     repo = Path(__file__).resolve().parents[1]
     if resolve_store_python(repo) is None:
         return [sys.executable, str(script)], {}
-    # project_python, not committed_venv as on Windows: a pre-PM venv selected before the first
-    # commit runs on its OWN interpreter here, so there is no ABI mix (#122183).
-    python = project_python(repo)
+    # Snapshot imports belong to their own generation, whose venv is a sibling of workspace.
+    # Asking project_python for the snapshot treats it as a new install (workspace/venv),
+    # while consulting the owning checkout could select a newer, incompatible generation.
+    if (repo.name == "workspace" and repo.parent.parent.name == "environments"
+            and (repo.parent / ".lease-managed").is_file()):
+        python = venv_python(repo.parent / "venv")
+    else:
+        # A pre-PM venv runs on its OWN interpreter here, so there is no ABI mix (#122183).
+        python = project_python(repo)
     if not python.is_file():
         # The caller's interpreter is the bare store Python here — the #123044 failure mode.
         raise RuntimeError(f"dependency environment interpreter is missing: {python}")
@@ -532,6 +538,7 @@ def _run_job_script(
         # or stderr raises UnicodeDecodeError in communicate() and fails the whole run,
         # discarding the output (#105582; the Windows branch decodes lossily per #45099).
         popen_kwargs: dict[str, Any] = {
+            # detached-spawn: ok — awaited; cancel and timeout tree-kill the group
             "start_new_session": True,
             "errors": "replace",
         }
@@ -583,7 +590,8 @@ def _run_job_script(
                 _terminate_cron_script_tree(proc)
                 _sweep_detached_script_orphans()
                 _drain_script_pipes(proc)
-                return False, ("Script cancelled because cron fire ownership was lost "
+                from cron.cancellation import cancel_reason
+                return False, (f"Script cancelled: {cancel_reason(cancel_event)} "
                                f"(exit code {proc.returncode if proc.returncode is not None else 'unknown'})")
             remaining = deadline - time.monotonic()
             if remaining <= 0:

@@ -88,7 +88,7 @@ def test_forward_identical_degradation_across_three_releases(tmp_path, monkeypat
 
 @pytest.mark.parametrize("operation", ["rollback", "restore"])
 def test_exhausted_recovery_preflight_still_reloads(tmp_path, monkeypatch, caplog, operation):
-    home, a, b = pair(tmp_path, monkeypatch)
+    home, a, _b = pair(tmp_path, monkeypatch)
     other = home / "profiles/other"
     other.mkdir(parents=True)
     (other / "config.yaml").write_text("memory: {provider: fixture}\n", encoding="utf-8")
@@ -121,7 +121,7 @@ def test_exhausted_recovery_preflight_still_reloads(tmp_path, monkeypatch, caplo
 
 @pytest.mark.parametrize("operation", ["rollback", "restore"])
 def test_recover_pending_recovery_transaction_keeps_probes_advisory(tmp_path, monkeypatch, caplog, operation):
-    home, a, b = pair(tmp_path, monkeypatch)
+    home, a, _b = pair(tmp_path, monkeypatch)
     provider(a, crash=True)
     with monkeypatch.context() as context:
         context.setattr(releases, "_run_transaction", lambda *args, **kwargs: {})
@@ -133,7 +133,7 @@ def test_recover_pending_recovery_transaction_keeps_probes_advisory(tmp_path, mo
 
 def test_guardian_restore_reloads_even_when_provider_probe_crashes(tmp_path, monkeypatch, caplog):
     from hermes_cli import gateway_guardian as guardian
-    home, a, b = pair(tmp_path, monkeypatch)
+    home, a, _b = pair(tmp_path, monkeypatch)
     provider(a, crash=True)
     body = plistlib.dumps({"Label": "fixture"})
     plist = home / "gateway.plist"

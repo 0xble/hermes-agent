@@ -82,15 +82,15 @@ DEFAULT_TRAILER_FLOOR_SUBJECT = "fix(tools): record the search process group bef
 # Trailer identities that name records rather than runtime patches; they need no unit owner.
 RECORD_IDENTITIES = frozenset({"evidence"})
 # One trailer per line; a commit may carry several. The identity is the text before the first ``;``.
-_TRAILER = re.compile(r"^Fork-Patch:[ \t]*(?P<identity>[^;\s][^;\n]*?)[ \t]*(?:;.*)?$", re.M)
+_TRAILER = re.compile(r"^Fork-Patch:[ \t]*(?P<identity>[^;\s][^;\n]*?)[ \t]*(?:;.*)?$", re.MULTILINE)
 # A unit owns an identity by naming it as a backticked token on an identity line: a line whose text
 # before the first backtick mentions "identit" (``Fork patch identity:``, ``identities:`` ...) or a
 # continuation line of such a list. Ordinary code spans (paths, config keys, commands) do not own.
 _OWNED_TOKEN = re.compile(r"`([^`\n]+)`")
-_IDENTITY_LINE = re.compile(r"identit", re.I)
+_IDENTITY_LINE = re.compile(r"identit", re.IGNORECASE)
 # A unit pins the behavioural tests that prove its fork behaviour as backticked pytest targets on a
 # ``Contract tests:`` line (or its indented continuation): ``tests/x.py`` or ``tests/x.py::test_name``.
-_CONTRACT_LINE = re.compile(r"^[-*\s]*(?:\*\*)?Contract tests?:", re.I)
+_CONTRACT_LINE = re.compile(r"^[-*\s]*(?:\*\*)?Contract tests?:", re.IGNORECASE)
 _CONTRACT_TARGET = re.compile(r"^(?P<path>tests/[\w./-]+\.py)(?P<nodes>(?:::\w+)*)$")
 MAINTENANCE_ROOT = "MAINTENANCE.md"
 MAINTENANCE_DIR = "maintenance"
@@ -105,13 +105,13 @@ def _git_raw(*args: str) -> str:
 
 
 def _is_git_checkout() -> bool:
-    return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True).returncode == 0
+    return subprocess.run(["git", "-C", str(REPO), "rev-parse", "--git-dir"], capture_output=True, check=False, timeout=30).returncode == 0
 
 
 def _has_revision(revision: str) -> bool:
     return subprocess.run(
         ["git", "-C", str(REPO), "cat-file", "-e", f"{revision}^{{commit}}"], capture_output=True,
-    ).returncode == 0
+     check=False).returncode == 0
 
 
 def _maintenance_texts(revision: str = "HEAD") -> list[str]:
@@ -264,7 +264,7 @@ def _verification_revision(home: Path) -> tuple[str, str, str | None]:
 def _is_ancestor(sha: str, revision: str = "HEAD") -> bool:
     return subprocess.run(
         ["git", "-C", str(REPO), "merge-base", "--is-ancestor", sha, revision], capture_output=True,
-    ).returncode == 0
+     check=False).returncode == 0
 
 
 def _resolve_floor(floor: str, baseline: str, subject: str | None, revision: str = "HEAD") -> tuple[str | None, str | None]:
@@ -302,7 +302,7 @@ def check_trailers(baseline: str, floor: str | None = None, floor_subject: str |
     # blanket floor. Stable patch IDs retain exact content coverage after a rebase.
     backfills = {}
     for text in _maintenance_texts(contract):
-        for patch_id, identity in re.findall(r"^Fork-Patch-Backfill: ([0-9a-f]{40}); ([^\n]+)$", text, re.M):
+        for patch_id, identity in re.findall(r"^Fork-Patch-Backfill: ([0-9a-f]{40}); ([^\n]+)$", text, re.MULTILINE):
             backfills[patch_id] = identity.strip()
     # Classify fork commits after the floor, excluding the verified upstream release
     # ancestry. A release merge introduces upstream commits without fork trailers.
@@ -343,7 +343,7 @@ def check_extensions(home: Path) -> list[str]:
         return failures
     probe = (
         "import hermes_cli.plugins as pm; pm.discover_plugins(force=True); from tools.registry import registry; "
-        "import json; print(json.dumps({t: bool(registry.get_entry(t)) for t in %r}))" % (EXTENSION_TOOLS,)
+        f"import json; print(json.dumps({{t: bool(registry.get_entry(t)) for t in {EXTENSION_TOOLS!r}}}))"
     )
     context = _runtime_context(home)
     if isinstance(context, str):
@@ -351,7 +351,7 @@ def check_extensions(home: Path) -> list[str]:
     python, code_root = context
     env = _runtime_env(home, code_root)
     run = subprocess.run([str(python), "-c", probe], cwd=str(code_root), env=env,
-                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180)
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=180, check=False)
     if run.returncode != 0:
         return [f"plugin discovery probe failed: {run.stderr.strip()[-400:]}"]
     try:
@@ -371,7 +371,7 @@ def check_config(home: Path) -> list[str]:
     env = _runtime_env(home, code_root)
     for key, expected in EXPECTED_CONFIG.items():
         run = subprocess.run([str(python), "-m", "hermes_cli.main", "config", "get", key], cwd=str(code_root), env=env,
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120)
+                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
         value = (run.stdout.strip().splitlines() or [""])[-1].strip()
         if expected is None:
             if run.returncode != 0 or not value or value.lower() in ("none", "null", ""):

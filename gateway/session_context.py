@@ -37,7 +37,7 @@ _SESSION_VARS = (
     _SESSION_USER_NAME, _SESSION_SCOPE_ID, _SESSION_KEY, _SESSION_ID,
     _SESSION_UI_SESSION_ID, _SESSION_MESSAGE_ID, _SESSION_PROFILE,
     _BROWSER_CONTROL_PRINCIPAL, _BROWSER_CONTROL_TRANSPORT_FAMILY, _CRON_SESSION, _SESSION_PARENT_CHAT_ID,
-    _TURN_ORIGIN,
+    _TURN_ORIGIN, _SESSION_ACTOR_ID, _SESSION_ACTOR_NAME,
 ) = tuple(ContextVar(name, default=_UNSET) for name in (
     "HERMES_SESSION_PLATFORM", "HERMES_SESSION_SOURCE", "HERMES_SESSION_CHAT_ID",
     "HERMES_SESSION_CHAT_TYPE", "HERMES_SESSION_CHAT_NAME", "HERMES_SESSION_THREAD_ID",
@@ -46,7 +46,14 @@ _SESSION_VARS = (
     "HERMES_UI_SESSION_ID", "HERMES_SESSION_MESSAGE_ID", "HERMES_SESSION_PROFILE",
     "HERMES_BROWSER_CONTROL_PRINCIPAL", "HERMES_BROWSER_CONTROL_TRANSPORT_FAMILY",
     "HERMES_CRON_SESSION", "HERMES_SESSION_PARENT_CHAT_ID", "HERMES_TURN_ORIGIN",
+    "HERMES_SESSION_ACTOR_ID", "HERMES_SESSION_ACTOR_NAME",
 ))
+
+# The MessageEvent of the running gateway turn. Another sender's input folded into the running turn
+# (steer, redirect) clears its user in place (``absorb_turn_input``); the worker's copied ACTOR vars
+# cannot change from outside, so ``get_session_env`` re-reads the actor through it.
+_SESSION_TURN_EVENT: ContextVar[Any] = ContextVar("HERMES_SESSION_TURN_EVENT", default=None)
+_ACTOR_VAR_NAMES = frozenset({"HERMES_SESSION_ACTOR_ID", "HERMES_SESSION_ACTOR_NAME"})
 
 # Whether this channel can route an ASYNC completion back AFTER the turn ends (see
 # ``async_delivery_supported()``).  _UNSET => supported (CLI, contextvar-unaware paths); stateless
@@ -104,6 +111,24 @@ def scoped_current_session_id(session_id: str | None = None) -> Iterator[None]:
         yield
     finally:
         _SESSION_ID.set(previous)
+
+
+@contextmanager
+def scoped_turn_actor(event: Any, turn: Any) -> Iterator[None]:
+    """Bind *event*'s sender as the actor of a turn run inside an already bound one (a queued follow-up
+    drained as the next turn), restoring the outer turn's actor on exit. The sender rides on the event,
+    else its source (``MessageEvent.sender_id``). *turn* (the session slot's ``TurnState``) runs *event*
+    meanwhile, so a steer or redirect folds into (and clears the actor of) the event read here."""
+    actor = event if getattr(event, "user_id", None) is not None else getattr(event, "source", None)
+    tokens = ((_SESSION_ACTOR_ID, _SESSION_ACTOR_ID.set(str(getattr(actor, "user_id", None) or ""))),
+              (_SESSION_ACTOR_NAME, _SESSION_ACTOR_NAME.set(str(getattr(actor, "user_name", None) or ""))),
+              (_SESSION_TURN_EVENT, _SESSION_TURN_EVENT.set(event)))
+    try:
+        with turn.running_follow_up(event):
+            yield
+    finally:
+        for var, token in reversed(tokens):
+            var.reset(token)
 
 
 @contextmanager
@@ -212,6 +237,7 @@ def set_session_vars(
     browser_control_transport_family: str = "", cwd: str = "", async_delivery: bool = True,
     ui_session_id: str = "", cron_session: Any = _UNSET, parent_chat_id: str = "",
     session_history_delivery: str | None = None, turn_origin: str = "unknown",
+    actor_id: str | None = None, actor_name: str | None = None, turn_event: Any = None,
 ) -> list:
     """Set all session context variables and return reset tokens.  Call
     ``clear_session_vars(tokens)`` in a ``finally``; not nestable, clearing resets every var
@@ -229,10 +255,12 @@ def set_session_vars(
         user_name, scope_id, session_key, session_id, ui_session_id, message_id, profile,
         browser_control_principal, browser_control_transport_family, cron_session, parent_chat_id,
         turn_origin if turn_origin in _TURN_ORIGINS else "unknown",
+        user_id if actor_id is None else actor_id, user_name if actor_name is None else actor_name,
     )
     tokens = [var.set(value) for var, value in zip(_SESSION_VARS, values)]
     tokens.append(_SESSION_ASYNC_DELIVERY.set(bool(async_delivery)))
     tokens.append(_SESSION_HISTORY_DELIVERY.set(_UNSET if session_history_delivery is None else session_history_delivery))
+    tokens.append(_SESSION_TURN_EVENT.set(turn_event))
     _runtime_cwd("set_session_cwd", cwd)
     return tokens
 
@@ -259,6 +287,7 @@ def clear_session_vars(tokens: list) -> None:
         var.set("")
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _SESSION_TURN_EVENT.set(None)
     _runtime_cwd("clear_session_cwd")
 
 
@@ -272,14 +301,24 @@ def reset_session_vars() -> None:
         var.set(_UNSET)
     _SESSION_ASYNC_DELIVERY.set(_UNSET)
     _SESSION_HISTORY_DELIVERY.set(_UNSET)
+    _SESSION_TURN_EVENT.set(None)
     _runtime_cwd("clear_session_cwd")
+
+
+def _bound_session_value(name: str) -> Any:
+    """The value of *name*'s ContextVar as this turn sees it, ``_UNSET`` if never bound here. The one
+    reader for in-process lookups and child-process env alike, so a script and an approval agree on
+    who asked."""
+    if name in _ACTOR_VAR_NAMES and getattr(_SESSION_TURN_EVENT.get(), "user_id", None) == "":
+        return ""  # another sender's input joined the running turn: it has no single actor any more
+    var = _VAR_MAP.get(name)
+    return _UNSET if var is None else var.get()
 
 
 def get_session_env(name: str, default: str = "") -> str:
     """Read a session var by legacy ``HERMES_SESSION_*`` name; drop-in for os.getenv.  The
     ContextVar wins if ever set here (even to ``""``); else ``os.environ``; else *default*."""
-    var = _VAR_MAP.get(name)
-    if var is not None and (value := var.get()) is not _UNSET:
+    if (value := _bound_session_value(name)) is not _UNSET:
         return value
     return os.getenv(name, default)
 

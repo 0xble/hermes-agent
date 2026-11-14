@@ -8,7 +8,7 @@ import pytest
 
 from gateway.session import SessionSource
 from gateway.session_authority import LiveSession, SessionAuthority
-from gateway.session_contract import Principal, SessionRef, Submission
+from gateway.session_contract import SessionActor, SessionRef, Submission
 from gateway.config import Platform
 from hermes_state import SessionDB
 from hermes_state_runtime import admit_session_input, claim_session_input, list_session_admissions, settle_session_input
@@ -64,7 +64,7 @@ async def test_submit_persists_viewer_provenance_and_restart_accepts_it(monkeypa
         authority._publish_pending = lambda ref: None
         authority._schedule = lambda ref: None
 
-        actor = Principal(
+        actor = SessionActor(
             "authenticated-viewer", "default", frozenset({"session:submit"}), "viewer")
         await authority.submit(
             actor,

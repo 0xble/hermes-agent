@@ -43,6 +43,7 @@ async def test_approval_pause_answer_resumes_original_surface(monkeypatch, platf
     runner, turn, event, refresh_metadata = _turn(platform, adapter)
     monkeypatch.setattr("gateway.run_turn_runner_approval_settle.register_timeout_notice", lambda *a, **k: None)
     monkeypatch.setattr("tools.approval.resolve_gateway_approval", lambda *a, **k: 1)
+    monkeypatch.setattr("tools.approval.resolve_gateway_approval_card", lambda *a, **k: 1)
 
     def schedule(coro, reason):
         coro.close()
@@ -57,7 +58,8 @@ async def test_approval_pause_answer_resumes_original_surface(monkeypatch, platf
     assert adapter._typing_is_paused("D123", refresh_metadata), "prompt did not pause the refresh transport"
     reply = MessageEvent(text=f"/{answer}", source=event.source, message_id="172.2")
     if answer == "relay":
-        await adapter._resolve_exec_approval({"session_key": "session"}, "once", "D123", {})
+        from gateway.relay.prompt_resolvers import resolve_exec_approval
+        await resolve_exec_approval(adapter, {"session_key": "session"}, "once", "D123", {})
     else:
         await runner._deliver_approval_confirmation(reply, "resolved", answer)
     assert not adapter._typing_is_paused("D123", refresh_metadata), "answer resumed its own route instead of the paused turn"

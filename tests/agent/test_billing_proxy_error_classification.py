@@ -161,18 +161,25 @@ class _Agent:
     [FailoverReason.billing, FailoverReason.auth, FailoverReason.rate_limit,
      FailoverReason.content_policy_blocked],
 )
-def test_classified_nonoverflow_400_persists_a_large_failed_session(reason):
+def test_classified_nonoverflow_400_preserves_only_accepted_session_history(reason):
     error = _ProxyError("HTTP 400 rejected request", 400)
     classified = ClassifiedError(reason=reason, status_code=400, retryable=False)
     agent = _Agent()
     agent._persist_session = Mock()
-    nonretryable_client_error_result(
+    history = [{"role": "user", "content": "earlier"}, {"role": "assistant", "content": "ok"}]
+    messages = history + [{"role": "user", "content": "continue"}]
+    result = nonretryable_client_error_result(
         agent, error, classified, status_code=400, api_kwargs=None, api_messages=[{}] * 81,
-        messages=[{"role": "user", "content": "continue"}], conversation_history=[{}] * 60,
+        messages=messages, conversation_history=list(messages), current_turn_user_idx=len(history),
         api_call_count=1, approx_tokens=100_000, provider="custom:claude-proxy",
         base_url="http://127.0.0.1:8317/v1", model="claude-opus-5-5",
     )
-    agent._persist_session.assert_called_once()
+    if reason is FailoverReason.content_policy_blocked:
+        # Upstream drops refused turns so the next request cannot replay the same refusal.
+        agent._persist_session.assert_not_called()
+        assert result["messages"] == history
+    else:
+        agent._persist_session.assert_called_once()
 
 
 @pytest.mark.parametrize(

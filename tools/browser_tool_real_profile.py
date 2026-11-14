@@ -202,8 +202,10 @@ def _launch_real_profile_chrome(real_binary: str, copy_dir: str) -> tuple[Option
     if not (_cloud._is_headed_mode() and (_has_display or not sys.platform.startswith("linux"))):
         chrome_argv.append("--headless=new")
     try:
-        chrome_proc = subprocess.Popen(chrome_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       stdin=subprocess.DEVNULL, start_new_session=True, env=browser_env)
+        chrome_proc = subprocess.Popen(
+            chrome_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            # detached-spawn: ok — tracked in _real_profile_chrome_procs and terminated by _terminate_real_profile_chrome on close and exit
+            start_new_session=True, env=browser_env)
     except (subprocess.SubprocessError, OSError) as e:
         return None, f"{_RP}the launch failed: {e}"
     _bt._real_profile_chrome_procs.append(chrome_proc)

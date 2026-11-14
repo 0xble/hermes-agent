@@ -7,8 +7,8 @@ import pytest
 
 pytest.importorskip("telegram.ext", reason="python-telegram-bot not installed")
 
-from gateway.platforms.base import in_ingress_consumer  # noqa: E402
-from plugins.platforms.telegram.update_admission import TelegramApplication  # noqa: E402
+from gateway.platforms.base import in_ingress_consumer
+from plugins.platforms.telegram.update_admission import TelegramApplication
 
 
 @pytest.mark.asyncio

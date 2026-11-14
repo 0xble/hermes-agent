@@ -683,5 +683,5 @@ def test_gateway_watcher_never_injects_an_unproven_terminal_result(tmp_path, mon
     asyncio.run(runner._async_delegation_watcher(interval=0))
     adapter.handle_message.assert_not_awaited()
     assert q.empty()
-    assert list(ad._unresolved.values())[0]["results"] == _result("consumer loser")["results"], "held, not lost"
+    assert next(iter(ad._unresolved.values()))["results"] == _result("consumer loser")["results"], "held, not lost"
     assert _row(record["delegation_id"])[1] == "pending"

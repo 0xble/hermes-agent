@@ -72,6 +72,8 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         elif not api_mode_explicit and api_mode == "chat_completions":
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
 
+    from agent.route_verdicts import reset_route_verdicts, save_primary_route_verdicts
+    save_primary_route_verdicts(agent)  # before the swap: stamped with the endpoint that earned them
     old_model, old_provider, old_base_url = agent.model, agent.provider, agent.base_url
     # Everything below mutates the live route; a failure restores the exact pre-bind objects so
     # the caller never keeps a half-bound route pointing at a closed candidate client.
@@ -86,8 +88,7 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     agent._reasoning_echo_flag = bool(entry.get("reasoning_echo", False))
     if hasattr(agent, "_transport_cache"):
         agent._transport_cache.clear()
-    from agent.turn_recovery_codex import reset_codex_reasoning_replay
-    reset_codex_reasoning_replay(agent)
+    reset_route_verdicts(agent)
     agent._fallback_activated = True
 
     compressor = getattr(agent, "context_compressor", None)
@@ -137,8 +138,8 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
         _apply_primary_runtime_fields, _rebuild_primary_client, _restore_runtime_capabilities,
     )
     _apply_primary_runtime_fields(agent, rt)
-    from agent.turn_recovery_codex import reset_codex_reasoning_replay
-    reset_codex_reasoning_replay(agent)
+    from agent.route_verdicts import reset_route_verdicts
+    reset_route_verdicts(agent)
     _restore_runtime_capabilities(agent, rt)
     agent._use_prompt_caching = rt["use_prompt_caching"]
     # Default to native layout for snapshots predating the native-vs-proxy split.
@@ -158,7 +159,7 @@ def reinstall_runtime_snapshot(agent: Any, rt: dict[str, Any]) -> None:
     )
     # Same rule as fallback activation: refresh an existing verdict only; never-probed sessions stay lazy.
     if getattr(agent, "_compression_feasibility_checked", False) is True:
-        from agent.conversation_compression import revalidate_compression_feasibility
+        from agent.conversation_compression_feasibility import revalidate_compression_feasibility
         revalidate_compression_feasibility(agent)
     # Older snapshots have no reasoning_config; keep the current value.
     saved_reasoning = rt.get("reasoning_config")
@@ -204,6 +205,8 @@ def reinstall_primary_runtime(
         else:
             agent.reasoning_override = None
     agent._pre_fallback_reasoning_override = None
+    from agent.route_verdicts import restore_primary_route_verdicts
+    restore_primary_route_verdicts(agent, rt)
     agent._fallback_activated = False
     agent._active_fallback_entry = None
     agent._fallback_stay_started_at = None

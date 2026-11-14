@@ -48,10 +48,10 @@ def _git(args, cwd, timeout: float = 10, *, tree_timeout: bool = False, **kwargs
         # run(timeout=) kills/reaps only git worktree add, leaving its checkout
         # child holding index.lock. Keep the parent alive until the whole group
         # is killed, then reap it before failed-add ownership checks run.
-        group_kw = ({"start_new_session": True} if os.name == "posix" else
-                    {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP})
+        from hermes_cli.process_identity import spawn_owned, release_process_group_once_empty
+        group_kw = {} if os.name == "posix" else {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
         check = kwargs.pop("check", False)
-        proc = subprocess.Popen(["git", *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        proc = spawn_owned(["git", *args], purpose="worktree-git", stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                 text=True, encoding="utf-8", errors="replace", cwd=cwd,
                                 **group_kw, **kwargs)
         try:
@@ -60,6 +60,8 @@ def _git(args, cwd, timeout: float = 10, *, tree_timeout: bool = False, **kwargs
             kill_and_drain(proc, 10)
             proc.wait(timeout=10)
             raise
+        finally:
+            release_process_group_once_empty(proc.pid, proc=proc, timeout=0)
         result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
         if check:
             result.check_returncode()
@@ -1018,11 +1020,7 @@ def _unlock_owned_worktree(repo_root: str, worktree_path: str, timeout: int = 10
         elif reason == "initializing" and initializing_before is not None:
             if not _initializing_worktree_is_dead(worktree_path, initializing_before):
                 return False
-        elif _HERMES_LOCK_RE.fullmatch(reason) is None:
-            return False
-        elif failed_add and reason.split(" ", 2)[1] != f"pid={os.getpid()}":
-            return False
-        elif dead_only and _worktree_lock_is_live(repo_root, worktree_path, timeout) != "dead":
+        elif _HERMES_LOCK_RE.fullmatch(reason) is None or failed_add and reason.split(" ", 2)[1] != f"pid={os.getpid()}" or dead_only and _worktree_lock_is_live(repo_root, worktree_path, timeout) != "dead":
             return False
         # The holder probe may take time; a foreign takeover must still win.
         if _worktree_lock_reason(repo_root, worktree_path, timeout) != (found, reason):

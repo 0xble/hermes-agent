@@ -107,7 +107,7 @@ def test_bot_chat_silence_reaches_real_goal_judge_and_loop_bookkeeping(server, t
     # A second identical quiet tick must back off without invoking the loop's until judge.
     loop.state.last_response_digest = loops._digest_response(marker)
     loop._save()
-    initial_delay = loop.state.current_delay
+    _initial_delay = loop.state.current_delay
     calls, followups, receipts = [], [], []
     _stub_judge(monkeypatch, {"verdict": "continue", "reason": "still waiting"}, calls)
     monkeypatch.setattr(server, "_run_post_turn_followups", lambda *args: followups.append(args[-1]))

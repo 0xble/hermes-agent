@@ -1,7 +1,10 @@
 """Real candidate web packaging coverage for immutable release staging."""
 from __future__ import annotations
 
+import os
+import shutil
 import subprocess
+from types import SimpleNamespace
 import uuid
 from pathlib import Path
 
@@ -15,7 +18,7 @@ def _git(source: Path, *args: str) -> str:
 
 
 @pytest.mark.platforms("macos")
-def test_real_candidate_web_build_from_staged_revision(tmp_path):
+def test_real_candidate_web_build_from_staged_revision(tmp_path, monkeypatch):
     """The production candidate web build must emit the staged revision's bundle.
 
     The staged commit carries a marker the source working tree lacks, and the
@@ -46,6 +49,15 @@ def test_real_candidate_web_build_from_staged_revision(tmp_path):
     staging = tmp_path / "staging"
     releases._stage_git_tree(source, staging, sha)
 
+    # Tool acquisition is covered by PM. Keep this proof on the real archived
+    # workspace and compiler, using the runner's prepared Node and pnpm.
+    node, pnpm = shutil.which("node"), shutil.which("pnpm")
+    assert node and pnpm, "candidate web build requires the prepared Node and pnpm"
+    path = os.pathsep.join([str(Path(node).parent), str(Path(pnpm).parent), os.environ["PATH"]])
+    monkeypatch.setattr("pm.prepare_tools", lambda _names, *, out, target: out)
+    monkeypatch.setattr("pm.build_operations.verified_tools", lambda *_args, **_kwargs: SimpleNamespace(
+        environment=lambda env: {**env, "PATH": path},
+    ))
     releases._build_candidate_web(staging)
 
     built = (staging / "hermes_cli" / "web_dist" / "index.html").read_text(encoding="utf-8")

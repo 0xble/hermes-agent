@@ -33,7 +33,7 @@ class _IntegerTimeoutEnvironment(BaseEnvironment):
             result = subprocess.run(
                 [bash, "-c", cmd_string], input=stdin_data,
                 capture_output=True, text=True, cwd=self.cwd, timeout=timeout,
-            )
+             check=False)
             return result.stdout + result.stderr, result.returncode
 
         return _ThreadedProcessHandle(execute)

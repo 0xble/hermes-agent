@@ -258,10 +258,9 @@ class TestRegistryResolution:
 class TestFirecrawlScrapeTimeout:
     """Verify the server-side scrape timeout matches the asyncio deadline."""
 
-    @pytest.mark.parametrize("address, content", [("93.184.216.34", "content"), ("198.18.4.8", "")])
+    @pytest.mark.parametrize("address, content", [("93.184.216.34", "content"), ("10.18.4.8", "")])
     def test_extract_passes_timeout_ms_to_scrape(
-        self, monkeypatch: pytest.MonkeyPatch, address: str, content: str,
-    ) -> None:
+        self, monkeypatch: pytest.MonkeyPatch, address: str, content: str, public_dns) -> None:
         """scrape() must receive timeout=60000 (ms) so the server-side
         deadline matches the 60 s asyncio.wait_for deadline.  Without this
         the API uses its 30 s default, causing SCRAPE_TIMEOUT."""
@@ -293,7 +292,7 @@ class TestFirecrawlScrapeTimeout:
             assert host == "example.com"
             return [(socket.AF_INET, socket.SOCK_STREAM, socket.IPPROTO_TCP, "", (address, 443))]
 
-        monkeypatch.setattr(socket, "getaddrinfo", resolve)
+        monkeypatch.setattr("tools.url_safety._getaddrinfo", resolve)
         p = firecrawl_provider.FirecrawlWebSearchProvider()
         results = asyncio.run(p.extract(["https://example.com"]))
 

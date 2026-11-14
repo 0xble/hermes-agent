@@ -9,7 +9,7 @@ import pytest
 
 def test_delivery_manager_waits_for_inflight_background_discovery(monkeypatch):
     """A discovered flag is published before loading finishes; hooks must wait for the worker."""
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     class Manager:
         _discovered = _discovery_complete = True
@@ -32,7 +32,7 @@ def test_finished_startup_sweep_still_allows_lazy_discovery(monkeypatch, sweep_e
     """Once the startup worker has exited, lazy discovery may recover the manager."""
     import threading
 
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     class Manager:
         _discovered = False
@@ -57,7 +57,7 @@ def test_tool_dispatch_blocks_until_discovery_finishes_then_honors_veto(monkeypa
     import json
     import threading
 
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
     import model_tools
 
     manager = plugins.PluginManager()
@@ -117,7 +117,7 @@ def _inflight_discovery(monkeypatch):
     """Register late only when a delivery joins the in-flight discovery worker."""
     import threading
 
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
     from tests.plugin_helpers import mark_plugin_discovery_started
 
     manager = plugins.PluginManager()
@@ -169,7 +169,7 @@ def test_concurrent_first_delivery_waits_for_sibling_foreground_discovery(monkey
     """Independent deliveries wait for discovery, without colliding in the callback gate."""
     import threading
 
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
     entered, release = threading.Event(), threading.Event()
@@ -249,7 +249,7 @@ def test_concurrent_first_delivery_waits_for_sibling_foreground_discovery(monkey
 async def test_ready_async_delivery_preserves_inline_ingress_order(monkeypatch):
     import asyncio
 
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
     from tests.plugin_helpers import mark_plugin_discovery_complete
 
     manager = plugins.PluginManager()
@@ -273,7 +273,7 @@ def test_async_delivery_does_not_block_the_event_loop_on_discovery_lock(monkeypa
     import asyncio
     import threading
 
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
     entered, release, waiting = threading.Event(), threading.Event(), threading.Event()
@@ -333,7 +333,7 @@ def test_async_delivery_does_not_block_the_event_loop_on_discovery_lock(monkeypa
 
 def test_sync_event_loop_observer_probe_snapshots_but_policy_refuses_unready_discovery(monkeypatch):
     import asyncio
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
     manager._discovered = True
@@ -354,7 +354,7 @@ def test_sync_event_loop_observer_probe_snapshots_but_policy_refuses_unready_dis
 
 @pytest.mark.parametrize("listing", ["discover", "skill_commands"])
 def test_discovery_listing_degrades_when_background_join_times_out(monkeypatch, caplog, listing):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     class SlowThread:
         def is_alive(self):
@@ -383,7 +383,7 @@ def test_discovery_listing_degrades_when_background_join_times_out(monkeypatch, 
 
 def test_sweep_thread_reentry_still_refuses_partial_registry(monkeypatch):
     """Re-entrant delivery from inside the sweep (register()-time hook) stays fail closed."""
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
     outcome = {}

@@ -5,6 +5,10 @@ Split out of ``hermes_cli/update_cmd.py``; every name is re-imported there so
 imported lazily inside each function (no import cycle; test patches stay effective).
 """
 
+from hermes_cli.update_cmd_fleet_restart_delay import (
+    _service_restart_sec
+)
+
 import json
 import logging
 import re
@@ -164,7 +168,7 @@ def _current_checkout_sha() -> str | None:
         return _capture_head_sha(["git"], _m().PROJECT_ROOT)
 
 
-from hermes_cli.update_cmd_fleet_receipts import _receipt_looks_unfinished as _receipt_looks_unfinished
+from hermes_cli.update_cmd_fleet_receipts import _receipt_looks_unfinished
 
 
 def _receipt_reports_stale_runtime(receipt: dict, expected_sha: str | None = None) -> bool:
@@ -1377,7 +1381,9 @@ def _repair_unit_without_fatal_exit_park(svc_name: str, scope: str) -> None:
         return
     if parked:
         return
-    if system and not _needs_sudo(scope) and svc_name == get_service_name():
+    from hermes_cli.update_cmd_commit import past_commit_point
+    # Past the move the generator would load the new tree's plugins into this process; the hint stays.
+    if system and not _needs_sudo(scope) and svc_name == get_service_name() and not past_commit_point():
         # The refresh adopts the unit's HERMES_HOME into os.environ (sudo strips it); the rest of the
         # update keeps running for the invoking profile.
         launch_home = os.environ.get("HERMES_HOME")
@@ -1859,6 +1865,9 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool, *,
     every planned gateway is verifiably covered.
     """
     from hermes_cli.update_cmd import _m, _write_gateway_update_exit_code, get_hermes_home
+    from hermes_cli.update_stage import publish_stage
+
+    publish_stage("Restarting Hermes services")  # also after a failed build: the code is committed
     # All bookkeeping is declared before the try so abort recovery and fleet reconciliation
     # can read it even if the phase raises early. ``pre_restart_gateway_pids`` stays empty
     # until we are about to stop/drain, so an early exception has nothing to fail closed on,
@@ -2025,27 +2034,6 @@ def _wait_for_service_active(scope_cmd_: list, svc_name_: str, timeout: float = 
 _RESTART_SEC_UNITS = (("ms", 0.001), ("us", 0.000001), ("min", 60.0), ("s", 1.0))
 
 
-def _service_restart_sec(scope_cmd_: list, svc_name_: str, default: float = 0.0) -> float:
-    """Read the unit's ``RestartUSec`` in seconds. ``is-active`` pollers must wait
-    >= RestartSec + slack or they give up *during* the cooldown and misreport."""
-    try:
-        _show = _systemctl(scope_cmd_ + ["show", svc_name_, "--property=RestartUSec", "--value"], timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return default
-    raw = (_show.stdout or "").strip()
-    # Values like "30s", "100ms", "1min 30s", "infinity"; on any miss return default.
-    if not raw or raw == "infinity":
-        return default
-    total = 0.0
-    matched = False
-    for part in raw.split():
-        for _suf, _mult in _RESTART_SEC_UNITS:
-            if part.endswith(_suf):
-                with suppress(ValueError):
-                    total += float(part[: -len(_suf)]) * _mult
-                    matched = True
-                break
-    return total if matched else default
 
 
 def _run_pending_fleet_restart() -> NoReturn:

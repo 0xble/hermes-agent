@@ -30,7 +30,7 @@ def apply_terminal_reply_metadata(turn_ctx: TurnContext, *results: Any) -> None:
             result["queued_terminal_inbound_id"] = turn_ctx.inbound_message_id
 
 
-def silence_recovery_due(runner, response: Any, turn_ctx: "TurnContext", *,
+def silence_recovery_due(runner, response: Any, turn_ctx: TurnContext, *,
                          silence_retry: bool, scheduled_heartbeat: bool) -> bool:
     """Whether a finished execution should get its single recovery re-prompt.
 
@@ -52,7 +52,7 @@ def silence_recovery_due(runner, response: Any, turn_ctx: "TurnContext", *,
     )
 
 
-async def run_silence_followup(runner, response: dict, turn_ctx: "TurnContext") -> Dict[str, Any]:
+async def run_silence_followup(runner, response: dict, turn_ctx: TurnContext) -> dict[str, Any]:
     """One gateway continuation after a rejected marker, with a fresh stream and no human input.
 
     The first execution and its stream have finished. Put recovery guidance in the existing

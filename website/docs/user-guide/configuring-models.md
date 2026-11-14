@@ -7,7 +7,7 @@ sidebar_position: 3
 Hermes uses two kinds of model slots:
 
 - **Main model** — what the agent thinks with. Every user message, every tool-call loop, every streamed response goes through this model.
-- **Auxiliary models** — smaller side-jobs the agent offloads. Context compression, vision (image analysis), web-page summarization, approval scoring, MCP tool routing, session-title generation, and skill search. Each has its own slot and can be overridden independently.
+- **Auxiliary models** — side-jobs the agent offloads, such as context compression, vision (image analysis), approval scoring, session-title generation, `/review` reviews and voice-chat replies. Each has its own slot and can be overridden independently; the slots the dashboard exposes are listed under [Setting auxiliary models](#setting-auxiliary-models).
 
 This page covers configuring both from the dashboard. If you prefer config files or the CLI, jump to [Alternative methods](#alternative-methods) at the bottom. To run models on your own machine instead of a cloud provider, see [Local Models](./local-models.md).
 
@@ -23,63 +23,61 @@ On a brand-new install the bundled default config has `model: ""` (an empty stri
 
 ## Reusing a named route
 
-Use `model_presets` to name a provider/model route and refer to it with the canonical
-`model_preset: NAME` form or the `@NAME` shorthand. Presets are expanded at the point each consumer runs.
-
-The `@NAME` shorthand is a preset reference only when the whole value is `@` followed by letters, digits,
-`_` or `-`. A value containing `/`, `.` or `:` is a literal model ID and is passed through unchanged with its
-own provider and `base_url`, so IDs such as `@cf/meta/llama-3.3-70b-instruct-fp8-fast` and `@hf/...` work
-as written. An unknown bare name such as `@missing` is still an error. Saving the config keeps `@NAME`
-strings exactly as you wrote them.
-Cron jobs re-read and resolve their route at fire time. Editing a preset affects the next use
-of that config without rewriting the stored job.
+Use upstream `model_aliases` as the single registry of model labels. Store the
+bare alias name in a topic, cron job or delegation option. Each request resolves
+that name from the current profile configuration, so an alias edit updates later
+requests without rewriting the stored references.
 
 ```yaml
-model_presets:
-  attended-fast:
-    provider: openrouter
-    model: google/gemini-3-flash-preview
-    reasoning_effort: medium
+model_aliases:
   coding:
-    provider: openrouter
-    model: anthropic/claude-sonnet-4.6
-    fallbacks:
-      - provider: openai
-        model: gpt-5.4
+    provider: openai-codex
+    model: gpt-6.1-sol
+    reasoning_effort: high
 
-model:
-  model_preset: coding
-# Equivalent shorthand in supported model slots: model: "@coding"
 delegation:
-  model_preset: coding
+  backend: model_map
+  fallback_providers: []
+  backends:
+    model_map:
+      default: coding
+      options:
+        - name: coding
+          description: Software implementation and debugging.
+          provider: openai-codex
+          model: coding
+          reasoning_effort: high
+          service_tier: normal
+          fallback_providers: []
 ```
 
-Presets must define `provider` and `model`. Definitions are flat, with no nested preset references.
-The names `attended` and `default` are reserved for the runtime config resolver. Unknown names,
-nested references and conflicting inline route fields are rejected. A concrete `/model` selection
-replaces the preset reference while preserving unrelated settings and comments.
+Install and enable the official Advanced Delegation plugin with
+`hermes plugins install advanced-delegation` and
+`hermes plugins enable advanced-delegation`. Its `model_map` backend exposes
+named options to `delegate_task`, and `profile_routes` selects complete profile
+routes when separate credentials, identity or terminal policy are needed.
+Unknown options are refused before child construction. Results report the route,
+resolved model, reasoning effort and service tier.
+
+The `openai-codex` provider uses the Codex subscription. The explicit empty
+fallback chain keeps a failed subscription request from falling back to a paid
+API provider. Provision OAuth credentials for the selected profile before use.
 
 ## Topic Model Roles
 
-In the gateway, `/model @coding` stores the role name, not a concrete route.
-`/model @attended` follows `model.attended`, and `/model @default` follows the
-configured default. Every API boundary resolves the role from the topic's
-current profile config. Changes to presets take effect on the next request,
-including within a long turn, without rewriting sessions. Fallback routes never
-replace the stored role.
+In the gateway, `/model coding` stores the alias name in `model_role`. The
+`telegram_topic` tool accepts the same bare name. Every API boundary resolves it
+from the topic's owning profile. Fallbacks never replace the stored alias.
+Explicit session and one-turn picks take precedence. `/model reset`,
+`/model reset --all` and `/new` clear the held alias.
 
-A held role is immune to attended idle expiry and does not emit switch cards.
-Explicit session and one-turn picks take precedence. A durable concrete pick
-replaces the role, while `--once` leaves it available after that turn. `/model
-reset`, `/model reset --all` and `/new` clear role state. Role picks cannot be
-combined with model-selection flags.
-
-The `telegram_topic` tool accepts the same `@NAME` values for create and edit.
-It reads route and reasoning from the routed profile, not the gateway's launch
-profile. `/status` shows the held role. The admin command `/model --all attended`
-converts existing concrete Telegram topic picks to `@attended` under the session
-store lock, writes one routing snapshot, and returns the converted session keys.
-It skips sessions already following a role and does not interrupt active agents.
+Legacy preset configuration and stored references are migrated automatically by
+config migration v54. Preview a selected home's migration with
+`python -m hermes_cli.config_migrations_model_aliases --home HOME --dry-run`,
+then apply it by omitting `--dry-run`. This rewrites the cron store, legacy topic
+mirror and authoritative topic routing in the selected home's database. Dry run
+reads existing routing rows without initializing the database. Apply refuses a
+concurrent topic edit and leaves transcript history intact.
 
 ## The Models page
 
@@ -148,7 +146,7 @@ Hermes still prints the full data-policy warning and the acknowledgement key on 
 
 ## Setting auxiliary models
 
-Click **Show auxiliary** to reveal the 11 task slots:
+Click **Show auxiliary** to reveal one row per auxiliary task (plugins can register more):
 
 ![Auxiliary panel expanded](/img/docs/dashboard-models/auxiliary-expanded.png)
 
@@ -162,13 +160,15 @@ Every auxiliary task defaults to `auto` — meaning Hermes tries your main model
 | **Vision** | When your main model lacks vision support. Point it at `google/gemini-2.5-flash` or `gpt-4o-mini`. |
 | **Compression** | When you're burning reasoning tokens on Opus/M2.7 just to summarize context. A fast chat model does the job at 1/50th the cost. |
 | **Approval** | For `approval_mode: smart` — a fast/cheap model (haiku, flash, gpt-5-mini) decides whether to auto-approve low-risk commands. Expensive models here are waste. |
-| **Web Extract** | When you use `web_extract` heavily. Same logic as compression — summarization doesn't need reasoning. |
-| **Skills Hub** | `hermes skills search` uses this. Usually fine at `auto`. |
+| **Review** | The `/review` reviewer subagent. `auto` uses the main model; pin a different (often stronger) model for reviews. See [Review model](./features/delegation.md#review-model). |
 | **MCP** | MCP tool routing. Usually fine at `auto`. |
+| **Voice Chat** | Spoken voice-chat replies. Point it at a faster model than your main one; reasoning is off on voice turns by default, and GPT-Live voice chat ignores this slot. See [Voice chat model](./features/voice-mode.md#voice-chat-model). |
 | **Triage Specifier** | Routes the Kanban triage specifier (`hermes kanban specify`) that expands a rough one-liner into a concrete spec. A cheap, capable model works well. |
 | **Kanban Decomposer** | Routes Kanban task decomposition — splits a triage task into a graph of child tasks for specialist profiles. |
 | **Profile Describer** | Routes profile-description generation (`hermes profile describe --auto` / the dashboard auto-generate button). Short, cheap call. |
 | **Curator** | Routes the curator skill-usage review pass. Can run for minutes on reasoning models, so a cheaper aux model is often worthwhile. |
+
+For more auxiliary-model options in `config.yaml`, including tasks the dashboard doesn't list, see [Auxiliary Models](./configuration.md#auxiliary-models).
 
 ### Per-task override
 
@@ -187,8 +187,8 @@ Every model card on the page has a **Use as** dropdown. This is the fast path �
 The dropdown has:
 
 - **Main model** — same as clicking Change on the main row.
-- **All auxiliary tasks** — assigns this model to all 11 aux slots at once. Useful when you just want every side-job on a cheap flash model.
-- **Individual task options** — Vision, Web Extract, Compression, etc. The currently-assigned model for each task is marked `current`.
+- **All auxiliary tasks** — assigns this model to every auxiliary slot on the page at once. Useful when you just want every side-job on a cheap flash model.
+- **Individual task options** — Vision, Review, Compression, etc. The currently-assigned model for each task is marked `current`.
 
 Cards are badged with `main` or `aux · <task>` when they're currently assigned to something — so you can see at a glance which of your historical models are wired in where.
 

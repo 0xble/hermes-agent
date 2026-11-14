@@ -415,6 +415,8 @@ async def test_relay_only_or_machinery_has_no_retry_or_delivery(harness, kind, m
             source=h.event.source, message_id="folded-1",
             reply_expected=None if folded == "relay" else False,
         )
+        from gateway.response_filters import apply_agent_origin_reply_expectation
+        apply_agent_origin_reply_expectation(incoming)
         def fold_during_tool():
             assert h.runner._steer_running_agent(h.agent, incoming.text)
             assert h.runner._fold_into_running_turn(h.agent, SESSION_KEY, incoming) is h.state.turn

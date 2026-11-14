@@ -52,6 +52,20 @@ session-scoped: unrelated standalone numbers equal to a component (for example `
 `12`, or `1990`) are also masked, on every tab, until the browser session closes.
 Navigating or focusing another tab does not lift it, because the filled tab may still
 be open. Screenshots remain refused for the same lifetime.
+### Desktop preview or managed browser
+
+The Desktop preview and the managed automation browser are separate pages.
+For a login open in the preview, the agent calls `browser_vault` (`fill`,
+`save_login`, `enter_code`) with `target: "preview"`; in a Desktop session
+with the in-app browser available an omitted target means the preview. This
+uses the preview already open beside the chat and does not require a separate
+browser runtime. `target: "browser"` uses the managed browser.
+
+Keep the chat and its preview page selected while filling. Hermes binds each
+operation to that window and page, and refuses if the target changes or navigates.
+Vault requests are live-only and are not replayed after a reconnect. A failed
+preview fill never switches to a different browser. Filling does not submit
+the login form.
 
 ## Two-factor codes
 
@@ -108,6 +122,24 @@ replies, files, commits, or shell arguments; never retry `payment_declined`.
 This fallback exposes the value to model context, the session record, and provider
 logs. The owner accepts that exposure; direct entry does not require input redaction.
 The security properties of vault fills do not describe this explicit fallback.
+## Logins saved in your real browser
+
+If you turn on [real-profile browsing](browser.md#real-profile-browsing-use-your-own-logins)
+(`browser.use_real_profile: true`), the passwords your everyday Chrome / Brave /
+Edge has saved become a login source too, shown in the Browser bar's key-button
+picker as **Browser profile — `your browser`** beside the Hermes vault and any
+1Password / Bitwarden entries. Pick one and Hermes fills it into the in-app
+browser just like a vault login.
+
+It is **read-only** and needs no master password: Hermes reads only the site and
+username from your profile's saved logins, and the password is filled by your own
+browser (which decrypts its own store) and read back over the debugging protocol
+at the moment of the fill — the agent never sees it, and it is scrubbed from every
+tool result and log. Nothing is decrypted or copied out by Hermes, and there is no
+separate switch: the source appears exactly while real-profile browsing is on, and
+disappears (along with the profile snapshot) when you turn it off. This is the
+saved-passwords companion to the real-profile **cookies** that the in-app browser
+already carries.
 
 ## Paying and filling addresses
 
@@ -296,9 +328,10 @@ one-time codes to tasks whose browser uses that named account.
 this path: not in tool results, logs, the session database, or process arguments.
 Fills happen over the supervised browser session's direct CDP socket and are
 refused unless the page origin exactly matches the saved origin, checked again
-inside the page immediately before the write. These guarantees do not apply to
-authorized direct entry, where model, session-record and provider-log exposure
-is explicitly accepted.
+inside the page immediately before the write. Native Camofox uses its protected
+evaluate transport on HTTPS or loopback HTTP. The Desktop preview uses its
+authenticated channel bound to the exact tab and origin. Authorized direct entry
+accepts the model, session-record and provider-log exposure described above.
 
 **Does not:** protect against the page itself. Once a password is typed into a
 site, that site (and any script it runs) has it, exactly as when you type it

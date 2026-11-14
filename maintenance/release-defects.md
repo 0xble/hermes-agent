@@ -1,5 +1,7 @@
 # Upstream release defects
 
+**Patch identity:** `release-defects`.
+
 Load this unit before changing any file named in a section's guard or description
 below, when a sync review finds a defect in upstream or fork code, and when deciding
 whether a fix here can retire because upstream now carries an equivalent. Current

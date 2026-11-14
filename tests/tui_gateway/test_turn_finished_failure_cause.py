@@ -22,6 +22,7 @@ can quote the request that produced it.
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import logging
 import threading
 import types
@@ -74,7 +75,7 @@ def _session(agent=None, **extra):
 @pytest.fixture()
 def turn_env(monkeypatch, tmp_path):
     """Neutralize the turn pipeline's environment-heavy side paths."""
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_emit", lambda *a, **k: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)

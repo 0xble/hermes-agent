@@ -31,3 +31,12 @@ def relay_chat_metadata(metadata: dict) -> dict:
     request even when the adapter speaks Responses or Messages to its provider.
     """
     return {**metadata, "api_mode": "chat_completions"}
+
+
+def record_route_info(
+    route_info: dict[str, str] | None, provider: str | None, model: str | None
+) -> None:
+    """Expose the concrete route selected for one auxiliary call."""
+    if route_info is not None:
+        route_info["provider"] = provider or "auto"
+        route_info["model"] = model or "default"

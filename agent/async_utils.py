@@ -50,7 +50,7 @@ def consume_detached_task_result(task: asyncio.Future[Any]) -> None:
         pass
 
 
-async def cancel_task_with_grace(task: "asyncio.Future", grace: float = 0.5) -> bool:
+async def cancel_task_with_grace(task: asyncio.Future, grace: float = 0.5) -> bool:
     """Cancel ``task`` and wait only a short grace before detaching it.
 
     Some transports swallow ``CancelledError`` while stuck in I/O. Waiting for such a task

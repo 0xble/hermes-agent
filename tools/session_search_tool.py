@@ -617,7 +617,7 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
             elif not query or not isinstance(query, str) or not query.strip():
                 if operation is not None:
                     operation.path = "browse"
-                result = _list_recent_sessions(db, _clamp_int(limit, 3, 1, 10), current_session_id, link_profile=profile)
+                result = _list_recent_sessions(db, _clamp_int(limit, 10, 1, 10), current_session_id, link_profile=profile)
             else:
                 sort_norm = sort.strip().lower() if isinstance(sort, str) else None
                 return _discover(
@@ -654,7 +654,7 @@ def _shape_session_links(raw_result: str, platform: str | None = None) -> str:
     return json.dumps(payload, ensure_ascii=False)
 
 
-def session_search(query: str = "", role_filter: str | None = None, limit: int = 3, db=None,
+def session_search(query: str = "", role_filter: str | None = None, limit: int | None = None, db=None,
                    current_session_id: str | None = None, session_id: str | None = None,
                    around_message_id: int | None = None, window: int = 5, sort: str | None = None,
                    profile: str | None = None, detail: str = "adaptive", after: str | None = None,
@@ -754,11 +754,11 @@ SESSION_SEARCH_SCHEMA = {
             "limit": {
                 "type": "integer",
                 "description": (
-                    "Discovery shape only. Max sessions to return (default 3, max 10). "
-                    "Bump to 5–10 when the topic likely spans several sessions and you "
-                    "want to pick the right one to scroll into."
+                    "Max sessions to return. Discovery defaults to 3; browse/no-args "
+                    "defaults to 10. Max 10. Bump discovery to 5–10 when the topic "
+                    "likely spans several sessions and you want to pick the right one "
+                    "to scroll into."
                 ),
-                "default": 3,
             },
             "sort": {
                 "type": "string",
@@ -865,7 +865,7 @@ registry.register(
     toolset="session_search",
     schema=SESSION_SEARCH_SCHEMA,
     handler=lambda args, **kw: session_search(
-        query=args.get("query") or "", limit=args.get("limit", 3), window=args.get("window", 5),
+        query=args.get("query") or "", limit=args.get("limit"), window=args.get("window", 5),
         detail=args.get("detail", "adaptive"), db=kw.get("db"), current_session_id=kw.get("current_session_id"),
         platform=kw.get("platform"),
         **{k: args.get(k) for k in ("role_filter", "session_id", "around_message_id", "sort", "profile",

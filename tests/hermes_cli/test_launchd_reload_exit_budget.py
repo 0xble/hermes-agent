@@ -52,7 +52,7 @@ def test_deferred_helper_waits_the_exit_budget_not_the_bootstrap_budget(tmp_path
     script = submitted[0][-1]
     exit_budget = int(gateway_launchd._launchd_old_gateway_exit_budget())
     assert f"_wait_deadline=$(($(date +%s) + {exit_budget}))" in script
-    assert f"_deadline=$(($(date +%s) + 30))" in script  # bootstrap retries keep their own budget
+    assert "_deadline=$(($(date +%s) + 30))" in script  # bootstrap retries keep their own budget
 
 
 def test_deferred_reload_marks_planned_restart_before_bootout(tmp_path, monkeypatch):

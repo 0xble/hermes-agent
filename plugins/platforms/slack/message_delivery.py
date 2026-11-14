@@ -17,8 +17,7 @@ def transcript_messages(transcript: str, shared_by: str):
     if len(labels) == 1 and labels[0].start() == 0:
         label = f"{labels[0].group(1)} · {label}"
         body = transcript[labels[0].end():]
-        if body.startswith(" "):
-            body = body[1:]
+        body = body.removeprefix(" ")
     elif labels and labels[0].start() == 0:
         speakers = ", ".join(dict.fromkeys(match.group(1) for match in labels))
         label = f"{speakers} · {label}"
