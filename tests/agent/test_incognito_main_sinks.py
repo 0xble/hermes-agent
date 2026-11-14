@@ -2,6 +2,8 @@
 
 import asyncio
 
+import pytest
+
 from agent.incognito import incognito_scope, register_session
 from tests.fakes.runtime_owner import begin_runtime_epoch
 
@@ -74,18 +76,23 @@ def test_delayed_native_result_and_worker_receipt_are_withheld(tmp_path):
         changes = connection.total_changes
         register_session("session", True)
         try:
-            assert rt.settle_session_input(db,
-                epoch=epoch, admission_id=admitted["admission_id"], generation=1,
-                outcome="completed", result={"response": "saved"},
-            ) == {}
+            with pytest.raises(rt.RuntimeStoreError, match="^privacy_denied$") as refusal:
+                rt.settle_session_input(db,
+                    epoch=epoch, admission_id=admitted["admission_id"], generation=1,
+                    outcome="completed", result={"response": "saved"},
+                )
+            assert refusal.value.field is None and refusal.value.detail is None
+
             def unexpected_handler(*_args):
                 raise AssertionError("private receipt reached a SQL mutation handler")
 
-            assert rt.apply_worker_receipt(db,
-                epoch=epoch, execution_id="worker", session_id="session", generation=1,
-                sequence=1, operation="messages", payload={"messages": []},
-                handlers={"messages": unexpected_handler},
-            ) == {}
+            with pytest.raises(rt.RuntimeStoreError, match="^privacy_denied$") as refusal:
+                rt.apply_worker_receipt(db,
+                    epoch=epoch, execution_id="worker", session_id="session", generation=1,
+                    sequence=1, operation="transcript.append", payload={"messages": []},
+                    handlers={"transcript.append": unexpected_handler},
+                )
+            assert refusal.value.field is None and refusal.value.detail is None
             assert connection.total_changes == changes
             assert rt.get_session_admission(db, admission_id=admitted["admission_id"])["status"] == "queued"
         finally:
@@ -121,13 +128,22 @@ def test_native_result_carries_identity_across_privacy_transition(tmp_path, monk
 
         monkeypatch.setattr(db, "_execute_write", entering_private)
         try:
-            assert rt.settle_session_input(db,
-                epoch=epoch, admission_id=admitted["admission_id"], generation=1,
-                outcome="completed", result={"response": "withheld"},
-            ) == {}
+            with pytest.raises(rt.RuntimeStoreError, match="^privacy_denied$") as refusal:
+                rt.settle_session_input(db,
+                    epoch=epoch, admission_id=admitted["admission_id"], generation=1,
+                    outcome="completed", result={"response": "withheld"},
+                )
+            assert refusal.value.field is None and refusal.value.detail is None
             assert db._conn.total_changes == changes
             assert rt.get_session_admission(db, admission_id=admitted["admission_id"])["status"] == "queued"
         finally:
             register_session("session", False)
+            monkeypatch.setattr(db, "_execute_write", write)
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id="session")
+        settled = rt.settle_session_input(db,
+            epoch=epoch, admission_id=admitted["admission_id"], generation=claimed["generation"],
+            outcome="completed", result={"response": "saved after off"},
+        )
+        assert settled["status"] == "terminal"
     finally:
         db.close()
