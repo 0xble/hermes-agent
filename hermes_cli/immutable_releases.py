@@ -651,6 +651,100 @@ def _build_candidate_web(staging: Path) -> None:
         raise RuntimeError("candidate web build did not produce hermes_cli/web_dist/index.html")
 
 
+_TAG_FETCH_TIMEOUT_SECONDS = 60
+
+
+def _fetch_release_tags(source: Path) -> list[str]:
+    """Best-effort: copy the stable release tags *source* lacks from its update remotes; never raises.
+
+    A source that never fetched a release's tag describes its commit against an older one, so the
+    stamp would name that older version (a calendar tag read as 0.20.0 disabled every plugin gated
+    on a newer ``requires_hermes``). Only missing stable tags are fetched, and never moved. A fork
+    carries upstream's release tags only when someone pushed them, so when the source has no
+    ``upstream`` remote the official repository is asked too. Returns one note per remote that
+    failed, for :func:`_stamped_identity`.
+    """
+    from hermes_cli._subprocess_compat import no_prompt_git_kwargs
+    from hermes_cli.update_channel import STABLE_TAG_RE
+    from hermes_cli.update_cmd_git import OFFICIAL_REPO_URL, _is_fork
+    from hermes_cli.update_custody import run_git
+
+    kwargs = dict(cwd=source, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                  timeout=_TAG_FETCH_TIMEOUT_SECONDS, **no_prompt_git_kwargs())
+
+    def git(*args: str) -> str:
+        done = run_git(["git"], list(args), **kwargs)
+        if done.returncode:
+            last = (done.stderr or "").strip().splitlines()[-1:]
+            raise RuntimeError(last[0] if last else f"git {args[0]} failed")
+        return done.stdout
+
+    failed: list[str] = []
+    try:
+        remotes = git("remote").split()
+        origin = git("remote", "get-url", "origin").strip() if "origin" in remotes else ""
+        have = set(git("tag", "--list", "v[0-9]*").split())
+    except (OSError, RuntimeError, subprocess.SubprocessError) as exc:  # custody refusals are OSErrors
+        logger.warning("Could not read the update source's remotes or tags: %s", exc)
+        return [f"{source}: {exc}"]
+    targets = [name for name in ("origin", "upstream") if name in remotes]
+    if "upstream" not in remotes and _is_fork(origin):
+        targets.append(OFFICIAL_REPO_URL)
+    for target in targets:
+        try:
+            advertised = (line.split("\t")[-1] for line in git("ls-remote", "--tags", target, "v[0-9]*").splitlines())
+            missing = sorted({ref.removeprefix("refs/tags/") for ref in advertised if not ref.endswith("^{}")}
+                             - have)
+            missing = [tag for tag in missing if STABLE_TAG_RE.fullmatch(tag)]
+            if missing:
+                git("fetch", "--no-tags", "--quiet", target, *(f"refs/tags/{tag}:refs/tags/{tag}" for tag in missing))
+                have.update(missing)
+        except (OSError, RuntimeError, subprocess.SubprocessError) as exc:
+            logger.warning("Could not fetch release tags from %s: %s", target, exc)
+            failed.append(f"{target}: {exc}")
+    return failed
+
+
+def _stamped_base_version(release: Path | None) -> str | None:
+    """The stable ``baseVersion`` a release's install stamp names, or None when it names none."""
+    from hermes_cli.update_channel import STABLE_TAG_RE
+
+    if release is None:
+        return None
+    try:
+        data = json.loads((release / "install-stamp.json").read_text(encoding="utf-8-sig"))
+    except (OSError, ValueError):
+        return None
+    base = data.get("baseVersion") if isinstance(data, dict) else None
+    return base if isinstance(base, str) and STABLE_TAG_RE.fullmatch(f"v{base}") else None
+
+
+def _stamped_identity(source: Path, sha: str, live: Path | None):
+    """The version identity of *sha* for its install stamp, from a source that has the release tags.
+
+    Refuses (before anything is built) a base version below the live release's: that is a source
+    missing the tag its commit was released under, and the stamp it would write turns off every
+    version-gated plugin. A live release that names no version leaves nothing to compare.
+    """
+    from hermes_cli.version_info import _git_version_info
+
+    failed = _fetch_release_tags(source)
+    identity = _git_version_info(source, revision=sha)
+    floor = _stamped_base_version(live)
+
+    def key(version: str) -> tuple[int, ...]:
+        return tuple(int(part) for part in version.split("."))
+
+    if floor and (identity.base_version == "unknown" or key(identity.base_version) < key(floor)):
+        tried = f"; tag fetch failed: {'; '.join(failed)}" if failed else ""
+        raise RuntimeError(
+            f"refusing to stamp release {sha[:12]}: its resolved base version {identity.base_version} is older "
+            f"than the live release's {floor}. The update source {source} is missing the release tag this "
+            f"commit shipped under{tried}. Fetch it (`git -C {source} fetch <remote> --tags`, from the remote "
+            "that carries it) and run the update again.")
+    return identity
+
+
 def stage_release(source: Path, home: Path, *, sha: str | None = None,
                   uv: str = "uv", plugin_dir: Path | None = None,
                   source_python: Path | None = None, branch: str | None = None) -> tuple[Path, str]:
@@ -675,6 +769,9 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
             _copy_tree(source, staging, home=paths.home)
         if not (staging / "hermes_cli" / "immutable_releases.py").is_file():
             raise RuntimeError(f"revision {sha} predates immutable releases and cannot be staged")
+        # Resolved before any build: a source without the release's tag must stop here, not after.
+        identity = (_stamped_identity(source, sha, read_pointer(paths.current))
+                    if (source / ".git").exists() else None)
         if (source / ".git").exists():
             _build_candidate_web(staging)
         prepare_venv(staging, previous=read_pointer(paths.current), uv=uv,
@@ -682,8 +779,6 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
                      source_python=source_python or (_source_install_python(source, paths.home)
                                                     if (source / ".git").exists() else None))
         from scripts.write_install_stamp import build_stamp
-        from hermes_cli.version_info import _git_version_info
-        identity = _git_version_info(source, revision=sha) if (source / ".git").exists() else None
         stamp = build_stamp(commit=sha, branch="", dirty=False, source="local",
                             update_mechanism="self",
                             base_version=identity.base_version if identity and identity.base_version != "unknown" else None,

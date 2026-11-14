@@ -289,3 +289,15 @@ release before replacement.
 ## Isolated Launcher Environment
 
 PM exports the selected project and dependency paths as `PYTHONPATH` for children, including the gateway spawned by the timestamp wrapper. A nonempty observed value is not evidence of import contamination for the exact generated isolated bootstrap: `-I` ignores inherited paths and the bootstrap clears them before importing. Acknowledgement qualifies this environment with the entrypoint, while non-isolated `-m` commands still require an empty value. The environment regression exercises observation-only recovery, durable acknowledgement and idempotence for both launch shapes, plus rejection of another release and arbitrary code. Keep all release, plist, supervisor, interpreter and cwd predicates intact.
+
+## Release Stamp Version
+
+`stage_release` stamps `install-stamp.json` from the update source's git history, so the source must hold the
+release tag its commit shipped under. Before stamping it fetches the stable tags the source lacks from `origin`,
+`upstream`, and (for a fork with no `upstream` remote) the official repository, one bounded fetch per remote. A
+failed fetch is logged and never aborts on its own. It then refuses, before any build, a resolved base version
+that is `unknown` or lower than the live release's stamped `baseVersion`: a source without the tag describes the
+commit against an older tag, and the resulting stamp disables every plugin gated on a newer `requires_hermes`.
+The first stage, or a live release whose stamp names no stable version, has nothing to compare and is not refused.
+
+Contract tests: `tests/hermes_cli/test_immutable_release_stamp_tags.py`.
