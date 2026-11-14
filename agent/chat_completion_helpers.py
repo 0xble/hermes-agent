@@ -2219,9 +2219,8 @@ def try_activate_fallback(
     ``_shared_cooldown_record`` is used only by a newly-created agent adopting an outage that
     another process already armed; it must not re-arm the record or emit a duplicate notice.
     """
-    from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
+    from agent.fallback_cooldown import _arm_rate_limit_cooldown, mark_fallback_route, switch_deferred_by_reset
     from agent.fallback_notice import buffer_fallback_route_notice, resolved_route
-    from agent.fallback_session_route import mark_fallback_route
     shared_adoption = isinstance(_shared_cooldown_record, dict)
     new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
     if new_fallback_episode and not shared_adoption:
@@ -2271,8 +2270,7 @@ def try_activate_fallback(
                 settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)
             buffer_fallback_route_notice(
                 agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds)
-            # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
-            # provenance so the restore path only emits a recovery notice after a real fallback.
+            # Provenance apart from ``_fallback_activated`` (`/model --once`): recovery notice + turn-scoped row (#152333).
             agent._provider_fallback_active = True
             _finalize_fallback_route(agent, fb_provider)
             mark_fallback_route(agent, fb_model)
