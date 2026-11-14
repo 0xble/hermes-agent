@@ -2282,7 +2282,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             self._invalidate_deferred_commands(session_key, forget_unresolved=False)
 
     def _resolve_deferred_command(self, event: MessageEvent) -> None:
-        """The deferred command's handler returned: its own reply (or a park) is the outcome."""
+        """The deferred command's handler returned: its own reply (or a park) is the outcome.
+        Any other event is absent from the map, so this is a no-op for it."""
         if not getattr(event, "_deferred_parked", False):
             self._unresolved_deferred_map().pop(id(event), None)
 
@@ -5552,8 +5553,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
             processing_ok = (delivery_succeeded and not required_delivery_failed) if delivery_attempted else not bool(response)
-            if deferred_session is not None and (delivery_succeeded or not delivery_attempted):
-                self._resolve_deferred_command(event)  # its own reply was the visible outcome
+            if delivery_succeeded or not delivery_attempted:
+                self._resolve_deferred_command(event)  # a deferred command's own reply was its outcome
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
@@ -5589,8 +5590,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             raise
         except BaseException as e:
             bind_event_turn(event)
-            if deferred_session is not None:
-                self._resolve_deferred_command(event)  # the turn-error notice below is its outcome
+            self._resolve_deferred_command(event)  # a deferred command's turn-error notice is its outcome
             await self._run_processing_hook("on_processing_complete", event, ProcessingOutcome.FAILURE)
             logger.error("[%s] Error handling message: %s", self.name, e, exc_info=True)
             await review_capture.notify_error(self, event, e, session_key)
