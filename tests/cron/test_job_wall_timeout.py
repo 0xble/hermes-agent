@@ -29,7 +29,7 @@ def profile(tmp_path):
 def test_operator_deadline_round_trip_preserves_other_jobs_and_model_dispatch(profile, monkeypatch):
     from hermes_cli import cron as cli
     from hermes_cli.subcommands.cron import build_cron_parser
-    from tools import cronjob_tools  # noqa: F401 — register the real model-facing handler
+    from tools import cronjob_tools
     from tools.registry import registry
 
     monkeypatch.setenv("HERMES_CRON_SCHEDULER", "builtin")

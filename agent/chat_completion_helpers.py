@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- shared cooldown fallback lookup must stay at the existing helper seam
 """API-call helpers extracted from :class:`AIAgent`: non-streaming and streaming
 request drivers, request kwargs builder, assistant-message materializer,
 provider-fallback activator, max-iterations handler, per-turn resource cleanup.
@@ -35,7 +36,7 @@ from agent.sdk_transform_bypass import bypass_chat_sdk_request_transform
 from agent.errors import EmptyStreamError
 from agent.chat_completion_local import _streams_llamacpp, stale_giveup
 from agent.chat_completion_headers import _chat_completion_capturing_headers
-from agent.chat_completion_stream_monitor import StreamingWaitMonitor
+from agent.chat_completion_stream_monitor import StreamingWaitMonitor, StreamLifetimeExceeded
 from agent.transports.chat_completions import is_router_timeout_shim, router_timeout_shim_may_follow
 from agent.fast_mode import effective_request_overrides
 from agent.turn_context import substitute_api_content
@@ -735,7 +736,7 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
         recover_from_cache_point_rejection, recover_from_redacted_reasoning_rejection)
     region = api_kwargs.pop("__bedrock_region__", "us-east-1")
     api_kwargs.pop("__bedrock_converse__", None)
-    client = _get_bedrock_runtime_client(region)
+    client = _get_bedrock_runtime_client(region, api_kwargs.get("modelId"))  # the active model's timeout
     method = client.converse_stream if stream else client.converse
     finish = (lambda raw: raw.get("stream", [])) if stream else normalize_converse_response
     try:
@@ -1294,8 +1295,8 @@ def _reasoning_config_for_wire(agent):
 
     Once the route has answered a disable with "reasoning is mandatory"
     (``agent._reasoning_disable_rejected``), every disable — configured or
-    the one-shot continuation override — is dropped for the rest of the
-    session: the request goes out without a reasoning config and the route
+    the one-shot continuation override — is dropped until the route
+    changes: the request goes out without a reasoning config and the route
     applies its own default.
     """
     cfg = _resolve_reasoning_config_for_wire(agent, _consume_ephemeral_reasoning_off(agent))
@@ -1310,7 +1311,7 @@ def _resolve_reasoning_config_for_wire(agent, ephemeral_off: bool):
     cfg = agent.reasoning_config
     if getattr(agent, "_reasoning_effort_rejected", False):
         # The route rejected the configured reasoning LEVEL itself (#100536: ``reasoning.effort:
-        # max`` on an enabled config). Omit the reasoning fields for the rest of the session —
+        # max`` on an enabled config). Omit the reasoning fields until the route changes —
         # the route default — as the auxiliary ladder does; resending would 400 identically.
         return None
     if cfg is None:
@@ -1541,15 +1542,6 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
     _is_lmstudio = (agent.provider or "").strip().lower() == "lmstudio"
     _profile_endpoint = agent._reasoning_endpoint_profile() is not None
 
-    # _fixed_temperature_for_model may return the OMIT_TEMPERATURE sentinel
-    # (temperature omitted entirely), a numeric override, or None.
-    _omit_temp, _fixed_temp = False, None
-    with contextlib.suppress(Exception):
-        from agent.auxiliary_client import _fixed_temperature_for_model, OMIT_TEMPERATURE
-        _ft = _fixed_temperature_for_model(agent.model, agent.base_url)
-        _omit_temp = _ft is OMIT_TEMPERATURE
-        _fixed_temp = None if _omit_temp else _ft
-
     _prefs = _provider_preferences_for_agent(agent)
 
     _qwen_meta = {"sessionId": agent.session_id or "hermes", "promptId": str(uuid.uuid4())} if _is_qwen else None
@@ -1585,16 +1577,8 @@ def _build_chat_completions_kwargs(agent, api_messages, tools_for_api, reasoning
         **_common,
         model_lower=(agent.model or "").lower(),
         is_openrouter=_is_or,
-        is_nous=base_url_host_matches(_host, "nousresearch.com"),
-        is_qwen_portal=_is_qwen,
-        is_nvidia_nim=base_url_host_matches(_host, "integrate.api.nvidia.com"),
         is_kimi=any(base_url_host_matches(agent.base_url, h) for h in ("api.kimi.com", "moonshot.ai", "moonshot.cn")),
         is_tokenhub=base_url_host_matches(_host, "tokenhub.tencentmaas.com"),
-        is_custom_provider=agent.provider == "custom",
-        qwen_prepare_fn=agent._qwen_prepare_chat_messages if _is_qwen else None,
-        qwen_prepare_inplace_fn=agent._qwen_prepare_chat_messages_inplace if _is_qwen else None,
-        fixed_temperature=_fixed_temp,
-        omit_temperature=_omit_temp,
         profile_endpoint=_profile_endpoint, endpoint_reasoning=agent._endpoint_reasoning_payload() if _profile_endpoint else None,
         provider_name=agent.provider,
     )
@@ -2011,7 +1995,7 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
     )
 
 
-def _fallback_chain_exhausted(agent, reason: "FailoverReason | None", cooldown_armed: bool = False) -> bool:
+def _fallback_chain_exhausted(agent, reason: FailoverReason | None, cooldown_armed: bool = False) -> bool:
     """Always False; briefly cool an exhausted chain if the primary has no cooldown.
     Gate next-turn restore even when a rate limit or overload came from an active fallback."""
     if agent._fallback_chain and not cooldown_armed:
@@ -2055,6 +2039,10 @@ def _should_skip_fallback_candidate(agent, fb: dict, fb_key: tuple, fb_provider:
         return True
     if _candidate_pool_exhausted(agent, fb_provider, fb_model):
         logger.warning("Fallback skip: %s/%s credential pool is exhausted (every entry in cooldown)", fb_provider, fb_model)
+        return True
+    from agent.shared_primary_probe_runtime import fallback_route_is_active
+    if fallback_route_is_active(fb_provider, fb.get("base_url"), fb_model):
+        logger.info("Fallback skip: %s/%s has an active shared cooldown", fb_provider, fb_model)
         return True
     local_skip_reason = _fallback_entry_unavailable_without_network(agent, fb)
     if local_skip_reason:
@@ -2100,7 +2088,7 @@ def _update_fallback_context_compressor(agent) -> None:
     # update_model()), but a session that never probed keeps its lazy compaction-time probe rather than
     # resolving an auxiliary client while the primary route is failing (#114707).
     if getattr(agent, "_compression_feasibility_checked", False) is True:
-        from agent.conversation_compression import revalidate_compression_feasibility
+        from agent.conversation_compression_feasibility import revalidate_compression_feasibility
         revalidate_compression_feasibility(agent)
 
 
@@ -2221,7 +2209,7 @@ def _finalize_fallback_route(agent, provider: str) -> None:
     agent._provider_fallback_route = (str(agent.model), str(provider))
 
 def try_activate_fallback(
-    agent, reason: "FailoverReason | None" = None, reset_at=None, *,
+    agent, reason: FailoverReason | None = None, reset_at=None, *,
     _shared_cooldown_record=None,
 ) -> bool:
     """Switch to the next fallback model/provider in the chain; False when exhausted. Swaps client,
@@ -2252,6 +2240,9 @@ def try_activate_fallback(
         cooldown_seconds = _arm_rate_limit_cooldown(agent, reason, reset_at=reset_at)
     while True:
         if agent._fallback_index >= len(agent._fallback_chain):
+            if getattr(agent, "_shared_primary_probe_token", None):
+                from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+                settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)
             return _fallback_chain_exhausted(agent, reason, cooldown_armed=cooldown_seconds is not None)
         fb = agent._fallback_chain[agent._fallback_index]
         agent._fallback_index += 1
@@ -2274,6 +2265,9 @@ def try_activate_fallback(
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
+            if getattr(agent, "_shared_primary_probe_token", None):
+                from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+                settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)
             buffer_fallback_route_notice(
                 agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds)
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
@@ -2456,9 +2450,13 @@ def _chat_summary_attempt(agent, api_messages: list, api_request_id: str):
 _SUMMARY_ATTEMPT_BUILDERS = {"codex_responses": _codex_summary_attempt, "anthropic_messages": _anthropic_summary_attempt}
 
 
-def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
-    """Request a summary when max iterations are reached. Returns the final response text."""
-    warning = f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+def handle_max_iterations(agent, messages: list, api_call_count: int, *, tool_cap=None) -> str:
+    """Request a bounded final answer after an iteration budget or per-turn tool cap."""
+    warning = (
+        f"⚠️  Reached per-turn {tool_cap.tool_name} limit. Requesting final answer..."
+        if tool_cap else
+        f"⚠️  Reached maximum iterations ({agent.max_iterations}). Requesting summary..."
+    )
     if getattr(agent, "suppress_status_output", False):
         # Strict machine-readable mode (-Q, oneshot): keep diagnostics off stdout. quiet_mode is
         # NOT the gate — the interactive CLI runs quiet_mode=True by default and must see this (#93220 class).
@@ -2469,19 +2467,29 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     summary_api_request_id = f"iteration-summary:{uuid.uuid4()}"
     summary_call_outcome = "failed"
 
-    # Shared constant so compaction recognizers can identify this runtime nudge by its stable
-    # content after SessionDB projection strips metadata flags.
+    # Iteration-budget nudges use the stable constant recognized by compaction.
     from agent.context_compressor import MAX_ITERATIONS_SUMMARY_REQUEST
-    nudge = append_message(messages, {"role": "user", "content": MAX_ITERATIONS_SUMMARY_REQUEST})
+    request = (
+        tool_cap.message + " Do not call any more tools. Answer the original request from the collected results; "
+        "state any remaining gaps honestly."
+        if tool_cap else MAX_ITERATIONS_SUMMARY_REQUEST
+    )
+    nudge = append_message(messages, {"role": "user", "content": request})
+
+    empty_response = (
+        f"I reached the per-turn limit for {tool_cap.tool_name} and could not generate a final answer "
+        "from the collected results."
+        if tool_cap else _EMPTY_SUMMARY_RESPONSE
+    )
 
     try:
         api_messages = _iteration_summary_api_messages(agent, messages)
         build_attempt = _SUMMARY_ATTEMPT_BUILDERS.get(agent.api_mode, _chat_summary_attempt)
         attempt = build_attempt(agent, api_messages, summary_api_request_id)
 
-        # One retry on an empty summary; a summary empty once its <think> block is stripped is NOT retried.
-        final_response = _EMPTY_SUMMARY_RESPONSE
-        for retry_count in (0, 1):
+        # Iteration summaries retry once if empty; caps allow only one completion.
+        final_response = empty_response
+        for retry_count in ((0,) if tool_cap else (0, 1)):
             text = attempt(retry_count)
             if not text:
                 continue
@@ -2503,40 +2511,24 @@ def handle_max_iterations(agent, messages: list, api_call_count: int) -> str:
     except Exception as e:
         logger.warning("Failed to get summary response: %s", e)
         from agent.turn_failure_copy import site_copy
-        final_response = site_copy("max_iterations_no_summary", limit=agent.max_iterations)
+        final_response = empty_response if tool_cap else site_copy("max_iterations_no_summary", limit=agent.max_iterations)
     finally:
         from agent import relay_llm
         relay_llm.complete_logical_call(summary_api_request_id, outcome=summary_call_outcome)
+        if tool_cap:
+            # The cap nudge exists only to drive this bounded completion; it is not a
+            # new human turn and must not be persisted in conversation history.
+            messages[:] = [m for m in messages if m is not nudge]
 
     return final_response
 
 
 def cleanup_task_resources(agent, task_id: str) -> None:
-    """Per-turn VM + browser cleanup for a task. Skips ``cleanup_vm`` for persistent
-    terminal envs (``_cleanup_inactive_envs`` reaps them after ``terminal.lifetime_seconds``)
-    and local ``cleanup_browser`` in headed mode. Camofox always runs native owned-tab
-    cleanup; visibility alone is not an explicit keep or user handoff."""
-    def _headed() -> bool:
-        try:
-            from tools import browser_tool
-            from tools.browser_tool_cloud import _is_headed_mode
-            return _is_headed_mode() and not browser_tool._is_camofox_mode()
-        except Exception:
-            return bool(os.environ.get("AGENT_BROWSER_HEADED"))
-
-    for label, skip, skip_what, cleanup in (
-        ("VM", is_persistent_env, "cleanup_vm for persistent env", lambda: _ra().cleanup_vm(task_id)),
-        ("browser", lambda _tid: _headed(), "cleanup_browser for headed session", lambda: _ra().cleanup_browser(task_id)),
-    ):
-        try:
-            if skip(task_id):
-                if agent.verbose_logging:
-                    logging.debug(f"Skipping per-turn {skip_what} {task_id}; idle reaper will handle it.")
-            else:
-                cleanup()
-        except Exception as e:
-            if agent.verbose_logging:
-                logger.warning("Failed to cleanup %s for task %s: %s", label, task_id, e)
+    """Compatibility facade for the extracted per-turn cleanup implementation."""
+    from agent.chat_completion_helpers_cleanup import cleanup_task_resources as _cleanup
+    _cleanup(
+        agent, task_id, persistent_env_check=is_persistent_env, run_agent_module=_ra, log=logger
+    )
 
 
 def _build_partial_stream_stub(role, full_content, full_reasoning, model_name, usage_obj, *,
@@ -2592,8 +2584,8 @@ _SSE_CONN_PHRASES = ("connection lost", "connection reset", "connection closed",
 def _rejects_stream_options(exc: BaseException) -> bool:
     """A 400/422 whose body names ``stream_options`` as an unknown/extra field: strict
     OpenAI-compatible endpoints (Azure AI Foundry MaaS, Pydantic ``extra_forbidden``) reject
-    the usage extension outright (#9705). Distinct from "stream not supported", which flips
-    the whole session to non-streaming."""
+    the usage extension outright (#9705). Distinct from "stream not supported", which turns
+    streaming off on this route (``_disable_streaming`` is a route verdict)."""
     if getattr(exc, "status_code", None) not in (400, 422):
         return False
     body = f"{getattr(exc, 'body', '') or ''} {exc}".lower()
@@ -2746,7 +2738,7 @@ class _BedrockStream:
             "falling back to non-streaming InvokeModel.\n"
             "   Grant that action to restore streaming output.\n", diagnostic=True)
         logger.info("bedrock: converse_stream denied by IAM (%s) — "
-            "using non-streaming converse() for this session.", type(exc).__name__)
+            "using non-streaming converse() on this route.", type(exc).__name__)
         return normalize_converse_response(client.converse(**final_kwargs))
 
     def _worker(self):
@@ -2995,12 +2987,13 @@ class _StreamingCall(StreamingWaitMonitor):
     def _emit_text(self, text: str) -> None:
         self._fire_first_delta()
         self.agent._fire_stream_delta(text)
+        # Only accepted visible text clears the breaker; TTS counts, display tracking stays separate.
+        if self._visible_text_delivered():
+            _reset_stale_streak(self.agent)
         self.deltas_were_sent["yes"] = True
 
     def _visible_text_delivered(self) -> bool:
-        """True when visible assistant text actually reached a stream consumer this attempt
-        (``_fire_stream_delta`` records only scrubbed, delivered text; ``deltas_were_sent``
-        flips on any content delta, including whitespace/think-only ones nobody saw)."""
+        """True when visible text reached any consumer (display, TTS, or relay)."""
         return bool((getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
 
     def _emit_reasoning(self, text: str) -> None:
@@ -3017,7 +3010,7 @@ class _StreamingCall(StreamingWaitMonitor):
         the delta callback for tag extraction (the CLI drops non-reasoning text
         once the stream box is closed)."""
         if self.agent.stream_delta_callback and not getattr(self.agent, "_hold_stream", False):
-            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text)))
+            self._quiet(lambda: (self.agent.stream_delta_callback(text), self.agent._record_streamed_assistant_text(text), self.agent._record_display_streamed_assistant_text(text)))
 
     def _new_diag(self) -> dict:
         diag = self.agent._stream_diag_init()
@@ -3115,7 +3108,7 @@ class _StreamingCall(StreamingWaitMonitor):
 
     def _open_chat_stream(self, stream_kwargs: dict[str, Any]):
         # Native Gemini rejects OpenAI's usage-streaming extension; so do strict endpoints that
-        # already 4xx'd on it this session (``_stream_options_unsupported``, see #9705).
+        # already 4xx'd on it on this route (``_stream_options_unsupported``, #9705; see route_verdicts).
         if not is_native_gemini_base_url(self.agent.base_url) and not getattr(self.agent, "_stream_options_unsupported", False):
             stream_kwargs["stream_options"] = {"include_usage": True}
         request_client = self._attempt_request_client = self.clients.set_client(
@@ -3401,10 +3394,10 @@ class _StreamingCall(StreamingWaitMonitor):
             getattr(self.agent, "provider", "") or "unknown")
 
     def _adopt_final_response(self, final_response):
-        """Adapter returned a completed response for ``stream=True``: switch the
-        session to non-streaming and replay its content as deltas."""
+        """Adapter returned a completed response for ``stream=True``: switch this
+        route to non-streaming and replay its content as deltas."""
         logger.info("Streaming request returned a final response object instead of an iterator; "
-            "switching %s/%s to non-streaming for this session.", self.agent.provider or "unknown",
+            "switching %s/%s to non-streaming on this route.", self.agent.provider or "unknown",
             self.agent.model or "unknown")
         self.agent._disable_streaming = True
         return self._replay_final_response(final_response)
@@ -3707,14 +3700,14 @@ class _StreamingCall(StreamingWaitMonitor):
             self.agent._disable_streaming = True
             logger.warning(
                 "Provider stream returned an empty SSE frame (keepalive, no payload) before any "
-                "delta — switching %s/%s to non-streaming for this session.",
+                "delta — switching %s/%s to non-streaming on this route.",
                 self.agent.provider or "unknown", self.agent.model or "unknown")
             # Durable channel, not _buffer_status: this recovery is expected to SUCCEED, and
             # buffered retry chatter is dropped on successful recovery. Fires at most once per
-            # session (streaming is off from here on).
+            # route (streaming is off on this route from here on).
             self.agent._emit_warning(ContextNotice(
                 "⚠️ Provider stream returned an empty keepalive frame — retrying this turn "
-                "without streaming (streaming stays off for this session)."))
+                "without streaming (streaming stays off on this route)."))
             return
         from agent.anthropic_adapter import _is_stream_unavailable_error
         if not _is_stream_unavailable_error(e):
@@ -3753,9 +3746,9 @@ class _StreamingCall(StreamingWaitMonitor):
         if self._request_cancelled["value"]:
             logger.debug("Streaming worker caught %s after request cancellation — exiting without retry.", type(e).__name__)
             return False
-        _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout))
-        # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader,
-        # ECONNRESET) — the retry loop owns recovery.
+        e = self._as_lifetime_error(e)  # a cap kill: transient, and its copy names the setting
+        _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout, StreamLifetimeExceeded))
+        # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader, ECONNRESET) — retry loop owns it.
         # anthropic.APIConnectionError: the Anthropic SDK wraps connect/read drops
         # (incl. stale-kill aborts) in its own type, not httpx's.
         _is_conn_err = isinstance(e, (_httpx.ConnectError, _httpx.ReadError, _httpx.RemoteProtocolError, ConnectionError,
@@ -3766,10 +3759,10 @@ class _StreamingCall(StreamingWaitMonitor):
         _is_transient = _is_timeout or _is_conn_err or _is_sse_conn_err or _is_stream_parse_err
 
         if not self.deltas_were_sent["yes"] and not getattr(self.agent, "_stream_options_unsupported", False) and _rejects_stream_options(e):
-            # Nothing streamed yet: drop the usage extension for this session and re-open.
+            # Nothing streamed yet: drop the usage extension on this route and re-open.
             self.agent._stream_options_unsupported = True
             self._compat_retries = 1
-            logger.info("Endpoint rejected stream_options (HTTP %s); retrying without it for this session.",
+            logger.info("Endpoint rejected stream_options (HTTP %s); retrying without it on this route.",
                         getattr(e, "status_code", None))
             self._cancel_current_stream_attempt("stream_options_rejected_retry")
             self.clients.close_once("stream_options_rejected_retry")
@@ -3903,8 +3896,7 @@ class _StreamingCall(StreamingWaitMonitor):
             while _stream_attempt < _max_stream_retries + self._compat_retries:
                 _stream_attempt += 1
                 stream_attempt_id = self._start_stream_attempt()
-                # Otherwise /stop closes the connection and the retry opens a
-                # FRESH one, blocking up to a full read timeout per attempt.
+                # Else /stop closes the socket and the retry opens a fresh one (a full read timeout each).
                 if self.agent._interrupt_requested:
                     self._cancel_current_stream_attempt("interrupt_before_stream_retry")
                     raise InterruptedError("Agent interrupted before stream retry")
@@ -3913,6 +3905,7 @@ class _StreamingCall(StreamingWaitMonitor):
                         self.agent, lambda: self._call_wire(stream_attempt_id))
                     return  # success
                 except Exception as e:
+                    self._released_attempt = stream_attempt_id  # unwound: kills during the backoff are not wedge kills
                     self._close_managed_stream()
                     if not self._handle_stream_error(e, _stream_attempt, _max_stream_retries):
                         return
@@ -4079,7 +4072,8 @@ class _StreamingCall(StreamingWaitMonitor):
             _partial_text = (_partial_text or "") + _warn
             if self.agent._warning_presentation_enabled():
                 self._quiet(self.agent._fire_stream_delta, _warn)
-        _reset_stale_streak(self.agent)  # deltas fired => provider responsive: clear the breaker
+        if self._visible_text_delivered():
+            _reset_stale_streak(self.agent)  # a consumer accepted visible text
         # #106260: continuing after a context-overflow error re-sends a larger request into the
         # same overflow. Return an EMPTY stub marked terminal so the loop ends the turn instead.
         # Scope is context_overflow ONLY: payload_too_large (413) has its own byte-scored recovery

@@ -266,7 +266,6 @@ def test_rejected_background_child_stops_with_parent(
         def pause_no_async(*_args, oneshot_session=None):
             admission_started.set()
             assert continue_admission.wait(5)
-            return None
 
         monkeypatch.setattr(dispatch_module, "_resolve_async_wake_sid", pause_no_async)
     else:

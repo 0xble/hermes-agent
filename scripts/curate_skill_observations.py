@@ -22,7 +22,7 @@ import shutil
 import sqlite3
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Iterable
 
@@ -45,7 +45,7 @@ class ArchiveResult:
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
 
 
 def sha256_bytes(value: bytes) -> str:
@@ -141,7 +141,7 @@ def index_observations(observations: Path, db: Path) -> IndexResult:
             payload = raw.decode("utf-8")
             oid = observation_id(skill, payload)
             now = _now()
-            mtime = datetime.fromtimestamp(source.stat().st_mtime, timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+            mtime = datetime.fromtimestamp(source.stat().st_mtime, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
             existing = conn.execute("SELECT id FROM observations WHERE id = ?", (oid,)).fetchone()
             if existing:
                 conn.execute(

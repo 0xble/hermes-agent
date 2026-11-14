@@ -19,7 +19,7 @@ def _facade():
     return goals
 
 
-def _is_user_typed(row: Dict[str, Any]) -> bool:
+def _is_user_typed(row: dict[str, Any]) -> bool:
     """Whether a user-role row is input the person typed, judged by provenance first."""
     content = row.get("content")
     if not isinstance(content, str) or row.get("compressed_summary"):
@@ -88,15 +88,15 @@ def _normalize_authority_text(text: Any) -> str:
     return " ".join("".join(chars).split())
 
 
-def _split_text_units(text: str) -> List[str]:
+def _split_text_units(text: str) -> list[str]:
     """Split sentence/clause-sized text without treating punctuation inside tokens as a boundary."""
     return [part.strip() for part in re.split(r"(?<=[.!?;])(?=\s|$)", text or "") if part.strip()]
 
 
-def _authority_unit_records(text: str) -> List[Tuple[str, List[str], str]]:
+def _authority_unit_records(text: str) -> list[tuple[str, list[str], str]]:
     """Mask before splitting, retaining original offsets and quoted data (never quoted authority)."""
     masked = _mask_non_authoritative_spans(text or "")
-    records: List[Tuple[str, List[str], str]] = []
+    records: list[tuple[str, list[str], str]] = []
     cursor = 0
     boundaries = [match.start() for match in re.finditer(r"(?<=[.!?;])(?=\s|$)", masked)]
     boundaries.append(len(masked))
@@ -114,7 +114,7 @@ def _authority_unit_records(text: str) -> List[Tuple[str, List[str], str]]:
     return records
 
 
-def _authority_units(text: str) -> List[str]:
+def _authority_units(text: str) -> list[str]:
     """Return sentence/clause units after masking the complete source first."""
     return [unit for unit, _quotes, _original in _authority_unit_records(text)]
 
@@ -210,7 +210,7 @@ def _replacement_action_is_authorized(source: str, goal: str) -> bool:
     return False
 
 
-def _removal_instruction_units(source: str, goal: str = "") -> List[Tuple[str, str, List[str]]]:
+def _removal_instruction_units(source: str, goal: str = "") -> list[tuple[str, str, list[str]]]:
     """Return explicit removal verbs and their targets from independent imperative clauses.
 
     Mask replacement-objective text before examining directives. A work task may itself
@@ -308,7 +308,7 @@ def _bound_removal_instruction_units(source: str, requirements: list[str]) -> li
     return units
 
 
-def _explicit_restriction_removals(source: str, goal: str) -> Tuple[bool, bool]:
+def _explicit_restriction_removals(source: str, goal: str) -> tuple[bool, bool]:
     """Require complete restriction targets in independent, un-negated removal directives."""
     remove_gates = remove_budget = False
     for verb, targets, _quoted_targets in _removal_instruction_units(source, goal):
@@ -338,7 +338,7 @@ def _bounded_authority_match(needle: str, source: str) -> Optional[re.Match[str]
     return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", source) if needle else None
 
 
-def _requirement_diff(field_name: str, before: Any, after: Any) -> Tuple[List[str], List[str], List[str]]:
+def _requirement_diff(field_name: str, before: Any, after: Any) -> tuple[list[str], list[str], list[str]]:
     """Return retained, removed, and added canonical items."""
     before_items = {_normalize_authority_value(item): item
                     for item in _facade().contract_items(field_name, before)}
@@ -373,7 +373,7 @@ def _evidence_is_negated(content: str, evidence: str, *, include_no: bool = Fals
     return False
 
 def _typed_user_message_records_since(session_id: Optional[str], since: float = 0.0,
-                                      limit: int = 500) -> List[Dict[str, Any]]:
+                                      limit: int = 500) -> list[dict[str, Any]]:
     """Newest-first active typed user rows; withdrawn and summarized-away rows cannot authorize."""
     db = _facade()._get_session_db()
     reader = getattr(db, "get_messages", None) if db is not None else None
@@ -391,13 +391,13 @@ def _typed_user_message_records_since(session_id: Optional[str], since: float = 
             and float(row.get("timestamp") or 0.0) >= float(since or 0.0)][:limit]
 
 
-def _typed_user_message_text(row: Dict[str, Any]) -> str:
+def _typed_user_message_text(row: dict[str, Any]) -> str:
     """Return only the user's text, excluding a client-provided assistant quote header."""
     content = row.get("content")
     return _REPLY_QUOTE_RE.sub("", content, count=1) if isinstance(content, str) else ""
 
 
-def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> List[str]:
+def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> list[str]:
     """Text the user actually wrote since ``since``: synthetic runtime prompts are dropped and a
     reply's quoted header (which repeats the assistant's words) is stripped. Fail-safe: ``[]``."""
     return [_typed_user_message_text(row)

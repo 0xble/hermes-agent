@@ -45,7 +45,7 @@ def _run(home, key, source, *, overrides=None, provider="fixture"):
     env.update(overrides or {})
     command = [sys.executable, "-c", BOOTSTRAP, *([provider] if provider is not None else [])]
     result = subprocess.run(command, cwd=ROOT, env=env, capture_output=True,
-                            text=True, timeout=30)
+                            text=True, timeout=30, check=False)
     assert key not in " ".join(command)
     output = result.stdout + result.stderr + (home / "probe.log").read_text()
     assert key not in output
@@ -69,7 +69,7 @@ with patch('hermes_cli.runtime_provider._try_resolve_from_custom_pool', return_v
 assert runtime['base_url'] == os.environ['PROBE_EXPECTED_BASE'].strip().rstrip('/')
 assert runtime['api_key'] == os.environ['PROBE_EXPECTED_KEY']
 assert runtime.get('api_mode') in {'chat_completions', 'codex_responses'}, runtime.get('api_mode')
-"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30, check=False)
         assert reference.returncode == 0, "accepted probe route diverged from the runtime"
     return result
 
@@ -182,7 +182,7 @@ def test_probe_refuses_last_known_good_backup_without_contacting_provider(tmp_pa
         seed = subprocess.run([sys.executable, "-c", """
 from hermes_cli.config import load_config_readonly
 assert load_config_readonly()['model']['provider'] == 'fixture'
-"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30, check=False)
         assert seed.returncode == 0, "valid config did not load"
         assert list((tmp_path / "backups" / "config").glob("config.yaml.good.*"))
         config_path.write_text(f"model: [{key}\n")
@@ -251,7 +251,7 @@ with patch('hermes_cli.runtime_provider._try_resolve_from_custom_pool', return_v
     runtime = resolve_runtime_provider(requested='fixture')
 assert runtime['base_url'] == os.environ['PROBE_TEST_BASE_URL']
 assert runtime['api_key'] == os.environ['PROBE_TEST_KEY']
-"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30)
+"""], cwd=ROOT, env=env, capture_output=True, text=True, timeout=30, check=False)
     assert runtime.returncode == 0, "runtime fixture did not resolve the expected route"
     assert stale_key not in result.stdout + result.stderr + (tmp_path / "probe.log").read_text()
     if conflict in {"endpoint", "duplicate"}:
@@ -605,7 +605,7 @@ def test_probe_refuses_every_runtime_selected_non_openai_transport(tmp_path, rou
         env = os.environ.copy()
         env["HERMES_HOME"] = str(tmp_path)
         reference = subprocess.run([sys.executable, "-c", _RUNTIME_REFERENCE], cwd=ROOT, env=env,
-                                   capture_output=True, text=True, timeout=30)
+                                   capture_output=True, text=True, timeout=30, check=False)
         assert reference.returncode == 0, "runtime reference did not resolve"
         # The fixture really is a route the runtime sends over a non-OpenAI wire.
         assert json.loads(reference.stdout.strip().splitlines()[-1]) == expected

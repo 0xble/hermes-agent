@@ -115,8 +115,8 @@ def release_job(tmp_path, monkeypatch, request):
     log.write_text("")
     yield SimpleNamespace(home=home, a=a, b=b, label=label, path=plist_path,
                           output=output, log=log, observed=observed, initial=initial)
-    subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
-    assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
+    subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15, check=False)
+    assert subprocess.run(["launchctl", "print", target], capture_output=True, check=False).returncode != 0
 
 
 def _ack_after_spawn(job, root, old_pid):

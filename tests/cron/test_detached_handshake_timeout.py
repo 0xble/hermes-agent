@@ -193,7 +193,7 @@ def test_refused_deferral_releases_claim_and_records_failure(occurrence_home, mo
         return False, '', '', 'gateway handshake timed out (connect)'
 
     monkeypatch.setattr(scheduler, 'run_job', timeout)
-    monkeypatch.setattr(scheduler_control, 'defer_unstarted_fire', lambda *_a, **_k: False)
+    monkeypatch.setattr(scheduler_control, 'defer_unstarted_fire', lambda *_a, **_k: None)
     scheduler._run_one_job_body(claimed)
     current = jobs.get_job(claimed['id'])
     assert current.get('fire_claim') is None
@@ -465,7 +465,10 @@ def test_prebody_journal_recovery_obeys_exact_pause_owner(occurrence_home, monke
     current = jobs.get_job(claimed['id'])
     assert calls == [1]
     if pause_kind == 'operator':
-        assert journal.exists()
+        # #1286 contract: an operator hold supersedes the occurrence (claim released, no
+        # slot restored); the settled journal retires rather than retrying forever.
+        assert not journal.exists()
+        assert current['fire_claim'] is None and not current.get('pending_slot')
         assert current['paused_reason'] == 'Operator hold'
         assert current['last_run_at'] is None and not current.get('failure_streak')
         assert not counter.exists()
@@ -492,7 +495,7 @@ def test_recovery_fence_refusal_stays_on_base_path(occurrence_home, monkeypatch,
     jobs, _executions, _scheduler, _counter = occurrence_home
     claimed, journal = _prebody_journal(occurrence_home, monkeypatch, kind, 'recovery')
     with monkeypatch.context() as patch:
-        patch.setattr(scheduler_control, 'defer_unstarted_fire', lambda *_a, **_k: False)
+        patch.setattr(scheduler_control, 'defer_unstarted_fire', lambda *_a, **_k: None)
         scheduler_authority.reconcile_pending(allow_connect=False)
     assert journal.exists()
     current = jobs.get_job(claimed['id'])
@@ -566,3 +569,78 @@ def test_canonical_detached_timeout_uses_shared_flag_only_before_body(occurrence
         with pytest.raises(scheduler_authority.CronExecutionUnknown):
             scheduler_authority.run_canonical_job(claimed)
         assert scheduler_authority.NOT_STARTED_FLAG not in claimed
+
+
+@pytest.mark.parametrize('pause_kind', ['none', 'recovery'])
+@pytest.mark.parametrize('kind', ['recurring', 'oneshot'])
+def test_operator_reschedule_during_prebody_recovery_is_not_undone(
+        occurrence_home, monkeypatch, kind, pause_kind):
+    """An edit made while a detached worker was lost before body start supersedes the
+    occurrence: recovery releases the claim without reviving the old slot or booking a run."""
+    jobs, _executions, scheduler, counter = occurrence_home
+    claimed, journal = _prebody_journal(occurrence_home, monkeypatch, kind, pause_kind)
+    later = (jobs._hermes_now() + timedelta(days=2)).replace(microsecond=0).isoformat()
+    edited = jobs.update_job(claimed['id'], {'schedule': 'every 2h' if kind == 'recurring' else later})
+    scheduler_authority.reconcile_pending(allow_connect=False)
+    assert not journal.exists()
+    current = jobs.get_job(claimed['id'])
+    assert current['fire_claim'] is None and not current.get('pending_slot')
+    assert current['schedule'] == edited['schedule']
+    assert current['last_run_at'] is None and not current.get('failure_streak')
+    assert current['last_fire_error']['detail'].startswith('Not started; superseded by an operator edit')
+    if kind == 'oneshot':
+        assert current['repeat']['completed'] == 0, 'refund the one-shot preclaim'
+    if pause_kind == 'none':
+        assert current['next_run_at'] == edited['next_run_at']
+    scheduler.tick(verbose=False, sync=True)
+    assert not counter.exists()
+
+
+def test_busy_fire_fence_is_not_reported_as_a_deferral(occurrence_home, monkeypatch):
+    from contextlib import contextmanager
+    from cron.scheduler_control import defer_unstarted_fire
+
+    jobs, _executions, _scheduler, _counter = occurrence_home
+    claimed = _due_occurrence(occurrence_home, 'recurring')
+
+    @contextmanager
+    def busy(_job_id):
+        yield False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(jobs, '_fire_job_lock', busy)
+        assert defer_unstarted_fire(claimed, 'pre-body handshake timeout') is None
+    current = jobs.get_job(claimed['id'])
+    assert current['fire_claim'] == claimed['fire_claim'] and not current.get('pending_slot')
+    assert defer_unstarted_fire(claimed, 'pre-body handshake timeout') == 'deferred'
+
+
+def test_superseded_prebody_settlement_retires_its_journal(occurrence_home, monkeypatch):
+    from utils import atomic_json_write
+
+    jobs, executions, scheduler, counter = occurrence_home
+    claimed = _due_occurrence(occurrence_home, 'recurring')
+    fire = claimed['execution_id']
+    journal = scheduler_authority.journal_path(claimed['id'], fire)
+    atomic_json_write(journal, {
+        'params': {'job_id': claimed['id'], 'request_id': fire, 'extra_prompt': None},
+        'job': claimed, 'receipt': {'admission_id': 'adm', 'session_id': 's'},
+    }, mode=0o600, fsync_dir=True)
+
+    def timeout(job, **_kwargs):
+        jobs.update_job(job['id'], {'schedule': 'every 2h'})
+        job[scheduler_authority.NOT_STARTED_FLAG] = True
+        return False, '', '', 'gateway handshake timed out (register)'
+
+    with monkeypatch.context() as patch:
+        patch.setattr(scheduler, 'run_job', timeout)
+        assert scheduler._run_one_job_body(claimed)
+    row = executions.get_execution(fire)
+    assert row['delivery_outcome'] == 'deferred' and 'superseded by an operator edit' in row['error']
+    scheduler_authority.reconcile_pending(allow_connect=False)
+    assert not journal.exists(), 'a superseded fire must not be retried by reconciliation forever'
+    current = jobs.get_job(claimed['id'])
+    assert current['fire_claim'] is None and not current.get('pending_slot')
+    assert current['last_run_at'] is None and not current.get('failure_streak')
+    scheduler.tick(verbose=False, sync=True)
+    assert not counter.exists()

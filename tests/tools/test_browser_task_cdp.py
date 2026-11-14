@@ -12,7 +12,7 @@ ENDPOINT = "ws://127.0.0.1:19222/devtools/browser/owned-fixture"
 
 
 @pytest.fixture
-def boundary(monkeypatch):
+def boundary(monkeypatch, public_dns):
     monkeypatch.setattr(bt, "_active_sessions", {})
     monkeypatch.setattr(bt, "_session_last_activity", {})
     monkeypatch.setattr(bt, "_session_owner_homes", {})

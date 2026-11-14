@@ -8,6 +8,7 @@ Tests cover:
 5. Prune — finalize_orphaned_compression_sessions catches ghost continuations
 """
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 import time
 import types
@@ -154,7 +155,7 @@ class TestPendingTitleValueError:
                 self._target()
 
         server._sessions["sid"] = session
-        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        patch_server_threads(monkeypatch, server, _ImmediateThread)
 
         try:
             server.handle_request({

@@ -10,9 +10,9 @@ def defer_proven_unstarted_worker(
 ) -> bool:
     """Reclaim only a terminal worker whose durable body gate was never won.
 
-    Reaped process + attaching is proof, not an empty transcript or started_at.
-    Reconnect refusals and hard-wall failures stay on the visible failure lane.
-    NULL/legacy and started rows fail closed.
+    The positive attach_lost marker proves the body gate was never won; neither an
+    empty transcript nor started_at is proof. Reconnect refusals and hard-wall
+    failures stay on the visible failure lane. NULL/legacy and started rows fail closed.
     """
     from cron.scheduler_control import defer_unstarted_fire
 
@@ -22,16 +22,18 @@ def defer_proven_unstarted_worker(
         return False
     deferred = dict(job, _scheduled_instant=(
         job.get('_scheduled_instant') or execution['scheduled_instant']))
-    deferred = defer_unstarted_fire(
+    outcome = defer_unstarted_fire(
         deferred, execution.get('error') or 'Detached worker died before body start', pause=pause)
-    if deferred:
-        from cron.executions import mark_deferred_execution
-        mark_deferred_execution(execution['id'])
-        # The deferral settles this admission through the same guarded retirement path as completion.
-        from cron.scheduler_authority import retire_completed_journal
-        retire_completed_journal(job['id'], execution['id'])
-    # "superseded" settles the same way: the claim is released and the operator's edit stands.
-    return bool(deferred)
+    if outcome is None:
+        # No occurrence restored (busy fence, lost claim): stay on the base failure lane.
+        return False
+    # "deferred" or "superseded" by an operator edit: the claim is released either way.
+    from cron.executions import mark_deferred_execution
+    mark_deferred_execution(execution['id'])
+    # The settlement retires this admission through the same guarded path as completion.
+    from cron.scheduler_authority import retire_completed_journal
+    retire_completed_journal(job['id'], execution['id'])
+    return True
 
 
 def record_external_worker_outcome(
@@ -58,6 +60,8 @@ def record_external_worker_outcome(
         return False
     execution = scheduler.get_execution(str(execution_key))
     status = execution.get("status") if execution else None
+    if status == "cancelled":
+        return worker_exited  # the firer already booked the operator stop and job state
     if not execution or status not in ("completed", "failed", "unknown"):
         return False
     if status in ("completed", "failed") and not worker_exited:

@@ -176,7 +176,7 @@ _RE_NOT_OTP_CONTEXT = re.compile(
 )
 
 
-def _anonymous_otp_group(controls: List[LoginControl], code_length: Optional[int] = None) -> bool:
+def _anonymous_otp_group(controls: list[LoginControl], code_length: Optional[int] = None) -> bool:
     """Require a complete, compact anonymous widget; never infer OTP from box count alone."""
     if not 4 <= len(controls) <= 8 or (code_length is not None and len(controls) != code_length):
         return False
@@ -223,7 +223,7 @@ def classify_otp_controls(controls: list[LoginControl]) -> list[ClassifiedLoginC
             out.append(ClassifiedLoginControl(c, 70, "one-time-code"))
     if out:
         return out
-    groups: Dict[int, List[LoginControl]] = {}
+    groups: dict[int, list[LoginControl]] = {}
     for c in controls:
         if c.container_index is not None:
             groups.setdefault(c.container_index, []).append(c)
@@ -395,8 +395,8 @@ def classify_protected_field_control(control: LoginControl, semantic: str) -> Op
     return None
 
 
-def select_protected_field_fills(classified: List[ClassifiedLoginControl], semantic: str,
-                                 value: str) -> List[Dict[str, Any]]:
+def select_protected_field_fills(classified: list[ClassifiedLoginControl], semantic: str,
+                                 value: str) -> list[dict[str, Any]]:
     """Select one birth-date field or a complete day/month/year split."""
     if semantic != "bday" or not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value or ""):
         return []
@@ -415,7 +415,7 @@ def select_protected_field_fills(classified: List[ClassifiedLoginControl], seman
     groups = {group_of(c) for c in classified if c.token in parts} - {None}
     complete_groups = []
     for group in groups:
-        selected: List[Dict[str, Any]] = []
+        selected: list[dict[str, Any]] = []
         score = 0
         for token, part in parts.items():
             candidates = sorted(
@@ -554,7 +554,7 @@ _LOGIN_CONTROL_INSPECTION_JS_TEMPLATE = """(() => {
     }
     const ariaText = (element.getAttribute("aria-labelledby") || "")
       .split(/\\s+/).filter(Boolean)
-      .map((id) => { const n = element.getRootNode().getElementById(id); return n ? (n.textContent || "") : ""; })
+      .map((id) => { const r = element.getRootNode(); const n = (r.getElementById ? r.getElementById(id) : null) || document.getElementById(id); return n ? (n.textContent || "") : ""; })
       .join(" ");
     const resolvedFormIndex = element.form ? forms.indexOf(element.form) : -1;
     const container = containerFor(element);
@@ -737,7 +737,7 @@ _FILL_JS_TEMPLATE = """(async () => {
         }
         if (opt && usable(el, f)) {
           el.value = opt.value;
-          el.dispatchEvent(new Event("change", { bubbles: true }));
+          el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
           if (!usable(el, f)) continue;
           selectedOptions.push({ token: f.token, value: opt.value, label: opt.textContent });
           filled += 1; result.status = "filled";
@@ -750,7 +750,7 @@ _FILL_JS_TEMPLATE = """(async () => {
         const tokens = String(el.getAttribute("autocomplete") || "").toLowerCase().split(/\\s+/);
         const labels = Array.from(el.labels || []).map((l) => l.textContent).join(" ");
         const ariaText = (el.getAttribute("aria-labelledby") || "").split(/\\s+/).filter(Boolean)
-          .map((id) => { const n = el.getRootNode().getElementById(id); return n ? n.textContent : ""; }).join(" ");
+          .map((id) => { const r = el.getRootNode(); const n = (r.getElementById ? r.getElementById(id) : null) || document.getElementById(id); return n ? n.textContent : ""; }).join(" ");
         const purpose = [el.name, el.id, labels, el.getAttribute("aria-label"), ariaText, el.placeholder, el.title]
           .filter(Boolean).join(" ").normalize("NFKD").toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
         const style = getComputedStyle(el);
@@ -781,7 +781,7 @@ _FILL_JS_TEMPLATE = """(async () => {
       if (!usable(el, f)) continue;
       el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, inputType: "insertText" }));
       if (!usable(el, f)) continue;
-      el.dispatchEvent(new Event("change", { bubbles: true }));
+      el.dispatchEvent(new Event("change", { bubbles: true, composed: true }));
       if (usable(el, f) && String(el.value).replace(/[^a-z0-9]/gi, "") === String(f.value).replace(/[^a-z0-9]/gi, "")) {
         filled += 1; result.status = "filled";
       }

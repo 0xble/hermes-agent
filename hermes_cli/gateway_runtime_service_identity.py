@@ -219,12 +219,12 @@ def _verify_launchd_argv(argv: list[str], home: Path) -> None:
 
 def _launchd_command(argv: list[str]) -> tuple[list[str], bool]:
     """``(command, wrapped)``: the command the launchd job runs, and whether it came out of the Local
-    Network wrapper (gateway_launchd.launchd_program_arguments, #71206). The wrapper is accepted only when
+    Network wrapper (gateway_launchd_runtime.launchd_program_arguments, #71206). The wrapper is accepted only when
     the installer regenerates it byte for byte from the inner command and the two log paths it carries,
     so no shell operator, substitution, extra JXA or foreign osascript rides along."""
     if argv[:1] != ["/usr/bin/osascript"]:
         return argv, False
-    from hermes_cli.gateway_launchd import launchd_program_arguments
+    from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
     # Recover the inputs, then let the installer rebuild the whole argv: the comparison is the check.
     script, opener = argv[-1], "$.system("
     try:

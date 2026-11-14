@@ -10,6 +10,14 @@ from __future__ import annotations
 from typing import Any
 
 
+def bind_persisted_assistant_uid(messages: list[dict], event: Any) -> None:
+    """Bind delivery to the last assistant row already carrying an identity."""
+    for message in reversed(messages):
+        if message.get("role") == "assistant" and message.get("message_uid"):
+            event._transcript_message_uid = str(message["message_uid"])
+            break
+
+
 def stamp_gateway_assistant_entry(entry: dict, event: Any) -> None:
     """Bind the gateway event to the assistant row it is writing.
 

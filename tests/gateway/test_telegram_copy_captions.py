@@ -56,7 +56,7 @@ async def test_auto_tts_copy_caption_fallbacks_keep_body_visible_but_never_spoke
     wires = [call.kwargs for call in transport.await_args_list]
     assert all("\x00" not in wire["caption"] and "HERMES_COPY_" not in wire["caption"] for wire in wires)
     assert all(utf16_len(wire["caption"]) <= 1024 for wire in wires)
-    if variant == "formatted":
+    if variant in {"formatted", "audio"}:
         assert wires[0]["parse_mode"] == "MarkdownV2"
         assert wires[0]["caption"] == "Before\\.\n> \\*literal\\* \\`code\\` &amp;\nAfter\\."
     else:

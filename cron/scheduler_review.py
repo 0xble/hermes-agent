@@ -191,11 +191,12 @@ def _bounded_review_rerun(job: dict, remaining: float) -> tuple:
     env.pop("_HERMES_CRON_EXTERNAL_WORKER", None)
     payload = {k: v for k, v in job.items() if not k.startswith("_")}
     from hermes_cli._subprocess_compat import windows_hide_flags
+    from hermes_cli.process_identity import spawn_owned, release_process_group_once_empty
     from cron.scheduler_script import _terminate_cron_script_tree, _drain_script_pipes
 
     with _rerun_lock:
         _check_review_active()
-        process = subprocess.Popen(
+        process = spawn_owned(
             [sys.executable, "-m", "cron.review_rerun"],
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
@@ -203,7 +204,7 @@ def _bounded_review_rerun(job: dict, remaining: float) -> tuple:
             text=True,
             env=env,
             cwd=str(Path(__file__).resolve().parents[1]),
-            start_new_session=True,
+            purpose="cron-review-rerun",
             creationflags=windows_hide_flags(),
         )
         _rerun_children.add(process)
@@ -221,6 +222,7 @@ def _bounded_review_rerun(job: dict, remaining: float) -> tuple:
                 _terminate_cron_script_tree(process)
                 _drain_script_pipes(process)
             _rerun_children.discard(process)
+        release_process_group_once_empty(process.pid, proc=process, timeout=0)
     for line in reversed(stdout.splitlines()):
         if line.startswith("HERMES_REVIEW_RESULT="):
             success, text, error = json.loads(line.split("=", 1)[1])

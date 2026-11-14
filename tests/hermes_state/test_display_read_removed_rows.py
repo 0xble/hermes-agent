@@ -22,14 +22,16 @@ def _compacted_repeatedly(db, rounds):
 
 def _big_bodies_read(db, monkeypatch, read):
     seen = []
-    real = db._read_all
+    real = db._read_retrying_ioerr
 
-    def spy(sql, params=()):
-        rows = real(sql, params)
-        seen.extend(r['content'] for r in rows
-                    if isinstance(r, sqlite3.Row) and 'content' in r.keys() and r['content'] == BIG)
+    def spy(read_query):
+        rows = real(read_query)
+        if isinstance(rows, list):
+            seen.extend(r['content'] for r in rows
+                        if isinstance(r, sqlite3.Row) and 'content' in r.keys() and r['content'] == BIG)
         return rows
-    monkeypatch.setattr(db, '_read_all', spy)
+    # Display and removed-identity reads share one transaction, bypassing _read_all.
+    monkeypatch.setattr(db, '_read_retrying_ioerr', spy)
     shown = read()
     monkeypatch.undo()
     return shown, len(seen)
@@ -49,7 +51,7 @@ def test_display_reads_fetch_no_body_of_a_removed_copy(tmp_path, monkeypatch):
             shown, bodies = _big_bodies_read(db, monkeypatch, read)
             assert sum(1 for m in shown if m.get('content') == BIG) == 1
             # Only the live copy and the compaction-archived ones (what the resume guard counts) carry a body.
-            assert bodies <= 1 + archived, (bodies, archived, removed)
+            assert bodies == 1 + archived, (bodies, archived, removed)
 
 
 def test_a_rewound_turn_stays_hidden_without_its_body(tmp_path):

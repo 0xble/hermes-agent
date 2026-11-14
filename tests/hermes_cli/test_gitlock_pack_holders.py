@@ -176,7 +176,7 @@ def test_unplaced_exception_does_not_bypass_unparsed_configuration_guards(scope,
 
 
 def test_unplaced_git_through_a_symlink_to_the_target_keeps_its_pack(scope, tmp_path):
-    table, ours, other = scope
+    table, ours, _other = scope
     alias = tmp_path / "alias-to-ours"
     alias.symlink_to(ours, target_is_directory=True)
     launch = tmp_path / "launch"

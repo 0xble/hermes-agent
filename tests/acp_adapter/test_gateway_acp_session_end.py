@@ -25,11 +25,11 @@ async def test_last_viewer_or_shutdown_ends_only_idle_acp_sessions(tmp_path, mon
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
                              _cached_agent_for=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
     db = authority.db
 
     def viewer():
-        return AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': 'fixture'})
+        return AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': str(tmp_path)})
 
     owner = viewer().actor
 
@@ -102,11 +102,11 @@ async def test_acp_session_left_mid_turn_ends_once_its_fifo_drains(tmp_path, mon
     runner = SimpleNamespace(session_store=store, _session_db=store._db, adapters={}, _draining=False,
                              _cached_agent_for=lambda route: None)
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-    authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
     try:
         rows = {}
         for source in ('acp', 'gui'):
-            viewer = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': 'fixture'})
+            viewer = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': str(tmp_path)})
             ref = create_local_session(authority, viewer.actor, {'request_id': source, 'source': source,
                                        'cwd': str(tmp_path), 'model': 'frozen', 'toolsets': []})
             target = local_receipt(authority.db, ref.session_id)['entry']['session_id']

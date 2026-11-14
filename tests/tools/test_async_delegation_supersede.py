@@ -69,7 +69,7 @@ def _background_parent(monkeypatch, outcomes):
 
     creds = {"model": "m", "provider": None, "base_url": None, "api_key": None, "api_mode": None, "command": None,
              "args": None}
-    monkeypatch.setattr(dt, "_load_config", lambda: {})
+    monkeypatch.setattr(dt, "_load_config", dict)
     monkeypatch.setattr(dt, "_build_child_agent", build)
     monkeypatch.setattr(dt, "_run_single_child", child)
     monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)

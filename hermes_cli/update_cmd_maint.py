@@ -166,10 +166,6 @@ def _print_fts_optimize_available_notice() -> None:
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' "
                 "AND name LIKE 'fts\\_v22\\_trash\\_%' ESCAPE '\\' LIMIT 1"
             ).fetchone()
-            or db._conn.execute(
-                "SELECT 1 FROM state_meta WHERE key IN "
-                "('fts_cjk_rebuild_high_water', 'fts_cjk_stale') LIMIT 1"
-            ).fetchone()
         )
     except Exception:
         return
@@ -520,6 +516,14 @@ def _invalidate_live_plugin_catalog_caches() -> None:
             invalidate_live_cache_for_home(profile_home)
 
 
+def _report_catalog_plugin_updates() -> None:
+    from hermes_cli.backup import _sibling_profile_homes
+    from hermes_cli.plugins_auto_update import report_catalog_updates_after_hermes_update
+    from hermes_cli.update_cmd import get_hermes_home
+    home = get_hermes_home()
+    report_catalog_updates_after_hermes_update(home, _sibling_profile_homes(home))
+
+
 def _print_bundled_skills_sync_report() -> None:
     """Run ``sync_skills`` (copies new, updates changed, respects user deletions) and print its summary."""
     from tools.skills_sync import sync_skills
@@ -690,7 +694,7 @@ def _sibling_profile_count() -> int:
         from hermes_cli.config import get_hermes_home
 
         return len(list(_sibling_profile_homes(get_hermes_home())))
-    except Exception:  # noqa: BLE001 — a probe must never break the update
+    except Exception:
         return 0
 
 
@@ -769,7 +773,7 @@ def _run_full_backup() -> None:
         print("    To get one: wait for the running backup to finish, then update again.")
         print()
         return
-    except Exception as exc:  # noqa: BLE001 — a failed archive must never kill an update
+    except Exception as exc:
         _record_update_step("pre_update_full_backup", False, f"{type(exc).__name__}: {exc}")
         print(f"  ⚠ Backup failed: {exc}")
         print("  Continuing with update.")
@@ -849,7 +853,7 @@ def _run_pre_update_backup(args) -> Optional[str]:
     snapshot_id = None
     try:
         snapshot_id = _run_quick_snapshots()
-    except Exception as exc:  # noqa: BLE001 — bookkeeping must never kill an update
+    except Exception as exc:
         # Loud, and with the real reason. This used to be swallowed at debug level and
         # recorded as "disabled or failed", so an update that silently lost its rollback
         # point was indistinguishable from one the user had opted out of.
@@ -891,13 +895,18 @@ def _sweep_bytecode_after_update(branch: str) -> None:
     Never fails the committed update: a failed sweep is a ``bytecode_sweep`` follow-up and the
     fingerprint stays un-stamped, so the launch-time sweep (fingerprint mismatch) retries it.
     """
+    from hermes_cli.main_web_build import _prune_dropped_directories, _recorded_bytecode_fingerprint
     from hermes_cli.update_cmd import _m
     from hermes_cli.update_receipt import record_followup
     # Timestamp-based .pyc validation can accept old bytecode after the source swap.
     try:
-        removed = _m()._clear_bytecode_cache(_m().PROJECT_ROOT)
+        root = _m().PROJECT_ROOT
+        recorded = _recorded_bytecode_fingerprint(root)
+        removed = _m()._clear_bytecode_cache(root)
         if removed:
             print(f"  ✓ Cleared {removed} stale __pycache__ director{'y' if removed == 1 else 'ies'}")
+        if pruned := _prune_dropped_directories(root, recorded):
+            print(f"  ✓ Removed {pruned} director{'y' if pruned == 1 else 'ies'} the new version no longer has")
         _m()._record_bytecode_fingerprint()
     except Exception as exc:  # health: allow BLE001 -- owed to the next launch's fingerprint sweep
         record_followup("bytecode_sweep", str(exc) or type(exc).__name__)
@@ -922,7 +931,7 @@ def _profile_skill_sync_status(r) -> str:
 
 
 def _sync_profiles_after_update() -> None:
-    """Best-effort per-profile syncs: bundled skills, ``.env`` backfill, Honcho profiles."""
+    """Best-effort per-profile syncs: bundled skills, ``.env`` backfill."""
     # All profiles incl. the active one: seed_profile_skills() subprocesses with an explicit
     # HERMES_HOME, so sync_skills()'s module-level HERMES_HOME cache can't skew it.
     with suppress(Exception):
@@ -937,21 +946,14 @@ def _sync_profiles_after_update() -> None:
                 except Exception as pe:
                     print(f"  {p.name}: error ({pe})")
 
-    # Backfill .env for profiles created before .env seeding (copy the default's) so they
-    # keep the credentials they were effectively using.
+    # Seed the placeholder .env into any named profile lacking one (never a copy of the default's).
     with suppress(Exception):
         # See #44792.
         from hermes_cli.profiles import backfill_profile_envs
         backfilled = backfill_profile_envs(quiet=True)
         if backfilled:
             print()
-            print(f"→ Seeded .env for {len(backfilled)} profile(s) (copied from default): {', '.join(backfilled)}")
-
-    with suppress(Exception):
-        from plugins.memory import import_provider_module
-        synced = import_provider_module("honcho", "cli").sync_honcho_profiles_quiet()
-        if synced:
-            print(f"\n-> Honcho: synced {synced} profile(s)")
+            print(f"→ Seeded .env for {len(backfilled)} profile(s) (empty placeholder): {', '.join(backfilled)}")
 
 
 def _refresh_cua_driver_after_update() -> None:
@@ -1188,6 +1190,10 @@ def _run_post_update_maintenance(
     # rest of the cache TTL (#119340).
     with _best_effort('Live plugin catalog cache invalidation failed: %s'):
         _invalidate_live_plugin_catalog_caches()
+    # New catalog pins are not applied by this update: name them per profile and re-arm each
+    # profile's plugin check so an opted-in (plugins.auto_apply) gateway applies them next tick.
+    with _best_effort('Plugin catalog update notice failed: %s'):
+        _report_catalog_plugin_updates()
 
     with _best_effort('Skills sync during update failed: %s'):
         print()

@@ -34,7 +34,9 @@ def fixture(tmp_path, monkeypatch):
     runner = SimpleNamespace(session_store=store, _draining=False, _is_session_running=lambda _: False,
                              _restored_source=lambda _: source, _async_profile_scope_for_source=lambda _: nullcontext(),
                              _run_in_executor_with_context=asyncio.to_thread, _delivery_adapter_for=lambda _: adapter,
-                             _is_intentional_silence=lambda result, text: text.strip() in {"NO_REPLY", "[SILENT]"})
+                             _is_intentional_silence=lambda result, text: text.strip() in {"NO_REPLY", "[SILENT]"},
+                             # Fork bot-loop accounting (0754ec0e) runs on every delivered reply.
+                             _note_bot_reply=lambda *_: None)
     pending = []
     authority = SimpleNamespace(db=db, logical_owner=lambda _: "owner", admit_automation=AsyncMock())
     monkeypatch.setattr("gateway.session_authorities.active_authority", lambda _: authority)

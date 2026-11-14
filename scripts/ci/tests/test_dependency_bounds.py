@@ -31,7 +31,7 @@ class DependencyBoundsTests(unittest.TestCase):
         self.git('commit', '-qm', 'fixture')
 
     def check(self, repo=None, *arguments):
-        return subprocess.run([sys.executable, str(CHECKER), '--repo', str(repo or self.repo), *arguments], capture_output=True, text=True, encoding='utf-8', errors='replace')
+        return subprocess.run([sys.executable, str(CHECKER), '--repo', str(repo or self.repo), *arguments], capture_output=True, text=True, encoding='utf-8', errors='replace', check=False)
 
     def add_spec(self, spec):
         content = self.manifest.read_text(encoding='utf-8-sig')
@@ -110,7 +110,7 @@ class DependencyBoundsTests(unittest.TestCase):
         self.assertEqual(self.git('rev-parse', '--is-shallow-repository'), 'true')
         result = self.check()
         self.assertEqual(result.returncode, 0, result.stderr)
-        selected = subprocess.run([sys.executable, str(CHECKER), '--repo', str(self.repo), '--base', 'refs/remotes/unrelated/main'], capture_output=True, text=True, encoding='utf-8', errors='replace')
+        selected = subprocess.run([sys.executable, str(CHECKER), '--repo', str(self.repo), '--base', 'refs/remotes/unrelated/main'], capture_output=True, text=True, encoding='utf-8', errors='replace', check=False)
         self.assertNotEqual(selected.returncode, 0)
         self.assertIn('Full history', selected.stderr)
 

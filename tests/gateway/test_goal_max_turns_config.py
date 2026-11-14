@@ -1,5 +1,5 @@
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 
 import pytest
 
@@ -12,7 +12,7 @@ from hermes_cli import goals
 
 class _FakeSessionStore:
     def __init__(self):
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         self.entry = SessionEntry("agent:main:discord:channel:goal-config",
                                   "sid-gateway-goal-config", now, now)
 

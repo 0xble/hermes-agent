@@ -44,7 +44,7 @@ def _payment_402(lane: str) -> Exception:
     return exc
 
 
-def _quarantine_remaining(base_url: str, model: str) -> float:
+def _quarantine_remaining(base_url: str, model: str = "") -> float:
     key = ac._unhealthy_cache_key("custom", base_url, model)
     return ac._aux_unhealthy_until[key] - time.time()
 
@@ -150,8 +150,10 @@ def test_candidate_quarantine_ttl_is_short_for_transient_429_and_long_for_paymen
 
     assert result.choices[0].message.content == "OK"
     assert 0 < _quarantine_remaining("http://127.0.0.1:2/v1", "modelB") <= 60
-    assert _quarantine_remaining("http://127.0.0.1:3/v1", "modelC") > 60
-    marks = [r.getMessage() for r in caplog.records if "marking local/custom unhealthy" in r.getMessage()]
+    assert _quarantine_remaining("http://127.0.0.1:3/v1") > 60
+    assert not ac._is_provider_unhealthy("custom", "http://127.0.0.1:2/v1", "other-model")
+    assert ac._is_provider_unhealthy("custom", "http://127.0.0.1:3/v1", "other-model")
+    marks = [r.getMessage() for r in caplog.records if "marking local/custom" in r.getMessage()]
     assert marks and "payment" not in marks[0] and "rate limit" in marks[0]
 
 
@@ -300,7 +302,7 @@ def test_auto_custom_failure_quarantines_concrete_custom_route(monkeypatch):
     monkeypatch.setattr(ac, "_try_main_fallback_chain", lambda *args, **kwargs: (None, None, ""))
     monkeypatch.setattr(ac, "_try_payment_fallback", lambda *args, **kwargs: (None, None, ""))
 
-    list(ac._ladder_provider_fallback(_payment_402("custom"), route))
+    list(ac._ladder_provider_fallback(ac._failure(route, _payment_402("custom")), route))
 
     mark.assert_called_once()
     assert mark.call_args.args[0] == "local/custom"

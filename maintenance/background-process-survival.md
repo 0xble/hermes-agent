@@ -141,7 +141,11 @@ Fork patch identity: `terminal-background-survival`.
   attached artifacts exist, so no ordinary directory inventory is needed.
   Recovery reads a bounded
   historical tail without watch/live callbacks; live polling drains all new
-  bytes in bounded chunks into a memory-bounded tail.
+  bytes in bounded chunks into a memory-bounded tail. Survivor pollers start
+  at a 100 ms interval for prompt short-command completion, then multiply the
+  interval by 1.5 while the exit marker and log are unchanged, capped at 2 s.
+  Observed log progress resets the interval; the 2 s cap bounds added exit
+  detection latency and limits N idle pollers to roughly N/2 wakeups per second.
 - Login rc options must not defeat file-backed supervision. Append to the
   pre-created output log under `noclobber`, and use an outer EXIT trap so
   `errexit` cannot bypass atomic exit publication without changing command

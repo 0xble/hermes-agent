@@ -10,7 +10,7 @@ from datetime import timedelta
 
 import pytest
 
-from cron import executions, jobs, scheduler, scheduler_authority, scheduler_transport
+from cron import executions, incidents, jobs, scheduler, scheduler_authority, scheduler_transport
 from hermes_cli import gateway_client
 
 PARAMS = {'job_id': 'job', 'request_id': 'fire', 'extra_prompt': None}
@@ -119,12 +119,15 @@ def test_handshake_timeout_before_submit_defers_the_occurrence(tmp_path, monkeyp
         assert [due['id'] for due in jobs.get_due_jobs()] == [job['id']]
 
 
-def test_handshake_timeout_of_a_manual_fire_still_fails_visibly(tmp_path, monkeypatch):
+@pytest.mark.parametrize('refusal', [
+    gateway_client.GatewayClientError('Gateway connection failed; no local fallback'),
+    gateway_client.GatewayUnavailableError('Gateway draining: update_paused', 'draining'),
+])
+def test_handshake_timeout_of_a_manual_fire_still_fails_visibly(tmp_path, monkeypatch, refusal):
     """A manual run has no occurrence to restore; deferring it would drop it silently."""
     @asynccontextmanager
     async def stalled():
-        raise gateway_client.GatewayClientError('Gateway connection failed; no local fallback') \
-            from TimeoutError('timed out')
+        raise refusal from TimeoutError('timed out')
         yield
 
     monkeypatch.setattr(gateway_client, 'connect_gateway', stalled)
@@ -139,11 +142,15 @@ def test_handshake_timeout_of_a_manual_fire_still_fails_visibly(tmp_path, monkey
         assert executions.get_execution(fire)['status'] == 'failed'
 
 
-@pytest.mark.parametrize('state, deferred', [('draining', True), ('starting', True), ('failed', False)])
-def test_unavailable_gateway_defers_only_transient_states(tmp_path, monkeypatch, state, deferred):
+@pytest.mark.parametrize('state, message, deferred', [
+    ('draining', 'Gateway draining: update_paused', True),
+    ('starting', 'Gateway starting: update_paused', True),
+    ('failed', 'Gateway could not start: process exited', False),
+])
+def test_unavailable_gateway_defers_only_transient_states(tmp_path, monkeypatch, state, message, deferred):
     @asynccontextmanager
     async def unavailable():
-        raise gateway_client.GatewayUnavailableError(f'Gateway {state}: update_paused', state)
+        raise gateway_client.GatewayUnavailableError(message, state)
         yield
 
     monkeypatch.setattr(gateway_client, 'connect_gateway', unavailable)
@@ -152,8 +159,26 @@ def test_unavailable_gateway_defers_only_transient_states(tmp_path, monkeypatch,
         claimed, fire = _claimed_due_fire(job['id'])
         scheduler._run_one_job_body(claimed)
         current = jobs.get_job(job['id'])
-        assert (current.get('last_status') != 'error') is deferred
-        assert ('Not started; occurrence deferred' in executions.get_execution(fire)['error']) is deferred
+        row = executions.get_execution(fire)
+        assert current is not None and row is not None
+        if deferred:
+            assert current.get('last_run_at') is None and current.get('last_status') is None
+            assert current.get('repeat', {}).get('completed', 0) == 0
+            assert current['state'] == 'scheduled'
+            assert not current.get('paused_at')
+            assert not current.get('failure_streak')
+            assert current['fire_claim'] is None
+            assert current['pending_slot']['scheduled_at'] == claimed['_scheduled_instant']
+            assert current['last_fire_error']['detail'].startswith('Deferred, not started:')
+            assert row['status'] == 'failed'  # audit row; it is not a job failure outcome
+            assert 'Not started; occurrence deferred' in row['error']
+            assert incidents.list_incidents() == []
+        else:
+            assert current['last_status'] == 'error'
+            assert current['state'] != 'paused'
+            assert not current.get('pending_slot')
+            assert row['status'] == 'failed'
+            assert 'Gateway could not start' in row['error']
 
 
 def _stalled_handshake(monkeypatch, during=lambda: None):
@@ -228,7 +253,7 @@ def test_oneshot_rescheduled_during_stalled_handshake_keeps_the_new_run_time(tmp
 
 
 def test_overlapping_tick_advance_is_not_an_operator_edit(tmp_path, monkeypatch):
-    """Review P1 (884bae32): while a recurring fire is in flight, a later tick's
+    """Review P1: while a recurring fire is in flight, a later tick's
     advance_next_runs rewrites next_run_at. That is not an operator edit, so the unstarted
     occurrence must still be restored, not dropped as superseded."""
     from cron.scheduler_control import defer_unstarted_fire

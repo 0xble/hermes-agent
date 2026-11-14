@@ -6,25 +6,11 @@ The module-scoped real install is shared only within this bounded file.
 from __future__ import annotations
 
 from tests.e2e.core.upgrade.git import _hostile_post as C
-from tests.e2e.core.upgrade.git._hostile_post import (
-    H,
-    INTERRUPTED_AFTER_COMMIT,
-    SLOW_WEB,
-    WEB_STARTED,
-    _clear_toggles,
-    _facts,
-    _foreground_group,
-    _namespace,
-    _pending_markers,
-    _publish_web_release,
-    _read,
-    _toggle,
-    signal,
-    w as w,
-)
+from tests.e2e.core.upgrade.git._hostile_post import H, INTERRUPTED_AFTER_COMMIT, SLOW_WEB, WEB_STARTED, _clear_toggles, _facts, _foreground_group, _namespace, _pending_markers, _publish_web_release, _read, _toggle, signal, w as _w_fixture
+w = _w_fixture
 from tests.e2e.core.upgrade.git._hostile_diagnostics import (
-    hostile_cell as hostile_cell,
-    hostile_diagnostics as hostile_diagnostics,
+    hostile_cell,
+    hostile_diagnostics,
 )
 
 pytestmark = C.pytestmark

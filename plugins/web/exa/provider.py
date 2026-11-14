@@ -11,8 +11,8 @@ from copy import copy
 from typing import Any, Dict, List
 
 from plugins.web._common import (
-    BaseWebSearchProvider, cached_sdk_client, document, keyless_extract, keyless_search, keyless_variant_schema,
-    provider_env, run_extract, run_search, search_ok, use_keyless, web_hit,
+    BaseWebSearchProvider, cached_sdk_client, document, exa_crawl_status, keyless_extract, keyless_search, keyless_variant_schema,
+    provider_env, run_extract, run_search, search_ok, use_keyless, vendor_error_entry, web_hit,
 )
 
 from plugins.web.exa.policy import select_search_policy
@@ -30,6 +30,11 @@ def _get_exa_client() -> Any:
         return client
 
     return cached_sdk_client("_exa_client", "EXA_API_KEY", _MISSING_KEY, "exa", _factory)
+
+
+def _crawl_status(error: Any) -> Any:
+    """The origin status of a failed ``statuses[]`` entry: ``http_status_code``, else the one its tag names."""
+    return getattr(error, "http_status_code", None) or exa_crawl_status(getattr(error, "tag", None))
 
 
 class ExaWebSearchProvider(BaseWebSearchProvider):
@@ -84,11 +89,15 @@ class ExaWebSearchProvider(BaseWebSearchProvider):
                 return keyless_extract("Exa", "exa", urls, logger)
             logger.info("Exa extract: %d URL(s)", len(urls))
             response = _get_exa_client().get_contents(urls, text=True)
-            # /contents preserves the response id separately from its final URL.
-            # Only a requested URL is an identity: opaque IDs must not imply a redirect.
-            return [document(r.url or "", r.title or "", r.text or "",
-                             source_url=r.id if getattr(r, "id", None) in urls else None)
-                    for r in response.results or []]
+            # /contents preserves requested identity separately from the final URL.
+            # Opaque IDs must not imply a redirect, while per-page statuses remain typed errors.
+            results = [document(r.url or "", r.title or "", r.text or "",
+                                source_url=r.id if getattr(r, "id", None) in urls else None)
+                       for r in response.results or []]
+            return results + [
+                vendor_error_entry(s.id or "", status=_crawl_status(s.error), reason=getattr(s.error, "tag", None))
+                for s in getattr(response, "statuses", None) or [] if s.status == "error"
+            ]
 
         return run_extract("Exa", logger, urls, _body, sdk=True)
 

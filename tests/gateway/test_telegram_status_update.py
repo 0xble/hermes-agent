@@ -163,7 +163,7 @@ async def test_gateway_turn_status_ownership_survives_topic_and_turn_reuse(adapt
                           _status_thread_metadata={"thread_id": topic}, user_config={})
         turn = TurnRunner(runner, ctx)
         pending = []
-        setattr(turn, "_schedule", lambda coro, log_message, loop=None: pending.append(asyncio.create_task(coro)))
+        turn._schedule = lambda coro, log_message, loop=None: pending.append(asyncio.create_task(coro))
         return ctx, turn, pending
 
     turns = [make_turn(topic) for topic in ("101", "202", "101")]
@@ -173,7 +173,7 @@ async def test_gateway_turn_status_ownership_survives_topic_and_turn_reuse(adapt
     assert len(set(ctx._cleanup_msg_ids[0] for ctx, _, _ in turns)) == len(turns)
     assert adapter.edit_message.await_count == 0
 
-    first_ctx, first_turn, pending = turns[0]
+    _first_ctx, first_turn, pending = turns[0]
     first_turn._status_callback_sync("lifecycle", "Still working")
     await asyncio.gather(*pending)
     assert adapter.edit_message.await_count == 1

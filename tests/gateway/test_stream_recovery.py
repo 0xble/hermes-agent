@@ -27,7 +27,7 @@ def record(**changes):
 
 
 def test_journal_redacts_preview_secret(monkeypatch):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
     secret = "sk-proj-" + "a" * 40
@@ -39,7 +39,7 @@ def test_journal_redacts_preview_secret(monkeypatch):
 
 
 def test_journal_redacts_replacement_text_without_corrupting_marker(monkeypatch):
-    import agent.redact as redact
+    from agent import redact
 
     monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
     secret = "sk-proj-" + "b" * 40
@@ -114,7 +114,7 @@ def test_schedule_resume_event_identity_restores_preview():
     )
     event = GatewayStartupMixin._build_startup_resume_event(source, "old")
     assert event.internal is True
-    assert getattr(event, "_outbox_admission_id") == "resume:old"
+    assert event._outbox_admission_id == "resume:old"
     consumer = GatewayStreamConsumer(SimpleNamespace(), "chat")
     restore(make_runner(event=event), consumer)
     assert consumer.message_id == "m1"

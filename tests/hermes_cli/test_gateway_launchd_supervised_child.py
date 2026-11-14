@@ -12,7 +12,7 @@ import pytest
 
 from tests.waiting import terminate_if_alive
 
-import hermes_cli.gateway as gateway
+from hermes_cli import gateway
 
 
 class _FakeProc:
@@ -89,7 +89,7 @@ def test_launchd_default_scope_includes_recursive_gateway_descendant(monkeypatch
 @pytest.mark.platforms("macos")
 def test_launchd_fleet_prefix_scan_expands_each_unmapped_wrapper(monkeypatch):
     monkeypatch.setattr(gateway, "get_launchd_label", lambda: "ai.hermes.gateway.default")
-    monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", lambda: [])
+    monkeypatch.setattr(gateway, "launchd_gateway_labels_for_install", list)
     monkeypatch.setattr(gateway, "_locate_launchd_gateway_service", lambda label: (None, None))
     monkeypatch.setattr(gateway, "_gateway_descendants_of", lambda pid: {pid + 1})
     monkeypatch.setattr(

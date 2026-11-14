@@ -8,11 +8,9 @@ import pytest
 
 from tools import delegate_tool as delegate
 from tools import delegate_tool_routes as routes
-from tests.tools.test_delegate_by_parent import (
+from tests.tools.alias_route_fixtures import (
     HIGH,
-    MEDIUM,
     SOL,
-    VENICE,
     _authored,
     _parent,
     config_file as _config_file,
@@ -48,7 +46,7 @@ def _spawn(parent, **options):
     return built[0], children[0]
 
 
-def test_default_backend_selects_by_parent_before_native_provider_and_real_builder(config_file):
+def test_default_backend_uses_configured_route_through_real_builder(config_file):
     raw = _authored()
     raw["delegation"]["max_iterations"] = 19
     config_file(raw)
@@ -61,14 +59,11 @@ def test_default_backend_selects_by_parent_before_native_provider_and_real_build
         built, _ = _spawn(parent)
     assert provider.call_count == route.call_count == runtime.call_count == 1
     assert route.call_args.args[0].name == "default"
-    selected = route.call_args.args[4]
-    assert "provider" not in selected and "model" not in selected
-    assert selected["max_iterations"] == 19
-    assert runtime.call_args.args[1] == selected
+    assert route.call_args.args[4]["max_iterations"] == 19
     assert (built["model"], built["provider"], built["base_url"]) == (
-        VENICE, parent.provider, parent.base_url,
+        SOL, "custom", "https://pinned.test/v1",
     )
-    assert built["reasoning_config"] == MEDIUM
+    assert built["reasoning_config"] == HIGH
 
 
 @pytest.mark.parametrize("credentials_cfg", [{}, {"model": "review-model"}])
@@ -116,6 +111,9 @@ def test_fast_mode_reaches_real_pinned_child_without_parent_wire_leak(config_fil
 
 
 def test_inherited_child_sanitizes_nested_fast_fields_without_mutating_parent(config_file):
+    raw = _authored()
+    raw["delegation"] = {"max_spawn_depth": 3}
+    config_file(raw)
     parent = _parent()
     parent.request_overrides = {
         "service_tier": "priority", "speed": "fast", "temperature": 0.25,

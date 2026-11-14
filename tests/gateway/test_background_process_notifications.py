@@ -822,7 +822,7 @@ async def test_async_delegation_batch_wake_carries_footer(monkeypatch, tmp_path)
         origin=SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", thread_id="43")
     )
     import gateway.run as gateway_run
-    import tools.async_delegation as async_delegation
+    from tools import async_delegation
 
     group = [
         {"type": "async_delegation", "session_key": session_key, "delegation_id": "deleg-push-1"},

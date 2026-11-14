@@ -219,6 +219,7 @@ def launch_lightpanda(session_name: str, *, block_private_networks: bool = False
     try:
         with open(log_path, "wb") as log_file:
             proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                    # detached-spawn: ok — a crashed owner's server is reaped from its state record by the next Hermes (reap_orphaned_lightpanda); owning it is a follow-up with the launcher's Chromium
                                     stderr=log_file, env=_browser_env(), start_new_session=True)
     except (OSError, subprocess.SubprocessError) as e:
         return None, f"Failed to launch lightpanda serve ({binary}): {e}"
@@ -343,3 +344,37 @@ def reap_orphaned_lightpanda() -> int:
                 logger.debug("orphan lightpanda kill failed for pid %s: %s", pid, e)
         record_path.unlink(missing_ok=True)
     return reaped
+
+
+def using_lightpanda_engine() -> bool:
+    """True when ``browser.engine`` is ``lightpanda``."""
+    from tools.browser_session_cloud import get_browser_engine
+    return get_browser_engine() == "lightpanda"
+
+
+def lightpanda_engine_status() -> tuple[bool, str]:
+    """Whether ``browser.engine: lightpanda`` is actually in effect, and why.
+
+    ``(False, "")`` when the engine isn't lightpanda; else the reason names the setting shadowing it, in
+    session-creation precedence, with config-only gates (no network I/O) for ``/browser status`` and
+    ``hermes doctor``."""
+    if not using_lightpanda_engine():
+        return False, ""
+    from tools.browser_session_cdp import get_cdp_override_raw
+    from tools.browser_session_cloud import get_cloud_provider, use_real_profile
+    if get_cdp_override_raw():
+        return False, "a CDP override is active (/browser connect or browser.cdp_url)"
+    # Real profile before the cloud provider: browser_exec resolves it first, so it claims the session.
+    if use_real_profile():
+        return False, "browser.use_real_profile is on (Lightpanda cannot load a Chromium profile)"
+    try:
+        provider = get_cloud_provider()
+    except ValueError:  # an unknown explicit provider name: browser_exec reports it on use
+        provider = None
+    if provider is not None:
+        name = getattr(provider, "display_name", "") or type(provider).__name__
+        return False, f"cloud provider {name} is selected (browser.cloud_provider, or auto-detected from credentials)"
+    from tools.browser_use_cli import _read_browser_cfg, is_legacy_browser_use_cloud_config
+    if is_legacy_browser_use_cloud_config(_read_browser_cfg()):
+        return False, "Browser Use cloud (BROWSER_USE_API_KEY) is selected"
+    return True, "Hermes spawns `lightpanda serve` per browser session"

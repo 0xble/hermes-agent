@@ -36,6 +36,8 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
+from tools.code_kernel_memory import KernelMemoryWatch, RUNNER_MEMORY_SOURCE, kernel_memory_limit_bytes
+
 logger = logging.getLogger(__name__)
 
 _IS_WINDOWS = sys.platform == "win32"
@@ -62,8 +64,16 @@ def run_cell(request, execution_count):
             exec(compile(request["code"], "<cell>", "exec"), GLOBALS)
     except SystemExit as exc:
         status, trace = "exit", "SystemExit: " + repr(exc.code)
-    except BaseException:
+    except BaseException as exc:
         status, trace = "error", traceback.format_exc()
+        # Only local runners install this backstop; remote/unlimited MemoryError
+        # remains an ordinary cell error. A refused allocation need not retire the
+        # kernel: execution has already unwound, though earlier mutations persist.
+        if isinstance(exc, MemoryError) and globals().get("_memory_rlimit_bytes", 0):
+            ceiling_mb = _memory_rlimit_bytes / (1024 ** 2)
+            trace += ("\\nkernel exceeded memory ceiling %g MiB " % ceiling_mb
+                      + "(allocation refused by OS limit); RLIMIT_DATA backstop; kernel kept alive. "
+                      + "Earlier cell mutations may persist.\\n")
     stdout_text, stdout_clipped = _clip(out.getvalue())
     stderr_text, stderr_clipped = _clip(err.getvalue())
     return {
@@ -89,39 +99,6 @@ _CAPTURE_LIMIT = {_RUNNER_CAPTURE_BYTES}
 _SPILL_DIR = os.environ.get("HERMES_KERNEL_SPILL_DIR", "")
 _SPILL_CAP = {5_000_000}
 _PARENT_PROCESS_HANDLE = os.environ.pop("HERMES_KERNEL_PARENT_PROCESS_HANDLE", "")
-_PARENT_DEATH_FD = os.environ.pop("HERMES_KERNEL_PARENT_DEATH_FD", "")
-
-
-def _start_parent_death_pipe_watchdog():
-    """POSIX twin of the Windows handle watchdog: exit when the parent dies.
-
-    The host holds the only write end of an inherited pipe; a blocking read
-    returns EOF the instant the host exits by ANY means (SIGKILL, OOM, crash),
-    exactly like the MCP death supervisor. Stdin EOF alone is not enough: the
-    main loop only sees it between cells, so a kernel SIGKILLed mid-cell
-    outlived its host. Not PR_SET_PDEATHSIG — that is bound to the spawning
-    THREAD, and kernels are spawned from per-cell threads that exit.
-    """
-    global _PARENT_DEATH_FD
-    raw_fd = _PARENT_DEATH_FD
-    _PARENT_DEATH_FD = ""
-    if sys.platform == "win32" or not raw_fd:
-        return
-    try:
-        fd = int(raw_fd)
-        os.set_inheritable(fd, False)
-    except (OSError, ValueError):
-        return
-
-    def _wait():
-        try:
-            while os.read(fd, 1):
-                pass
-        except OSError:
-            pass
-        os._exit(0)
-
-    threading.Thread(target=_wait, name="hermes-parent-watchdog", daemon=True).start()
 
 
 def _start_parent_process_watchdog():
@@ -174,8 +151,9 @@ def _start_parent_process_watchdog():
     threading.Thread(target=_wait, name="hermes-parent-watchdog", daemon=True).start()
 
 
+{RUNNER_MEMORY_SOURCE}
+
 _start_parent_process_watchdog()
-_start_parent_death_pipe_watchdog()
 
 _real_stdout = sys.stdout
 
@@ -328,13 +306,14 @@ class SessionKernel:
         self.sock_path: Optional[str] = None
         self.server_sock: Optional[socket.socket] = None
         self.stop_event = threading.Event()
-        self.death_pipe_w: Optional[int] = None
         self.tool_call_log: list = []
         self.cell_log_start = 0
         self.tool_call_counter: list[int] = [0]
         self.kernel_id = uuid.uuid4().hex
         self.process_start: int | str | None = None
         self.retire_reason = "teardown"
+        self.tree_memory_bytes = 0
+        self.memory_ceiling_bytes = 0
         self.current_task = ""
         self.current_caller = ""
         # Cells currently attached (bumped under the registry lock on selection, dropped when the
@@ -373,21 +352,17 @@ class SessionKernel:
             self.closed = True
             self.stop_event.set()
             proc = self.proc
-            death_pipe_w = self.death_pipe_w
-            self.death_pipe_w = None
             sock, self.server_sock = self.server_sock, None
             sock_path, self.sock_path = self.sock_path, None
             tmpdir, self.tmpdir = self.tmpdir, ""
         _log_kernel_lifecycle(self, "retire", task_id=self.current_task,
                               caller=self.current_caller, reason=reason, proc=proc)
-        if death_pipe_w is not None:
-            try:
-                os.close(death_pipe_w)
-            except OSError:
-                pass
         if proc is not None and proc.poll() is None:
             from tools.code_execution_tool import _kill_process_group
             _kill_process_group(proc, escalate=True)
+        if proc is not None and not _IS_WINDOWS:
+            from hermes_cli.process_identity import release_process_group_once_empty
+            release_process_group_once_empty(proc.pid, proc=proc)
         try:
             if sock is not None:
                 sock.close()
@@ -441,6 +416,9 @@ def _emit_kernel_lifecycle(kernel, event: str, *, task_id: str, caller: str, rea
         "pid": pid, "process_start": getattr(kernel, "process_start", None) or "unknown",
         "rss_bytes": rss, "reason": reason, "attached": kernel.attached, "pinned": kernel.pinned,
     }
+    if not remote:
+        record.update(tree_memory_bytes=kernel.tree_memory_bytes,
+                      memory_ceiling_bytes=kernel.memory_ceiling_bytes)
     logger.info("kernel_lifecycle %s", json.dumps(record, ensure_ascii=True))
 
 
@@ -520,7 +498,7 @@ _MAX_REMEMBERED_KERNEL_EVICTIONS = 256
 # A bounded tombstone map lets the next acquire explain why a session kernel was recreated.
 # It is deliberately separate from idle/dead/reset disposal: those paths already report their
 # state loss or are explicit model requests, while LRU eviction was previously silent.
-_EVICTED_KERNELS: "OrderedDict[Tuple, str]" = OrderedDict()
+_EVICTED_KERNELS: OrderedDict[tuple, str] = OrderedDict()
 
 
 def _lifecycle_limits() -> tuple[int, int]:
@@ -786,30 +764,26 @@ def _spawn_locked(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     child_env["HERMES_KERNEL_SPILL_DIR"] = kernel.tmpdir
     # Generated client reconnects after the RPC server's 300s idle timeout between cells.
     child_env["HERMES_RPC_PERSISTENT"] = "1"
-    # Parent-death watchdog plumbing: Windows inherits a SYNCHRONIZE handle to this process; POSIX
-    # inherits the read end of a pipe whose only write end we hold (EOF == host gone, any cause).
+    # Owner death: Windows inherits a SYNCHRONIZE handle to this process for the runner's watchdog.
     parent_handle, close_handle, startupinfo = _parent_process_handle(child_env) if _IS_WINDOWS else (None, None, None)
-    death_r: Optional[int] = None
-    pass_fds: tuple[int, ...] = ()
-    if not _IS_WINDOWS:
-        death_r, kernel.death_pipe_w = os.pipe()
-        child_env["HERMES_KERNEL_PARENT_DEATH_FD"] = str(death_r)
-        pass_fds = (death_r,)
+    # POSIX: spawn_owned makes the kernel lead its own group, which everything a cell spawns joins,
+    # and hands that group to the owner-death supervisor: the whole group dies the moment this
+    # process dies, by any cause. A kernel-only death pipe let a cell's subprocesses outlive the host.
+    from hermes_cli.process_identity import spawn_owned
     try:
         kernel.ensure_open()
-        kernel.proc = subprocess.Popen(
-            [child_python, os.path.join(kernel.tmpdir, "hermes_kernel_runner.py")],
+        kernel.proc = spawn_owned(
+            [child_python, os.path.join(kernel.tmpdir, "hermes_kernel_runner.py"),
+             str(kernel_memory_limit_bytes())], purpose="code-kernel",
             # Strict mode passes an empty cwd: the kernel's staging dir plays the per-call tmpdir's role.
-            cwd=child_cwd or kernel.tmpdir, env=child_env, start_new_session=True,
+            cwd=child_cwd or kernel.tmpdir, env=child_env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, stdin=subprocess.PIPE,
             creationflags=subprocess.CREATE_NO_WINDOW if _IS_WINDOWS else 0,
-            close_fds=True, pass_fds=pass_fds, startupinfo=startupinfo,
+            close_fds=True, startupinfo=startupinfo,
         )
     finally:
         if parent_handle and close_handle is not None:
             close_handle(parent_handle)
-        if death_r is not None:
-            os.close(death_r)
     _log_kernel_lifecycle(kernel, "start", task_id=kernel.current_task, caller=kernel.current_caller, reason="spawn")
     kernel.ensure_open()
     # Deliberately NOT propagate_context_to_thread: that would freeze the spawning cell's
@@ -825,7 +799,7 @@ def _pop_idle_expired(now: float, idle_timeout: float) -> list[SessionKernel]:
     return _REGISTRY.pop_idle_unlocked(now, idle_timeout)
 
 
-def _remember_kernel_eviction(key: Tuple, cap: int) -> None:
+def _remember_kernel_eviction(key: tuple, cap: int) -> None:
     """Remember a bounded LRU-eviction tombstone for the key's next acquire."""
     _EVICTED_KERNELS[key] = (
         f"kernel evicted: {cap} session kernels max; re-create variables before using them."
@@ -946,15 +920,24 @@ def _background_reaper() -> None:
 def _await_cell(kernel: SessionKernel, timeout: int, is_interrupted) -> tuple[str, dict[str, Any]]:
     """Wait for the cell's reply; returns (host status, payload)."""
     deadline = time.monotonic() + timeout if timeout else None
+    assert kernel.proc is not None
+    kernel.memory_ceiling_bytes = kernel_memory_limit_bytes()
+    watch = KernelMemoryWatch(kernel.proc.pid, kernel.memory_ceiling_bytes)
     while True:
         if is_interrupted():
             return "interrupted", {}
         if deadline is not None and time.monotonic() > deadline:
             return "timeout", {}
+        if usage := watch.exceeded():
+            kernel.tree_memory_bytes = usage
+            return "memory_ceiling", {}
         try:
             payload = kernel.response_q.get(timeout=0.05)
         except queue.Empty:
             continue
+        if usage := watch.exceeded(final=True):
+            kernel.tree_memory_bytes = usage
+            return "memory_ceiling", {}
         if payload.get("status") in ("kernel-eof", "protocol-error"):
             return "error", payload
         return "success", payload
@@ -973,7 +956,7 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
     from tools.ansi_strip import strip_ansi
     def clean(text: str) -> str:
         return redact_sensitive_text(strip_ansi(text), code_file=True)
-    if status in ("timeout", "interrupted"):
+    if status in ("timeout", "interrupted", "memory_ceiling"):
         # No safe way to interrupt one cell in place: kill the kernel, report the loss, respawn next call.
         _REGISTRY.discard(key, kernel, reason=status)
     duration = round(time.monotonic() - exec_start, 2)
@@ -1004,7 +987,17 @@ def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[s
             f'— page it with read_file(path="{cell_spill}", offset=...) instead of re-running. '
             "(Kernel state persists: printing a narrower slice next call is often cheaper.)"
         )
-    if status == "timeout":
+    if status == "memory_ceiling":
+        ceiling_mb = kernel.memory_ceiling_bytes / (1024 ** 2)
+        message = (f"kernel exceeded memory ceiling {ceiling_mb:g} MiB "
+                   f"(process-tree footprint {kernel.tree_memory_bytes} bytes); kernel retired "
+                   "and its state was lost. The next execute_code call starts a fresh kernel.")
+        result.update(status="error", exit_code=-1, error=message,
+                      output=(stdout_text + "\n\n" + message) if stdout_text else message)
+        result["kernel"].update(ended=True, state_lost=True,
+                                 memory_bytes=kernel.tree_memory_bytes,
+                                 memory_ceiling_bytes=kernel.memory_ceiling_bytes)
+    elif status == "timeout":
         message = (f"Cell timed out after {timeout}s; the session kernel was killed and its "
                    "state was lost. The next execute_code call starts a fresh kernel.")
         result.update(exit_code=-1, error=message,

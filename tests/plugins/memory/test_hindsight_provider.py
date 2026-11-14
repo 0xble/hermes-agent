@@ -2420,7 +2420,7 @@ class TestLoadSimpleEnv:
         """A Notepad-edited .env carries a BOM; the first key must still parse
         instead of becoming '\ufeffHINDSIGHT_LLM_API_KEY'."""
         env_path = tmp_path / ".env"
-        env_path.write_bytes("﻿HINDSIGHT_LLM_API_KEY=sk-test\n".encode("utf-8"))
+        env_path.write_bytes("﻿HINDSIGHT_LLM_API_KEY=sk-test\n".encode())
         values = _load_simple_env(env_path)
         assert values.get("HINDSIGHT_LLM_API_KEY") == "sk-test"
 
@@ -2443,7 +2443,7 @@ class TestPostSetupEnvEncoding:
         """The setup writer reads the existing .env BOM-tolerantly, so a
         BOM'd first key is matched and rewritten, not duplicated."""
         env_path = tmp_path / ".env"
-        env_path.write_bytes("﻿HINDSIGHT_API_KEY=old\n".encode("utf-8"))
+        env_path.write_bytes("﻿HINDSIGHT_API_KEY=old\n".encode())
 
         self._run_cloud_post_setup(tmp_path, monkeypatch)
 
@@ -2500,7 +2500,7 @@ class TestMultiplexBackgroundScope:
         reset_hermes_home_override(home_tok)
 
     def test_writer_thread_resolves_profile_secret(self, scoped_embedded):
-        created, home = scoped_embedded
+        created, _home = scoped_embedded
         p = HindsightMemoryProvider()
         p._mode = "local_embedded"
         p._config = {"profile": "hermes", "llm_provider": "openai", "llm_model": "m"}
@@ -2824,7 +2824,7 @@ def _recall_by_query(responses):
 class TestOwnerSubjectRecall:
     def test_disabled_by_default_keeps_a_single_recall(self, provider):
         assert provider._recall_owner_subject == ""
-        text, count = provider._do_recall("what car do I drive")
+        _text, count = provider._do_recall("what car do I drive")
         assert provider._client.arecall.call_count == 1
         assert count == 2
 
@@ -2856,7 +2856,7 @@ class TestOwnerSubjectRecall:
             "my plans": [("a", long + "a"), ("b", long + "b")],
             "my plans (Brian Le)": [("c", long + "c"), ("d", long + "d")],
         })
-        text, count = p._do_recall("my plans")
+        _text, count = p._do_recall("my plans")
         assert count == 1
 
     def test_owner_recall_failure_is_an_empty_recall_not_a_crash(self, provider_with_config):

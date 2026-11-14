@@ -54,8 +54,12 @@ survive checkpoint and completion receipt serialization. The UUID is a run
 identity, not a new service credential. Profile-filtered list and release sweeps
 must filter before probing remote handles. `tools/process_registry_ssh.py` uses a per-command POSIX
 supervisor holding its unreaped child's identity and a token-scoped receipt. It
-is not a resident service. Stop requests go to that supervisor, never to a bare
-remote PID or local kill helper. If the supervisor is lost, a stop request may
+uses the same eager-then-geometric supervision cadence as local survivor
+pollers: 100 ms initially, ×1.5 while unchanged, capped at 2 s. The cap
+bounds remote completion/stop observation while preventing one thread per
+remote command from polling at a fixed 10 Hz. It is not a resident service.
+Stop requests go to that supervisor, never to a bare remote PID or local kill
+helper. If the supervisor is lost, a stop request may
 kill the child's process group only after proving the PID still leads that group
 with the start time the supervisor recorded. Persist the binding before launch, never replay
 on lost acknowledgement, and retain unknown/unavailable state when proof is

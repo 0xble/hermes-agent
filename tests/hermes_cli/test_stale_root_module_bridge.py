@@ -87,5 +87,5 @@ assert callable(sys.modules['utils'].file_signature)
     env = {k: v for k, v in os.environ.items() if not k.startswith("HERMES_")}
     env.update(HOME=str(tmp_path), HERMES_HOME=str(tmp_path / ".hermes"))
     result = subprocess.run([sys.executable, "-I", "-B", "-c", code], env=env,
-                            capture_output=True, text=True, timeout=30)
+                            capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stdout + result.stderr

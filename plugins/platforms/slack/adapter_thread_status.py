@@ -6,8 +6,6 @@ import logging
 import time
 from typing import Literal, Optional
 
-from agent.i18n import t
-
 logger = logging.getLogger(__name__)
 
 
@@ -108,6 +106,7 @@ class SlackThreadStatusMixin:
     @staticmethod
     def _default_status_text(started: Optional[float]) -> str:
         """Live phrases win over the elapsed fallback for long-running turns."""
+        from plugins.platforms.slack.adapter import t
         elapsed = int(time.monotonic() - started) if started is not None else 0
         if elapsed < 30:
             return t("platform.slack.status.thinking")

@@ -11,8 +11,9 @@ pytest.importorskip("telegram")
 
 from telegram.error import RetryAfter
 
-from plugins.platforms.telegram.adapter import TelegramAdapter, _FLOOD_INLINE_WAIT_CAP_SECS, _standalone_send
-from tools.send_message_senders import _send_telegram
+from plugins.platforms.telegram.adapter import TelegramAdapter, _FLOOD_INLINE_WAIT_CAP_SECS
+from plugins.platforms.telegram.standalone import standalone_send as _standalone_send
+from plugins.platforms.telegram.standalone import _send_telegram
 
 
 @pytest.fixture
@@ -21,7 +22,7 @@ def bot(monkeypatch):
         do_api_request=AsyncMock(return_value={"message_id": 123}),
         send_message=AsyncMock(return_value=SimpleNamespace(message_id=1)),
     )
-    monkeypatch.setattr("tools.send_message_senders._telegram_bot", lambda _token: bot)
+    monkeypatch.setattr("plugins.platforms.telegram.standalone._telegram_bot", lambda _token, extra=None: bot)
     return bot
 
 
@@ -29,11 +30,11 @@ def bot(monkeypatch):
 @pytest.mark.parametrize("repeat", [False, True])
 def test_short_retry_after_waits_and_retries_only_once(bot, monkeypatch, wait, repeat):
     sleep = AsyncMock()
-    monkeypatch.setattr("tools.send_message_senders.asyncio.sleep", sleep)
+    monkeypatch.setattr("plugins.platforms.telegram.telegram_outbound.asyncio.sleep", sleep)
     error = RetryAfter(wait)
     bot.do_api_request.side_effect = [error, error if repeat else {"message_id": 456}]
 
-    result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages="always"))
+    result = asyncio.run(_send_telegram("test-token", "123", "**hello**", extra={"rich_messages": "always"}))
 
     assert bot.do_api_request.await_count == 2
     assert bot.do_api_request.await_args_list[0] == bot.do_api_request.await_args_list[1]
@@ -54,10 +55,10 @@ def test_short_retry_after_waits_and_retries_only_once(bot, monkeypatch, wait, r
 ])
 def test_long_penalty_and_ambiguous_errors_never_resend(bot, monkeypatch, error):
     sleep = AsyncMock()
-    monkeypatch.setattr("tools.send_message_senders.asyncio.sleep", sleep)
+    monkeypatch.setattr("plugins.platforms.telegram.telegram_outbound.asyncio.sleep", sleep)
     bot.do_api_request.side_effect = error
 
-    result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages="always"))
+    result = asyncio.run(_send_telegram("test-token", "123", "**hello**", extra={"rich_messages": "always"}))
 
     assert "error" in result
     bot.do_api_request.assert_awaited_once()
@@ -73,7 +74,7 @@ def test_rich_adapter_setup_errors_warn_and_fall_back(bot, monkeypatch, caplog, 
         calls = []
 
         class BrokenAdapter(TelegramAdapter):
-            def __new__(cls):
+            def __new__(cls, *args, **kwargs):
                 calls.append(cls)
                 if len(calls) == 1:
                     raise error
@@ -86,7 +87,7 @@ def test_rich_adapter_setup_errors_warn_and_fall_back(bot, monkeypatch, caplog, 
 
         monkeypatch.setattr(TelegramAdapter, "_should_attempt_rich", eligibility)
 
-    result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages="always"))
+    result = asyncio.run(_send_telegram("test-token", "123", "**hello**", extra={"rich_messages": "always"}))
 
     assert result["success"] and result["message_id"] == "1"
     bot.do_api_request.assert_not_awaited()

@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import logging
 import os
-from typing import Any, Dict, List, NamedTuple, Optional
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import Any, Dict, Iterator, List, NamedTuple, Optional
 from agent.fast_mode import BOUNDED_MODES, STATIC_TIERS
 from utils import base_url_hostname, is_truthy_value
 from hermes_cli.fallback_config import scoped_fallback_chain
@@ -91,6 +93,15 @@ def _get_oneshot_max_children() -> int:
     )
 
 
+def _get_prefix_stagger_seconds() -> float:
+    """delegation.prefix_stagger_seconds: longest a batch sibling waits for the first child's response to start so
+    its request reads the shared prompt cache (0 = off, the default). See tools/delegate_tool_prefix_gate.py."""
+    return _knob(
+        "prefix_stagger_seconds", None, lambda v: min(60.0, max(0.0, float(v))), 0.0,
+        "delegation.prefix_stagger_seconds=%r is not a number; the prompt-cache warm-up wait is off",
+    )
+
+
 def _get_max_concurrent_children() -> int:
     """delegation.max_concurrent_children > DELEGATION_MAX_CONCURRENT_CHILDREN env > 10.
 
@@ -119,6 +130,48 @@ def _get_independent_completions() -> bool:
     """delegation.independent_completions (bool, default False): split a background call into per-task / per-group
     completion messages that land as each finishes. Off = one consolidated message when the whole call is done."""
     return is_truthy_value(_cfg().get("independent_completions", False))
+
+# delegation.gateway_mode: "background" (alias "async") always detaches; "inline" joins in the turn; anything else is
+# "auto". Read from the gateway turn's own (profile-scoped) user config, not from this process's config.
+_GATEWAY_MODES = {"inline": True, "background": False, "async": False}
+
+def gateway_delegation_inline(user_config: Any, platform_key: str, *, interim_enabled: bool) -> bool:
+    """Whether a gateway session joins its top-level delegations inside the turn (``delegation.gateway_mode``).
+
+    ``auto`` (default) joins on a human chat whose interim assistant messages are off (the gateway's resolved
+    ``display.interim_assistant_messages``, platform overrides included): there the "status, end your turn" reply
+    the background path asks for would be delivered as the turn's answer, then the real answer as a second message.
+    API, local and webhook surfaces keep the background path under ``auto``."""
+    from gateway.session_context import NON_MESSAGING_SESSION_SURFACES
+    section = user_config.get("delegation") if isinstance(user_config, dict) else None
+    mode = str(section.get("gateway_mode") or "auto").strip().lower() if isinstance(section, dict) else "auto"
+    if mode in _GATEWAY_MODES:
+        return _GATEWAY_MODES[mode]
+    return not interim_enabled and str(platform_key or "").lower() not in NON_MESSAGING_SESSION_SURFACES
+
+# Set by the gateway around building a session's agent; read once by that agent's first tool build.
+_GATEWAY_DELEGATION_INLINE: ContextVar[bool] = ContextVar("hermes_gateway_delegation_inline", default=False)
+
+@contextmanager
+def gateway_delegation_inline_scope(inline: bool) -> Iterator[None]:
+    """Build an agent whose tools carry the joined ``delegate_task`` variant (frozen on the agent by
+    :func:`agent_joins_delegation`). Dispatch reads the variant the session carries, not this flag."""
+    token = _GATEWAY_DELEGATION_INLINE.set(bool(inline))
+    try:
+        yield
+    finally:
+        _GATEWAY_DELEGATION_INLINE.reset(token)
+
+def agent_joins_delegation(agent: Any) -> bool:
+    """The gateway's inline decision, frozen on *agent* at its first tool build (like ``agent_is_oneshot``) and
+    re-frozen from a restored tools[] pin (``tools.delegate_tool.adopt_session_delegation_mode``), so later rebuilds
+    outside the build scope keep the session's ``delegate_task`` bytes. Dispatch does not read this: it follows the
+    schema the session carries (``tools.delegate_tool.session_joins_delegation``)."""
+    cached = getattr(agent, "_delegation_inline", None)
+    if not isinstance(cached, bool):
+        cached = _GATEWAY_DELEGATION_INLINE.get()
+        agent._delegation_inline = cached
+    return cached
 
 def _get_worktree_isolation() -> bool:
     """delegation.worktree_isolation (bool, default False): each child gets its own
@@ -462,8 +515,6 @@ def _direct_endpoint_credentials(v: dict, explicit_request_overrides) -> dict:
         provider, api_mode = "openai-codex", "codex_responses"
     elif host == "api.anthropic.com":
         provider, api_mode = "anthropic", "anthropic_messages"
-    elif "api.kimi.com/coding" in base_lower:
-        api_mode = "anthropic_messages"
     # Explicit delegation.api_mode always wins over the URL heuristic; a provider plugin's
     # registered dialect counts as explicit.
     from agent.transports import registered_api_modes
@@ -535,27 +586,6 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
         command=pinned_command, args=list(runtime.get("args") or []),
     )
 
-_DELEGATION_ROUTE_KEYS = frozenset({
-    "model", "provider", "base_url", "api_key", "api_mode", "request_overrides",
-    "fallback_providers", "fallback_chain", "reasoning_effort", "command", "args",
-})
-
-
-def _select_routing_cfg(cfg: dict, parent_agent) -> dict:
-    """Select from the live model, never the original model before a switch or fallback.
-
-    Preset keys and values have already been validated and expanded by config loading.
-    Return the original config on a miss so existing route behavior stays untouched.
-    """
-    route = cfg.get("by_parent", {}).get(getattr(parent_agent, "model", None))
-    if route is None:
-        return cfg
-    selected = {key: value for key, value in cfg.items() if key not in _DELEGATION_ROUTE_KEYS}
-    if route != "inherit":
-        selected.update(route)
-    return selected
-
-
 def _resolve_delegation_credentials(cfg: dict, parent_agent) -> dict:
     """Child credential bundle from the ``delegation`` config section. Three branches: ``base_url`` set → direct
     endpoint (``api_key`` None means inherit the parent's key, so providers keyed outside OPENAI_API_KEY work);
@@ -582,19 +612,15 @@ def _load_config() -> dict:
     (follows HERMES_HOME/profile; no deepcopy, since this runs on every get_definitions() rebuild) over the legacy
     ``cli.CLI_CONFIG``, which can hide user-set keys — except that ``HERMES_IGNORE_USER_CONFIG=1`` is only honored
     by the legacy loader, so it stays authoritative when that flag is set."""
-    from hermes_cli.model_presets import ModelPresetError, delegation_runtime_config
     if os.environ.get("HERMES_IGNORE_USER_CONFIG") != "1":
         try:
             from hermes_cli.config import load_config_readonly
-            return delegation_runtime_config(load_config_readonly())
-        except Exception as exc:
-            if isinstance(exc, ModelPresetError):
-                raise
+            return (load_config_readonly() or {}).get("delegation") or {}
+        except Exception:
+            logger.debug("Read-only delegation config unavailable; checking CLI config", exc_info=True)
     try:
         from cli import CLI_CONFIG
-        return delegation_runtime_config(CLI_CONFIG)
-    except ModelPresetError:
-        raise
+        return CLI_CONFIG.get("delegation") or {}
     except Exception:
         return {}
 

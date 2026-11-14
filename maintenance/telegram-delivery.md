@@ -27,7 +27,7 @@ are owned by [Telegram rendering](telegram-rendering.md).
 Fork patch identity: `telegram-delivery`.
 Contract tests: `tests/gateway/test_telegram_thread_fallback.py`.
 
-The 2026-11-09 investigation of https://github.com/NousResearch/hermes-agent/issues/152148 found that this fork's text retry ladder already returned `raw_response.thread_fallback`, and `cron/scheduler_delivery.py` already read it. The delivery-obligation finalizer, cancellation settlement, and recovered-obligation replay discarded it: `mark_delivered` unconditionally cleared `last_error`. Media anchor retries and control sends also removed routing without carrying the distinction into their results. This branch has no `telegram_dm_topic_send.py`; the corresponding routing helpers live in `plugins/platforms/telegram/adapter.py`.
+The 2026-11-09 investigation of https://github.com/NousResearch/hermes-agent/issues/152148 found that this fork's text retry ladder already returned `raw_response.thread_fallback`, and `cron/scheduler_delivery.py` already read it. The delivery-obligation finalizer, cancellation settlement, and recovered-obligation replay discarded it: `mark_delivered` unconditionally cleared `last_error`. Media anchor retries and control sends also removed routing without carrying the distinction into their results. Upstream `telegram_dm_topic_send.py` owns route classification. The adapter carries the fork fallback receipt into delivery settlement.
 
 Successful root fallbacks retain `success=True` and report `thread_fallback=True` with `requested_thread_id`. Delivery obligations retain `state=delivered`, their requested `thread_id`, and their existing attempt count, with `last_error=thread_fallback_root`. This records receipt without claiming topic recovery or scheduling duplicate delivery. Anchored and newly created topic text sends retain their existing fail-closed contract. Each fallback logs a content-free WARNING naming the requested thread. Per-send context keeps media albums and control results honest without leaking a fallback into a later or concurrent send.
 
@@ -366,7 +366,7 @@ batched cleanup and its flood retention, and the standalone lane. The 30-session
 fails on the pre-patch base (30 chat actions instead of 1).
 
 **Rollback:** Revert the `fix(telegram): one outbound budget per chat` commit. It removes
-`chat_budget.py`, the builder `rate_limiter`, `MeteredBot` in `tools/send_message_senders.py`,
+`chat_budget.py`, the builder `rate_limiter`, `MeteredBot` in `plugins/platforms/telegram/standalone.py`,
 `delete_messages` (base, Telegram, cleanup grouping), the inline-cap helper and the 3.0s
 producer interval, and restores the 1.0s slot helpers. No state, schema or configuration
 migration is involved.
@@ -435,10 +435,11 @@ The adopted fix is upstream salvage PR
 [#74004](https://github.com/NousResearch/hermes-agent/issues/74004). It is
 cherry-picked with original authorship. It escapes the indicator and separates
 it from a closing code fence, reusing `_separate_chunk_indicator_from_fence`.
-Source: `tools/send_message_senders.py`. Proof:
+Source: `plugins/platforms/telegram/standalone.py` after v0.23.1 adoption. Proof:
 `tests/tools/test_telegram_send_message_chunk_mdv2.py`, which fails on the
-unpatched sender. The standalone lane still sends MarkdownV2, never Rich
-Messages. That gap is unchanged.
+unpatched sender. v0.23.1 contains the indicator escaping and fence separation, so
+that part is retired against upstream. The fork retains the UTF-16 indicator reserve
+under `telegram-rendering`; eligible standalone text now follows the shared rich policy.
 
 Retire after an accepted upstream release contains #126100, or an equivalent,
 and the proof test passes without this patch. Roll back by reverting the two

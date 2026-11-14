@@ -418,12 +418,24 @@ def _live_system_guard(request, monkeypatch):
             (".venv/bin/hermes" in low and "update" in low)
         )
 
-    def _is_npm_refresh_fixture(cmd, kwargs) -> bool:
-        # Only PM's direct temporary fixture command is a known false positive:
-        # its parent path can contain "hermes-ci-home", but it updates a throwaway
-        # package-lock.json. Shell payloads, extra args and executable overrides
-        # are deliberately not exempt. No real Hermes entrypoint has this shape.
-        if not isinstance(cmd, (list, tuple)) or len(cmd) != 2 or cmd[1] != "update":
+    def _is_dependency_refresh_fixture(cmd, kwargs) -> bool:
+        # PM's direct npm/pnpm fixture commands are known false positives: their
+        # temp path contains "hermes", but they refresh only a throwaway lockfile.
+        # Match exact argv and tool layout, never shell payloads or extra options.
+        if not isinstance(cmd, (list, tuple)) or not cmd:
+            return False
+        if not all(isinstance(arg, str) for arg in cmd[1:]):
+            return False
+        npm_suffix = ("store", "npm-fixture", "npm.cmd") if _os.name == "nt" else (
+            "store", "npm-fixture", "bin", "npm")
+        pnpm_suffix = ("store", "pnpm-fixture", "pnpm.exe" if _os.name == "nt" else "pnpm")
+        diagnostic_args = ("update", "--recursive", "--lockfile-only", "--reporter=ndjson")
+        suffix = {
+            ("update",): npm_suffix,
+            ("update", "--recursive", "--lockfile-only", "--no-save"): pnpm_suffix,
+            diagnostic_args: pnpm_suffix,
+        }.get(tuple(cmd[1:]))
+        if suffix is None:
             return False
         if not kwargs or kwargs.get("shell") or kwargs.get("executable") is not None:
             return False
@@ -431,20 +443,28 @@ def _live_system_guard(request, monkeypatch):
         binary = Path(_argv_token(cmd[0]))
         if not binary.is_absolute():
             return False
-        suffix = ("store", "npm-fixture", "npm.cmd") if _os.name == "nt" else (
-            "store", "npm-fixture", "bin", "npm"
-        )
         if binary.parts[-len(suffix):] != suffix:
             return False
         root = binary.parents[len(suffix) - 1]
         cwd = kwargs.get("cwd")
-        return (
-            root.name.startswith("pm-deps-")
-            and root.parent.resolve() == Path(tempfile.gettempdir()).resolve()
-            and binary.is_file()
-            and cwd is not None
-            and Path(cwd).resolve() == (root / "repo").resolve()
-        )
+        if not (root.name.startswith("pm-deps-")
+                and root.parent.resolve() == Path(tempfile.gettempdir()).resolve()
+                and binary.is_file() and cwd is not None):
+            return False
+        if tuple(cmd[1:]) != diagnostic_args:
+            return Path(cwd).resolve() == (root / "repo").resolve()
+        # pnpm's release-age diagnostic permits saves only in its separate copy
+        # of this fixture's workspace. Keep its tool and homes owned by the fixture.
+        scratch = Path(cwd).resolve()
+        env = kwargs.get("env")
+        return (scratch.name.startswith("pm-pnpm-release-age-")
+                and scratch.parent == root.parent.resolve()
+                and (scratch / "package.json").is_file()
+                and (scratch / "pnpm-workspace.yaml").is_file()
+                and kwargs.get("stdin") == _subprocess.DEVNULL
+                and isinstance(env, dict)
+                and Path(env.get("HERMES_HOME", "")).resolve() == (root / "home").resolve()
+                and Path(env.get("HERMES_RUNTIME_DIR", "")).resolve() == (root / "store").resolve())
 
     def _argv_token(token) -> str:
         if isinstance(token, (bytes, bytearray)):
@@ -596,7 +616,7 @@ def _live_system_guard(request, monkeypatch):
         # the update-spawn path must mock subprocess.Popen explicitly.
         cmd_str = _cmd_to_string(cmd)
         block_update = _base_is_hermes_update(cmd) or _is_hermes_update(cmd)
-        if block_update and not _is_npm_refresh_fixture(cmd, kwargs):
+        if block_update and not _is_dependency_refresh_fixture(cmd, kwargs):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
                 f"subprocess.{name}({cmd!r}) — this command would run "

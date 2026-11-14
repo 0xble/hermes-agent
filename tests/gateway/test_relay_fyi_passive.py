@@ -71,7 +71,7 @@ def runner(monkeypatch):
         return fn(*args, **kwargs)
 
     runner._run_in_executor_with_context = run_in_executor
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._load_gateway_config", dict)
     monkeypatch.setattr("hermes_cli.goals._get_session_db", lambda: object())
     monkeypatch.setattr("hermes_cli.goals.load_goal", lambda _sid: None)
     monkeypatch.setattr("hermes_cli.loops.load_loop", lambda _sid: None)
@@ -372,5 +372,5 @@ def test_rollback_flag_fails_closed_on_malformed_values(runner, monkeypatch, raw
 
 
 def test_absent_rollback_flag_keeps_passive_delivery(runner, monkeypatch):
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._load_gateway_config", dict)
     assert runner._relay_fyi_passive_enabled() is True

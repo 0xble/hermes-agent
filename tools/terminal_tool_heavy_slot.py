@@ -336,9 +336,7 @@ def _command_start(words: list[str]) -> tuple[int, Optional[int]]:
             return index, None
         if insert is None and word in _EXEC_PREFIXES:
             insert = index
-        if _ASSIGNMENT.match(word) or word in _KEYWORDS:
-            index += 1
-        elif word == "nohup":
+        if _ASSIGNMENT.match(word) or word in _KEYWORDS or word == "nohup":
             index += 1
         elif word == "env":
             index += 1

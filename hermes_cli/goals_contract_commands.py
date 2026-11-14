@@ -37,7 +37,7 @@ class GoalContractCommandsMixin:
     # Public revise()/replace() live on GoalRevisionsMixin (snapshot/CAS boundary); this mixin
     # supplies the pure additive-revision validator and the recorded-evidence check they use.
 
-    def _recorded_evidence_error(self, evidence: str, state: GoalState) -> Optional[Dict[str, str]]:
+    def _recorded_evidence_error(self, evidence: str, state: GoalState) -> Optional[dict[str, str]]:
         """Require evidence-backed revisions to cite an eligible recorded tool result.
 
         Matching uses word-bounded decoded or identically whitespace-normalized token sequences.
@@ -89,8 +89,8 @@ class GoalContractCommandsMixin:
 
     @staticmethod
     def _revise_state(state: GoalState, *, reason: str, actor: str, goal: Optional[str],
-                      contract: Optional[Dict[str, str]], subgoals: Optional[List[str]],
-                      evidence: str, evidence_error: Optional[Dict[str, str]]) -> Dict[str, Any]:
+                      contract: Optional[dict[str, str]], subgoals: Optional[list[str]],
+                      evidence: str, evidence_error: Optional[dict[str, str]]) -> dict[str, Any]:
         """Validate and apply an additive revision to the live row (pure; no I/O)."""
         from hermes_cli.goals import (
             GoalContract, _CONTRACT_FIELDS, _REVISION_EVIDENCE_MIN_CHARS, _requirement_diff,
@@ -350,7 +350,7 @@ class GoalContractCommandsMixin:
             lines.append(f"- {i}. $ {g.command}{status}")
         return "\n".join(lines)
 
-    def _check_gates(self) -> Optional[Dict[str, Any]]:
+    def _check_gates(self) -> Optional[dict[str, Any]]:
         """Run quality gates in order; return a decision dict on failure.
 
         Every eligible boundary re-executes a failed gate. A git HEAD+porcelain fingerprint used to

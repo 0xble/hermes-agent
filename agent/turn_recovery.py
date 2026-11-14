@@ -24,7 +24,8 @@ from agent.model_metadata import is_output_cap_error, parse_available_output_tok
 from agent.retry_utils import is_zai_coding_overload_error, zai_coding_overload_retry_ceiling
 from agent.error_classifier import FailoverReason, classify_api_error, is_context_overflow_reason
 from agent.message_sanitization import (
-    _looks_like_corrupt_image_rejection, _looks_like_image_content_rejection, _sanitize_messages_non_ascii,
+    _looks_like_corrupt_image_rejection, _looks_like_image_content_rejection, _messages_carry_images,
+    _sanitize_messages_non_ascii,
     _sanitize_messages_surrogates, _sanitize_structure_non_ascii, _sanitize_structure_surrogates,
     _strip_images_from_messages, _strip_non_ascii, close_interrupted_tool_sequence, record_reasoning_field_rejection,
 )
@@ -33,19 +34,16 @@ from agent.vision_message_prep import _provider_model_key
 from agent.turn_failure_copy import (
     CONTENT_POLICY_NEXT_STEPS, content_policy_copy, exhausted_copy, limit_reset_copy, nonretryable_copy, provider_label_for, site_copy, stamp_failure,
 )
+from agent.route_verdicts import route_visit
 from agent.turn_retry_state import TurnRetryState
 from agent.notice_style import ContextNotice
-from agent.turn_recovery_codex import _is_codex_token_expired, _recover_stale_codex_reasoning
+from agent.turn_recovery_codex import _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning
 from hermes_constants import display_hermes_home
 from utils import base_url_host_matches
 
 logger = logging.getLogger("agent.conversation_loop")
 
 
-def _runtime_uses_ascii_encoding() -> bool:
-    """Return whether the process genuinely needs an ASCII-only request fallback."""
-    encoding = locale.getpreferredencoding(False).strip().lower().replace("_", "-")
-    return encoding in {"ascii", "us-ascii", "ansi-x3.4-1968"}
 
 
 def _vlines(agent: Any, *lines: str) -> None:
@@ -102,126 +100,13 @@ def _image_error_max_dimension(error: Exception) -> Optional[int]:
     return max_dimension if 512 <= max_dimension <= 8000 else None
 
 
-from agent.turn_recovery_entitlement import _try_refresh_nous_paid_entitlement_credentials as _try_refresh_nous_paid_entitlement_credentials
+from agent.turn_recovery_entitlement import _try_refresh_nous_paid_entitlement_credentials
 
 
-def _repair_transport_credentials(agent: Any) -> bool:
-    """Strip non-ASCII from ``_client_kwargs["default_headers"]`` and the API key.
-
-    Non-ASCII in the key makes httpx fail encoding the Authorization header — the usual
-    persistent cause of UnicodeEncodeError that survives message/tool sanitization (#6843,
-    e.g. ʋ instead of v from a bad copy-paste). Entra ID bearer providers are callables
-    minting ASCII JWTs; skip them (``_strip_non_ascii`` would crash). Returns True when
-    either the headers or the key were repaired.
-    """
-    _client_kwargs = getattr(agent, "_client_kwargs", None)
-    _default_headers = _client_kwargs.get("default_headers") if isinstance(_client_kwargs, dict) else None
-    _repaired = bool(isinstance(_default_headers, dict) and _sanitize_structure_non_ascii(_default_headers))
-    _raw_key = getattr(agent, "api_key", None) or ""
-    if isinstance(_raw_key, str) and _raw_key:
-        _clean_key = _strip_non_ascii(_raw_key)
-        if _clean_key != _raw_key:
-            agent.api_key = _clean_key
-            if isinstance(_client_kwargs, dict):
-                _client_kwargs["api_key"] = _clean_key
-            # The live client reads its own api_key copy on every request.
-            if getattr(agent, "client", None) is not None and hasattr(agent.client, "api_key"):
-                agent.client.api_key = _clean_key
-            _repaired = True
-            _vlines(
-                agent,
-                "⚠️  API key contained non-ASCII characters (bad copy-paste?) — stripped them. "
-                "If auth fails, re-copy the key from your provider's dashboard.",
-            )
-    return _repaired
 
 
-def _recover_unicode_encode_error(
-    agent: Any, api_error: Exception, messages: list[dict[str, Any]], api_messages: Any,
-    api_kwargs: Any, active_system_prompt: Any,
-) -> tuple[bool, Any]:
-    """UnicodeEncodeError recovery: lone surrogates (clipboard paste) first, then an ASCII
-    codec under a non-UTF-8 locale. Sanitizes in place; bounded by the caller's
-    ``_unicode_sanitization_passes < 2`` guard (surrogate strip, then ASCII-only)."""
-    _err_str = str(api_error).lower()
-    _is_ascii_codec = "'ascii'" in _err_str or "ascii" in _err_str
-    # utf-8 refusing U+D800..U+DFFF ("surrogates not allowed").
-    _is_surrogate_error = "surrogate" in _err_str or ("'utf-8'" in _err_str and not _is_ascii_codec)
-    # Sanitize canonical messages for surrogate recovery, but keep ASCII recovery
-    # request-local: API copies may carry fields absent from the durable transcript.
-    _surrogates_found = _sanitize_messages_surrogates(messages)
-    _surrogates_found |= isinstance(api_messages, list) and _sanitize_messages_surrogates(api_messages)
-    _surrogates_found |= isinstance(api_kwargs, dict) and _sanitize_structure_surrogates(api_kwargs)
-    # Gate the retry on the error type, not on whether anything was found — a new
-    # transformed field could slip through.
-    if _surrogates_found or _is_surrogate_error:
-        if _surrogates_found:
-            # In-place rewrites may have popped _DB_PERSISTED_MARKER off stamped live dicts;
-            # force a full flush scan so the repaired rows are rewritten.
-            agent._db_flush_scan_prefix = None
-        agent._unicode_sanitization_passes += 1
-        agent._buffer_vprint(
-            "⚠️  Stripped invalid surrogate characters from messages. Retrying..."
-            if _surrogates_found else
-            "⚠️  Surrogate encoding error — retrying after full-payload sanitization..."
-        )
-        return True, active_system_prompt
-    if not _is_ascii_codec:
-        return False, active_system_prompt
-
-    # Error text is provider-controlled and can mention ``ascii`` even when the
-    # process sends UTF-8. In that normal case, do not rewrite conversation,
-    # tools, prompts, or prefill; only repair values that can poison an ASCII
-    # transport header. If nothing was repaired, an identical retry cannot
-    # succeed — return False so the error surfaces through the normal path
-    # instead of burning both sanitization passes on unchanged requests.
-    if not _runtime_uses_ascii_encoding():
-        if not _repair_transport_credentials(agent):
-            return False, active_system_prompt
-        agent._unicode_sanitization_passes += 1
-        _vlines(
-            agent,
-            "⚠️  Repaired non-ASCII request credentials/headers without changing conversation content. Retrying...",
-        )
-        return True, active_system_prompt
-
-    agent._force_ascii_payload = True
-    # Strip all non-ASCII from the request-local api_messages (reused across retries). The
-    # failed attempt's api_kwargs is NOT touched: build_api_request rebuilds it from
-    # ``agent.tools`` on the next iteration and ``sanitize_outbound_kwargs`` strips the whole
-    # payload under ``_force_ascii_payload``. Canonical agent state stays byte-stable.
-    _messages_sanitized = isinstance(api_messages, list) and _sanitize_messages_non_ascii(api_messages)
-
-    _system_sanitized = False
-    if isinstance(active_system_prompt, str):
-        _sanitized_system = _strip_non_ascii(active_system_prompt)
-        if _sanitized_system != active_system_prompt:
-            active_system_prompt = _sanitized_system
-            _system_sanitized = True
-
-    _transport_repaired = _repair_transport_credentials(agent)
-
-    # Always retry on ASCII codec detection: _force_ascii_payload sanitizes the full
-    # api_kwargs next iteration even when the checks above find nothing.
-    agent._unicode_sanitization_passes += 1
-    _vlines(
-        agent,
-        "⚠️  System encoding is ASCII — stripped non-ASCII characters from request payload. Retrying..."
-        if (_messages_sanitized or _system_sanitized or _transport_repaired) else
-        "⚠️  System encoding is ASCII — enabling full-payload sanitization for retry...",
-    )
-    return True, active_system_prompt
 
 
-def _strip_request_images_and_retry(agent: Any, api_messages: Any) -> bool:
-    """Strip image parts from the per-call ``api_messages`` copy; True if anything was removed.
-
-    Shared by the corrupt-image recoveries: a bad payload says nothing about the model, so it
-    is stripped for this attempt only and the model is never recorded as image-rejecting."""
-    if isinstance(api_messages, list) and _strip_images_from_messages(api_messages):
-        _vlines(agent, "⚠️  Provider rejected a corrupted image — stripped images from the retry payload and retrying...")
-        return True
-    return False
 
 
 def recover_before_classification(
@@ -279,9 +164,11 @@ def recover_before_classification(
             # request would loop on the same error.
             if _strip_request_images_and_retry(agent, api_messages):
                 return True, active_system_prompt
-        else:
+        elif _messages_carry_images(api_messages or messages):
             # Record the model; the retry re-enters build_api_request with the same
             # api_messages and strip_images_for_rejecting_model strips them there.
+            # A request with no image never marks: a 4xx body can echo the user's own text
+            # ("X is not a multimodal model"), and a wrong mark blinds a vision model until /new.
             _rejected.add(_model_key)
             _vlines(
                 agent,
@@ -421,7 +308,10 @@ def _refresh_credentials_after_401(
         and not _retry.nous_auth_retry_attempted
     ):
         _retry.nous_auth_retry_attempted = True
-        if agent._try_refresh_nous_client_credentials(force=True):
+        from agent.credential_auth_recovery import nous_pool_refreshed_this_turn
+        # The pool already spent this episode's one forced refresh (and its backoff retries):
+        # a second force here would redeem the rotating grant again for a server-side 401.
+        if not nous_pool_refreshed_this_turn(agent) and agent._try_refresh_nous_client_credentials(force=True):
             agent._buffer_vprint("🔐 Nous agent key refreshed after 401. Retrying request...")
             return True
         _print_nous_401_diagnostics(agent, api_error)
@@ -722,20 +612,20 @@ def recover_after_classification(
     # 400s on the ``reasoning_effort: none`` the title/continuation disable projects (#114460).
     # The catalog guard in the provider profile normally swallows the first, but a process that
     # warmed its caps cache before the route flipped keeps sending it. One-shot: never send a
-    # disable again this session (the wire builder omits it → route default), queue a catalog
+    # disable again on this route (the wire builder omits it → route default), queue a catalog
     # refresh so the guard is right next time (no-op for providers without a catalog), retry.
     if (
         classified.reason == FailoverReason.reasoning_mandatory
-        and not _retry.reasoning_mandatory_retry_attempted
+        and _retry.reasoning_mandatory_retry_visit != route_visit(agent)
     ):
-        _retry.reasoning_mandatory_retry_attempted = True
+        _retry.reasoning_mandatory_retry_visit = route_visit(agent)
         sent = getattr(agent, "_wire_reasoning_config", None)
         if isinstance(sent, dict) and sent.get("enabled") is not False and sent.get("effort") not in (None, "none"):
             # The rejected request carried an ENABLED config: the route refuses that reasoning
             # level (#100536: ``reasoning.effort: max`` on a Responses relay). Dropping a disable
             # would resend the identical request; omit the reasoning fields instead (route default).
             agent._reasoning_effort_rejected = True
-            _vlines(agent, f"⚠️  {agent.model} rejects reasoning effort {sent['effort']} — using the route's default for this session, retrying...")
+            _vlines(agent, f"⚠️  {agent.model} rejects reasoning effort {sent['effort']} — using the route's default until the route changes, retrying...")
             logger.warning("%sReasoning-effort recovery: dropping reasoning config for %s", agent.log_prefix, agent.model)
             return True, recovered_with_pool
         agent._reasoning_disable_rejected = True
@@ -752,11 +642,11 @@ def recover_after_classification(
             pass
         if agent._reasoning_floor_required:
             from agent.auxiliary_reasoning_floor import REASONING_FLOOR_EFFORT
-            _vlines(agent, f"⚠️  {agent.model} cannot disable reasoning — using effort={REASONING_FLOOR_EFFORT} for this session, retrying...")
+            _vlines(agent, f"⚠️  {agent.model} cannot disable reasoning — using effort={REASONING_FLOOR_EFFORT} until the route changes, retrying...")
             logger.warning("%sReasoning-disable recovery: stepping reasoning up to %s for %s",
                            agent.log_prefix, REASONING_FLOOR_EFFORT, agent.model)
         else:
-            _vlines(agent, f"⚠️  {agent.model} rejects disabling reasoning — using the route's default for this session, retrying...")
+            _vlines(agent, f"⚠️  {agent.model} rejects disabling reasoning — using the route's default until the route changes, retrying...")
             logger.warning("%sReasoning-disable recovery: dropping reasoning disable for %s", agent.log_prefix, agent.model)
         return True, recovered_with_pool
 
@@ -1017,7 +907,7 @@ def nonretryable_client_error_result(
     agent: Any, api_error: Exception, classified: Any, *, status_code: Optional[int],
     api_kwargs: Any, api_messages: Any, messages: list[dict[str, Any]], conversation_history: Any,
     api_call_count: int, approx_tokens: int, provider: Any, base_url: Any, model: Any,
-    delivered: str = "",
+    delivered: str = "", current_turn_user_idx: Any = None,
 ) -> dict[str, Any]:
     """Terminal path for a non-retryable 4xx once fallback is exhausted: debug dump, flush
     the retry trace, print auth / billing / content-policy / TLS guidance, persist (skipped
@@ -1095,6 +985,22 @@ def nonretryable_client_error_result(
             "        for localhost, or add the server's cert to your trust store.",
         )
     logger.error("%sNon-retryable client error: %s", agent.log_prefix, api_error)
+    if classified.reason == FailoverReason.content_policy_blocked:
+        # Safety refusal that arrived as an exception (400 / APIError) rather than an HTTP-200
+        # finish_reason. Treat it exactly like the HTTP-200 refusal handler: do NOT persist the
+        # refused turn, and hand back the PRE-refusal history so an in-memory surface (CLI/TUI/ACP
+        # keep result["messages"] as live history) carries nothing forward. A refusal is
+        # deterministic for the unchanged conversation, so a persisted refused turn re-trips the
+        # filter on every later message and locks the chat (the "stuck session" report); the owner
+        # erases the durable turn-start row after the lease releases. Mirrors #1630.
+        from agent.turn_context import history_before_current_turn, refused_turn_boundary_row_id
+        _clean = history_before_current_turn(messages, current_turn_user_idx, conversation_history)
+        return _content_policy_blocked_result(
+            _clean, api_call_count,
+            final_response="⚠️ " + content_policy_copy(label=_plabel, summary=_nonretryable_summary),
+            error_detail=_nonretryable_summary,
+            boundary_row_id=refused_turn_boundary_row_id(messages, current_turn_user_idx),
+        )
     # Skip persistence only for genuine context-overflow verdicts. A large 400 with no
     # classified reason retains the historical #1630 guard; classified billing/auth/rate-limit
     # failures must persist so the user turn is not lost.
@@ -1105,12 +1011,6 @@ def nonretryable_client_error_result(
         _vlines(agent, "⚠️  Skipping session persistence for large failed session to prevent growth loop.")
     else:
         agent._persist_session(messages, conversation_history)
-    if classified.reason == FailoverReason.content_policy_blocked:
-        return _content_policy_blocked_result(
-            messages, api_call_count,
-            final_response="⚠️ " + content_policy_copy(label=_plabel, summary=_nonretryable_summary),
-            error_detail=_nonretryable_summary,
-        )
     # Billing walls get the same structured recovery descriptor as the max-retries path
     # so every surface renders one consistent signal.
     if classified.reason == FailoverReason.billing:
@@ -1254,7 +1154,7 @@ def max_retries_exhausted_result(
         _reset_at = classified.error_context.get("reset_at")
         _earliest_s = earliest_route_delay(agent, failing_route=(provider, base_url, model))
         _final_response = exhausted_copy(
-            classified.reason.value, label=provider_label_for(provider), attempts=attempts,
+            classified.reason.value, label=provider_label_for(provider), attempts=attempts, error=api_error,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
             earliest_route_seconds=_earliest_s,
         )
@@ -1376,7 +1276,7 @@ def abort_turn_on_interrupt(
     # already-executed tool result. Strip only that request-local scaffold before
     # closing, so this exit owner can persist its specific interrupt reason.
     agent._drop_trailing_empty_response_scaffolding(messages)
-    close_interrupted_tool_sequence(messages, interrupt_text)
+    close_interrupted_tool_sequence(messages, interrupt_text, stopped=True)
     agent._persist_session(messages, conversation_history)
     # The turn was stopped, not rebuilt: a pending steer was aimed at this turn's next
     # tool iteration, which will no longer happen — drop it (hard-cancel semantics).
@@ -1521,46 +1421,6 @@ def free_tier_cooldown_ends_turn(agent: Any, api_error: Exception, base_url: Any
         return False
     cooldown = provider_retry_after_seconds(api_error)
     return cooldown is not None and cooldown > LIVE_RETRY_WAIT_CAP_S
-
-
-def _codex_soft_failure_error(response: Any) -> dict[str, Any]:
-    """``response.error`` of a Codex ``failed``/``cancelled`` Response as ``{"code", "message"}``
-    (the SDK types it as ``ResponseError``; the raw-SSE assembler keeps the dict); ``{}`` when absent."""
-    error_obj = getattr(response, "error", None)
-    if not error_obj:
-        return {}
-    if isinstance(error_obj, dict):
-        fields = error_obj
-    elif hasattr(error_obj, "code") or hasattr(error_obj, "message"):
-        fields = {"code": getattr(error_obj, "code", None), "message": getattr(error_obj, "message", None)}
-    else:
-        fields = {"message": str(error_obj)}
-    return {k: v for k, v in fields.items() if isinstance(v, str) and v.strip()}
-
-
-class _CodexSoftFailure(Exception):
-    """A Codex HTTP-200 ``status=failed`` Response reshaped so ``classify_api_error`` and
-    ``extract_api_error_context`` read ``response.error`` exactly like an SDK error body."""
-
-    def __init__(self, error: dict[str, Any]) -> None:
-        super().__init__(error.get("message") or "")
-        self.body = {"error": error}
-
-
-def classify_codex_soft_failure(agent: Any, response: Any) -> tuple[Any, dict[str, Any]]:
-    """``(classified, error_context)`` for a Codex ``failed``/``cancelled`` Response, or
-    ``(None, {})`` when it is not one. The SDK never raises on these HTTP-200 soft failures,
-    so this is the only place their quota/billing/auth semantics reach the credential pool."""
-    if agent.api_mode != "codex_responses":
-        return None, {}
-    if str(getattr(response, "status", "") or "").strip().lower() not in {"failed", "cancelled"}:
-        return None, {}
-    exc = _CodexSoftFailure(_codex_soft_failure_error(response))
-    classified = classify_api_error(
-        exc, provider=getattr(agent, "provider", "") or "", model=getattr(agent, "model", "") or "",
-        base_url=str(getattr(agent, "base_url", "") or ""), api_key=getattr(agent, "api_key", None),
-    )
-    return classified, agent._extract_api_error_context(exc)
 
 
 def validate_response_shape(agent: Any, response: Any) -> tuple[bool, list[str]]:
@@ -1766,7 +1626,12 @@ def activate_codex_app_server_fallback(agent: Any, result: dict[str, Any]) -> bo
         return False
     agent._buffer_diagnostic_status(
         _eager_fallback_status(classified, classified.reason == FailoverReason.upstream_rate_limit, False))
-    return bool(agent._try_activate_fallback(reason=classified.reason))
+    if not agent._try_activate_fallback(reason=classified.reason):
+        return False
+    # The status above is dropped once the fallback answers: log the trigger (#152101).
+    logger.warning("%sCodex app-server turn failed (%s: %s) — switched to fallback",
+                   agent.log_prefix, classified.reason.value, str(error)[:200])
+    return True
 
 
 def _is_genuine_nous_rate_limit(agent: Any, api_error: Exception, error_context: Any, classified: Any = None) -> bool:
@@ -1995,9 +1860,11 @@ def route_classified_error(
                 return _fallback_break()
 
     # A 401/403 surviving credential refresh means a broken credential or endpoint:
-    # escalate to the fallback chain once; False -> terminal handling.
+    # escalate to the fallback chain once; False -> terminal handling. A verdict that opts out
+    # (a missing CLI login no other provider can fix, #132337) fails closed instead.
     if (
         classified.is_auth
+        and classified.should_fallback
         and not _retry.auth_failover_attempted
         and agent._fallback_index < len(agent._fallback_chain)
     ):
@@ -2024,3 +1891,9 @@ def route_classified_error(
         return _verdict("continue")
     # Upstream capacity 429: normal retry logic will typically succeed.
     return _verdict("fallthrough")
+
+
+from agent.turn_recovery_encoding import (
+    _runtime_uses_ascii_encoding, _repair_transport_credentials, _recover_unicode_encode_error,
+    _strip_request_images_and_retry,
+)

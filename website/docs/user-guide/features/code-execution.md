@@ -171,6 +171,7 @@ setting is no longer a separate switch.
 | Resource | Limit | Notes |
 |----------|-------|-------|
 | **Timeout** | 5 minutes (300s) | Script is killed with SIGTERM, then SIGKILL after 5s grace |
+| **Local kernel memory** | 8192 MiB (8 GiB) | Kernel + descendants sampled every second during cells; over-budget kernels are retired with state loss |
 | **Stdout** | 50 KB | Shown head-and-tail inline; the full output is saved to `~/.hermes/cache/exec/` and the path is included in the result |
 | **Stderr** | 10 KB | Included in output on non-zero exit for debugging |
 | **Tool calls** | 50 per execution | Error returned when limit reached |
@@ -191,7 +192,7 @@ On the local terminal backend, `execute_code` does not start a fresh interpreter
 
 What ends a kernel:
 
-- **Timeout or interrupt.** A cell that hits the timeout (or is interrupted) kills the kernel process and its state is lost on purpose; the result says so and the next call starts a fresh kernel.
+- **Timeout, interrupt, or memory ceiling.** A cell that hits the timeout, is interrupted, or exceeds the local process-tree memory ceiling kills the kernel and its descendants. State is lost on purpose; the result says so and the next call starts a fresh kernel. Memory retirement returns `status: error`, `kernel.state_lost: true`, and the measured footprint and ceiling in bytes.
 - **`reset=true`.** The agent can pass `reset: true` to discard the kernel's state and start clean. This is also the way to pick up environment changes: a kernel's environment is frozen when it spawns, so a newly allowlisted passthrough variable is invisible until the kernel is reset.
 - **Idle timeout and eviction.** Kernels die with the session, after `code_execution.kernel_idle_timeout` idle seconds (default 1800), or when more than `code_execution.max_session_kernels` (default 4) top-level sessions' kernels are alive and the oldest is evicted (running subagents' kernels do not count against the cap).
 
@@ -202,7 +203,31 @@ The security envelope is the same as a one-shot script: environment scrubbing, t
 code_execution:
   kernel_idle_timeout: 1800   # seconds a kernel may sit idle before it is reaped
   max_session_kernels: 4      # kernels kept alive at once; oldest is evicted past this
+  kernel_memory_limit_mb: 8192 # local kernel + descendant memory ceiling, in MiB
 ```
+
+The local memory watchdog samples at cell start, roughly once per second while a
+cell runs, and once before accepting its reply. macOS uses the larger of RSS and
+`phys_footprint` (including compressed memory) for each process; other platforms use
+RSS. Shared pages may be counted more than once. This is a best-effort guard, not
+an OS-enforced aggregate reservation: short allocation bursts between samples and
+allocations from background threads while the kernel is idle are not covered.
+Linux also applies `RLIMIT_DATA` inside newly spawned kernels as a per-process
+backstop (including private writable mappings on Linux 4.7+). It does not cap
+virtual address space, so Chromium and JVM address reservations are not restricted.
+A cell `MemoryError` with an active backstop reports
+`kernel exceeded memory ceiling N MiB (allocation refused by OS limit)` and names
+the `RLIMIT_DATA` backstop alongside the traceback. This refusal keeps the kernel
+alive because the allocation failed and the cell has unwound; earlier cell mutations
+may persist. Watchdog-detected process-tree excess still retires the kernel and
+reports state loss.
+Positive integer overrides, including integer-valued floats such as `1024.0`,
+take effect at the next cell; Linux spawn-time limits need `reset: true` to pick up
+a higher ceiling. Missing, invalid, zero, or negative values retain the 8192 MiB
+safety default; ignored values log a warning. There is no implicit unlimited mode.
+Unreadable descendants are skipped individually, so they do not suppress checks
+on the remaining readable process tree.
+This ceiling does not yet cover remote kernels or standalone per-call fallback.
 
 **Remote backends** (Docker, SSH, Modal) run a remote session kernel with the same contract. If the kernel cannot be spawned on the backend, Hermes falls back to running each call as a standalone script and says so in the result.
 

@@ -72,7 +72,10 @@ fi
 # wrong; on CalVer names it is also the release chronology, so the list can be
 # ordered from the tag names alone.
 remote_tags="$(git -C "$REPO" ls-remote --refs --tags origin 'v*')"
-mapfile -t tags < <(
+tags=()
+while IFS= read -r tag; do
+  tags+=("$tag")
+done < <(
   printf '%s\n' "$remote_tags" \
     | cut -f2 \
     | sed 's|^refs/tags/||' \

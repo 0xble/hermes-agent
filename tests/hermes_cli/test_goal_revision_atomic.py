@@ -41,7 +41,6 @@ def test_revision_preserves_the_durable_winner(tmp_path, monkeypatch, timing, ch
             # inside a revision is the recorded-evidence lookup.
             def lookup(self, evidence, state):
                 publish()
-                return None
             monkeypatch.setattr(goals.GoalManager, "_recorded_evidence_error", lookup)
         else:
             execute = db._execute_write

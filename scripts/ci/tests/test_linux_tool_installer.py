@@ -172,7 +172,7 @@ class LinuxToolDownloadTests(unittest.TestCase):
 
     def test_download_failure_is_bounded_and_never_installs(self):
         for failure in ['persistent', 'deadline', 404, 403, 'checksum']:
-            with self.subTest(failure=failure), download_fixture() as (_, data, artifact, clock, installed):
+            with self.subTest(failure=failure), download_fixture() as (_, _data, _artifact, clock, installed):
                 attempts = []
 
                 def open_url(url, timeout):

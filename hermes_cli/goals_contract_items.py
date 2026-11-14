@@ -29,7 +29,7 @@ def goal_remove_usage() -> str:
     return f"/goal remove <{kinds}> <N>"
 
 
-def render_removable_contract_items(state: "GoalState | None") -> str:
+def render_removable_contract_items(state: GoalState | None) -> str:
     from hermes_cli.goals import _CONTRACT_FIELDS, _CONTRACT_LABELS, contract_items
 
     if state is None:
@@ -44,7 +44,7 @@ def render_removable_contract_items(state: "GoalState | None") -> str:
     return "\n".join(blocks)
 
 
-def _migrate_legacy_revision_requirements(state: "GoalState") -> bool:
+def _migrate_legacy_revision_requirements(state: GoalState) -> bool:
     """Move the old history-backed requirements into current state exactly once.
 
     Legacy quotes were only evidence for the judge to interpret, not deterministic

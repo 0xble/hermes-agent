@@ -64,12 +64,17 @@ FORK_RELEASE_FLOOR = "002f8807dbdef3b9aa450980baa501c6e9920f58"
 
 
 @lru_cache(maxsize=1)
-def n1_tag() -> str:
+def n1_tag(generation: str | None = None) -> str:
     """Newest promoted fork release strictly before HEAD; offline, the verified floor.
 
     Keep the historical name for callers; the result is an immutable commit, not
     an upstream tag. Listing/fetching promotions here keeps nightly.yml unchanged.
     """
+    if generation or os.environ.get("HERMES_E2E_UPGRADE_BASE") or os.environ.get("HERMES_E2E_N1_REF"):
+        base = I.upgrade_base(generation)
+        if base is None:
+            pytest.skip("no release tag reachable before HEAD (fetch tags)")
+        return base.ref
     deadline = time.monotonic() + 30
 
     def git(*args: str) -> subprocess.CompletedProcess:
@@ -112,10 +117,9 @@ def n1_tag() -> str:
     raise RuntimeError("Cannot resolve a promoted fork N-1 strict ancestor or its release floor")
 
 
-def n1_base() -> str:
-    """N-1's promoted commit, or ``HERMES_E2E_N1_REF`` (a patched commit object,
-    used to prove red a cell whose bug lives in N-1's own updater code)."""
-    return commit_of(os.environ.get("HERMES_E2E_N1_REF") or n1_tag())
+def n1_base(generation: str | None = None) -> str:
+    """The commit an N-1 install sits on."""
+    return commit_of(n1_tag(generation))
 
 
 def commit_of(ref: str) -> str:
@@ -186,8 +190,15 @@ class World:
         """
         seed = self.root / "retained-clone"
         mark = self.srv.mark()
+        # A full clone has no filter to constrain the pack. Reuse the fixture's complete bare
+        # object store as a local reference cache so a large history cannot turn this shape check
+        # into a network-sized download. ``--dissociate`` is intentionally not used: the bare
+        # store is owned by this world and remains alive until the retained clone is installed.
+        clone_args = [*args]
+        if not args:
+            clone_args += ["--reference-if-able", str(self.bare)]
         cp = subprocess.run(
-            ["git", "clone", "-q", *args, "--branch", "main", I.OFFICIAL_HTTPS, str(seed)],
+            ["git", "clone", "-q", *clone_args, "--branch", "main", I.OFFICIAL_HTTPS, str(seed)],
             env=self.git_env(), capture_output=True, text=True,
             timeout=self.cache.remaining(120) if self.cache is not None else 120, check=False,
         )

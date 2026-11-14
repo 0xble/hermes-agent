@@ -33,15 +33,15 @@ def _resolve_model() -> str:
 def _default_route(cfg: dict):
     """Concrete default route, or None when the config has no preset to resolve.
 
-    A literal ``@cf/...`` model id is not a preset reference and stays as written.
-    An unknown preset fails open here: startup still has the raw config to read.
+    A literal ``@cf/...`` model id is not an alias reference and stays as written.
+    An unknown alias fails open here: startup still has the raw config to read.
     """
     with contextlib.suppress(Exception):
-        from hermes_cli.model_preset_runtime import resolve_default_route
-        from hermes_cli.model_presets import ModelPresetError
+        from hermes_cli.model_alias_runtime import resolve_default_route
+        from hermes_cli.model_alias_runtime import ModelAliasError
         try:
             route = resolve_default_route(cfg)
-        except ModelPresetError:
+        except ModelAliasError:
             return None
         if route.model:
             return route
@@ -70,7 +70,7 @@ def _config_model_target() -> tuple[str, str]:
     the per-turn sync would be replayed as a /model switch and persisted globally, or pin the session so
     dashboard/CLI model changes never reach an open chat. Empty model = "no preference" → no-op sync.
 
-    ``@name`` and ``{model_preset: name}`` resolve to the preset's model and provider.
+    Upstream aliases resolve to their current model and provider.
     """
     cfg = _load_cfg()
     route = _default_route(cfg)
@@ -580,15 +580,23 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
         requested_provider = model_override.get("provider") or provider_override or None
         override_base_url = model_override.get("base_url")
         resolve_kwargs = {}
-        if str(requested_provider or "").strip().lower() == "custom":
+        provider_norm = str(requested_provider or "").strip().lower()
+        # An empty provider names no route either; once the main slot targets another model it 404s (#132648).
+        if provider_norm == "custom":
             from hermes_cli.runtime_provider import canonical_custom_identity
             if recovered := canonical_custom_identity(base_url=override_base_url or None, model=model or None):
                 requested_provider = recovered
-            if override_base_url:
-                # Failing identity recovery, still hand base_url to the direct-alias branch so pool/env credentials resolve.
-                resolve_kwargs["explicit_base_url"] = override_base_url
+        elif not provider_norm and _config_model_target()[0] != model:
+            from hermes_cli.runtime_provider_custom import empty_provider_identity
+            requested_provider = empty_provider_identity(override_base_url, model) or requested_provider
+        if provider_norm == "custom" and override_base_url:
+            # Failing identity recovery, still hand base_url to the direct-alias branch so pool/env credentials resolve.
+            resolve_kwargs["explicit_base_url"] = override_base_url
         resolve_kwargs.update(requested=requested_provider, target_model=model or None)
         overrides = {k: model_override.get(k) for k in ("base_url", "api_key", "api_mode")}
+        if not provider_norm and requested_provider:
+            # The healed entry supplies its own endpoint and wire; the row's may be stamps from misrouted turns.
+            overrides["base_url"] = overrides["api_mode"] = None
     else:
         model, requested_provider = _resolve_startup_runtime()
         if isinstance(model_override, str) and model_override:
