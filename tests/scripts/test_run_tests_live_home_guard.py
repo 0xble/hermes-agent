@@ -184,8 +184,7 @@ def test_refusal_advice_selects_rebuilt_interpreter_without_setup(tmp_path, acti
     home = tmp_path / "live-home"
     _mark(home, "gateway-state")
     before = _snapshot(home)
-    interpreter = root / ".venv" / "bin" / "python"
-    interpreter.parent.mkdir(parents=True)
+    interpreter = root / ".venv" / "bin" / "python"  # replaces _checkout's shim with a rebuilt one
     interpreter.write_text(
         "#!/bin/bash\n"
         "case \"$1\" in\n"
