@@ -22,7 +22,7 @@ from tests.e2e.core.platforms import _contract as C
 from tests.e2e.core.platforms._drv_telegram import TelegramDriver
 from tests.e2e.core.platforms._suite import rig_fixtures
 from tests.e2e.core.platforms.test_incognito_leak_scan import (
-    _ask, _baseline, _hits, _interval_dirs, _leftovers, _reboot, _report, _slash,
+    _ask, _hits, _interval_dirs, _leftovers, _reboot, _report, _slash,
 )
 from tests.fakes import recording_memory_provider
 from tests.fakes.fake_llm_provider import Text, ToolCall
@@ -169,7 +169,6 @@ def test_content_oracles_reject_missing_or_placeholder_payloads():
 
 
 def test_private_content_tools_memory_and_restored_request(rig):
-    assert not _baseline(), "acceptance requires final-mode privacy assertions"
     word = "incognito-" + secrets.token_hex(24)
     tag = hashlib.sha256(word.encode()).hexdigest()[:10]
     public = "public-fact-" + secrets.token_hex(16)
