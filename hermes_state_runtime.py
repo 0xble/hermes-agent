@@ -227,12 +227,15 @@ def list_session_admissions(db, *, session_id: str, pending_only: bool = True) -
 _ANY_HEAD = object()
 
 
-def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_ANY_HEAD) -> dict | bool | None:
+def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_ANY_HEAD,
+                        passing=()) -> dict | bool | None:
     """Claim the FIFO head. ``_guard(conn)`` (owner admission gate) raises to refuse inside the
     write transaction, so a drain that began while this waited on the writer still wins.
     ``head`` is the admission id the caller's preclaim checks validated (None: it saw nothing
     queued); if the head is another row by the time this write runs, nothing is claimed and False
-    tells the caller to re-read and validate the row that is now first."""
+    tells the caller to re-read and validate the row that is now first. ``passing`` names queued
+    rows the caller let ``head`` overtake (an automation retry in backoff); any other row still
+    ahead of it refuses the claim the same way."""
     def write(conn):
         _epoch(conn, epoch)
         if _guard is not None:
@@ -248,6 +251,14 @@ def claim_session_input(db, *, epoch: int, session_id: str, _guard=None, head=_A
         if blocked or workers:
             return None
         row = conn.execute("SELECT * FROM session_admissions WHERE target_session_id=? AND status='queued' ORDER BY seq LIMIT 1", (session_id,)).fetchone()
+        if passing and row is not None and row['admission_id'] in passing and head not in (None, _ANY_HEAD):
+            target = conn.execute("SELECT * FROM session_admissions WHERE admission_id=? AND target_session_id=? "
+                                  "AND status='queued'", (head, session_id)).fetchone()
+            ahead = () if target is None else {item[0] for item in conn.execute(
+                "SELECT admission_id FROM session_admissions WHERE target_session_id=? AND status='queued' "
+                "AND seq<?", (session_id, target['seq']))}
+            if target is not None and ahead <= set(passing):
+                row = target
         if head is not _ANY_HEAD and (row['admission_id'] if row is not None else None) != head:
             return False
         if row is None:

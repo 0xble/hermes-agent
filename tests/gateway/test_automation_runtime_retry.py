@@ -180,6 +180,70 @@ async def test_only_proven_refusals_delay_the_fifo_with_bounded_backoff(tmp_path
         authority.db.close()
 
 
+@pytest.mark.asyncio
+async def test_persistently_refused_completion_yields_its_head_to_human_input(tmp_path, monkeypatch):
+    """A refusal that never clears (a broken model route) keeps retrying the completion, but a
+    person's message queued behind it runs instead of waiting behind the backoff forever."""
+    from gateway import session_automation_retry as retry
+    from gateway.platforms.event import MessageEvent
+    from gateway.session_ingress_context import native_callback
+    from gateway.session_results import execution_result
+    from tests.gateway.test_automation_notification_category import _SOURCE
+    runner, authority, adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    ref = SessionRef(authority.profile_id, metadata['gateway_session_id'])
+    clock = SimpleNamespace(now=1000.0)
+    seen = []
+
+    async def execute(event):
+        if event.internal:
+            execution_result.get()['result'] = {'pre_execution_runtime_refusal': True,
+                'failed': True, 'messages': [], 'tools': [], 'api_calls': 0}
+        else:
+            seen.append(event.text)
+            execution_result.get()['result'] = {'final_response': '', 'messages': [], 'api_calls': 1}
+
+    async def human(text, message_id):
+        event = MessageEvent(text=text, source=adapter.build_source(**_SOURCE, message_id=message_id),
+                             message_id=message_id)
+        with native_callback(runner, event, tmp_path):
+            await authority.admit_native(event)
+
+    async def claim_and_run():
+        live = authority.sessions[ref.session_id]
+        row, _ = await authority._claim_next(ref, live)
+        assert isinstance(row, dict) and row['status'] == 'started'
+        return row, await authority._execute_claimed(ref, live, row)
+
+    monkeypatch.setattr(runner, '_handle_message', execute)
+    monkeypatch.setattr(retry, 'time', SimpleNamespace(time=lambda: clock.now))
+    try:
+        await authority._drain(ref)
+        seen.clear()
+        assert await runner._inject_watch_notification('blocked result', dict(type='completion',
+            event_id='blocked', session_id='blocked', started_at=1.0,
+            session_key=metadata['gateway_session_key'], parent_session_id=ref.session_id)) is True
+        identity = list_session_admissions(authority.db, session_id=ref.session_id)[0]['admission_id']
+        for attempt, message_id in enumerate(('h1', 'h2', 'h3'), 1):
+            row, outcome = await claim_and_run()
+            assert row['admission_id'] == identity and outcome == (None, 'deferred')
+            assert retry_state(authority.db, identity)['attempt'] == attempt
+            await human(f'human {attempt}', message_id)
+            # Still inside the backoff: the person's turn runs now, the completion stays queued.
+            row, (response, outcome) = await claim_and_run()
+            assert row['admission_id'] != identity
+            from gateway.session_settlement_recovery import settle_and_deliver
+            await settle_and_deliver(authority, authority.sessions[ref.session_id], ref, row, response, outcome)
+            assert seen[-1] == f'human {attempt}'
+            pending = list_session_admissions(authority.db, session_id=ref.session_id)
+            assert [item['admission_id'] for item in pending] == [identity]
+            assert pending[0]['status'] == 'queued'
+            assert (await authority._claim_next(ref, authority.sessions[ref.session_id]))[0] == 'automation_wait'
+            clock.now = retry_state(authority.db, identity)['due_at']
+        assert seen == ['human 1', 'human 2', 'human 3']
+    finally:
+        authority.db.close()
+
+
 def test_real_turn_runner_stamps_resolution_refusal_before_agent_construction(monkeypatch):
     from gateway.config import Platform
     from gateway.run_turn_runner import TurnRunner

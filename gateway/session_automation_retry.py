@@ -27,7 +27,7 @@ def held_runtime_refusal(event, result):
 
 
 async def defer_claimed_refusal(authority, row, result):
-    if not _automation(row):
+    if not is_automation(row):
         return
     from gateway.session_runtime_workers import tracked_write
     if not (isinstance(result, dict) and result.get('pre_execution_runtime_refusal')):
@@ -42,7 +42,7 @@ async def defer_claimed_refusal(authority, row, result):
     raise AutomationRuntimeDeferred()
 
 
-def _automation(row):
+def is_automation(row):
     payload = row.get('payload') or {}
     return ('local_automation_v1' in payload
             or 'automation' in (payload.get('native_text_v1') or {}))
@@ -88,6 +88,25 @@ def _clear_refusal(authority, row):
     authority.db._execute_write(write)
 
 
+async def claimable_head(authority, queued):
+    """``(row, passing)``: the queued row the next claim validates and the ids it may pass.
+
+    Normally the FIFO head. An automation head waiting out a proven refusal's backoff yields
+    to the first person's input queued behind it: a refusal that persists (a broken model or
+    credential route) must not hold human turns behind it forever, and the human turn reports
+    that failure itself. Later automation rows keep their place behind the refused one.
+    """
+    if not queued:
+        return None, ()
+    head = queued[0]
+    if await retry_ready(authority, head):
+        return head, ()
+    for index, row in enumerate(queued[1:], 1):
+        if not is_automation(row):
+            return row, tuple(item['admission_id'] for item in queued[:index])
+    return head, ()
+
+
 async def retry_ready(authority, row):
     """Honor a proven refusal's deadline without probing the executor's model or credentials.
 
@@ -96,7 +115,7 @@ async def retry_ready(authority, row):
     Never exhaust and drop a result during a long outage. The normal owner/route checks
     still run before every eventual claim.
     """
-    if not _automation(row):
+    if not is_automation(row):
         return True
     state = await asyncio.to_thread(retry_state, authority.db, row['admission_id'])
     return state.get('due_at', 0) <= time.time()

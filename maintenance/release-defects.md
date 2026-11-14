@@ -48,6 +48,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   and admitting a new one. A refused row holding a retry clock is never a fold target
   (`_fold_queued` checks `refusal_held` in the same transaction), so a later completion queues
   behind it and cannot replace it with an undelayed admission.
+- A refused automation head waiting out its backoff yields to the first person's input queued
+  behind it (`claimable_head`). The claim may overtake only the rows the drain named, checked in
+  the claim transaction. Later automation rows keep their place behind the refused one. Without
+  this, a refusal that never clears held every human message in the topic behind it with no reply.
 - Source: `gateway/session_automation_retry.py`, `gateway/session_authority.py`,
   `gateway/session_ingress.py`, `gateway/session_automation.py`, `gateway/run_turn.py`,
   `gateway/run_turn_runner.py`.

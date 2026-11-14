@@ -1117,7 +1117,8 @@ class SessionAuthority:
             pending = list_session_admissions(self.db, session_id=ref.session_id)
             if any(row['status'] == 'unknown' for row in pending):
                 raise RuntimeStoreError('unknown_execution')
-            first = next((row for row in pending if row['status'] == 'queued'), None)
+            from gateway.session_automation_retry import claimable_head
+            first, passing = await claimable_head(self, [row for row in pending if row['status'] == 'queued'])
             from gateway.config import Platform
             if live.source.platform == Platform.LOCAL:
                 # A reasoning command or a model pick made while the previous turn ran lands here, at the
@@ -1200,7 +1201,8 @@ class SessionAuthority:
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
                                                     session_id=ref.session_id, _guard=self._admission_gate(),
-                                                    head=first['admission_id'] if first is not None else None),
+                                                    head=first['admission_id'] if first is not None else None,
+                                                    passing=passing),
                                       then=partial(self._stamp_claim, ref, live))
             # Input scheduled while this claim's transaction ran may postdate its read: re-read
             # instead of letting the drain exit idle over a committed admission.
@@ -1280,8 +1282,10 @@ class SessionAuthority:
                         # A verdict on the head alone (its route or binding moved under it) that every drain
                         # repeats: pausing behind it strands the FIFO for good. Refused only once the same
                         # head conflicted twice, read after each: never a successor a cancel advanced to.
-                        head = next((row['admission_id'] for row in list_session_admissions(
-                            self.db, session_id=ref.session_id) if row['status'] == 'queued'), None)
+                        from gateway.session_automation_retry import claimable_head
+                        head, _passing = await claimable_head(self, [row for row in list_session_admissions(
+                            self.db, session_id=ref.session_id) if row['status'] == 'queued'])
+                        head = head['admission_id'] if head is not None else None
                         if head is not None and head != conflicted:
                             conflicted = head
                             continue
