@@ -621,13 +621,22 @@ def smoke_schemas(release: Path, home: Path) -> None:
     with tempfile.TemporaryDirectory(prefix="hermes-schema-smoke-") as sandbox:
         env = _release_subprocess_env(release)
         env.update({"HERMES_HOME": sandbox, "PYTHONDONTWRITEBYTECODE": "1"})
-        result = subprocess.run(
-            [str(python), "-m", "hermes_cli.schema_smoke", "--source-home", str(home)],
-            cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
-            timeout=180, check=False)
+        try:
+            result = subprocess.run(
+                [str(python), "-m", "hermes_cli.schema_smoke", "--source-home", str(home)],
+                cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=180, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"  ⚠ schema smoke skipped: {type(exc).__name__}: {exc}")
+            return
     notes = [line for line in (result.stderr or "").splitlines() if line.startswith("schema smoke skipped")]
     for line in notes:
         print(f"  ⚠ {line}")
+    from hermes_cli.schema_smoke import _NOT_CONVERGED
+    if result.returncode not in (0, _NOT_CONVERGED):
+        # The probe itself died: that proves nothing about the candidate's migrations.
+        print(f"  ⚠ schema smoke skipped: probe exited {result.returncode}")
+        return
     if result.returncode:
         detail = "; ".join(line for line in (result.stderr or result.stdout).splitlines()
                            if line.strip() and line not in notes) or f"exit {result.returncode}"

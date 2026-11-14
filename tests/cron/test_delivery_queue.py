@@ -196,15 +196,14 @@ def test_legacy_queue_schema_adds_failure_lane_before_enqueue(tmp_path, monkeypa
 
 
 _UNCONSTRAINED_STATUS = "status TEXT NOT NULL"
-_FORK_STATUS_BEFORE_SUPPRESSED = (
-    "status TEXT NOT NULL CHECK(status IN ('pending','reviewing','delivering','delivered','failed','unknown'))")
+_UPSTREAM_STATUS_BEFORE_REVIEWING = (
+    "status TEXT NOT NULL CHECK(status IN ('pending','delivering','delivered','failed','unknown'))")
 
 
-@pytest.mark.parametrize("status_column", [_UNCONSTRAINED_STATUS, _FORK_STATUS_BEFORE_SUPPRESSED])
+@pytest.mark.parametrize("status_column", [_UNCONSTRAINED_STATUS, _UPSTREAM_STATUS_BEFORE_REVIEWING])
 def test_an_older_queue_is_migrated_once_not_on_every_open(tmp_path, monkeypatch, status_column):
     """SQLite cannot widen a CHECK in place, so the queue is rebuilt to admit new statuses. The
-    rebuild must converge: a table it cannot widen (no CHECK) or a fork shape upstream never had
-    must not be renamed and copied again on every open, which rewrites the whole file each time."""
+    rebuild must converge: a table it cannot widen (no CHECK) must not be renamed and copied again on every open, which rewrites the whole file each time."""
     import cron.delivery_queue as queue
 
     db = tmp_path / "deliveries.db"

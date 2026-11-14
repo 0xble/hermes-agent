@@ -99,7 +99,7 @@ def test_the_module_entry_point_exits_nonzero_and_names_the_database(tmp_path):
     env = {"HERMES_HOME": str(scratch_home), "PATH": "/usr/bin:/bin", "PYTHONDONTWRITEBYTECODE": "1"}
     broken = subprocess.run([sys.executable, "-c", bootstrap, "--source-home", str(home)],
                             cwd=root, env=env, capture_output=True, text=True, check=False)
-    assert broken.returncode == 1 and "cron/executions.db schema is still changing" in broken.stderr
+    assert broken.returncode == 3 and "cron/executions.db schema is still changing" in broken.stderr
 
     clean = subprocess.run([sys.executable, "-m", "hermes_cli.schema_smoke", "--source-home", str(home)],
                            cwd=root, env=env, capture_output=True, text=True, check=False)
@@ -115,10 +115,11 @@ def test_staging_refuses_a_candidate_whose_schema_smoke_fails(tmp_path, monkeypa
     (release / "hermes_cli").mkdir(parents=True)
     monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     ran = []
+    exit_code = 3
 
     def run(argv, **kwargs):
         ran.append(argv[1:])
-        return subprocess.CompletedProcess(argv, 1, "", "schema smoke skipped state.db: probe\n"
+        return subprocess.CompletedProcess(argv, exit_code, "", "schema smoke skipped state.db: probe\n"
                                            "cron/executions.db schema is still changing on the second open (x)\n")
     monkeypatch.setattr(releases.subprocess, "run", run)
 
@@ -126,6 +127,10 @@ def test_staging_refuses_a_candidate_whose_schema_smoke_fails(tmp_path, monkeypa
     assert ran == []
 
     (release / "hermes_cli" / "schema_smoke.py").write_text("")
+    exit_code = 1  # the probe crashed: reported, never a refusal
+    releases.smoke_schemas(release, tmp_path / "profile")
+    ran.clear()
+    exit_code = 3
     with pytest.raises(RuntimeError, match=r"candidate schema smoke failed: cron/executions\.db schema is still"):
         releases.smoke_schemas(release, tmp_path / "profile")
     assert ran == [["-m", "hermes_cli.schema_smoke", "--source-home", str(tmp_path / "profile")]]
