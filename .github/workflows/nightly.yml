@@ -190,7 +190,6 @@ jobs:
           security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
           security list-keychains -d user -s "$CI_KEYCHAIN" </dev/null
           security default-keychain -s "$CI_KEYCHAIN" </dev/null
-          echo "HERMES_TEST_KEYCHAIN=$CI_KEYCHAIN" >> "$GITHUB_ENV"
       - name: Qualify native OS at exact SHA
         shell: bash
         run: |

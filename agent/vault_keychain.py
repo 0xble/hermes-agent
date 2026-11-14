@@ -33,22 +33,31 @@ class KeychainUnavailable(Exception):
     """No OS keychain is reachable from this process (headless, no keyring extra, plaintext backend)."""
 
 
-def _probe_macos_keychain() -> None:
-    """Fail fast when the CI keychain would block waiting for an unlock prompt."""
-    if sys.platform != "darwin":
+def _is_macos_backend(backend) -> bool:
+    children = getattr(backend, "backends", None)
+    if children is not None:
+        return bool(children) and _is_macos_backend(children[0])
+    return type(backend).__module__.startswith("keyring.backends.macOS")
+
+
+def _probe_macos_keychain(backend) -> None:
+    """Fail fast when the real macOS keychain would block waiting for an unlock prompt.
+
+    Only the native macOS backend is probed: any other keyring (an injected in-memory one) never
+    reaches ``security``.
+    """
+    if sys.platform != "darwin" or not _is_macos_backend(backend):
         return
-    path = os.environ.get("HERMES_TEST_KEYCHAIN")
     try:
-        if not path:
-            selected = subprocess.run(
-                ["security", "default-keychain", "-d", "user"],
-                check=True,
-                capture_output=True,
-                stdin=subprocess.DEVNULL,
-                text=True,
-                timeout=2,
-            )
-            path = selected.stdout.strip().strip('"')
+        selected = subprocess.run(
+            ["security", "default-keychain", "-d", "user"],
+            check=True,
+            capture_output=True,
+            stdin=subprocess.DEVNULL,
+            text=True,
+            timeout=2,
+        )
+        path = selected.stdout.strip().strip('"')
         if not path:
             raise KeychainUnavailable("the macOS user keychain is not configured")
         subprocess.run(
@@ -89,7 +98,7 @@ def os_keyring():
     if not _is_os_keychain(backend):
         raise KeychainUnavailable(
             f"no OS keychain is reachable from this session (keyring backend: {type(backend).__module__}.{type(backend).__name__})")
-    _probe_macos_keychain()
+    _probe_macos_keychain(backend)
     return backend
 
 
