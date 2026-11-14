@@ -1,5 +1,6 @@
 """Restart recovery must visit every served profile's pending-message spool."""
 
+from datetime import datetime
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -8,12 +9,13 @@ from unittest.mock import MagicMock
 import pytest
 
 from gateway.config import GatewayConfig, Platform
-from gateway.session import SessionSource, SessionStore
+from gateway.session import SessionEntry, SessionSource, SessionStore
 
+import hermes_state
 from hermes_constants import get_hermes_home
 from gateway import run as gateway_run
 from gateway.run_pending_recovery import recover_pending_shutdown_flush
-from gateway.shutdown_flush import flush_pending_to_file
+from gateway.shutdown_flush import flush_pending_to_file, spool_dropped_transcript_message
 
 
 def test_shutdown_spools_real_runner_session_views(tmp_path, monkeypatch):
@@ -169,3 +171,43 @@ def test_multiplex_pending_owner_matrix(tmp_path, monkeypatch, primary_name):
     assert recover_pending_shutdown_flush(runner) == 2
     for home, db in dbs.items():
         assert db.append_message.call_args.kwargs["content"] == home.name
+
+
+def test_unreadable_launch_store_does_not_stop_secondary_profile_recovery(tmp_path, monkeypatch):
+    """Stops one profile's failed spool replay from stranding the pending messages of every profile after it."""
+    launch = tmp_path / "hermes"
+    work = launch / "profiles" / "work"
+    work.mkdir(parents=True)
+    (work / "config.yaml").write_text("{}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(launch))
+    # Resolve each state.db through the active HERMES_HOME, as production does.
+    monkeypatch.setattr(hermes_state, "DEFAULT_DB_PATH", hermes_state._IMPORT_DEFAULT_DB_PATH)
+    store = SessionStore(sessions_dir=launch / "sessions", config=GatewayConfig(multiplex_profiles=True))
+    runner = object.__new__(gateway_run.GatewayRunner)
+    runner.config = store.config
+    runner.session_store = store
+    runner._primary_profile_name = "default"
+    runner._served_profile_homes = {"default": launch, "work": work}
+
+    work_key, work_sid = "agent:work:telegram:dm:42", "20260926_000000_work0000"
+    now = datetime.now()
+    store._entries[work_key] = SessionEntry(
+        session_key=work_key, session_id=work_sid, created_at=now, updated_at=now,
+        origin=SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42"),
+        platform=Platform.TELEGRAM, chat_type="dm",
+    )
+    work_db = store._db_for_key(work_key)
+    work_db.create_session(work_sid, source="telegram", session_key=work_key)
+    assert runner._flush_owned_pending(work_key, "work follow-up", reason="adapter_shutdown") == 1
+
+    # The launch profile is visited first: its transcript backlog needs a state.db that cannot be
+    # opened (a directory sits at its path), which fails that whole profile's pass.
+    assert spool_dropped_transcript_message("20260926_000000_default0", {"role": "user", "content": "stuck"})
+    (launch / "state.db").mkdir()
+
+    assert recover_pending_shutdown_flush(runner) == 1
+
+    assert [message["content"] for message in work_db.get_messages(work_sid)] == ["work follow-up"]
+    assert not list((work / "pending_messages").glob("*.json"))
+    # The failed profile keeps its spool for a later boot.
+    assert len(list((launch / "pending_messages").glob("*.json"))) == 1

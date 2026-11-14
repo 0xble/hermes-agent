@@ -232,3 +232,35 @@ async def test_served_profiles_prime_their_state_db_off_the_loop(tmp_path, monke
     work_opens = [(kind, thread) for kind, home, thread in opened if home == str(work)]
     assert {kind for kind, _ in work_opens} == {"store", "runner"}
     assert all(thread != loop_thread for _kind, _home, thread in opened)
+
+
+@pytest.mark.asyncio
+async def test_gateway_start_arms_the_guard_and_stop_disarms_it(monkeypatch, tmp_path):
+    """Stops a gateway that never registers its loop thread at startup, which would leave every
+    loop-thread state.db wait unreported on the live gateway."""
+    from hermes_loop_guard import LoopThreadBlockingError
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    for name in ("GATEWAY_ALLOW_ALL_USERS", "WEIXIN_ALLOW_ALL_USERS"):
+        monkeypatch.delenv(name, raising=False)
+    # An open-policy platform without its opt-in ends the real startup at the access gate, right
+    # after the loop is bound and before any adapter or background service starts.
+    config = GatewayConfig(
+        platforms={Platform.WEIXIN: PlatformConfig(enabled=True, extra={"dm_policy": "open"})},
+        sessions_dir=tmp_path / "sessions",
+    )
+    runner = GatewayRunner(config)
+    try:
+        assert await runner.start() is True
+        assert runner.should_exit_cleanly is True
+
+        with pytest.raises(LoopThreadBlockingError, match="SessionDB open"):
+            SessionDB(db_path=tmp_path / "probe.db")
+        worker_db = await asyncio.to_thread(SessionDB, db_path=tmp_path / "probe.db")
+        await asyncio.to_thread(worker_db.close)
+    finally:
+        await runner.stop()
+
+    loop_db = SessionDB(db_path=tmp_path / "probe.db")  # disarmed: shutdown drains on the loop
+    loop_db.close()
