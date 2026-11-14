@@ -150,8 +150,10 @@ writer while an empty sweep reads. `tests/gateway/test_delegation_sweep_contenti
 holds a writer past a shortened test-only busy timeout, verifies unchanged
 durable claims and other-profile progress, then releases it and verifies the
 next sweep claims exactly once. Both primary and secondary profile failures
-exercise escalation and recovery. Production timeouts and retry budgets are
-unchanged. Existing retry and gateway-delivery suites cover claim races, stop,
+exercise escalation and recovery. The profile-local deferral lives in the upstream
+`_collect_delegation_retry_actions` (`gateway/run_notifications_delegation.py`), not
+in a separate mixin: upstream's method wins the gateway MRO, so a mixin listed after it
+never runs. Production timeouts and retry budgets are unchanged. Existing retry and gateway-delivery suites cover claim races, stop,
 seals, pending completion/outbox delivery and bounded lineage behavior.
 
 Retire this fork adjustment when upstream provides equivalent read-before-write
