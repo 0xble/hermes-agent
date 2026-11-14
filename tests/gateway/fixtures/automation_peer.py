@@ -111,9 +111,8 @@ async def _identify_until_ready(home, seconds):
     return desc
 
 
-async def probe(root, base, mode):
-    home, user = base / 'state', base / 'user'
-    home.mkdir(); user.mkdir()
+def _model_for(home, mode):
+    """The fake model server for ``mode``, plus the mode's derived flags."""
     model = AutomationServer(('127.0.0.1', 0), Model)
     model.requests = []
     model.blocked, model.release = threading.Event(), threading.Event()
@@ -123,12 +122,19 @@ async def probe(root, base, mode):
     peer_checkin = mode.startswith('peer-checkin')
     model.checkin = peer_checkin or mode in ('checkin', 'checkin-race-admission', 'checkin-race-execution')
     model.checkin_failure = mode == 'peer-checkin-failure'
-    status_marker = 'Still outstanding:' if model.checkin_failure else 'SUPERVISOR_STATUS'
-    race = mode.startswith('checkin-race-')
-    spawn_terminal = mode in {'terminal', 'checkin'} or race or mode.startswith('restart-')
     if peer_checkin:
         model.status_text = 'SUPERVISOR_STATUS: peer result still awaits parent verification. Next check in 30 minutes.'
     model.checkin_turns = 0
+    race = mode.startswith('checkin-race-')
+    spawn_terminal = mode in {'terminal', 'checkin'} or race or mode.startswith('restart-')
+    status_marker = 'Still outstanding:' if model.checkin_failure else 'SUPERVISOR_STATUS'
+    return model, peer_checkin, race, spawn_terminal, status_marker
+
+
+async def probe(root, base, mode):
+    home, user = base / 'state', base / 'user'
+    home.mkdir(); user.mkdir()
+    model, peer_checkin, race, spawn_terminal, status_marker = _model_for(home, mode)
     threading.Thread(target=model.serve_forever, daemon=True).start()
     ready = asyncio.Queue()
     outgoing = []
