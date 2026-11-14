@@ -463,7 +463,7 @@ def ensure_gateway_runtime(profile_home: str | Path, *, timeout: float = DEFAULT
                 return deadline_verdict(finite_owner)
             # Never borrow or compete with a finite owner. Its exit and an idle
             # daemon's retirement share this ensure's existing startup budget.
-            wait_for_exit, finite_owner = retirement_wait(observed, finite_owner)
+            wait_for_exit, finite_owner = retirement_wait(observed, finite_owner, retiring=retiring)
             if wait_for_exit:
                 retiring, requested, child = True, False, None
                 time.sleep(min(0.1, remaining(deadline)))
