@@ -8,6 +8,7 @@ clear denial for models that respect tool errors plus a visible audit trail.
 from __future__ import annotations
 
 import os
+import posixpath
 from pathlib import Path
 from contextlib import suppress
 from typing import Optional
@@ -92,6 +93,22 @@ def _resolve_target(path: str) -> Optional[Path]:
     return None
 
 
+def _write_path_spellings(path: str) -> set[str]:
+    """Keep the protected location even when a symlink redirects its target."""
+    return {os.path.abspath(path), _realpath(path)}
+
+
+def _lexical_write_path(path: str) -> Optional[str]:
+    """Normalized, unresolved spelling of a write target (``~`` expanded in the target's home).
+
+    A named node's relative path has no controller-side meaning, so it yields None."""
+    if _named_remote():
+        from tools.file_backend_state import file_ops
+        text = file_ops()._expand_path(str(path))
+        return posixpath.normpath(text) if text.startswith("/") else None
+    return os.path.abspath(os.path.expanduser(str(path)))
+
+
 def _guard_homes(path: str = "") -> set[str]:
     """Every home the write guards must cover. Process ``~`` alone is wrong whenever the
     process HOME is not the OS user's real home — ``TERMINAL_HOME_MODE=profile``,
@@ -117,7 +134,7 @@ def _guard_homes(path: str = "") -> set[str]:
         expanded = os.path.expanduser(f"~{name}")
         if not expanded.startswith("~"):
             homes.add(expanded)
-    return {_realpath(h) for h in homes}
+    return {spelling for home in homes for spelling in _write_path_spellings(home)}
 
 
 def _homes_and_resolved(path: str) -> tuple[set[str], str]:
@@ -231,7 +248,7 @@ def build_write_denied_paths(home: str) -> set[str]:
         *(str(base / f) for f in hermes_files for base in _hermes_dirs()),
         "/etc/sudoers", "/etc/passwd", "/etc/shadow",
     ]
-    return {_realpath(p) for p in paths}
+    return {spelling for path in paths for spelling in _write_path_spellings(path)}
 
 
 # Home-relative credential directories (POSIX paths). Also dropped from profile exports (hermes_cli.profiles).
@@ -244,7 +261,7 @@ def build_write_denied_prefixes(home: str) -> list[str]:
         *(os.path.join(home, *d.split("/")) for d in HOME_CREDENTIAL_DIRS),
         "/etc/sudoers.d", "/etc/systemd",
     ]
-    return [_realpath(p) + os.sep for p in paths]
+    return [spelling + os.sep for path in paths for spelling in _write_path_spellings(path)]
 
 
 def get_safe_write_roots() -> set[str]:
@@ -264,7 +281,7 @@ def build_write_approval_paths(home: str) -> set[str]:
     (approve-once/session/always, like the terminal tool's ``~/.ssh`` gate);
     non-interactive callers (ACP shims, background jobs) fail closed.
     """
-    return {_realpath(os.path.join(home, ".ssh", "config"))}
+    return _write_path_spellings(os.path.join(home, ".ssh", "config"))
 
 
 # HERMES_HOME / root subpaths that the agent's generic file tools must not
@@ -300,8 +317,15 @@ def _classify_write_denial(path: str, *, entry: bool = False) -> Optional[str]:
     if not _named_remote() and (is_protected_path(path) or (entry and is_protected_path(path, follow=False))):
         return "credential"
     denial = _classify_resolved_write_denial(homes, resolved)
-    if denial or not entry:
+    if denial:
         return denial
+    lexical = _lexical_write_path(path)
+    # Only credential policy applies to the lexical spelling: safe roots still
+    # describe where the write lands, not where a harmless symlink is located.
+    if lexical and lexical != resolved and _classify_resolved_write_denial(homes, lexical) == "credential":
+        return "credential"
+    if not entry:
+        return None
     # A named node expands ``~`` in its own home during resolution, never the controller's.
     parent, leaf = split_entry(str(path) if _named_remote() else os.path.expanduser(str(path)))
     entry_path = os.path.join(_realpath(parent or "."), leaf)
@@ -309,7 +333,7 @@ def _classify_write_denial(path: str, *, entry: bool = False) -> Optional[str]:
 
 
 def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[str]:
-    """Credential / protected-subpath / safe-root verdict for an already-resolved path."""
+    """Credential / protected-subpath / safe-root verdict for a normalized path."""
     # Approval-gated paths are allowed at this layer so interactive tools can
     # prompt; checked first so the ``.ssh/`` prefix deny doesn't swallow them.
     if any(resolved in build_write_approval_paths(home) for home in homes):
