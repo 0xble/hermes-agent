@@ -114,10 +114,14 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   `_routing_baseline` (key -> entry JSON this process last persisted, None when a fast
   single-entry save may have skipped it), diffs the snapshot against it in Python before the
   writer lock, and writes the changed and removed keys through `apply_gateway_routing_delta`
-  with the same retired-route skip and report. A full replace still runs with no baseline
-  (first save, a failed write, a private interval) and every `_ROUTING_RECONCILE_S` (600 s) to
-  restore rows changed behind the process. On 2026-11-14 the full replace of a 37,670-route
-  index held the writer lock 9-113 s per save and stalled every session's writes. Proof:
+  with the same retired-route skip and report. With no trusted baseline (first save, a failed
+  or skipped write) and every `_ROUTING_RECONCILE_S` (600 s), the baseline is the stored rows,
+  read through a pooled reader without the write lock, so rows changed behind the process are
+  restored by a diff too. During a private interval the delta applies replace's privacy rules
+  to its own keys (stored private rows stay byte-exact, private entries are never written) and
+  reports the keys it left alone, which stay unknown in the baseline. No routing save issues the
+  full-table replace. On 2026-11-14 the full replace of a 37,670-route index held the writer
+  lock 9-113 s per save and stalled every session's writes. Proof:
   `tests/gateway/test_routing_save_delta.py`.
 - The check-in poll (`gateway/run_checkins.py::poll_checkins`, every 5 s) groups every routed
   session on the loop. `_standalone_runtime_home` memoizes the resolved parent per DB path, and
