@@ -61,7 +61,6 @@ def configure(sb: I.Sandbox, base_url: str, extra: str = "", env_extra: str = ""
     # These origins publish main-branch commits, not GitHub stable releases.
     I.pin_main_channel(sb)
     (sb.hermes_home / ".env").write_text(f"OPENAI_API_KEY={I.FAKE_KEY}\n{env_extra}", encoding="utf-8")
-    I.pin_main_channel(sb)
 
 
 def state_dir(sb: I.Sandbox) -> Path:
