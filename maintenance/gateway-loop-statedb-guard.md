@@ -245,6 +245,9 @@ the Telegram and Slack adapters, and `gateway/session_ingress.py` with
 `tests/gateway/test_admission_adapter_reconnect_wait.py`,
 `tests/gateway/test_startup_resume_admission.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
+`test_reaped_classic_slot_is_evicted_so_the_queued_head_runs` in
+`tests/gateway/test_classic_slot_holds_fifo_head.py` (the drain awaits the now-async probe, so a reaped
+classic slot cannot hold the FIFO head until restart),
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and
 the lock-tolerance and delayed-renewal cases in `tests/agent/test_turn_facade_lease.py`,
 `test_writers_proceed_while_a_slow_checkpoint_runs` and `test_writers_proceed_while_a_slow_fts_merge_runs`
