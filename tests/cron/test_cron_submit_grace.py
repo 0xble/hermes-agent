@@ -154,3 +154,120 @@ def test_unavailable_gateway_defers_only_transient_states(tmp_path, monkeypatch,
         current = jobs.get_job(job['id'])
         assert (current.get('last_status') != 'error') is deferred
         assert ('Not started; occurrence deferred' in executions.get_execution(fire)['error']) is deferred
+
+
+def _stalled_handshake(monkeypatch, during=lambda: None):
+    """A ticket read that times out before any submit, running *during* while it stalls."""
+    @asynccontextmanager
+    async def stalled():
+        during()
+        raise TimeoutError('timed out')
+        yield
+
+    monkeypatch.setattr(gateway_client, 'connect_gateway', stalled)
+
+
+@pytest.mark.parametrize('edit', [
+    {'schedule': 'every 24h'},
+    {'timezone': 'Asia/Tokyo'},
+    {'enabled': False, 'state': 'paused', 'paused_at': '2026-11-12T19:00:00-08:00',
+     'paused_reason': 'operator'},
+])
+def test_operator_edit_during_stalled_handshake_is_not_undone(tmp_path, monkeypatch, edit):
+    """Live race (2026-11-12 review): an operator edit while the handshake stalls drops the
+    occurrence's pending_slot; deferral must not recreate it and overwrite the edited schedule."""
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        claimed, fire = _claimed_due_fire(job['id'])
+        edited = {}
+        _stalled_handshake(monkeypatch, lambda: edited.update(jobs.update_job(job['id'], dict(edit))))
+        assert scheduler._run_one_job_body(claimed) is True
+
+        current = jobs.get_job(job['id'])
+        assert not current.get('pending_slot')
+        assert current['next_run_at'] == edited['next_run_at']
+        assert current['schedule'] == edited['schedule'] and current.get('timezone') == edited.get('timezone')
+        assert 'Not started; occurrence deferred' not in (executions.get_execution(fire)['error'] or '')
+        assert claimed['id'] not in [due['id'] for due in jobs.get_due_jobs()]
+        assert jobs.get_job(job['id'])['next_run_at'] == edited['next_run_at']
+
+
+def _claimed_due_oneshot(job_id):
+    """Claim a due one-shot the way the ticker does; the run body takes its dispatch preclaim."""
+    return _claimed_due_fire(job_id)
+
+
+def test_oneshot_unedited_handshake_timeout_still_refunds_its_preclaim(tmp_path, monkeypatch):
+    _stalled_handshake(monkeypatch)
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        run_at = (jobs._hermes_now() + timedelta(hours=1)).isoformat()
+        job = jobs.create_job(prompt='report', schedule=run_at, deliver='local')
+        claimed, fire = _claimed_due_oneshot(job['id'])
+        assert scheduler._run_one_job_body(claimed) is True
+
+        current = jobs.get_job(job['id'])
+        assert current['repeat']['completed'] == 0 and current['fire_claim'] is None
+        assert current['state'] == 'scheduled' and current.get('last_status') != 'error'
+        assert 'Not started; occurrence deferred' in executions.get_execution(fire)['error']
+
+
+def test_oneshot_rescheduled_during_stalled_handshake_keeps_the_new_run_time(tmp_path, monkeypatch):
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        run_at = (jobs._hermes_now() + timedelta(hours=1)).isoformat()
+        job = jobs.create_job(prompt='report', schedule=run_at, deliver='local')
+        claimed, fire = _claimed_due_oneshot(job['id'])
+        later = (jobs._hermes_now() + timedelta(days=2)).replace(microsecond=0).isoformat()
+        edited = {}
+        _stalled_handshake(monkeypatch, lambda: edited.update(jobs.update_job(job['id'], {'schedule': later})))
+        assert scheduler._run_one_job_body(claimed) is True
+
+        current = jobs.get_job(job['id'])
+        assert current['next_run_at'] == edited['next_run_at']
+        assert current['schedule'] == edited['schedule']
+        assert 'Not started; occurrence deferred' not in (executions.get_execution(fire)['error'] or '')
+
+
+def test_overlapping_tick_advance_is_not_an_operator_edit(tmp_path, monkeypatch):
+    """Review P1 (884bae32): while a recurring fire is in flight, a later tick's
+    advance_next_runs rewrites next_run_at. That is not an operator edit, so the unstarted
+    occurrence must still be restored, not dropped as superseded."""
+    from cron.scheduler_control import defer_unstarted_fire
+
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1m', deliver='local')
+        claimed, _fire = _claimed_due_fire(job['id'])
+        before = jobs.get_job(job['id'])['next_run_at']
+        later = jobs._hermes_now() + timedelta(seconds=61)
+        monkeypatch.setattr(jobs, '_hermes_now', lambda: later)
+        jobs.get_due_jobs()
+        assert jobs.advance_next_runs([job['id']]) == 1
+        assert jobs.get_job(job['id'])['next_run_at'] != before
+
+        assert defer_unstarted_fire(claimed, 'pre-body handshake timeout') == 'deferred'
+        current = jobs.get_job(job['id'])
+        assert current['pending_slot']['scheduled_at'] == claimed['_scheduled_instant']
+        assert current['fire_claim'] is None
+
+
+def test_operator_next_run_edit_marks_only_a_live_claim(tmp_path, monkeypatch):
+    """update_job's provenance marker: set on a real next_run_at edit of a claimed job, absent
+    for an unchanged write and for a job with no claim."""
+    from cron.scheduler_control import defer_unstarted_fire
+
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        claimed, _fire = _claimed_due_fire(job['id'])
+        stored = jobs.get_job(job['id'])['next_run_at']
+        jobs.update_job(job['id'], {'next_run_at': stored})
+        assert 'superseded_at' not in jobs.get_job(job['id'])['fire_claim']
+        edited = (jobs._hermes_now() + timedelta(hours=5)).replace(microsecond=0).isoformat()
+        jobs.update_job(job['id'], {'next_run_at': edited})
+        assert jobs.get_job(job['id'])['fire_claim']['superseded_at']
+
+        assert defer_unstarted_fire(claimed, 'pre-body handshake timeout') == 'superseded'
+        current = jobs.get_job(job['id'])
+        assert current['next_run_at'] == edited and not current.get('pending_slot')
+
+        other = jobs.create_job(prompt='other', schedule='every 1h', deliver='local')
+        jobs.update_job(other['id'], {'next_run_at': edited})
+        assert not jobs.get_job(other['id']).get('fire_claim')
