@@ -66,7 +66,15 @@ class GatewayIncognitoCommandsMixin:
             await asyncio.to_thread(shared_worker_context().run, flush)
         # The durable flag must land before any private input can be admitted. On failure
         # propagate the exception, never acknowledge privacy that was not persisted.
-        await asyncio.to_thread(self.session_store.set_incognito, key, True)
+        from hermes_state_runtime import RuntimeStoreError
+        try:
+            await asyncio.to_thread(self.session_store.set_incognito, key, True)
+        except RuntimeStoreError as exc:
+            if exc.reason == 'session_busy':
+                return "Incognito was not changed. Wait for the active turn and queued messages to finish, then retry."
+            if exc.reason == 'storage_unavailable':
+                return "Incognito was not changed. The session store is unavailable. Retry when it recovers."
+            raise
         from copy import copy
         from gateway.run import _CONVERSATION_SCOPED_STATE
         conversation = copy(self._session_state(key).conversation)
