@@ -10,6 +10,7 @@ import sqlite3
 import threading
 import time
 import uuid
+import weakref
 from collections.abc import Callable, Iterator
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone, UTC
@@ -221,7 +222,6 @@ class SharedMetricsStore:
         _ensure_private(self.database_path.parent, 0o700)
         _ensure_private(self.outbox_directory, 0o700)
         _ensure_private(self.database_path, 0o600)
-        self._wal_anchor: sqlite3.Connection | None = None
         self._ensure_schema()
         self._deferred: list[Callable[[sqlite3.Connection], object]] = []
         self._deferred_lock = threading.Lock()
@@ -623,10 +623,18 @@ class SharedMetricsStore:
         # seconds. This idle connection keeps the WAL and its index open for the store's lifetime, so
         # a write costs its one commit; the commit-time auto-checkpoint still folds the WAL back.
         # Windows cannot delete open files, and deleting the local state must keep resetting it there.
+        # It is kept only once the store is confirmed in WAL (the conversion above ran on it) and never
+        # holds a transaction, so writers, readers and checkpoints never wait on it. It is closed
+        # explicitly when the store goes away or the process exits: the connection's own statement
+        # cache is a reference cycle that would otherwise keep it, and its WAL, open until a GC pass.
         try:
-            if os.name != "nt" and str(anchor.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal":
-                anchor.execute("SELECT 1 FROM telemetry_state LIMIT 1").fetchall()  # map the WAL index
-                self._wal_anchor, anchor = anchor, None
+            with closing(anchor.execute("PRAGMA journal_mode")) as cursor:
+                wal = str(cursor.fetchone()[0]).lower() == "wal"
+            if wal and os.name != "nt":
+                with closing(anchor.execute("SELECT 1 FROM telemetry_state LIMIT 1")) as cursor:
+                    cursor.fetchall()  # maps the WAL index; a plain SELECT leaves no transaction open
+                self._close_wal_anchor = weakref.finalize(self, anchor.close)
+                anchor = None
         finally:
             if anchor is not None:
                 anchor.close()
