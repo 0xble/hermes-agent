@@ -2399,7 +2399,12 @@ def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -
     child is transient, so only a scalar row classified for retry is suppressed here.
     """
     from tools.delegation_resume import (
-        MAX_LINEAGE_AGE_S, MAX_RETRY_ATTEMPTS, RETRY_ARMED, RETRY_SCHEDULED, classify_outcome, retry_status,
+        MAX_LINEAGE_AGE_S,
+        MAX_RETRY_ATTEMPTS,
+        RETRY_ARMED,
+        RETRY_SCHEDULED,
+        classify_outcome,
+        retry_status,
     )
     try:
         persisted = retry_status(delegation_id)
