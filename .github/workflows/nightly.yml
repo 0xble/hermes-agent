@@ -175,6 +175,21 @@ jobs:
         run: |
           ci_tmp=$(scripts/ci/case-sensitive-tmpdir.sh "$CI_SCRATCH")
           echo "TMPDIR=$ci_tmp" >> "$GITHUB_ENV"
+      - name: Provision isolated macOS keychain
+        if: runner.os == 'macOS'
+        timeout-minutes: 3
+        shell: bash
+        env:
+          CI_KEYCHAIN: ${{ runner.temp }}/hermes-ci.keychain-db
+        run: |
+          export CI_KEYCHAIN_PASSWORD="$(python -c 'import secrets; print(secrets.token_urlsafe(32))')"
+          security list-keychains -d user </dev/null > "$RUNNER_TEMP/hermes-ci-keychains.before"
+          security default-keychain -d user </dev/null > "$RUNNER_TEMP/hermes-ci-default.before"
+          security create-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
+          security set-keychain-settings -lt 0 "$CI_KEYCHAIN" </dev/null
+          security unlock-keychain -p "$CI_KEYCHAIN_PASSWORD" "$CI_KEYCHAIN" </dev/null
+          security list-keychains -d user -s "$CI_KEYCHAIN" </dev/null
+          security default-keychain -s "$CI_KEYCHAIN" </dev/null
       - name: Qualify native OS at exact SHA
         shell: bash
         run: |
@@ -183,6 +198,24 @@ jobs:
           # serially so a stalled launcher is not mistaken for a pipe leak or
           # a UI timeout; preserve the existing macOS file concurrency.
           ./bin/ci nightly-native '${{ github.sha }}' --workers ${{ matrix.os == 'windows-2025-vs2026' && '1' || '4' }}
+      - name: Clean up isolated macOS keychain
+        if: always() && runner.os == 'macOS'
+        shell: bash
+        env:
+          CI_KEYCHAIN: ${{ runner.temp }}/hermes-ci.keychain-db
+        run: |
+          if [ -f "$RUNNER_TEMP/hermes-ci-default.before" ]; then
+            default_keychain=$(sed -n 's/^ *"\(.*\)" *$/\1/p' "$RUNNER_TEMP/hermes-ci-default.before")
+            [ -n "$default_keychain" ] && security default-keychain -d user -s "$default_keychain" </dev/null || true
+          fi
+          if [ -f "$RUNNER_TEMP/hermes-ci-keychains.before" ]; then
+            keychains=()
+            while IFS= read -r keychain; do
+              [ -n "$keychain" ] && keychains+=("$keychain")
+            done < <(sed -n 's/^ *"\(.*\)" *$/\1/p' "$RUNNER_TEMP/hermes-ci-keychains.before")
+            [ "${#keychains[@]}" -gt 0 ] && security list-keychains -d user -s "${keychains[@]}" || true
+          fi
+          security delete-keychain "$CI_KEYCHAIN" || true
       - name: Clean up case-sensitive macOS scratch
         if: always() && runner.os == 'macOS'
         shell: bash
