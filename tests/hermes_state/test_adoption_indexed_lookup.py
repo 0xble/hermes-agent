@@ -54,8 +54,12 @@ def test_adoption_candidate_plan_uses_covering_index_not_admissions_table_scan(w
 def test_adoption_session_revalidations_fetch_only_named_generation_column(worker):
     statements = adoption_trace(worker)
     queries = [sql for sql in statements if 'FROM sessions WHERE id=' in sql]
-    assert len(queries) == 2, queries
-    assert all(sql.startswith('SELECT runtime_generation FROM sessions WHERE id=') for sql in queries), queries
+    revalidations = [sql for sql in queries if sql.startswith('SELECT runtime_generation FROM sessions WHERE id=')]
+    assert len(revalidations) == 2, queries
+    # The incognito owner resolution (#1198) also reads sessions inside the adoption write; every
+    # such lookup still names one column rather than reading the whole row.
+    assert all(sql.startswith(('SELECT runtime_generation ', 'SELECT chat_id ', 'SELECT session_key '))
+               for sql in queries), queries
 
 
 def test_linked_admission_matches_original_query_for_1050_seeded_cases(tmp_path):
