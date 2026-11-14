@@ -495,6 +495,7 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
 
 
 _SMOKE_RUNNING_VERSION_ENV = "HERMES_PLUGIN_SMOKE_RUNNING_VERSION"
+_SMOKE_CANDIDATE_VERSION_ENV = "HERMES_PLUGIN_SMOKE_CANDIDATE_VERSION"
 
 
 def _version_regression(manifest) -> str | None:
@@ -503,14 +504,29 @@ def _version_regression(manifest) -> str | None:
     The loader skips a plugin whose ``requires_hermes`` rejects the running version, so an import
     probe alone passes a candidate that then boots without it (a mis-stamped v0.23.1 dropped
     delegation this way). A plugin the running release already rejects is not this update's doing.
+    The candidate's version is the one staging stamped, the identity the release will boot with.
     """
-    from hermes_cli.plugins_manifest import requires_hermes_error, version_satisfies
-    reason = requires_hermes_error(manifest)
+    from hermes_cli.plugins_manifest import version_satisfies
+    spec = getattr(manifest, "requires_hermes", "") or ""
+    candidate = os.environ.get(_SMOKE_CANDIDATE_VERSION_ENV, "")
     running = os.environ.get(_SMOKE_RUNNING_VERSION_ENV, "")
-    return reason if reason and running and version_satisfies(manifest.requires_hermes, running) else None
+    if not spec or not candidate or not running or version_satisfies(spec, candidate):
+        return None
+    return f"requires hermes {spec}, candidate {candidate}" if version_satisfies(spec, running) else None
 
 
-def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) -> None:
+def _stamped_base_version(release: Path) -> str:
+    """The base version staging stamped into *release*, or "" when it has none."""
+    from pm.paths import install_stamp_path
+    try:
+        value = json.loads(install_stamp_path(release).read_text(encoding="utf-8")).get("baseVersion")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return value if isinstance(value, str) and value != "unknown" else ""
+
+
+def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None,
+                  candidate_version: str | None = None) -> None:
     """Load enabled plugins with the interpreter the candidate will boot, before promotion.
 
     That is its committed PM generation when one exists (a carry commits one), else `.venv`.
@@ -535,9 +551,12 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
         env.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
         from hermes_cli.version_info import get_version_info
         running = get_version_info().base_version
+        candidate = _stamped_base_version(release) if candidate_version is None else candidate_version
         env.pop(_SMOKE_RUNNING_VERSION_ENV, None)
-        if running != "unknown":
+        env.pop(_SMOKE_CANDIDATE_VERSION_ENV, None)
+        if running != "unknown" and candidate:
             env[_SMOKE_RUNNING_VERSION_ENV] = running
+            env[_SMOKE_CANDIDATE_VERSION_ENV] = candidate
         result = subprocess.run(
             [str(python), "-m", "hermes_cli.immutable_releases", "--smoke-imports"],
             cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
