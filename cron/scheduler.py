@@ -385,19 +385,16 @@ def _upsert_incident_for_failure(
     try:
         from cron.incidents import get_incident, upsert_incident
 
-        incident_id, is_new = upsert_incident(
+        incident_id, _is_new = upsert_incident(
             job["id"], str(error or ""), job_name=job.get("name"), output_file=output_file,
             failure_type=("script" if job.get("_script_failed") else
                           scheduler_failure_copy.agent_failure_type(error) if agent_declared else None))
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
-        failure_type = incident.get("failure_type") if incident else None
+        # A shared dependency outage follows the same rule: only a notice that actually reached
+        # the operator (``alerted``) quiets the other jobs, and only inside the repeat window.
+        # ``detected`` is never withheld, or an undelivered first notice would silence it for good.
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
-        # The first job to record a shared dependency outage pages. The rest of the
-        # same wave still see ``detected`` because the alert stamp happens after
-        # delivery, so a new row is the only once-per-outage signal.
-        if failure_type == "dependency_unavailable" and not is_new and state == "detected":
-            withheld = True
         return withheld, incident_id
     except Exception as exc:
         logger.debug(
