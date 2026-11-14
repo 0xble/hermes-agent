@@ -121,6 +121,25 @@ def install_cron_fallbacks(config: dict, changes: list[str], *, install_missing:
         changes.append("cron.fallback_providers: claude-sonnet-5-5 -> Muse -> Grok (Opus removed from the default cron chain)")
 
 
+# Review routes keep their own effort per entry. Only the Opus head becomes Sonnet,
+# so the Muse then Grok tail and every other key on the entry are left as authored.
+REVIEW_ROUTES = ("review", "background_review")
+
+
+def retire_opus_review_fallbacks(config: dict, changes: list[str]) -> None:
+    auxiliary = config.get("auxiliary")
+    if not isinstance(auxiliary, dict):
+        return
+    for name in REVIEW_ROUTES:
+        route = auxiliary.get(name)
+        chain = route.get("fallback_chain") if isinstance(route, dict) else None
+        head = chain[0] if isinstance(chain, list) and chain else None
+        if (isinstance(head, dict) and head.get("model") == "claude-opus-5-5"
+                and head.get("provider") == "custom:claude-proxy"):
+            head["model"] = "claude-sonnet-5-5"
+            changes.append(f"auxiliary.{name}.fallback_chain: claude-opus-5-5 -> claude-sonnet-5-5 (Opus removed from the review chain)")
+
+
 def role_settings():
     # Ruamel preserves absolute comment columns when this block is nested in
     # delegation.backends.model_map. Its option entries start at column 8.

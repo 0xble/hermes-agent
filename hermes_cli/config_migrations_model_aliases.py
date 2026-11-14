@@ -113,6 +113,8 @@ def migrate_document(config: dict) -> tuple[dict, list[str]]:
     elif delegation.get("backend") == "model_map":
         from hermes_cli.config_migrations_delegation_roles import install_cron_fallbacks
         install_cron_fallbacks(cfg, changes)
+    from hermes_cli.config_migrations_delegation_roles import retire_opus_review_fallbacks
+    retire_opus_review_fallbacks(cfg, changes)
     if aliases:
         cfg["model_aliases"] = aliases
     settings = delegation.get("backends", {}).get("model_map", {})

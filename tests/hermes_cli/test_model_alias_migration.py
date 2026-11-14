@@ -176,3 +176,46 @@ def test_cli_dry_run_reads_bom_config_without_writing(tmp_path, capsys):
     assert main(["--home", str(tmp_path), "--dry-run"]) == 0
     assert "DRY RUN" in capsys.readouterr().out
     assert config.read_bytes() == before
+
+
+def _review_chain(first_model, effort):
+    return [
+        {"provider": "custom:claude-proxy", "model": first_model, "reasoning_effort": effort, "note": "keep"},
+        {"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0", "reasoning_effort": effort},
+        {"provider": "xai-oauth", "model": "grok-4.7", "reasoning_effort": effort},
+    ]
+
+
+def test_review_chains_replace_opus_with_sonnet_and_keep_grok_last():
+    before, _ = migrate_document(_config())
+    before["auxiliary"] = {
+        "review": {"model": "gpt-6.1-sol", "fallback_chain": _review_chain("claude-opus-5-5", "high")},
+        "background_review": {"model": "gpt-6.1-sol", "fallback_chain": _review_chain("claude-opus-5-5", "low")},
+    }
+    after, changes = migrate_document(before)
+    for name, effort in (("review", "high"), ("background_review", "low")):
+        chain = after["auxiliary"][name]["fallback_chain"]
+        assert [e["model"] for e in chain] == ["claude-sonnet-5-5", "muse-wonder-full-1.0", "grok-4.7"]
+        assert all(e["reasoning_effort"] == effort for e in chain)
+        assert chain[0]["note"] == "keep" and chain[0]["provider"] == "custom:claude-proxy"
+        assert after["auxiliary"][name]["model"] == "gpt-6.1-sol"
+        assert any(f"auxiliary.{name}.fallback_chain" in change for change in changes)
+    again, changes = migrate_document(after)
+    assert again == after and changes == []
+
+
+@pytest.mark.parametrize("route", [
+    {"model": "gpt-6.1-sol"},
+    {"model": "gpt-6.1-sol", "fallback_chain": []},
+    {"model": "gpt-6.1-sol", "fallback_chain": None},
+    {"model": "gpt-6.1-sol", "fallback_chain": [{"provider": "custom:openai-proxy", "model": "x"}]},
+    {"model": "gpt-6.1-sol", "fallback_chain": [{"provider": "other", "model": "claude-opus-5-5"}]},
+    {"model": "claude-opus-5-5", "provider": "custom:claude-proxy", "fallback_chain": [
+        {"provider": "custom:openai-proxy", "model": "gpt-6.1-sol"}]},
+])
+def test_review_migration_leaves_other_routes_alone(route):
+    before, _ = migrate_document(_config())
+    before["auxiliary"] = {"review": copy.deepcopy(route), "goal_judge": {"model": "claude-opus-5-5"}}
+    after, changes = migrate_document(before)
+    assert after["auxiliary"] == before["auxiliary"]
+    assert not any("auxiliary." in change for change in changes)
