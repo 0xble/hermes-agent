@@ -27,4 +27,4 @@ Ported from archived HERMES-023 (archived commit `bc39474cfdf0`) after reproduci
 
 Retire after a released upstream version routes equivalent status-less provider overloads through both sync and async auxiliary fallback chains. Roll back the patch commit and its focused tests; preserve timeout, connection, auth, billing, rate-limit, and response-validation handling.
 
-Contract tests: `tests/agent/test_auxiliary_client.py`.
+Contract tests: `tests/agent/test_auxiliary_client.py`, `tests/agent/test_auxiliary_overload_fallback_chain.py`.
