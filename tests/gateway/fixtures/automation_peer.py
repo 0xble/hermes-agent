@@ -1,6 +1,7 @@
 """Ordinary daemon, real terminal child, loopback-only relay/provider peers."""
 import asyncio
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import functools
 import json
 import os
 from pathlib import Path
@@ -131,15 +132,19 @@ def _model_for(home, mode):
     return model, peer_checkin, race, spawn_terminal, status_marker
 
 
+async def _goal_call(parent, sid, call, *args, **kwargs):
+    reply = await rpc(parent, 'session.automation', session_id=sid,
+                      kind='goal', call=call, args=list(args), kwargs=kwargs)
+    assert 'result' in reply, reply
+    return reply['result']
+
+
 async def _arm_peer_goal_wait(root, env, home, desc, sid):
-    """Set a goal on ``sid`` and park it on a peer's work through the real goal_peer_command CLI."""
+    """Set a goal on ``sid`` and park it on a peer's work through the real goal_peer_command CLI.
+    Returns the goal instance."""
     async with websocket(home, desc) as parent:
         await rpc(parent, 'session.resume', session_id=sid)
-        async def goal(call, *args, **kwargs):
-            reply = await rpc(parent, 'session.automation', session_id=sid,
-                              kind='goal', call=call, args=list(args), kwargs=kwargs)
-            assert 'result' in reply, reply
-            return reply['result']
+        goal = functools.partial(_goal_call, parent, sid)
         result = await goal('set', 'Verify the peer artifact')
         instance = json.loads(result['state'])['created_at']
         await goal('wait_for_seconds', 3600, reason='await the peer artifact')
@@ -156,6 +161,7 @@ async def _arm_peer_goal_wait(root, env, home, desc, sid):
             if cli.returncode is None:
                 cli.kill()
                 await cli.wait()
+    return instance
 
 
 async def probe(root, base, mode):
@@ -241,7 +247,7 @@ async def probe(root, base, mode):
                         await wait_for(lambda: 'Heartbeat' in json.dumps(outgoing))
                     sid = rows()[0]['target_session_id']
                     if peer_checkin:
-                        await _arm_peer_goal_wait(root, env, home, desc, sid)
+                        instance = await _arm_peer_goal_wait(root, env, home, desc, sid)
                     if model.checkin:
                         def state():
                             with sqlite3.connect(home / 'state.db') as db:
@@ -320,6 +326,7 @@ async def probe(root, base, mode):
                         if peer_checkin:
                             async with websocket(home, desc) as parent:
                                 await rpc(parent, 'session.resume', session_id=sid)
+                                goal = functools.partial(_goal_call, parent, sid)
                                 unchanged = await goal('state')
                                 assert len(json.loads(unchanged['state'])['pending_peers']) == 1
                                 refused = await goal('resolve_peer', 'hermes:default/idle-peer', 'existing-peer-work',
