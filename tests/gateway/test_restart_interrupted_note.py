@@ -1457,6 +1457,8 @@ async def test_startup_claims_ledger_answer_before_resume_snapshot(tmp_path, mon
     runner._finish_startup_restore = AsyncMock()
     runner._schedule_auto_resume_delegations = Mock()
     runner._send_session_db_warning_notifications = AsyncMock()
+    runner._sweep_orphan_progress_cards = AsyncMock()
+    runner._retain_background_task = lambda task: task
     monkeypatch.setattr(run_module, "_startup_restore_drain_timeout_secs", lambda: 0)
     monkeypatch.setattr(startup_module, "recover_pending_shutdown_flush", lambda *args, **kwargs: None,
                         raising=False)
