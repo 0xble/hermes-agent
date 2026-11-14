@@ -21,6 +21,34 @@ class ResumeCandidates(list):
 
 
 class RestartRecoveryMixin:
+    async def _sweep_orphan_progress_cards(self) -> int:
+        """Delete temporary progress cards a dead process recorded but never cleaned up: their
+        deletion was a post-delivery callback held only in that process's memory. Off the boot path,
+        one batch per chat, through the adapter's budgeted delete. Returns the cards deleted."""
+        try:
+            orphans = await self.async_session_store.orphan_progress_cards()
+        except Exception as exc:
+            logger.warning("Orphan progress-card sweep could not read the session store: %s", exc, exc_info=True)
+            return 0
+        deleted = 0
+        for session_key, origin, chat_id, message_ids in orphans:
+            adapter = self._delivery_adapter_for(origin)
+            if adapter is None:
+                continue  # platform not connected yet: keep the record for a later boot
+            try:
+                outcome = await adapter.delete_messages(chat_id, message_ids)
+            except Exception as exc:
+                logger.warning("Orphan progress-card delete failed for session %s: %s", session_key, exc,
+                               exc_info=True)
+                continue
+            deleted += sum(1 for mid in message_ids if outcome.get(str(mid)))
+            # Settled after one attempt: Telegram reports a card that is already gone, or past its 48h
+            # delete window, as a plain False, and retrying either would spend budget on every boot.
+            await self._persist_progress_cards("forget_progress_cards", session_key, chat_id, message_ids)
+        if orphans:
+            logger.info("Swept orphan progress cards: chats=%d deleted=%d", len(orphans), deleted)
+        return deleted
+
     def _record_restart_resume_outcome(self, session_key: str, outcome: str) -> None:
         """Emit one terminal decision per session per boot, including reconnect retries."""
         recorded = getattr(self, "_restart_resume_outcomes", None)
