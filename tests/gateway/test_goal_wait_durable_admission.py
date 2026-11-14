@@ -631,6 +631,30 @@ async def test_secondary_profile_wait_admits_without_taking_launch_db_lock(tmp_p
 
 
 @pytest.mark.asyncio
+async def test_private_topic_suspends_wait_without_refusal_and_resumes_after_off(parked, caplog):
+    # A private interval suspends the goal (#1033): no terminal refusal, no retry, no FIFO row.
+    runner, _adapter, _authority, _source, sid, key, _manager, rows, adapter_calls = parked
+    store = runner.session_store
+    before = goals.load_goal(sid).to_json()
+    store.set_incognito(key, True)
+    try:
+        with caplog.at_level('WARNING', logger='gateway.run_goal_wait'):
+            for _ in range(3):
+                await runner._goal_wakeup_fire_one(sid)
+    finally:
+        store.set_incognito(key, False)
+    assert not [r for r in caplog.records if r.name == 'gateway.run_goal_wait' and r.levelname == 'WARNING']
+    assert sid not in getattr(runner, '_goal_wait_retries', {})
+    assert sid not in getattr(runner, '_goal_wait_terminal', {})
+    assert rows() == []
+    assert goals.load_goal(sid).to_json() == before
+    assert runner._get_replay_scheduler().gate.load() == 0
+    adapter_calls.assert_not_called()
+    await runner._goal_wakeup_fire_one(sid)
+    assert len(rows()) == 1, 'the suspended wait resumes once the topic is public again'
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('route', ['incognito', 'missing_durable_route'])
 async def test_unfenceable_wait_is_terminal_once_without_retry_tracebacks(parked, monkeypatch, caplog, route):
     runner, _adapter, authority, _source, sid, key, _manager, rows, adapter_calls = parked
@@ -644,6 +668,9 @@ async def test_unfenceable_wait_is_terminal_once_without_retry_tracebacks(parked
     try:
         if route == 'incognito':
             store.set_incognito(key, True)
+            # The wakeup normally suspends a private topic first; this covers a switch that
+            # raced past that check, which the durable route snapshot still refuses.
+            monkeypatch.setattr('gateway.run_goals._goal_suspended_while_private', lambda _entry: False)
         with caplog.at_level('WARNING', logger='gateway.run_goal_wait'):
             for _ in range(3):
                 await runner._goal_wakeup_fire_one(sid)
