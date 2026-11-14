@@ -8,6 +8,7 @@ logs through ``gateway.run``'s logger so its records keep that name.
 from __future__ import annotations
 
 import contextlib
+import functools
 import logging
 import os
 import threading
@@ -45,10 +46,18 @@ def _env_truthy(name: str) -> bool:
     return _auth_env(name).lower() in _TRUTHY
 
 
+@functools.lru_cache(maxsize=64)
+def _resolved_db_parent(path: str) -> Path:
+    return Path(path).resolve().parent
+
+
 def _standalone_runtime_home(runner) -> Optional[Path]:
     """Parent of this runner's session DB, else the process home.
 
-    A partial runner (identity-restore fixtures) may not have opened a DB.
+    A partial runner (identity-restore fixtures) may not have opened a DB. The resolved parent is
+    memoized per DB path: the check-in poll restores every routed session's origin on the event
+    loop every few seconds, and one realpath per session (36,898 on the live gateway, each a
+    handful of GIL-releasing lstat calls) held the loop for seconds per pass under thread load.
     """
     db = None
     with contextlib.suppress(Exception):
@@ -56,7 +65,7 @@ def _standalone_runtime_home(runner) -> Optional[Path]:
     inner = getattr(db, "_db", db)
     path = getattr(inner, "db_path", None)
     if path:
-        return Path(path).resolve().parent
+        return _resolved_db_parent(os.fspath(path))
     with contextlib.suppress(Exception):
         from hermes_constants import get_hermes_home
         return Path(get_hermes_home())
