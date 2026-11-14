@@ -3349,7 +3349,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         try:
             await getattr(self.async_session_store, method)(session_key, *args)
         except Exception as exc:
-            logger.warning("Progress card %s failed for session %s: %s", method, session_key, exc)
+            logger.warning("Progress card %s failed for session %s: %s", method, session_key, exc, exc_info=True)
 
     async def _forget_turn_progress_cards(self, turn_ctx: TurnContext, message_ids: list[str]) -> None:
         # A record still in flight would otherwise land after its forget and outlive it.

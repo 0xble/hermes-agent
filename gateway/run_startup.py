@@ -898,7 +898,7 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         try:
             orphans = await self.async_session_store.orphan_progress_cards()
         except Exception as exc:
-            logger.warning("Orphan progress-card sweep could not read the session store: %s", exc)
+            logger.warning("Orphan progress-card sweep could not read the session store: %s", exc, exc_info=True)
             return 0
         deleted = 0
         for session_key, origin, chat_id, message_ids in orphans:
@@ -908,7 +908,8 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
             try:
                 outcome = await adapter.delete_messages(chat_id, message_ids)
             except Exception as exc:
-                logger.warning("Orphan progress-card delete failed for session %s: %s", session_key, exc)
+                logger.warning("Orphan progress-card delete failed for session %s: %s", session_key, exc,
+                               exc_info=True)
                 continue
             deleted += sum(1 for mid in message_ids if outcome.get(str(mid)))
             # Settled after one attempt: Telegram reports a card that is already gone, or past its 48h
