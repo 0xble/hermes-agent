@@ -13,6 +13,7 @@ import threading
 import time
 
 from websockets.asyncio.client import connect
+from hermes_cli._subprocess_compat import kill_process_tree
 from tests.gateway.test_normal_runtime_boot import control
 from tests.waiting import async_wait_until
 from tests.socket_paths import short_socket_dir
@@ -125,7 +126,7 @@ def daemon(root, home, env, *, barrier, fixture='local_recovery_daemon.py'):
             yield proc, desc
         finally:
             if proc.poll() is None:
-                proc.kill()
+                kill_process_tree(proc)
             proc.wait(timeout=10)
 
 
@@ -170,7 +171,7 @@ def probe(tmp_path):
                 'session_id': sessions['safe'], 'input_id': 'safe', 'text': 'RECOVER_QUEUED'}}))
             await async_wait_until(lambda: rows().get('safe') == 'queued', timeout=20, what='safe admission queued')
             assert rows()['tampered'] == 'queued', rows()
-            proc.kill()
+            kill_process_tree(proc)
             await asyncio.to_thread(proc.wait, 10)
     async def second(desc):
         async with websocket(home, desc) as ws:
