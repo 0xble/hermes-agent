@@ -216,7 +216,7 @@ class SharedMetricsStore:
         _ensure_private(self.outbox_directory, 0o700)
         _ensure_private(self.database_path, 0o600)
         self._ensure_schema()
-        self._deferred: list[Callable[[sqlite3.Connection], None]] = []
+        self._deferred: list[Callable[[sqlite3.Connection], object]] = []
         self._deferred_lock = threading.Lock()
         self._drain_at_exit = False
 
@@ -250,10 +250,12 @@ class SharedMetricsStore:
         self, state_key: str, metric_name: str, dimensions: dict[str, str],
         resource: dict[str, str],
     ) -> bool:
-        """Transactional compare-and-set latch shared by concurrent Hermes processes."""
+        """Transactional compare-and-set latch shared by concurrent Hermes processes. False when the
+        latch is already set, or when a busy store deferred it (see ``_write_or_defer``)."""
         self._validate_counter(metric_name, dimensions, resource)
         now = _utc_now()
-        with self._write() as connection:
+
+        def latch(connection: sqlite3.Connection) -> bool:
             row = connection.execute(
                 "SELECT value FROM telemetry_state WHERE key = ?", (state_key,)
             ).fetchone()
@@ -277,7 +279,9 @@ class SharedMetricsStore:
                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (state_key, _isoformat(now)),
             )
-        return True
+            return True
+
+        return self._write_or_defer(latch) is True
 
     def record_counter(
         self, metric_name: str, dimensions: dict[str, str], resource: dict[str, str],
@@ -350,13 +354,15 @@ class SharedMetricsStore:
 
     def record_counter_once_per_day(self, metric_name: str, dimensions: dict[str, str], resource: dict[str, str]) -> bool:
         """Count at most once per UTC day per dimension set, whatever the surface (``surface`` is
-        attribution of the first one that day). One state row per dimension set, overwritten daily."""
+        attribution of the first one that day). One state row per dimension set, overwritten daily.
+        False when already counted today, or when a busy store deferred it."""
         self._validate_counter(metric_name, dimensions, resource)
         now = _utc_now()
         today = now.date().isoformat()
         key = f"{_DAILY_ONCE_STATE_PREFIX}{metric_name}:" + _compact_json(
             {k: v for k, v in dimensions.items() if k != "surface"})
-        with self._write() as connection:
+
+        def latch(connection: sqlite3.Connection) -> bool:
             changed = connection.execute(
                 "INSERT INTO telemetry_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE"
                 " SET value = excluded.value WHERE telemetry_state.value != excluded.value",
@@ -366,7 +372,9 @@ class SharedMetricsStore:
                 return False
             self._install_id(connection)
             self._record_counter_in_transaction(connection, metric_name, dimensions, resource, today)
-        return True
+            return True
+
+        return self._write_or_defer(latch) is True
     # ---- end v5 signals ----
 
     def _latched(self, prefix: str) -> frozenset[str]:
@@ -379,9 +387,12 @@ class SharedMetricsStore:
     def _record_once_ever(
         self, state_key: str, metric_name: str, dimensions: dict[str, str], resource: dict[str, str],
     ) -> bool:
+        """Compare-and-set latch, once per install ever. False when already latched, or when a busy
+        store deferred it."""
         self._validate_counter(metric_name, dimensions, resource)
         now = _utc_now()
-        with self._write() as connection:
+
+        def latch(connection: sqlite3.Connection) -> bool:
             inserted = connection.execute(
                 "INSERT INTO telemetry_state(key, value) VALUES (?, ?) ON CONFLICT(key) DO NOTHING",
                 (state_key, _isoformat(now)),
@@ -392,7 +403,9 @@ class SharedMetricsStore:
             self._record_counter_in_transaction(
                 connection, metric_name, dimensions, resource, now.date().isoformat()
             )
-        return True
+            return True
+
+        return self._write_or_defer(latch) is True
 
     @staticmethod
     def _validate_counter(
@@ -431,16 +444,19 @@ class SharedMetricsStore:
                 break
         return self._export_and_prune()
 
-    def _write_or_defer(self, write: Callable[[sqlite3.Connection], None]) -> None:
-        """Run ``write`` (after any deferred ones) in one write transaction. A store another writer
-        holds past the short busy timeout keeps them in memory for the next write or process exit
-        instead of losing them or stalling the caller."""
+    def _write_or_defer(self, write: Callable[[sqlite3.Connection], object]) -> object:
+        """Run ``write`` (after any deferred ones) in one write transaction and return its result. A
+        store another writer holds past the short busy timeout keeps them in memory for the next write
+        or process exit instead of losing them, raising, or stalling the caller, which then gets None.
+        Every caller-path write goes through here: a deferred compare-and-set latch re-reads its state
+        when it finally runs, so concurrent processes still latch exactly once."""
         with self._deferred_lock:
             pending, self._deferred = [*self._deferred, write], []
         try:
             with self._write() as connection:
-                for item in pending:
+                for item in pending[:-1]:
                     item(connection)
+                result = write(connection)
         except sqlite3.OperationalError as exc:
             busy = "locked" in str(exc) or "busy" in str(exc)
             with self._deferred_lock:
@@ -453,6 +469,8 @@ class SharedMetricsStore:
                     _DEFERRING_STORES.append(self)
             if not busy:
                 raise
+            return None
+        return result
 
     def drain_deferred(self, busy_timeout_ms: int = _SCHEMA_BUSY_TIMEOUT_MS) -> None:
         """Write the deferred writes (process exit / export waits longer than the user's path does)."""
