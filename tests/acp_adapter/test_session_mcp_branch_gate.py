@@ -47,9 +47,9 @@ def owner(tmp_path, monkeypatch, server_spec):
     built = []
 
     async def build():
-        authority = await initialize_session_authority(runner, profile_id='fixture', instance_id='owner')
+        authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
         built.append(authority)
-        connection = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': 'fixture'})
+        connection = AuthorityConnection(authority, object(), {'user_id': 'human', 'profile_id': str(tmp_path)})
         ref = create_local_session(authority, connection.actor, {
             'request_id': 'editor', 'source': 'acp', 'cwd': str(tmp_path), 'model': 'frozen', 'toolsets': []})
         return authority, _Bridge(connection), ref.session_id

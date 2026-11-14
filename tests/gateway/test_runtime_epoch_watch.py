@@ -14,7 +14,7 @@ from gateway.readiness import _probe_runtime_epoch
 from gateway.runtime_ownership import process_ownership
 from gateway.session_epoch_watch import check_runtime_epochs
 from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
+from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 @pytest.fixture

@@ -1160,9 +1160,14 @@ function buildSpawnCommand(hermesPath, profile, opts: any = {}) {
   // when its owning remote shell is dead.
   const markerAbsent = `[ ! -e ${marker} ]`
 
+  // A dev build's renderer is served from HERMES_DESKTOP_DEV_SERVER, an http origin the backend
+  // trusts only when it inherits the variable, exactly as a locally spawned backend does. A value the
+  // remote login shell exports is cleared first, so a packaged build never hands one on.
+  const devServerEnv = opts.devServer ? ` HERMES_DESKTOP_DEV_SERVER=${shq(opts.devServer)}` : ''
+
   const dashCmd =
-    `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; ` +
-    `exec env HERMES_DESKTOP=1 ${hermes} ${profileArgs}${subCmd}`
+    `ulimit -n ${REMOTE_NOFILE_SOFT_LIMIT} 2>/dev/null || true; unset HERMES_DESKTOP_DEV_SERVER; ` +
+    `exec env HERMES_DESKTOP=1${devServerEnv} ${hermes} ${profileArgs}${subCmd}`
 
   const detachedShell: string = `eval "exec $1>&-"; ${dashCmd} </dev/null >> ${logPath} 2>&1 & echo $!`
   // The inner shell backgrounds Hermes and reports its PID; backgrounding the
@@ -1304,7 +1309,15 @@ async function scrapeReadyPort(ssh, logPath, { timeoutMs = resolveReadyTimeoutMs
 
 async function spawnRemoteDashboard(
   ssh,
-  { hermesPath, profile, token, ownershipId, hermesHome = '~/.hermes', assertInstallClear = async () => {} }
+  {
+    hermesPath,
+    profile,
+    token,
+    ownershipId,
+    hermesHome = '~/.hermes',
+    devServer = '',
+    assertInstallClear = async () => {}
+  }
 ) {
   if (!(await remoteSupportsSshOwnership(ssh, hermesPath))) {
     const err: any = new Error(
@@ -1374,6 +1387,7 @@ async function spawnRemoteDashboard(
         tokenFilePath,
         logPath,
         hermesHome,
+        devServer,
         ownershipId,
         reservationNonce: spawnNonce,
         lockMetadata: {
@@ -1386,6 +1400,7 @@ async function spawnRemoteDashboard(
           logPath,
           tokenFingerprint: fingerprintToken(token),
           protocolVersion: PROTOCOL_VERSION,
+          devServer,
           startedAt: new Date().toISOString()
         }
       })
@@ -1510,6 +1525,22 @@ async function waitForRemoteSpawnCompletion(ssh, ownershipId, timeoutMs) {
   throw error
 }
 
+// Whether a published backend record serves this connect as-is. The backend trusts a dev
+// renderer's origin only from the HERMES_DESKTOP_DEV_SERVER it was spawned with; one spawned for
+// another renderer (or none, as older records and packaged builds are) would refuse every renderer
+// socket, so it is replaced rather than reused.
+function lockServesConnect(lock, { profile, reuseToken, hermesPath, hermesHome, devServer }) {
+  return (
+    lock.port > 0 &&
+    lock.profile === profile &&
+    Boolean(reuseToken) &&
+    lock.tokenFingerprint === fingerprintToken(reuseToken) &&
+    lock.hermesPath === hermesPath &&
+    lock.hermesHome === hermesHome &&
+    (lock.devServer ?? '') === devServer
+  )
+}
+
 async function connect(deps) {
   const {
     ssh,
@@ -1523,6 +1554,7 @@ async function connect(deps) {
     adoptServedToken,
     rememberLog = () => {},
     readyTimeoutMs = resolveReadyTimeoutMs(),
+    devServer = '',
     signal
   } = deps
 
@@ -1587,14 +1619,7 @@ async function connect(deps) {
       ))
 
     const reusable =
-      pidAlive &&
-      owned &&
-      lock.port > 0 &&
-      lock.profile === profile &&
-      Boolean(reuseToken) &&
-      lock.tokenFingerprint === fingerprintToken(reuseToken) &&
-      lock.hermesPath === hermesPath &&
-      lock.hermesHome === hermesHome
+      pidAlive && owned && lockServesConnect(lock, { profile, reuseToken, hermesPath, hermesHome, devServer })
 
     if (reusable) {
       const creationTime = lock.creationTime || (await remoteProcessCreationTime(ssh, lock.pid))
@@ -1683,6 +1708,7 @@ async function connect(deps) {
     token: spawnToken,
     ownershipId,
     hermesHome,
+    devServer,
     assertInstallClear: () => assertRemoteInstallUpdateClear(ssh, hermesHome, hermesPath)
   })
 
@@ -1720,6 +1746,7 @@ async function connect(deps) {
     logPath,
     tokenFingerprint: fingerprintToken(spawnToken),
     protocolVersion: PROTOCOL_VERSION,
+    devServer,
     startedAt: new Date().toISOString(),
     ...(creationTime ? { creationTime } : {})
   }
@@ -1824,6 +1851,7 @@ export {
   locateHermes,
   LOCKFILE_SCHEMA_VERSION,
   lockfilePath,
+  lockServesConnect,
   MIN_READY_TIMEOUT_MS,
   mintToken,
   openForward,

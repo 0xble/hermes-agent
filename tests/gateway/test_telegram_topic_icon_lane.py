@@ -37,6 +37,7 @@ def _runner(tmp_path, *, extra: dict, session_id: str = "sess-1", bind: bool = T
     runner = object.__new__(GatewayRunner)
     runner.config = GatewayConfig(platforms={Platform.TELEGRAM: PlatformConfig(enabled=True, token="***", extra=extra)})
     adapter = MagicMock()
+    adapter.config = runner.config.platforms[Platform.TELEGRAM]
     adapter._bot = None
     adapter.rename_dm_topic = AsyncMock(return_value=True)
     adapter.get_forum_topic_icon_options = AsyncMock(return_value=[
@@ -192,7 +193,7 @@ async def test_explicit_title_skips_rename_when_topic_is_rebound_during_icon_pic
 async def test_explicit_title_renames_without_icon_when_pick_overruns_deadline(tmp_path, monkeypatch):
     import threading
 
-    import gateway.run_topics as run_topics
+    from gateway import run_topics
     runner, adapter, _ = _runner(tmp_path, extra={"auto_topic_icons": True})
     release = threading.Event()
     monkeypatch.setattr(run_topics, "_EXPLICIT_TITLE_ICON_TIMEOUT_S", 0.2)

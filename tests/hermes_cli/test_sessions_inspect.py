@@ -4,6 +4,7 @@ import argparse
 import json
 
 import pytest
+from datetime import UTC
 
 
 def _run_cli(capsys, *argv):
@@ -118,7 +119,7 @@ def test_state_cli_selected_home_owns_profile(monkeypatch, tmp_path, inherited_p
         result = subprocess.run(
             [*prefix, "sessions", "state", *argv], env=env,
             cwd=Path(__file__).resolve().parents[2], capture_output=True, text=True, timeout=60,
-        )
+         check=False)
         assert result.returncode == 0, result.stderr
         payload = json.loads(result.stdout)
         assert payload["ok"] is True
@@ -161,7 +162,7 @@ def test_search_cli_reuses_discovery_in_current_profile(monkeypatch, tmp_path, c
                 sid = f"{profile}-{index}"
                 db.create_session(sid, "telegram", profile_name=profile)
                 db.append_message(sid, "user", "nebula routing owner")
-            stamp = datetime(2026, 1, 15, tzinfo=timezone.utc).timestamp()
+            stamp = datetime(2026, 1, 15, tzinfo=UTC).timestamp()
             db._write_sql("UPDATE sessions SET started_at = ?", (stamp,))
             db._write_sql("UPDATE messages SET timestamp = ?", (stamp,))
         finally:

@@ -446,7 +446,7 @@ def test_wrapper_quotes_parent_address_and_keeps_it_out_of_snapshot(tmp_path):
         snap_tmp_template=f"{snap}.tmp.XXXXXX", passthrough_names=(), snapshot_ready=True,
         cwd_marker="__M__", relay_parent_address=hostile)
     out = subprocess.run(["bash", "-c", script], capture_output=True, text=True, cwd=tmp_path,
-                         env={"PATH": "/usr/bin:/bin"}).stdout
+                         env={"PATH": "/usr/bin:/bin"}, check=False).stdout
     assert out.startswith(hostile)
     assert not (tmp_path / "pwned").exists()
     assert RELAY_PARENT_ADDRESS_ENV not in snap.read_text()

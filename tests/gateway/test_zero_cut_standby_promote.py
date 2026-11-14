@@ -107,7 +107,7 @@ async def test_prefilter_defers_telegram_before_adapter_creation(tmp_path):
     runner._failed_platforms = {}
     runner._abort_startup_if_shutdown_requested = lambda *args: asyncio.sleep(0, result=False)
     runner._create_adapter = lambda *args: pytest.fail("standby must not create Telegram")
-    aborted, enabled, skipped, pending = await runner._start_prefilter_platforms()
+    aborted, enabled, _skipped, pending = await runner._start_prefilter_platforms()
     assert not aborted
     assert enabled == 0
     assert pending == []
@@ -339,6 +339,7 @@ def _secondary_runner(tmp_path, connect):
     from gateway.run import GatewayRunner
 
     runner = GatewayRunner.__new__(GatewayRunner)
+    runner.config = GatewayConfig()
     runner.adapters = {}
     runner._failed_platforms = {}
     runner._profile_failed_platforms = {}
@@ -383,7 +384,7 @@ def _secondary_runner(tmp_path, connect):
 @pytest.mark.asyncio
 async def test_promote_flags_a_secondary_whose_adapter_cannot_be_created(monkeypatch, tmp_path):
     monkeypatch.setattr("gateway.run._start_gateway_start_cron_and_housekeeping", lambda r: (None,) * 4)
-    runner, _scopes, reconnects = _secondary_runner(tmp_path, lambda a, p: asyncio.sleep(0, result=True))
+    runner, _scopes, _reconnects = _secondary_runner(tmp_path, lambda a, p: asyncio.sleep(0, result=True))
     runner._served_profile_homes = {"work": tmp_path / "work"}
     runner._create_adapter = lambda platform, config: None
     zcs.defer_platform(runner, Platform.TELEGRAM, object(), profile="work")

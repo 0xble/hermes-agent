@@ -76,18 +76,17 @@ def changed_entries(root: Path, base: str, head: str | None) -> tuple[str | None
     if head is None:
         names += run(["git", "ls-files", "--others", "--exclude-standard", "-z", "--", *patterns], cwd=root)
     selected = {name for name in names.split("\0") if name and not name.endswith("/removed.yaml")}
-    return head_sha if head is not None else None, sorted(
-        name for name in selected if not _matches_release(root, name, head_sha if head is not None else None)
-    )
+    revision = head_sha if head is not None else None
+    release = accepted_release_baseline(root, revision) if selected else None
+    return revision, sorted(name for name in selected if not _matches_release(root, name, revision, release))
 
 
-def _matches_release(root: Path, name: str, head_sha: str | None) -> bool:
+def _matches_release(root: Path, name: str, head_sha: str | None, release: str | None) -> bool:
     """True when the entry is byte-identical to the accepted upstream release.
 
     A release sync brings upstream-admitted entries, whose pins may no longer be
     fetchable anonymously. Fork CI admits fork changes only.
     """
-    release = accepted_release_baseline(root, head_sha)
     if not release:
         return False
     try:

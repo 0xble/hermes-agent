@@ -12,6 +12,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import gateway, gateway_launchd, gateway_service_owner
+from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
 from hermes_cli.immutable_releases import promote
 from tests.hermes_cli.immutable_launchd_cleanup import (
     install_probe_process_dependency,
@@ -116,8 +117,9 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
     # Dependency isolation is out of scope here: the .pth reuses the runner's
     # site-packages. Real _build_venv coverage lives in test_immutable_releases.py:354 and :913.
     monkeypatch.setattr(releases, "_build_venv", _build_test_venv)
-    # Both commits contain the real S2 tree. A pre-S2 fixture would be refused by
-    # the candidate smoke check and would not prove an installable release.
+    # Both revisions contain the packaged Python runtime and use real Git
+    # archives and venvs. Frontend/test/contributor files do not participate in
+    # this launchd interpreter, code-identity and rollback contract.
     source = tmp_path / "source-revisions"
     # Borrow local objects instead of negotiating the entire partial-clone
     # history through upload-pack. Only these two disposable revisions matter.
@@ -158,7 +160,7 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
     # only the gateway payload with a bounded, no-credential process probe.
     python = str(home / "current" / ".venv" / "bin" / "python")
     logs = home / "logs"
-    plist["ProgramArguments"] = gateway_launchd.launchd_program_arguments(
+    plist["ProgramArguments"] = launchd_program_arguments(
         [python, "-m", "probe"], logs / "stdout.log", logs / "stderr.log"
     )
     plist["EnvironmentVariables"]["S2_PROBE_OUTPUT"] = str(output)
@@ -283,8 +285,8 @@ def test_two_s2_bearing_releases_rollback_retains_previous(tmp_path, monkeypatch
         assert any(s["name"] == "immutable_rollback" and f"from_sha={sha_b}" in s["detail"]
                    and f"to_sha={sha_a}" in s["detail"] for s in receipt["steps"])
     finally:
-        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
-        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15, check=False)
+        assert subprocess.run(["launchctl", "print", target], capture_output=True, check=False).returncode != 0
 
 
 @pytest.mark.platforms("macos")
@@ -413,7 +415,7 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         assert plist_path.read_bytes() == replacement
         assert (home / "current").resolve() == b
         assert (home / "previous").resolve() == source
-        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode == 0
+        assert subprocess.run(["launchctl", "print", target], capture_output=True, check=False).returncode == 0
         assert json.loads(output.read_text(encoding="utf-8"))["pid"] == a["pid"]
         import psutil
         assert Path(psutil.Process(a["pid"]).cwd()).resolve() == source
@@ -500,5 +502,5 @@ def test_first_migration_a_to_b_rollback_restores_source_revision_and_plist(tmp_
         }
         assert any(s["name"] == "immutable_rollback" and s["ok"] for s in rollback_receipt["steps"])
     finally:
-        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
-        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15, check=False)
+        assert subprocess.run(["launchctl", "print", target], capture_output=True, check=False).returncode != 0

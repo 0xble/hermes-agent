@@ -8,9 +8,9 @@ import json
 import pytest
 
 from agent import redact
+from agent.redact_json import redact_sensitive_json
 from agent.redact import (
     clear_vault_redaction_values,
-    redact_sensitive_json,
     register_vault_date_component,
     register_vault_redaction_value,
     register_vault_card_component,
@@ -22,7 +22,8 @@ SENTINEL = "«redacted-vault-secret»"
 @pytest.fixture(autouse=True)
 def _isolated_redaction(monkeypatch):
     monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
-    monkeypatch.setattr(redact, "_REDACT_ENABLED_BY_HOME", {})
+    monkeypatch.setattr(redact, "_ENV_POLICY_BY_HOME", {})
+    monkeypatch.setattr(redact, "_CONFIG_POLICY_BY_HOME", {})
     clear_vault_redaction_values()
     yield
     clear_vault_redaction_values()
@@ -201,6 +202,7 @@ def test_default_api_honors_routed_profile_opt_out(tmp_path, monkeypatch):
     routed = tmp_path / "routed-opt-out"
     routed.mkdir()
     (routed / ".env").write_text("HERMES_REDACT_SECRETS=false\n", encoding="utf-8")
+    redact.resolve_profile_policy(routed)
     token = set_hermes_home_override(routed)
     try:
         register_vault_redaction_value("9876")

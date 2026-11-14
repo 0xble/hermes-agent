@@ -60,12 +60,20 @@ class StreamDeliveryMixin:
             return False
 
     def _deliver_to_stream_callbacks(self, text: str) -> bool:
-        """Send ``text`` to the display + TTS delta callbacks; True if at least one accepted it.
-        Nothing leaves while a ``hold_stream`` plugin holds this turn's reply (``_hold_stream``)."""
+        """Send text to display and TTS; return whether display accepted it.
+
+        Keep the any-consumer record for content recovery and liveness, and the
+        display-only record for replay/dedup decisions.
+        """
         if getattr(self, "_hold_stream", False):
             return False
-        results = [self._call_quietly(cb, text) for cb in (self.stream_delta_callback, self._stream_callback)]
-        return any(results)
+        display_delivered = self._call_quietly(getattr(self, "stream_delta_callback", None), text)
+        tts_delivered = self._call_quietly(getattr(self, "_stream_callback", None), text)
+        if isinstance(text, str) and text and (display_delivered or tts_delivered):
+            self._record_streamed_assistant_text(text)
+            if display_delivered:
+                self._record_display_streamed_assistant_text(text)
+        return display_delivered
 
     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
@@ -93,8 +101,8 @@ class StreamDeliveryMixin:
         def deliver(tail: str) -> None:
             # Recorded only once shown (as ``_fire_stream_delta``): a held tail must not become an
             # interrupted turn's untransformed partial final.
-            if tail and self._deliver_to_stream_callbacks(tail):
-                self._record_streamed_assistant_text(tail)
+            if tail:
+                self._deliver_to_stream_callbacks(tail)
 
         # Flush any benign partial-tag tail held by the think scrubber first (#17924): an innocent '<' at
         # the end of the stream that turned out not to be a tag prefix should reach the UI. Then flush the
@@ -111,6 +119,7 @@ class StreamDeliveryMixin:
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
         self._current_streamed_assistant_text = ""
+        self._display_streamed_assistant_text = ""
 
     @property
     def _current_streamed_assistant_text(self) -> str:
@@ -123,13 +132,31 @@ class StreamDeliveryMixin:
     @_current_streamed_assistant_text.setter
     def _current_streamed_assistant_text(self, value: str) -> None:
         self._streamed_assistant_text_parts = [value] if value else []
+        self._display_streamed_assistant_text_parts = [value] if value else []
 
     def _record_streamed_assistant_text(self, text: str) -> None:
-        """Accumulate visible assistant text emitted through stream callbacks (superseded writers excluded)."""
+        """Accumulate text accepted by any consumer (display, TTS, or relay)."""
         if isinstance(text, str) and text and not self._stream_writer_superseded():
             parts = getattr(self, "_streamed_assistant_text_parts", None)
             if parts is None:
                 parts = self._streamed_assistant_text_parts = []
+            parts.append(text)
+
+    @property
+    def _display_streamed_assistant_text(self) -> str:
+        """Text accepted by the chat display only, for replay/dedup decisions."""
+        parts = getattr(self, "_display_streamed_assistant_text_parts", None)
+        return "".join(parts) if parts else ""
+
+    @_display_streamed_assistant_text.setter
+    def _display_streamed_assistant_text(self, value: str) -> None:
+        self._display_streamed_assistant_text_parts = [value] if value else []
+
+    def _record_display_streamed_assistant_text(self, text: str) -> None:
+        if isinstance(text, str) and text and not self._stream_writer_superseded():
+            parts = getattr(self, "_display_streamed_assistant_text_parts", None)
+            if parts is None:
+                parts = self._display_streamed_assistant_text_parts = []
             parts.append(text)
 
     @staticmethod
@@ -139,7 +166,7 @@ class StreamDeliveryMixin:
     def _interim_visible_and_streamed(self, content: str) -> tuple[str, str]:
         """(visible content, streamed text), both think-stripped and whitespace-normalized."""
         normalize = self._normalize_interim_visible_text
-        streamed = getattr(self, "_current_streamed_assistant_text", "") or ""
+        streamed = getattr(self, "_display_streamed_assistant_text", "") or ""
         return normalize(self._strip_think_blocks(content or "")), normalize(self._strip_think_blocks(streamed))
 
     def _interim_content_was_streamed(self, content: str) -> bool:
@@ -370,10 +397,9 @@ class StreamDeliveryMixin:
                 text = text.lstrip("\n")
         if not text:
             return
-        delivered = self._deliver_to_stream_callbacks(text)
+        self._deliver_to_stream_callbacks(text)
         self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
-        if delivered:
-            self._record_streamed_assistant_text(text)
+
 
     def _fire_reasoning_delta(self, text: str, *, inline: bool = False) -> None:
         """Fire reasoning callback if registered; superseded writers are fenced like content deltas.

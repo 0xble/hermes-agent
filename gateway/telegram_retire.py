@@ -102,7 +102,7 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
     if runner._session_db is None:
         raise TopicRequestError("Session storage is unavailable. The topic was not changed.")
     existing = await load(runner, source)
-    from gateway.telegram_retire_prepare import validate_decision
+    from gateway.telegram_retire_prepare import save_decision, validate_decision
     validate_decision(existing, owners, generation)
     target = target.strip() if target is not None else None
     reason, context = reason.strip(), context.strip()
@@ -175,7 +175,7 @@ async def request(runner, source, *, target=None, now=False, cancel=False, owner
             state["handoff_generation"] = previous.get("handoff_generation", previous["generation"])
         if auto_retries:
             state["auto_retries"] = auto_retries
-        await save(runner, source, state, force=True, expected_generation=generation, retry_of=retry_of)
+    await save_decision(runner, source, state, previous, generation, retry_of)
     if now:
         adapter = runner._delivery_adapter_for(source)
         agent = (getattr(runner, "_running_agents", {}) or {}).get(session_key)
@@ -304,11 +304,13 @@ async def _finalize_absent(runner, source, state, bot):
             record.get("item", {}).get("kind") == "context" for record in state["handoffs"].values())):
         return True
     await settle_handoffs(runner, source, state)
-    if await inventory(runner, source, state):
-        return True
+    from gateway.telegram_retire_work import reconcile_controls
+    items = await inventory(runner, source, state)
     current = await _current(runner, source, generation)
     if (not current or current["phase"] not in {"failed", "pending", "waiting"} or runner._is_session_running(key)
             or await asyncio.to_thread(runner.session_store.peek_session_id, key) not in {None, state["session_id"]}):
+        return True
+    if await reconcile_controls(runner, source, current, items, confirmed_absent=True):
         return True
     # This records observed absence, not a claim that a closing send succeeded.
     # Historical errors and any real closing receipt remain unchanged.

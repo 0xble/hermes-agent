@@ -17,7 +17,7 @@ import importlib.util
 import json
 import subprocess
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 
 import pytest
@@ -307,16 +307,16 @@ def test_git_dates_added_is_first_commit_updated_is_last_and_renames_keep_added(
     # Git's strict ISO output may spell UTC as Z or +00:00. The contract is
     # the commit instant, including its timezone, rather than that spelling.
     parsed_dates = {
-        name: {key: datetime.fromisoformat(value.replace("Z", "+00:00")) for key, value in fields.items()}
+        name: {key: datetime.fromisoformat(value) for key, value in fields.items()}
         for name, fields in dates.items()
     }
     assert parsed_dates["alpha.yaml"] == {
-        "addedAt": datetime(2026, 1, 1, tzinfo=timezone.utc),
-        "updatedAt": datetime(2026, 2, 1, tzinfo=timezone.utc),
+        "addedAt": datetime(2026, 1, 1, tzinfo=UTC),
+        "updatedAt": datetime(2026, 2, 1, tzinfo=UTC),
     }
     assert parsed_dates["new-name.yaml"] == {
-        "addedAt": datetime(2026, 1, 1, tzinfo=timezone.utc),
-        "updatedAt": datetime(2026, 3, 1, tzinfo=timezone.utc),
+        "addedAt": datetime(2026, 1, 1, tzinfo=UTC),
+        "updatedAt": datetime(2026, 3, 1, tzinfo=UTC),
     }
     entries = mod.load_catalog_entries(catalog, dates=dates)
     by_name = {e["name"]: e for e in entries}

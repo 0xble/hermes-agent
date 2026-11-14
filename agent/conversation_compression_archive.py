@@ -36,7 +36,7 @@ def optional_archive_method(session_db):
     Resolve the bound callable only after static inspection proves it exists.
     """
     if getattr_static(session_db, "archive_and_compact_best_effort", None) is not None:
-        optional = getattr(session_db, "archive_and_compact_best_effort")
+        optional = session_db.archive_and_compact_best_effort
         if callable(optional):
             return optional
     return session_db.archive_and_compact

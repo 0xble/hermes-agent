@@ -32,7 +32,7 @@ def test_canonical_resolver_binds_the_member_the_driver_names(hosted_owner, monk
     from tui_gateway.hosted_room_driver import HostedRoomBinding, _member_id
     authority, loop, _, _ = hosted_owner
     service = CanonicalHostedRoomService(authority, loop)
-    monkeypatch.setattr(service, 'profile_homes', lambda: {'default': Path(authority.profile_id)})
+    monkeypatch.setattr(service, 'profile_homes', lambda: {'default': Path(authority.db.db_path).parent})
     service.authorize_room('alice', 'room', create=True)
     gateway = local_authority_gateway_id()
     create_room(authority.db.db_path, room_id='room', name='Room', authority_gateway_id=gateway, members=[

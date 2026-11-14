@@ -203,10 +203,10 @@ def _templates():
 
 
 def _template_id(template: str) -> str:
-    import hermes_cli.checkins as checkins
-    import hermes_cli.goals as goals
-    import hermes_cli.heartbeat as heartbeat
-    import hermes_cli.loops as loops
+    from hermes_cli import checkins
+    from hermes_cli import goals
+    from hermes_cli import heartbeat
+    from hermes_cli import loops
 
     from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
 
@@ -345,7 +345,7 @@ def _turn_agent(*, display_kind=None, platform="telegram", recall_synthetic_turn
 def test_turn_start_skips_recall_for_a_delegation_result_but_still_notifies_providers():
     agent = _turn_agent(display_kind="internal_notification")
 
-    assert _memory_turn_start_and_prefetch(agent, _delegation_notice()) == ""
+    assert _memory_turn_start_and_prefetch(agent, _delegation_notice(), turn_author=None, previous_message="") == ""
     agent._memory_manager.prefetch_all.assert_not_called()
     agent._memory_manager.on_turn_start.assert_called_once()
 
@@ -353,14 +353,14 @@ def test_turn_start_skips_recall_for_a_delegation_result_but_still_notifies_prov
 def test_turn_start_recalls_on_the_human_suffix_only():
     agent = _turn_agent(display_kind=None)
 
-    _memory_turn_start_and_prefetch(agent, _goal_prompt() + "\n\n" + HUMAN)
+    _memory_turn_start_and_prefetch(agent, _goal_prompt() + "\n\n" + HUMAN, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_called_once_with(HUMAN, session_id="s-1")
 
 
 def test_turn_start_skips_recall_for_text_merged_into_a_runtime_notification():
     agent = _turn_agent(display_kind="internal_notification")
 
-    _memory_turn_start_and_prefetch(agent, _process_notice() + "\n\n" + HUMAN)
+    _memory_turn_start_and_prefetch(agent, _process_notice() + "\n\n" + HUMAN, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_not_called()
 
 
@@ -368,7 +368,7 @@ def test_turn_start_honors_the_recall_synthetic_turns_switch():
     agent = _turn_agent(recall_synthetic_turns=True)
     prompt = _goal_prompt()
 
-    _memory_turn_start_and_prefetch(agent, prompt)
+    _memory_turn_start_and_prefetch(agent, prompt, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_called_once_with(prompt.strip(), session_id="s-1")
 
 
@@ -496,7 +496,7 @@ class _BufferingProvider:
 
 @pytest.fixture()
 def clock(monkeypatch):
-    import agent.memory_manager as memory_manager
+    from agent import memory_manager
 
     now = [1_000_000.0]
     monkeypatch.setattr(memory_manager, "_now", lambda: now[0])
@@ -544,7 +544,7 @@ def test_buffered_recall_for_the_last_human_turn_survives_generated_turns_within
 
 
 def test_buffered_recall_older_than_the_age_limit_is_dropped(clock):
-    agent, provider = _session_with_buffering_provider()
+    agent, _provider = _session_with_buffering_provider()
 
     _run_turn(agent, HUMAN)
     clock[0] += 1200
@@ -585,7 +585,7 @@ def test_zero_prefetch_max_age_disables_the_bound(clock):
 
 
 def test_agent_init_reads_prefetch_max_age_from_config(monkeypatch):
-    import agent.agent_init as agent_init
+    from agent import agent_init
 
     class _Provider(_BufferingProvider):
         def is_available(self):
@@ -845,7 +845,7 @@ def test_a_fresh_queue_racing_the_stale_check_is_not_discarded(clock):
     assert manager.flush_pending(timeout=5) is True
     clock[0] += 1801  # the buffered recall is now stale
 
-    import agent.memory_manager as memory_manager
+    from agent import memory_manager
     stale_now = memory_manager._now
     fresh = threading.Thread(target=manager.queue_prefetch_all, args=(HUMAN,), kwargs={"session_id": "s-1"})
     fresh_blocked = threading.Event()

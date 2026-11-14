@@ -86,7 +86,7 @@ async def _admit_with_retry(adapter: _Adapter, event: MessageEvent) -> None:
 @pytest.mark.asyncio
 async def test_typed_message_starts_ahead_of_a_background_flood_and_the_cap_holds():
     cap, flood = 2, 5
-    runner, adapter = _runner(cap)
+    _unused_runner, adapter = _runner(cap)
     wakes = [asyncio.create_task(_admit_with_retry(adapter, _event(f"bg{i}"))) for i in range(flood)]
     await _settle()
 
@@ -106,7 +106,7 @@ async def test_typed_message_starts_ahead_of_a_background_flood_and_the_cap_hold
 
 @pytest.mark.asyncio
 async def test_a_wake_for_a_session_mid_turn_joins_it_without_a_slot():
-    runner, adapter = _runner(1)
+    _unused_runner, adapter = _runner(1)
     await admit_internal_event(adapter, _event("other"))  # the only background slot is taken
     await adapter.handle_message(_event("busy", typed=True))
 

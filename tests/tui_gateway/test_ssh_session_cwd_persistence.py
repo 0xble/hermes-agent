@@ -7,6 +7,7 @@ only exists on the Hermes host.
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import contextlib
 
 import pytest
@@ -38,7 +39,7 @@ def backend(monkeypatch):
 def db(tmp_path, monkeypatch):
     db = SessionDB(db_path=tmp_path / "state.db")
     monkeypatch.setattr(server, "_get_db", lambda: db)
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server.git_probe, "branch", lambda _cwd: None)
     monkeypatch.setattr(server.git_probe, "common_repo_root", lambda _cwd: None)
     yield db

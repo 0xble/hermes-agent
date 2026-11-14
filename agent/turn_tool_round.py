@@ -16,6 +16,7 @@ from agent.message_metadata import append_message
 from agent.message_sanitization import coalesce_tool_call_id, normalize_provider_tool_call_ids
 from agent.turn_preflight import compress_after_tool_results
 from agent.turn_tool_validation import validate_tool_calls
+from agent.turn_tool_guardrails import handle_tool_cap_answer
 
 logger = logging.getLogger("agent.conversation_loop")
 
@@ -46,6 +47,7 @@ class ToolRoundVerdict:
     _turn_exit_reason: Any
     truncated_tool_call_retries: Any
     current_turn_user_idx: Any
+    interrupted: bool = False
     result: Optional[dict[str, Any]] = None
 
 
@@ -92,6 +94,7 @@ def run_tool_round(
     system_message: Any, active_system_prompt: Any, compression_attempts: Any,
     max_compression_attempts: Any, final_response: Any, failed: Any, _turn_exit_reason: Any,
     truncated_tool_call_retries: Any, current_turn_user_idx: Any,
+    interrupted: bool = False,
 ) -> ToolRoundVerdict:
     """Execute one tool round in the exact original order. Persist-before-execute is a
     durability invariant: resume must see the executed block if a destructive tool restarts
@@ -105,7 +108,7 @@ def run_tool_round(
             active_system_prompt=active_system_prompt, compression_attempts=compression_attempts,
             final_response=final_response, failed=failed, _turn_exit_reason=_turn_exit_reason,
             truncated_tool_call_retries=truncated_tool_call_retries,
-            current_turn_user_idx=current_turn_user_idx, result=result,
+            current_turn_user_idx=current_turn_user_idx, interrupted=interrupted, result=result,
         )
 
     if not agent.quiet_mode:
@@ -227,6 +230,13 @@ def run_tool_round(
         return _verdict("break")
 
     if agent._tool_guardrail_halt_decision is not None:
+        decision = agent._tool_guardrail_halt_decision
+        if decision.code in {"loop_web_search_cap", "loop_subagent_cap"}:
+            cap_verdict = handle_tool_cap_answer(agent, messages, api_call_count, decision)
+            final_response = cap_verdict.final_response
+            interrupted = cap_verdict.interrupted
+            _turn_exit_reason = cap_verdict.turn_exit_reason
+            return _verdict("break")
         halt_reply = _end_turn_on_guardrail_halt(agent, messages)
         if halt_reply is not None:
             final_response = halt_reply

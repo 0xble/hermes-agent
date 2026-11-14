@@ -205,7 +205,7 @@ def _cli_streaming_tts_turn(monkeypatch, *, quiet, chunks):
     """Drive the real CLI streaming-TTS setup and settle; returns everything queued for speech."""
     import threading
     from cli import _ChatTurn
-    import tools.tts_tool as tts_tool
+    from tools import tts_tool
     import tools.tts_tool_speaker as tts_speaker
 
     monkeypatch.setattr(tts_tool, "_import_sounddevice", lambda: None)

@@ -17,6 +17,7 @@ async def test_deleted_private_topic_delivers_final_at_chat_root():
     adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
     send_message = AsyncMock(side_effect=[
         BadRequest("Message thread not found"),
+        BadRequest("Message thread not found"),
         SimpleNamespace(message_id=120),
     ])
     adapter._bot = SimpleNamespace(send_message=send_message)
@@ -30,12 +31,28 @@ async def test_deleted_private_topic_delivers_final_at_chat_root():
     )
     assert result.success is True
     assert result.message_id == "120"
-    assert send_message.await_count == 2
-    root = send_message.await_args_list[1].kwargs
+    assert send_message.await_count == 3
+    assert all((c.kwargs.get("message_thread_id") or c.kwargs.get("direct_messages_topic_id")) == 150565
+               for c in send_message.await_args_list[:2])
+    root = send_message.await_args_list[2].kwargs
     assert root["reply_to_message_id"] is None
-    assert root["message_thread_id"] is None
+    assert root.get("message_thread_id") is None and root.get("direct_messages_topic_id") is None
     assert root["text"].startswith("Recovered response from a deleted Telegram topic:")
+    assert result.raw_response["thread_fallback"] is True
+    assert str(result.raw_response["requested_thread_id"]) == "150565"
     assert adapter.is_dm_topic_stale("2027045491", "150565") is True
+
+    send_message.reset_mock(side_effect=True)
+    send_message.side_effect = BadRequest("Message thread not found")
+    interim = await adapter.send(
+        chat_id="2027045491", content="Interim commentary", reply_to="150565",
+        metadata={"_interim_send": True, "thread_id": "150565",
+                  "telegram_reply_to_message_id": "150565", "telegram_dm_topic_reply_fallback": True},
+    )
+    assert not interim.success
+    assert send_message.await_count == 2
+    assert all((c.kwargs.get("message_thread_id") or c.kwargs.get("direct_messages_topic_id")) == 150565
+               for c in send_message.await_args_list)
 
 
 @pytest.mark.asyncio

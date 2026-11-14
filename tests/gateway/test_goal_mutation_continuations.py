@@ -12,7 +12,7 @@ from gateway.run import GatewayRunner
 from gateway.session import SessionEntry, build_session_key
 from hermes_cli.goals import GoalContract, GoalManager
 from tests.gateway.test_goal_continuation_drain import (
-    _DrainProbeAdapter, _slack_thread_source, hermes_home,  # noqa: F401
+    _DrainProbeAdapter, _slack_thread_source, hermes_home,
 )
 
 

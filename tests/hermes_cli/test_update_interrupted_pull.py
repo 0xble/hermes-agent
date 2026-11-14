@@ -22,7 +22,7 @@ from hermes_cli import update_cmd
 
 def _git(root: Path, *args: str) -> str:
     result = subprocess.run(["git", "-C", str(root), *args], capture_output=True,
-                            text=True, encoding="utf-8")
+                            text=True, encoding="utf-8", check=False)
     assert result.returncode == 0, f"git {args}: {result.stderr}"
     return result.stdout.strip()
 
@@ -539,7 +539,7 @@ def test_dead_index_lock_scan_retries_an_unknown_holder(tmp_path, monkeypatch):
     scans = iter([None, False])
     monkeypatch.setattr(er, "_held_open", lambda *args, **kwargs: next(scans))
 
-    assert er._release_dead_index_lock(git_dir, tmp_path, any_git=True) is True
+    assert er._release_dead_lock(lock, tmp_path, any_git=True) is True
     assert not lock.exists()
 
 
@@ -606,14 +606,10 @@ def test_an_empty_head_answer_keeps_the_marker(tmp_path, monkeypatch, capsys):
     stub = tmp_path / "silent-git"
     stub.write_text("", encoding="utf-8")
     monkeypatch.setattr(er, "_git_executable", lambda recorded="": str(stub))
-    real_run = subprocess.run
-
-    def silent(argv, *args, **kwargs):  # every git call "succeeds" with no output
-        if argv and argv[0] == str(stub):
-            return subprocess.CompletedProcess(argv, 0, "", "")
-        return real_run(argv, *args, **kwargs)
-
-    monkeypatch.setattr(subprocess, "run", silent)
+    # Restore delegates Git to the custody runner. Model an empty answer at
+    # that actual lookup, independent of its process backend.
+    monkeypatch.setattr(er, "_custody_git", lambda _root, _recorded:
+                        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, "", ""))
     assert er.restore_interrupted_pull(root) is False
     assert marker.exists(), "an empty `rev-parse HEAD` deleted the marker over a torn tree"
     assert "Could not read HEAD" in capsys.readouterr().err
@@ -740,7 +736,7 @@ def test_an_unmarked_rollback_that_fails_never_reports_the_install_unchanged(che
     root, a, b = checkout
     _git(root, "reset", "-q", "--hard", b)
     er.interrupted_pull_marker(root).mkdir()
-    monkeypatch.setattr(update_cmd, "_validate_critical_files_syntax", lambda _root: (False, "utils.py", "SyntaxError"))
+    monkeypatch.setattr(update_cmd._commit, "tree_syntax_error", lambda _root, _files: ("utils.py", "SyntaxError"))
     real = update_cmd._git_run
 
     def hard_reset_fails(git_cmd, args, *rest, **kw):

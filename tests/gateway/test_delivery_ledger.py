@@ -516,10 +516,11 @@ class TestGatewayRedeliverySweep:
 
     @pytest.mark.asyncio
     async def test_refused_row_holds_later_rows_for_the_same_chat(self):
-        for oid, content in (("ob-1", "first"), ("ob-2", "second"), ("ob-3", "third")):
-            _record(oid, content=content)
-            _orphan(oid)
-            time.sleep(0.002)  # distinct created_at, so replay order is the recorded order
+        # Equal timestamps exercise the ledger's stable rowid tie-breaker.
+        with patch("gateway.delivery_ledger.time.time", return_value=time.time()):
+            for oid, content in (("ob-1", "first"), ("ob-2", "second"), ("ob-3", "third")):
+                _record(oid, content=content)
+                _orphan(oid)
         adapter = self._adapter(success=False)
         runner = self._runner(adapter)
 
@@ -589,12 +590,12 @@ class TestGatewayRedeliverySweep:
         started = time.time() - 1
         text = "Intro\n[[copy]]\none\n[[/copy]]\n[[copy]]\ntwo\n[[/copy]]\n"
         origin = SimpleNamespace(platform="telegram")
-        for ref, content in GatewayRunner._crash_left_parts(key, "tok", text, started, origin):
-            dl.record_crash_left_reply(
-                obligation_id=dl.compute_obligation_id(key, ref, content), session_key=key,
-                platform="telegram", chat_id="C9", thread_id=None, content=content, since=started,
-                part=True)
-            time.sleep(0.002)
+        with patch("gateway.delivery_ledger.time.time", return_value=time.time()):
+            for ref, content in GatewayRunner._crash_left_parts(key, "tok", text, started, origin):
+                dl.record_crash_left_reply(
+                    obligation_id=dl.compute_obligation_id(key, ref, content), session_key=key,
+                    platform="telegram", chat_id="C9", thread_id=None, content=content, since=started,
+                    part=True)
         sends = []
         refuse = {"two": 1}
 

@@ -95,7 +95,7 @@ def _preflight_check_provider_key(job: dict, cfg: dict, jc=None) -> Optional[str
     """
     try:
         jc = jc if jc is not None else _sched._resolve_cron_job_config(job, cfg)
-        if _sched._job_fallback_chain(job, jc.cfg, jc.route):
+        if _sched._job_fallback_chain(job, jc.cfg):
             return None  # execution can rescue a missing primary credential
         kwargs = _sched._cron_runtime_kwargs(job, jc)
     except Exception:
@@ -263,6 +263,8 @@ def _preflight_check_delivery(job: dict) -> Optional[str]:
             # bot-chat targets deliver via a local subprocess; failures land in last_delivery_error.
             if _delivery.parse_bot_chat_deliver_token(part) is not None:
                 continue
+            if _delivery.parse_room_deliver_token(part) is not None:
+                continue  # Group Chat posts write the room store directly; no adapter needed.
             platform_parts.append(part.split(":", 1)[0].strip())
     if not platform_parts:
         return None

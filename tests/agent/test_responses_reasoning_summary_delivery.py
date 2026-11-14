@@ -163,13 +163,15 @@ def test_folded_human_message_reaches_the_running_agent():
     """A typed message folded into a relay turn must lift the agent's silence permission too."""
     from gateway.platforms.event import MessageEvent, MessageType
     from gateway.run_busy import GatewayBusySessionMixin
+    from gateway.session_state import TurnState
 
     relay = MessageEvent(text="[relay from=session/child receipt=r]\nFYI", message_type=MessageType.TEXT)
     relay.reply_expected = False
     typed = MessageEvent(text="status?", message_type=MessageType.TEXT)
     typed.reply_expected = True
     agent = SimpleNamespace(_turn_reply_expected=False)
-    turn = SimpleNamespace(agent=agent, event=relay, ctx=SimpleNamespace(reply_expected=False))
+    turn = TurnState(agent=agent, event=relay,
+                     ctx=SimpleNamespace(reply_expected=False, terminal_reply_metadata={}))
     runner = SimpleNamespace(_session_state=lambda _key: SimpleNamespace(turn=turn))
 
     fold = GatewayBusySessionMixin._fold_into_running_turn

@@ -542,7 +542,7 @@ def test_streaming_tts_never_speaks_copy_bodies() -> None:
     consumer._aborted = consumer._finished = False
     consumer._streamer = object()
     spoken = []
-    consumer._chunker = SimpleNamespace(feed=lambda t: [t], flush=lambda: [])
+    consumer._chunker = SimpleNamespace(feed=lambda t: [t], flush=list)
     consumer._enqueue_clauses = lambda clauses, *_a, **_k: spoken.extend(clauses)
     for delta in ["before\n[[copy]]\nPaste ", "exactly.\n[[/copy]]\nafter\n"]:
         consumer.on_delta(delta)
@@ -776,7 +776,7 @@ async def test_fifo_delivery_sends_exact_incident_copy_block(monkeypatch) -> Non
 
     monkeypatch.setattr(adapter, "send_final_ledgered", send_final)
     await deliver_response(adapter, event, "incident-session", _INCIDENT_REPLY)
-    prose, blocks = extract_copy_blocks(_INCIDENT_REPLY)
+    _prose, blocks = extract_copy_blocks(_INCIDENT_REPLY)
     assert len(blocks) == 1
     from gateway.copy_blocks import copy_free_text_for
     assert [item[0] for item in sent] == [copy_free_text_for(adapter, _INCIDENT_REPLY).strip(), *blocks]

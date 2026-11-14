@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import MappingProxyType, SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -71,7 +71,7 @@ def _message(*, rich=None, text=None, caption=None, chat_type="private", **kwarg
         from_user=SimpleNamespace(id=42, full_name="Brian", username="brian", is_bot=False),
         sender_chat=None, business_connection_id=None, text=text, caption=caption,
         entities=[], caption_entities=[], message_thread_id=None, direct_messages_topic=None,
-        is_topic_message=False, reply_to_message=None, quote=None, date=datetime.now(timezone.utc),
+        is_topic_message=False, reply_to_message=None, quote=None, date=datetime.now(UTC),
         forum_topic_created=None, photo=None, document=None, video=None, audio=None, voice=None,
         sticker=None, api_kwargs=MappingProxyType({"rich_message": rich} if rich is not None else {}),
     )
@@ -229,3 +229,13 @@ def test_projection_limits_hold():
         "not-a-row", [{"text": "Name", "is_header": True}], [{"text": "Brian"}]]}]}).text == "| Name |\n| --- |\n| Brian |"
     tiny = project_rich_message({"blocks": [{"type": "paragraph", "text": "x" * 100}]}, max_chars=10)
     assert tiny.truncated is True and len(tiny.text) <= 10
+
+
+def test_empty_paragraph_is_a_blank_line_not_content():
+    """Telegram carries a blank line between blocks as an empty paragraph (upstream #146067's shape)."""
+    blank = {"type": "paragraph", "text": ""}
+    assert project_rich_message({"blocks": [
+        {"type": "paragraph", "text": "one"}, blank, {"type": "paragraph", "text": "two"}]}).text == "one\n\ntwo"
+    assert project_rich_message({"blocks": [{"type": "list", "items": [
+        {"label": "•", "blocks": [blank, {"type": "paragraph", "text": "item"}]}, {"label": "•", "blocks": [blank]}]}]}).text == "• item"
+    assert project_rich_message({"blocks": [blank, blank]}).text == ""

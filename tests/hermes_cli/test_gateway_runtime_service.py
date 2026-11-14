@@ -164,7 +164,7 @@ def test_launchd_verifies_the_osascript_wrapped_command_the_installer_writes(cas
     """The Local Network wrapper (#71206) is unwrapped only as its exact template, and the command inside
     is held to the same gateway identity as a bare ProgramArguments, on disk and as launchd loaded it."""
     import plistlib
-    from hermes_cli.gateway_launchd import launchd_program_arguments
+    from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
     from hermes_cli.gateway_runtime_service_identity import verify_launchd_loaded, verify_launchd_plist
     home = tmp_path / ".hermes"
     from hermes_cli import gateway as gw

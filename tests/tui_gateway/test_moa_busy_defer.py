@@ -113,7 +113,6 @@ def test_claim_time_restore_ignores_expired_model_once_override(monkeypatch):
 
     def apply(_sid, _session, raw, **kwargs):
         calls.append(raw)
-        return None
 
     monkeypatch.setattr(server, "_apply_model_switch", apply)
     assert server._apply_pending_moa("sid", session, "compare", token) is True

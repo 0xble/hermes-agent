@@ -139,7 +139,7 @@ def _raise(error: OSError) -> None:
     raise error
 
 
-def _paths_size_mb(tree: Path, rels: List[str]) -> Optional[int]:
+def _paths_size_mb(tree: Path, rels: list[str]) -> Optional[int]:
     """Bytes (MiB, rounded up) the archive would copy for *rels*; None when unreadable."""
     total = 0
     try:
@@ -259,7 +259,7 @@ def _classify_tree(_ops, repo_root: str, entry: Path, merge_cache, remote_heads)
     return "reap", "clean and fully merged/pushed", []
 
 
-def _worktree_porcelain(repo_root: str) -> Optional[List[List[str]]]:
+def _worktree_porcelain(repo_root: str) -> Optional[list[list[str]]]:
     """Read worktree records without quoting or splitting paths containing newlines."""
     result = _git(["worktree", "list", "--porcelain", "-z"], cwd=repo_root, timeout=10, binary=True)
     if result.returncode != 0 or not result.stdout.endswith(b"\0\0"):
@@ -484,9 +484,9 @@ def reclaim_finished_generated(
     *,
     safety_script: str,
     integration_ref: str = "origin/main",
-    exclude: Optional[List[str]] = None,
+    exclude: Optional[list[str]] = None,
     timeout: int = 20,
-) -> List[str]:
+) -> list[str]:
     """Delete generated dirs from finished worktrees. Does not delete source.
 
     Calls ``safety_script`` (the worktree-safety helper) for each linked tree
@@ -505,7 +505,7 @@ def reclaim_finished_generated(
     if not managed.is_dir():
         return []
     excluded = {os.path.realpath(path) for path in (exclude or [])}
-    removed: List[str] = []
+    removed: list[str] = []
     for entry in sorted(managed.iterdir()):
         if not entry.is_dir() or entry.is_symlink():
             continue

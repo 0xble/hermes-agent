@@ -197,7 +197,7 @@ def _crash(home: Path, source: Path, plist: Path, scenario: str, checkpoint: str
                              str(home), str(source), str(plist), scenario, checkpoint,
                              original.hex(), intended.hex(), "real" if real else "simulated"],
                             env=env, cwd=Path(__file__).resolve().parents[2],
-                            capture_output=True, text=True, timeout=100 if real else 20)
+                            capture_output=True, text=True, timeout=100 if real else 20, check=False)
     assert result.returncode == 73, (scenario, checkpoint, result.stdout, result.stderr)
 
 
@@ -369,14 +369,14 @@ def test_disposable_launchd_first_migration_and_rollback(tmp_path, monkeypatch, 
         # the reload boundary it must run the new target despite the child dying.
         wait_for((source if scenario == "migration" else b) if checkpoint == "plist"
                  else (b if scenario == "migration" else source))
-        assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=15).returncode == 0
+        assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=15, check=False).returncode == 0
         _retry(home, source, plist, scenario, a, b, source_sha, original, intended, monkeypatch, real=True,
                checkpoint=checkpoint)
         wait_for(b if scenario == "migration" else source)
-        assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=15).returncode == 0
+        assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=15, check=False).returncode == 0
     finally:
-        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
-        assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=15).returncode != 0
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15, check=False)
+        assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=15, check=False).returncode != 0
 
 
 @pytest.mark.platforms("macos")
@@ -387,7 +387,7 @@ def test_failed_launchd_reload_remains_unacknowledged_until_intended_process_sta
     """A failed helper/bootout-bootstrap cannot commit a release transaction."""
     from hermes_cli import gateway, gateway_launchd
 
-    home, source, plist, a, b, _, original, intended = _fixture(tmp_path, "promote", real=True)
+    home, _source, plist, a, b, _, _original, intended = _fixture(tmp_path, "promote", real=True)
     domain = f"gui/{os.getuid()}"
     target = f"{domain}/{plist.stem}"
     observed = home / "observed"
@@ -410,14 +410,14 @@ def test_failed_launchd_reload_remains_unacknowledged_until_intended_process_sta
         if failure == "submit":
             # Failed submission leaves the original registered service untouched.
             def failed_reload():
-                assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode == 0
+                assert subprocess.run(["launchctl", "print", target], capture_output=True, check=False).returncode == 0
                 return False
         else:
             def failed_reload():
                 subprocess.run(["launchctl", "bootout", target], check=True, timeout=15)
                 missing = plist.with_name("nonexistent.plist")
                 assert subprocess.run(["launchctl", "bootstrap", domain, str(missing)],
-                                      capture_output=True, timeout=15).returncode != 0
+                                      capture_output=True, timeout=15, check=False).returncode != 0
                 return False
 
         with pytest.raises(RuntimeError, match="reload|refresh"):
@@ -438,10 +438,10 @@ def test_failed_launchd_reload_remains_unacknowledged_until_intended_process_sta
         # The startup acknowledgement is authoritative; the callback return is not.
         assert releases.acknowledge_running_release(home)
         assert not txn.exists()
-        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode == 0
+        assert subprocess.run(["launchctl", "print", target], capture_output=True, check=False).returncode == 0
     finally:
-        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
-        assert subprocess.run(["launchctl", "print", target], capture_output=True).returncode != 0
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15, check=False)
+        assert subprocess.run(["launchctl", "print", target], capture_output=True, check=False).returncode != 0
 
 
 @pytest.mark.platforms("macos")
@@ -450,7 +450,7 @@ def test_deferred_helper_crash_phases_never_acknowledge_transaction(tmp_path, mo
     """Kill the real generated bash helper at each handoff phase; WAL remains."""
     from hermes_cli import gateway, gateway_launchd
 
-    home, source, plist, a, b, _, original, intended = _fixture(tmp_path, "promote")
+    home, _source, plist, _a, b, _, _original, intended = _fixture(tmp_path, "promote")
     monkeypatch.setenv("HERMES_HOME", str(home))
     monkeypatch.setattr(gateway, "get_hermes_home", lambda: home)
     captured = {}
@@ -559,7 +559,7 @@ def test_reload_submission_is_not_release_completion(tmp_path, monkeypatch, reas
 @pytest.mark.parametrize("scenario", ["promote", "rollback", "migration_rollback"])
 def test_issued_reload_is_observation_only_across_entry_points(tmp_path, monkeypatch, scenario):
     from hermes_cli import gateway, gateway_launchd, update_cmd
-    home, source, plist, a, b, _, original, intended = _fixture(tmp_path, scenario)
+    home, _source, plist, _a, b, _, original, intended = _fixture(tmp_path, scenario)
     calls = []
     callback = lambda: calls.append(1) or "deferred"
     monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_, **_kw: False)
@@ -592,7 +592,7 @@ def test_issued_reload_is_observation_only_across_entry_points(tmp_path, monkeyp
 @pytest.mark.platforms("macos")
 def test_catch_up_pending_reload_never_invokes_callback(tmp_path, monkeypatch):
     from hermes_cli import gateway, gateway_launchd, update_cmd
-    home, source, plist, a, b, _, original, intended = _fixture(tmp_path, "promote")
+    home, source, plist, _a, b, _, _original, intended = _fixture(tmp_path, "promote")
     calls = []
     monkeypatch.setattr(releases, "acknowledge_running_release", lambda *_, **_kw: False)
     assert releases.activate_release(home, b, plist_path=plist, plist_body=intended,
@@ -687,7 +687,7 @@ def test_wrong_gateway_identity_cannot_acknowledge(tmp_path, monkeypatch, wrong)
                          ["python", "-m", "hermes_cli.main", "gateway", "run"]),
         exe=lambda: str((home / "releases/A" if wrong == "release" else b) / ".venv/bin/python"),
         cwd=lambda: str(home / "releases/A" if wrong == "release" else b),
-        environ=lambda: {}, children=lambda **_: [])
+        environ=dict, children=lambda **_: [])
     monkeypatch.setattr(psutil, "Process", lambda _: gateway)
     assert not releases.acknowledge_running_release(home)
     record = json.loads((home / "release-txn.json").read_text())
@@ -719,9 +719,9 @@ def test_generated_launchd_gateway_acknowledges_only_its_release(tmp_path, monke
 
     interpreter = tmp_path / "interpreter"
     monkeypatch.setattr(releases, "_interpreter_process_executable", lambda _: interpreter)
-    process = lambda pid, cmd: SimpleNamespace(  # noqa: E731
+    process = lambda pid, cmd: SimpleNamespace(
         pid=pid, cmdline=lambda: cmd, exe=lambda: str(interpreter), cwd=lambda: str(target),
-        environ=lambda: {}, children=lambda **_: [])
+        environ=dict, children=lambda **_: [])
     supervisor = process(31415, definition["ProgramArguments"])
     supervisor.children = lambda **_: [process(31416, wrapper), process(31417, argv)]
     monkeypatch.setattr(gateway_launchd, "_launchctl_supervised_pid", lambda _, **kwargs: supervisor.pid)

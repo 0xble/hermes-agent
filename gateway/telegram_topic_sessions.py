@@ -138,14 +138,14 @@ def _resolve_topic_model_ref(raw: str, source: Optional[SessionSource] = None, r
     """Resolve a topic role from the config that owns the topic's session: the routed profile's
     under ``multiplex_profiles``, else the gateway's module-level loader."""
     from gateway.run import _load_gateway_config
-    from hermes_cli.model_preset_runtime import resolve_model_ref
+    from hermes_cli.model_alias_runtime import resolve_model_alias
     config_path = None
     if (runner is not None and source is not None
             and getattr(getattr(runner, "config", None), "multiplex_profiles", False)):
         config_path = Path(runner._resolve_profile_home_for_source(source)) / "config.yaml"
     try:
         config = _load_gateway_config() if config_path is None else _load_gateway_config(config_path)
-        return resolve_model_ref(raw, config)
+        return resolve_model_alias(raw, config)
     except (ValueError, TypeError) as exc:
         raise TopicRequestError(str(exc)) from exc
 
@@ -153,20 +153,19 @@ def _resolve_topic_model_ref(raw: str, source: Optional[SessionSource] = None, r
 async def _resolve_model(runner, source: SessionSource, spec: TopicSpec, session_key: str = ""):
     if not (spec.model or spec.provider):
         return None
-    from hermes_cli.model_presets import preset_ref_name
-    if preset_ref_name(spec.model):
+    route = _resolve_topic_model_ref(spec.model.strip(), source, runner) if spec.model else None
+    if route is not None and route.name:
         if spec.provider:
             raise TopicRequestError(
                 f"model {spec.model.strip()!r} is a role, which carries its own provider. "
                 "Drop provider, or pass a concrete model.")
-        route = _resolve_topic_model_ref(spec.model.strip(), source, runner)
         if route.model:
             _ctx, _result, error = await runner.resolve_session_model_selection(
                 source, route.model, route.provider, session_key=session_key,
             )
             if error:
                 raise TopicRequestError(error)
-        return ("role", spec.model.strip()[1:].strip().lower())
+        return ("role", route.name)
     ctx, result, error = await runner.resolve_session_model_selection(
         source, spec.model, spec.provider, session_key=session_key)
     if error is not None:
@@ -266,7 +265,7 @@ async def _session_settings_readback(runner, dest: SessionSource, entry, selecti
         readback.update(model=result.new_model, provider=result.target_provider)
     try:
         if isinstance(selection, tuple) and selection and selection[0] == "role":
-            route = await asyncio.to_thread(_resolve_topic_model_ref, "@" + selection[1], dest, runner)
+            route = await asyncio.to_thread(_resolve_topic_model_ref, selection[1], dest, runner)
             readback.update(model=route.model, provider=route.provider)
         async with runner._async_profile_scope_for_source(dest):
             profile_home = runner._profile_scope_key_for_source(dest)

@@ -179,7 +179,7 @@ async def test_reasoning_hydration_cannot_overwrite_newer_picker(monkeypatch, tm
         await runner._handle_reasoning_command(MessageEvent(text="/reasoning", source=source))
         await asyncio.wait_for(asyncio.to_thread(picker_applied.wait, 10), 12)
         persisted = read(key)
-        live = runner._session_reasoning_overrides[key]
+        live = runner._session_state(key).conversation.reasoning_override
         assert live == persisted == {"enabled": True, "effort": "high"}, (
             f"reasoning hydration overwrote picker: persisted={persisted!r}, live={live!r}"
         )

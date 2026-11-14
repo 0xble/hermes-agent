@@ -234,8 +234,10 @@ async def test_inflight_disarm_fences_pending_delivery_and_replay(fixture, monke
             f.runner._snapshot_active_turns_for_recovery = lambda: [(
                 f.entry.session_key, f.entry.session_id, "exact-turn", datetime.fromtimestamp(1300, UTC), f.source, "default")]
             f.runner.async_session_store = SimpleNamespace(
-                load_transcript=AsyncMock(return_value=f.db.get_messages(f.entry.session_id)), clear_turn_active=AsyncMock(return_value=True))
-            f.runner._crash_left_reply = lambda *_: text
+                load_transcript=AsyncMock(return_value=f.db.get_messages(f.entry.session_id)), clear_turn_active=AsyncMock(return_value=True),
+                # Fork per-room silence (33cf2037) reads the room decision before judging the reply.
+                get_session_metadata=AsyncMock(return_value={}))
+            f.runner._crash_left_reply = lambda *_, **__: text
             f.runner._crash_left_parts = lambda *_: [("crash:exact-turn", text)]
             monkeypatch.setattr("gateway.run_startup.time.time", lambda: 1400)
             ledgered = await GatewayStartupMixin._ledger_crash_left_replies(f.runner, 7200)

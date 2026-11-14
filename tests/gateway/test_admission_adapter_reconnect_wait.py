@@ -63,23 +63,27 @@ def _statuses(authority, receipt):
 
 
 @pytest.mark.asyncio
-async def test_turn_waits_out_a_brief_adapter_reconnect(tmp_path, monkeypatch, caplog):
-    import logging
-
+async def test_turn_waits_out_a_brief_adapter_reconnect(tmp_path, monkeypatch):
+    from gateway import session_ingress_context
     from gateway.config import Platform
     from gateway.session_authority import SessionAuthority
-    from tests.waiting import async_wait_until
-
-    caplog.set_level(logging.INFO, logger='gateway.session_ingress_context')
 
     runner, adapter, authority, receipt, executed = await _admitted(tmp_path, monkeypatch, 'during-reconnect')
     try:
         _adapter_lost_after_claim(monkeypatch, runner)
+        waiting = asyncio.Event()
+        wait_for_adapter = session_ingress_context.await_reconnecting_adapter
+
+        async def observed_wait(*args):
+            assert Platform.DISCORD not in runner.adapters
+            waiting.set()
+            return await wait_for_adapter(*args)
+
+        monkeypatch.setattr(session_ingress_context, 'await_reconnecting_adapter', observed_wait)
 
         async def reinstall():
-            # Re-register only once the turn is provably waiting on the empty slot.
-            await async_wait_until(lambda: any('waiting up to' in r.getMessage() for r in caplog.records),
-                                   what='admitted turn waiting for the adapter')
+            await asyncio.wait_for(waiting.wait(), timeout=2)
+            assert executed == []
             runner.adapters[Platform.DISCORD] = adapter  # the reconnect watcher's install
 
         reconnect = asyncio.create_task(reinstall())

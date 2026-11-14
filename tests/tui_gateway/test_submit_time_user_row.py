@@ -1,6 +1,7 @@
 """prompt.submit writes the user's message at send time, and the turn that follows adopts that row instead of
 writing a second one (#111868: a Desktop freeze during a slow first agent build left a session row with no message)."""
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 from types import SimpleNamespace
 
 from agent.turn_context import _stage_turn_user_message
@@ -62,10 +63,10 @@ def test_submit_ack_binds_the_written_row_even_if_worker_consumes_staging(monkey
         def start(self):
             self.target()
 
-    monkeypatch.setattr(server.threading, "Thread", InlineThread)
+    patch_server_threads(monkeypatch, server, InlineThread)
     monkeypatch.setattr(server, "_start_agent_build", lambda *args: None)
     monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *args: False)
-    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *args: session.pop("_submit_user_row", None))
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *args, **kwargs: session.pop("_submit_user_row", None))
     try:
         replies = []
         for _ in range(2):

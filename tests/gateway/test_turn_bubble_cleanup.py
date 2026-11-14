@@ -236,7 +236,7 @@ async def test_stop_cancelling_the_adapter_task_still_deletes_the_turns_bubbles(
     turn's cards still go once it ends."""
     from gateway.platforms.event import MessageEvent
 
-    runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
+    _runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     gates['first'] = asyncio.Event()
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
     await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
@@ -253,7 +253,7 @@ async def test_a_shutdown_release_of_the_waiters_still_deletes_the_turns_bubbles
     from gateway.platforms.event import MessageEvent
     from gateway.session_contract import SessionRef
 
-    runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
+    _runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     gates['first'], gates['follow-up'] = asyncio.Event(), asyncio.Event()
     await adapter.handle_message(MessageEvent(text='first', source=source, message_id='m1'))
     await asyncio.wait_for(adapter.turn_started['first'].wait(), 5)
@@ -274,7 +274,7 @@ async def test_an_unknown_settlement_still_deletes_the_turns_bubbles(monkeypatch
     import gateway.session_settlement_recovery as recovery
     from gateway.platforms.event import MessageEvent
 
-    runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
+    _runner, authority, adapter, source, _gates, cleaned = await _owner(monkeypatch)
     settle = recovery.settle_with_retry
 
     async def failing(authority_, live, ref, row, *args, **kwargs):
@@ -294,7 +294,7 @@ async def test_a_waiter_registered_after_its_turn_started_deletes_the_bubbles_af
     the reply over; the cleanup follows that reply instead of racing it."""
     from gateway.platforms.event import MessageEvent
 
-    runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
+    _runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     gates['late'] = asyncio.Event()
     registered = asyncio.Event()
     admit = authority.admit_native
@@ -328,11 +328,11 @@ async def test_a_waiter_registered_after_its_turn_started_deletes_the_bubbles_af
 async def test_a_newer_turn_never_deletes_an_older_turns_cards_before_its_reply(monkeypatch):
     """Turn A's reply send outlasts the drain's bounded marker wait, so follow-up B runs and is
     answered first. B's fire must not sweep A's cleanup ahead of A's reply."""
-    import gateway.session_authority as session_authority
+    from gateway import session_authority
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
 
-    runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
+    _runner, authority, adapter, source, gates, cleaned = await _owner(monkeypatch)
     monkeypatch.setattr(session_authority, '_MARKER_RELEASE_WAIT_S', 0.05)
     release_first_reply = asyncio.Event()
     send = adapter.send

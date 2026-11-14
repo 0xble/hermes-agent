@@ -69,8 +69,8 @@ paths and inspection path all share the pinned activity predicate.
 ## Precedence and Telegram topic edits
 
 The gateway resolves a lane in this order: `--once`, explicit session picks,
-temporary picks, a held `@role`, active `model.attended`, then the
-channel/global fallback. A held role follows the live preset on every request
+temporary picks, a held alias name, active `model.attended`, then the
+channel/global fallback. A held role follows the live model_aliases entry on every request
 and does not post a switch-in or switch-back card. A session `/model reset`
 removes the persisted model pick and the role, including when attended
 switching is unconfigured but a role is set. `/model reset --all` clears both
@@ -185,14 +185,13 @@ For example, with a `gpt-6.1-sol` default and a 15 minute window:
 
 Fork patch identities: `attended-model-switching`, `gateway-telegram-topic-tool`, `live-model-preset-roles`, `model-pick-expiry`.
 
-`live-model-preset-roles` covers `@role` holds: the role field on conversation
-state and `SessionEntry`, role reset, concrete-pick precedence, live preset
-follow, and the silent held-role card. The earlier identities cover attended
-routing and the Telegram topic tool.
+`live-model-preset-roles` is retired as a preset integration. Its required
+persisted-name behavior now belongs to [Dynamic model aliases](dynamic-model-aliases.md),
+which uses upstream `model_aliases` and bare labels. The earlier identities
+continue to cover attended routing and the Telegram topic tool.
 
-Preset syntax, route readers, reasoning precedence and config persistence are owned
-by [Model presets](model-presets.md). This unit adds only session role state,
-API-boundary config-follow, attended holds, topic commands and bulk conversion.
+This unit owns session role state, API-boundary config-follow, attended holds,
+topic commands and bulk conversion. It does not own a second label registry.
 
 `/model --all attended` writes the converted sessions in one routing snapshot.
 A topic role edit reads reasoning from the same routed profile as the route.
@@ -204,8 +203,8 @@ The attended feature adds per-topic attended routing, idle expiry, persisted act
 The combined resolution is implemented in `gateway/run_turn.py` and
 `gateway/run_config_loaders.py`; the topic commit path is
 `gateway/telegram_topic_sessions.py` and `gateway/slash_commands_model.py`.
-`@role` holds persist on `SessionEntry.model_role` and resolve through the shared
-config route resolver in `hermes_cli/model_preset_runtime.py`. `/model --all attended` converts concrete Telegram
+Bare alias names persist on `SessionEntry.model_role` and resolve through
+`hermes_cli/model_alias_runtime.py` using upstream model switching. `/model --all attended` converts concrete Telegram
 overrides to that role and returns the converted session keys, skipping keys
 already on a role.
 This is a fork-only gateway feature that adds per-topic attended routing, idle

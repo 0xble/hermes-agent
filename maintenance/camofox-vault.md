@@ -37,6 +37,18 @@ OTP writes around the native origin and account checks. Attribute Browser Use
 metrics to the session that served the call, including cloud-to-local fallback,
 without changing the native browser or its consent surface.
 
+Fork patch identity: `browser-use-cli`.
+
+The Browser Use harness shares upstream's `browser_session` routing owner:
+configured cloud routes, hybrid local sidecars, consented real-profile fallback,
+profile-scoped credentials and guarded URL/CDP bindings use the same session.
+Do not restore retired `browser_tool_*` routing consumers during a sync.
+Contract tests: `tests/tools/test_browser_use_cli.py`
+  `tests/tools/test_browser_use_harness.py`
+  `tests/tools/test_browser_real_profile.py`.
+Retire this integration identity when upstream's harness preserves the same
+profile, routing, consent and vault boundaries without the fork bridge.
+
 ## Required behavior
 
 - A confirmed stale tab (410 or 404 with a tab-missing payload) invalidates the cached ID.

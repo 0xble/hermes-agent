@@ -90,6 +90,7 @@ async def test_idle_loop_tick_runs_as_a_fifo_turn_not_beside_it(monkeypatch):
     from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress import executing_admission
     from gateway.session_results import execution_result
+    from gateway.run_goals import post_turn_bookkeeping_pending
     from hermes_cli import loops
     from hermes_state_runtime import list_session_admissions
     from plugins.platforms.discord.adapter import DiscordAdapter
@@ -124,7 +125,9 @@ async def test_idle_loop_tick_runs_as_a_fifo_turn_not_beside_it(monkeypatch):
         return list_session_admissions(authority.db, session_id=owner, pending_only=False) if owner else []
     await async_wait_until(lambda: [r['status'] for r in rows()] == ['terminal'] and not runner._is_session_running(key),
                            what='the first turn to settle and release the session')
-    await async_wait_until(lambda: key not in adapter._active_sessions, what='adapter delivery lifecycle to release')
+    await async_wait_until(lambda: key not in adapter._active_sessions
+                           and not post_turn_bookkeeping_pending(runner, key),
+                           what='adapter delivery and post-turn bookkeeping to release')
     owner = runner.session_store.peek_session_id(key)
 
     route = {'platform': 'discord', 'chat_id': '42', 'chat_type': 'dm', 'user_id': '42'}

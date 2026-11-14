@@ -32,7 +32,7 @@ class Wall:
 
 
 def _utc(s: str) -> float:
-    return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
+    return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.UTC).timestamp()
 
 
 def test_counts_every_endpoint_and_each_created_message(tmp_path):
@@ -468,6 +468,20 @@ async def test_post_delivery_cleanup_keeps_the_registering_turns_trigger(tmp_pat
         reset_trigger(token)
 
 
+@pytest.mark.asyncio
+async def test_post_delivery_registration_reports_success_and_honours_first(tmp_path):
+    """Deferred goal bookkeeping only waits for delivery when registration says True; a ``first``
+    signal must run ahead of the bubble cleanup chained before it."""
+    adapter = _adapter(tmp_path)
+    order = []
+    assert adapter.register_post_delivery_callback("sk", lambda: order.append("cleanup"), generation=1) is True
+    assert adapter.register_post_delivery_callback(
+        "sk", lambda: order.append("delivered"), generation=1, first=True) is True
+    assert adapter.register_post_delivery_callback("sk", lambda: None, generation=0) is False
+    await adapter._fire_post_delivery_callback("sk", 1)
+    assert order == ["delivered", "cleanup"]
+
+
 # --- Daily call budget (2026-10-24: 36261s ban at 19875 calls, 10116 of them from typed turns) ---
 
 
@@ -886,7 +900,7 @@ async def test_failed_initial_tool_send_can_retry_but_only_accepts_one_bubble(tm
 
 @pytest.mark.asyncio
 async def test_deferred_initial_tool_send_spends_slot_and_preserves_native_replay_class(tmp_path, monkeypatch):
-    import gateway.outbox as outbox
+    from gateway import outbox
     from gateway.platforms.base import OUTBOUND_TOOL_PROGRESS
     from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
 

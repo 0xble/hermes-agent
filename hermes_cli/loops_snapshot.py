@@ -97,7 +97,7 @@ def _same_tick(first: LoopState, second: LoopState) -> bool:
 
 
 @snapshot_control
-def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> Optional[Tuple[str, str, str]]:
+def _release_superseded_tick(manager: Any, original: LoopState, db: Any) -> Optional[tuple[str, str, str]]:
     """Release only the SAME tick on the winner, never apply its obsolete verdict.
 
     A revision may preserve awaiting_response. Leaving that claim behind would

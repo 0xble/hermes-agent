@@ -10,6 +10,7 @@ uses to render a system line and fire the kickoff prompt.
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import importlib
 import threading
 import types
@@ -120,7 +121,7 @@ class _InlineThread:
 def turn_env(server, monkeypatch, tmp_path):
     """Neutralize side paths unrelated to post-turn goal continuation."""
     emitted = []
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(
         server,
         "_emit",
@@ -740,7 +741,7 @@ def test_prompt_submit_rpc_marks_turn_as_user_turn(server, session, monkeypatch)
         _session["running"] = False  # the real one releases the turn in its finally
         return True
 
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_wait_agent_for_prompt", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_start_agent_build", lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_run_prompt_submit", fake_run)
@@ -855,7 +856,7 @@ def test_goal_draft_uses_session_profile_without_blocking_rpc_reader(
 
 @pytest.mark.parametrize("hidden", [False, True])
 def test_isolated_submit_keeps_preview_separate_from_user_provenance(server, session, monkeypatch, hidden):
-    sid, _, record = session
+    sid, _, _record = session
     seen = []
     monkeypatch.setattr(server, "_session_uses_compute_host", lambda *_a: True)
     monkeypatch.setattr(server, "_ensure_active_session_slot", lambda *_a: None)

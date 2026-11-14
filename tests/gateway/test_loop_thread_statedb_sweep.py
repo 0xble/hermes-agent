@@ -234,7 +234,7 @@ async def test_delivery_validates_automation_topic_off_the_loop(tmp_path, metada
 @pytest.mark.asyncio
 async def test_role_hold_without_attended_routing_reads_route_state_off_the_loop(lane, monkeypatch):
     cfg = {"model": {"default": "base", "provider": "baseline"},
-           "model_presets": {"fast": {"model": "first", "provider": "provider-a"}}}
+           "model_aliases": {"fast": {"model": "first", "provider": "provider-a"}}}
     (lane.runner._resolve_profile_home_for_source(lane.source) / "config.yaml").write_text(yaml.safe_dump(cfg))
     await lane.runner._set_session_model_role(lane.key, "fast")
     route_active = _Probe(True)

@@ -20,7 +20,7 @@ _MAX_CONTENT_CHARS = 8192
 _ACTIONS = ("resolve_topic", "inspect_session", "inspect_delivery")
 _SQL_SHAPED = re.compile(
     r"(?:\bselect\b|\binsert\b|\bupdate\b|\bdelete\b|\bdrop\b|\bpragma\b|--|/\*|\*/|;|\bunion\b|\bor\s+1\s*=)",
-    re.I,
+    re.IGNORECASE,
 )
 
 SESSION_STATE_SCHEMA = {

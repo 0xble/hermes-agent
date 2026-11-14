@@ -38,7 +38,7 @@ def test_client_owned_cli_requires_a_lifetime_pipe(tmp_path, stdin_kind):
         proc = subprocess.run([sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--client-owned"],
                               env={**os.environ, "HOME": str(tmp_path), "HERMES_HOME": str(tmp_path), "PYTHONPATH": str(Path.cwd())},
                               stdin=slave if slave is not None else subprocess.DEVNULL,
-                              capture_output=True, text=True, encoding="utf-8", timeout=15)
+                              capture_output=True, text=True, encoding="utf-8", timeout=15, check=False)
         assert proc.returncode != 0
         assert "--client-owned requires stdin to be a pipe" in proc.stderr, (proc.stdout, proc.stderr)
         assert not (tmp_path / "gateway.pid").exists()

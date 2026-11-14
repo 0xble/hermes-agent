@@ -1098,6 +1098,26 @@ runtime change. Retire when the accepted upstream case teardown handles the same
 race without weakening ownership or survivor checks. Rollback reverts this helper
 and its regression, with no runtime or stored-state migration.
 
+The same identity owns the TUI routing helper's close path: it kills the exact
+test-owned stdio process instead of signalling a detached process group after the
+group leader has exited. The compute-host child owns its own parent-guard shutdown,
+and case-owned detached gateway cleanup remains with the dedicated routing-process
+regression, which carries the explicit reparented-daemon survivor proof.
+
+It also owns the cold dashboard/session-listener test harness boundary: child
+commands use the checkout interpreter's tool path and a temporary cwd, while the
+listener test's HTTP client leaves the dashboard's documented lazy import to the
+outer bounded probe rather than imposing a second cold-import deadline.
+
+The SSH connection tests use the same reliability identity. Their simulated remote
+shells now run with the checkout interpreter's bin directory first and with the
+fixture home as cwd, so a developer `mise` shim or repository-relative path cannot
+change the command's behavior. The leaked `default/`, `fixture/`, and `owned/`
+directories came from the child Hermes config path, `ensure_hermes_home()` through
+`initialize_home()`, materializing a relative `HERMES_HOME` in the checkout. The
+fixture now keeps that home inside `tmp_path` and preserves the existing ownership
+assertions.
+
 ## Classic command output synchronization
 
 The classic PTY harness shares its existing 45-second screen poll between

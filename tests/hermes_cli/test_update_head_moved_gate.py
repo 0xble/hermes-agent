@@ -84,6 +84,12 @@ def _patch_update_deps(monkeypatch, tmp_path, run_side_effect):
     tests/hermes_cli/test_cmd_update.py).
     """
     monkeypatch.setattr(hermes_main.subprocess, "run", run_side_effect)
+    from hermes_cli import update_custody
+
+    # The macOS owner watchdog uses Popen; stub the public Git boundary that
+    # this update-plan fixture models, independent of the containment backend.
+    monkeypatch.setattr(update_custody, "run_git", lambda git_cmd, args, **kw:
+                        run_side_effect([*git_cmd, *args], **kw))
     monkeypatch.setattr(hermes_main, "PROJECT_ROOT", tmp_path)
     monkeypatch.setenv("PYTHONPATH", str(tmp_path))
     (tmp_path / ".git").mkdir()  # pass the "is a git repo" gate

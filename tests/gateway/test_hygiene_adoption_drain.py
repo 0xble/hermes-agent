@@ -47,7 +47,7 @@ def test_completed_adoption_task_drain_runs_queued_discard_callbacks(helper, att
         result = subprocess.run(
             [sys.executable, "-c", probe, helper, attribute],
             capture_output=True, text=True, timeout=5,
-        )
+         check=False)
     except subprocess.TimeoutExpired as exc:
         raise AssertionError(
             f"adoption drain starved its loop and timeout callback:\n{exc.stderr}"

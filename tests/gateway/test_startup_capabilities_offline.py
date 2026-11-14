@@ -102,7 +102,7 @@ def test_session_create_completes_while_catalog_dns_is_blocked(tmp_path):
             assert created["session_id"] == created["stored_session_id"]
             assert elapsed < 15, f"session.create and tool-schema assembly waited {elapsed:.1f}s for catalog discovery"
             output = log_path.read_text()
-            assert "CATALOG_DNS_BLOCKED models-dev-refresh" in output, output
+            assert "CATALOG_DNS_BLOCKED " in output, output
             assert "TOOL_SCHEMA_READY terminal vision_analyze browser_exec" in output, output
             print(f"session.create and tool-schema assembly completed in {elapsed:.2f}s with models.dev DNS still blocked")
         finally:

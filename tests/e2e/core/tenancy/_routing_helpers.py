@@ -307,7 +307,9 @@ def run_hermes(argv: list[str], home: Path, *, hermes_home: Path | None = None, 
 
 def _kill_group(proc: subprocess.Popen) -> None:
     try:
-        os.killpg(proc.pid, signal.SIGKILL)
+        # The gateway is a test-owned session leader. Kill that exact handle instead of signalling
+        # a process group whose leader may already have exited and been reaped by the OS guard.
+        proc.kill()
     except (ProcessLookupError, PermissionError):
         pass
 
