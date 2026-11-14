@@ -24,5 +24,5 @@ def session_control_outcome(record: dict[str, Any], who: str) -> tuple[str, str]
         return "⌛ Not applied", "This approval expired before it was resolved."
     if record.get("error") == "target_changed":
         return f"◆ Not applied by {who}", "The target changed before approval, so nothing was changed."
-    error = str(record.get("error") or "unknown error")
-    return f"✗ Not applied by {who}", f"Reason: {error}"
+    from hermes_cli.session_controls import control_error_reason
+    return f"✗ Not applied by {who}", f"Reason: {control_error_reason(record.get('error'), kind=kind)}"

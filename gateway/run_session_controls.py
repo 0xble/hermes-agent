@@ -6,7 +6,7 @@ import logging
 import time
 from typing import Any
 
-from hermes_cli.session_controls import REPLACEMENT_MAX_CHARS
+from hermes_cli.session_controls import REPLACEMENT_MAX_CHARS, control_error_reason
 from hermes_cli.goal_notices import lifecycle_cards_hidden, notice_level
 
 logger = logging.getLogger(__name__)
@@ -525,7 +525,14 @@ class GatewaySessionControlsMixin:
         if status == "expired":
             return f"⌛ Request to {action} this {kind} expired"
         if status == "failed":
-            return f"✗ Request to {action} this {kind} failed: {record.get('error') or 'unknown error'}"
+            error = control_error_reason(record.get("error"), kind=kind)
+            authority = record.get("authority") or {}
+            if authority.get("via") == "button" and authority.get("user_id"):
+                return (
+                    f"✓ Request to {action} this {kind} was approved but not applied: "
+                    f"{error}"
+                )
+            return f"✗ Request to {action} this {kind} failed: {error}"
         if status == "applied" and record.get("outcome") == "timed_wait":
             return f"◷ {record['notice']}. Requested by {requester}."
         verb = {
@@ -563,7 +570,8 @@ class GatewaySessionControlsMixin:
         target_id = record.get("target_session_id", "")
         target_title = record.get("target_title") or "Untitled session"
         target = f"{target_title} ({target_id})"
-        action = f"{record.get('kind', '')} {record.get('action', '')}"
+        kind = record.get("kind", "")
+        action = f"{kind} {record.get('action', '')}"
         if record.get("status") == "applied":
             if record.get("outcome") == "timed_wait":
                 return f"✓ {record['notice']} in {target}."
@@ -582,4 +590,8 @@ class GatewaySessionControlsMixin:
             return f"✗ Your request to {action} in {target} was denied."
         if record.get("status") == "expired":
             return f"⌛ Your request to {action} in {target} expired without approval."
-        return f"✗ Your request to {action} in {target} failed: {record.get('error') or 'unknown error'}"
+        error = control_error_reason(record.get("error"), kind=kind)
+        authority = record.get("authority") or {}
+        if authority.get("via") == "button" and authority.get("user_id"):
+            return f"✓ Your request to {action} in {target} was approved but not applied: {error}"
+        return f"✗ Your request to {action} in {target} failed: {error}"
