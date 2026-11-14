@@ -113,7 +113,7 @@ class GatewayProcessNotificationsMixin:
                 # The owning profile's authority, as on the delivery path.
                 async with self._completion_event_scope(completion_evt):
                     committed = await asyncio.to_thread(completion_admission, self, completion_evt) is not None
-            except Exception:
+            except Exception:  # health: allow BLE001 -- fail-open recheck boundary logs and falls back to the notice
                 # Failing open sends the notice; a dead watcher would send nothing.
                 logger.debug("Process watcher: admission recheck failed for %s", session_id,
                              exc_info=True)
