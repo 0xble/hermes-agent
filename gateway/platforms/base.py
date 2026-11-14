@@ -2281,10 +2281,10 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         for session_key in set(self._session_generations) | set(self._deferred_commands):
             self._invalidate_deferred_commands(session_key, forget_unresolved=False)
 
-    def _resolve_deferred_command(self, event: MessageEvent) -> None:
+    def _resolve_deferred_command(self, event: MessageEvent, *, outcome_visible: bool = True) -> None:
         """The deferred command's handler returned: its own reply (or a park) is the outcome.
         Any other event is absent from the map, so this is a no-op for it."""
-        if not getattr(event, "_deferred_parked", False):
+        if outcome_visible and not getattr(event, "_deferred_parked", False):
             self._unresolved_deferred_map().pop(id(event), None)
 
     async def _report_unrun_deferred_commands(self) -> None:
@@ -5553,8 +5553,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
                     is_ephemeral_response=is_ephemeral_response)
             await self._release_turn_marker(event)
             processing_ok = (delivery_succeeded and not required_delivery_failed) if delivery_attempted else not bool(response)
-            if delivery_succeeded or not delivery_attempted:
-                self._resolve_deferred_command(event)  # a deferred command's own reply was its outcome
+            # A deferred command's own reply was its outcome, unless that reply failed to deliver.
+            self._resolve_deferred_command(event, outcome_visible=delivery_succeeded or not delivery_attempted)
             # Clean up the per-turn streaming-TTS flag.
             self._streaming_tts_completed_turns.discard(self._streaming_tts_turn_key(
                 session_key, getattr(interrupt_event, "_hermes_run_generation", None),
