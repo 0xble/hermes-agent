@@ -747,8 +747,7 @@ class SessionSessionsMixin:
         # Flush first: a still-queued pre-switch delta applied after this UPDATE would trip the
         # first_accounted_route overwrite and resurrect the old route.
         self.flush_token_counts()
-        # An explicit pick owns the route now, even when it names the model a fallback used (#152333).
-        patch: dict[str, Any] = {"browser_model_lock": None, "_fallback_route": None}
+        patch: dict[str, Any] = {"browser_model_lock": None, "_fallback_route": None}  # explicit pick owns the route (#152333)
         if model:
             patch["model"] = model
         if provider:
