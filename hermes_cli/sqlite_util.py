@@ -110,16 +110,7 @@ def open_shared_state_db(
         # pre-existing/replaced DB or bytes SQLite has already committed.
         sidecars = [Path(str(path) + suffix) for suffix in ("-wal", "-shm")]
         existing_sidecars = {sidecar for sidecar in sidecars if os.path.lexists(sidecar)}
-        created = None
-        try:
-            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
-        except FileExistsError:
-            pass
-        else:
-            try:
-                created = os.fstat(fd)
-            finally:
-                os.close(fd)
+        created = _create_exclusive(path)
         conn = None
         try:
             _secure_state_db_files(path)
@@ -135,16 +126,32 @@ def open_shared_state_db(
                 # All participating openers still wait on the startup lock.
                 # Do not let cleanup errors hide the original open failure.
                 with contextlib.suppress(OSError):
-                    current = path.lstat()
-                    if ((current.st_dev, current.st_ino) == (created.st_dev, created.st_ino)
-                            and current.st_size == 0):
-                        for sidecar in sidecars:
-                            if sidecar not in existing_sidecars:
-                                with contextlib.suppress(OSError):
-                                    if sidecar.lstat().st_size == 0:
-                                        sidecar.unlink()
-                        path.unlink()
+                    _remove_created_empty(path, created, [sidecar for sidecar in sidecars if sidecar not in existing_sidecars])
             raise
+
+
+def _create_exclusive(path: Path) -> os.stat_result | None:
+    """Create ``path`` with O_EXCL: its identity when this call created it, else None."""
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return None
+    try:
+        return os.fstat(fd)
+    finally:
+        os.close(fd)
+
+
+def _remove_created_empty(path: Path, created: os.stat_result, new_sidecars: list[Path]) -> None:
+    """Remove the still-empty file this opener created, and its empty new sidecars."""
+    current = path.lstat()
+    if (current.st_dev, current.st_ino) != (created.st_dev, created.st_ino) or current.st_size != 0:
+        return
+    for sidecar in new_sidecars:
+        with contextlib.suppress(OSError):
+            if sidecar.lstat().st_size == 0:
+                sidecar.unlink()
+    path.unlink()
 
 
 @contextlib.contextmanager
