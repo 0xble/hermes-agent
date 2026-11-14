@@ -194,6 +194,8 @@ def test_randomized_incremental_equals_full_fold(tmp_path, monkeypatch, caplog, 
             expected = "display_incremental=1" if mode == "incremental" else "display_fallback=1"
             assert any(expected in record.message for record in caplog.records)
             if mode == "retry":
+                # Rollback preserves the session proof, while total_changes invalidates the
+                # display hint. The real transaction retry uses the base full-fold fallback.
                 assert attempts == ["_AffectedFold", "_FoldPlan"]
                 monkeypatch.setattr(db, "_reconcile_display_orders", reconcile)
             assert [tuple(row) for row in db._read_all("SELECT * FROM messages WHERE session_id = 'foreign'")] == foreign

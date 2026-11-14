@@ -41,10 +41,49 @@ Runtime session resolution and the shared compression/branch/reset child-row pub
 
 `tests/hermes_state/test_session_delete_batches.py` covers a 1,025-message single/chain/prune regression, another SQLite writer committing between pages, interruption immediately after retirement and after a committed page, restart/next-prune recovery, invisibility through FTS and LIKE, propagated database errors, pending-marker expiry, snapshot fences, and message-byte bounds. Existing guard, cascade, compression, retirement, media and prune tests remain authoritative.
 
+Contract tests: `tests/hermes_state/test_compaction_prepare_snapshot.py`, `tests/hermes_state/test_compaction_prepare_fallback.py`.
+
 ## Compaction Attribution
 
-The existing slow-write warning also brackets in-lock compaction preparation
-(`compaction_prepare`: lease/history guards, model-config merge and coverage proof),
+The existing slow-write warning retains `compaction_prepare`. For
+`SessionDB.archive_and_compact`, held-summary checks, held-row CAS and coverage
+proof run in an independent read-only snapshot before `BEGIN IMMEDIATE` when
+held messages/CAS are supplied or more than 8 unresolved dicts need coverage.
+The cheap lease path retains its original transactional preparation and SQL
+content matching. Only the plain content-match branch above that width builds
+the role/content index. Retired-row and merged-run resolution are unchanged.
+The freshness token is captured in that same snapshot and covers only the target
+session: its transcript/runtime revisions and generation, plus a streamed digest
+of active row ids, timestamps, durable identities and CAS-owned columns not
+covered by the transcript revision trigger. The large content/tool/reasoning
+bodies are fenced by that revision instead of copied or hashed in the writer
+transaction. No full payload copy survives preparation. Summary markers and
+untriggered sidecars remain fenced. The revision covers UPDATEs. Inserts/deletes
+are fenced by the id set, and supported writers never delete/reinsert or REPLACE
+an existing id with changed bodies and identical identities. Arbitrary SQL that
+does so is outside this fence. Unrelated session writes cannot invalidate the proof.
+A changed token rolls back the attempt and repeats preparation outside the writer
+lock. After 2 optimistic attempts, the final attempt prepares inside the writer
+transaction, preserving the original compaction's progress under contention.
+Each attempt refreshes the display-fold plan outside the lock as well.
+A SQLite transaction retry that rolled back all mutations can reuse the session
+proof. Its writer-wide display hint may be stale, so the existing full-fold
+fallback remains authoritative, with the same output as the incremental path.
+
+Independent snapshot reads use the reader pool's IOERR retry and storage-error
+classification. Reader exhaustion or a persistent read failure falls back to
+transactional preparation. Actual writer-side errors still propagate through the
+normal transaction policy.
+
+Lease expiry/ownership and model-config merging remain transactional. The
+receipt-owned `archive_on_connection` entry point retains preparation on its
+caller's transaction, sharing the same proof implementation. Its atomic receipt
+contract is unchanged.
+
+`compaction_prepare` includes the off-lock preparation duration for the accepted
+snapshot plus transactional lease/config checks. It can exceed `callback_total`
+and the measured write hold. Other phases retain their write-lock scope:
+
 `archive_enumerate` (active/carried/tail selection and rewind preparation),
 `archive_timestamp_carry` and the final `session_counters` update. Both the
 watermark and proved-coverage paths use these buckets. Disjoint enumeration
@@ -69,7 +108,8 @@ a non-NULL identity and NULL order occurs in both cursors.
 the cursor counts may sum to more than the unique count. Completed enumeration
 counts in a failed transaction describe attempted work, not committed rows.
 
-All of these buckets are inside `callback_total`, and the display buckets are
+Except for the off-lock portion of `compaction_prepare`, these buckets are inside
+`callback_total`, and the display buckets are
 nested further. Do not sum parent and child durations. Thresholds, outer callback
 thread-CPU timing, rollback behavior and metric isolation remain unchanged. No
 extra diagnostic queries, SQL tracing, row payloads or per-row clocks are added.
@@ -79,12 +119,12 @@ GIL, scheduling or index bottleneck, and do not claim a latency improvement.
 
 ## Source surfaces
 
-`gateway/run.py`, `gateway/session_prune.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_cli/maintenance_window.py`, `hermes_cli/sessions_cmd.py`, `hermes_cli/web_routers/sessions.py`, `hermes_state_prune_pacing.py`, `hermes_state_mutation_retirement.py`, `hermes_state_local.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_transactions.py`, `hermes_state_messages.py`, `hermes_state_compression.py`, `hermes_state_message_archive.py`, `hermes_state_write_metrics.py`, `hermes_state_lockowners.py`, and their focused tests.
+`gateway/run.py`, `gateway/session_prune.py`, `hermes_cli/cli_auto_maintenance.py`, `hermes_cli/maintenance_window.py`, `hermes_cli/sessions_cmd.py`, `hermes_cli/web_routers/sessions.py`, `hermes_state_prune_pacing.py`, `hermes_state_mutation_retirement.py`, `hermes_state_local.py`, `hermes_state_maintenance.py`, `hermes_state.py`, `hermes_state_transactions.py`, `hermes_state_messages.py`, `hermes_state_compaction_prepare.py`, `hermes_state_coverage.py`, `hermes_state_compression.py`, `hermes_state_message_archive.py`, `hermes_state_write_metrics.py`, `hermes_state_lockowners.py`, and their focused tests.
 
 ## Focused regression
 
 ```text
-scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
+scripts/run_tests.sh tests/hermes_state/test_prune_pass_bounds.py tests/hermes_cli/test_sessions_prune_window.py tests/gateway/test_state_db_maintenance_window.py tests/hermes_cli/test_session_vacuum_config.py tests/hermes_state/test_hermes_state.py tests/hermes_state/test_write_lock_owner_attribution.py tests/hermes_state/test_compaction_write_metrics.py tests/hermes_state/test_compaction_prepare_snapshot.py tests/hermes_state/test_compaction_prepare_fallback.py tests/hermes_state/test_transcript_write_diagnostics.py tests/hermes_state/test_compression_lease_refresh_before_publish.py
 ```
 
 ## Retirement

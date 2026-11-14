@@ -730,29 +730,29 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         unresolved_held: Optional[list[dict[str, Any]]] = None,
         held_messages: Optional[list[dict[str, Any]]] = None,
         held_for_cas: Optional[list[dict[str, Any]]] = None,
-        fold_plan: Optional[_FoldPlan] = None) -> int:
+        fold_plan: Optional[_FoldPlan] = None, prepared=None) -> int:
         """Run compaction on the caller's write transaction without committing it."""
-        from hermes_state import SessionCompressionInProgressError
+        from hermes_state_compaction_prepare import prepare_compaction
         from hermes_state_errors import CompressionLeaseLostError
-        affected_fold = self._begin_display_fold(conn, fold_plan)
         with write_phase("compaction_prepare"):
             if lock_holder is not None:
                 lock_row = conn.execute(_COMPRESSION_LOCK_ROW_SQL, (session_id,)).fetchone()
                 if lock_row is None or lock_row["holder"] != lock_holder or float(lock_row["expires_at"]) <= time.time():
                     raise CompressionLeaseLostError(
                         f"Compression lease for {session_id!r} lost before commit; refusing to publish a stale compaction")
-            if held_messages is not None:
-                self._raise_if_unheld_summary(conn, session_id, held_messages)
-            if held_for_cas:
-                mismatches = getattr(self, "held_row_mismatches", None)
-                if callable(mismatches) and mismatches(conn, session_id, held_for_cas):
-                    from hermes_state_errors import HeldRowRewrittenError
-                    raise HeldRowRewrittenError(
-                        f"a held row of session {session_id} was rewritten in place before the commit")
+            if prepared is not None:
+                prepared.validate(conn)
+            if prepared is None:
+                proved = prepare_compaction(self, conn, session_id, covered_ids, unresolved_held,
+                    watermark, held_messages, held_for_cas)
+            else:
+                if prepared.error is not None:
+                    raise prepared.error
+                proved = prepared.coverage
             patch = model_config_patch is not None
             patched_model_config = self._merge_model_config_json(
                 conn, session_id, model_config_patch, on_missing="raise") if patch else None
-            proved = self._proved_coverage(conn, session_id, covered_ids, unresolved_held, watermark)
+        affected_fold = self._begin_display_fold(conn, fold_plan)
         if proved is not None:
             return archive_named_rows(
                 self, conn, session_id, compacted_messages, proved[0], tail_count=tail_count,
@@ -812,23 +812,24 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         compacted set by a pure-SQL clone (fresh ids); ``None`` archives everything. *covered_ids*: the
         rows the compressor actually held. When proved, only those are summarized; every other active
         row is cloned after the new set, so a gap below the newest held id is not archived unseen.
-        ``None`` keeps the watermark path. *unresolved_held*: held dicts with no row id, matched inside
-        the transaction. *lock_holder*: verified
+        ``None`` keeps the watermark path. *unresolved_held*: held dicts with no row id, matched in a read-only
+        snapshot before the writer transaction. *lock_holder*: verified
         in-txn so a reclaimed lease fails instead of clobbering the winner. *tail_count*: the LAST N compacted
         rows are the verbatim carried tail; *carried_messages* names exact durable originals carried forward
         verbatim when they are not a contiguous suffix (micro-compaction's prefix + marker + suffix shape).
-        They are resolved inside this transaction by row id when present, else by unique durable identity +
+        They are resolved by row id when present, else by unique durable identity +
         timestamp. Those originals and the clones' originals are superseded duplicates and get rewind flags
         (``active=0, compacted=0``) so search doesn't return each carried message once per compaction.
         ``held_for_cas``: the caller's held message dicts for the lease-less staleness gate — re-verified
-        against the live rows INSIDE this transaction (see :meth:`held_row_mismatches`), so a rewrite that
+        against a read-only snapshot (see :meth:`held_row_mismatches`), fenced by a freshness check
+        INSIDE this transaction, so a rewrite that
         lands after the caller's precheck aborts the commit as :class:`HeldRowRewrittenError` before any
         row is archived (#124102). The lease path leaves it ``None``: its lease rules out an overlapping
         rewrite, and the turn's own writes are the ones a CAS here would misread.
         ``model_config_patch`` merges in the same txn (``None`` removes a key).
 
         *held_messages*: the history a LEASE-LESS caller (proactive prune, micro-compaction) rewrote. Checked
-        inside the transaction: an active summary row it does not hold means another compaction committed
+        in the fenced snapshot: an active summary row it does not hold means another compaction committed
         after it loaded that history, so publishing would put a stale generation beside the winner (the
         whole pre-compaction transcript re-inserted). Raises ``StaleHeldHistory`` and writes nothing.
 
@@ -843,15 +844,11 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         above the watermark or left unnamed) is not cloned: the carried copy is its one live row and the
         original takes rewind flags (#137197).
         """
-        # The display re-fold's history read happens here, before the writer lock (see _display_fold_plan).
-        fold_plan = self._display_fold_plan(session_id)
-        def _do(conn):
-            return self._archive_and_compact_on_conn(
-                conn, session_id, compacted_messages, model_config_patch=model_config_patch,
-                watermark=watermark, lock_holder=lock_holder, tail_count=tail_count,
-                carried_messages=carried_messages, covered_ids=covered_ids,
-                unresolved_held=unresolved_held, held_messages=held_messages, held_for_cas=held_for_cas, fold_plan=fold_plan)
-        inserted = execute_transcript_write(self, _do, compacted_messages, session_id=session_id)
+        from hermes_state_compaction_prepare import execute_prepared_compaction
+        inserted = execute_prepared_compaction(self, session_id, compacted_messages,
+            model_config_patch=model_config_patch, watermark=watermark, lock_holder=lock_holder,
+            tail_count=tail_count, carried_messages=carried_messages, covered_ids=covered_ids,
+            unresolved_held=unresolved_held, held_messages=held_messages, held_for_cas=held_for_cas)
         # The caller adopts the committed generation in memory: one dict per message_uid, as stored.
         compacted_messages[:] = _newest_message_uid_rows(compacted_messages)
         return inserted
