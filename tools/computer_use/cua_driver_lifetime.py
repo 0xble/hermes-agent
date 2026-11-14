@@ -520,6 +520,7 @@ def arm_owner(socket_path: str, exe: str) -> OwnerWatch:
         "close_fds": True,
     }
     if sys.platform != "win32":
+        # detached-spawn: ok — the watchdog must outlive its owner to reap the driver after the owner dies; it exits on pipe EOF
         kwargs["start_new_session"] = True
     try:
         process = subprocess.Popen(cmd, **kwargs)  # type: ignore[arg-type]
