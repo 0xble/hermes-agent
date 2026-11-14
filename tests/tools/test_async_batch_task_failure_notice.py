@@ -5,18 +5,94 @@ child died in a 401 storm at 08:29 and the parent learned of it at 09:36 from th
 block: 66 minutes of a dead wave with nothing running.
 """
 import queue
+import threading
 from unittest.mock import patch
+
+import pytest
 
 from tools import async_delegation as ad
 from tools.process_registry import process_registry
 from tools.process_registry_notifications import format_process_notification
-from tui_gateway.session_notifications import _notification_event_dedup_key
+
+
+def _drain_completion_queue():
+    while True:
+        try:
+            process_registry.completion_queue.get_nowait()
+        except queue.Empty:
+            return
+
+
+@pytest.fixture(autouse=True)
+def _home(tmp_path, monkeypatch):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(ad, "_db_path", lambda: tmp_path / "state.db")
+    _drain_completion_queue()
+    ad._reset_for_tests()
+    yield
+    ad._reset_for_tests()
+    _drain_completion_queue()
 
 
 def _record(status="running"):
     return {"delegation_id": "deleg_x", "status": status, "is_batch": True, "goals": ["a", "b", "c"], "goal": "a",
             "session_key": "sk", "origin_ui_session_id": "ui", "origin_session_id": "", "parent_session_id": "root",
             "dispatched_at": 1.0, "role": "leaf", "model": "m", "context": None, "toolsets": None}
+
+
+def _real_running_batch(goals):
+    gate = threading.Event()
+    def runner():
+        gate.wait(5)
+        return {"results": []}
+    handle = ad.dispatch_async_delegation_batch(
+        goals=goals, context=None, toolsets=None, role="leaf", model="m",
+        session_key="agent:main:telegram:dm:1", parent_session_id="root",
+        runner=runner, max_async_children=1,
+    )
+    assert handle["status"] == "dispatched"
+    delegation_id = handle["delegation_id"]
+    assert ad._records[delegation_id]["status"] == "running"
+    return delegation_id, gate
+
+
+
+
+@pytest.mark.parametrize("retry_attempt,root_age", [(0, 0), (6, 0), (0, 24 * 3600 + 1)])
+def test_real_dispatched_multi_child_terminal_notice_uses_persisted_retry_row(retry_attempt, root_age):
+    """A transient child in a real persisted multi-goal row is terminal, not silently auto-retried."""
+    from tools import delegation_resume as dr
+
+    delegation_id, gate = _real_running_batch(["a", "b"])
+    entry = {"task_index": 0, "status": "failed", "failure_reason": "rate_limit", "error": "429"}
+    assert ad.record_unit_child(delegation_id, entry) is None
+    with ad._DB_LOCK, ad._transaction() as conn:
+        conn.execute("UPDATE async_delegations SET retry_attempt=?, retry_root_started_at=? WHERE delegation_id=?",
+                     (retry_attempt, ad._records[delegation_id]["dispatched_at"] - root_age, delegation_id))
+    q = queue.Queue()
+    with patch("tools.process_registry.process_registry") as reg:
+        reg.completion_queue = q
+        ad.push_task_failure_notice(delegation_id, entry, n_tasks=2)
+        assert q.qsize() == 1
+        gate.set()
+        ad._records[delegation_id]["_future"].result(timeout=5)
+    persisted = dr.retry_status(delegation_id)
+    assert persisted["retry_state"] == dr.RETRY_TERMINAL
+
+
+def test_real_dispatched_scalar_transient_notice_is_suppressed_only_when_classifier_retries():
+    delegation_id, gate = _real_running_batch(["a"])
+    entry = {"task_index": 0, "status": "failed", "failure_reason": "rate_limit", "error": "429"}
+    ad.record_unit_child(delegation_id, entry)
+    q = queue.Queue()
+    with patch("tools.process_registry.process_registry") as reg:
+        reg.completion_queue = q
+        ad.push_task_failure_notice(delegation_id, entry, n_tasks=1)
+        assert q.empty()
+        gate.set()
+        ad._records[delegation_id]["_future"].result(timeout=5)
+    from tools import delegation_resume as dr
+    assert dr.retry_status(delegation_id)["retry_state"] == dr.RETRY_SCHEDULED
 
 
 def test_failure_notice_reaches_the_queue_while_the_batch_keeps_running_and_formats_as_early_warning():

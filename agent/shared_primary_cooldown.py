@@ -379,7 +379,7 @@ def earliest_available(routes: list[tuple[str, str, str]], *, now: float | None 
 
 
 def earliest_route_delay(agent: Any, *, now: float | None = None) -> float | None:
-    """Return seconds until the earliest configured route is available, or None if unknown."""
+    """Return seconds until the earliest configured route with an active record, or None if unknown."""
     from contextlib import suppress
     with suppress(Exception):
         routes = [route_from_agent(agent)] + [

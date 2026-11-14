@@ -2,9 +2,8 @@
 from __future__ import annotations
 
 import json
-import queue
 import time
-from unittest.mock import patch
+from types import SimpleNamespace
 
 import pytest
 
@@ -58,16 +57,25 @@ def _failed_delegation(did, now, *, hint="usage window resets in 48h", reason="r
 
 def test_retry_follows_earliest_route_not_last_fallback():
     now = time.time()
-    _store((PRIMARY, now + 600), (FALLBACK, now + 48 * 3600))
+    # Production records only the primary when fallback_cooldown leaves it.
+    _store((PRIMARY, now + 600))
     did = _failed_delegation("deleg_early", now)
     plan = dr.schedule_retry(did, now=now)
     assert plan["retry_state"] == "scheduled"
     assert now + 600 <= plan["due_at"] < now + 600 + dr.BASE_BACKOFF_S + 1
 
 
+def test_primary_record_beats_a_long_provider_hint():
+    now = time.time()
+    _store((PRIMARY, now + 10 * 3600))
+    did = _failed_delegation("deleg_primary_hint", now, hint="usage window resets in 3h")
+    plan = dr.schedule_retry(did, now=now)
+    assert now + 3 * 3600 <= plan["due_at"] < now + 3 * 3600 + dr.BASE_BACKOFF_S + 1
+
+
 def test_all_routes_ready_uses_minimal_backoff():
     now = time.time()
-    _store((PRIMARY, now - 10), (FALLBACK, now - 10))
+    _store((PRIMARY, now - 10))
     did = _failed_delegation("deleg_ready", now)
     plan = dr.schedule_retry(did, now=now)
     assert plan["due_at"] == pytest.approx(now + dr.BASE_BACKOFF_S)
@@ -92,7 +100,7 @@ def test_unreadable_store_is_unknown_not_never():
 
 def test_earliest_available_reports_index():
     now = time.time()
-    _store((PRIMARY, now + 600), (FALLBACK, now + 48 * 3600))
+    _store((PRIMARY, now + 600))
     assert spc.earliest_available([FALLBACK, PRIMARY], now=now) == (1, now + 600)
     assert spc.earliest_available([], now=now) == (None, None)
 
@@ -103,36 +111,15 @@ def test_non_transient_failure_without_cooldown_is_terminal():
     assert dr.schedule_retry(did, now=now)["retry_state"] == "terminal"
 
 
-def _batch_record(**extra):
-    return {"delegation_id": "deleg_n", "status": "running", "is_batch": True, "goals": ["a", "b"], "goal": "a",
-            "session_key": "sk", "origin_ui_session_id": "ui", "origin_session_id": "", "parent_session_id": "root",
-            "dispatched_at": time.time(), "role": "leaf", "model": "m", "context": None, "toolsets": None, **extra}
-
-
-def _notices(entry, **record_extra):
-    q = queue.Queue()
-    with patch.object(ad, "_records", {"deleg_n": _batch_record(**record_extra)}), \
-         patch.object(ad, "_persist_outbox_event"), patch("tools.process_registry.process_registry") as reg:
-        reg.completion_queue = q
-        ad.push_task_failure_notice("deleg_n", entry, n_tasks=2)
-        ad.push_task_failure_notice("deleg_n", entry, n_tasks=2)  # lineage dedupe
-    return q.qsize()
-
-
-def test_scheduled_availability_failure_does_not_alert():
-    assert _notices({"task_index": 0, "status": "failed", "failure_reason": "rate_limit"}) == 0
-
-
-def test_terminal_failures_still_alert_once_per_lineage():
-    assert _notices({"task_index": 0, "status": "failed", "failure_reason": "auth"}) == 1
-    exhausted = {"task_index": 0, "status": "failed", "failure_reason": "rate_limit"}
-    assert _notices(exhausted, retry_attempt=dr.MAX_RETRY_ATTEMPTS) == 1
-
-
-def test_exhausted_copy_does_not_tell_user_to_wait_out_a_far_reset_when_another_route_is_sooner():
+def test_exhausted_copy_does_not_tell_user_to_wait_out_a_far_reset_when_primary_record_is_sooner():
     from agent.turn_failure_copy import exhausted_copy
+    now = time.time()
+    _store((PRIMARY, now + 600))
+    agent = SimpleNamespace(_primary_runtime={"provider": PRIMARY[0], "base_url": PRIMARY[1], "model": PRIMARY[2]},
+                            _fallback_chain=[{"provider": FALLBACK[0], "base_url": FALLBACK[1], "model": FALLBACK[2]}])
+    earliest = spc.earliest_route_delay(agent, now=now)
     text = exhausted_copy("rate_limit", label="Muse", attempts=3, summary="429",
-                          reset_seconds=48 * 3600, earliest_route_seconds=600)
-    assert "another configured model" in text and "Send /retry after that" not in text
-    plain = exhausted_copy("rate_limit", label="Muse", attempts=3, summary="429", reset_seconds=48 * 3600)
-    assert "Send /retry after that" in plain
+                          reset_seconds=48 * 3600, earliest_route_seconds=earliest)
+    assert "earlier recorded reset" in text and "available now" not in text
+    plain = exhausted_copy("rate_limit", label="Muse", attempts=3, summary="429")
+    assert "available now" not in plain

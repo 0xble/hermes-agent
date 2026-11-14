@@ -855,7 +855,7 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
                 if available_at is not None:
                     candidates.append(max(0.0, available_at - now))
                 if reset_delay := _reset_delay(_texts(record), now):
-                    candidates.append(reset_delay + 30.0)
+                    candidates.append(reset_delay)
                 due = now + max(_backoff(record["retry_attempt"]), min(candidates, default=0.0))
         conn.execute(
             """UPDATE async_delegations SET retry_state=?, retry_reason=?, retry_due_at=?, updated_at=?

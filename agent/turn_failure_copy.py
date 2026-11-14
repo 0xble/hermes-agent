@@ -456,8 +456,8 @@ def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, rese
             and earliest_route_seconds < reset_seconds - 60):
         # Another configured route recovers sooner than the failing one: do not tell the user to wait out the long reset.
         from agent.retry_utils import format_reset_window
-        situation = (f"another configured model is expected back in {format_reset_window(earliest_route_seconds)}"
-                     if earliest_route_seconds >= 120 else "another configured model should be available now")
+        situation = (f"another configured model has an earlier recorded reset (in "
+                     f"{format_reset_window(max(0.0, earliest_route_seconds))})")
         situation += f" (this one's limit resets in {format_reset_window(reset_seconds)}). Send /retry then, or switch models with /model."
     elif reset_seconds is not None and (reset_seconds >= 120 or first_attempt and reset_seconds > 0):
         from agent.retry_utils import format_reset_window
