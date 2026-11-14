@@ -804,6 +804,16 @@ cached identity. Shared foreign sessions, unverifiable processes and genuinely
 unowned groups remain blocked. Previously verified identities continue to cover
 leaderless groups without trusting a bare PID or PGID.
 
+On macOS a gateway start bootstraps a transient launchd plist, and launchd, not
+the test, then runs the gateway under an osascript wrapper with ppid 1. The
+bootstrap argv names only the plist, so the guard reads the plist's
+`ProgramArguments`. It applies the same gateway-spawn check to the wrapped shell
+command and refuses the bootstrap unless the test is marked
+`spawns_gateway_lookalike`. Without this, a cron unit test that reached
+`run_canonical_job` leaked a real detached gateway that kept its pytest
+`HERMES_HOME` for hours. Retire this when upstream starts gateways without a
+launchd job or its own guard inspects launchd payloads.
+
 Run the live-system guard canary, process registry and PTY suites, plus the real
 handoff publication fixture. The canary creates an inert orphan before the first
 signal and covers stale identities, vanished leaders and changing membership.
