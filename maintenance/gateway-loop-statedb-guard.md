@@ -123,6 +123,12 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   full-table replace. On 2026-11-14 the full replace of a 37,670-route index held the writer
   lock 9-113 s per save and stalled every session's writes. Proof:
   `tests/gateway/test_routing_save_delta.py`.
+- Sites the live guard named on 2026-11-14 run their state.db step off the loop: the process
+  watcher's survivor acknowledgement (it loads retained results, whose `_owns_result` opens
+  state.db), the WebSocket handler's first backend heartbeat write, and the cron RPC's route
+  restore (`restore_local_session_async`) and admission reads. Still on the loop and named by
+  the guard: `session_detached.name` (`lookup_by_session_key`), `session_viewer_close._physical_target`
+  (`local_receipt`) and `/discard` (`peek_session_id`).
 - The check-in poll (`gateway/run_checkins.py::poll_checkins`, every 5 s) groups every routed
   session on the loop. `_standalone_runtime_home` memoizes the resolved parent per DB path, and
   the scan yields to the loop every `_SCAN_YIELD_EVERY` (512) entries. On 2026-11-14 the live
