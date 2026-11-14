@@ -28,8 +28,11 @@ private history and starts a normal session.
 Incognito starts off in every topic. Prior saved history remains readable, including
 session search and Hindsight recall. Hermes does not save new private conversation
 content, automatic memory writes, explicit memory writes, hook payloads, or durable
-restart/outbox payloads. Plugin tools are denied unless their manifest or tool
-registration declares them incognito-safe. Incognito does not change the visible
+restart/outbox payloads. A plugin tool runs in a private turn only when its
+manifest explicitly declares `incognito_safe: true`; an omitted declaration is
+refused. A declared-safe tool's `plugin_data_dir` and `PluginState` writes land
+in the private interval and are deleted with it. Direct `HERMES_HOME` writes by
+that plugin remain the plugin author's responsibility. Incognito does not change the visible
 tool schema or the frozen system prompt. It is not anonymity: the messaging platform,
 model provider and any deliberately contacted external service still receive content.
 
@@ -41,10 +44,13 @@ Hindsight reads require a server with no-store read support. Hermes checks that
 capability before sending a private query and requires an explicit no-store
 acknowledgment. An unsupported server makes the read unavailable, not public.
 
-Telegram attachments that require a disk cache are refused before download while
-incognito is on. Text and captions still work. In observe-enabled groups, incognito
-is refused if commands and ordinary conversation route to different sessions. Use
-a DM or a shared topic in that case.
+Telegram attachments are admitted into the interval's private directory while
+incognito is on, then the directory is deleted at `/incognito off` or `/new`. Text,
+caption, voice and other supported media therefore work without leaving private files
+behind. The default private-directory parent is outside `HERMES_HOME`, under the account
+cache root (`~/Library/Caches/Hermes/incognito/` on macOS) in a folder specific to this
+Hermes home. Set `incognito.private_dir` to override it, with a different path for each
+Hermes home.
 
 Optionally choose a private model using the same model-route syntax as `/model`:
 

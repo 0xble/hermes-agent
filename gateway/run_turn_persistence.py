@@ -837,6 +837,9 @@ class GatewayTurnPersistenceMixin:
                 from gateway.copy_blocks import strip_copy_blocks
                 media_delivered = bool(await self._deliver_media_from_response(
                     strip_copy_blocks(response), event, adapter))
+            from gateway.run_turn_incognito_notice import apply_streamed_incognito_restart_notice
+            response = await apply_streamed_incognito_restart_notice(
+                self, session_entry, response, adapter, source, event)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter and not _intentional_silence:
                 try:
@@ -877,7 +880,12 @@ class GatewayTurnPersistenceMixin:
             # extraction, instead of promoting a possibly partial block to its own message.
             with suppress(Exception):
                 event._copy_blocks_inline_only = True
-        return response
+        return self._prepend_incognito_restart_notice(session_entry, response)
+
+    def _prepend_incognito_restart_notice(self, session_entry, response):
+        """One visible line after a restart dropped the private RAM tail."""
+        from gateway.run_turn_incognito_notice import prepend_incognito_restart_notice
+        return prepend_incognito_restart_notice(getattr(self, "session_store", None), session_entry, response)
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
     # sign-in, `{relogin}` the profile-aware host equivalent, filled from the turn's agent provider).

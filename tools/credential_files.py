@@ -301,6 +301,13 @@ def _cache_dir_roots(container_base: str, *, create_missing: bool) -> Iterator[t
 
 def get_cache_directory_mounts(container_base: str = "/root/.hermes") -> list[dict[str, str]]:
     """Bind-mount entries for each cache directory (host layout via ``get_hermes_dir``)."""
+    # A persistent Docker container snapshots bind mounts at creation. Private interval
+    # directories are deleted at /incognito off, so mounting one would leave a dangling
+    # public container state after the boundary. Private Docker turns use the container's
+    # own cache instead of borrowing a mount that cannot outlive the interval.
+    from agent.incognito import is_incognito
+    if is_incognito() and _terminal_backend() == "docker":
+        return []
     return [_mount(h, c) for h, c in _cache_dir_roots(container_base, create_missing=True)]
 
 

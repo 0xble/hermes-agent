@@ -345,6 +345,11 @@ def _build_child_agent(
             effective_requested_provider=rt.get("requested_provider"),
         )
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    if private:
+        with _quiet("Failed to bind child to parent private interval: %s"):
+            from agent.incognito_private_dir import bind_private_session, private_dir_for_session
+            parent_private_dir = private_dir_for_session(parent_sid)
+            bind_private_session(getattr(child, "session_id", None), parent_private_dir)
     # An inherited explicit pick stays explicit, so an orchestrator's own children keep it too.
     if profile_home is None and explicit_parent_reasoning(parent_agent) is not None:
         rc = child.reasoning_config
@@ -966,12 +971,16 @@ def adopt_session_delegation_mode(agent: Any) -> None:
 from tools.registry import registry, tool_error
 
 def _model_background_value(args: dict, parent_agent=None) -> bool:
-    """Background flag for the MODEL-facing dispatch path (registry fallback). Top-level delegations always run in the
-    background — the model does not choose — for single tasks and fan-out batches alike (one async unit, one
-    consolidated result); an orchestrator subagent (depth > 0) is the exception since it needs its workers' results
-    within its own turn. The live path is ``run_agent._dispatch_delegate_task``; this mirrors it for the rare case
-    the intercept is bypassed. Direct Python callers keep the synchronous default."""
-    return not getattr(parent_agent, "_delegate_depth", 0) > 0
+    """Shared model routing: public top-level calls detach; private helpers and orchestrator
+    children join in-turn. Model-supplied background flags never override that policy.
+
+    Resolve privacy from both the parent and session registry: dispatch may arrive without
+    the turn's ContextVars. Direct callers retain their explicit background/refusal contract.
+    """
+    from agent.incognito import is_incognito
+    private = getattr(parent_agent, "incognito", False) is True or is_incognito(
+        getattr(parent_agent, "session_id", None))
+    return not private and not getattr(parent_agent, "_delegate_depth", 0) > 0
 
 _MODEL_HIDDEN_TASK_FIELDS = {"acp_command", "acp_args"}
 

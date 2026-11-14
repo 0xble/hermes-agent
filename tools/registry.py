@@ -1106,17 +1106,15 @@ class ToolRegistry:
             from agent.incognito import is_incognito
             if is_incognito(kwargs.get("session_id")):
                 return tool_error("This plugin tool is unavailable in incognito mode.")
+        from agent.incognito import incognito_scope, is_incognito
         try:
-            # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
-            # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
-            # plugin handler is not broken by every field the dispatcher injects (#68318).
-            kwargs = _kwargs_accepted_by(entry.handler, kwargs)
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
+            private_session = kwargs.get("session_id")
+            with incognito_scope(enabled=is_incognito(private_session), session_id=private_session):
+                # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
+                # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
+                # plugin handler is not broken by every field the dispatcher injects (#68318).
+                result = _invoke_tool_handler(entry.handler, args, kwargs, is_async=entry.is_async)
+                return self._normalize_handler_result(name, result)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
             logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
@@ -1237,6 +1235,42 @@ def tool_error(message, **extra) -> str:
 def tool_result(data=None, **kwargs) -> str:
     """JSON-encode a dict positional arg *or* keyword arguments (not both)."""
     return json.dumps(data if data is not None else kwargs, ensure_ascii=False)
+
+
+def _context_signature_target(handler: Callable) -> Callable:
+    """Callable whose declared parameters should receive injected context.
+
+    ``unittest.mock.Mock`` accepts ``**kwargs`` and forwards them to ``side_effect``.
+    Inspect that inner callable so a narrow ``handle(args)`` plugin handler is not
+    broken by context the dispatcher injects. Private scope is the caller's
+    ``incognito_scope``, not these keywords.
+    """
+    side_effect = getattr(handler, "side_effect", None)
+    if callable(side_effect) and not isinstance(side_effect, type):
+        return side_effect
+    wrapped = getattr(handler, "_mock_wraps", None)
+    if callable(wrapped):
+        return wrapped
+    return handler
+
+
+def _invoke_tool_handler(handler: Callable, args: dict, kwargs: dict, *, is_async: bool):
+    """Call *handler* once, with only context kwargs its signature binds.
+
+    A wrapper can reject a keyword its visible signature claimed to accept. Choose
+    the accepted set before entering the handler; never retry after it has run.
+    """
+    target = _context_signature_target(handler)
+    accepted = _kwargs_accepted_by(target, kwargs)
+    try:
+        inspect.signature(target).bind(args, **accepted)
+    except (TypeError, ValueError):
+        accepted = {}
+
+    if is_async:
+        from model_tools import _run_async
+        return _run_async(handler(args, **accepted))
+    return handler(args, **accepted)
 
 
 def _kwargs_accepted_by(handler: Callable, kwargs: dict) -> dict:

@@ -12,8 +12,10 @@ A test module declares ``KNOWN`` (scenario -> (pattern, "#<issue> <symptom>")) a
 
 from __future__ import annotations
 
+import contextlib
 import importlib.metadata
 import os
+import signal
 import sys
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
@@ -68,11 +70,23 @@ def run_scenario(name: str, request: pytest.FixtureRequest, tmp_path: Path,
     finally:
         rig.known = None
 
-
 class _RestartableRig(C.Rig):
+    private_parent: Path | None = None
+
     def restart(self) -> None:
         self.gw.stop()
         self.gw.start()
+
+    def kill_and_start(self) -> None:
+        """SIGKILL the live gateway's process group (no exit path runs), then start it again on
+        the same home and sidecars. Only the live life: an earlier pid may have been reused."""
+        proc = self.gw.proc
+        if proc is not None and proc.poll() is None:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.killpg(proc.pid, signal.SIGKILL)
+            proc.wait(timeout=15)
+        self.gw.start()
+
 
 
 def _short_root(factory: pytest.TempPathFactory, name: str) -> Path:
@@ -99,9 +113,12 @@ def rig_fixtures(driver_cls: type) -> tuple[Any, Any]:
         llm = FakeLLMServer(director)
         llm.start()
         cfg = C.merge(drv.gateway_config(), extra_cfg)
+        cfg = C.merge(cfg, {"incognito": {"private_dir": str(factory.mktemp(f"{drv.name[:2]}{label}-private"))}})
         gw = GatewayUnderTest(_short_root(factory, f"{drv.name[:2]}{label}"), llm_base_url=llm.base_url,
                               config=cfg, env={**drv.gateway_env(), **extra_env}, ready=drv.connected)
+        private_parent = Path(cfg["incognito"]["private_dir"])
         rig = _RestartableRig(gw=gw, drv=drv, director=director, llm=llm)
+        rig.private_parent = private_parent
         try:
             gw.start()
         except BaseException:

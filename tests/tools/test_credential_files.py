@@ -397,6 +397,18 @@ class TestCacheDirectoryMounts:
         assert "/root/.hermes/cache/audio" in paths
         assert "/root/.hermes/cache/videos" in paths
 
+    def test_private_docker_turn_does_not_mount_ephemeral_cache_dirs(self, tmp_path, monkeypatch):
+        """A persistent Docker container must not retain mounts deleted at /incognito off."""
+        from agent.incognito import incognito_scope
+
+        home = tmp_path / ".hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setattr("tools.credential_files._terminal_backend", lambda: "docker")
+        with incognito_scope(True, session_id="private-docker"):
+            assert get_cache_directory_mounts() == []
+        assert not (home / "cache").exists()
+
 
     def test_legacy_dir_names_resolved(self, tmp_path, monkeypatch):
         """Old-style dir names (e.g. document_cache) are resolved correctly.

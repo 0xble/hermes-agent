@@ -358,6 +358,11 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    # Incognito intervals live outside HERMES_HOME. Use a sibling sandbox even when a
+    # test selects tmp_path itself as its home and snapshots every file beneath it.
+    from agent import incognito_private_dir as _incognito_private_dir
+    private_root = tmp_path_factory.mktemp("incognito-private")
+    monkeypatch.setattr(_incognito_private_dir, "_configured_root", lambda: private_root)
     # Synthetic authority ids such as "owned" are relative profile homes in scope
     # readers. Keep their real initialization (including SOUL.md) inside this test,
     # rather than materializing those profiles in the checkout shared by workers.

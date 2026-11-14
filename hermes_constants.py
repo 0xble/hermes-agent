@@ -506,6 +506,14 @@ def get_hermes_dir(new_subpath: str, old_name: str, *, home: Path | None = None)
     regression where a dormant empty ``pairing/`` orphaned approved-user data in ``platforms/pairing/``.
     """
     home = home or get_hermes_home()
+    if new_subpath.startswith("cache/"):
+        from agent.incognito import is_incognito
+        from agent.incognito_private_dir import disposable_path_for_current_session
+        private_root = disposable_path_for_current_session()
+        if private_root is not None:
+            return private_root / new_subpath
+        if is_incognito():
+            raise RuntimeError("No private interval is bound to the current incognito session")
     old_path = home / old_name
     return old_path if _legacy_path_has_content(old_path) else home / new_subpath
 
@@ -975,9 +983,14 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     a managed/shared home is honored instead of a blanket ``0700`` (#117347).
     """
     base = Path(home) if home is not None else get_hermes_home()
-    scratch = base / "cache" / "scratch"
+    from agent.incognito_private_dir import disposable_path_for_current_session
+    private_root = disposable_path_for_current_session() if home is None else None
+    if private_root is not None:
+        scratch = private_root / "cache" / "scratch"
+    else:
+        scratch = base / "cache" / "scratch"
     from agent.incognito import is_incognito
-    if is_incognito():
+    if private_root is None and is_incognito():
         return scratch
     try:
         scratch.mkdir(parents=True, exist_ok=True)
@@ -1050,16 +1063,26 @@ def apply_scratch_tmp_env(env: MutableMapping[str, str]) -> bool:
         for key in SCRATCH_TMP_ENV_VARS
     )
     home = env.get("HERMES_HOME", "").strip()
-    try:
-        scratch = str(get_scratch_dir(_expand_hermes_home(home) if home else get_process_hermes_home()))
-    except (RuntimeError, OSError):
-        # No HERMES_HOME and no resolvable user home (a child env built from nothing on
-        # Windows): there is no scratch dir to point at; the child keeps the OS default.
-        return False
-    if user_temp:
-        # An OS/user-selected TMPDIR must remain authoritative, but it must not disable
-        # maintenance of Hermes' own scratch tree on macOS where TMPDIR is exported by launchd.
-        return False
+    from agent.incognito_private_dir import private_path_for_current_session
+    private_root = private_path_for_current_session()
+    if private_root is not None:
+        scratch_path = private_root / "cache" / "scratch"
+        try:
+            scratch_path.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        scratch = str(scratch_path)
+    else:
+        try:
+            scratch = str(get_scratch_dir(_expand_hermes_home(home) if home else get_process_hermes_home()))
+        except (RuntimeError, OSError):
+            # No HERMES_HOME and no resolvable user home (a child env built from nothing on
+            # Windows): there is no scratch dir to point at; the child keeps the OS default.
+            return False
+        if user_temp:
+            # An OS/user-selected TMPDIR must remain authoritative, but it must not disable
+            # maintenance of Hermes' own scratch tree on macOS where TMPDIR is exported by launchd.
+            return False
     for key in SCRATCH_TMP_ENV_VARS:
         env[key] = scratch
     env[SCRATCH_DIR_MARKER_ENV] = scratch

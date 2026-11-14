@@ -81,24 +81,30 @@ def _truncate_stdout_text(stdout_text: str) -> tuple[str, dict[str, Any]]:
 
 
 def _spill_full_stdout(stdout_text: str) -> Optional[str]:
-    """Write full stdout to cache/exec; return its path (None on failure — best-effort,
-    the truncated inline output is still returned). Keyed by content digest so identical
-    reruns coalesce; the dir rides the cache/web remote bind-mount list (credential_files)."""
-    from agent.incognito import is_incognito
-    if is_incognito():
-        return None
+    """Write full stdout to the active session's disposable directory.
+
+    Private execution must not silently disable recovery of truncated output: the spill is
+    disposable, just like the kernel, and is removed with the interval. Public execution
+    retains the established cache/exec location.
+    """
     try:
         import hashlib
         from hermes_constants import get_hermes_dir
         from tools.spill_safety import write_text_exclusive
+        from agent.incognito_private_dir import private_subdir_for_current_session
+        private_dir = private_subdir_for_current_session("exec")
+        if private_dir is None:
+            from agent.incognito import is_incognito
+            if is_incognito():
+                return None
         if len(stdout_text) > MAX_SPILLED_STDOUT_BYTES:
             stdout_text = (stdout_text[:MAX_SPILLED_STDOUT_BYTES]
                            + f"\n\n[... spill capped at {MAX_SPILLED_STDOUT_BYTES:,} bytes ...]")
-        cache_dir = get_hermes_dir("cache/exec", "exec_spill")
+        cache_dir = private_dir if private_dir is not None else get_hermes_dir("cache/exec", "exec_spill")
         cache_dir.mkdir(parents=True, exist_ok=True)
         digest = hashlib.sha256(stdout_text.encode("utf-8", errors="replace")).hexdigest()[:12]
         path = cache_dir / f"stdout-{digest}.txt"
-        write_text_exclusive(path, stdout_text, private=False, overwrite=True)
+        write_text_exclusive(path, stdout_text, private=private_dir is not None, overwrite=True)
         return str(path)
     except Exception as exc:
         logger.debug("Failed to spill execute_code stdout: %s", exc)
@@ -740,9 +746,8 @@ def execute_code(
     the security envelope (env scrubbing, tool whitelist + call budget, output redaction), not an
     isolation jail: default `project` mode runs in the session's cwd with the project venv.
     ``enabled_tools`` ∩ SANDBOX_ALLOWED_TOOLS; ``reset`` kills the existing kernel first."""
-    from agent.incognito import is_incognito
-    if is_incognito():
-        return tool_error("File-backed Python kernels are unavailable in incognito mode. Use foreground terminal instead.")
+    # Private sessions use the same persistent kernel; its staging, RPC and spill paths
+    # are resolved from the bound session identity in code_kernel._spawn_locked.
     if not SANDBOX_AVAILABLE:
         return tool_error("execute_code sandbox is unavailable in this environment. "
                           "Use normal tool calls (terminal, read_file, write_file, ...) instead.")
@@ -797,6 +802,10 @@ def execute_code(
     from tools.terminal_tool import _get_env_config, _docker_has_host_access
     _env_config = _get_env_config()
     env_type = _env_config["env_type"]
+    if env_type != "local":
+        from agent.incognito import is_incognito
+        if is_incognito():
+            return tool_error("execute_code is unavailable in incognito mode on remote execution backends.")
     # Arbitrary Python never passes through terminal()/DANGEROUS_PATTERNS, so guard the whole
     # script before either dispatch path spawns it — in this (tool-executor) thread, which holds
     # the session context. A Docker sandbox with host bind mounts gets no container fast-path.

@@ -1084,8 +1084,8 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
     agent.session_id = session_id or new_session_id(agent.session_start)
     _publish_session_id(agent.session_id)
     if agent.incognito:
-        from agent.incognito import register_session
-        register_session(agent.session_id)
+        from agent.incognito import register_foreground_session
+        register_foreground_session(agent.session_id)
 
     # ~/.hermes/sessions/ — kept unconditionally for request_dump_*.json debug breadcrumbs.
     agent.logs_dir = get_hermes_home() / "sessions"

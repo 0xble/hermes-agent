@@ -199,11 +199,13 @@ def _error_json(message: str) -> str:
 
 def _run_edge_tts(text: str, file_str: str, tts_config: dict[str, Any]) -> None:
     """Run the async Edge generator from sync code (worker thread; direct run if that fails)."""
+    from tools.thread_context import propagate_context_to_thread
     run = lambda: asyncio.run(_generate_edge_tts(text, file_str, tts_config))
+    run_in_context = propagate_context_to_thread(run)
     try:
         from concurrent.futures import ThreadPoolExecutor
         with ThreadPoolExecutor(max_workers=1) as pool:
-            pool.submit(run).result(timeout=60)
+            pool.submit(run_in_context).result(timeout=60)
     except RuntimeError:
         run()
 
