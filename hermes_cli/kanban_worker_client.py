@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from typing import Optional
@@ -181,10 +182,16 @@ def _submit():
         # before contacting the owner, so TTL recovery sees its live handle during admission.
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli.kanban_db_dispatch import adopt_worker_pid
-        with connect_closing(Path(board_db)) as conn:
-            if not adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid()):
-                print('Kanban owner refused: stale dispatcher claim', file=sys.stderr)
-                return 1
+        # Lock contention deliberately counts against the card.
+        try:
+            with connect_closing(Path(board_db).resolve(strict=True)) as conn:
+                if not adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid()):
+                    print('Kanban owner refused: stale dispatcher claim', file=sys.stderr)
+                    return 1
+        except sqlite3.Error as exc:
+            print(f'Kanban owner refused: {exc}', file=sys.stderr)
+            return 1
+
         # Owner startup must never inherit this worker's task/tool/goal identity.
         for key in list(os.environ):
             # The busy timeout is a host tuning knob, not task identity: the answer budget reads it.
