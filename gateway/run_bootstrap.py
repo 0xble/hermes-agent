@@ -798,6 +798,11 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     os.environ["HERMES_EXEC_ASK"] = "1"
     from hermes_cli.update_proxy_env import restore_user_proxy_env
     restore_user_proxy_env()  # a gateway an update restarted keeps the user's proxy env, not the update's
+    try:
+        from tools.computer_use.cua_driver_lifetime import sweep_on_startup
+        sweep_on_startup()
+    except Exception:
+        pass
     _start_gateway_resolve_terminal_cwd()
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
