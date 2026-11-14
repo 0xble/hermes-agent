@@ -22,6 +22,19 @@ from gateway.platforms.base_log_safety import safe_url_for_log
 from gateway.platforms.event import MessageEvent
 
 
+@pytest.fixture(autouse=True)
+def _isolated_kanban_home(tmp_path, monkeypatch):
+    """Keep root-shared Kanban lookup inside this test's temporary tree."""
+    from gateway.platforms import base
+
+    hermes_home = tmp_path / "hermes-home"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_KANBAN_HOME", str(tmp_path / "kanban-home"))
+    monkeypatch.setattr(base, "_HERMES_HOME", hermes_home)
+    monkeypatch.setattr(base, "_HERMES_ROOT", hermes_home)
+    monkeypatch.setattr(base, "MEDIA_DELIVERY_SAFE_ROOTS", ())
+
+
 def test_media_delivery_denies_encrypted_bitwarden_cache(tmp_path, monkeypatch):
     """Encrypted Bitwarden cache is covered by the media credential guard."""
     from gateway.platforms import base
@@ -734,6 +747,8 @@ class TestMediaDeliveryDefaultMode:
         hermes_dir = fake_home / ".hermes"
         hermes_dir.mkdir(parents=True)
         monkeypatch.setenv("HOME", str(fake_home))
+        monkeypatch.setenv("HERMES_HOME", str(hermes_dir))
+        monkeypatch.setenv("HERMES_KANBAN_HOME", str(hermes_dir))
         monkeypatch.setattr("gateway.platforms.base._HERMES_HOME", hermes_dir)
         monkeypatch.setattr("gateway.platforms.base._HERMES_ROOT", hermes_dir)
         board = hermes_dir / "kanban" / "boards" / "team-a"
