@@ -136,7 +136,8 @@ def check(source_home: Path, scratch_home: Path) -> tuple[list[str], list[str]]:
             settled = snapshot(target)
             open_once()
             reopened = snapshot(target)
-        except Exception as exc:  # the probe failed, not the candidate
+        # health: allow BLE001 -- probe boundary: whatever stops the probe is reported in `skipped`, never raised
+        except Exception as exc:
             skipped.append(f"{relative}: {type(exc).__name__}: {exc}")
             continue
         if reopened != settled:
