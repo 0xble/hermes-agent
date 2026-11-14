@@ -378,17 +378,18 @@ def earliest_available(routes: list[tuple[str, str, str]], *, now: float | None 
     return index, known[index]
 
 
-def earliest_route_delay(agent: Any, *, now: float | None = None) -> float | None:
-    """Return seconds until the earliest configured route with an active record, or None if unknown."""
+def earliest_route_delay(agent: Any, *, failing_route: tuple[str, str, str], now: float | None = None) -> float | None:
+    """Return the earliest recorded delay only when it belongs to a different route than the failure."""
     from contextlib import suppress
     with suppress(Exception):
         routes = [route_from_agent(agent)] + [
             (str(entry.get("provider") or "").strip().lower(), str(entry.get("base_url") or ""), str(entry.get("model") or "").strip())
             for entry in (getattr(agent, "_fallback_chain", None) or []) if isinstance(entry, dict)
         ]
-        _, available_at = earliest_available(routes, now=now)
-        if available_at is not None:
-            return max(0.0, available_at - (time.time() if now is None else now))
+        index, available_at = earliest_available(routes, now=now)
+        if index is not None and available_at is not None:
+            if route_key(**_route_fields(routes[index])) != route_key(**_route_fields(failing_route)):
+                return max(0.0, available_at - (time.time() if now is None else now))
     return None
 
 

@@ -2,7 +2,7 @@
 
 - **Patch identity:** `delegation-earliest-route-retry`
 - **Contract tests:** `tests/tools/test_delegation_earliest_route.py`
-- **Behavior:** Durable delegation retries use the configured route chain, but the shared store records only primary-route outages. A recorded active primary reset is combined with the provider reset hint and normal backoff floor; missing, malformed, or unreadable route state remains unknown. The retry cap remains six attempts within 24 hours.
+- **Behavior:** Durable delegation retries use the configured route chain, but the shared store records only primary-route outages. Recorded resets and provider hints over 24 hours are ignored in favor of backoff. The earliest accepted reset includes a 30-second safety buffer and the normal backoff floor; no retry parks beyond its lineage deadline. Missing, malformed, or unreadable route state remains unknown. The retry cap remains six attempts within 24 hours. Each terminal child still emits its own failure notice; only persisted auto-retry outcomes suppress interim notices. Exhaustion copy names another model only when the earliest recorded reset belongs to a different route.
 - **Surfaces:** `agent/shared_primary_cooldown.py`, `tools/delegation_resume.py`, `tools/async_delegation.py`, `tools/delegate_tool_dispatch.py`, `agent/turn_failure_copy.py`, and `agent/turn_recovery.py`.
 - **Retirement:** Remove this patch and its focused tests when upstream provides equivalent earliest-route retry scheduling and lineage-scoped availability notice suppression.
 - **Rollback:** Revert the commit carrying `Fork-Patch: delegation-earliest-route-retry`.

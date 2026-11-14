@@ -1252,7 +1252,7 @@ def max_retries_exhausted_result(
         # text carries the plain what-happened + next step itself.
         from agent.shared_primary_cooldown import earliest_route_delay
         _reset_at = classified.error_context.get("reset_at")
-        _earliest_s = earliest_route_delay(agent)
+        _earliest_s = earliest_route_delay(agent, failing_route=(provider, base_url, model))
         _final_response = exhausted_copy(
             classified.reason.value, label=provider_label_for(provider), attempts=attempts,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,

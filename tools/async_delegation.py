@@ -48,8 +48,6 @@ _executor_max_workers: int = 0
 _records_lock = threading.RLock()
 # delegation_id -> record dict; kept for the run plus a short completed tail.
 _records: dict[str, dict[str, Any]] = {}
-# Interim task-failure dedupe is process-local because the schema has no notice-key column.
-_failure_notice_keys: set[tuple[str, str]] = set()
 # A closed session's token -> the (field, value) selectors a new dispatch is refused for (``refuse_for_session``),
 # and each selector -> the tokens refusing it, so a dispatch checks its own selectors, not every fence.
 _refused: dict[Any, frozenset] = {}
@@ -2391,7 +2389,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
                          "result lost: %s", record.get("delegation_id"), exc)
 
 
-def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -> tuple[bool, str]:
+def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -> bool:
     """Classify the persisted row, including the child just checkpointed, before suppressing a notice.
 
     The live registry record can be stale and does not carry retry lineage across a restart.  A
@@ -2410,9 +2408,9 @@ def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -
         persisted = retry_status(delegation_id)
     except Exception:
         logger.debug("Could not classify persisted retry state for %s", delegation_id, exc_info=True)
-        return False, delegation_id
+        return False
     if persisted is None or persisted.get("retry_state") not in {RETRY_ARMED, RETRY_SCHEDULED}:
-        return False, (persisted or {}).get("retry_root") or delegation_id
+        return False
     result = dict(persisted.get("result") or {})
     results = [item for item in result.get("results") or [] if isinstance(item, dict)]
     task_index = entry.get("task_index")
@@ -2421,31 +2419,21 @@ def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -
     result["results"] = results
     persisted["result"] = result
     verdict, _ = classify_outcome(persisted)
-    root = persisted.get("retry_root") or delegation_id
     started = float(persisted.get("retry_root_started_at") or persisted.get("dispatched_at") or time.time())
     within_budget = (int(persisted.get("retry_attempt") or 0) < MAX_RETRY_ATTEMPTS
                      and time.time() - started < MAX_LINEAGE_AGE_S)
-    return verdict == "retry" and within_budget, root
+    return verdict == "retry" and within_budget
 
 
 def push_task_failure_notice(delegation_id: str, entry: dict[str, Any], *, n_tasks: int) -> None:
-    """Surface one terminal child failure; suppress only a persisted row that will auto-retry.
-
-    Notice dedupe is in-memory because the async delegation schema has no lineage/reason key for
-    interim notices; the terminal retry state and attempt budget remain persisted and authoritative.
-    """
-    will_retry, root = _failure_notice_will_auto_retry(delegation_id, entry)
-    reason = str(entry.get("failure_reason") or entry.get("status") or "unknown")
-    notice_key = (str(root), reason)
+    """Surface each terminal child's failure; suppress only a persisted row that will auto-retry."""
+    will_retry = _failure_notice_will_auto_retry(delegation_id, entry)
     with _records_lock:
         record = _records.get(delegation_id)
         if record is None or record.get("status") not in _ACTIVE_STATES:
             return
-        if notice_key in _failure_notice_keys:
-            return
         if will_retry:
             return
-        _failure_notice_keys.add(notice_key)
         snapshot = dict(record)
     entry = redact_child_result(entry, force=False)
     try:
@@ -2932,7 +2920,6 @@ def _reset_for_tests() -> None:
         thread.join(timeout=2)
     with _records_lock:
         _records.clear()
-        _failure_notice_keys.clear()
         _PENDING_QUEUE.clear()
         _PENDING_ADMISSION_SLOTS.clear()
         _refused.clear()

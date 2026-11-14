@@ -447,7 +447,8 @@ def site_copy(code: str, **fields: Any) -> str:
 def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None,
                    earliest_route_seconds: Optional[float] = None) -> str:
     """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
-    limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401)."""
+    limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401).
+    ``earliest_route_seconds`` must belong to a different configured route than the failing one."""
     first_attempt = attempts == 1 and reason in _EXHAUSTED_FIRST_ATTEMPT_LEADS
     lead = (_EXHAUSTED_FIRST_ATTEMPT_LEADS if first_attempt else _EXHAUSTED_LEADS).get(
         reason, _EXHAUSTED_DEFAULT_LEAD).format(label=label, attempts=attempts)

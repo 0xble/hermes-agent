@@ -56,8 +56,6 @@ def _real_running_batch(goals):
     return delegation_id, gate
 
 
-
-
 @pytest.mark.parametrize("retry_attempt,root_age", [(0, 0), (6, 0), (0, 24 * 3600 + 1)])
 def test_real_dispatched_multi_child_terminal_notice_uses_persisted_retry_row(retry_attempt, root_age):
     """A transient child in a real persisted multi-goal row is terminal, not silently auto-retried."""
@@ -93,6 +91,32 @@ def test_real_dispatched_scalar_notice_uses_persisted_classifier_and_budget(retr
         reg.completion_queue = q
         ad.push_task_failure_notice(delegation_id, entry, n_tasks=1)
         assert q.qsize() == int(notice)
+        gate.set()
+        ad._records[delegation_id]["_future"].result(timeout=5)
+
+
+@pytest.mark.parametrize("reason", ["auth", "rate_limit"])
+def test_each_terminal_child_with_the_same_failure_reason_gets_a_durable_notice(reason):
+    delegation_id, gate = _real_running_batch(["a", "b"])
+    q = queue.Queue()
+    try:
+        with patch("tools.process_registry.process_registry") as reg:
+            reg.completion_queue = q
+            for index in range(2):
+                entry = {"task_index": index, "status": "failed", "failure_reason": reason, "error": reason}
+                ad.record_unit_child(delegation_id, entry)
+                ad.push_task_failure_notice(delegation_id, entry, n_tasks=2)
+            assert q.qsize() == 2
+            notices = [q.get_nowait(), q.get_nowait()]
+            assert {notice["results"][0]["task_index"] for notice in notices} == {0, 1}
+            assert {notice["_delivery_event_id"] for notice in notices} == {
+                f"{delegation_id}:task-failure:0", f"{delegation_id}:task-failure:1"}
+            with ad._DB_LOCK, ad._transaction() as conn:
+                assert conn.execute(
+                    "SELECT COUNT(*) FROM async_delegation_events WHERE delegation_id=? AND event_kind='task_failure'",
+                    (delegation_id,),
+                ).fetchone() == (2,)
+    finally:
         gate.set()
         ad._records[delegation_id]["_future"].result(timeout=5)
 
