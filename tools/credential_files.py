@@ -305,12 +305,9 @@ def get_cache_directory_mounts(container_base: str = "/root/.hermes") -> list[di
     # directories are deleted at /incognito off, so mounting one would leave a dangling
     # public container state after the boundary. Private Docker turns use the container's
     # own cache instead of borrowing a mount that cannot outlive the interval.
-    try:
-        from agent.incognito import is_incognito
-        if is_incognito() and _terminal_backend() == "docker":
-            return []
-    except Exception:
-        pass
+    from agent.incognito import is_incognito
+    if is_incognito() and _terminal_backend() == "docker":
+        return []
     return [_mount(h, c) for h, c in _cache_dir_roots(container_base, create_missing=True)]
 
 

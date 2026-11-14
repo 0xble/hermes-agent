@@ -939,13 +939,11 @@ def _media_delivery_allowed_roots() -> list[Path]:
         if (root := Path(os.path.expanduser(raw_root.strip()))).is_absolute())
     # Private turns may only deliver files created in their own interval. Besides
     # enforcing the boundary, returning early avoids probing public profile/kanban roots.
-    try:
-        from agent.incognito_private_dir import private_path_for_current_session
-        private_root = private_path_for_current_session()
-    except Exception:
-        private_root = None
-    if private_root is not None:
-        return [private_root / "cache"]
+    from agent.incognito import is_incognito
+    from agent.incognito_private_dir import private_path_for_current_session
+    private_root = private_path_for_current_session()
+    if is_incognito():
+        return [private_root / "cache"] if private_root is not None else []
 
     roots = [*map(Path, MEDIA_DELIVERY_SAFE_ROOTS), *_profile_cache_roots(),
              *_kanban_attachment_roots(), *operator_roots]
