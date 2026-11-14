@@ -536,17 +536,25 @@ def retarget_local_automation(db, *, epoch: int, session_id: str, principal_id: 
     return db._execute_write(write, session_ids=(session_id, old_targets, new_target,), skip_result=0)
 
 
+# Each names its partial index's WHERE terms verbatim (hermes_state_common), so restart recovery reads
+# only in-flight rows instead of scanning the whole history at every start.
+_RECOVER_WORKERS_SQL = ("UPDATE worker_executions SET status='unknown' WHERE status != 'terminal' "
+                        "AND status IN ('registered','running') AND owner_epoch!=?")
+_RECOVER_STEERS_SQL = (f"UPDATE session_admissions SET outcome='interrupted' WHERE status = 'terminal' "
+                       f"AND outcome = '{STEERING}' AND owner_epoch!=?")
+_RECOVER_STARTED_SQL = "UPDATE session_admissions SET status='unknown' WHERE status = 'started' AND owner_epoch!=?"
+
+
 def recover_session_inputs(db, *, epoch: int) -> int:
     """Never replay started work. Live worker adoption is a separate explicit operation."""
     def write(conn):
         _epoch(conn, epoch)
         from hermes_state_runtime_workers import retire_stale_children
         retire_stale_children(conn, epoch)
-        conn.execute("UPDATE worker_executions SET status='unknown' WHERE status IN ('registered','running') AND owner_epoch!=?", (epoch,))
+        conn.execute(_RECOVER_WORKERS_SQL, (epoch,))
         # A steer handed to a lost claim may or may not have reached its agent: never replayed.
-        conn.execute("UPDATE session_admissions SET outcome='interrupted' WHERE status='terminal' AND outcome=? "
-                     "AND owner_epoch!=?", (STEERING, epoch))
-        return conn.execute("UPDATE session_admissions SET status='unknown' WHERE status='started' AND owner_epoch!=?", (epoch,)).rowcount
+        conn.execute(_RECOVER_STEERS_SQL, (epoch,))
+        return conn.execute(_RECOVER_STARTED_SQL, (epoch,)).rowcount
     return db._execute_write(write)
 
 
