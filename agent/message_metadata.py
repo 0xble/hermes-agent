@@ -260,6 +260,15 @@ def unstamped_replay_fields(msg: Mapping[str, Any]) -> dict:
     return fields
 
 
+def apply_unstamped_replay_fields(msg: Mapping[str, Any], entry: MutableMapping[str, Any]) -> None:
+    """Carry ``msg``'s unstamped provenance onto replay ``entry``, merging into (never replacing) the
+    display metadata ``entry`` already holds, such as its typed-ask stamp."""
+    unstamped = unstamped_replay_fields(msg)
+    if "display_metadata" in unstamped:
+        unstamped["display_metadata"] = {**(entry.get("display_metadata") or {}), **unstamped["display_metadata"]}
+    entry.update(unstamped)
+
+
 def is_compaction_scaffolding(msg: Mapping[str, Any]) -> bool:
     """Compaction sent its summary and restatement rows unstamped; a replay stamp would break the cached prefix."""
     return bool(scaffolding_replay_fields(msg))
