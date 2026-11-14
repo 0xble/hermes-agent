@@ -13,22 +13,13 @@ import pytest
 
 from gateway import delivery_ledger as dl
 from gateway import stream_recovery as recovery
-from tests.gateway.test_delivery_ledger_fd_leak import _TrackingConnection
+from tests.gateway.test_delivery_ledger_fd_leak import _track_connections
 
 
 @pytest.fixture
 def tracked(monkeypatch, tmp_path):
     monkeypatch.setattr(dl, "_db_path", lambda: tmp_path / "state.db")
-    opened, closed = [], []
-    real_connect = sqlite3.connect
-
-    def tracking_connect(*args, **kwargs):
-        conn = real_connect(*args, **kwargs)
-        opened.append(id(conn))
-        return _TrackingConnection(conn, closed)
-
-    monkeypatch.setattr(sqlite3, "connect", tracking_connect)
-    return opened, closed
+    return _track_connections(monkeypatch)
 
 
 def _exercise():
