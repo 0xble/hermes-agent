@@ -1381,11 +1381,11 @@ DEFAULT_CONFIG = {
         "backends": {},
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
-        # Fallback chain for delegated children (same entry format as the top-level list).
-        # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
-        # A child pinned by provider, endpoint, or model gets no fallback unless this
-        # setting declares one explicitly.
+        # Delegated children's fallback chain (top-level entry format). Unpinned child: null = inherit the
+        # parent chain, [] = disable. A child pinned by provider, endpoint or model gets none unless declared.
         "fallback_providers": None,
+        # Subagent/cron/side-agent runs retry transient errors on the same route this long before fallback; 0 = no wait.
+        "fallback": {"transient_retry_window_seconds": 180.0},
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
         # Wire protocol for delegation.base_url: "chat_completions" | "codex_responses" |
