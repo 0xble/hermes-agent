@@ -504,7 +504,8 @@ class SessionAuthority:
         """The FIFO stopped without claiming its head. Committed rows stay queued for a later
         drain; process-local delivery/HTTP/producer waiters on this session are released,
         with the reason instead of a reply, so an adapter loop is never parked on a turn that
-        will not run. The ingress turns that refusal into one user-facing notice per episode.
+        will not run. The ingress turns that refusal into one user-facing notice per episode;
+        an ``unknown_execution`` pause is also announced to the chat (``session_pause_announce``).
         ``session_busy`` is transient (a registered worker finishes and wakes the FIFO), so only
         the messaging delivery waiters are released for it; an API/webhook/Bot observer keeps
         waiting for the answer instead of reporting accepted work as a conflict."""
@@ -516,6 +517,10 @@ class SessionAuthority:
             waiter = self.waiters.pop(admission_id, None)
             if waiter is not None and not waiter.done():
                 waiter.set_exception(RuntimeStoreError(reason))
+        # A lost turn's pause is also told to the chat unprompted (once per episode, shared with
+        # the reply path): input the previous owner admitted has no waiter here to carry it.
+        from gateway.session_pause_announce import schedule_pause_announcement
+        schedule_pause_announcement(self, ref, reason)
 
     async def admit_automation(self, adapter, event, identity, replaces=None, fold=None, *, authorize_write=None):
         from gateway.admission_canary import refusal_evidence
@@ -716,6 +721,9 @@ class SessionAuthority:
                 results[sid] = 'ready'
             except RuntimeStoreError as exc:
                 results[sid] = exc.reason
+                if exc.reason == 'unknown_execution' and sid in self.sessions:
+                    # Paused before any drain: no waiter or new message reports it to the chat.
+                    self._pause(SessionRef(self.profile_id, sid), exc.reason)
         return results
 
     async def submit(self, actor: SessionActor, request: Submission, *, _authorize_write=None, queue_while_restarting=False,
