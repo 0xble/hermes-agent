@@ -3209,6 +3209,7 @@ class GatewayNotificationsMixin(
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
+                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
                         break
                     # Captured before injection: afterwards the key is busy either way (the injected
                     # turn itself installs the guard).

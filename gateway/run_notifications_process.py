@@ -84,6 +84,11 @@ class GatewayProcessNotificationsMixin:
         if not surface:
             # Recheck live ownership next tick: handoff retains notification intent.
             if session.exited:
+                if is_restart_safe(session):
+                    if process_registry._claim_survivor_delivery(session):
+                        process_registry._mark_survivor_delivered(session)
+                else:
+                    acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
                 return None
             return False
         if silent:
@@ -139,6 +144,11 @@ class GatewayProcessNotificationsMixin:
             if sent is False and is_restart_safe(session):
                 process_registry.release_survivor_completion(session_id)
                 return False
+            if sent is False:
+                # A non-restart-safe completion cannot be replayed by a successor. Settle it even when
+                # transport could not return a receipt, so the released handover does not wait forever.
+                acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
+                return True
         # Presented, or deliberately suppressed by the notification mode: either way the
         # claimed survivor completion is settled and must not replay on a successor.
         if settled:
