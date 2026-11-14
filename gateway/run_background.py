@@ -6,7 +6,6 @@ import os
 from typing import Optional
 
 from agent.i18n import t
-from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.session import SessionSource
@@ -139,13 +138,9 @@ class GatewayBackgroundMixin:
                 images, text_content = adapter.extract_images(response)
                 text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
-                content = header + text_content
-                if source.platform == Platform.SLACK and not (result or {}).get("error"):
-                    from agent.notice_style import notice_metadata
-                    await adapter.send(chat_id=source.chat_id, content=header,
-                                       metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
-                    content = text_content
-                await adapter.send(chat_id=source.chat_id, content=content, metadata=_thread_metadata)
+                # Keep attribution and body in one send: concurrent completions must not
+                # interleave headers, and a rejected receipt must not leave a bare result.
+                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
             for copy_block in copy_blocks:
                 copy_metadata = dict(_thread_metadata or {})
                 copy_metadata["copy_block"] = True
