@@ -378,7 +378,8 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     """Background review is an owner choice; enabling it must not fail the fork-patch check."""
     mod = _load("check_fork_patches")
     assert "auxiliary.background_review.enabled" not in mod.EXPECTED_CONFIG
-    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m",
+    values = {"memory.write_approval": "false", "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m",
               "auxiliary.background_review.enabled": "true"}
 
     def fake_run(cmd, **_kwargs):
@@ -390,6 +391,25 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     assert mod.check_config(tmp_path) == ["config memory.write_approval = 'true', expected 'false'"]
 
 
+def test_check_config_requires_the_model_map_default_route_not_the_retired_model_key(tmp_path, monkeypatch):
+    """v0.23.1 routes delegation through model_map; ``delegation.model`` is gone from a correct config."""
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m",
+              "delegation.model": ""}
+
+    def fake_run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=values.get(cmd[-1], "") + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+    values["delegation.backends.model_map.default"] = ""
+    assert mod.check_config(tmp_path) == ["config delegation.backends.model_map.default is not set"]
+    values.update({"delegation.backend": "default", "delegation.backends.model_map.default": "worker"})
+    assert mod.check_config(tmp_path) == [
+        "config delegation.backend = 'default', expected 'model_map'"]
+
+
 def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     release = tmp_path / "releases" / ("b" * 40)
@@ -398,7 +418,8 @@ def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch)
     python.write_text("placeholder", encoding="utf-8")
     (tmp_path / "current").symlink_to(release, target_is_directory=True)
     calls = []
-    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m"}
+    values = {"memory.write_approval": "false", "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m"}
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
