@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# health: allow FILE_LINES -- route persistence and lineage notice policy belong in this established registry.
 """Async (background) delegation registry behind ``delegate_task(background=true)``.
 
 The parent dispatches a subagent on a module-level daemon executor and returns a handle
@@ -259,7 +260,7 @@ def _persist_dispatch(record: dict[str, Any]) -> None:
         owner_started_at = None
     task_payload = {
         key: record.get(key)
-        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
+        for key in ("goal", "goals", "context", "toolsets", "role", "model", "is_batch", "task_indexes", "task_contexts", "task_transcripts", "route_chain", "cron_execution_id", "cron_job_id", "cron_job_name", "cron_deliver", *_ROUTING_KEYS)
         if key in record}
     if child_sessions := record.get("child_sessions"):
         task_payload["child_execution"] = {
@@ -1960,6 +1961,7 @@ def _dispatch_admitted(
     task_indexes: Optional[list[int]] = None,
     task_contexts: Optional[dict[str, str]] = None,
     task_transcripts: Optional[dict[str, str]] = None,
+    route_chain: Optional[list[tuple[str, str, str]]] = None,
     child_sessions: Optional[dict[str, str]] = None,
     cron_execution: Optional[dict[str, str]] = None,
     max_queued_delegations: int = _DEFAULT_MAX_QUEUED_DELEGATIONS,
@@ -1989,6 +1991,7 @@ def _dispatch_admitted(
         "slot_key": slot_key or delegation_id, "max_async_children": max_async_children,
         **(cron_execution or {}), **({"task_contexts": dict(task_contexts)} if task_contexts else {}),
         **({"task_transcripts": dict(task_transcripts)} if task_transcripts else {}),
+        **({"route_chain": [tuple(route) for route in route_chain]} if route_chain else {}),
         **({"child_sessions": dict(child_sessions)} if child_sessions else {}),
         **({"task_indexes": list(task_indexes)} if task_indexes is not None else {}),
         "_context": contextvars.copy_context(),
@@ -2151,6 +2154,7 @@ def dispatch_async_delegation_batch(
     task_contexts: Optional[dict[str, str]] = None,
     task_transcripts: Optional[dict[str, str]] = None, cancel_fn: Optional[Callable[[str], None]] = None,
     child_sessions: Optional[dict[str, str]] = None,
+    route_chain: Optional[list[tuple[str, str, str]]] = None,
 ) -> dict[str, Any]:
     """Dispatch a fan-out unit (a whole batch, or one ``group`` of a delegate_task call) as ONE
     background unit: ``runner`` runs its tasks and returns the combined ``{"results": [...],
@@ -2170,7 +2174,7 @@ def dispatch_async_delegation_batch(
         interrupt_fn=interrupt_fn, max_async_children=max_async_children, progress_fn=progress_fn, slot_key=slot_key,
         max_queued_delegations=max_queued_delegations, cancel_fn=cancel_fn,
         task_indexes=task_indexes, task_contexts=task_contexts, task_transcripts=task_transcripts,
-        child_sessions=child_sessions,
+        child_sessions=child_sessions, route_chain=route_chain,
         capacity_error=(
             f"Async delegation capacity reached ({max_async_children} running). Wait for one to finish "
             "(its result will re-enter the chat), or raise delegation.max_concurrent_children in "
@@ -2386,20 +2390,19 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
 
 
 def push_task_failure_notice(delegation_id: str, entry: dict[str, Any], *, n_tasks: int) -> None:
-    """Surface ONE failed child of a still-running detached batch to the parent now, instead of
-    when the slowest sibling finishes. In a 1,393-agent run every wave-1 child died in a 401 storm
-    at 08:29 and the parent learned of it at 09:36, when the batch's "unknown outcome" block finally
-    arrived: 66 minutes of a dead wave with nothing running. The notice rides the same
-    ``type="async_delegation"`` event shape as the batch result (so every drain/route/format path
-    treats it identically) with ``task_failure_notice=True`` and a single-entry ``results`` list; the
-    batch record is NOT finalized and its consolidated result still arrives as before. In-process
-    queue only (never persisted), so the parent's copy honours ``security.redact_secrets: false``."""
-    entry = redact_child_result(entry, force=False)
+    """Surface one terminal child failure; retryable availability failures stay silent while budget remains."""
+    from tools.delegation_resume import MAX_LINEAGE_AGE_S, MAX_RETRY_ATTEMPTS, TRANSIENT_REASONS
+    retryable = str(entry.get("failure_reason") or "") in TRANSIENT_REASONS
     with _records_lock:
         record = _records.get(delegation_id)
-        if record is None or record.get("status") not in _ACTIVE_STATES:
+        if record is None or record.get("status") not in _ACTIVE_STATES or record.get("_task_failure_notice_sent"):
             return
+        root = float(record.get("retry_root_started_at") or record.get("dispatched_at") or time.time())
+        if retryable and int(record.get("retry_attempt") or 0) < MAX_RETRY_ATTEMPTS and time.time() - root < MAX_LINEAGE_AGE_S:
+            return
+        record["_task_failure_notice_sent"] = True
         snapshot = dict(record)
+    entry = redact_child_result(entry, force=False)
     try:
         from tools.process_registry import process_registry
     except Exception as exc:  # pragma: no cover

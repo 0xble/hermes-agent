@@ -444,14 +444,22 @@ def site_copy(code: str, **fields: Any) -> str:
     return _SITE_COPY[code].format_map(_Defaults(fields))
 
 
-def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None) -> str:
+def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None,
+                   earliest_route_seconds: Optional[float] = None) -> str:
     """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
     limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401)."""
     first_attempt = attempts == 1 and reason in _EXHAUSTED_FIRST_ATTEMPT_LEADS
     lead = (_EXHAUSTED_FIRST_ATTEMPT_LEADS if first_attempt else _EXHAUSTED_LEADS).get(
         reason, _EXHAUSTED_DEFAULT_LEAD).format(label=label, attempts=attempts)
     # The free-tier cutoff (one attempt) fires on any cooldown over a minute, so it always names the reset.
-    if reset_seconds is not None and (reset_seconds >= 120 or first_attempt and reset_seconds > 0):
+    if (reset_seconds is not None and earliest_route_seconds is not None
+            and earliest_route_seconds < reset_seconds - 60):
+        # Another configured route recovers sooner than the failing one: do not tell the user to wait out the long reset.
+        from agent.retry_utils import format_reset_window
+        situation = (f"another configured model is expected back in {format_reset_window(earliest_route_seconds)}"
+                     if earliest_route_seconds >= 120 else "another configured model should be available now")
+        situation += f" (this one's limit resets in {format_reset_window(reset_seconds)}). Send /retry then, or switch models with /model."
+    elif reset_seconds is not None and (reset_seconds >= 120 or first_attempt and reset_seconds > 0):
         from agent.retry_utils import format_reset_window
         situation = (f"its usage limit resets in {format_reset_window(reset_seconds)}. "
                      "Send /retry after that, or switch models with /model.")

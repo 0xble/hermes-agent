@@ -842,7 +842,17 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
                 verdict, reason = RETRY_TERMINAL, f"retry budget exhausted: still failing after 24h ({reason})"
             else:
                 verdict = RETRY_SCHEDULED
-                due = now + max(_backoff(record["retry_attempt"]), (_reset_delay(_texts(record), now) or 0) + 30.0)
+                task = record.get("task") or {}
+                routes = [tuple(route) for route in task.get("route_chain") or [] if isinstance(route, (list, tuple)) and len(route) == 3]
+                available_at = None
+                if routes:
+                    from agent.shared_primary_cooldown import earliest_available
+                    _, available_at = earliest_available(routes, now=now)
+                # The provider's error hint is only authoritative when the shared store has
+                # no usable route data. Otherwise retry at the earliest eligible route.
+                if available_at is None:
+                    available_at = now + (_reset_delay(_texts(record), now) or 0) + 30.0
+                due = now + max(_backoff(record["retry_attempt"]), available_at - now)
         conn.execute(
             """UPDATE async_delegations SET retry_state=?, retry_reason=?, retry_due_at=?, updated_at=?
                WHERE delegation_id=? AND retry_state=?""",

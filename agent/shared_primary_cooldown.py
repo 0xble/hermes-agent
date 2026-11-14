@@ -350,6 +350,51 @@ def clear_if_current(route: tuple[str, str, str], outage_id: str | None) -> bool
         return False
 
 
+def earliest_available(routes: list[tuple[str, str, str]], *, now: float | None = None) -> tuple[int | None, float | None]:
+    """Earliest usable route in ``routes`` as ``(index, available_at)``.
+
+    Per route: no record = available now (only counted when the store holds data for some
+    route in the chain); record with a plausible ``reset_at`` = cooling until then (expired =
+    now); unreadable store or implausible record = unknown, skipped. ``(None, None)`` means
+    nothing is known, so callers should use their normal backoff or error hint, never "never".
+    """
+    if not routes:
+        return None, None
+    now = time.time() if now is None else now
+    known: dict[int, float] = {}
+    missing: list[int] = []
+    for index, route in enumerate(routes):
+        try:
+            record = read_cooldown(route)
+        except OSError:
+            continue
+        if not isinstance(record, dict):
+            missing.append(index)
+            continue
+        reset_at = _plausible_reset(record.get("reset_at"), now)
+        if reset_at is not None:
+            known[index] = max(reset_at, now)
+    if known:
+        known.update({index: now for index in missing})
+        index = min(known, key=lambda i: (known[i], i))
+        return index, known[index]
+    return None, None
+
+
+def earliest_route_delay(agent: Any, *, now: float | None = None) -> float | None:
+    """Return seconds until the earliest configured route is available, or None if unknown."""
+    from contextlib import suppress
+    with suppress(Exception):
+        routes = [route_from_agent(agent)] + [
+            (str(entry.get("provider") or "").strip().lower(), str(entry.get("base_url") or ""), str(entry.get("model") or "").strip())
+            for entry in (getattr(agent, "_fallback_chain", None) or []) if isinstance(entry, dict)
+        ]
+        _, available_at = earliest_available(routes, now=now)
+        if available_at is not None:
+            return max(0.0, available_at - (time.time() if now is None else now))
+    return None
+
+
 def list_cooldowns(*, strict: bool = False) -> list[dict[str, Any]]:
     """Return active (still cooling) records.
 
