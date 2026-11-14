@@ -277,7 +277,10 @@ def _fold_queued(admission_id, session_id, replaced, skip=()):
                            "AND target_session_id=? AND status='queued'", (admission_id, session_id)).fetchone()
         later = row and conn.execute("SELECT admission_id FROM session_admissions WHERE target_session_id=? "
                                      "AND status='queued' AND seq>?", (session_id, row[0])).fetchall()
-        if row is None or any(other[0] not in skip for other in later):
+        from gateway.session_automation_retry import refusal_held
+        # A refused head keeps its persisted backoff by admission id; folding would cancel it and
+        # admit an undelayed replacement, so the later completion queues behind it instead.
+        if row is None or refusal_held(conn, admission_id) or any(other[0] not in skip for other in later):
             raise RuntimeStoreError('stale_generation')
         replace(conn)
         payload = json.loads(row[1])
