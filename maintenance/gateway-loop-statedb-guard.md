@@ -110,6 +110,13 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   ~120 busy agent threads that turned a 10 ms diff of 2,753 rows into 3-17 s holds
   (2026-10-25: 58 holds, 365 s in 2 h; callback CPU ~0.4 s). Keep new writer callbacks
   O(1) in Python round trips where the row count grows with history or sessions.
+- The check-in poll (`gateway/run_checkins.py::poll_checkins`, every 5 s) groups every routed
+  session on the loop. `_standalone_runtime_home` memoizes the resolved parent per DB path, and
+  the scan yields to the loop every `_SCAN_YIELD_EVERY` (512) entries. On 2026-11-14 the live
+  gateway held 36,898 routed sessions; a per-entry realpath made each pass ~150k GIL-releasing
+  lstat calls, and a 150 s Python stack sample showed 39 s of loop time in that scan, in
+  unbroken runs up to 5.1 s (`ws write slow (loop stalled >10s)` under heavier load). Proof:
+  `tests/gateway/test_checkin_poll_loop_budget.py`.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.
