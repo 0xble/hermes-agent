@@ -131,6 +131,33 @@ def _model_for(home, mode):
     return model, peer_checkin, race, spawn_terminal, status_marker
 
 
+async def _arm_peer_goal_wait(root, env, home, desc, sid):
+    """Set a goal on ``sid`` and park it on a peer's work through the real goal_peer_command CLI."""
+    async with websocket(home, desc) as parent:
+        await rpc(parent, 'session.resume', session_id=sid)
+        async def goal(call, *args, **kwargs):
+            reply = await rpc(parent, 'session.automation', session_id=sid,
+                              kind='goal', call=call, args=list(args), kwargs=kwargs)
+            assert 'result' in reply, reply
+            return reply['result']
+        result = await goal('set', 'Verify the peer artifact')
+        instance = json.loads(result['state'])['created_at']
+        await goal('wait_for_seconds', 3600, reason='await the peer artifact')
+        cli = await asyncio.create_subprocess_exec(
+            sys.executable, '-m', 'hermes_cli.goal_peer_command', 'wait', str(instance),
+            'hermes:default/idle-peer', 'existing-peer-work', 'artifact readback',
+            cwd=root, env={**env, 'HERMES_SESSION_ID': sid},
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            stdout, stderr = await asyncio.wait_for(cli.communicate(), 30)
+            assert cli.returncode == 0, stdout.decode() + stderr.decode()
+            assert json.loads(stdout)['value']['ok'], stdout
+        finally:
+            if cli.returncode is None:
+                cli.kill()
+                await cli.wait()
+
+
 async def probe(root, base, mode):
     home, user = base / 'state', base / 'user'
     home.mkdir(); user.mkdir()
@@ -214,29 +241,7 @@ async def probe(root, base, mode):
                         await wait_for(lambda: 'Heartbeat' in json.dumps(outgoing))
                     sid = rows()[0]['target_session_id']
                     if peer_checkin:
-                        async with websocket(home, desc) as parent:
-                            await rpc(parent, 'session.resume', session_id=sid)
-                            async def goal(call, *args, **kwargs):
-                                reply = await rpc(parent, 'session.automation', session_id=sid,
-                                                  kind='goal', call=call, args=list(args), kwargs=kwargs)
-                                assert 'result' in reply, reply
-                                return reply['result']
-                            result = await goal('set', 'Verify the peer artifact')
-                            instance = json.loads(result['state'])['created_at']
-                            await goal('wait_for_seconds', 3600, reason='await the peer artifact')
-                            cli = await asyncio.create_subprocess_exec(
-                                sys.executable, '-m', 'hermes_cli.goal_peer_command', 'wait', str(instance),
-                                'hermes:default/idle-peer', 'existing-peer-work', 'artifact readback',
-                                cwd=root, env={**env, 'HERMES_SESSION_ID': sid},
-                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                            try:
-                                stdout, stderr = await asyncio.wait_for(cli.communicate(), 30)
-                                assert cli.returncode == 0, stdout.decode() + stderr.decode()
-                                assert json.loads(stdout)['value']['ok'], stdout
-                            finally:
-                                if cli.returncode is None:
-                                    cli.kill()
-                                    await cli.wait()
+                        await _arm_peer_goal_wait(root, env, home, desc, sid)
                     if model.checkin:
                         def state():
                             with sqlite3.connect(home / 'state.db') as db:
