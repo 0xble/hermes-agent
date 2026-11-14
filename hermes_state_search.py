@@ -388,7 +388,9 @@ class SessionSearchMixin:
         if not self._fts_enabled:
             return
         try:
-            self._merge_fts_incrementally(max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX)
+            from hermes_state_prune_budget import current_budget
+            options = {"max_commands": 1} if current_budget() is not None else {}
+            self._merge_fts_incrementally(max_pages=self._FTS_MERGE_MAX_PAGES_PER_INDEX, **options)
         except Exception as exc:
             # The canonical write is already committed before this cadence runs. No maintenance failure —
             # including the bare SystemError the CPython sqlite3 layer can raise under cross-thread errmsg
@@ -1555,17 +1557,21 @@ class SessionSearchMixin:
         # (synchronous=FULL), and holding the in-process writer lock across a whole pass stalled every
         # writer for seconds on a busy disk (2026-10-11 11:39: 19 turns, 48 writers queued). SQLite's
         # own write lock still serializes each command against every other writer.
-        with self._maintenance_conn() as conn:
+        from hermes_state_prune_budget import check_prune_budget, current_budget, prune_sql
+        with self._maintenance_conn(blocking=current_budget() is None) as conn:
             if conn is None:
                 return 0
-            for tbl in [t for t in self._FTS_TABLES if self._fts_table_exists(t, conn=conn)]:
-                if not self._fts_usermerge_floor_applied:
-                    conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
-                for _ in range(max_commands):
-                    before = conn.total_changes
-                    conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
-                    executed += 1
-                    if conn.total_changes - before < 2:
-                        break
-            self._fts_usermerge_floor_applied = True
+            with prune_sql(conn, write=True):
+                for tbl in [t for t in self._FTS_TABLES if self._fts_table_exists(t, conn=conn)]:
+                    check_prune_budget()
+                    if not self._fts_usermerge_floor_applied:
+                        conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('usermerge', 2)")
+                    for _ in range(max_commands):
+                        check_prune_budget()
+                        before = conn.total_changes
+                        conn.execute(f"INSERT INTO {tbl}({tbl}, rank) VALUES('merge', ?)", (max_pages,))
+                        executed += 1
+                        if conn.total_changes - before < 2:
+                            break
+                self._fts_usermerge_floor_applied = True
         return executed
