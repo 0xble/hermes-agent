@@ -783,7 +783,8 @@ from hermes_cli.old_updater_main import (
     _windows_shim_in_process_chain,
     _write_web_ui_build_stamp,
 )
-from hermes_cli.main_install_repair import _cleanup_quarantined_exes, _recover_update_debts_on_startup
+from hermes_cli.main_install_repair import (
+    _cleanup_quarantined_exes, _reap_orphaned_cua_drivers, _recover_update_debts_on_startup)
 from hermes_cli.main_install_repair import (  # frozen updater surface: update_cmd*.py resolve these via _m()
     _UPDATE_REEXEC_ENV,
     _clear_lazy_refresh_incomplete_marker,
@@ -3426,20 +3427,10 @@ def main():
 
     install_truststore()
 
-    # Sweep stale ``hermes.exe.old.*`` quarantine files from previous Windows
-    # updates. No-op elsewhere.
-    try:
+    # Sweep stale ``hermes.exe.old.*`` quarantine files from previous Windows updates (no-op elsewhere).
+    with contextlib.suppress(Exception):  # a quarantine sweep must never stop the CLI
         _cleanup_quarantined_exes()
-    except Exception:
-        pass
-
-    # Reap cua-driver serve processes whose Hermes owner has already died, and
-    # stale hc- sockets. Never raises and never signals a live owner's driver.
-    try:
-        from tools.computer_use.cua_driver_lifetime import sweep_on_startup
-        sweep_on_startup()
-    except ImportError:  # sweep_on_startup itself never raises; only an unimportable module reaches here
-        logger.debug("cua-driver startup sweep unavailable", exc_info=True)
+    _reap_orphaned_cua_drivers()
 
     # Checkout changed since last launch → sweep stale __pycache__ once so no
     # process resolves fresh source against old bytecode. Never raises.
