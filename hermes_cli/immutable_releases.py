@@ -519,7 +519,7 @@ def _stamped_base_version(release: Path) -> str:
     """The base version staging stamped into *release*, or "" when it has none."""
     from pm.paths import install_stamp_path
     try:
-        value = json.loads(install_stamp_path(release).read_text(encoding="utf-8")).get("baseVersion")
+        value = json.loads(install_stamp_path(release).read_text(encoding="utf-8-sig")).get("baseVersion")
     except (OSError, ValueError, AttributeError):
         return ""
     return value if isinstance(value, str) and value != "unknown" else ""
