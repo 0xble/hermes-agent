@@ -264,3 +264,102 @@ async def test_gateway_start_arms_the_guard_and_stop_disarms_it(monkeypatch, tmp
 
     loop_db = SessionDB(db_path=tmp_path / "probe.db")  # disarmed: shutdown drains on the loop
     loop_db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("notify", [False, True])
+async def test_process_completion_acknowledgement_runs_off_the_loop(monkeypatch, tmp_path, notify):
+    import tools.process_registry as pr_module
+    from tests.gateway.test_background_process_notifications import _build_runner, _FakeRegistry, _watcher_dict
+
+    threads = []
+    session = SimpleNamespace(output_buffer="ok\n", exited=True, exit_code=0, command="build", started_at=None)
+    registry = _FakeRegistry([session])
+    # Acknowledging loads retained results, whose ownership check opens state.db (_owns_result).
+    registry.acknowledge_survivor_completion = lambda session_id: threads.append(threading.get_ident())
+    monkeypatch.setattr(pr_module, "process_registry", registry)
+    runner = _build_runner(monkeypatch, tmp_path, "concise")
+    runner._enqueue_process_completion_notification = AsyncMock(return_value=True)
+    runner._launching_turn_active = AsyncMock(return_value=False)
+    loop_thread = _arm()
+    await runner._run_process_watcher({**_watcher_dict(), "notify_on_complete": notify})
+    assert threads and loop_thread not in threads
+
+
+@pytest.mark.asyncio
+async def test_ws_backend_heartbeat_registration_runs_off_the_loop(monkeypatch):
+    from tui_gateway import server, ws as ws_mod
+
+    threads = []
+    # The first heartbeat refresh writes the backend's row through the state.db writer.
+    monkeypatch.setattr(server, "_start_backend_heartbeat_refresher", lambda: threads.append(threading.get_ident()))
+    monkeypatch.setattr(server, "resolve_skin", lambda: "default")
+    monkeypatch.setattr(server, "_ensure_skin_watcher", lambda: None)
+    monkeypatch.setattr(server, "register_live_transport", lambda *_a, **_k: None)
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0)
+
+    class _WS:
+        async def accept(self):
+            pass
+
+        async def send_text(self, line):
+            pass
+
+        async def receive_text(self):
+            raise ws_mod._WebSocketDisconnect()
+
+        async def close(self):
+            pass
+
+    loop_thread = _arm()
+    await ws_mod.handle_ws(_WS())
+    assert threads and loop_thread not in threads
+
+
+def test_cron_rpc_restore_and_admission_reads_run_off_the_loop(tmp_path, monkeypatch):
+    from cron import jobs
+    from gateway import run, session_cron, session_local_recovery
+    from gateway.session import SessionStore
+    from gateway.session_authority import SessionAuthority
+    from hermes_state import SessionDB
+    from tests.fakes.runtime_owner import begin_runtime_epoch
+
+    monkeypatch.setenv('HERMES_HOME', str(tmp_path))
+    monkeypatch.setenv('HERMES_MODEL', 'fixture')
+    monkeypatch.setattr(run, '_load_gateway_config', lambda: {'model': {}, 'platform_toolsets': {'cli': []}})
+    threads = {}
+
+    def _probe(name, real):
+        def _call(*args, **kwargs):
+            threads.setdefault(name, []).append(threading.get_ident())
+            return real(*args, **kwargs)
+        return _call
+
+    # The route restore takes the session-store lock; the admission reads can fall back to the writer.
+    monkeypatch.setattr(session_local_recovery, '_restore_local_entry',
+                        _probe('restore', session_local_recovery._restore_local_entry))
+    monkeypatch.setattr(session_cron, 'get_session_admission', _probe('admission', session_cron.get_session_admission))
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='original', schedule='every 1h', deliver='telegram:123')
+        db = SessionDB(tmp_path / 'state.db')
+        runner = SimpleNamespace(_draining=False, session_store=SessionStore(tmp_path / 'sessions', GatewayConfig()),
+                                 adapters={})
+        authority = SessionAuthority(runner, profile_id=str(tmp_path), instance_id='test', db=db,
+                                     epoch=begin_runtime_epoch(db, instance_id='test'))
+        monkeypatch.setattr(authority, '_schedule', lambda ref: None)
+        runner.session_authority = authority
+
+        async def probe():
+            params = {'job_id': job['id'], 'request_id': 'fire', 'extra_prompt': None}
+            receipt = await session_cron.operation(authority, 'submit', params)
+            status = await session_cron.operation(authority, 'status', {
+                'session_id': receipt['session_id'], 'admission_id': receipt['admission_id']})
+            assert status['status'] == 'queued'
+            return threading.get_ident()
+
+        try:
+            loop_thread = asyncio.run(probe())
+        finally:
+            db.close()
+    assert set(threads) == {'restore', 'admission'}
+    assert all(loop_thread not in idents for idents in threads.values()), threads

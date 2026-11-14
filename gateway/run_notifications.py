@@ -2179,7 +2179,7 @@ class GatewayNotificationsMixin(
                         await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
                     admitted = await delivery
                     if admitted is not False:
-                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
                         break
                     # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
                     # for a few minutes, then fall through to the plain notice instead of dropping it.
@@ -2194,7 +2194,7 @@ class GatewayNotificationsMixin(
                         continue
                     if await self._process_completion_committed(completion_evt, session_id):
                         # The last refusal was a lost ACK: the turn is committed.
-                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
                         break
                     logger.warning(
                         "Process watcher: completion for %s was refused %d times; falling back to the "

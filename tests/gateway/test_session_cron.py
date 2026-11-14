@@ -124,6 +124,8 @@ async def test_cron_recover_adopts_session_published_during_restore(tmp_path, mo
     races = []
 
     async def raced(owner, sid, *, admission_gate=True):
+        if admission_gate:  # submit restoring the session it just created; the race targets recover
+            return await real_restore(owner, sid, admission_gate=admission_gate)
         races.append(admission_gate)
         if len(races) == 1:
             published.append(await real_restore(owner, sid, admission_gate=admission_gate))
