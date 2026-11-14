@@ -79,7 +79,9 @@ def _live_system_guard(request, monkeypatch):
         yield
         return
 
+    import json as _json
     import os as _os
+    import plistlib as _plistlib
     import re as _re
     import shlex as _shlex
     import subprocess as _subprocess
@@ -558,6 +560,29 @@ def _live_system_guard(request, monkeypatch):
         except Exception:
             return False
 
+    def _launchd_gateway_command(cmd_str: str) -> str | None:
+        """Extract a transient launchd job's shell command before bootstrap can detach it."""
+        try:
+            tokens = _shlex.split(cmd_str)
+        except ValueError:
+            return None
+        if len(tokens) < 3 or tokens[0].rsplit("/", 1)[-1] != "launchctl" or tokens[1] != "bootstrap":
+            return None
+        plist_path = next((token for token in reversed(tokens[2:]) if token.endswith(".plist")), None)
+        if plist_path is None:
+            return None
+        try:
+            with open(plist_path, "rb") as handle:
+                program = _plistlib.load(handle).get("ProgramArguments")
+            if not isinstance(program, list) or "/usr/bin/osascript" not in program:
+                return None
+            source = program[program.index("/usr/bin/osascript") + 4]
+            marker = "$.system("
+            encoded = source[source.index(marker) + len(marker):]
+            return _json.JSONDecoder().raw_decode(encoded)[0]
+        except (OSError, ValueError, TypeError, KeyError, IndexError, _plistlib.InvalidFileException):
+            return None
+
     def _check_subprocess_cmd(name, cmd, kwargs=None):
         git_verb = blocked_git_mutation(cmd, kwargs, _LIVE_GUARD_PROTECTED_GIT_ROOTS)
         if git_verb is not None:
@@ -610,6 +635,26 @@ def _live_system_guard(request, monkeypatch):
                 "needed (e.g. an integration test testing the update "
                 "flow against a dedicated throwaway repo)."
             )
+        # launchd hides the gateway argv inside a transient plist and JXA script, so the
+        # ordinary subprocess matcher only sees ``launchctl bootstrap``. Inspect that
+        # plist before launchd adopts the process; otherwise the osascript child is
+        # orphaned under pid 1 and survives the pytest worker.
+        from gateway.status import gateway_spawn_intent_subcommand
+        launchd_cmd = _launchd_gateway_command(cmd_str)
+        if (
+            not lookalike_ok
+            and launchd_cmd is not None
+            and gateway_spawn_intent_subcommand(launchd_cmd) in ("run", "start", "restart")
+        ):
+            raise RuntimeError(
+                f"tests/conftest.py live-system guard: blocked "
+                f"subprocess.{name}({cmd!r}) — this launchd bootstrap would "
+                "detach a REAL Hermes gateway from pytest. Mark a test that "
+                "spawns and reaps its own stub with "
+                "@pytest.mark.spawns_gateway_lookalike, or mock the gateway "
+                "spawn seam."
+            )
+
         # Block spawning a REAL gateway runtime (``python -m hermes_cli.main
         # gateway run|start|restart``). ``_spawn_hermes_action`` launches it
         # with start_new_session=True, so it outlives the pytest worker; the
@@ -619,7 +664,6 @@ def _live_system_guard(request, monkeypatch):
         # webhook port. 2026-09-03: 39 such orphans lived 6 days after a
         # sibling refactor moved the spawn seam and left tests patching the
         # facade. The canonical matcher, never an argv substring.
-        from gateway.status import gateway_spawn_intent_subcommand
         # A gateway launched INSIDE a container (`docker exec … hermes gateway start`) cannot
         # reach the host's systemd unit or webhook port; tests/docker/ exists to exercise it.
         in_container = _first_token_basename(cmd_str) in _CONTAINER_RUNTIMES
