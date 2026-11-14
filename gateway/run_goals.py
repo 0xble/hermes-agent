@@ -42,6 +42,24 @@ _GOAL_NOTICE_MAX_ATTEMPTS = 3
 _STALL_KINDS = frozenset({"blocked", "paused", "failed"})
 
 
+def _goal_suspended_while_private(session_entry) -> bool:
+    """A goal neither judges nor changes during a private interval and resumes untouched after it.
+
+    The judge would send the private reply to the auxiliary goal_judge provider, and every goal
+    write is withheld from state.db while private anyway.
+    """
+    return bool(getattr(session_entry, "incognito", False)) or session_private(
+        getattr(session_entry, "session_id", None), getattr(session_entry, "session_key", None),
+    )
+
+
+def session_private(*identities) -> bool:
+    """Suspend background work for private sessions, including an in-flight privacy switch."""
+    from agent.incognito import is_registered
+    from gateway.incognito import transition_pending
+    return any(is_registered(identity) or transition_pending(identity) for identity in identities)
+
+
 def _goal_notice_kind(message: str) -> str:
     """Stable warning label for the user-visible goal state a notice represents."""
     text = str(message or "")
@@ -662,7 +680,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _revive_blocked_goal_for_user_turn(self, session_entry, source, event) -> None:
         """Resume only after turn admission, independently of model success or delivery."""
-        if not self._is_user_turn_event(event):
+        if not self._is_user_turn_event(event) or _goal_suspended_while_private(session_entry):
             return
         from hermes_cli.goals import GoalManager
 
@@ -994,7 +1012,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 goal_kwargs["goal_instance"] = instance
             if invalidation_epoch is not None:
                 goal_kwargs["invalidation_epoch"] = invalidation_epoch
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
+            if not _goal_suspended_while_private(session_entry):
+                hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
             if hook == self._post_turn_goal_continuation and invalidation_epoch is not None and (
                 self._session_invalidation_epoch(self._session_key_for_source(source))
@@ -1460,6 +1479,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
             forget_goal_wait(self, sid)
             return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
+        if _goal_suspended_while_private(entry):
+            return  # the barrier clear is withheld while private, so waking would repeat every scan
         assert store is not None
         source = self._restored_source(entry)
         adapter = self._delivery_adapter_for(source) if source is not None else None
@@ -1494,6 +1515,10 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         from gateway.wake import automatic_route_available
 
         if not await automatic_route_available(self, source):
+            return
+        # Recheck after every async eligibility probe. The existing background reservation
+        # then fences /incognito through claim/admission without holding a reentrant route lock.
+        if _goal_suspended_while_private(entry):
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.
         # The live SessionEntry is the generation fence for that narrow race: defer to the next
