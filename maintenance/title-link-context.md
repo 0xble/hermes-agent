@@ -24,3 +24,5 @@ When the opening message contains a link, the background title upgrade starts im
 Run `scripts/run_tests.sh tests/agent/test_title_link_context.py tests/agent/test_title_generator.py tests/tools/test_url_safety.py -q`. Sample the configured title model on a few real links with opaque URLs, such as a YouTube watch URL or an arXiv abstract. On a host behind a fake-IP TUN proxy, a resolved `198.18.0.0/15` answer is dialable only after `security.fake_ip_ranges: ['198.18.0.0/15']` is configured. Without that declaration both validation and TCP connect reject the answer.
 
 Retire this patch when a released upstream baseline informs automatic titles from linked page metadata under equivalent refusal rules. Roll back by reverting the `title_link_context` module, the title-generator wiring, and the config default together. The `url_safety` `allow_private` parameter defaults to the previous behavior, so it can stay or be removed independently.
+
+Contract tests: `tests/agent/test_title_link_context.py`, `tests/agent/test_title_generator.py`, `tests/tools/test_url_safety.py`.

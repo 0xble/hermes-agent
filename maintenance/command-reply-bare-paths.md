@@ -47,3 +47,5 @@ Retire when a selected upstream release stops bare-path delivery for
 gateway-authored command replies, including `/goal resume`, and this regression
 passes without the local code. To roll back, revert the patch commit. Nothing
 is persisted.
+
+Contract tests: `tests/gateway/test_command_reply_bare_paths.py`.

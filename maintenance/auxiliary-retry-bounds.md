@@ -24,3 +24,5 @@ scripts/run_tests.sh tests/agent/test_auxiliary_retry_bounds.py tests/agent/test
 ## Retirement And Rollback
 
 Retire each adaptation when the selected released upstream baseline passes the corresponding entry-point regression without it. Revert the commit carrying this identity to roll back. There is no state migration, runtime configuration edit, or release promotion.
+
+Contract tests: `tests/agent/test_auxiliary_retry_bounds.py`, `tests/agent/test_auxiliary_compression_timeout_floor.py`, `tests/agent/test_auxiliary_client.py`, `tests/agent/test_compress_context_progress_timeout.py`, `tests/hermes_cli/test_goal_judge_timeout_config.py`.

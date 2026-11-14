@@ -137,3 +137,5 @@ Retire this unit with its implementation only after a replacement passes that
 same boundary proof. A source rollback removes the feature, it does not retract
 content already sent to messaging or model providers. Never turn an active
 private lane public merely by ignoring or deleting its routing sidecar.
+
+Contract tests: `tests/agent/test_incognito.py`, `tests/agent/test_incognito_main_sinks.py`, `tests/hermes_cli/test_incognito_plugins.py`, `tests/plugins/platforms/telegram/test_incognito_ingress.py`, `tests/tools/test_delegate_tool.py`, `tests/gateway/test_incognito_turn_e2e.py`, `tests/hermes_state/test_incognito_off_regression.py`.

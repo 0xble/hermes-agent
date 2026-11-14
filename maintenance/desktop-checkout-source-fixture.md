@@ -35,3 +35,6 @@ No upstream contribution or live activation is included in this patch.
 Retire when upstream supplies equivalent fixture correlation or replaces this
 legacy fixture with another protocol. Revert commits carrying
 `Fork-Patch: desktop-checkout-source-fixture` to roll back.
+
+
+Contract tests: none. The proof is the TypeScript fixture `apps/desktop/electron/updater/checkout-source.test.ts`, which the desktop suite runs.

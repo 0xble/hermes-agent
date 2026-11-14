@@ -569,7 +569,10 @@ unit on a `Contract tests:` line naming backticked pytest targets (`tests/x.py` 
 `tests/x.py::test_name`) that drive the behaviour through its real boundary. The checker fails
 when a pinned target's file or test is gone, so a sync cannot drop the proof silently; the
 hosted suite runs it. `--list-contract-tests` prints the pinned targets for a focused sync
-run, and `--list-uncovered` lists identity-owning units that still pin none.
+run. A unit that owns a patch identity must pin at least one target or carry
+`Contract tests: none` with the reason (retired, a documentation or dependency pin, proof in
+another language), and the checker fails otherwise, so a new fork patch cannot land without
+named proof. `--list-uncovered` lists the units that have neither.
 Retire a patch only after its
 regression passes on the selected upstream release without the local implementation.
 Load [runtime ownership](maintenance/runtime-ownership.md) whenever changing

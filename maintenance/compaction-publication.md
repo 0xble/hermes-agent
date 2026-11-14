@@ -99,3 +99,5 @@ lease renewal admission, while closed
 retry changes with slow-write diagnostics. Neither supplies the fork's bounded
 publication mutex attribution. Extend the existing wrapper and warning instead
 of changing admission, patience, or retries.
+
+Contract tests: `tests/hermes_state/test_publication_wait_budget.py`, `tests/agent/test_compaction_events.py`.

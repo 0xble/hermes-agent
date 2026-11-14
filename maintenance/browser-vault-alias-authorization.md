@@ -38,3 +38,5 @@ injection after either revocation point. No real vault access is needed.
 Retire this unit if upstream supplies equivalent refusal retention and in-flight
 alias revalidation. Revert the implementing commit to roll back this unit without
 editing configured aliases or vault items.
+
+Contract tests: `tests/tools/test_vault_alias_authorization.py`, `tests/tools/test_vault_origin_aliases.py`, `tests/tools/test_browser_vault_otp_origin.py`, `tests/tools/test_browser_vault.py`, `tests/tools/test_browser_vault_camofox.py`, `tests/tools/test_browser_vault_manager_card.py`.

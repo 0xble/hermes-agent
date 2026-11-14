@@ -25,3 +25,5 @@ The absent-path guard alone does not cover an absent-then-recreated database bet
 Run `scripts/run_tests.sh --file-retries 0 tests/hermes_state` for the quarantine/preflight integration, including read-only refusal, directory-before-lock repair, concurrent no-clobber quarantine, forensic backup and integrity. For the remaining repairs, run `scripts/run_tests.sh --file-retries 0` on `tests/e2e/core/providers/test_native_copilot_acp.py` (Linux non-root) and `tests/tools/test_process_heartbeat.py` in a pinned Linux CI container. The forced quarantine preflight race and heartbeat ordering tests are event-synchronized. Run `scripts/check_fork_patches.py --repo . --source-only` with a clean HOME and HERMES_HOME after committing.
 
 Retire the fork patch only after the accepted upstream release has equivalent behavior and all focused regressions pass without these local changes. Reverting a single aspect requires retaining its invariant test and reassessing this unit's scope; no stored-state migration is involved.
+
+Contract tests: `tests/hermes_state/test_zeroed_db_quarantine_race.py`, `tests/tools/test_process_heartbeat.py`.

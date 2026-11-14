@@ -23,3 +23,5 @@ Fork-original. Upstream NousResearch/hermes-agent has no per-run compression str
 ## Retirement and rollback
 
 Retire if upstream ships an equivalent per-run strength and a `here N` head that does not keep its own tail. Roll back the patch commit and its regressions, and remove the `cc`/`ccc` quick commands from `~/.hermes/config.yaml`. No persistent-data migration is required.
+
+Contract tests: `tests/hermes_cli/test_compress_flags.py`, `tests/agent/test_conversation_compression_manual.py`, `tests/hermes_cli/test_partial_compress.py`, `tests/hermes_cli/test_compress_here.py`.

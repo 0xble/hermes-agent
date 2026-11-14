@@ -144,3 +144,6 @@ non-blocking admission, bounded pending queue, cancellation, restart truth, and
 completion-routing contract. Roll back by reverting the commit carrying this
 unit and its tests/record; queued rows use their existing terminal/unknown
 recovery path and require no destructive schema rollback.
+
+
+Contract tests: `tests/tools/test_async_delegation.py`, `tests/tools/test_delegate_capacity_interrupt.py`.

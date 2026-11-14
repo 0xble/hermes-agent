@@ -17,3 +17,5 @@ The implementation proof surface is `agent/turn_tool_round.py`, `agent/turn_tool
 ## Upstream disposition and retirement
 
 Retire this record when released upstream gives both per-turn caps one bounded answer from collected results, never executes tools from that answer, and tracks chat display independently of audio delivery. Rollback is the commit carrying `Fork-Patch: loop-cap-final-answer`.
+
+Contract tests: `tests/agent/test_tool_guardrails.py`, `tests/agent/test_tool_call_guardrail_runtime.py`, `tests/agent/test_stream_delivery_display_tts.py`.

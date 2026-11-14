@@ -71,3 +71,5 @@ supersedes it, and asserts the parent receives only the replacement.
 Retire when upstream lets a plugin claim or defer a child failure notice and
 supersede a background completion. To roll back, revert the patch commits;
 `review-candidate` then only loses the suppression, not its fallback.
+
+Contract tests: `tests/gateway/test_subagent_failure_notice.py`, `tests/agent/test_retry_wait_cap.py`, `tests/tools/test_async_delegation_supersede.py`.

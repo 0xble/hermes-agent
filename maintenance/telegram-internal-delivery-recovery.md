@@ -43,3 +43,5 @@ Both cases leave failed rows and sibling transports untouched.
 ## Rollback and retirement
 
 Revert the scoped patch without resetting any ledger rows. Retire once an accepted upstream release supplies both same-object recovery and the late-write race guard with equivalent SQLite/profile regression evidence. Runtime adoption requires its separately authorized promotion path.
+
+Contract tests: `tests/gateway/test_telegram_internal_delivery_recovery.py`, `tests/gateway/test_delivery_ledger_producer.py`, `tests/gateway/test_delivery_ledger.py`, `tests/gateway/test_telegram_polling_health_confirmation.py`.

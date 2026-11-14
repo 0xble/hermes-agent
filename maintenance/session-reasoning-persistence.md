@@ -19,3 +19,5 @@ Upstream [PR #98901](https://github.com/NousResearch/hermes-agent/pull/98901) (o
 ## Retirement and rollback
 
 Retire when an adopted upstream release persists and rehydrates the session reasoning pick across messaging-gateway restarts with clears on reset, `/new` and `/resume`. Revert the scoped changes in `gateway/session.py`, `gateway/run_config_loaders.py`, `gateway/slash_commands_session.py`, the test, this file and its index row. A persisted `reasoning_override` key left in routing rows is ignored by builds without the field, so rollback needs no state migration.
+
+Contract tests: `tests/gateway/test_session_reasoning_override_persistence.py`, `tests/gateway/test_model_command_reasoning_flag.py`, `tests/gateway/test_running_agent_session_toggles.py`, `tests/gateway/test_reasoning_command.py`.

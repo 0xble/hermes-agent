@@ -56,3 +56,5 @@ Focused regression: `scripts/run_tests.sh tests/agent/test_turn_recovery_autorec
 Retire when a released upstream implementation buffers the post-exhaustion ladder
 notice and preserves the same success, terminal-failure, live-wait, and interrupt
 contracts.
+
+Contract tests: `tests/agent/test_turn_recovery_autorecover.py`.

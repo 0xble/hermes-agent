@@ -31,3 +31,5 @@ raised historical upgrade floor makes its guard redundant. Read
 [install and scratch GC](install-and-scratch-gc.md) when changing takeover PM
 runtime lock/owner identity; the PM dependency project is not the checkout
 whose dependency state recovery and collection fence.
+
+Contract tests: `tests/pm/test_legacy_tar_bootstrap.py`, `tests/pm/test_archive_safety.py`, `tests/hermes_cli/test_stale_root_module_bridge.py`, `tests/e2e/core/upgrade/test_fresh_process_entrypoints.py`.

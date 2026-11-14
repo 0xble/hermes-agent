@@ -47,3 +47,5 @@ skill sync or `hermes update`.
 Set the flag through `hermes config set skills.seed_essentials false` and read
 it back as a YAML boolean. The reader checks `is not False`, so a quoted
 `"false"` string silently keeps the default.
+
+Contract tests: `tests/agent/test_phantom_tool_references.py`.

@@ -27,3 +27,5 @@ only after a successful recapture.
 Run `scripts/run_tests.sh -j 6` on `tests/hermes_cli/test_quick_snapshot_retention.py`, `test_backup_stability.py`, `test_backup.py`, `test_backup_all_profiles.py`, `test_backup_path_errors.py`, and `tests/agent/test_curator_backup.py`. These tests use disposable homes and real SQLite files. Manifest size is not a content digest: a different valid SQLite file of identical size cannot be identified under the present format.
 
 Retire the fork patch only when a selected released upstream revision preserves bounded incomplete retention, verified database and oversized non-DB recovery copies, manual/pre-update family isolation, and just-published generation safety. Roll back this patch through source revert, not by removing existing recovery directories; source rollback cannot resurrect snapshots already expired under retention.
+
+Contract tests: `tests/hermes_cli/test_quick_snapshot_retention.py`, `tests/agent/test_curator_backup.py`.

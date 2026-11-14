@@ -19,3 +19,5 @@ Run `scripts/run_tests.sh tests/tools/test_tts_*.py` and `scripts/run_tests.sh t
 ## Retirement and rollback
 
 Retire when a released upstream version separates TTS discovery from lazy SDK installation with equivalent opt-out and managed-install behavior. Roll back the probe and its focused tests together; re-check the matrix under cold-start load before removing this protection.
+
+Contract tests: `tests/e2e/core/providers/test_catalog_matrix_1.py`.

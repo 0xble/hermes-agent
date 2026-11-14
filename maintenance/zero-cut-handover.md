@@ -262,3 +262,5 @@ planned-handover guarantee.
 
 The switch stays false until the later PRs and the launchd drill pass. The legacy
 single-slot drain/restart path remains canonical until then.
+
+Contract tests: `tests/plugins/test_received_handover.py`, `tests/gateway/test_zero_cut_handover_verb.py`.

@@ -262,3 +262,5 @@ and the attended model unit and turn-runner tests together with the gateway regr
 ## Retirement and rollback
 
 Retire when an adopted upstream release provides equivalent attended model switching and disabled-path compatibility, or an upstream Telegram topic tool provides the same agent-callable contract. Remove the corresponding routing/tool implementation, tests, configuration and documentation, and this maintenance unit without changing the existing default routing path.
+
+Contract tests: `tests/gateway/test_attend_command.py`, `tests/gateway/test_attended_session_opening.py`, `tests/gateway/test_model_pick_expiry.py`, `tests/gateway/test_attended_busy_activity.py`, `tests/gateway/test_session_store_lock_io.py`, `tests/gateway/test_model_role_lifecycle.py`, `tests/tui_gateway/test_tui_gateway_server.py`.

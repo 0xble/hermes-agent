@@ -72,3 +72,5 @@ Load this unit when changing the adapter active-session guard, the runner busy f
 Retire alias expansion when upstream expands alias quick commands on the busy path. Retire
 defer-until-idle when PR 116295 or equivalent is in the candidate release. Roll back by
 reverting the logical patch; no persistent data changes.
+
+Contract tests: `tests/gateway/test_exec_quick_command_tree.py`, `tests/gateway/test_telegram_voice_v0_regressions.py`, `tests/gateway/test_command_bypass_active_session.py`, `tests/gateway/test_session_race_guard.py`, `tests/gateway/test_busy_command.py`, `tests/gateway/test_running_agent_session_toggles.py`.

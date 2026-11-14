@@ -21,3 +21,5 @@ Reproduced on 2026-10-17: 4 concurrent long compressions held all 4 workers, and
 ## Retirement and rollback
 
 Retire after a released upstream version treats pool saturation as a transient defer for every automatic caller. Roll back the patch commit and its regression. No persistent-data migration is required.
+
+Contract tests: `tests/agent/test_preflight_compression_pool_saturation.py`, `tests/agent/test_over_window_compression_fail_closed.py`, `tests/agent/test_compression_attempt_lifecycle.py`, `tests/agent/test_long_context_pool_saturation.py`.

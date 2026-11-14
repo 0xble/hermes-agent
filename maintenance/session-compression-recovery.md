@@ -279,3 +279,5 @@ release. No persistent schema migration, data deletion or config rollback is
 needed. A source rollback restores the old unsafe auto-reset behavior, so pause
 oversized-topic traffic until the parent confirms a safe route. Never restart,
 deploy or roll back from a source worker.
+
+Contract tests: `tests/gateway/test_compression_exhaustion_keeps_context.py`, `tests/gateway/test_native_fifo_context_exhaustion.py`, `tests/gateway/test_api_session_compression_exhaustion.py`, `tests/gateway/test_model_role_lifecycle.py`, `tests/gateway/test_auto_reset_clean_context.py`, `tests/agent/test_native_preflight_estimate.py`.

@@ -22,3 +22,5 @@ Load this unit when changing Telegram typing refresh cadence or the post-send ty
 ## Retirement
 
 Remove this unit when released upstream provides an equivalent adapter-specific typing cadence and deferred, coalescing post-send re-arm with final-turn cancellation.
+
+Contract tests: `tests/gateway/test_typing_refresh_interval.py`, `tests/gateway/test_telegram_typing_retrigger.py`.

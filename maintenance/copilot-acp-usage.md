@@ -21,3 +21,5 @@ Found by the scheduled fork nightly on 2026-09-26 (run 36234305522 at `c8e334259
 ## Retirement and rollback
 
 Retire when a released upstream baseline stops fabricating ACP usage and its compaction E2E passes on the fork nightly. Roll back by reverting the patch commit. No persisted state changes.
+
+Contract tests: `tests/hermes_cli/test_config_edit_seed.py`, `tests/agent/test_copilot_acp_client.py`.

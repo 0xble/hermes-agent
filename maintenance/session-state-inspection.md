@@ -29,3 +29,5 @@ Run `HERMES_TEST_FILE_RETRIES=0 scripts/run_tests.sh tests/tools/test_session_st
 ## Retirement and rollback
 
 Retire when a released upstream Hermes surface provides an equivalent typed, bounded, profile-scoped read-only route and preview boundary while preserving the same no-migration and no-transcript guarantees. Roll back by reverting the commits carrying `Fork-Patch: session-state-inspection`; no persisted data or schema migration is part of this patch.
+
+Contract tests: `tests/tools/test_session_state_tool.py`, `tests/agent/test_display.py`, `tests/hermes_cli/test_sessions_export_read_only.py`, `tests/hermes_cli/test_sessions_inspect.py`, `tests/tools/test_session_search.py`, `tests/ci/test_prompt_surface.py`, `tests/hermes_cli/test_shared_metrics_efficiency.py`.

@@ -131,3 +131,5 @@ policy, index creation, and regressions together. The extra index may remain
 on disk harmlessly. Rolling back to count-only pruning immediately weakens
 future audit coverage and cannot restore already-deleted history. Source
 qualification alone does not install or activate the change.
+
+Contract tests: `tests/cron/test_execution_retention.py`, `tests/cron/test_execution_coverage.py`.

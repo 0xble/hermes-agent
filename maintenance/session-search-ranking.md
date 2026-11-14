@@ -19,3 +19,6 @@ The synthetic regression uses a strong older match and a weak recent match for t
 ## Retirement and rollback
 
 Retire after a released upstream version provides relevance-first temporal tie-breaking with equivalent coverage. Roll back by reverting the fork patch commit; no persisted data or schema migration.
+
+
+Contract tests: `tests/tools/test_session_search.py`.

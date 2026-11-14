@@ -26,3 +26,5 @@ Upstream has no `scripts/ci/portable.py` and no fork-style shards. Its `tests.ym
 ## Verification
 
 `scripts/ci/tests/test_portable.py` checks that the soak file's shard runs it alone under its listed bound while every other file in that shard, and every file in other shards, runs with no override. It also checks that ordinary E2E files keep their mapped bound and the upgrade suite keeps 900 s.
+
+Contract tests: `tests/e2e/core/delivery/test_cron_virtual_clock_soak.py`, `tests/e2e/core/cli_tmux/test_classic_cli_live_session.py`.

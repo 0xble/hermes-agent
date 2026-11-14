@@ -26,3 +26,5 @@ Patch identity: `slack-linked-emphasis`. The same renderer split Markdown and Sl
 The existing inline-code adaptation from fork PR #783 remains part of this behavior. Upstream PR [#105534](https://github.com/NousResearch/hermes-agent/pull/105534), inspected at `be3494cc59be3b41455a71a596e7fa24723124ee`, uses the same opaque-span and outermost-emphasis approach but does not cover this fork's native Slack autolinks. Adapt rather than replace that supported link path.
 
 The regression boundary is `tests/plugins/platforms/slack/test_linked_emphasis.py`: the reported linked labels, Markdown and Slack links across native containers, nested emphasis, opaque code/link content, literal placeholder characters, and adjacent unstyled content. Existing renderer and adapter suites remain required. Retire the local inline change only when a selected upstream release passes those contracts, including the native Slack link forms, without it.
+
+Contract tests: `tests/plugins/platforms/slack/test_ordered_list_numbering.py`, `tests/plugins/platforms/slack/test_linked_emphasis.py`.

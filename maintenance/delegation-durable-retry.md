@@ -130,3 +130,5 @@ Fork patch identity: `delegation-durable-retry`.
 `tests/tools/test_delegation_retry.py`, `tests/tools/test_delegation_retry_controls.py`,
 `tests/gateway/test_delegation_retry_delivery.py`, `tests/tools/test_delegate_control_actions.py`,
 `tests/gateway/test_delegation_auto_resume.py`.
+
+Contract tests: `tests/tools/test_delegation_retry.py`, `tests/tools/test_delegation_retry_controls.py`, `tests/gateway/test_delegation_retry_delivery.py`, `tests/tools/test_delegate_control_actions.py`, `tests/gateway/test_delegation_auto_resume.py`.
