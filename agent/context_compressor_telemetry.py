@@ -6,6 +6,7 @@ must never import that module at module level (import cycle).
 
 from __future__ import annotations
 
+import logging
 import uuid
 from typing import Any
 
@@ -43,6 +44,8 @@ class CompressionTelemetryMixin:
             "current_estimated_tokens": _safe_int(current_tokens),
             "effective_threshold": _safe_int(self.threshold_tokens), "protected_head_tokens": None,
             "protected_tail_tokens": None, "middle_window_tokens": None, "prellm_skip_count": 0,
+            "aux_input_tokens": None, "aux_output_tokens": None,
+            "summary_budget_tokens": None, "summary_output_tokens": None, "summary_budget_overrun_tokens": None,
             "aux_prompt_tokens": None, "aux_output_reservation": None, "aux_provider": "", "aux_model": "",
             "effective_aux_context": None, "fit_margin": None, "chunking": False, "chunk_count": 0,
             "total_duration_ms": None, "aux_call_duration_ms": None, "queue_wait_ms": None, "prompt_build_ms": None,
@@ -76,10 +79,20 @@ class CompressionTelemetryMixin:
         self, *, prompt_messages: list[dict[str, Any]], max_tokens: int | None, duration_ms: int,
         aux_provider: str | None = None, aux_model: str | None = None,
         effective_aux_context: int | None = None, phase_timings: dict[str, Any] | None = None,
+        response: Any = None,
     ) -> None:
         telemetry = getattr(self, "_active_compression_telemetry", None)
         if not isinstance(telemetry, dict):
             return
+        usage = getattr(response, "usage", None)
+        for field, names in (("aux_input_tokens", ("prompt_tokens", "input_tokens")),
+                             ("aux_output_tokens", ("completion_tokens", "output_tokens"))):
+            for name in names:
+                value = usage.get(name) if isinstance(usage, dict) else getattr(usage, name, None)
+                value = _safe_int(value)
+                if value is not None:
+                    telemetry[field] = (telemetry.get(field) or 0) + value
+                    break
         telemetry["aux_prompt_tokens"] = estimate_messages_tokens_rough(prompt_messages)
         # The summary prompt is built fresh per attempt and never estimated again; don't let the memo pin it.
         forget_message_token_memo(prompt_messages)
@@ -119,6 +132,26 @@ class CompressionTelemetryMixin:
             self._last_aux_model_failure_model = failed_model
             failure = route.get("failure") or "unknown error"
             self._last_aux_model_failure_error = failure if len(failure) <= 220 else failure[:217].rstrip() + "..."
+
+    def _record_summary_budget(self, budget: int) -> None:
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry["summary_budget_tokens"] = budget
+
+    def _record_summary_output(self, summary: str, budget: int) -> None:
+        # Observe overruns without truncating memory or paying for another summary call.
+        messages = [{"role": "assistant", "content": summary}]
+        tokens = estimate_messages_tokens_rough(messages)
+        forget_message_token_memo(messages)
+        overrun = max(0, tokens - budget)
+        telemetry = getattr(self, "_active_compression_telemetry", None)
+        if isinstance(telemetry, dict):
+            telemetry.update(summary_output_tokens=tokens, summary_budget_overrun_tokens=overrun)
+        if overrun:
+            logging.getLogger(__name__).warning(
+                "Compression summary budget exceeded: summary_output_tokens=%s summary_budget_tokens=%s overrun_tokens=%s",
+                tokens, budget, overrun,
+            )
 
     def _compression_method(self) -> str:
         """How the summary that replaced the middle window was produced."""
