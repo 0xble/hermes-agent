@@ -1235,9 +1235,12 @@ class GatewayModelCommandsMixin:
         if self._live_agent_for_session_control(session_key) is None:
             self._evict_cached_agent(session_key)
 
-    def _set_reasoning_override(self, session_key: str, value, source=None, *, scope: Optional[str] = None) -> None:
+    def _set_reasoning_override(
+        self, session_key: str, value, source=None, *, scope: Optional[str] = None,
+        persist: bool = True,
+    ) -> None:
         """Apply a session override to the live tool loop's next model request."""
-        self._set_session_reasoning_override(session_key, value, scope=scope)
+        self._set_session_reasoning_override(session_key, value, scope=scope, persist=persist)
         agent = self._live_agent_for_session_control(session_key)
         if agent is not None:
             effective = value if value is not None else self._resolve_session_reasoning_config(
@@ -1249,10 +1252,21 @@ class GatewayModelCommandsMixin:
         else:
             self._evict_idle_agent_after_session_control(session_key)
 
+    def _session_reasoning_override_lock(self, session_key: str) -> asyncio.Lock:
+        locks = getattr(self, "_session_reasoning_override_locks", None)
+        if not isinstance(locks, dict):
+            locks = self._session_reasoning_override_locks = {}
+        lock = locks.get(session_key)
+        if lock is None:
+            lock = locks[session_key] = asyncio.Lock()
+        return lock
+
     async def _apply_reasoning_selection_off_loop(self, session_key: str, *args, **kwargs) -> str:
         """Apply /reasoning off-loop while preserving the existing session-state write order."""
         if session_key:
             self._session_state(session_key)
+            async with self._session_reasoning_override_lock(session_key):
+                return await asyncio.to_thread(self._apply_reasoning_selection, session_key, *args, **kwargs)
         return await asyncio.to_thread(self._apply_reasoning_selection, session_key, *args, **kwargs)
 
     def _apply_reasoning_selection(

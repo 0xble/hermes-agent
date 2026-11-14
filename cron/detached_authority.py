@@ -20,6 +20,10 @@ PREFIX = 'cron-worker:'
 logger = logging.getLogger(__name__)
 
 
+class DetachedHandshakeTimeout(TimeoutError):
+    """The gateway handshake budget was exhausted before cron work started."""
+
+
 def detached_assignment(job_id, execution_id):
     from cron.executions import get_execution
     row = get_execution(execution_id) if execution_id else None
@@ -235,7 +239,25 @@ def _attach_worker(rpc, scope):
     from websockets.exceptions import ConnectionClosed
 
     ambiguous = False
+
+    def timeout_phase(exc, operation):
+        current = exc
+        while current is not None:
+            phase = getattr(current, 'phase', None)
+            if phase:
+                return f"gateway handshake timed out ({str(phase).replace('_', '-')})"
+            if isinstance(current, TimeoutError):
+                # run_detached calls this only BEFORE start_detached_body wins
+                # the durable body gate. Later reconnect timeouts must never use
+                # this classifier: an ambiguous started body cannot be replayed.
+                text = str(current)
+                phase = 'connect' if text in ('', 'timed out') else operation + '-answer'
+                return f'gateway handshake timed out ({phase})'
+            current = current.__cause__
+        return None
+
     for attempt in range(4):
+        operation = 'register'
         try:
             try:
                 rpc('worker.register', **scope, kind='cron')
@@ -244,12 +266,16 @@ def _attach_worker(rpc, scope):
                 # original worker instead. Never create a replacement identity.
                 if not ambiguous or str(exc) not in ('admission_conflict', 'producer_not_started', 'stale_epoch'):
                     raise
+            operation = 'adopt'
             return rpc('worker.adopt', **scope)
         except (WorkerPersistenceError, GatewayOwnerRestartError, ConnectionClosed, OSError) as exc:
             if isinstance(exc, WorkerPersistenceError) and str(exc) not in (
                     'owner_unavailable', 'gateway_unavailable', 'storage_unavailable', 'stale_epoch'):
                 raise
             if attempt == 3:
+                phase = timeout_phase(exc, operation)
+                if phase is not None:
+                    raise DetachedHandshakeTimeout(phase) from exc
                 raise
             ambiguous = True
             logger.warning('detached_cron_handshake_retry execution_id=%s session_id=%s '
@@ -269,7 +295,10 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     from websockets.exceptions import ConnectionClosed
     import psutil
 
-    if not owns_detached_execution(job['id'], execution_id):
+    from cron.executions import mark_detached_attach_lost, mark_detached_attaching, start_detached_body
+
+    if (not owns_detached_execution(job['id'], execution_id)
+            or not mark_detached_attaching(execution_id)):
         raise RuntimeStoreError('permission_denied')
     scope = dict(profile_id=state['profile_id'], session_id=receipt['session_id'],
                  execution_id=PREFIX + execution_id, generation=state['generation'],
@@ -277,6 +306,13 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     rpc = WorkerRPC(get_hermes_home())
     try:
         adopted = _attach_worker(rpc, scope)
+    except DetachedHandshakeTimeout:
+        # This is the only handshake loss that is eligible for pre-body recovery.
+        # Record it while the durable attaching fence still identifies this worker;
+        # downstream code must not infer it from the eventual error text.
+        mark_detached_attach_lost(execution_id)
+        rpc.close()
+        raise
     except BaseException:
         rpc.close()
         raise
@@ -331,6 +367,8 @@ def run_detached(job, receipt, state, record, save, *, execution_id, extra_promp
     watcher.start()
     try:
         from cron.scheduler import run_job
+        if not start_detached_body(execution_id):
+            raise RuntimeStoreError('permission_denied')
         value = run_job(job, execution_id=execution_id, extra_prompt=extra_prompt, cancel_event=cancel_event)
         from gateway.session_cron import RUN_JOB_FLAGS
         record['worker_result'] = {'result': list(value),

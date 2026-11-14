@@ -42,6 +42,57 @@ def test_recovered_receipt_finishes_foreign_execution_and_is_idempotent(tmp_path
         assert executions.get_execution(execution['id'])['delivery_outcome'] == 'suppressed'
 
 
+
+
+def test_dead_firer_recovery_unknown_row_uses_base_receipt_path(tmp_path, monkeypatch):
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        execution = executions.create_execution(job['id'], source='test')
+        executions.mark_execution_running(execution['id'])
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET process_id=?, pid=?, process_started_at=? WHERE id=?",
+                ('dead-owner', 999999, '0', execution['id']),
+            )
+        params = {'job_id': job['id'], 'request_id': execution['id'], 'extra_prompt': None}
+        journal = scheduler_authority.journal_path(job['id'], execution['id'])
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text(json.dumps({'params': params, 'job': job, 'receipt': None}))
+        executions.recover_interrupted_executions()
+        assert executions.get_execution(execution['id'])['status'] == 'unknown'
+        peer(monkeypatch, lambda method, params: {'status': 'terminal', 'job': job,
+                                                 'result': [True, 'document', 'answer', None]})
+        scheduler_authority.reconcile_pending()
+        assert executions.get_execution(execution['id'])['status'] == 'completed'
+        assert jobs.get_job(job['id'])['state'] == 'scheduled'
+        assert not journal.exists()
+
+
+def test_attach_lost_capture_stays_on_receipt_path(tmp_path, monkeypatch):
+    with jobs.use_cron_store(tmp_path / 'cron'):
+        job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')
+        execution = executions.create_execution(job['id'], source='test')
+        with executions._transaction() as conn:
+            conn.execute(
+                "UPDATE executions SET status='unknown', body_phase='attach_lost', finished_at=? WHERE id=?",
+                (jobs._hermes_now().isoformat(), execution['id']),
+            )
+        params = {'job_id': job['id'], 'request_id': execution['id'], 'extra_prompt': None}
+        journal = scheduler_authority.journal_path(job['id'], execution['id'])
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text(json.dumps({
+            'params': params, 'job': job,
+            'receipt': None,
+            'worker_result': {'result': [True, 'worker', 'worker', None], 'job_flags': {}},
+        }))
+        peer(monkeypatch, lambda method, params: {'status': 'terminal', 'job': job,
+                                                 'result': [True, 'receipt', 'receipt', None]})
+        scheduler_authority.reconcile_pending()
+        assert executions.get_execution(execution['id'])['status'] == 'completed'
+        assert not journal.exists()
+        assert journal.with_name(journal.name + '.unsettled').exists()
+
+
 def test_definite_refusal_is_booked_and_journal_retired(tmp_path, monkeypatch):
     with jobs.use_cron_store(tmp_path / 'cron'):
         job = jobs.create_job(prompt='report', schedule='every 1h', deliver='local')

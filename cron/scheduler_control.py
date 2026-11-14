@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import threading
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 from agent.interrupt_scope import InterruptScope
 
@@ -45,43 +45,89 @@ def release_unstarted_claim(job: dict) -> None:
     jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply))
 
 
-def defer_unstarted_fire(job: dict, reason: str) -> bool:
-    """Put a scheduled fire that never reached the gateway owner back on the schedule.
+def defer_unstarted_fire(job: dict, reason: str, *, pause: dict | None = None) -> str | None:
+    """Restore a proven unstarted occurrence under its exact fire-owner fence.
 
-    Releases only this attempt's claim and re-stamps its occurrence as an unclaimed
-    ``pending_slot`` (one-shots refund their preclaim instead), recording no run outcome and
-    no pause. The next due scan restores the slot once this process no longer runs the job,
-    and the ordinary late / catch-up policy bounds the retries. False when the fire has no
-    occurrence to restore (a manual run) or the claim is no longer this attempt's: the caller
-    then fails the run as before, so nothing is dropped silently."""
+    Shared with pre-submit deferral: no run outcome, pause, or failure-streak write.
+    The due scan enforces ordinary catch-up limits. One-shots refund the preclaim,
+    but retain the ORIGINAL occurrence identity rather than inventing a retry fire.
+    Returns ``"deferred"``.
+
+    When an operator edit (schedule, timezone or ``next_run_at`` through ``update_job``) superseded the
+    occurrence while it was unstarted, the edit already chose what runs next. ``update_job``
+    dropped the unclaimed slot for the same reason, so restoring it would revive the old
+    occurrence, and the ordinary failure lane would recompute ``next_run_at`` or consume the
+    one-shot. The claim is released and a one-shot preclaim refunded instead, leaving the
+    edited schedule untouched. Returns ``"superseded"``.
+
+    None when there is no occurrence to restore, the claim is no longer this attempt's, or
+    the job was stopped: the caller then fails the run visibly as before.
+    """
     from cron import jobs
     from cron.job_run_retry import preserve_unstarted_run
     from cron.occurrences import pending_slot_stamp
 
     owner = (job.get("fire_claim") or {}).get("by")
     instant = job.get("_scheduled_instant")
-    if owner is None or not instant:
-        return False
+    if not owner or not instant:
+        return None
 
     def apply(records, _index, current):
-        if (current.get("fire_claim") or {}).get("by") != owner:
-            return False
+        paused_by_recovery = (
+            isinstance(pause, dict)
+            and (current.get("paused_at"), current.get("paused_reason"))
+            == (pause.get("paused_at"), pause.get("reason"))
+        )
+        if ((current.get("fire_claim") or {}).get("by") != owner
+                or (not paused_by_recovery and not jobs.is_job_runnable(current))):
+            return None
         now = jobs._hermes_now()
+        if paused_by_recovery:
+            current["enabled"] = True
+            current["state"] = "scheduled"
+            current["paused_at"] = None
+            current["paused_reason"] = None
         kind = (current.get("schedule") or {}).get("kind")
-        if kind in {"cron", "interval"}:
+        if _occurrence_superseded(job, current):
+            if kind == "once":
+                _refund_oneshot_preclaim(current)
+            outcome, detail = "superseded", f"Not started; superseded by an operator edit: {reason}"
+        elif kind in {"cron", "interval"}:
             current["pending_slot"] = pending_slot_stamp(instant, now)
+            outcome, detail = "deferred", f"Deferred, not started: {reason}"
         elif kind == "once":
             preserve_unstarted_run(current, now.isoformat())
-            if current.get("run_claim") is not None:
-                current["run_claim"] = None
+            outcome, detail = "deferred", f"Deferred, not started: {reason}"
         else:
-            return False
+            return None
         current["fire_claim"] = None
-        current["last_fire_error"] = {"at": now.isoformat(), "detail": f"Deferred, not started: {reason}"[:500]}
+        current["run_claim"] = None
+        current["last_fire_error"] = {"at": now.isoformat(), "detail": detail[:500]}
         jobs.save_jobs(records)
-        return True
+        return outcome
 
-    return bool(jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply, False)))
+    return jobs._under_fire_fence(job["id"], lambda: jobs._with_job(job["id"], apply, None))
+
+
+def _occurrence_superseded(claimed: dict, current: dict) -> bool:
+    """True when an operator edit replaced this claimed occurrence before it started.
+
+    ``update_job`` marks the live claim (``superseded_at``) for schedule, timezone and
+    ``next_run_at`` edits. A raw ``next_run_at`` comparison is not evidence, because an
+    overlapping tick's ``advance_next_runs`` rewrites it while the fire is in flight. Schedule and
+    timezone are also compared directly, since a definition import rewrites them outside
+    ``update_job``, and nothing in the scheduler changes them."""
+    if (current.get("fire_claim") or {}).get("superseded_at"):
+        return True
+    return any(current.get(key) != claimed.get(key) for key in ("schedule", "timezone"))
+
+
+def _refund_oneshot_preclaim(current: dict) -> None:
+    """Undo ``claim_dispatch``'s increment so an edited one-shot can still fire at its new time."""
+    repeat = current.get("repeat") or {}
+    times = repeat.get("times")
+    if times is not None and times > 0 and repeat.get("completed", 0) > 0:
+        repeat["completed"] -= 1
 
 
 def owns_terminal_claim(job_id: str, owner: str) -> bool:
@@ -114,7 +160,7 @@ def start_control(job_id: str) -> None:
     with sched._running_lock:
         control = sched._running_cancel_events.get(sched._inflight_key(job_id))
         if control is not None:
-            control.started_at = datetime.now(timezone.utc).isoformat()
+            control.started_at = datetime.now(UTC).isoformat()
 
 
 def note_completed_delivery(job_id: str) -> None:
