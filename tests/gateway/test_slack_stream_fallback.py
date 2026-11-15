@@ -113,3 +113,39 @@ async def test_gateway_fallback_reuses_only_current_uninterrupted_stream(monkeyp
         client.chat_update.assert_not_awaited()
         if not current:
             client.chat_postMessage.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_abandoning_old_draft_keeps_replacement_draft_registered():
+    """Draft 7's abandon awaits stopStream while draft 8 opens in the same thread."""
+    adapter, client = _make_adapter()
+    old_meta = {"thread_id": "111.000", "user_id": "U123", "_draft_id": 7}
+    new_meta = {**old_meta, "_draft_id": 8}
+    await adapter.send_draft("D1", 7, "old partial", metadata=old_meta)
+    client.chat_startStream.return_value = {"ok": True, "ts": "124.000"}
+    stopping, release = asyncio.Event(), asyncio.Event()
+
+    async def stop_stream(**kwargs):
+        if kwargs["ts"] == "123.456" and not stopping.is_set():
+            stopping.set()
+            await release.wait()
+        return {"ok": True}
+
+    client.chat_stopStream.side_effect = stop_stream
+    abandon = asyncio.create_task(
+        adapter.abandon_open_draft("D1", "old partial", metadata=old_meta))
+    await asyncio.wait_for(stopping.wait(), timeout=5)
+    opened = await adapter.send_draft("D1", 8, "new answer", metadata=new_meta)
+    release.set()
+    abandoned = await asyncio.wait_for(abandon, timeout=5)
+
+    assert opened.message_id == "124.000"
+    assert abandoned.success and abandoned.message_id == "123.456"
+    assert [s["draft_id"] for s in _open_streams(adapter)] == [8]
+
+    final = await adapter.send("D1", "new answer", metadata=new_meta)
+
+    assert final.message_id == "124.000"
+    client.chat_postMessage.assert_not_awaited()
+    assert [c.kwargs["ts"] for c in client.chat_stopStream.await_args_list] == ["123.456", "124.000"]
+    assert not _open_streams(adapter)
