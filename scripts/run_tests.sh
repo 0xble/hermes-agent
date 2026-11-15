@@ -51,7 +51,8 @@
 # venv instead, from the checkout, after stopping anything that is using .venv
 # and removing it if it exists:
 #   python -m pm.build_env --source . --out .venv --group dev --group test
-# Or set HERMES_HOME to a scratch directory that is not a live runtime home.
+# Or set both HERMES_HOME and HERMES_RUNTIME_DIR to scratch directories that are
+# not a live runtime home (HERMES_HOME alone still resolves the live bootstrap store).
 # HERMES_ALLOW_LIVE_HOME_SETUP=1 overrides the refusal only when setup against
 # that home is deliberate. Activation's hermes_sync uses the same guard, even
 # when called directly. hermes update and the installer do not use this guard.

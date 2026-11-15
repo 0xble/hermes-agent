@@ -157,7 +157,7 @@ hermes_require_safe_setup() {
   echo "Then explicitly select that interpreter (clearing any stale activation for this command only):" >&2
   echo '  env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh' >&2
   echo "Append your original test arguments to that command." >&2
-  echo "Or set HERMES_HOME to a scratch directory that is not a live runtime home." >&2
+  echo "Or set both HERMES_HOME and HERMES_RUNTIME_DIR to scratch directories that are not a live runtime home." >&2
   echo "Set HERMES_ALLOW_LIVE_HOME_SETUP=1 only when setup against this home is deliberate." >&2
   return 1
 }
