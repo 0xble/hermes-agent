@@ -12,6 +12,7 @@ import os
 import re
 import threading
 import time
+import unicodedata
 import weakref
 from contextlib import suppress
 from contextvars import Context, copy_context
@@ -68,6 +69,33 @@ MAX_DERIVED_TITLE_CHARS = 48
 # Answer-shaped guard: a tiny model sometimes answers instead of titling; longer is rejected, not truncated.
 # The ceiling is the configured ``max_words`` plus headroom (see generate_title; port of can1357/oh-my-pi#7306).
 _TITLE_WORD_SLACK = 5
+# Absolute safety ceiling for answer-shaped output, retained alongside the configurable fork preference.
+_MAX_TITLE_WORDS = 12
+# Answer-shaped guard, CJK half: Han, kana and Hangul have no inter-word spaces, so the word count above
+# cannot see a full reply in those scripts (a 76-character Chinese answer counts as three "words"). Length
+# alone does not separate them: a plain Japanese title such as "クラウドストレージの同期エラーを解決する方法"
+# runs 22 characters. A reply is a sentence, so over 20 characters it is rejected when it carries sentence
+# punctuation, and past 40 (twice a sidebar title, where the 80-char cut would truncate it anyway) always.
+_MAX_TITLE_CJK_CHARS = 20
+_MAX_UNPUNCTUATED_TITLE_CJK_CHARS = 40
+# CJK script ranges counted by _cjk_char_count (after NFC): Han (Unified Ideographs, Extension A and the
+# supplementary-plane extensions), kana, Hangul syllables, and the CJK punctuation/fullwidth/halfwidth
+# blocks a reply in those scripts is written with, so "可以，直接在这说。…" counts its punctuation too.
+_CJK_RANGES = (
+    ("\u3000", "\u303f"),
+    ("\u3040", "\u30ff"),
+    ("\u3400", "\u4dbf"),
+    ("\u4e00", "\u9fff"),
+    ("\uac00", "\ud7af"),
+    ("\uff01", "\uff9f"),
+    ("\U00020000", "\U0003134f"),
+)
+# Sentence punctuation after NFKC (fullwidth ！？，． fold to ASCII): the ideographic full stop, and ASCII
+# ! ? , or a full stop that ends a sentence (followed by space or the end, so "Node.js" is not one).
+# Not "、" or ":": list commas and "Topic: detail" prefixes are title shapes.
+_SENTENCE_PUNCTUATION = re.compile(r"[\u3002!?,]|\.(?:\s|$)")
+# Output budget for the title call: room for a fenced/prefixed JSON reply and for a reasoning model that
+# thinks despite the thinking-disabled request, without letting a runaway reply burn minutes.
 TITLE_MAX_TOKENS = 512
 
 # The example titles shown to the model in the prompt, and the echo-guard
@@ -787,6 +815,29 @@ def _is_prompt_example_echo(title: str, title_style: str = "noun") -> bool:
     return normalized in reject
 
 
+def _cjk_char_count(text: str) -> int:
+    """CJK script characters in ``text`` after canonical composition (NFD Hangul is conjoining jamo,
+    outside the syllable block, so the same visible reply would otherwise count 0)."""
+    return sum(1 for ch in unicodedata.normalize("NFC", text) if any(lo <= ch <= hi for lo, hi in _CJK_RANGES))
+
+
+def _is_answer_shaped(title: str) -> bool:
+    """True when the model answered the user instead of titling the session.
+
+    Titling is a 3-7 word task with a short result; a reply is a full sentence. The word count covers
+    space-delimited text and the character budget covers CJK, where ``str.split()`` sees no boundaries.
+    NFKC first, for the judgement only (the stored title keeps its bytes): decomposed Hangul is the
+    same text as precomposed, and fullwidth punctuation the same as ASCII. The character count reads
+    the NFC text, where fullwidth punctuation still counts as CJK text.
+    """
+    text = unicodedata.normalize("NFKC", title)
+    if len(text.split()) > _MAX_TITLE_WORDS:
+        return True
+    cjk = _cjk_char_count(title)
+    return cjk > _MAX_UNPUNCTUATED_TITLE_CJK_CHARS or (
+        cjk > _MAX_TITLE_CJK_CHARS and _SENTENCE_PUNCTUATION.search(text) is not None)
+
+
 def generate_title(
     user_message: str,
     timeout: Optional[float] = None,
@@ -891,7 +942,8 @@ def generate_title(
         if _extract_json_title(str(raw_content)) == "":
             return ""
         title_value = payload.get("title") if isinstance(payload, dict) else None
-        title = _clean_title(_extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message))
+        raw_title = _extract_title_text(title_value or raw_content) or _title_from_reasoning(choice.message)
+        title = _clean_title(raw_title)
         if icon_allowed and icon_callback is not None:
             from agent.topic_icons import choose_topic_icon_deterministic, pick_ranked_icon, validate_ranked_icons
             proposed = None
@@ -910,11 +962,10 @@ def generate_title(
         if title is None or not any(char.isalnum() for char in title):
             return None
         title = _restore_name_aliases(title, prefs["name_aliases"])
-        # Answer-shaped output guard: titling is a short noun-phrase task. Respect the
-        # configured ceiling (already bounded by _title_preferences()).
+        # Reject model answers before _clean_title's 80-character cut hides their shape.
         max_title_words = prefs["max_words"] + _TITLE_WORD_SLACK
-        if len(title.split()) > max_title_words:
-            logger.debug("Rejecting answer-shaped title output (%d words > %d)", len(title.split()), max_title_words)
+        if _is_answer_shaped(" ".join(str(raw_title).split())) or len(title.split()) > max_title_words:
+            logger.debug("Rejecting answer-shaped title output (%r)", title)
             return None
         # _clean_title strips trailing punctuation before truncating, so a trailing "..." can only
         # come from its 80-character cut. A clipped task title is the defect this style replaces.

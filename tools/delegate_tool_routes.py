@@ -40,6 +40,9 @@ class TaskRoute:
     backend: str = "default"
     error: Optional[str] = None
     reasoning_cfg: Optional[dict[str, Any]] = None
+    # The task's provider-declared parameters this route came from (no secrets): what a continue after a restart
+    # re-routes with. None for an internal caller's explicit route (``route_for_config``), which cannot be rebuilt.
+    request: Optional[dict[str, Any]] = None
 
     def report(self) -> Optional[dict[str, Any]]:
         """The ``route`` a backend-routed task's result carries (None for the default backend's unlabelled route)."""
@@ -349,7 +352,8 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
             route = _route_one(provider, declared, i, task, config)
             _check_backend_effort(i, route, config)
             resolved = _route_to_task_route(route, parent_agent, cache, config, provider.name)
-            routes.append(replace(resolved, reasoning_cfg=dict(resolved.routing_cfg)))
+            request = {name: task[name] for name in declared if task.get(name) is not None}
+            routes.append(replace(resolved, reasoning_cfg=dict(resolved.routing_cfg), request=request))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
             routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
     return routes, None

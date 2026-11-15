@@ -10,6 +10,7 @@ import inspect
 import logging
 import os
 import platform
+import shlex
 import signal
 import stat
 import subprocess
@@ -25,7 +26,8 @@ _IS_WINDOWS = platform.system() == "Windows"
 # (not merely "not Windows") so macOS and other POSIX platforms never touch systemd.
 # See #70716.
 _IS_LINUX = platform.system() == "Linux"
-from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env
+from tools.environments.sandbox_scope import hosted_scope, producer_fields
+from tools.environments.local import _append_dropped_path_entries, _find_shell, _resolve_safe_cwd, _sanitize_subprocess_env, _terminal_env, routed_terminal_base
 from hermes_cli._subprocess_compat import windows_hide_flags
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, NamedTuple, Optional
@@ -37,6 +39,7 @@ from tools.process_registry_notifications import (
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_env import EnvironmentProcessMixin
 from tools.process_registry_ssh import SSHProcessBinding, SSHProcessMixin, process_provenance
+from tools.process_registry_env_scope import ProcessEnvScopeMixin
 from tools.process_registry_output_log import ProcessOutputLogMixin, open_output_log, record_exit_command, worker_output_log
 from tools.process_registry_ownership import ProcessOwnershipMixin
 from tools.process_registry_termination import ProcessTerminationMixin
@@ -48,7 +51,7 @@ from tools.process_registry_results import (
     save_completed_result,
     save_cut_pending_result,
 )
-from tools.process_registry_env_log import log_delta_command
+from tools.process_registry_env_log import fallback_exit_code, log_delta_command, parse_log_delta_reply
 from tools.process_registry_wait import monotonic as _monotonic, plan_for as _wait_plan
 from tools.process_registry_wsl import _is_wsl_launcher_command
 
@@ -586,6 +589,8 @@ class ProcessSession:
                                                 # may be collapsed by _resolve_container_task_id)
     owner_task_id: str = ""                     # RAW spawning task id ("sa-..."); ownership
                                                 # checks must use this, not task_id
+    sandbox_key: str = ""                       # hosted agent whose sandbox it runs in ("" = local activity);
+                                                # only that agent's scope can see it (sandbox_scope)
     session_key: str = ""                       # Gateway session key (reset protection)
     pid: Optional[int] = None
     process: Optional[subprocess.Popen] = None  # Popen handle (local only)
@@ -597,7 +602,7 @@ class ProcessSession:
     exited_at: float = 0.0                      # time.time() of the FIRST move to finished (0 = unknown)
     exit_code: Optional[int] = None             # None while running
     completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
-    termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    termination_source: str = ""                # process.kill|kill_all|backend_lost|env_closed|failed_start
     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # Recovered from checkpoint (no pipe)
@@ -699,15 +704,14 @@ class ProcessSession:
         if len(self.output_buffer) > self.max_output_chars:
             self.output_buffer = self.output_buffer[-self.max_output_chars:]
 
-    def mark_exited(self, exit_code, reason: str = "exited", source: str = "") -> None:
-        """Record an exit. A kill that raced the observer already recorded its own
-        exit_code/reason; never overwrite it."""
-        self.exited = True
-        if self.completion_reason != "killed":
-            self.exit_code = exit_code
-            self.completion_reason = reason
-            if source:
-                self.termination_source = source
+    def mark_exited(self, exit_code, reason: str = "exited", source: str = "") -> bool:
+        """Record an exit unless one is already recorded: the first observer's result (a raced kill,
+        an env-close settlement, a reconcile) stands. Returns whether it recorded. Hold ``self._lock``."""
+        if self.exited:
+            return False
+        self.exited, self.exit_code, self.completion_reason = True, exit_code, reason
+        self.termination_source = source or self.termination_source
+        return True
 
 
 # Watcher routing fields, in event-dict key order (``watcher_<key>`` on the session).
@@ -736,8 +740,11 @@ _WSL_CHAIN_NOTE = (
 )
 
 
-class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSurvivalMixin, ProcessOutputLogMixin,
-                      ProcessOwnershipMixin, EnvironmentProcessMixin, SSHProcessMixin):
+from tools.process_registry_readers import ProcessRegistry as ProcessReadersMixin
+
+
+class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSurvivalMixin, ProcessOutputLogMixin,
+                      ProcessOwnershipMixin, EnvironmentProcessMixin, SSHProcessMixin, ProcessEnvScopeMixin):
     """In-memory registry of running and finished background processes.
     Thread-safe: accessed from executor threads (terminal_tool, process handlers),
     the gateway asyncio loop (watchers, reset checks) and the cleanup thread."""
@@ -869,7 +876,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
     def _emit_output(self, session: ProcessSession, chunk: str) -> None:
         """Forward a chunk to the live-output sink; called from reader threads, never raises."""
         sink = self.on_output
-        if sink is None or not chunk:
+        if sink is None or not chunk or session.sandbox_key:  # the UI sinks are local surfaces with no scope
             return
         with suppress(Exception):
             sink(session, chunk)
@@ -971,6 +978,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             "session_key": session.session_key,
             "task_id": session.task_id,
             "owner_task_id": session.owner_task_id,
+            **producer_fields(session.sandbox_key),
             "command": session.command,
             **process_provenance(session),
             **{key: getattr(session, f"watcher_{key}") for key in _WATCHER_ROUTE_KEYS},
@@ -1151,10 +1159,11 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
     @staticmethod
     def _new_session(command, task_id, owner_task_id, session_key, cwd, **extra) -> ProcessSession:
         from gateway.session_context import get_session_env
+        from tools.environments.sandbox_scope import current_sandbox_key
 
         return ProcessSession(
             id=f"proc_{uuid.uuid4().hex[:12]}", command=command, task_id=task_id,
-            owner_task_id=owner_task_id, session_key=session_key, cwd=cwd,
+            owner_task_id=owner_task_id, session_key=session_key, cwd=cwd, sandbox_key=current_sandbox_key(),
             parent_session_id=get_session_env("HERMES_SESSION_ID", ""),
             wsl_chain=_is_wsl_launcher_command(command),
             started_at=time.time(), **extra)
@@ -1193,9 +1202,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
 
     @staticmethod
     def _spawn_env(env_vars: dict) -> dict:
-        """Sanitized child env from the session's client toolchain; PYTHONUNBUFFERED so poll sees progress."""
+        """Sanitized child env from the served profile's base, as foreground commands; PYTHONUNBUFFERED."""
         from agent.session_client_env import toolchain_environ
-        env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(), env_vars))
+        env = _terminal_env(_sanitize_subprocess_env(toolchain_environ(routed_terminal_base()), env_vars))
         env["PYTHONUNBUFFERED"] = "1"
         return env
 
@@ -1437,28 +1446,6 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 session, decoder, _append_chunk, "Process",
                 session.process.wait, lambda: session.process.returncode)
 
-    def _finish_reader(self, session, decoder, append, label, wait, exit_code) -> None:
-        """Reader-thread teardown: flush the decoder (a truncated multibyte tail becomes
-        one U+FFFD instead of vanishing), reap the child (no zombies), record the exit.
-
-        A process may close stdout long before it exits.  The reader owns a dedicated
-        daemon thread, so it must keep waiting rather than publish a false completion
-        and discard the only ``Popen`` handle that can reap the child.
-        """
-        with suppress(Exception):
-            tail = decoder.decode(b"", final=True)
-            if tail:
-                append(tail)
-        try:
-            wait()
-        except Exception as e:
-            # A PTY child reaped by isalive() already has its exitstatus; only an
-            # unknown status must stay tracked for later reconciliation.
-            if exit_code() is None:
-                logger.warning("%s wait failed; leaving process tracked: %s", label, e)
-                return
-            logger.warning("%s wait failed; recording known exit status: %s", label, e)
-        self._finish_exited(session, exit_code())
 
     _log_delta_command = staticmethod(log_delta_command)
 
@@ -1527,13 +1514,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         self._check_watch_patterns(session, text)
         self._emit_output(session, text)
 
-    def _finish_exited(self, session: ProcessSession, exit_code, reason: str = "exited", source: str = "") -> None:
-        """Mark a reader-observed exit (a raced kill keeps its own code/reason) and finish.
-        Under the session lock, like kill_process's commit: otherwise the kill can land between
-        mark_exited's ``killed`` check and its writes, and the reader overwrites the kill."""
+    def _finish_exited(self, session: ProcessSession, exit_code, reason: str = "exited", source: str = "") -> bool:
+        """Mark an observed exit and finish; returns whether this call recorded the result. Under the
+        session lock (like kill_process's commit) so the check-and-write is atomic against other finishers."""
         with session._lock:
-            session.mark_exited(exit_code, reason, source)
+            recorded = session.mark_exited(exit_code, reason, source)
         self._move_to_finished(session)
+        return recorded
 
     def _move_to_finished(self, session: ProcessSession) -> bool:
         """Claim finalization once; publish completion only after persistence finishes.
@@ -1589,6 +1576,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 "parent_session_id": session.parent_session_id,
                 "task_id": session.task_id,
                 "owner_task_id": session.owner_task_id,
+                **producer_fields(session.sandbox_key),
                 "command": session.command,
                 **process_provenance(session),
                 **({"handoff_note": session.handoff_note} if session.handoff_note else {}),
@@ -1789,6 +1777,9 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
     @staticmethod
     def _owns_event(evt: dict, session_key: str, owns_event, is_async_delegation: bool) -> bool:
         """Routing verdict for one drained event (see drain_notifications); False = requeue."""
+        from tools.environments.sandbox_scope import event_visible
+        if not event_visible(evt):
+            return False  # another agent's: stays queued for it, whatever the session routing says
         evt_session_key = str(evt.get("session_key") or "")
         requires_positive_proof = is_async_delegation or bool(evt_session_key or evt.get("origin_ui_session_id"))
         if owns_event is not None and requires_positive_proof:
@@ -1810,7 +1801,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         session's profile binding, and a once-per-process replay taken under a secondary's scope
         would leave the launch ledger unreplayed for the life of the process. Secondaries are
         replayed by the gateway's ``_restore_secondary_completion_ledgers``."""
-        if self._completions_restored:
+        if self._completions_restored or hosted_scope() is not None:  # hosted: not its ledger, and the setter refuses
             return 0
         self._completions_restored = True
         from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -1897,18 +1888,19 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
 
     def _lookup_session(self, session_id: str) -> Optional[ProcessSession]:
         """Session by full ID or unique prefix (``proc_4dae`` / bare ``4dae``, like git
-        short hashes); ambiguous or too-short prefixes resolve to None, never a guess."""
+        short hashes); ambiguous or too-short prefixes resolve to None, never a guess.
+        Inside a hosted scope another agent's process is indistinguishable from a missing one."""
+        from tools.environments.sandbox_scope import sandbox_visible
         if not isinstance(session_id, str) or not session_id:
             return None
         with self._lock:
             session = self._running.get(session_id) or self._finished.get(session_id)
         if session is None:
             session = load_completed_results(session_id).get(session_id)
-        return session if session is not None else self._resolve_prefix(session_id)
-
-    def get(self, session_id: str) -> Optional[ProcessSession]:
-        """Resolve a handle and refresh its original backend only."""
-        return self._refresh_detached_session(self._lookup_session(session_id))
+        session = session if session is not None else self._resolve_prefix(session_id)
+        if session is not None and not sandbox_visible(session.sandbox_key):
+            return None
+        return self._refresh_detached_session(session)
 
     def _resolve_prefix(self, session_id: str) -> Optional[ProcessSession]:
         """Resolve a unique session-ID prefix (a bare hex tail is normalized to
@@ -1920,12 +1912,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             query = f"proc_{query}"
         if len(query) - len("proc_") < self._MIN_PREFIX_CHARS:
             return None
+        from tools.environments.sandbox_scope import sandbox_visible
         matches = load_completed_results(query)
         with self._lock:
             matches.update({
                 sid: s for store in (self._running, self._finished)
                 for sid, s in store.items() if sid.startswith(query)
             })
+        # Another agent's process neither matches nor makes a prefix ambiguous.
+        matches = {sid: s for sid, s in matches.items() if sandbox_visible(s.sandbox_key)}
         return next(iter(matches.values())) if len(matches) == 1 else None
 
     def _reconcile_local_exit(self, session: ProcessSession) -> None:
@@ -2442,12 +2437,13 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             sessions.update(self._finished)
             sessions.update(self._running)
         from hermes_constants import get_hermes_home
+        from tools.environments.sandbox_scope import sandbox_visible
         home = str(get_hermes_home())
-        selected = [s for s in sessions.values() if self._matches_ssh_scope(s, home, node)]
+        selected = [s for s in sessions.values() if self._matches_ssh_scope(s, home, node) and sandbox_visible(s.sandbox_key)]
         all_sessions = [
             refreshed for refreshed in (
                 self._refresh_detached_session(s) for s in selected
-            ) if refreshed is not None
+            ) if refreshed is not None and not self._uncollected_gone(refreshed)
         ]
         if task_id or session_key:
             all_sessions = [
@@ -2620,7 +2616,10 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         session end / compression / error recovery (#41225). An explicit operator stop
         (``process.kill`` via process_manage, CLI /stop) passes its own source and still
         reaches them, so the user can always stop a persisted process on purpose."""
+        from tools.environments.sandbox_scope import sandbox_visible
         lifecycle = source in self._LIFECYCLE_KILL_SOURCES
+        # A sweep reaches only the current activity's own processes; a hosted agent's run in its
+        # sandbox and end with it (its kill would go through that agent's scope anyway).
         with self._lock:
             all_sessions = (*self._running.values(), *self._finished.values())
             if task_id is not None:
@@ -2629,7 +2628,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 all_sessions = tuple(s for s in all_sessions if self._matches_ssh_scope(s, home))
             candidates = [
                 s for s in all_sessions
-                if (task_id is None or s.owner_task_id == task_id)
+                if (task_id is None or s.owner_task_id == task_id) and sandbox_visible(s.sandbox_key)
                 and s.id not in exclude_ids and (not s.exited or s._scope_stop_pending)
                 and not (lifecycle and (s.persist_on_release or is_restart_safe(s)))
                 and not (source == "gateway_shutdown" and is_restart_safe(s))
@@ -2639,6 +2638,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 s for s in all_sessions
                 if (task_id is None or s.owner_task_id == task_id)
                 and s.id not in exclude_ids and not s.exited and is_restart_safe(s)
+                and sandbox_visible(s.sandbox_key)
             ]
             # Finished sessions whose systemd scope did not stop: retry only the scope stop.
             scope_retries = [s for s in candidates if s.exited]

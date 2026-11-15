@@ -311,17 +311,16 @@ def note_config_policy(home_key: str, raw) -> None:
 
 def resolve_profile_policy(home) -> None:
     """Record ``home``'s redaction policy now (log-routing setup), so its records never wait for it."""
-    from hermes_constants import hermes_home_key, reset_hermes_home_override, set_hermes_home_override
-    token = set_hermes_home_override(home)
+    from agent.runtime_scope import bind_profile_scope
+    from hermes_constants import hermes_home_key
     try:
-        key = hermes_home_key()
-        from hermes_cli.config import load_config_readonly, load_env
-        note_env_policy(key, load_env().get("HERMES_REDACT_SECRETS"))
-        note_config_policy(key, (load_config_readonly().get("security") or {}).get("redact_secrets"))
+        with bind_profile_scope(home, hydrate_secrets=False):
+            key = hermes_home_key()
+            from hermes_cli.config import load_config_readonly, load_env
+            note_env_policy(key, load_env().get("HERMES_REDACT_SECRETS"))
+            note_config_policy(key, (load_config_readonly().get("security") or {}).get("redact_secrets"))
     except (Exception, SystemExit) as exc:  # health: allow BLE001 -- unreadable now: stays unknown, which redacts
         logging.getLogger(__name__).debug("redaction policy for %s not read: %s", home, exc)
-    finally:
-        reset_hermes_home_override(token)
 
 
 def _redact_enabled() -> bool:
@@ -372,6 +371,8 @@ _PREFIX_PATTERNS = [
     r"xapp-\d+-[A-Za-z0-9-]{10,}",      # Slack app-Level token
     r"xox[baprs]-[A-Za-z0-9-]{10,}",    # Slack bot/app/user tokens
     r"AIza[A-Za-z0-9_-]{30,}",          # Google API keys
+    r"GOCSPX-[A-Za-z0-9_-]{8,}",        # Google OAuth client secret (pasted client_secret.json, #64351)
+    r"ya29\.(?:[a-z]\.)?[A-Za-z0-9_-]{20,}",  # Google OAuth access token: user a0…, service-account c., STS d. (#64351)
     r"pplx-[A-Za-z0-9]{10,}",           # Perplexity
     r"fal_[A-Za-z0-9_-]{10,}",          # Fal.ai
     r"fc-[A-Za-z0-9]{10,}",             # Firecrawl
@@ -1047,7 +1048,11 @@ def _is_opaque_prefixed_token(token: str) -> bool:
 
 def _mask_prefix_match(m: "re.Match[str]", mask) -> str:
     glued = m.start() > 0 and m.string[m.start() - 1] in "-_"
-    return m.group(0) if glued and not _is_opaque_prefixed_token(m.group(1)) else mask(m.group(1))
+    token = m.group(1)
+    # Google OAuth prefixes are distinctive even when base64url separators break every long run.
+    if glued and not token.startswith(("GOCSPX-", "ya29.")) and not _is_opaque_prefixed_token(token):
+        return m.group(0)
+    return mask(token)
 
 # Zhipu API keys use an unprefixed ``id.secret`` form. Keep this deliberately
 # provider-shaped instead of applying a generic high-entropy dotted-token rule:

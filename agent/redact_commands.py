@@ -43,8 +43,10 @@ def _is_under_hermes_home(path: str) -> bool:
     from agent.redact import (os)
     from agent.file_safety import _hermes_dirs, _realpath, _named_remote
 
+    from tools.environments.sandbox_scope import sandbox_lexical_path
     try:
-        target = os.path.normcase(_realpath(path if _named_remote() else os.path.expanduser(path)))
+        target = os.path.normcase(
+            sandbox_lexical_path(path) or _realpath(path if _named_remote() else os.path.expanduser(path)))
         homes = _hermes_dirs()
     except (OSError, RuntimeError, ValueError):
         return False

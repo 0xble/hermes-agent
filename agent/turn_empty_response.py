@@ -301,7 +301,6 @@ def recover_empty_response(
     # final response instead of fallback or retries.
     if (_recovered := _partial_stream_reply(agent)) is not None:
         _turn_exit_reason = "partial_stream_recovery"
-        _recovered = agent._strip_think_blocks(_partial_streamed).strip()
         logger.info(
             "Partial stream content delivered (%d chars) — using as final response",
             len(_recovered),

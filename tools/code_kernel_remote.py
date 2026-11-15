@@ -18,6 +18,7 @@ failure fails OPEN to the per-call path with a note.
 from __future__ import annotations
 
 import atexit
+import contextlib
 import json
 import logging
 import secrets
@@ -28,7 +29,7 @@ import uuid
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from tools.code_kernel import RUNNER_CELL_SOURCE, KernelRegistry, _current_caller, _log_kernel_lifecycle
+from tools.code_kernel import RUNNER_CELL_SOURCE, KernelRegistry, _current_caller, _log_kernel_lifecycle, stale_modules_warning
 
 logger = logging.getLogger(__name__)
 
@@ -144,9 +145,32 @@ class RemoteKernel:
     current_task: str = ""
     current_caller: str = ""
     retire_reason: str = "teardown"
+    # The bound hosted scope at spawn (None outside a hosted scope): kernel maintenance (reap,
+    # eviction kill, session-boundary shutdown) may run on another agent's thread or none at all,
+    # and its commands reach the sandbox only under the scope that owns it.
+    owner_scope: Any = None
 
     def sh(self, cmd: str, timeout: int = 15) -> str:
-        return _sh(self.env, cmd, timeout)
+        with self._owning_scope():
+            return _sh(self.env, cmd, timeout)
+
+    @contextlib.contextmanager
+    def _owning_scope(self):
+        """Bind the captured owning scope for trusted teardown: the kernel record itself is the
+        authority for whose sandbox its commands may reach, never a caller's bound scope. With the
+        owning sandbox already bound (a later turn of it: its own, newer fence) or never hosted
+        this is the identity."""
+        from tools.environments.sandbox_scope import hosted_scope, sandbox_identity
+        scope, bound = self.owner_scope, hosted_scope()
+        if scope is None or (bound is not None and sandbox_identity(bound) == sandbox_identity(scope)):
+            yield
+            return
+        from hermes_scope import push_state
+        token = push_state(scope=scope, home=None, secrets=None, terminal=None)
+        try:
+            yield
+        finally:
+            token.reset()
 
     def is_alive(self) -> bool:
         """Bounded liveness probe: kill -0 through the transport. Any transport
@@ -206,9 +230,12 @@ def shutdown_all_remote_kernels() -> None:
 
 def shutdown_remote_kernels_for_owner(owner: str) -> None:
     """Session-boundary disposal — wired to the same clear_session hook as
-    local kernels, so /new and session close reap both kinds."""
+    local kernels, so /new and session close reap both kinds. The owner is
+    resolved for the CURRENT scope, so a session close touches only the
+    current agent's remote kernels, never another hosted agent's."""
     if owner:
-        _REGISTRY.shutdown(owner)
+        from tools.code_kernel import session_close_owner
+        _REGISTRY.shutdown(session_close_owner(owner))
 
 
 def shutdown_remote_kernels_where(owner_matches: Callable[[str], bool]) -> None:
@@ -309,7 +336,9 @@ def _spawn_remote_kernel(env, env_type: str, owner: str, task_env_id: str,
 def _attach_remote_kernel(env, env_type, owner, task_env_id, sandbox_tools, *, reset, idle_exit):
     from agent.delegation_context import is_delegated_child_context
     from tools.code_kernel import _lifecycle_limits
+    from tools.environments.sandbox_scope import hosted_scope
     cap, _ = _lifecycle_limits()
+    owner_scope = hosted_scope()
     key = _kernel_key(owner, env_type, task_env_id, sandbox_tools)
     with _REGISTRY.lock:
         expired = _reap_unlocked(idle_exit)
@@ -324,6 +353,7 @@ def _attach_remote_kernel(env, env_type, owner, task_env_id, sandbox_tools, *, r
         if kernel is None:
             kernel = RemoteKernel(env, env_type, "", "", "", owner)
             kernel.pinned = is_delegated_child_context()
+            kernel.owner_scope = owner_scope
             _REMOTE_KERNELS[key] = kernel
         kernel.attached += 1
         kernel.last_used = time.monotonic()
@@ -583,4 +613,7 @@ def _run_attached_cell(kernel: RemoteKernel, key: tuple, code: str, *, env, task
             "restart, or idle self-exit); state from earlier calls was lost and a fresh kernel was started."))
     if cell_status == "error" and result["traceback"]:
         result["error"] = result["traceback"].strip().splitlines()[-1]
+    stale_warning = stale_modules_warning(cell_payload)
+    if stale_warning:
+        kernel_info["warning"] = stale_warning  # the caller rebuilds the result but keeps `kernel`
     return result
