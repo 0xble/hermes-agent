@@ -178,6 +178,46 @@ async def test_a_notice_that_never_reached_the_chat_is_not_lost_to_a_restart(tmp
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('told_by', ['next_message', 'next_boot'])
+async def test_a_reply_notice_that_failed_to_send_is_not_recorded_as_told(tmp_path, monkeypatch, told_by):
+    """(g) The unprompted notice failed, and so did the reply that then carried it: the chat was
+    never told, so neither the next message on this boot nor the next boot may stay silent."""
+    runner, adapter, source, sent = _gateway(tmp_path, monkeypatch)
+    deliver, failed, down = adapter.send, [], [True]
+
+    async def flaky(chat_id, content, **kwargs):
+        if PAUSED in content and down:
+            failed.append(content)
+            return SendResult(success=False, error='network down')
+        return await deliver(chat_id, content, **kwargs)
+    monkeypatch.setattr(adapter, 'send', flaky)
+    try:
+        sid, lost, queued = await _lose_human_turn_behind_queued_message(runner, source, tmp_path)
+        first, verdicts = await _restart(runner, tmp_path)
+        assert verdicts[sid] == 'unknown_execution'
+        await _settle(first)
+        await adapter.handle_message(MessageEvent(text='hello?', source=source, message_id='later'))
+        await _settle(first, adapter)
+        await asyncio.gather(*getattr(first, '_mutation_tasks', ()), return_exceptions=True)
+        assert len(failed) >= 2 and _notices(sent) == [], (failed, sent)  # the announcement and the reply
+        down.clear()
+        if told_by == 'next_message':
+            await adapter.handle_message(MessageEvent(text='anyone?', source=source, message_id='again'))
+            await _settle(first, adapter)
+            assert len(_notices(sent)) == 1, sent
+        else:
+            again = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='restarted-again')
+            verdicts = await recover_profile_native_sessions(runner, again)
+            assert verdicts[sid] == 'unknown_execution'
+            await _settle(again)
+            assert len(_notices(sent)) == 1, sent
+        assert get_session_admission(first.db, admission_id=lost)['status'] == 'unknown'
+        assert get_session_admission(first.db, admission_id=queued)['status'] == 'queued'
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('boot', ['settled', 'left-unknown'])
 async def test_no_notice_when_no_person_is_waiting(tmp_path, monkeypatch, boot):
     """(c) A lost automation turn pages nobody: boot settles it, or (its resolution refused) it

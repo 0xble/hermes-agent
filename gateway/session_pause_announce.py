@@ -94,7 +94,7 @@ async def remember_told(authority, ref) -> None:
 
 
 def schedule_remember_told(authority, ref):
-    """``remember_told`` from a synchronous reply path that has just claimed the notice."""
+    """``remember_told`` from a synchronous caller: the reply carrying the notice was delivered."""
     try:
         asyncio.get_running_loop()
     except RuntimeError:
@@ -135,7 +135,7 @@ async def announce_pause(authority, ref, reason) -> bool:
         return False
     if authority.sessions.get(ref.session_id) is not live:
         return False  # retired or replaced while the read ran
-    text = pause_notice(authority, ref, reason, told=False)  # claims this episode's one notice
+    text = pause_notice(authority, ref, reason)  # claims this episode's one notice
     if text is None:
         return False  # a message on the reply path already told the chat
     from gateway.run import _interim_metadata
