@@ -174,3 +174,47 @@ def test_pruning_converges_past_permanent_latest_attempts(ledger, monkeypatch, p
         if policy == "backstop":
             assert conn.execute("SELECT COUNT(*) FROM executions WHERE status='completed'").fetchone()[0] == singleton_count + 1
     assert executions.get_execution(current["id"])["status"] == "claimed"
+
+
+@pytest.mark.parametrize("protection", ["journal", "queued", "pending", "delivering", "provisional"])
+def test_protected_oldest_page_cannot_starve_newer_eligible_history(ledger, monkeypatch, protection):
+    from cron.scheduler_authority import journal_path
+
+    executions, home = ledger
+    monkeypatch.setattr(executions, "TERMINAL_PRUNE_BATCH_SIZE", 10)
+    older = (NOW - timedelta(days=30)).isoformat()
+    expired = (NOW - timedelta(days=20)).isoformat()
+    # Exactly one full candidate page (4x the batch) of older protected rows, then
+    # eligible rows of a job whose latest attempt is still live.
+    with executions._transaction() as conn:
+        conn.executemany(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at, finished_at,
+                delivery_outcome, delivery_status, delivery_status_provisional)
+               VALUES (?, 'audit', 'builtin', 'seed', 1, 'completed', ?, ?, ?, ?, ?)""",
+            ((f"protected-{i:02}", older, older,
+              "queued" if protection == "queued" else None,
+              protection if protection in ("pending", "delivering") else None,
+              int(protection == "provisional")) for i in range(40)),
+        )
+        conn.executemany(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at, finished_at)
+               VALUES (?, 'recurring', 'builtin', 'seed', 1, 'completed', ?, ?)""",
+            ((f"eligible-{i}", expired, expired) for i in range(5)),
+        )
+    if protection == "journal":
+        for i in range(40):
+            journal = journal_path("audit", f"protected-{i:02}")
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            journal.write_text('{"canonical_settled":false}', encoding="utf-8")
+    executions.create_execution("recurring", source="builtin")
+    for i in range(3):
+        monkeypatch.setattr(executions, "_hermes_now", lambda i=i: NOW + timedelta(seconds=i))
+        trigger = executions.create_execution("trigger", source="builtin")
+        assert executions.finish_execution(trigger["id"], success=True)
+    with sqlite3.connect(home / "cron" / "executions.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executions WHERE id LIKE 'eligible-%'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executions WHERE id LIKE 'protected-%'").fetchone()[0] == 40
