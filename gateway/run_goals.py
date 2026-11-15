@@ -18,7 +18,12 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform
-from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
+from gateway.platforms.event import (
+    GOAL_CONTINUATION_METADATA_KEY,
+    MessageEvent,
+    MessageType,
+    is_goal_continuation_event,
+)
 from hermes_cli.goal_notices import HIDDEN, notice_level
 from gateway.run_background_admission import BACKGROUND_RESERVATION_ATTR
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -901,7 +906,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not isinstance(agent_result, dict) or event is None:
             return False
         metadata = getattr(event, "metadata", None) or {}
-        if not (getattr(event, "internal", False) or getattr(self, "_is_goal_continuation_event")(event)):
+        if not (getattr(event, "internal", False) or is_goal_continuation_event(event)):
             return False
         if metadata.get("gateway_internal_retry_count", 0) >= 1:
             return False
@@ -953,7 +958,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not successful:
             final_text = ""
         if not successful:
-            await self._retry_failed_synthetic_event(event, source, agent_result)
+            try:
+                await self._retry_failed_synthetic_event(event, source, agent_result)
+            except Exception:
+                # Recovery is best-effort and must never mask goal/loop settlement.
+                logger.debug("failed internal turn recovery hook failed", exc_info=True)
         try:
             if existing_session_only:
                 # Settlement can precede a stop that suspends this route. Deferred
