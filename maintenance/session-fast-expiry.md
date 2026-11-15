@@ -134,3 +134,5 @@ second notice if another path already consumed it.
 Tests use frozen virtual clocks; no sleeps are used. Rows 1, 2, 4, and 5
 exercise the production ordering through preparation, tier resolution, cache
 selection, and wire-time reads rather than adding another Fast-state writer.
+
+Contract tests: `tests/gateway/test_custom_provider_request_overrides.py`.

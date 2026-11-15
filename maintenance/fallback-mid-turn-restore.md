@@ -45,8 +45,16 @@ quiet earlier-backup reclamation, and bookkeeping reset on restore or explicit
 switch. Voice turns that start on a provider fallback remain pinned across a
 tool call even when another session clears the shared outage. Both accepted
 and rejected voice routes preserve the session fallback's entry and stay timer.
+A reloaded session comes back on its pre-fallback route (#152333):
+`tests/agent/test_fallback_session_reload.py` covers the marker, legacy gateway
+rows, and that every explicit-pick writer (`update_session_model`, a local
+policy model selection, the TUI live persist) clears both the marker and the
+legacy `gateway_runtime.fallback_active` flag through `clear_fallback_markers`.
 Retire this patch when the selected upstream release contains equivalent
 mid-turn restore and optional stay-limit behavior and the regressions pass
 without the local implementation.
 
 Fork patch identities: `fallback-mid-turn-restore`.
+
+Contract tests: `tests/agent/test_mid_turn_primary_restore.py`,
+`tests/agent/test_fallback_session_reload.py`.

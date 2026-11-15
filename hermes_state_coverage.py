@@ -303,12 +303,15 @@ class SessionCoverageMixin:
                 resolved.append(matches[0])
         return list(dict.fromkeys(resolved))
 
-    def _matching_active_ids(self, conn, session_id: str, message: dict[str, Any]) -> list[int]:
+    def _matching_active_ids(self, conn, session_id: str, message: dict[str, Any],
+                             content_index: dict | None = None) -> list[int]:
         """Active row ids whose stored role and content equal *message*. Empty when it was never persisted."""
         content = message.get("content")
         if not isinstance(content, str):
             return []
         stored = self._encode_content(self._loaded_view_content(message.get("role", "unknown"), content))
+        if content_index is not None:
+            return content_index.get((message.get("role"), stored), [])
         return [int(row["id"]) for row in conn.execute(
             "SELECT id FROM messages WHERE session_id = ? AND active = 1 AND role = ? AND content = ?",
             (session_id, message.get("role"), stored)).fetchall()]
@@ -424,6 +427,9 @@ class SessionCoverageMixin:
 
         proved = [int(row_id) for row_id in covered_ids if isinstance(row_id, int) and row_id > 0]
         merged_away: set[int] = set()
+        content_index = None
+        from hermes_state_compaction_prepare import UNRESOLVED_SNAPSHOT_THRESHOLD
+        index_content = len(unresolved_held or ()) > UNRESOLVED_SNAPSHOT_THRESHOLD
         for message in unresolved_held or ():
             if not isinstance(message, dict):
                 continue
@@ -447,7 +453,14 @@ class SessionCoverageMixin:
             run = self._merged_user_run(conn, session_id, message, watermark)
             if message.get(MERGED_DURABLE_ROWS) and not run:
                 return None
-            matches = [] if run else self._matching_active_ids(conn, session_id, message)
+            if not run and index_content and content_index is None:
+                content_index = {}
+                for row in conn.execute(
+                    "SELECT id, role, content FROM messages WHERE session_id = ? AND active = 1",
+                    (session_id,)).fetchall():
+                    if row["role"] is not None:
+                        content_index.setdefault((row["role"], row["content"]), []).append(int(row["id"]))
+            matches = [] if run else self._matching_active_ids(conn, session_id, message, content_index)
             if len(matches) > 1 or (
                     message.get(_DB_PERSISTED_MARKER) and len(matches) != 1 and not run):
                 return None

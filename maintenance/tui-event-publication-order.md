@@ -25,3 +25,5 @@ Retire this patch when an adopted upstream revision provides equivalent stable s
 ## Verification Boundary
 
 The deterministic publication and lifecycle cohort lives in `tests/tui_gateway/test_session_event_publication.py`. Preserve baseline RED evidence for normal and connector publishers with 1 and 2 peers, then run that cohort, all `tests/tui_gateway`, and `tests/e2e/core/terminal`. The multiclient model must retain and pass seeds 11, 23 and 37 across repeated runs. Actual command results belong in the PR verification record, not in this evolution contract.
+
+Contract tests: `tests/tui_gateway/test_session_event_publication.py`.

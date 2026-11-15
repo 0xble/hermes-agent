@@ -26,3 +26,5 @@ Run `scripts/run_tests.sh -j 6 tests/hermes_cli/test_gateway_service.py tests/he
 ## Retirement and rollback
 
 Retire when the selected upstream release composes the same cron-aware stop envelope, retains authoritative outgoing inventory IDs without expanding kill targets, and emits historical warnings under the same conservative obligations; rerun regressions against that release without this patch. Roll back the fork commit and maintenance row together. No persistent state/schema change is made.
+
+Contract tests: `tests/hermes_cli/test_gateway_service.py`, `tests/hermes_cli/test_update_fleet_restart_pending.py`, `tests/hermes_cli/test_update_outgoing_gateway_identity.py`, `tests/gateway/test_restart_after_turn.py`, `tests/gateway/test_restart_drain.py`.

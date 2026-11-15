@@ -347,6 +347,34 @@ def test_units_owning_identities_without_contract_tests_are_listed_uncovered(tmp
     assert checker.uncovered_units() == ["maintenance/unit.md"]
 
 
+def test_a_unit_must_pin_proof_or_say_why_it_has_none(tmp_path, monkeypatch):
+    """A fork patch whose unit names no proof can be dropped by a sync unseen, so it fails the
+    check. A unit with no pytest proof by nature says so; the reason's code spans are not targets."""
+    _units(tmp_path, "fixture")
+    checker = _checker(tmp_path, monkeypatch)
+    assert [f.split(" owns ")[0] for f in checker.check_units_are_covered()] == ["maintenance/unit.md"]
+
+    _units(tmp_path, "fixture", prose="\nContract tests: none. A dependency pin proved by `uv.lock`.\n")
+    assert checker.check_units_are_covered() == [] and checker.check_contract_tests() == []
+
+    _units(tmp_path, "fixture", prose="\nContract tests: none\n")  # a bare none states no reason
+    assert len(checker.check_units_are_covered()) == 1
+
+
+def test_ci_harness_tests_can_be_pinned(tmp_path, monkeypatch):
+    _units(tmp_path, "fixture", prose="\nContract tests: `scripts/ci/tests/test_portable.py::test_gate`\n")
+    harness = tmp_path / "scripts" / "ci" / "tests"
+    harness.mkdir(parents=True)
+    (harness / "test_portable.py").write_text("def test_gate():\n    pass\n", encoding="utf-8")
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.check_contract_tests() == [] and checker.check_units_are_covered() == []
+
+
+def test_this_checkout_leaves_no_fork_unit_without_named_proof(monkeypatch):
+    checker = _checker(Path(__file__).resolve().parents[2], monkeypatch)
+    assert checker.check_units_are_covered() == []
+
+
 def test_this_checkout_pins_queued_voice_and_every_pinned_test_exists(monkeypatch):
     """The real contract: every pinned fork-behaviour test is present in this checkout."""
     root = Path(__file__).resolve().parents[2]

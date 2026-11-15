@@ -81,6 +81,11 @@ def _cancel_path(job_id, execution_id):
 
 def cancel_detached(row):
     request = _request(row)
+    if request is None and row.get('owner_kind') == 'detached':
+        job_id = row.get('job_id')
+        execution_id = row.get('id')
+        if job_id and execution_id:
+            request = ('cron', str(job_id), str(execution_id))
     if request is not None:
         from utils import atomic_json_write
         # The owner can accept Stop after claim but before the submit answer is

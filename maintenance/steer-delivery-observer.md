@@ -32,3 +32,5 @@ Run `scripts/run_tests.sh tests/agent/test_steer_delivered_hook.py
  tests/hermes_cli/test_plugins.py` (one shell command).
 The consumer's native probe additionally checks real plugin dispatch and durable
 capture with disposable state; it is not provider-acceptance or live activation proof.
+
+Contract tests: `tests/agent/test_steer_delivered_hook.py`, `tests/agent/test_steer.py`, `tests/agent/test_compression_busy_steer_anchor.py`, `tests/agent/test_lock_fallback_base_semantics.py`, `tests/hermes_cli/test_plugins.py`.

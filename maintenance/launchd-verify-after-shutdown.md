@@ -121,3 +121,5 @@ and that an old PID which never exits still fails within the shutdown budget.
 Retire when the selected upstream release verifies a slow-draining restart
 without the local change, whether through PR #94768 revised as suggested or an
 equivalent. Roll back by reverting the change.
+
+Contract tests: `tests/hermes_cli/test_launchd_reload_exit_budget.py`, `tests/hermes_cli/test_launchd_reload_handoff.py`, `tests/gateway/test_planned_restart_signal.py`, `tests/hermes_cli/test_update_launchd_restart_verification.py`, `tests/hermes_cli/test_update_launchd_fleet_restart.py`, `tests/hermes_cli/test_gateway_service.py`.

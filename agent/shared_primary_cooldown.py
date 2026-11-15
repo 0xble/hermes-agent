@@ -801,6 +801,49 @@ def primary_probe_is_owned(agent) -> bool:
     return False
 
 
+def earliest_available(routes: list[tuple[str, str, str]], *, now: float | None = None) -> tuple[int | None, float | None]:
+    """Return the earliest *recorded active* route as ``(index, reset_at)``.
+
+    The shared store records the configured primary when it leaves that route; it does not
+    record every fallback a request may later try.  Therefore a missing, malformed, expired,
+    or unreadable record is unknown, not proof that the route is available.  Callers combine
+    the returned active reset with their provider error hint and normal backoff.
+    """
+    if not routes:
+        return None, None
+    now = time.time() if now is None else now
+    known: dict[int, float] = {}
+    for index, route in enumerate(routes):
+        try:
+            record = read_cooldown(route)
+        except OSError:
+            continue
+        if not isinstance(record, dict):
+            continue
+        reset_at = _plausible_reset(record.get("reset_at"), now)
+        if reset_at is not None and reset_at > now:
+            known[index] = reset_at
+    if not known:
+        return None, None
+    index = min(known, key=lambda i: (known[i], i))
+    return index, known[index]
+
+
+def earliest_route_delay(agent: Any, *, failing_route: tuple[str, str, str], now: float | None = None) -> float | None:
+    """Return the earliest recorded delay only when it belongs to a different route than the failure."""
+    from contextlib import suppress
+    with suppress(Exception):
+        routes = [route_from_agent(agent)] + [
+            (str(entry.get("provider") or "").strip().lower(), str(entry.get("base_url") or ""), str(entry.get("model") or "").strip())
+            for entry in (getattr(agent, "_fallback_chain", None) or []) if isinstance(entry, dict)
+        ]
+        index, available_at = earliest_available(routes, now=now)
+        if index is not None and available_at is not None:
+            if route_key(**_route_fields(routes[index])) != route_key(**_route_fields(failing_route)):
+                return max(0.0, available_at - (time.time() if now is None else now))
+    return None
+
+
 def list_cooldowns(*, strict: bool = False) -> list[dict[str, Any]]:
     """Return active (still cooling) records.
 

@@ -20,3 +20,5 @@ When a successful Camofox navigation omits its page title, read `/tabs` using on
 ## Retirement and rollback
 
 Retire the fork delta only after a selected upstream *release* includes the full contract and named-account adaptation remains covered. Revert this patch and its tests/maintenance entry to roll back; no Camofox service, credential, state, or profile migration occurs.
+
+Contract tests: `tests/tools/test_browser_camofox.py`, `tests/tools/test_browser_camofox_accounts.py`, `tests/tools/test_browser_camofox_ensure_tab.py`.

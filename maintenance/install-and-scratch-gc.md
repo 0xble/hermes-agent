@@ -8,7 +8,7 @@ Both the gateway's install-orphan collection and the cron tick's periodic worktr
 
 Scratch maintenance must still run when macOS exports `TMPDIR`; honoring that user/OS temp directory must not bypass Hermes' scratch-tree pruner.
 
-The scratch pruner treats idle as not unused. Before reaping processes and again right before removal, it reads the retention declarations the host storage cleaner already honors: a `.keep` anywhere in an entry (outside `node_modules` and virtualenvs) pins that entry, and an entry's top-level `input-pins.json` pins the entry plus every scratch entry that holds one of its declared paths, followed transitively and compared by realpath. An unreadable declaration keeps every idle entry for that pass, because its dependencies cannot be ruled out. A declaration lasts until its owner deletes it. There is no lifecycle registry.
+The scratch pruner treats idle as not unused. Before reaping processes and again right before the hold move, it reads the retention declarations the host storage cleaner already honors: a `.keep` anywhere in an entry (outside `node_modules` and virtualenvs) pins that entry, and an entry's top-level `input-pins.json` pins the entry plus every scratch entry that holds one of its declared paths, followed transitively and compared by realpath. An unreadable declaration keeps every idle entry for that pass, because its dependencies cannot be ruled out. A declaration lasts until its owner deletes it. There is no lifecycle registry. Expired entries are renamed into a 7-day holding directory rather than deleted; that hold, its purge, and literal cron-job references are owned by [scratch prune hold](scratch-prune-hold.md).
 
 Guard tests: `tests/pm/test_install_gc.py` covers orphan, live, leased, locked, and legacy installs, the per-pass limit, and finishing an interrupted removal. `tests/gateway/test_install_orphan_housekeeping.py` covers the housekeeping chore collecting an orphan idle past a day while keeping a younger orphan and a live checkout's install. `tests/test_scratch_dir.py::test_user_tmpdir_does_not_disable_scratch_pruning` covers the macOS boot path, and the `test_prune_*` retention tests in the same file cover pinned, transitive, unreadable, `.keep` and re-read cases.
 
@@ -22,3 +22,5 @@ preserving the PM project's dependency inputs. Related historical upgrade
 seams are owned by [historical upgrade compatibility](nightly-upgrade-e2e.md).
 
 Retire when equivalent upstream behavior is present and the guard tests pass without this fork patch.
+
+Contract tests: `tests/pm/test_install_gc.py`, `tests/gateway/test_install_orphan_housekeeping.py`, `tests/test_scratch_dir.py`, `tests/pm/test_runtime.py`.

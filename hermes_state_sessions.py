@@ -755,10 +755,17 @@ class SessionSessionsMixin:
         if provider:
             route = {"provider": provider, "base_url": base_url or None, "api_mode": api_mode or None}
             patch.update(route, gateway_runtime=route)
-        self._write_model_config_patch(
-            session_id, patch, "UPDATE sessions SET model = ?, model_config = ? WHERE id = ?",
-            lambda merged: (model, merged, session_id),
-        )
+
+        def _do(conn):
+            from agent.fallback_session_route import clear_fallback_markers
+            merged = self._merge_model_config_json(conn, session_id, patch)
+            if merged is _MODEL_CONFIG_ROW_MISSING:
+                return
+            # An explicit pick owns the route, even when it names the model a fallback used (#152333).
+            config = clear_fallback_markers(_parse_model_config(merged))
+            conn.execute("UPDATE sessions SET model = ?, model_config = ? WHERE id = ?",
+                         (model, json.dumps(config) if config else None, session_id))
+        self._execute_write(_do, session_ids=(session_id,))
 
     def _write_model_config_patch(
         self, session_id: str, patch: dict[str, Any],

@@ -36,3 +36,5 @@ When tool registrations change, also run `tests/ci/test_prompt_surface.py` and `
 Install and activate the matching server first, then the Python client. Source publication does not authorize either installation or activation. A server lacking the inline contract must fail visibly, never trigger a legacy-path retry. Revert or deactivate the client before removing inline server support. Existing server-side path callers remain compatible. Captured local artifacts remain ordinary profile-local files.
 
 Retire this divergence when released upstream supports equivalent Camofox byte transfer, ownership and artifact safety with the behavior tests passing.
+
+Contract tests: `tests/tools/test_browser_file_transfer.py`, `tests/tools/test_browser_upload.py`, `tests/ci/test_prompt_surface.py`, `tests/hermes_cli/test_shared_metrics_efficiency.py`.

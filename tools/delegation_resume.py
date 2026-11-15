@@ -809,13 +809,19 @@ def classify_outcome(record: dict[str, Any]) -> tuple[str, str]:
         return "retry", "not started"  # the scheduler rejected it before any child ran
     reasons = {str(r.get("failure_reason") or "") for r in failed} - {""}
     if reasons and reasons <= TRANSIENT_REASONS:
-        return "retry", sorted(reasons)[0]
+        return "retry", min(reasons)
     if reasons - {"unknown"}:
         return RETRY_TERMINAL, ", ".join(sorted(reasons - {"unknown"}))
     if any(p in text.lower() for p in _TRANSIENT_TEXT):
         return "retry", "transient provider error"
     first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "error")
     return RETRY_TERMINAL, first_line[:160]
+
+
+def _route_chain(record: dict[str, Any]) -> list[tuple[str, str, str]]:
+    task = record.get("task") or {}
+    return [tuple(route) for route in task.get("route_chain") or []
+            if isinstance(route, (list, tuple)) and len(route) == 3]
 
 
 def _backoff(attempt: int) -> float:
@@ -826,6 +832,15 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
     """Classify one terminal ``armed`` row exactly once. Returns the plan, or None when not applicable."""
     ad = _ad()
     now = time.time() if now is None else now
+    # The route cooldown read loads config and takes a cross-process file lock with no timeout.
+    # Do it before BEGIN IMMEDIATE so it never stretches the ledger's writer transaction.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        preview = _load(conn, delegation_id)
+    routes = _route_chain(preview) if preview is not None and preview["retry_state"] == RETRY_ARMED else []
+    available_at = None
+    if routes:
+        from agent.shared_primary_cooldown import earliest_available
+        _, available_at = earliest_available(routes, now=now)
     with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
         record = _load(conn, delegation_id)
         if (record is None or record["retry_state"] != RETRY_ARMED
@@ -842,7 +857,20 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
                 verdict, reason = RETRY_TERMINAL, f"retry budget exhausted: still failing after 24h ({reason})"
             else:
                 verdict = RETRY_SCHEDULED
-                due = now + max(_backoff(record["retry_attempt"]), (_reset_delay(_texts(record), now) or 0) + 30.0)
+                if _route_chain(record) != routes:
+                    available_at = None  # the chain changed after the read: its cooldown is unknown
+                # A route with no record is unknown: the store only records primary-route
+                # outages in production. Combine every recorded active reset with the provider
+                # hint, then apply the normal exponential backoff floor.
+                candidates = []
+                if available_at is not None and 0 < available_at - now <= MAX_LINEAGE_AGE_S:
+                    candidates.append(available_at - now)
+                if reset_delay := _reset_delay(_texts(record), now):
+                    candidates.append(reset_delay)
+                # Avoid racing the provider's reset, but never park beyond the lineage budget.
+                reset_wait = min(candidates) + 30.0 if candidates else 0.0
+                deadline = float(record["retry_root_started_at"] or now) + MAX_LINEAGE_AGE_S
+                due = min(deadline, now + max(_backoff(record["retry_attempt"]), reset_wait))
         conn.execute(
             """UPDATE async_delegations SET retry_state=?, retry_reason=?, retry_due_at=?, updated_at=?
                WHERE delegation_id=? AND retry_state=?""",
@@ -883,18 +911,57 @@ def classify_armed(*, now: Optional[float] = None, limit: int = 64) -> int:
         armed = [r[0] for r in conn.execute(
             """SELECT delegation_id FROM async_delegations WHERE retry_state='armed'
                AND state NOT IN ('new','queued','admitted','running','stalling','finalizing') LIMIT ?""", (limit,))]
-        # A successful result whose delivery was permanently dropped still owes the user one line.
-        conn.execute(
-            f"""UPDATE async_delegations SET retry_state='terminal', retry_reason=?, retry_due_at=NULL, updated_at=?
-               WHERE retry_state='none' AND retry_reason IN ({",".join("?" for _ in SUCCESS_REASONS)})
+        # Even a zero-row UPDATE takes SQLite's writer lock. Discover dropped
+        # successes first, then recheck that predicate in the short update.
+        dropped_where = f"""retry_state='none' AND retry_reason IN ({",".join("?" for _ in SUCCESS_REASONS)})
                  AND (delivery_state='dropped' OR EXISTS (
                       SELECT 1 FROM async_delegation_events e
                       WHERE e.delegation_id=async_delegations.delegation_id
-                        AND e.event_kind='terminal_fallback' AND e.delivery_state='dropped'))""",
-            (RESULT_UNDELIVERABLE, now, *SUCCESS_REASONS))
+                        AND e.event_kind='terminal_fallback' AND e.delivery_state='dropped'))"""
+        dropped = [r[0] for r in conn.execute(
+            f"SELECT delegation_id FROM async_delegations WHERE {dropped_where} LIMIT ?",
+            (*SUCCESS_REASONS, limit))]
+        if dropped:
+            conn.execute(
+                f"""UPDATE async_delegations SET retry_state='terminal', retry_reason=?, retry_due_at=NULL, updated_at=?
+                    WHERE delegation_id IN ({",".join("?" for _ in dropped)}) AND {dropped_where}""",
+                (RESULT_UNDELIVERABLE, now, *dropped, *SUCCESS_REASONS))
     for delegation_id in armed:
         schedule_retry(delegation_id, now=now)
     return len(armed)
+
+
+def _claimable_retry_rows(conn, now: float, limit: int) -> list:
+    """Read without writer admission, then revalidate only the selected ids under it."""
+    stale = now - RETRY_CLAIM_TTL_S
+    conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
+    where = """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
+             OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
+             OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
+             OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
+           AND (event_json IS NULL OR delivery_state != 'pending')
+           AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
+                           WHERE e.delegation_id=async_delegations.delegation_id
+                             AND e.delivery_state='pending')
+           AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
+                                           json_extract(result_json, '$.cut_reason')))
+                    AND (delivery_state='delivered' OR retry_notices > 0)
+                    AND retry_state IN ('scheduled','notified')
+                    AND COALESCE(retry_root_started_at, dispatched_at) > ?)
+           """
+    params = (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S)
+    candidates = conn.execute(
+        "SELECT delegation_id FROM async_delegations" + where + " ORDER BY updated_at ASC LIMIT ?",
+        (*params, limit)).fetchall()
+    if not candidates:
+        return []
+    # SELECT above is autocommit/read-only. Recheck delivery, stop, seal and
+    # claim eligibility after acquiring the writer, restricted to these ids.
+    conn.execute("BEGIN IMMEDIATE")
+    return conn.execute(
+        _RETRY_SELECT + where + f" AND delegation_id IN ({','.join('?' for _ in candidates)})"
+        + " ORDER BY updated_at ASC",
+        (*params, *(row[0] for row in candidates))).fetchall()
 
 
 def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
@@ -907,25 +974,8 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     now = time.time() if now is None else now
     classify_armed(now=now, limit=limit)
     actions = []
-    stale = now - RETRY_CLAIM_TTL_S
-    with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
-        conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
-        rows = conn.execute(
-            _RETRY_SELECT + """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
-                 OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
-                 OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
-                 OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
-               AND (event_json IS NULL OR delivery_state != 'pending')
-               AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
-                               WHERE e.delegation_id=async_delegations.delegation_id
-                                 AND e.delivery_state='pending')
-               AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
-                                               json_extract(result_json, '$.cut_reason')))
-                        AND (delivery_state='delivered' OR retry_notices > 0)
-                        AND retry_state IN ('scheduled','notified')
-                        AND COALESCE(retry_root_started_at, dispatched_at) > ?)
-               ORDER BY updated_at ASC LIMIT ?""",
-            (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S, limit)).fetchall()
+    with ad._DB_LOCK, ad._transaction() as conn:
+        rows = _claimable_retry_rows(conn, now, limit)
         for row in rows:
             record = _retry_record(row)
             # An execution seal blocks recovery work, not an already-owed
