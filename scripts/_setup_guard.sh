@@ -150,7 +150,7 @@ hermes_require_safe_setup() {
   echo "error: refusing to run test-environment setup against a live runtime home: ${HERMES_HOME:-<default>} ($reason)." >&2
   echo "That setup writes tool, dependency, and test-env state into HERMES_HOME." >&2
   echo "Rebuild the checkout-local venv instead. From the checkout, stop anything using .venv, remove it if it exists, then run:" >&2
-  echo "  python -m pm.build_env --source . --out .venv --group dev --group test" >&2
+  echo '  env -u HERMES_RUNTIME_DIR HERMES_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/hermes-agent/tooling" python -m pm.build_env --source . --out .venv --group dev --group test' >&2
   echo "Then explicitly select that interpreter (clearing any stale activation for this command only):" >&2
   echo '  env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh' >&2
   echo "Append your original test arguments to that command." >&2

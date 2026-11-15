@@ -18,6 +18,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[2]
 REBUILD = "python -m pm.build_env --source . --out .venv --group dev --group test"
+# PM writes install state under HERMES_HOME even for this build: the advice must scope it away.
+SCOPED_REBUILD = 'env -u HERMES_RUNTIME_DIR HERMES_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/hermes-agent/tooling" ' + REBUILD
 
 
 def _snapshot(home: Path) -> dict[str, str]:
@@ -180,7 +182,7 @@ def test_stale_fallback_refuses_live_home_and_writes_nothing(tmp_path, kind):
     output = result.stdout + result.stderr
     assert result.returncode != 0, output
     assert "refusing" in output
-    assert REBUILD in output
+    assert SCOPED_REBUILD in output
     assert "scratch" in output
     assert "HERMES_ALLOW_LIVE_HOME_SETUP" in output
     assert "re-running under run-in-hermes-env" not in output

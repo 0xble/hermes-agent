@@ -50,7 +50,9 @@
 # If that lookup fails, the home is treated as live. Rebuild the checkout-local
 # venv instead, from the checkout, after stopping anything that is using .venv
 # and removing it if it exists:
-#   python -m pm.build_env --source . --out .venv --group dev --group test
+#   env -u HERMES_RUNTIME_DIR HERMES_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/hermes-agent/tooling" \
+#     python -m pm.build_env --source . --out .venv --group dev --group test
+# (PM keeps its build state under HERMES_HOME; this keeps it out of the live home.)
 # Or set HERMES_HOME to a scratch directory that is not a live runtime home.
 # HERMES_ALLOW_LIVE_HOME_SETUP=1 overrides the refusal only when setup against
 # that home is deliberate. Activation's hermes_sync uses the same guard, even

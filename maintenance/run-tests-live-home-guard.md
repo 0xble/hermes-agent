@@ -41,8 +41,10 @@ first bootstrap without a usable interpreter requires the explicit opt-in.
 
 The refusal writes nothing to that home or its resolved root. It tells the caller to rebuild the
 checkout-local venv with
-`python -m pm.build_env --source . --out .venv --group dev --group test`,
-then run `env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh`
+`env -u HERMES_RUNTIME_DIR HERMES_HOME="${XDG_CACHE_HOME:-$HOME/.cache}/hermes-agent/tooling" python -m pm.build_env --source . --out .venv --group dev --group test`.
+PM keeps its install state, uv, interpreter and cache under `HERMES_HOME` even for
+this build, so the command scopes them to the tooling home below; with the live
+home inherited it would write `installs/<key>` there. The caller then runs `env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh`
 with their original test arguments. Rebuilding alone does not select `.venv`;
 the explicit interpreter must contain pytest, and a stale activation must be
 cleared for that command because activation takes precedence over `HERMES_PYTHON`.
