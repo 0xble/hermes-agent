@@ -27,6 +27,22 @@ GOAL_PROMPT_REGISTRY: Final[tuple[GoalPromptEntry, ...]] = ({'formatter': 'auton
               'goal_set complete only with an evidence mapping from EVERY verification criterion to concrete recorded '
               'tool output. Never clear a goal. If nothing material changed, reply exactly [SILENT].',
   'source_commits': ('a106bbe2aaeca9dcb56e7fd5ef2303c901c4070b', '0295c3b67d17fc24939cdb695083bfd0fbc3d3c7')},
+ {'formatter': 'autonomy',
+  'template': '[Continuing toward your standing goal] Goal: {goal}\n'
+              '\n'
+              'Completion contract:\n'
+              '{contract_block}\n'
+              '{subgoals_block}\n'
+              '\n'
+              'Manage this goal autonomously. Choose the next concrete authorized step. If a route fails, try a new '
+              'route. For an external dependency use a timed wait with an automatic wake, rather than stopping for '
+              'input or approval. Preserve every constraint, hard limit and verification criterion when revising or '
+              'replacing. Never use complete or replace to escape constraints, failing checks or unsolved work. Use '
+              'goal_set complete only with an evidence mapping from EVERY verification criterion to concrete recorded '
+              'tool output. Clear only an obsolete, superseded, duplicated or handed-off goal, with a stated reason; '
+              'cite verified takeover for a handoff. Never clear to escape unmet criteria or failing checks. Use '
+              'complete for an achieved goal. If nothing material changed, reply exactly [SILENT].',
+  'source_commits': ('working-tree',)},
  {'formatter': 'plain',
   'template': '[Continuing toward your standing goal]\n'
               'Goal: {goal}\n'
@@ -708,7 +724,7 @@ CURRENT_GOAL_FORMATTER_NAMES: Final[tuple[tuple[str, str], ...]] = (
     ("barrier_lift", "GOAL_WAIT_LIFTED_NOTE_OPEN"),
 )
 
-GOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {'autonomy': 1, 'plain': 6, 'contract': 12, 'subgoals': 5, 'gate_failed': 1, 'revisions': 6, 'barrier_lift': 1, 'barrier_lift_note': 10}
+GOAL_PROMPT_REGISTRY_COUNTS: Final[dict[str, int]] = {'autonomy': 2, 'plain': 6, 'contract': 12, 'subgoals': 5, 'gate_failed': 1, 'revisions': 6, 'barrier_lift': 1, 'barrier_lift_note': 10}
 
 # All historical goal formatter versions contributing to the frozen registry. Individual rows
 # name their newest and oldest source commits instead of repeating this complete list per row.

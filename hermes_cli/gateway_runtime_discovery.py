@@ -195,6 +195,14 @@ def _socket_path(home: Path) -> Path:
 
 def query_identify(home: Path, *, timeout: float) -> dict:
     """Unlike diagnostic queries, retain timeout/access/protocol failures."""
+    try:
+        return _query_identify(home, timeout=timeout)
+    except TimeoutError as exc:
+        from cron.dependency_timeout import name_gateway_handshake_timeout
+        raise name_gateway_handshake_timeout(exc) from exc
+
+
+def _query_identify(home: Path, *, timeout: float) -> dict:
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
         return _identify_response(query_runtime_control(

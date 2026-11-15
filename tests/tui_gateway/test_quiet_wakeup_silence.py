@@ -157,6 +157,14 @@ def test_cli_wakeup_stream_drops_a_bare_marker_and_streams_real_replies(monkeypa
     cli._flush_stream()
     assert any("the queue is 2." in line for line in emitted)
 
+    # A combined silent reply with the loop control marker stays hidden, whole or in pieces.
+    for chunks in (["[SILENT]\nLOOP_COMPLETE"], ["[SIL", "ENT]", "\nLO", "OP_COMP", "LETE\n"]):
+        cli, emitted = _cli_stub(monkeypatch, quiet=True)
+        for chunk in chunks:
+            cli._stream_delta(chunk)
+        cli._flush_stream()
+        assert emitted == [] and cli._stream_box_opened is False
+
     cli, emitted = _cli_stub(monkeypatch, quiet=False)
     cli._stream_delta("[SILENT]\n")
     cli._flush_stream()
@@ -233,6 +241,10 @@ def test_cli_streaming_tts_never_speaks_a_wakeup_marker(monkeypatch):
     assert _cli_streaming_tts_turn(monkeypatch, quiet=True, chunks=["[SIL", "ENT]"]) == ""
     assert _cli_streaming_tts_turn(
         monkeypatch, quiet=True, chunks=["Checking the queue.", "\n\n[SILENT]"]) == "Checking the queue."
+    assert _cli_streaming_tts_turn(
+        monkeypatch, quiet=True, chunks=["[SILENT]\nLOOP_COMPLETE"]) == ""
+    assert _cli_streaming_tts_turn(
+        monkeypatch, quiet=True, chunks=["[SIL", "ENT]\nLO", "OP_COMPLETE"]) == ""
     assert _cli_streaming_tts_turn(monkeypatch, quiet=True, chunks=["NO"]) == "NO"
     assert _cli_streaming_tts_turn(
         monkeypatch, quiet=True, chunks=["Queue", " is 2."]) == "Queue is 2."

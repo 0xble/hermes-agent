@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- earliest-route copy is coupled to the existing recovery response surface.
 """Recovery-branch handlers for the conversation turn's inner retry loop.
 
 When the model call raises, one-shot recovery chains run before the generic retry/backoff
@@ -1149,10 +1150,13 @@ def max_retries_exhausted_result(
     else:
         # Every surface reads final_response (the 💡 lines above are CLI-only), so the chat
         # text carries the plain what-happened + next step itself.
+        from agent.shared_primary_cooldown import earliest_route_delay
         _reset_at = classified.error_context.get("reset_at")
+        _earliest_s = earliest_route_delay(agent, failing_route=(provider, base_url, model))
         _final_response = exhausted_copy(
             classified.reason.value, label=provider_label_for(provider), attempts=attempts, error=api_error,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
+            earliest_route_seconds=_earliest_s,
         )
         if _welcome_hint:
             _final_response = _welcome_tier_guidance(classified, model=model, in_chat=True)
@@ -1169,6 +1173,8 @@ def max_retries_exhausted_result(
             "happens when it writes a very large file in one go. Ask me to write the file in "
             "smaller sections (or via execute_code with Python's open())."
         )
+    from agent.fallback_endpoint_domain import append_attempt_summary
+    _final_response = append_attempt_summary(agent, _final_response)
     result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary)
     result.update({
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall
@@ -1673,14 +1679,17 @@ def route_classified_error(
     messages: list[dict[str, Any]], api_messages: Any, system_message: Any,
     active_system_prompt: Any, conversation_history: Any, retry_count: int, max_retries: int,
     compression_attempts: int, max_compression_attempts: int, api_call_count: int,
-    effective_task_id: Any,
+    effective_task_id: Any, hold_noninteractive_transient: Optional[bool] = None,
 ) -> ClassifiedErrorVerdict:
     """Ordered (load-bearing) recovery steps between classification and overflow handling:
     compaction-disabled overflow → terminal error (output-cap errors exempt); Anthropic
     long-context tier 429 → cap at 200k and compress; eager fallback for rate-limit/billing
     (immediately) and transport failures (after 1 retry) unless credential-pool rotation may
     still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
-    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
+    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once.
+
+    ``hold_noninteractive_transient`` (the caller's once-per-error decision; ``None`` computes
+    it) suppresses the eager transient fallbacks while an unattended route's window is open."""
     from agent.conversation_compression import (
         compression_pool_saturated,
         conversation_history_after_compression,
@@ -1688,6 +1697,14 @@ def route_classified_error(
     from agent.conversation_loop import _arm_fallback_restart, _compression_deferred_result, _ra
     from agent.model_metadata import estimate_request_tokens_rough
 
+    if hold_noninteractive_transient is None:
+        from agent.fallback_cooldown import hold_noninteractive_transient_retry
+        hold_noninteractive_transient = hold_noninteractive_transient_retry(
+            agent, classified, error_message=error_msg,
+        )
+    from agent.fallback_endpoint_domain import note_endpoint_failure
+
+    note_endpoint_failure(agent, classified)
     _provider_overflow_recovery_pending = False
     is_rate_limited = False
     _wrapped_output_cap_budget = None
@@ -1835,7 +1852,7 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
-    _should_fallback = (
+    _should_fallback = not hold_noninteractive_transient and (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or _provider_wide_overload
         or (_is_transport_failure and retry_count >= 2)
@@ -1862,6 +1879,7 @@ def route_classified_error(
         classified.is_auth
         and classified.should_fallback
         and not _retry.auth_failover_attempted
+        and not hold_noninteractive_transient
         and agent._fallback_index < len(agent._fallback_chain)
     ):
         _retry.auth_failover_attempted = True

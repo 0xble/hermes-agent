@@ -148,13 +148,13 @@ DEFAULT_CONFIG = {
             # drops from 3 to 1. Unknown pricing / missing usage leaves it untouched.
             "cost_threshold_usd": 0.25,
         },
-        # Fast mode: "" / "normal" (off), "fast" (always), "auto" (first fast_auto_seconds of every
-        # turn), "cold" (first turn of a session only). Messaging gateway sessions only:
-        # agent.fast_expiry_seconds is the seconds before a session fast/ultrafast override switches
-        # to normal; 0 disables. CLI/TUI sessions do not expire.
+        # Fast: ""/normal (off), fast (always), auto (first fast_auto_seconds each turn),
+        # cold (first turn only). Gateway sessions expire per tier: Fast 30m, Ultrafast 5m.
+        # Zero disables that tier's expiry. CLI/TUI sessions do not expire.
         "service_tier": "",
         "fast_auto_seconds": 60,
-        "fast_expiry_seconds": 0,
+        "fast_expiry_seconds": 1800,
+        "ultrafast_expiry_seconds": 300,
         # Responses-only `text.verbosity` (never chat_completions): "" = not sent, or low | medium | high.
         "text_verbosity": "",
         "daybreak": False,  # opt-in; only catalog-listed Codex models (agent/codex_service_tiers.py)
@@ -1381,11 +1381,11 @@ DEFAULT_CONFIG = {
         "backends": {},
         "model": "",  # e.g. "google/gemini-3-flash-preview" (empty = inherit parent)
         "provider": "",  # e.g. "openrouter" (empty = inherit parent provider + credentials)
-        # Fallback chain for delegated children (same entry format as the top-level list).
-        # For an unpinned child, null = inherit the parent chain; [] = disable fallback.
-        # A child pinned by provider, endpoint, or model gets no fallback unless this
-        # setting declares one explicitly.
+        # Delegated children's fallback chain (top-level entry format). Unpinned child: null = inherit the
+        # parent chain, [] = disable. A child pinned by provider, endpoint or model gets none unless declared.
         "fallback_providers": None,
+        # Subagent/cron/side-agent runs retry transient errors on the same route this long before fallback; 0 = no wait.
+        "fallback": {"transient_retry_window_seconds": 180.0},
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
         "api_key": "",  # key for delegation.base_url (falls back to OPENAI_API_KEY)
         # Wire protocol for delegation.base_url: "chat_completions" | "codex_responses" |
@@ -1465,7 +1465,7 @@ DEFAULT_CONFIG = {
         # True shows every goal card. False hides automatic lifecycle output, not queries or
         # approvals. "hidden" also hides approval cards and control receipts (hermes_cli/goal_notices.py).
         "notices": True,
-        "autonomy": False,  # Model controls stay within the inherited contract; clear is user-only.
+        "autonomy": False,  # Inherit the contract; clearing obsolete goals requires a recorded reason.
         # Max turns before pausing, or a paced counter checkpoint when autonomy is enabled.
         "max_turns": 20,
         # Minimum seconds between autonomous continuation turns (continuation after continuation,

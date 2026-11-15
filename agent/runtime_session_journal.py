@@ -65,7 +65,9 @@ def check_worker_frame(scope, entry):
 def save_journal(store, journal):
     if store._outbox_owner.closed:
         raise WorkerPersistenceError('outbox_closed')
-    encoded = encode_journal(journal, store.max_bytes)
-    from utils import atomic_write_bytes
-    # Owner-only journal (the directory is 0700 too); rename and directory entry are durable.
-    atomic_write_bytes(store.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
+    from agent.runtime_session_privacy import journal_admission
+    with journal_admission(store.scope, journal):
+        encoded = encode_journal(journal, store.max_bytes)
+        from utils import atomic_write_bytes
+        # Owner-only journal (the directory is 0700 too); rename and directory entry are durable.
+        atomic_write_bytes(store.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)

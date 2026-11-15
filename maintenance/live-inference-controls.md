@@ -19,3 +19,5 @@ Upstream [PR #123803](https://github.com/NousResearch/hermes-agent/pull/123803) 
 ## Retirement and rollback
 
 Retire when an adopted upstream release both dispatches inference controls while busy and applies them to the next request without evicting the active agent, preserving unrelated overrides and global/reset semantics. Revert the scoped fork patch and its tests and index row; leave `maintenance/gateway-commands.md` and unrelated busy-command dispatch intact. No persisted-state migration or runtime activation is part of this patch.
+
+Contract tests: `tests/gateway/test_running_agent_session_toggles.py`, `tests/gateway/test_fast_command.py`, `tests/gateway/test_reasoning_command.py`, `tests/gateway/test_command_bypass_active_session.py`, `tests/gateway/test_session_race_guard.py`, `tests/gateway/test_busy_command.py`.

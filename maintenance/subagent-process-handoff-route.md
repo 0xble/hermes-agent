@@ -84,3 +84,5 @@ route scans are bounded while route-write and cooldown-expiry recovery remain in
 Retire when upstream transfers the parent's session id, notify intent and watcher route
 with handoff ownership. Roll back by reverting this patch. The added checkpoint key
 `handoff_note` is ignored by older code.
+
+Contract tests: `tests/tools/test_process_handoff_routing.py`, `tests/tools/test_subagent_process_handoff.py`, `tests/gateway/test_telegram_retire_work.py`, `tests/gateway/test_background_process_notifications.py`, `tests/gateway/test_process_event_source_recovery.py`.

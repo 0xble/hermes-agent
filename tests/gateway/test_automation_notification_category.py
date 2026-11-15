@@ -1,4 +1,5 @@
 """Diagnostic-only metadata survives the canonical FIFO, without inference."""
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -232,8 +233,10 @@ async def test_native_completion_wake_refuses_another_adapter(tmp_path, monkeypa
 async def test_refused_watch_wake_logs_the_refusal_code(tmp_path, monkeypatch, caplog):
     """A refused wake used to requeue silently; the refusal code is what diagnoses it (#138940)."""
     import logging
+    from gateway import admission_canary
     from gateway.session_identity import replace_source
     from gateway.wake import WakeNotAccepted
+    monkeypatch.setattr(admission_canary, '_events', deque(maxlen=4096))
     runner, authority, _adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'human')
     try:
         route = metadata['gateway_session_key']
@@ -250,5 +253,7 @@ async def test_refused_watch_wake_logs_the_refusal_code(tmp_path, monkeypatch, c
             'Internal admission refused: admission_conflict (None) platform=discord chat=42 '
             "counts={'admission_conflict:unspecified': 1} previous_window={}"]
         assert runner._internal_refusal_window[1] == {'admission_conflict:unspecified': 5}
+        assert [clause for _, clause in admission_canary.snapshot()['refusals']] == [
+            'automation: admission_conflict']
     finally:
         authority.db.close()

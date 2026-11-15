@@ -5,11 +5,12 @@
       "stable": 1829,
       "volatile": 1268
     },
-    "tool_tokens": 16101,
+    "tool_tokens": 16270,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",
@@ -54,11 +55,12 @@
       "stable": 1225,
       "volatile": 1268
     },
-    "tool_tokens": 16101,
+    "tool_tokens": 16270,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",
@@ -103,11 +105,12 @@
       "stable": 1646,
       "volatile": 1267
     },
-    "tool_tokens": 16101,
+    "tool_tokens": 16270,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",
@@ -152,11 +155,12 @@
       "stable": 2392,
       "volatile": 1265
     },
-    "tool_tokens": 16257,
+    "tool_tokens": 16426,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",
@@ -201,11 +205,12 @@
       "stable": 1225,
       "volatile": 1268
     },
-    "tool_tokens": 16101,
+    "tool_tokens": 16270,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",
@@ -247,14 +252,15 @@
   "cron.claude": {
     "prompt_tokens": {
       "context": 0,
-      "stable": 1211,
+      "stable": 1228,
       "volatile": 1269
     },
-    "tool_tokens": 16101,
+    "tool_tokens": 16270,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",
@@ -299,11 +305,12 @@
       "stable": 1473,
       "volatile": 1269
     },
-    "tool_tokens": 16373,
+    "tool_tokens": 16542,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",
@@ -348,11 +355,12 @@
       "stable": 1244,
       "volatile": 1269
     },
-    "tool_tokens": 16538,
+    "tool_tokens": 16707,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",
@@ -398,11 +406,12 @@
       "stable": 1388,
       "volatile": 1270
     },
-    "tool_tokens": 16576,
+    "tool_tokens": 16745,
     "tools": [
       "browser_back",
       "browser_cdp",
       "browser_click",
+      "browser_close",
       "browser_console",
       "browser_dialog",
       "browser_downloads",

@@ -2,7 +2,6 @@
 flags (end/reopen/archive/pin/hide/read), model_config patching, listing and
 counting, delete cascades, and the auto-archive sweep."""
 
-import glob
 import json
 import logging
 import re
@@ -755,10 +754,17 @@ class SessionSessionsMixin:
         if provider:
             route = {"provider": provider, "base_url": base_url or None, "api_mode": api_mode or None}
             patch.update(route, gateway_runtime=route)
-        self._write_model_config_patch(
-            session_id, patch, "UPDATE sessions SET model = ?, model_config = ? WHERE id = ?",
-            lambda merged: (model, merged, session_id),
-        )
+
+        def _do(conn):
+            from agent.fallback_session_route import clear_fallback_markers
+            merged = self._merge_model_config_json(conn, session_id, patch)
+            if merged is _MODEL_CONFIG_ROW_MISSING:
+                return
+            # An explicit pick owns the route, even when it names the model a fallback used (#152333).
+            config = clear_fallback_markers(_parse_model_config(merged))
+            conn.execute("UPDATE sessions SET model = ?, model_config = ? WHERE id = ?",
+                         (model, json.dumps(config) if config else None, session_id))
+        self._execute_write(_do, session_ids=(session_id,))
 
     def _write_model_config_patch(
         self, session_id: str, patch: dict[str, Any],
@@ -1643,21 +1649,8 @@ class SessionSessionsMixin:
         ``request_dump_<id>_*.json``; OSError is swallowed so a filesystem hiccup never blocks a
         DB operation. Every historical writer name is swept because a "deleted" session's snapshot
         can carry plaintext secrets (#20334, #60207)."""
-        if sessions_dir is None:
-            return
-        targets = [sessions_dir / f"{session_id}{suffix}" for suffix in (".json", ".jsonl")]
-        targets.append(sessions_dir / f"session_{session_id}.json")
-        try:
-            # glob.escape: a session id carrying ``[`` / ``?`` / ``*`` is a PATTERN otherwise, so the
-            # dump sweep either matches nothing or matches another session's files.
-            targets.extend(sessions_dir.glob(f"request_dump_{glob.escape(session_id)}_*.json"))
-        except OSError:
-            pass
-        for p in targets:
-            try:
-                p.unlink(missing_ok=True)
-            except OSError:
-                pass
+        from hermes_state_deletion import remove_session_files
+        remove_session_files(sessions_dir, session_id)
 
     def get_session_delete_targets(self, session_id: str) -> list[str]:
         """Rows :meth:`delete_session` would remove: the session, then its recursive delegate children

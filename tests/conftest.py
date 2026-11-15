@@ -1841,6 +1841,11 @@ def isolated_machine_home(tmp_path_factory, monkeypatch):
     home = tmp_path_factory.mktemp("installer-home")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("USERPROFILE", str(home))
+    # Git's user config moves with the home. An inherited GIT_CONFIG_GLOBAL or absolute
+    # XDG_CONFIG_HOME would keep the developer's config (commit signing, global hooks) live
+    # while its ``~`` paths resolve under this empty home: fixture commits then fail locally
+    # and pass on a bare CI runner. XDG_CONFIG_HOME itself stays: other tools (uv) need it.
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(home / ".gitconfig"))
     monkeypatch.setattr(Path, "home", lambda: home)
     if os.name == "nt":
         for name, directory in (("LOCALAPPDATA", "Local"), ("APPDATA", "Roaming")):
