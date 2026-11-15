@@ -68,12 +68,18 @@ DATABASES: dict[str, Callable[[], None]] = {
 }
 
 
+def _read_only(path: Path) -> sqlite3.Connection:
+    """Open *path* read-only. ``as_uri`` percent-encodes it: a raw ``#`` or ``?`` in a profile path
+    would otherwise end the URI's filename early, drop ``mode=ro`` and open an unrelated file."""
+    return sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, timeout=30)
+
+
 def copy_schema(source: Path, target: Path) -> None:
     """Recreate *source*'s schema, and the rows of its version table, in a new empty *target*."""
     target.parent.mkdir(parents=True, exist_ok=True)
     for stale in (target, target.with_name(target.name + "-wal"), target.with_name(target.name + "-shm")):
         stale.unlink(missing_ok=True)
-    reader = sqlite3.connect(f"file:{source}?mode=ro", uri=True, timeout=30)
+    reader = _read_only(source)
     try:
         objects = reader.execute(
             "SELECT type, name, sql FROM sqlite_master WHERE sql IS NOT NULL AND name NOT LIKE 'sqlite\\_%' ESCAPE '\\' "
@@ -103,7 +109,7 @@ def copy_schema(source: Path, target: Path) -> None:
 
 def snapshot(path: Path) -> tuple[int, list[tuple]]:
     """The schema cookie and every schema object with its root page: any rebuild moves one."""
-    reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=30)
+    reader = _read_only(path)
     try:
         return (reader.execute("PRAGMA schema_version").fetchone()[0],
                 reader.execute("SELECT type, name, rootpage, sql FROM sqlite_master ORDER BY type, name").fetchall())
