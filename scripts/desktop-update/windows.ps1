@@ -1107,6 +1107,9 @@ function Step-PipeDrain($Reader, [ref]$Task, $Buffer, $Sink, [ref]$Moved) {
 }
 
 function Sync-ChildStage {
+    # A prior writer may have queued lines while another process held the log. Every stage poll
+    # is also a publication opportunity, so release the queue before checking for new child data.
+    [void](Sync-HandoffLog)
     # Best-effort: an unreadable or half-replaced file leaves the current stage on screen.
     try {
         $stream = [IO.File]::Open($script:ChildStageFile, 'Open', 'Read', 'ReadWrite, Delete')
@@ -1652,7 +1655,7 @@ if ($SelfTestLogConcurrency) {
     # would leave the runspace without a callable definition.
     $fnAst = [System.Management.Automation.Language.Parser]::ParseFile($PSCommandPath, [ref]$null, [ref]$null).FindAll({
         param($node)
-        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in @("Write-HandoffLog", "Sync-HandoffLog", "Complete-HandoffLog")
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and @("Write-HandoffLog", "Sync-HandoffLog", "Complete-HandoffLog") -contains [string]$node.Name
     }, $true)
     if (-not $fnAst -or $fnAst.Count -ne 3) {
         Write-Host "LOG-CONCURRENCY SELF-TEST: FAIL -- the hand-off log writer definitions were not found in this script"

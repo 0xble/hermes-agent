@@ -44,6 +44,9 @@ def test_same_remote_file_edits_from_distinct_sessions_do_not_lose_updates(peers
             self.lock.release()
 
     class ObservedLocks(dict):
+        def __init__(self, source):
+            super().__init__((key, ObservedLock(lock)) for key, lock in source.items())
+
         def setdefault(self, key, default=None):
             return super().setdefault(key, ObservedLock(default))
 
