@@ -10,7 +10,7 @@ import pytest
 
 from tools import browser_tool
 from tools.registry import registry
-from tests.tools.test_computer_use_nodes import endpoint as node_endpoint, home as node_home  # noqa: F401
+from tests.tools.test_computer_use_nodes import endpoint as node_endpoint, home as node_home
 
 # These entrypoints register outside browser_tool's table. Exercise their actual
 # registrations too, without calling any handler or replacing the registry.
