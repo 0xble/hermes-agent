@@ -7,6 +7,7 @@ process that recorded it is gone.
 """
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -209,3 +210,32 @@ async def test_card_that_never_deletes_is_forgotten_after_a_few_boots(monkeypatc
         assert reloaded._entries[entry.session_key].progress_cards[0]["attempts"] == boot
     reloaded = await _flood_refused_boot(monkeypatch, tmp_path)
     assert _cards(reloaded, entry.session_key) == []
+
+
+@pytest.mark.asyncio
+async def test_record_queued_behind_its_forget_does_not_outlive_it(monkeypatch, tmp_path):
+    """A worker-thread record hands its write to the loop with call_soon_threadsafe. When that
+    hand-off is still queued after the forget has looked for in-flight records, the record must be
+    dropped, not land after the forget and leave an orphan the next boot deletes (on a failed run,
+    a card the run keeps on purpose)."""
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    entry = store.get_or_create_session(SOURCE)
+    adapter = CleanupCaptureAdapter()
+    runner = _make_runner(adapter)
+    _attach_store(runner, store, adapter)
+    turn_ctx = SimpleNamespace(session_key=entry.session_key, source=SOURCE, _card_writes=set(), _card_forgotten=set())
+    record = runner._progress_card_recorder(turn_ctx)
+    forget = store.forget_progress_cards
+
+    def forget_while_a_worker_records(*args):
+        record("55")  # a worker thread tracks the card now: its spawn is queued, no write task exists
+        return forget(*args)
+
+    monkeypatch.setattr(store, "forget_progress_cards", forget_while_a_worker_records)
+    await runner._forget_turn_progress_cards(turn_ctx, ["55"])
+    await asyncio.sleep(0)
+    await _settle(runner)
+
+    assert _cards(store, entry.session_key) == []
+    _rebooted, boot_adapter = await _reboot_and_sweep(monkeypatch, tmp_path)
+    assert boot_adapter.deleted == []
