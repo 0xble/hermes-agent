@@ -98,9 +98,10 @@ async def test_concurrent_topics_share_typing_windows_and_other_chats_stay_indep
         await burst("12345")
     assert fired == [("12345", start)]
     await burst("67890")  # Not held by the first chat's typing lease.
+    assert fired == [("12345", start), ("67890", start + 4.49)]
     clock.t = start + 4.5
     await burst("12345")
-    assert [stamp for chat, stamp in fired if chat == "12345"] == [start, start + 4.5]
+    assert fired == [("12345", start), ("67890", start + 4.49), ("12345", start + 4.5)]
 
 
 def test_documented_rates_leave_headroom_under_each_class_ceiling():
