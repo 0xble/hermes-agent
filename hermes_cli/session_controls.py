@@ -1434,9 +1434,12 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
 
     manager = GoalManager(sid, cursor=cursor)
+    autonomous = (authority or {}).get("via") == "autonomy"
     # Mark explicit controls separately from migratable legacy judge/budget pauses.
     # Model-supplied reason text must not accidentally opt this pause into migration.
-    return manager.pause(reason="session-control: " + (reason or "paused"))
+    # Record the agent as owner of its own pause so it may later lift it, as for loops.
+    return manager.pause(reason="session-control: " + (reason or "paused"),
+                         by="agent" if autonomous else "user")
 
 
 
@@ -1445,6 +1448,10 @@ def _clear_goal(sid, reason, payload, authority, cursor=None):
 
     manager = GoalManager(sid, cursor=cursor)
     if (authority or {}).get("via") == "autonomy":
+        state = manager.state
+        if state is not None and state.status == "paused" and state.paused_by != "agent":
+            # A reason never ends a /goal pause, /stop, Ctrl+C, quoted or system pause.
+            return _user_paused(state, "goal")
         return manager.clear(reason=reason, actor="agent", authority="autonomy")
     return manager.clear()
 
