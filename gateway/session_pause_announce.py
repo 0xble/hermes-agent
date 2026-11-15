@@ -27,6 +27,8 @@ logger = logging.getLogger(__name__)
 _TOLD = 'pause_notice:'
 # The key range of every marker: ';' sorts right after ':'.
 _TOLD_END = 'pause_notice;'
+# Per session: the unprompted send in flight, resolved with whether it was delivered.
+_SENDING = 'pause_notice_sends'
 _UNKNOWN_HEAD = ("SELECT admission_id FROM session_admissions WHERE target_session_id=? AND status='unknown' "
                  'ORDER BY seq LIMIT 1')
 
@@ -47,6 +49,16 @@ def schedule_pause_announcement(authority, ref, reason):
     tasks[ref.session_id] = task
     task.add_done_callback(lambda done: tasks.pop(ref.session_id, None) if tasks.get(ref.session_id) is done else None)
     return task
+
+
+async def await_announcement_send(authority, ref) -> None:
+    """Wait out an unprompted notice already being sent to this chat. Its claim on
+    ``pause_notified`` is not yet a delivered notice: a reply that saw it and stayed silent would
+    leave the chat untold if the send then failed. Afterwards the flag says whether it got there."""
+    from gateway.session_ingress import _registry
+    sending = _registry(authority, _SENDING).get(ref.session_id)
+    if sending is not None and not sending.done():
+        await asyncio.shield(sending)
 
 
 def _person_waiting(rows) -> bool:
@@ -139,6 +151,9 @@ async def announce_pause(authority, ref, reason) -> bool:
     if text is None:
         return False  # a message on the reply path already told the chat
     from gateway.run import _interim_metadata
+    from gateway.session_ingress import _registry
+    sends = _registry(authority, _SENDING)
+    sending = sends[ref.session_id] = asyncio.get_running_loop().create_future()
     delivered = False
     try:
         result = await adapter.send(str(source.chat_id), text,
@@ -146,9 +161,14 @@ async def announce_pause(authority, ref, reason) -> bool:
         delivered = getattr(result, 'success', True) is not False
     except Exception:
         logger.warning('Pause notice for session %s could not be sent', ref.session_id, exc_info=True)
+    finally:
+        if not delivered:
+            # Leave the episode unannounced: the next message's reply path still carries the notice.
+            live.pause_notified = False
+        if sends.get(ref.session_id) is sending:
+            del sends[ref.session_id]
+        sending.set_result(delivered)  # a reply that waited on this send claims it if it failed
     if not delivered:
-        # Leave the episode unannounced: the next message's reply path still carries the notice.
-        live.pause_notified = False
         return False
     logger.info('Session %s paused (%s): notice sent to its chat', ref.session_id, reason)
     await remember_told(authority, ref)
