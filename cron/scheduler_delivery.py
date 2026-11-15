@@ -1419,17 +1419,15 @@ def _mark_formatting_degraded(t: _TargetDelivery) -> None:
 def _deliver_standalone(
     t: _TargetDelivery, content: str, media_files: list, target_errors: list, delivery_errors: list,
     copy_blocks: list[str] | None = None,
-) -> None:
+) -> bool:
     """Standalone fallback for a target the live lane did not deliver."""
-    from cron import scheduler_delivery_reconnect as reconnect
-
     job = t.job
     if t.is_relay:
         # Relay owns the destination and credential; a native retry could duplicate — fail closed.
         if not target_errors:
             target_errors.append(f"relay delivery to {t.where} failed")
         delivery_errors.extend(target_errors)
-        return
+        return False
     if _live_flood_held(t):
         # The live adapter already recorded the platform deadline. Do not enter the standalone
         # sender at all: it cannot improve the outcome and a future fallback implementation must
@@ -1437,7 +1435,7 @@ def _deliver_standalone(
         msg = f"Telegram delivery deferred for {t.where}: flood-control deadline is active"
         logger.warning("Job '%s': %s", job["id"], msg)
         delivery_errors.extend([*target_errors, msg])
-        return
+        return False
     payloads = [(content, [] if copy_blocks else media_files, False)]
     if not content and copy_blocks:
         payloads = []
@@ -1450,6 +1448,7 @@ def _deliver_standalone(
     err = None
     delivered_text = False
     delivered_copy_count = 0
+    partial = False
     for payload_content, payload_media, is_copy_block in payloads:
         if is_copy_block:
             result, err = _standalone_send(t, payload_content, payload_media, copy_block=True)
@@ -1457,6 +1456,10 @@ def _deliver_standalone(
             result, err = _standalone_send(t, payload_content, payload_media)
         if err is None and result and result.get("error"):
             err = f"delivery error: {result['error']} (target {t.where})"
+            from gateway.platforms._shared import NONE, PARTIAL, delivery_state
+            state = delivery_state(result)
+            t.standalone_in_flight = t.standalone_in_flight or state != NONE
+            partial = state == PARTIAL
             logger.error("Job '%s': %s", job["id"], err)
         if err is not None:
             break
@@ -1472,31 +1475,16 @@ def _deliver_standalone(
     if err is not None:
         target_errors.append(err)
         delivery_errors.extend(target_errors)
-        # A standalone timeout is ambiguous: the worker may have been released while
-        # the Bot API request remained in flight. Replaying it from the earlier
-        # reconnect-only live error can therefore deliver the same message twice.
-        if isinstance(err, _StandaloneTimeout):
-            logger.warning(
-                "Job '%s': not queueing ambiguous standalone timeout for %s",
-                job["id"], t.where,
-            )
-            pending_copies = (copy_blocks or [])[delivered_copy_count + int(is_copy_block):]
-            pending_media = [] if payload_media else media_files
-            if pending_copies or pending_media:
-                reconnect.queue_for_live_reconnect(
-                    t, "", pending_media, delivery_errors, copy_blocks=pending_copies,
-                )
-            return
-        # A satellite profile's worker has no platform token, so standalone cannot stand in for a
-        # live adapter that is only waiting to reconnect: keep the payload for that adapter.
-        reconnect.queue_for_live_reconnect(
-            t,
-            "" if delivered_text else content,
-            media_files,
-            delivery_errors,
-            copy_blocks=(copy_blocks or [])[delivered_copy_count:],
-        )
-        return
+        # A timeout or an exception after request dispatch is ambiguous. The send implementation
+        # marks the target in flight, so treat it as reached and never replay it.
+        if t.standalone_in_flight:
+            logger.warning("Job '%s': not queueing ambiguous standalone failure for %s", job["id"], t.where)
+            return True
+        # A definite pre-send failure may be safely handed back to the live reconnect ledger.
+        _queue_for_live_reconnect(
+            t, "" if delivered_text else content, media_files, delivery_errors,
+            copy_blocks=(copy_blocks or [])[delivered_copy_count:])
+        return False
     _mark_formatting_degraded(t)
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
     # success; surface them so a vanished attachment doesn't mark the run ok.
@@ -1832,6 +1820,10 @@ from cron import scheduler_delivery_origin as _origin
 from cron import scheduler_preflight as _preflight
 from cron import scheduler_script as _script
 
+
+# Late-bound standalone lane: the facade remains the seam used by the cron scheduler, while
+# the delivery implementation owns timeout ambiguity and reconnect admission.
+from cron.scheduler_delivery_standalone import (_queue_for_live_reconnect, _standalone_send)
 
 from cron.scheduler_delivery_sessions import (
     _resolve_cron_surface_mode, _resolve_origin, _cron_mirror_delivery_enabled, _target_matches_origin,

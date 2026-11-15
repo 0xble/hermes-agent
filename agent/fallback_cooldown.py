@@ -109,8 +109,6 @@ def _arm_rate_limit_cooldown(
         # signal that permits a long fallback turn to retry the primary.
         agent._fallback_episode_cooled = True
         return max(0, math.ceil(float(record.get("reset_at", 0) or 0) - time.time()))
-    if getattr(agent, "_fallback_activated", False) and not _on_primary_route(agent):
-        return None
     backoff_count = getattr(agent, "_rate_limit_backoff_count", 0)
     if getattr(agent, "_fallback_activated", False):
         # Compare the whole route: a same-provider fallback (another model or endpoint) failing
