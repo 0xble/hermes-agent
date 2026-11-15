@@ -2139,6 +2139,23 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                         reason: Optional[str] = None) -> bool:
         if getattr(self, "_client_owned", False) or self._restart_task_started:
             return False
+        from gateway.config import is_zero_cut_handover_enabled
+        if is_zero_cut_handover_enabled(getattr(self, "config", None)):
+            self._restart_task_started = True
+
+            async def hand_over():
+                try:
+                    from hermes_cli.gateway_handover import planned_handover
+                    if await asyncio.to_thread(planned_handover) is not True:
+                        logger.error("Planned restart handover refused, existing work left intact")
+                except Exception:
+                    logger.exception("Planned restart handover failed, no destructive fallback")
+                finally:
+                    self._restart_task_started = False
+
+            # Handover keeps the original owner alive for its in-flight work; it is not a shutdown drain.
+            self._restart_task = Context().run(lambda: asyncio.create_task(hand_over()))
+            return True
         self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
         self._restart_requested = True
         self._restart_detached = detached

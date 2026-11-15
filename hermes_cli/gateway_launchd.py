@@ -749,6 +749,10 @@ def _bootout_drain_and_rebootstrap(domain, plist_path, label, old_pid, budget: f
 
 def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
     """Re-register the installed bytes (including a saved source-checkout plist)."""
+    from hermes_cli.gateway_handover import planned_handover
+    handed_over = planned_handover()
+    if handed_over is not None:
+        return handed_over
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
@@ -1036,6 +1040,12 @@ def _wait_for_launchd_service_pid(
 
 
 def launchd_restart():
+    from hermes_cli.gateway_handover import planned_handover
+    handed_over = planned_handover()
+    if handed_over is not None:
+        if not handed_over:
+            raise RuntimeError("planned handover refused, existing work left intact")
+        return
     if configured_launchd_domain() is None:
         return _launchd_restart_locked()
     from hermes_cli.gateway_launchd_lifetime import lifetime_lock
