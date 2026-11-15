@@ -491,3 +491,43 @@ def test_independent_responses_route_has_one_physical_request_at_cap(routes, dis
         assert result['failed'] is True
     else:
         assert result['final_response'] == 'Grok actually answered.'
+
+
+@pytest.mark.parametrize('stream', [False, True])
+def test_independent_bedrock_attempt_still_evicts_a_stale_client(monkeypatch, stream):
+    # A reserved attempt may not retry, but evicting a dead pool sends nothing. Without
+    # the eviction, every later turn reuses the cached stale client and keeps failing.
+    from urllib3.exceptions import ProtocolError
+
+    from agent import bedrock_adapter
+    from agent.chat_completion_helpers import _bedrock_converse_call
+
+    bedrock_adapter.reset_client_cache()
+    monkeypatch.setattr(bedrock_adapter, '_require_boto3',
+                        lambda: SimpleNamespace(Session=lambda **_: object()))
+    monkeypatch.setattr(bedrock_adapter, 'scoped_aws_session_kwargs', dict)
+    stale = MagicMock()
+    stale.converse.side_effect = stale.converse_stream.side_effect = ProtocolError('Connection aborted.')
+    fresh = MagicMock()
+    fresh.converse.return_value = {
+        'output': {'message': {'role': 'assistant', 'content': [{'text': 'ok'}]}},
+        'stopReason': 'end_turn', 'usage': {'inputTokens': 1, 'outputTokens': 1, 'totalTokens': 2}}
+    fresh.converse_stream.return_value = {'stream': ['event']}
+    built = iter([stale, fresh])
+    monkeypatch.setattr(bedrock_adapter, '_new_client', lambda *_args: next(built))
+    kwargs = {'__bedrock_region__': 'us-east-1', 'modelId': 'anthropic.claude-test-v1:0',
+              'messages': [{'role': 'user', 'content': [{'text': 'hi'}]}]}
+
+    stale_call = stale.converse_stream if stream else stale.converse
+    with pytest.raises(ProtocolError):
+        _bedrock_converse_call(dict(kwargs), stream=stream, allow_retry=False)
+    stale_call.assert_called_once()
+
+    # The next turn builds a fresh pool instead of reusing the dead one.
+    result = _bedrock_converse_call(dict(kwargs), stream=stream)
+    stale_call.assert_called_once()
+    if stream:
+        assert result == ['event']
+    else:
+        assert result.choices[0].message.content == 'ok'
+    bedrock_adapter.reset_client_cache()
