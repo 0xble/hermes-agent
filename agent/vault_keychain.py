@@ -40,7 +40,7 @@ def _is_macos_backend(backend) -> bool:
     return type(backend).__module__.startswith("keyring.backends.macOS")
 
 
-_macos_probe_ok = False
+_macos_keychain_path: Optional[str] = None
 
 
 def _stdin_is_tty() -> bool:
@@ -55,24 +55,26 @@ def _probe_macos_keychain(backend) -> None:
 
     Only the native macOS backend is probed: any other keyring (an injected in-memory one) never
     reaches ``security``. A process with an interactive stdin skips the probe: a locked keychain
-    there shows the user an unlock prompt, which is better than refusing. A successful probe is
-    cached for the process.
+    there shows the user an unlock prompt, which is better than refusing. The selected keychain
+    path is stable for the process, but its lock state is checked on every operation.
     """
-    global _macos_probe_ok
-    if _macos_probe_ok or sys.platform != "darwin" or not _is_macos_backend(backend):
+    global _macos_keychain_path
+    if sys.platform != "darwin" or not _is_macos_backend(backend):
         return
     if _stdin_is_tty():
         return
     try:
-        selected = subprocess.run(
-            ["security", "default-keychain", "-d", "user"],
-            check=True,
-            capture_output=True,
-            stdin=subprocess.DEVNULL,
-            text=True,
-            timeout=2,
-        )
-        path = selected.stdout.strip().strip('"')
+        if _macos_keychain_path is None:
+            selected = subprocess.run(
+                ["security", "default-keychain", "-d", "user"],
+                check=True,
+                capture_output=True,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+            _macos_keychain_path = selected.stdout.strip().strip('"')
+        path = _macos_keychain_path
         if not path:
             raise KeychainUnavailable("the macOS user keychain is not configured")
         subprocess.run(
@@ -90,7 +92,6 @@ def _probe_macos_keychain(backend) -> None:
         raise
     except (OSError, subprocess.CalledProcessError) as exc:
         raise KeychainUnavailable(f"the macOS keychain is unavailable ({type(exc).__name__})") from exc
-    _macos_probe_ok = True
 
 
 def _is_os_keychain(backend) -> bool:

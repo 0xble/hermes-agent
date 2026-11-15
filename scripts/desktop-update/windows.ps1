@@ -158,7 +158,7 @@ function Complete-HandoffLog([int]$Seconds = 10) {
     while (-not (Sync-HandoffLog) -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 100 }
 }
 
-function Write-HandoffLog([string]$Message) {
+function Write-HandoffLog([string]$Message, [bool]$ReplayToHost = $true) {
     $line = "{0:yyyy-MM-ddTHH:mm:ssK} {1}" -f (Get-Date), $Message
     # Add-Content is unsafe once a second writer is live: PowerShell caches a
     # content writer per path, so the second writer (an overlapping hand-off
@@ -174,7 +174,7 @@ function Write-HandoffLog([string]$Message) {
     [void](Sync-HandoffLog)
     if ($MarkerOp) { return }   # a helper op's stdout is its one verdict line
     if ($script:ConsoleInput -and [HermesHandoff.ConsoleInput]::Selecting()) { return }
-    Write-Host $line
+    if ($ReplayToHost) { Write-Host $line }
 }
 
 # Update marker (contract C1 v2 + amendments A1-A4) lives in marker.ps1 next
