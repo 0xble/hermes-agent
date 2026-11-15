@@ -249,3 +249,66 @@ def test_protected_oldest_page_cannot_starve_newer_eligible_history(ledger, monk
             "SELECT COUNT(*) FROM executions WHERE id LIKE 'eligible-%'").fetchone()[0] == 0
         assert conn.execute(
             "SELECT COUNT(*) FROM executions WHERE id LIKE 'protected-%'").fetchone()[0] == 40
+
+
+@pytest.mark.parametrize("undated_protected", [
+    # The reviewer's case: one protected unparseable row sits in the first page, the
+    # cursor then advances among dated rows, and the row's journal is released.
+    pytest.param(1, id="released-behind-dated-cursor"),
+    # More protected unparseable rows than a page: the cursor must resume inside them.
+    pytest.param(12, id="full-undated-page"),
+])
+def test_unparseable_age_rows_stay_in_the_cap_walk(ledger, monkeypatch, undated_protected):
+    from cron.scheduler_authority import journal_path
+
+    executions, home = ledger
+    monkeypatch.setattr(executions, "TERMINAL_PRUNE_BATCH_SIZE", 2)
+    monkeypatch.setattr(executions, "MAX_TERMINAL_EXECUTIONS", 0)
+    (home / "config.yaml").write_text("cron:\n  execution_retention_days: 0\n", encoding="utf-8")
+    older = (NOW - timedelta(days=30)).isoformat()
+    undated = [f"undated-{i:02}" for i in range(undated_protected)]
+    dated = [f"protected-{i:02}" for i in range(20)]
+    with executions._transaction() as conn:
+        # Both times unreadable: julianday() is NULL, so the age key is NULL.
+        conn.executemany(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at, finished_at)
+               VALUES (?, 'recurring', 'builtin', 'seed', 1, 'completed', 'not-a-time', 'not-a-time')""",
+            ((row_id,) for row_id in undated),
+        )
+        conn.executemany(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, status, claimed_at, finished_at)
+               VALUES (?, 'audit', 'builtin', 'seed', 1, 'completed', ?, ?)""",
+            ((row_id, older, older) for row_id in dated),
+        )
+    for job_id, row_id in [("recurring", r) for r in undated] + [("audit", r) for r in dated]:
+        journal = journal_path(job_id, row_id)
+        journal.parent.mkdir(parents=True, exist_ok=True)
+        journal.write_text('{"canonical_settled":false}', encoding="utf-8")
+    executions.create_execution("recurring", source="builtin")
+
+    def settle(i):
+        monkeypatch.setattr(executions, "_hermes_now", lambda: NOW + timedelta(seconds=i))
+        trigger = executions.create_execution("trigger", source="builtin")
+        assert executions.finish_execution(trigger["id"], success=True)
+
+    settle(0)
+    with sqlite3.connect(home / "cron" / "executions.db") as conn:
+        assert conn.execute(
+            "SELECT scan_after_id FROM execution_prune_watermarks WHERE reason='cap'"
+        ).fetchone()[0] is not None
+    # The undated rows' owner settles after the cursor has moved past them.
+    for row_id in undated:
+        journal_path("recurring", row_id).unlink()
+    # Each call examines at most one 8-row page, so a full cycle spans several calls.
+    for i in range(1, 21):
+        settle(i)
+    with sqlite3.connect(home / "cron" / "executions.db") as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executions WHERE id LIKE 'undated-%'").fetchone()[0] == 0
+        assert conn.execute(
+            "SELECT COUNT(*) FROM executions WHERE id LIKE 'protected-%'").fetchone()[0] == 20
+        assert conn.execute(
+            "SELECT unparseable_claimed_at_count FROM execution_prune_watermarks WHERE reason='cap'"
+        ).fetchone()[0] == undated_protected

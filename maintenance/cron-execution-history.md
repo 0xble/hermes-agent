@@ -59,6 +59,10 @@ These protections have no guaranteed expiry, so each policy keeps a scan cursor
 the read contract). The next call seeks past the last examined candidate; when
 that range ends with page budget left, the same call wraps to the oldest rows up
 to the old cursor, so rows whose protection has since released are not delayed.
+Rows whose finish and claim times are both unparseable have a NULL age key and
+sort first in the index; the cursor can stop inside that segment and every wrap
+passes through it, so such a row is never skipped once a cursor exists (the age
+policy never matches them, so only the ceiling walk visits them).
 A page of journal-protected rows therefore costs one bounded pass per call; it
 cannot permanently hide eligible newer rows.
 Compute the cutoff in UTC before subtracting the duration,
