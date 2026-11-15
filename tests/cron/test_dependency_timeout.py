@@ -127,6 +127,21 @@ def test_agent_reported_proxy_503_is_named_by_the_scheduler():
     assert str(named) == "model proxy 127.0.0.1:8317 unavailable: 503 servers overloaded"
 
 
+@pytest.mark.parametrize("base_url", [
+    "http://127.0.0.1:99999/v1",
+    "http://127.0.0.1:not-a-port/v1",
+    "127.0.0.1:-1",
+    "http://[::1/v1",
+])
+def test_malformed_base_url_keeps_the_original_failure(base_url):
+    """An unparseable proxy URL is not the proxy; parsing must not mask the job's failure."""
+    failure = RuntimeError("HTTP 503: servers overloaded")
+    timeout = TimeoutError("timed out")
+
+    assert annotate_job_failure(failure, base_url=base_url, elapsed=1) is failure
+    assert annotate_job_failure(timeout, base_url=base_url, elapsed=1) is timeout
+
+
 def test_job_owned_timeout_is_not_renamed():
     own = TimeoutError("Cron job 'monitor' idle for 120s (limit 600s) — last activity: tool")
     assert annotate_job_failure(own, base_url="http://127.0.0.1:8317/v1", elapsed=120) is own
