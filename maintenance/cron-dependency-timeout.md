@@ -14,6 +14,12 @@ that timed out and that request went to the configured loopback proxy. A loopbac
 alone is not proof: a bare `TimeoutError: timed out` from a tool or the job's own code stays a
 `timeout` incident for that job.
 
+A 503 (`auth_unavailable` or overloaded) is named a model-proxy outage only with the same kind
+of proof: the exception chain carries a request to the configured loopback proxy, or it carries
+no request and is the agent's own reported failure (retries exhausted on its model route, raised
+by the scheduler through `agent_reported_failure`). A matching 503 whose request went elsewhere,
+or a bare one from a tool or the job's own code, stays that job's failure.
+
 The shared incident (`job_id="dependency"`) follows the ordinary alert rule: only an `alerted`
 row (a notice actually reached the operator) inside `cron.failure_repeat_alert_hours` quiets the
 other jobs. A `detected` row is never withheld, so an undelivered first notice cannot silence
