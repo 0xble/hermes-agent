@@ -540,6 +540,8 @@ def _record_prune_watermark(
 
 def _retention_cutoff() -> Optional[str]:
     """Retention config is best-effort; it must never undo a terminal write."""
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+
     try:
         from hermes_cli.config import load_config_readonly
 
@@ -548,6 +550,14 @@ def _retention_cutoff() -> Optional[str]:
         days = float(value)
         if not math.isfinite(days) or days < 0:
             raise ValueError("expected a non-negative finite duration")
+    except ConfigBackendUnavailable as error:
+        # A SystemExit subclass, so ``except Exception`` would let it abort the
+        # terminal write. The selected backend may hold a longer window than the
+        # default, so skip age expiry this pass instead of deleting history under
+        # defaults; the row backstop still runs and the next transition retries.
+        logger.warning("Config backend unavailable, skipping cron execution age pruning: %s",
+                       error)
+        return None
     except Exception as error:
         # Unrelated config (e.g. an unknown model preset), malformed mappings,
         # and conversion errors are all retention failures, not execution failures.

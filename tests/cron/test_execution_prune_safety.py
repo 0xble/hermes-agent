@@ -19,16 +19,11 @@ def ledger(monkeypatch, tmp_path):
     return executions, tmp_path
 
 
-@pytest.mark.parametrize("config", [
-    pytest.param("cron:\n  execution_retention_days: 10000000\n", id="overflow"),
-    pytest.param("model:\n  model_preset: missing-retention-test\n", id="unknown-preset"),
-    pytest.param("cron: not-a-mapping\n", id="non-mapping"),
-])
-@pytest.mark.parametrize("transition", [
-    "finish", "recover", "receipt", "dead-owner", "give-up", "missed",
-])
-def test_terminal_writes_survive_broken_retention_config(ledger, monkeypatch, config, transition):
-    executions, home = ledger
+TRANSITIONS = ["finish", "recover", "receipt", "dead-owner", "give-up", "missed"]
+
+
+def _settle_with_history(executions, monkeypatch, home, transition, *, config=None):
+    """Seed 2 rows past the default window, run one terminal transition, and read it back."""
     stamp = (NOW - timedelta(days=20)).isoformat()
     with executions._transaction() as conn:
         conn.executemany(
@@ -44,7 +39,8 @@ def test_terminal_writes_survive_broken_retention_config(ledger, monkeypatch, co
             conn.execute("UPDATE executions SET process_id='departed' WHERE id=?", (attempt["id"],))
         monkeypatch.setattr(executions, "_owner_identity", lambda *_: "dead")
         monkeypatch.setattr(executions, "_owner_is_live", lambda *_: False)
-    (home / "config.yaml").write_text(config, encoding="utf-8")
+    if config is not None:
+        (home / "config.yaml").write_text(config, encoding="utf-8")
 
     transitions = {
         "finish": lambda: executions.finish_execution(attempt["id"], success=True),
@@ -67,12 +63,47 @@ def test_terminal_writes_survive_broken_retention_config(ledger, monkeypatch, co
         status, finished = conn.execute(
             "SELECT status, finished_at FROM executions WHERE id=?", (attempt["id"],)).fetchone()
         expired = conn.execute("SELECT id FROM executions WHERE id='history-0'").fetchone()
-    # An overflowing window is longer than representable history; other config
-    # failures use the default age window rather than silently disabling cleanup.
-    assert (expired is not None) == ("10000000" in config)
     expected = {"finish": "completed", "receipt": "completed", "missed": "failed"}
     assert status == expected.get(transition, "unknown")
     assert finished == NOW.isoformat()
+    return expired is None
+
+
+@pytest.mark.parametrize("config", [
+    pytest.param("cron:\n  execution_retention_days: 10000000\n", id="overflow"),
+    pytest.param("model:\n  model_preset: missing-retention-test\n", id="unknown-preset"),
+    pytest.param("cron: not-a-mapping\n", id="non-mapping"),
+])
+@pytest.mark.parametrize("transition", TRANSITIONS)
+def test_terminal_writes_survive_broken_retention_config(ledger, monkeypatch, config, transition):
+    executions, home = ledger
+    expired = _settle_with_history(executions, monkeypatch, home, transition, config=config)
+    # An overflowing window is longer than representable history; other config
+    # failures use the default age window rather than silently disabling cleanup.
+    assert expired == ("10000000" not in config)
+
+
+@pytest.mark.parametrize("transition", TRANSITIONS)
+def test_terminal_writes_survive_unavailable_config_backend(ledger, monkeypatch, transition):
+    """``ConfigBackendUnavailable`` is a ``SystemExit``: it must not escape the terminal write."""
+    import sys
+
+    import hermes_cli.config
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+
+    executions, home = ledger
+    real_load = hermes_cli.config.load_config_readonly
+
+    def unavailable_for_retention():
+        # Only the retention lookup inside the terminal transaction sees the outage;
+        # opening the ledger reads config too and is not under test here.
+        if sys._getframe(1).f_code is executions._retention_cutoff.__code__:
+            raise ConfigBackendUnavailable("config plane unreachable")
+        return real_load()
+
+    monkeypatch.setattr(hermes_cli.config, "load_config_readonly", unavailable_for_retention)
+    # The backend may hold a longer window than the default, so age expiry waits for it.
+    assert _settle_with_history(executions, monkeypatch, home, transition) is False
 
 
 @pytest.mark.parametrize("protection", ["journal", "queued", "pending", "delivering", "provisional"])
