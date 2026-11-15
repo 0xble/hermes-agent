@@ -6,7 +6,9 @@
 # process only and then exec'd into CMD, so nothing leaks back and nothing has
 # to be sourced or deactivated. It is synced first when there is none to
 # inherit or the inherited one no longer matches its inputs
-# (scripts/_activation.sh).
+# (scripts/_activation.sh). When that sync would write into a live runtime home
+# (scripts/_setup_guard.sh), CMD runs in the checkout's .venv instead, built
+# outside that home if missing, so tools such as the pre-commit lint still run.
 #
 # Shebang for repo Python scripts, so `./scripts/foo.py` works from any cwd:
 #     #!/usr/bin/env -S bash -c 'exec "$BASH" "$(dirname "$0")/run-in-hermes-env" python3 "$0" "$@"'
@@ -25,8 +27,16 @@ if [ "$#" -eq 0 ]; then
 fi
 
 _here="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+_repo="$(dirname "$_here")"
 # shellcheck source=scripts/_activation.sh
 . "$_here/_activation.sh"
-hermes_ensure_env "$(dirname "$_here")" || exit 1
+# shellcheck source=scripts/_setup_guard.sh
+if hermes_activation_current "$_repo"; then
+    :
+elif (. "$_here/_setup_guard.sh" && hermes_require_safe_setup "$_repo") 2>/dev/null; then
+    hermes_ensure_env "$_repo" || exit 1
+else
+    hermes_checkout_env "$_repo" || exit 1
+fi
 
 exec "$@"

@@ -1,8 +1,8 @@
 # Test-runner live-home guard
 
 Load when changing `scripts/_setup_guard.sh`, the stale-environment fallback in
-`scripts/run_tests.sh`, or setup reached through `scripts/_activation.sh` and
-`scripts/run-in-hermes-env`.
+`scripts/run_tests.sh`, setup reached through `scripts/_activation.sh` and
+`scripts/run-in-hermes-env`, or the checkout `.venv` tools use instead.
 
 ## Required behavior
 
@@ -52,6 +52,20 @@ and only for a deliberate setup against that home.
 
 `hermes update` and the installer are unchanged. A scratch home, a dead pid
 file, and a non-symlink file named `current` still take the fallback.
+
+Tools are not refused. When `scripts/run-in-hermes-env` (and so
+`scripts/hermes-python`, the `just ruff` pre-commit lint and repo script
+shebangs) finds no current activation and the same admission check would
+refuse setup, it runs the command in the checkout's `.venv` instead
+(`hermes_checkout_env`). An existing `.venv` is only used. A missing one, or one
+that path built whose `uv.lock`, `pyproject.toml` or `setup.py` mtime has since
+changed, is built with `pm.build_env --group dev --group test` under
+`HERMES_HOME=${XDG_CACHE_HOME:-$HOME/.cache}/hermes-agent/tooling` and without
+`HERMES_RUNTIME_DIR`, so PM's install state, uv, interpreter and cache land in
+that tooling home and the live home is only read. The tooling home itself must
+pass the runtime resolution's live check. The resulting environment carries no
+activation sentinel, so `scripts/run_tests.sh` still refuses rather than
+running under it.
 
 Upstream: no matching issue or PR in `NousResearch/hermes-agent` for this
 fallback. The live release pointer and account-default home are fork runtime

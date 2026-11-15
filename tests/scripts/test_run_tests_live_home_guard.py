@@ -93,6 +93,7 @@ def _run(
     home_text: str | None = None,
     activation_entry: str | None = None,
     cwd: Path | None = None,
+    command: list[str] | None = None,
 ):
     env = {
         "PATH": str(commands),
@@ -112,6 +113,8 @@ def _run(
             "bash", "-c", 'source "$1/scripts/_activation.sh"; "$2" "$1"',
             "activation", str(root), activation_entry,
         ]
+    if command is not None:
+        argv = command
     return subprocess.run(
         argv,
         cwd=cwd or root,
@@ -242,6 +245,89 @@ def test_direct_activation_refuses_live_home_without_writing(tmp_path, entry, ov
     assert result.returncode != 0, output
     assert "refusing" in output, output
     assert "SETUP_RAN" not in output, output
+    assert _snapshot(home) == before
+
+
+_FAKE_BUILD_ENV = """\
+import json, os, sys
+from pathlib import Path
+args = sys.argv[1:]
+home = Path(os.environ["HERMES_HOME"])
+(home / "installs").mkdir(parents=True, exist_ok=True)
+(home / "installs" / "built.json").write_text(json.dumps(
+    {"argv": args, "runtime_dir": os.environ.get("HERMES_RUNTIME_DIR")}))
+python = Path(args[args.index("--out") + 1]) / "bin" / "python"
+python.parent.mkdir(parents=True)
+python.write_text("#!/bin/sh\\nexec %s \\"$@\\"\\n")
+python.chmod(0o755)
+print(python)
+"""
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("live", ["gateway-state", "account-default"])
+def test_tools_run_from_a_checkout_without_venv_and_leave_the_live_home_alone(tmp_path, live):
+    """The pre-commit lint (`scripts/hermes-python -m <tool>`) from a worktree with no .venv.
+
+    Setup into the live home stays refused; the tool gets the checkout .venv, built by PM with
+    its state in a tooling home outside the runtime homes, reused while its inputs are unchanged.
+    """
+    root, commands = _checkout(tmp_path)
+    shutil.rmtree(root / ".venv")
+    for name in ("rm", "touch"):
+        commands.joinpath(name).symlink_to(shutil.which(name))
+    shutil.copy2(ROOT / "scripts" / "hermes-python", root / "scripts" / "hermes-python")
+    for name in ("uv.lock", "pyproject.toml"):
+        (root / name).write_text("", encoding="utf-8")
+    (root / "pm" / "build_env.py").write_text(_FAKE_BUILD_ENV % shlex.quote(sys.executable), encoding="utf-8")
+    (root / "probe_tool.py").write_text(
+        "import os, shutil\n"
+        "print('TOOL_RAN', os.environ.get('VIRTUAL_ENV'), shutil.which('python'),"
+        " os.environ.get('__HERMES_ACTIVATED'))\n",
+        encoding="utf-8",
+    )
+    # Bootstrap interpreter in the tool store, as in a worktree that never had a .venv.
+    store_python = tmp_path / "runtime" / "python-3.0-test" / "bin" / "python3"
+    store_python.parent.mkdir(parents=True)
+    store_python.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} \"$@\"\n")
+    store_python.chmod(0o755)
+    extra: dict[str, str] = {}
+    if live == "account-default":
+        suffix = f"-guard-probe-{os.getpid()}"
+        home = _passwd_account_home() / f".hermes{suffix}"
+        extra["HERMES_DATA_DIR_SUFFIX"] = suffix
+    else:
+        home = tmp_path / "live-home"
+        _mark(home, live)
+    before = _snapshot(home)
+    tool = ["bash", str(root / "scripts" / "hermes-python"), "-m", "probe_tool"]
+    built = tmp_path / "account-home" / ".cache" / "hermes-agent" / "tooling" / "installs" / "built.json"
+
+    result = _run(root, commands, home, extra, command=tool)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert f"TOOL_RAN {root / '.venv'} {root / '.venv' / 'bin' / 'python'} None" in output
+    assert "SETUP_RAN" not in output
+    record = json.loads(built.read_text(encoding="utf-8"))
+    assert record["runtime_dir"] is None
+    assert record["argv"][-4:] == ["--group", "dev", "--group", "test"]
+    assert _snapshot(home) == before
+
+    built.unlink()
+    again = _run(root, commands, home, extra, command=tool)
+    assert again.returncode == 0, again.stdout + again.stderr
+    assert "TOOL_RAN" in again.stdout
+    assert not built.exists()  # the existing .venv is only used
+
+    os.utime(root / "uv.lock", (1, 1))
+    rebuilt = _run(root, commands, home, extra, command=tool)
+    assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
+    assert built.exists()  # changed inputs rebuild the .venv this path built
+
+    tests = _run(root, commands, home, extra)
+    assert tests.returncode != 0
+    assert "refusing" in tests.stderr
+    assert "SETUP_RAN" not in tests.stdout + tests.stderr
     assert _snapshot(home) == before
 
 
