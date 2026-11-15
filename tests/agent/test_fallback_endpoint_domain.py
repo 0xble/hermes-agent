@@ -32,6 +32,7 @@ def _server(port=0):
         malformed = False
         disconnect = False
         read_timeout_models = frozenset()
+        tool_call_models = frozenset()
 
     requests = Requests()
 
@@ -57,6 +58,16 @@ def _server(port=0):
                 return
             if requests.malformed:
                 data = b'{"choices": []}'
+            elif body['model'] in requests.tool_call_models and not any(
+                    m.get('role') == 'tool' for m in body['messages']):
+                data = json.dumps({
+                'id': 'local-tool', 'object': 'chat.completion', 'created': 1, 'model': body['model'],
+                'choices': [{'index': 0, 'finish_reason': 'tool_calls', 'message': {
+                    'role': 'assistant', 'content': None, 'tool_calls': [{
+                        'id': 'call_local', 'type': 'function',
+                        'function': {'name': 'web_search', 'arguments': '{}'}}]}}],
+                'usage': {'prompt_tokens': 1, 'completion_tokens': 4, 'total_tokens': 5},
+                }).encode()
             else:
                 data = json.dumps({
                 'id': 'local', 'object': 'chat.completion', 'created': 1,
@@ -116,14 +127,16 @@ def routes(monkeypatch):
         yield dead, healthy, config, requests
 
 
-def _agent(routes, *, responses=False):
+def _agent(routes, *, responses=False, tools=()):
     from run_agent import AIAgent
     dead, _healthy, _config, _requests = routes
     chain = [{'provider': p, 'model': m} for p, m in [
         ('custom:claude', 'Claude'), ('custom:muse', 'Muse'), ('custom:sol', 'Sol'), ('xai-oauth', 'Grok')]]
     if responses:
         chain[-1]['api_mode'] = 'codex_responses'
-    with patch('model_tools.get_tool_definitions', return_value=[]), \
+    tool_defs = [{'type': 'function', 'function': {
+        'name': name, 'description': name, 'parameters': {'type': 'object', 'properties': {}}}} for name in tools]
+    with patch('model_tools.get_tool_definitions', return_value=tool_defs), \
             patch('model_tools.check_toolset_requirements', return_value={}):
         agent = AIAgent(provider='custom:sol', model='Sol', api_key='local-test-only', base_url=dead,
                         quiet_mode=True, skip_context_files=True, skip_memory=True,
@@ -235,6 +248,19 @@ def test_inherited_alias_is_skipped_but_explicit_override_and_different_port_are
     assert same_endpoint(_identity(dead), _identity(healthy)) is False
 
 
+@pytest.mark.parametrize('key', ['api', 'url', 'base_url', 'baseUrl'])
+def test_every_runtime_endpoint_spelling_joins_the_failed_domain(routes, key):
+    """The offline identity sees the endpoint the runtime resolver routes to, whatever its spelling."""
+    from agent.route_binding import resolve_route_identity
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+    dead, _, config, _ = routes
+    config['providers']['alias'] = {key: dead}
+    runtime = _get_named_custom_provider('custom:alias', config=config, resolve_credentials=False)
+    assert runtime['base_url'] == dead
+    assert same_endpoint(resolve_route_identity({'provider': 'custom:alias', 'model': 'Alias'}), _identity(dead))
+    assert _skip(_candidate_agent(dead), {'provider': 'custom:alias', 'model': 'Alias'})
+
+
 def test_connection_failure_covers_other_paths_and_wire_modes_on_same_socket(routes):
     dead, _, _, _ = routes
     agent = _candidate_agent(dead)
@@ -338,6 +364,32 @@ def test_full_turn_at_switch_cap_still_requests_the_independent_route(routes):
     assert result['final_response'] == 'Grok actually answered.'
     assert activated == ['xai-oauth']
     assert [r['model'] for r in routes[3]] == ['Grok']
+
+
+def test_reserved_route_tool_call_continuation_completes_the_turn(routes):
+    """A valid response settles the one-request allowance: its tool continuation is a normal request."""
+    from functools import wraps
+    agent = _agent(routes, tools=('web_search',))
+    routes[3].tool_call_models = {'Grok'}
+
+    @wraps(apply_retry_restarts)
+    def at_cap(agent, **kwargs):
+        if agent.model == 'Grok' and kwargs['_retry'].restart_with_rebuilt_messages:
+            kwargs['restart_count'] = 3
+        return apply_retry_restarts(agent, **kwargs)
+
+    with _run_locally(agent, routes) as activated, \
+            patch('agent.conversation_loop.apply_retry_restarts', new=at_cap), \
+            patch('model_tools.handle_function_call', return_value='{"results": []}') as tool:
+        result = agent.run_conversation('search, then answer at the cap')
+    tool.assert_called_once()
+    assert result['final_response'] == 'Grok actually answered.'
+    assert result.get('failed') is not True
+    assert activated == ['xai-oauth']
+    grok = routes[3]
+    assert [r['model'] for r in grok] == ['Grok', 'Grok'], 'the tool continuation must reach the route'
+    assert any(m.get('role') == 'tool' for m in grok[1]['messages'])
+    assert agent._turn_independent_attempt_used is True, 'no second allowance this turn'
 
 
 @pytest.mark.parametrize("malformed,streaming", [(False, False), (True, False), (False, True)])

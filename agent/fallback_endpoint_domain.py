@@ -79,6 +79,14 @@ def reserve_independent_attempt(agent) -> bool:
     return True
 
 
+def settle_independent_attempt(agent) -> None:
+    """A validated response spends the allowance; later requests are the route's normal work.
+
+    ``used`` stays set, so a failing continuation cannot reserve a second allowance this turn.
+    """
+    agent._turn_independent_attempt_active = False
+
+
 def attempted_routes_summary(agent) -> str:
     from agent.i18n import t
     labels = getattr(agent, '_turn_attempted_route_labels', None)

@@ -35,11 +35,17 @@ def _route_metadata_config() -> dict[str, Any]:
     apply the same root normalization, env expansion and managed overlay order.
     """
     from hermes_cli import config as cfg
+    from hermes_cli.config_providers import _CAMEL_ALIASES
+    from hermes_cli.runtime_provider_custom import ENTRY_URL_KEYS
+
+    # Every endpoint spelling runtime resolution accepts, including camelCase aliases the legacy
+    # normalizer maps onto them; dropping one leaves the identity empty and the alias unexcluded.
+    endpoint_keys = {*ENTRY_URL_KEYS, *(camel for camel, key in _CAMEL_ALIASES.items() if key in ENTRY_URL_KEYS)}
 
     def project(source):
         if not isinstance(source, dict):
             return {}
-        fields = {'name', 'provider_key', 'base_url', 'enabled', 'api_mode', 'transport'}
+        fields = {'name', 'provider_key', 'enabled', 'api_mode', 'transport', *endpoint_keys}
         def entry(value):
             return {k: v for k, v in value.items() if k in fields} if isinstance(value, dict) else value
         result = {}
