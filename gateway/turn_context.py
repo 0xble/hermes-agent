@@ -103,6 +103,7 @@ class TurnContext:
     _cleanup_msg_ids: list[str] = field(default_factory=list)
     _card_recorder: Optional[Callable[[str], None]] = None
     _card_writes: set = field(default_factory=set)
+    _card_forgotten: set = field(default_factory=set)  # ids whose record is forgotten; a late record is dropped
     _bubble_cleanup_registered: bool = False
     _post_delivery_adapter: Any = None
     _progress_metadata: Optional[dict] = None

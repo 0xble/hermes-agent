@@ -212,6 +212,9 @@ callback, stranded every card the turn posted (about 215 deleted by hand on
   final reply never is.
 - The cleanup callback forgets its ids after one attempt; a cancelled cleanup
   keeps them. A failed run forgets them too, because failed runs keep their cards.
+  A forget waits for the record writes already spawned and marks its ids on the
+  turn first, so a worker-thread record still queued for the loop is dropped
+  instead of landing after the forget.
 - Boot (`_start_finish_wiring`, after adapters connect) deletes, in the
   background, every recorded card whose recording pid is dead, one
   `delete_messages` batch per chat. It forgets the cards that were deleted and
