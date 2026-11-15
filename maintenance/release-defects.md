@@ -56,6 +56,11 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   retry: the claim settles `interrupted` and its retry clock is deleted, checked inside the requeue
   write so a Stop that lands while the write waits for the writer lock counts too. Requeueing it
   would run work the person stopped once the model or credentials recover.
+- Recording the refusal retries transient storage failures (`OSError`, `sqlite3.OperationalError`)
+  in place with the claim's 0.25-5s backoff instead of letting them settle the unexecuted input
+  `failed`. A write that committed before raising is recognized by its requeued row and held
+  retry clock, so the attempt is not counted twice. If the drain stops first, the claim stays
+  started for the next owner's recovery to fence.
 - Source: `gateway/session_automation_retry.py`, `gateway/session_authority.py`,
   `gateway/session_ingress.py`, `gateway/session_automation.py`, `gateway/run_turn.py`,
   `gateway/run_turn_runner.py`.
