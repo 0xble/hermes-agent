@@ -948,8 +948,22 @@ class CLILoopsMixin:
 
         last_response, successful = self._post_turn_response()
         if not successful or getattr(self, "_last_turn_failed", False):
+            # A failed goal continuation is an internal work item, not a user request. Preserve
+            # the active goal and retry its generated prompt once the current failure is settled;
+            # never print the generic resend boundary as the continuation's answer.
+            if (
+                not getattr(self, "_goal_turn_user_initiated", True)
+                and not getattr(self, "_last_turn_interrupted", False)
+                and getattr(self, "_last_turn_failed", False)
+                and getattr(self, "_goal_failed_retry_count", 0) < 1
+            ):
+                self._goal_failed_retry_count = getattr(self, "_goal_failed_retry_count", 0) + 1
+                prompt = mgr.next_continuation_prompt()
+                if prompt:
+                    getattr(self, "_pending_input").put(prompt)
             return
         _active_deleg = 0
+        self._goal_failed_retry_count = 0
         try:
             from hermes_cli.goals import count_active_delegations, gather_background_processes as _gather_bg
             # Only THIS session's processes: subagents' pollers must not park the parent's goal.

@@ -88,6 +88,11 @@ _NO_ATTENDED_ACTIVITY_STAMP = object()
 _attended_notice_lock = threading.RLock()
 
 
+def _failed_turn_copy_is_user_facing(event, display_kind) -> bool:
+    """Synthetic admissions must be retried/settled silently, never shown the resend boundary."""
+    return getattr(event, "reply_expected", None) is not False and not is_machinery_display_kind(display_kind)
+
+
 def _tool_call_logger() -> logging.Logger:
     """Process-wide ``hermes.tool_calls`` Logger + one RotatingFileHandler on logs/tool_calls.log.
     Named Loggers live in ``logging.Logger.manager.loggerDict`` forever, so the former per-turn name
@@ -1392,7 +1397,22 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure = (
                 self._hmwa_classify_turn_failure(agent_result, history, session_entry)
             )
-            if agent_failed_early and not is_context_overflow_failure and automatic_notices_allowed(source):
+            # Failed-turn copy is for a human-facing request. Synthetic wakes (including goal
+            # continuations, which intentionally set reply_expected=False) stay in the FIFO/goal
+            # recovery path; never turn their internal boundary into a chat refusal.
+            if agent_failed_early and not is_context_overflow_failure and not _failed_turn_copy_is_user_facing(
+                event, prepared.persist_user_display_kind,
+            ):
+                # Synthetic turns are durable work, not a person waiting for a resend. Keep the
+                # failure in the admission/result for retry/recovery, but do not deliver provider or
+                # failed-turn copy as if it were a user-facing answer.
+                response = ""
+            elif (
+                agent_failed_early and not is_context_overflow_failure
+                and automatic_notices_allowed(source)
+                and event.reply_expected is not False
+                and not is_machinery_display_kind(prepared.persist_user_display_kind)
+            ):
                 response = self._hmwa_add_failed_turn_notice(response, self._hmwa_failed_turn_notice(agent_result))
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
                 agent_result, response, session_entry, session_key, source,

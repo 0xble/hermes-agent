@@ -107,6 +107,25 @@ class TestHealthyTurnStillRuns:
         assert "Continuing toward your standing goal" in queued
         assert mgr.state.status == "active"
 
+    def test_failed_synthetic_continuation_is_requeued_without_judging(self, hermes_home):
+        sid = f"sid-failed-{uuid.uuid4().hex}"
+        cli, mgr = _make_cli_with_goal(sid)
+        cli._goal_turn_user_initiated = False
+        cli._last_turn_failed = True
+        cli._last_turn_started = True
+        cli._last_turn_result = {
+            "completed": False,
+            "failed": True,
+            "final_response": "Your request was not processed. Send it again if you still want me to carry it out.",
+        }
+
+        with patch("hermes_cli.goals.judge_goal") as judge:
+            cli._maybe_continue_goal_after_turn()
+
+        judge.assert_not_called()
+        assert mgr.state.status == "active"
+        assert "Continuing toward your standing goal" in cli._pending_input.get_nowait()
+
     def test_clean_response_marks_done_when_judge_says_done(self, hermes_home):
         sid = f"sid-done-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)

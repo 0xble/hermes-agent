@@ -8,6 +8,7 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import functools
 import logging
@@ -890,6 +891,51 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 owners.append(bookkeeping_owner)
             captured['post_delivery'] = owners
 
+    async def _retry_failed_synthetic_event(self, event: Any, source: Any, agent_result: Any) -> bool:
+        """Requeue one failed internal delivery instead of exposing failed-turn copy.
+
+        Admission is durable, but inference can still fail after the admission is consumed. One
+        retry covers busy/interrupt/provider-transient races without creating an infinite provider
+        retry loop; user events and context/safety refusals never enter this path.
+        """
+        if not isinstance(agent_result, dict) or event is None:
+            return False
+        metadata = getattr(event, "metadata", None) or {}
+        if not (getattr(event, "internal", False) or getattr(self, "_is_goal_continuation_event")(event)):
+            return False
+        if metadata.get("gateway_internal_retry_count", 0) >= 1:
+            return False
+        if metadata.get("gateway_loop_tick"):
+            return False  # loop settlement schedules the next due tick
+        if agent_result.get("failure_reason") in {"context_overflow", "content_policy_blocked"}:
+            return False
+        if not (agent_result.get("failed") or agent_result.get("interrupted")
+                or agent_result.get("completed") is False):
+            return False
+        if not agent_result.get("interrupted") and agent_result.get("failure_retryable") is False:
+            return False
+        retry = copy.copy(event)
+        retry.metadata = {**metadata, "gateway_internal_retry_count": 1}
+        try:
+            adapter = self._delivery_adapter_for(source)
+            key = self._session_key_for_source(source)
+            if getattr(source, "platform", None) == Platform.LOCAL:
+                from gateway.session_automation import admit_route_wake
+                accepted = await admit_route_wake(
+                    self, adapter, source, retry.text, "internal-failure-retry", event=retry,
+                )
+                if not accepted:
+                    return False
+            elif adapter and key:
+                self._enqueue_fifo(key, retry, adapter)
+            else:
+                return False
+            logger.info("requeued failed internal turn for %s", key or "unknown")
+            return True
+        except Exception:
+            logger.debug("failed internal turn requeue failed", exc_info=True)
+            return False
+
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
         invalidation_epoch: Optional[int] = None, existing_session_only: bool = False,
@@ -906,6 +952,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         )
         if not successful:
             final_text = ""
+        if not successful:
+            await self._retry_failed_synthetic_event(event, source, agent_result)
         try:
             if existing_session_only:
                 # Settlement can precede a stop that suspends this route. Deferred

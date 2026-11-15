@@ -113,6 +113,11 @@ class CLIChatTurnMixin:
             message = _sanitize_surrogates(message)
 
         self._revive_blocked_goal_for_user_turn(original_message)
+        from hermes_cli.cli_loops_mixin import _is_self_injected_turn
+        self._goal_turn_user_initiated = (
+            not isinstance(original_message, TimelineNotification)
+            and not _is_self_injected_turn(original_message)
+        )
         self._chat_stage_user_message(agent, message)
         if isinstance(message, TimelineNotification):
             message = str(message)  # UI metadata is on the staged row, never in model content.
@@ -412,6 +417,7 @@ class CLIChatTurnMixin:
                     conversation_history=self.conversation_history[:-1],
                     stream_callback=None if muted else turn.stream_callback, task_id=self.session_id,
                     persist_user_message=_persist_clean_user_message, moa_config=_moa_cfg,
+                    turn_origin=("user" if getattr(self, "_goal_turn_user_initiated", True) else "goal_loop"),
                     **_author_kwargs,
                 )
             if getattr(self, "_pending_moa_disable_after_turn", False):
