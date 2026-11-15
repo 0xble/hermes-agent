@@ -10,7 +10,7 @@ def rich_message_payload(content: str, *, skip_entity_detection: bool = False) -
     """
     from .adapter import _degrade_unsupported_markdown_links, _protect_rich_currency, _rich_normalize_linebreaks
     from .copy_quotes import protect_rich_copy_quotes
-    from .telegram_markdown import escape_rich_currency_dollars
+    from .telegram_markdown import escape_rich_currency_dollars, normalize_rich_latex
     from gateway.copy_blocks import restore_inline_copy_bodies
     from .rich_markdown import (
         escape_literal_hash_prefixes,
@@ -19,6 +19,7 @@ def rich_message_payload(content: str, *, skip_entity_detection: bool = False) -
     )
 
     content, quotes = protect_rich_copy_quotes(content)
+    content = normalize_rich_latex(content)
     markdown = normalize_blockquote_markdown(
         normalize_footnotes(
             escape_literal_hash_prefixes(_degrade_unsupported_markdown_links(content))

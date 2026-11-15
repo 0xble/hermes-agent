@@ -33,9 +33,10 @@ async def admit_media(adapter: Any, msg: Any) -> Optional[list[str]]:
     allowed, _note = adapter._telegram_media_size_allowed(voice, "voice message")
     if not allowed:
         return None
-    from plugins.platforms.telegram.telegram_media_fetch import fetch_telegram_file
+    from plugins.platforms.telegram.telegram_media_download import fetch_telegram_file
+    from plugins.platforms.telegram.telegram_media_fetch import local_root
     try:
-        _file, data = await fetch_telegram_file(voice, "user voice")
+        _file, data = await fetch_telegram_file(voice, "user voice", local_root(adapter))
         path = await cache_audio_from_bytes_async(data, ext=".ogg")
     except Exception as exc:  # health: allow BLE001 -- a failed fetch leaves the note gated, as before
         logger.warning("[%s] Could not fetch a group voice note for the spoken mention check: %s", adapter.name, exc)
