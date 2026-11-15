@@ -362,13 +362,25 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # readers. Keep their real initialization (including SOUL.md) inside this test,
     # rather than materializing those profiles in the checkout shared by workers.
     set_home_override = hermes_constants.set_hermes_home_override
+    get_home_override = hermes_constants.get_hermes_home_override
 
     def isolated_home_override(value):
         if value is not None and not Path(value).is_absolute():
             value = fake_hermes_home / "profile-scopes" / value
         return set_home_override(value)
 
+    def isolated_get_home_override():
+        # Some profile-scope modules import set_hermes_home_override before this
+        # fixture patches the module attribute. Normalize those aliases at the
+        # read boundary too; otherwise a symbolic authority id such as "owned"
+        # can still become a relative HERMES_HOME.
+        value = get_home_override()
+        if value is not None and not Path(value).is_absolute():
+            return str(fake_hermes_home / "profile-scopes" / value)
+        return value
+
     monkeypatch.setattr(hermes_constants, "set_hermes_home_override", isolated_home_override)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home_override", isolated_get_home_override)
     # A test that pins the process home (hermes_constants.pin_process_hermes_home) must not
     # leak that module-global into the next test's routed-profile decisions.
     try:
