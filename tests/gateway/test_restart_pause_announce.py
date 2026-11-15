@@ -117,6 +117,67 @@ async def test_restart_pause_is_announced_once_and_discard_still_resumes(tmp_pat
 
 
 @pytest.mark.asyncio
+async def test_a_later_restart_does_not_announce_the_same_pause_again(tmp_path, monkeypatch):
+    """(e) The episode outlives the process: a pause an earlier boot already announced is not told
+    to the chat again by every later restart while the person has not answered it yet."""
+    runner, _adapter, source, sent = _gateway(tmp_path, monkeypatch)
+    try:
+        sid, lost, queued = await _lose_human_turn_behind_queued_message(runner, source, tmp_path)
+        first, verdicts = await _restart(runner, tmp_path)
+        assert verdicts[sid] == 'unknown_execution'
+        await _settle(first)
+        assert len(_notices(sent)) == 1, sent
+        for instance in ('restarted-again', 'restarted-third'):
+            again = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id=instance)
+            verdicts = await recover_profile_native_sessions(runner, again)
+            assert verdicts[sid] == 'unknown_execution'  # still paused for the person to resolve
+            await _settle(again)
+            assert len(_notices(sent)) == 1, sent
+        assert get_session_admission(again.db, admission_id=lost)['status'] == 'unknown'
+        assert get_session_admission(again.db, admission_id=queued)['status'] == 'queued'
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('told_by', ['next_boot', 'reply'])
+async def test_a_notice_that_never_reached_the_chat_is_not_lost_to_a_restart(tmp_path, monkeypatch, told_by):
+    """(f) A boot whose unprompted send failed leaves the episode untold: the next boot still
+    announces it once. A reply that carried the notice meanwhile counts as told for later boots."""
+    runner, adapter, source, sent = _gateway(tmp_path, monkeypatch)
+    deliver, failed = adapter.send, []
+
+    async def flaky(chat_id, content, **kwargs):
+        if PAUSED in content and not failed:
+            failed.append(content)
+            return SendResult(success=False, error='network down')
+        return await deliver(chat_id, content, **kwargs)
+    monkeypatch.setattr(adapter, 'send', flaky)
+    try:
+        sid, lost, queued = await _lose_human_turn_behind_queued_message(runner, source, tmp_path)
+        first, verdicts = await _restart(runner, tmp_path)
+        assert verdicts[sid] == 'unknown_execution'
+        await _settle(first)
+        assert len(failed) == 1 and _notices(sent) == [], sent
+        expected = 1
+        if told_by == 'reply':
+            await adapter.handle_message(MessageEvent(text='hello?', source=source, message_id='later'))
+            await _settle(first, adapter)
+            await asyncio.gather(*getattr(first, '_mutation_tasks', ()), return_exceptions=True)
+            assert len(_notices(sent)) == 1, sent  # the reply carried it
+        for instance in ('restarted-again', 'restarted-third'):
+            again = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id=instance)
+            verdicts = await recover_profile_native_sessions(runner, again)
+            assert verdicts[sid] == 'unknown_execution'
+            await _settle(again)
+            assert len(_notices(sent)) == expected, sent  # told exactly once across every boot
+        assert get_session_admission(again.db, admission_id=lost)['status'] == 'unknown'
+        assert get_session_admission(again.db, admission_id=queued)['status'] == 'queued'
+    finally:
+        runner.session_store.close_all_db_handles()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize('boot', ['settled', 'left-unknown'])
 async def test_no_notice_when_no_person_is_waiting(tmp_path, monkeypatch, boot):
     """(c) A lost automation turn pages nobody: boot settles it, or (its resolution refused) it
