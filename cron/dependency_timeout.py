@@ -21,11 +21,17 @@ def model_proxy_endpoint(base_url: str | None) -> str | None:
     text = str(base_url or "").strip()
     if not text:
         return None
-    parts = urlsplit(text if "://" in text else f"http://{text}")
-    host = parts.hostname
+    try:
+        parts = urlsplit(text if "://" in text else f"http://{text}")
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        # This runs inside the scheduler's failure handler: a malformed URL (bad IPv6
+        # brackets, non-numeric or out-of-range port) is not the proxy, and must not
+        # replace the job's real failure.
+        return None
     if not host or host.lower() not in _LOOPBACK:
         return None
-    port = parts.port
     if port is None:
         port = 443 if parts.scheme == "https" else 80
     return f"{host}:{port}"
