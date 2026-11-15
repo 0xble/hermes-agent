@@ -263,3 +263,15 @@ ledger failed on its first v0.23.1 night. The queue therefore rebuilds only when
 table definition differs from the stored one.
 
 Contract tests: `tests/cron/test_delivery_queue.py::test_an_older_queue_is_migrated_once_not_on_every_open`.
+
+## Update fence holds agent jobs
+
+An update's install fence can outlive the gateway restart it drives. While it is held,
+`ensure_gateway_runtime` answers `update_paused` to every agent fire, so the restarted gateway's
+ticker booked a failed "Not started; occurrence deferred" run, restored the slot and re-fired it on
+every tick (2026-11-14 08:57-08:59 AM PT: 141 failed and 50 missed rows, one occurrence restored 49
+times). The due scan now skips agent jobs while `update_fence_held` is true, leaving their due
+instant and pending slot untouched and stamping the drain hold, so each occurrence fires (or is
+restored) once after the update ends. Script jobs never reach the gateway and keep running.
+
+Contract tests: `tests/cron/test_update_fence_holds_agent_jobs.py`.

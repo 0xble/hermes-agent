@@ -48,10 +48,12 @@ def _resolve_repo() -> Path:
 
 REPO = _resolve_repo()
 EXTENSION_TOOLS = ("goal_set", "loop_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
-# key -> (expected, or None meaning "must be set")
+# key -> (expected, or None meaning "must be set"). Delegated children route through Advanced
+# Delegation's model_map and its default route (v0.23.1 retired ``delegation.model`` presets).
 EXPECTED_CONFIG = {
     "memory.write_approval": "false",
-    "delegation.model": None,
+    "delegation.backend": "model_map",
+    "delegation.backends.model_map.default": None,
     "auxiliary.review.model": None,
 }
 # Fallback only: the accepted baseline is read from MAINTENANCE.md (scripts/ci/release_baseline.py),

@@ -110,6 +110,25 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   ~120 busy agent threads that turned a 10 ms diff of 2,753 rows into 3-17 s holds
   (2026-10-25: 58 holds, 365 s in 2 h; callback CPU ~0.4 s). Keep new writer callbacks
   O(1) in Python round trips where the row count grows with history or sessions.
+- A structural routing save sends state.db only its diff. `_persist_routing_data` keeps
+  `_routing_baseline` (key -> entry JSON this process last persisted, None when a fast
+  single-entry save may have skipped it), diffs the snapshot against it in Python before the
+  writer lock, and writes the changed and removed keys through `apply_gateway_routing_delta`
+  with the same retired-route skip and report. With no trusted baseline (first save, a failed
+  or skipped write) and every `_ROUTING_RECONCILE_S` (600 s), the baseline is the stored rows,
+  read through a pooled reader without the write lock, so rows changed behind the process are
+  restored by a diff too. During a private interval the delta applies replace's privacy rules
+  to its own keys (stored private rows stay byte-exact, private entries are never written) and
+  reports the keys it left alone, which stay unknown in the baseline. No routing save issues the
+  full-table replace. On 2026-11-14 the full replace of a 37,670-route index held the writer
+  lock 9-113 s per save and stalled every session's writes. Proof:
+  `tests/gateway/test_routing_save_delta.py`.
+- Sites the live guard named on 2026-11-14 run their state.db step off the loop: the process
+  watcher's survivor acknowledgement (it loads retained results, whose `_owns_result` opens
+  state.db), the WebSocket handler's first backend heartbeat write, and the cron RPC's route
+  restore (`restore_local_session_async`) and admission reads. Still on the loop and named by
+  the guard: `session_detached.name` (`lookup_by_session_key`), `session_viewer_close._physical_target`
+  (`local_receipt`) and `/discard` (`peek_session_id`).
 - The check-in poll (`gateway/run_checkins.py::poll_checkins`, every 5 s) groups every routed
   session on the loop. `_standalone_runtime_home` memoizes the resolved parent per DB path, and
   the scan yields to the loop every `_SCAN_YIELD_EVERY` (512) entries. On 2026-11-14 the live

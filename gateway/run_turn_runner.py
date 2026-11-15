@@ -197,7 +197,7 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
         ctx = self._ctx
         if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+            ctx.track_cleanup_id(str(result.message_id))
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -1921,13 +1921,13 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            # Model/credential resolution failed before the turn began. Keep the raw cause in logs,
-            # but return a failed turn with a stable user-facing recovery message and reason.
+            # Resolution failed before the turn began: raw cause to logs, a stable recovery reply to the user.
             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
             from agent.turn_failure_copy import stamp_failure
             text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
             return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
-                                  "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
+                                  "failed": True, "completed": False, "error": str(exc),
+                                  "pre_execution_runtime_refusal": True}, reason, retryable)
         from gateway.session_authorities import active_authority
         from gateway.session_worker_construct import session_routing
         pr = session_routing(active_authority(runner), policy) if policy else runner._provider_routing

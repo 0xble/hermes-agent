@@ -113,6 +113,9 @@ def locked_scan():
         scan.needs_save = True
         jobs = [j for j in jobs if scan.find(j.get("id")) is not None]
 
+    from cron.dispatch_hold import agent_jobs_held_for_update
+
+    hold_agent_jobs = agent_jobs_held_for_update()
     due = []
     for job in jobs:
         # Per-job containment: one malformed record must never abort the whole scan. Normalization
@@ -125,6 +128,8 @@ def locked_scan():
                 continue
             if store._has_pause_marker(job):
                 store._self_disable_half_paused(job, scan)
+                continue
+            if hold_agent_jobs and not job.get("no_agent"):
                 continue
             if store._evaluate_due_job(job, scan, run_claim_ttl):
                 due.append(job)

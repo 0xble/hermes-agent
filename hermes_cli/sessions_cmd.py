@@ -698,7 +698,10 @@ _NEVER_ACTIVE_DEFAULT_DAYS = 30.0
 def _now_param(args):
     """``session.prune``'s run-now override, sent only when asked: a gateway older than this CLI
     rejects the unknown key."""
-    return {"now": True} if getattr(args, "now", False) else {}
+    params = {"now": True} if getattr(args, "now", False) else {}
+    if (seconds := getattr(args, "max_seconds", None)) is not None:
+        params["max_seconds"] = seconds
+    return params
 
 
 def _prune_never_active_keyed(db, args):
@@ -773,8 +776,23 @@ def _note_pinned_skipped(db, filters, action):
           f"(pin is a keep flag). {optin}")
 
 
+def _prune_runtime_refusal(args):
+    from hermes_state_prune_budget import validate_max_seconds
+    value = getattr(args, "max_seconds", None)
+    try:
+        validate_max_seconds(value)
+    except ValueError as exc:
+        return str(exc)
+    if value is not None and getattr(args, "never_active", False):
+        return "--max-seconds applies to retention prune, not --never-active"
+    return None
+
+
 def _cmd_prune_or_archive(db, args, action):
     prune = action == "prune"
+    if prune and (refusal := _prune_runtime_refusal(args)):
+        print(f"Error: {refusal}")
+        return 1
     if prune and getattr(args, "never_active", False):
         return _prune_never_active_keyed(db, args)
     from hermes_cli.session_filters import build_prune_filters, describe_filters, format_epoch
@@ -857,7 +875,8 @@ def _cmd_prune_or_archive(db, args, action):
         from hermes_state_prune_pacing import DeletionWindowClosedError
         try:
             pruned = db.prune_sessions(sessions_dir=_sessions_dir(), exclude_active_write_guards=True,
-                                       within_deletion_window=not getattr(args, "now", False), **filters)
+                                       within_deletion_window=not getattr(args, "now", False),
+                                       max_seconds=getattr(args, "max_seconds", None), **filters)
         except DeletionWindowClosedError as exc:
             print(f"Error: {exc}")
             return 1

@@ -19,7 +19,6 @@ import queue
 import sys
 import threading
 import time
-from hermes_dir_acl import make_user_dir
 
 logger = logging.getLogger(__name__)
 
@@ -349,19 +348,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.lock = threading.RLock()
         self.failure = None
         self.path = Path(outbox_dir) / 'pending.json'
-        make_user_dir(self.path.parent, mode=0o700, parents=True, exist_ok=True)
-        if self.path.parent.is_symlink() or self.path.is_symlink():
-            raise WorkerPersistenceError('unsafe_outbox')
-        os.chmod(self.path.parent, 0o700)
-        from gateway.status import _try_acquire_file_lock
-        lock_path = self.path.parent / 'owner.lock'
-        if lock_path.is_symlink():
-            raise WorkerPersistenceError('unsafe_outbox')
-        self._outbox_owner = lock_path.open('a+', encoding='utf-8')
-        os.chmod(lock_path, 0o600)
-        if not _try_acquire_file_lock(self._outbox_owner):
-            self._outbox_owner.close()
-            raise WorkerPersistenceError('outbox_in_use')
+        from agent.runtime_session_privacy import open_public_outbox
+        self._outbox_owner = open_public_outbox(self)
         try:
             if self.path.exists():
                 from agent.runtime_session_journal import read_journal
@@ -425,29 +413,10 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
     def _apply(self, operation, payload, *, best_effort=False):
         with self.lock:
-            if self.failure:
-                raise WorkerPersistenceError(self.failure)
-            if self.journal['pending']:
-                raise WorkerPersistenceError('pending_receipt')
-            entry = {'sequence': self.journal['next_sequence'], 'operation': operation, 'payload': payload}
-            candidate = json.loads(json.dumps(self.journal))
-            candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
-            candidate['next_sequence'] += 1
-            from agent.runtime_session_journal import OutboxCapacityError, check_worker_frame
-            try:
-                check_worker_frame(self.scope, candidate['pending'][-1])
-                self._save(candidate)
-            except OutboxCapacityError:
-                # Only explicitly optional archives may skip an unsent rejection. Mandatory
-                # append callers can swallow errors: retain the failure for flush/finish.
-                if not best_effort:
-                    self.failure = 'outbox_full'
-                raise
-            except Exception as exc:
-                self.failure = str(exc)
-                raise
-            self.journal = candidate
-            return self.retry_pending()[0]
+            from agent.runtime_session_privacy import journal_admission, queue_entry
+            with journal_admission(self.scope, operation=operation, payload=payload):
+                queue_entry(self, operation, payload, best_effort=best_effort)
+            return self.retry_pending(_first_send=True)[0]
 
     def _persist_entry(self, entry):
         try:
@@ -461,13 +430,24 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.adopt(adopted['owner_epoch'])
         return self.rpc('worker.persist', **self.scope, **entry)
 
-    def retry_pending(self):
+    def retry_pending(self, *, _first_send=False):
         with self.lock:
             results = []
             try:
                 while self.journal['pending']:
                     entry = self.journal['pending'][0]
-                    result = self._persist_entry(entry)
+                    from agent.runtime_session_privacy import (authoritative_privacy_denial,
+                        discard_refused_entry, journal_admission)
+                    with journal_admission(self.scope, self.journal):
+                        pass
+                    try:
+                        result = self._persist_entry(entry)
+                    except Exception as exc:
+                        # Reopened/retried entries may already have committed under
+                        # a lost ACK. A later privacy refusal cannot disprove that.
+                        if _first_send and authoritative_privacy_denial(exc):
+                            discard_refused_entry(self, entry)
+                        raise
                     candidate = dict(self.journal, pending=self.journal['pending'][1:])
                     candidate = self._compression_receipt_journal(candidate, result)
                     self._save(candidate)
@@ -475,7 +455,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                     self.journal = candidate
                     results.append(result)
             except Exception as exc:
-                self.failure = str(exc)
+                from agent.runtime_session_privacy import authoritative_privacy_denial
+                if not authoritative_privacy_denial(exc):
+                    self.failure = str(exc)
                 raise
             self.failure = None
             return results
@@ -493,6 +475,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
                        compression_lock_holder=None, turn_lease_holder=None,
                        turn_lease_ttl_seconds=300.0, **metadata):
         self._session(session_id)
+        from agent.runtime_session_privacy import private_convenience
+        if private_convenience(self.scope):
+            return 0
         payload = dict(metadata, role=role, content=content, archived=archived,
             compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
             turn_lease_ttl_seconds=turn_lease_ttl_seconds)
@@ -501,6 +486,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
         self._session(session_id)
+        from agent.runtime_session_privacy import private_convenience
+        if private_convenience(self.scope):
+            return 0
         if chunk_rows is not None:
             raise WorkerPersistenceError('unsupported_operation')
         if compression_lock_holder is not None or turn_lease_ttl_seconds != 300.0:
@@ -544,10 +532,16 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
 
     def queue_token_counts(self, session_id, **usage):
         self._session(session_id)
+        from agent.runtime_session_privacy import private_convenience
+        if private_convenience(self.scope):
+            return
         self._apply('usage.main', usage)
 
     def record_auxiliary_usage(self, session_id, task, **usage):
         self._session(session_id)
+        from agent.runtime_session_privacy import private_convenience
+        if private_convenience(self.scope):
+            return
         self._apply('usage.auxiliary', dict(usage, task=task))
 
     def flush_token_counts(self, timeout=5.0):

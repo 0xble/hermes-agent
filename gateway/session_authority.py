@@ -504,7 +504,8 @@ class SessionAuthority:
         """The FIFO stopped without claiming its head. Committed rows stay queued for a later
         drain; process-local delivery/HTTP/producer waiters on this session are released,
         with the reason instead of a reply, so an adapter loop is never parked on a turn that
-        will not run. The ingress turns that refusal into one user-facing notice per episode.
+        will not run. The ingress turns that refusal into one user-facing notice per episode;
+        an ``unknown_execution`` pause is also announced to the chat (``session_pause_announce``).
         ``session_busy`` is transient (a registered worker finishes and wakes the FIFO), so only
         the messaging delivery waiters are released for it; an API/webhook/Bot observer keeps
         waiting for the answer instead of reporting accepted work as a conflict."""
@@ -516,6 +517,10 @@ class SessionAuthority:
             waiter = self.waiters.pop(admission_id, None)
             if waiter is not None and not waiter.done():
                 waiter.set_exception(RuntimeStoreError(reason))
+        # A lost turn's pause is also told to the chat unprompted (once per episode, shared with
+        # the reply path): input the previous owner admitted has no waiter here to carry it.
+        from gateway.session_pause_announce import schedule_pause_announcement
+        schedule_pause_announcement(self, ref, reason)
 
     async def admit_automation(self, adapter, event, identity, replaces=None, fold=None, *, authorize_write=None):
         from gateway.admission_canary import refusal_evidence
@@ -666,7 +671,7 @@ class SessionAuthority:
     async def recover_native_sessions(self, bindings):
         """Bind only server-observed native routes; unknown work stays paused."""
         from collections import Counter
-        from gateway.session_envelope import check_native_route
+        from gateway.session_envelope import check_native_route, restore_native_source
         bindings = list(bindings)
         counts = Counter(sid for sid, _, _ in bindings)
         results = {}
@@ -678,6 +683,11 @@ class SessionAuthority:
                 native = [row for row in rows if 'native_text_v1' in row['payload']]
                 if not native:
                     raise RuntimeStoreError('not_found')
+                if adapter is None:
+                    # Origins omit live transport proof. The sealed envelope must still bind
+                    # to the current owned credential before its adapter can be selected.
+                    restored = restore_native_source(native[-1]['payload'], self.runner)
+                    adapter = self.runner._adapter_for_source(restored)
                 target = self.physical_target(SessionRef(self.profile_id, sid))
                 source, route = await check_native_route(self.runner, native[-1]['payload'], target,
                                                     available_source, adapter)
@@ -697,6 +707,10 @@ class SessionAuthority:
                 self.sessions.setdefault(sid, LiveSession(source, route))
                 if any(row['status'] == 'unknown' for row in rows):
                     raise RuntimeStoreError('unknown_execution')
+                prime = getattr(adapter, 'prime_routing_cache', None)
+                if callable(prime):
+                    from gateway.platforms.event import MessageEvent
+                    prime(MessageEvent(text='', source=source))
                 # Recover audio only after all route checks, before the replay can prepare it.
                 if prefetch := getattr(self.runner, '_prefetch_admitted_voice', None):
                     from gateway.session_envelope import restore_native
@@ -707,6 +721,10 @@ class SessionAuthority:
                 results[sid] = 'ready'
             except RuntimeStoreError as exc:
                 results[sid] = exc.reason
+                if (exc.reason == 'unknown_execution' and sid in self.sessions
+                        and sid in getattr(self, 'fenced_at_boot', ())):
+                    # Paused by this boot, before any drain: no waiter or new message reports it to the chat.
+                    self._pause(SessionRef(self.profile_id, sid), exc.reason)
         return results
 
     async def submit(self, actor: SessionActor, request: Submission, *, _authorize_write=None, queue_while_restarting=False,
@@ -1108,7 +1126,8 @@ class SessionAuthority:
             pending = list_session_admissions(self.db, session_id=ref.session_id)
             if any(row['status'] == 'unknown' for row in pending):
                 raise RuntimeStoreError('unknown_execution')
-            first = next((row for row in pending if row['status'] == 'queued'), None)
+            from gateway.session_automation_retry import claimable_head
+            first, passing = await claimable_head(self, [row for row in pending if row['status'] == 'queued'])
             from gateway.config import Platform
             if live.source.platform == Platform.LOCAL:
                 # A reasoning command or a model pick made while the previous turn ran lands here, at the
@@ -1180,6 +1199,10 @@ class SessionAuthority:
                 # a claim now would hand this row to its busy path and settle it unrun. The head
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
                 return 'classic_busy', first
+            if first is not None:
+                from gateway.session_automation_retry import retry_ready
+                if not await retry_ready(self, first):
+                    return 'automation_wait', first
             self._require_admission_open()
             from gateway.session_runtime_workers import tracked_write
             live.rescan = False  # a _schedule from here on may not be visible to this claim's read
@@ -1187,7 +1210,8 @@ class SessionAuthority:
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
                                                     session_id=ref.session_id, _guard=self._admission_gate(),
-                                                    head=first['admission_id'] if first is not None else None),
+                                                    head=first['admission_id'] if first is not None else None,
+                                                    passing=passing),
                                       then=partial(self._stamp_claim, ref, live))
             # Input scheduled while this claim's transaction ran may postdate its read: re-read
             # instead of letting the drain exit idle over a committed admission.
@@ -1267,8 +1291,10 @@ class SessionAuthority:
                         # A verdict on the head alone (its route or binding moved under it) that every drain
                         # repeats: pausing behind it strands the FIFO for good. Refused only once the same
                         # head conflicted twice, read after each: never a successor a cancel advanced to.
-                        head = next((row['admission_id'] for row in list_session_admissions(
-                            self.db, session_id=ref.session_id) if row['status'] == 'queued'), None)
+                        from gateway.session_automation_retry import claimable_head
+                        head, _passing = await claimable_head(self, [row for row in list_session_admissions(
+                            self.db, session_id=ref.session_id) if row['status'] == 'queued'])
+                        head = head['admission_id'] if head is not None else None
                         if head is not None and head != conflicted:
                             conflicted = head
                             continue
@@ -1296,17 +1322,18 @@ class SessionAuthority:
                 await asyncio.sleep(backoff)
                 continue
             backoff = 0.0
-            if row != 'classic_busy':
+            if row not in ('classic_busy', 'automation_wait'):
                 return row, first
             if self._drain_stopping(ref, live):
                 return None
-            await asyncio.sleep(_CLAIM_RETRY_MIN_S)
+            await asyncio.sleep(1.0 if row == 'automation_wait' else _CLAIM_RETRY_MIN_S)
 
     async def _execute_claimed(self, ref, live, row):
         """Run the claimed admission: ``(response, outcome)``. The executing stamp clears the moment
         execution returns; a lost managed worker settles an automation turn (``settled_unknown``) or pauses
         the FIFO and re-raises ManagedExecutionUnknown."""
         from gateway.session_finite import execute_finite_admission
+        from gateway.session_automation_retry import AutomationRuntimeDeferred
         from gateway.session_managed_worker import ManagedExecutionUnknown
         try:
             try:
@@ -1322,6 +1349,15 @@ class SessionAuthority:
             finally:
                 with live.event_stream.lock:
                     self.executing.pop(ref.session_id, None)
+        except AutomationRuntimeDeferred:
+            with live.event_stream.lock:
+                live.event_stream.execution = {}
+            self.pending_stops.pop(ref.session_id, None)
+            self.pending_stop_causes.pop(ref.session_id, None)
+            self.pending_steers.pop(ref.session_id, None)
+            self.adopted.pop(ref.session_id, None)
+            self._publish_pending(ref)
+            return None, 'deferred'
         except ManagedExecutionUnknown:
             with live.event_stream.lock:
                 live.event_stream.execution = {}
@@ -1376,7 +1412,7 @@ class SessionAuthority:
             admission_id = row['admission_id']
             try:
                 response, outcome = await self._execute_claimed(ref, live, row)
-                if outcome == 'settled_unknown':
+                if outcome in ('settled_unknown', 'deferred'):
                     self.deferred_resets.pop(live.route, None)  # no settlement follows, as below
                     continue
                 from gateway.session_settlement_recovery import requeue_shutdown_unstarted
@@ -1547,7 +1583,11 @@ async def _claim_epoch(authority, *, successor=False):
                                         successor=successor)
         authority.begun_epoch = epoch
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
-    await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
+    # The sessions whose lost turn this boot fenced: only those pauses are new to their chat. A turn an
+    # earlier owner already left ``unknown`` was announced then, or by the next message's reply.
+    fenced = set()
+    await asyncio.to_thread(recover_session_inputs, db, epoch=epoch, fenced=fenced)
+    authority.fenced_at_boot = getattr(authority, 'fenced_at_boot', frozenset()) | fenced
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
     from gateway.session_unattended_unknown import settle_recovered_unattended
     await asyncio.to_thread(settle_recovered_unattended, db, epoch)

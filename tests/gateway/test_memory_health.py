@@ -101,9 +101,10 @@ def prepare_startup(gateway, monkeypatch):
     for name in (
         "_start_post_connect_services", "_await_startup_boot_sends",
         "_recover_pending_shutdown_flush_off_loop", "_await_mcp_discovery",
-        "_finish_startup_restore", "_send_session_db_warning_notifications",
+        "_finish_startup_restore", "_send_session_db_warning_notifications", "_sweep_orphan_progress_cards",
     ):
         setattr(gateway, name, AsyncMock())
+    gateway._retain_background_task = lambda task: task
     gateway._claim_pending_obligations = AsyncMock(return_value=[])
     gateway._resume_pending_candidates_async = AsyncMock(return_value=None)
     gateway._startup_interrupted_note_candidates = Mock(return_value=[])
