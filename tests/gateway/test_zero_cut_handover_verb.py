@@ -255,11 +255,11 @@ def test_handover_waits_for_real_runner_followup_views():
     runner, _ = make_restart_runner()
     runner._zero_cut_handover_state = {"accepted": True, "updates_settled": True, "token_lock_released": True, "active_turns": 0, "idle": False, "failed": None}
     runner._pending_messages["pending"] = "received follow-up"
-    runner._queued_events["overflow"] = [object()]
+    runner._session_state("overflow").conversation.queued_events = [object()]
     assert drain.status(runner)["idle"] is False
     runner._pending_messages.clear()
     assert drain.status(runner)["idle"] is False
-    runner._queued_events.clear()
+    runner._session_state("overflow").conversation.queued_events.clear()
     assert drain.status(runner)["idle"] is True
 
 

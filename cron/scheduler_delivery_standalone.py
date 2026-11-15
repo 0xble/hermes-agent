@@ -55,7 +55,6 @@ def _standalone_send(
 
     def _failed(e) -> tuple[None, str]:
         msg = f"delivery to {t.where} failed: {e}"
-        logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
         # An exception escaping the sender says nothing about what already went out, unless it
         # proves the request never left.
         from gateway.platforms._shared import request_never_left
@@ -105,8 +104,10 @@ def _standalone_send(
             # A result timeout leaves the pooled thread's send running: same in-flight ambiguity.
             if isinstance(e, TimeoutError):
                 return _in_flight(30 + send_timeout - base_timeout)
+            logger.error("Job '%s': delivery to %s failed: %s", job["id"], t.where, e, exc_info=True)
             return _failed(e)
     except Exception as e:
+        logger.error("Job '%s': delivery to %s failed: %s", job["id"], t.where, e, exc_info=True)
         return _failed(e)
 
 

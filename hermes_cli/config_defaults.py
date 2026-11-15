@@ -8,16 +8,14 @@ from hermes_cli.config_defaults_auxiliary import _aux
 from hermes_cli.config_defaults_vault import DEFAULT_VAULT_CONFIG
 
 
-#: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
-#: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
-#: (the 3.14 pin shipped between the two without a migration); a saved config still holding one
-#: is the template copied, and the config migration unsets it, never a user's own pin.
-DEFAULT_SANDBOX_IMAGE = "nousresearch/hermes-sandbox:desktop"
-LEGACY_SANDBOX_IMAGES = ("nikolaik/python-nodejs:python3.11-nodejs20", "nikolaik/python-nodejs:python3.14-nodejs22")
-LEGACY_SANDBOX_IMAGE = LEGACY_SANDBOX_IMAGES[0]
-# Vercel Sandbox managed image (Vercel deprecated its `runtime` presets in Aug 2026).
-DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
-LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
+from hermes_cli.config_defaults_sandbox import (
+    DEFAULT_SANDBOX_IMAGE as DEFAULT_SANDBOX_IMAGE,
+    LEGACY_SANDBOX_IMAGES as LEGACY_SANDBOX_IMAGES,
+    LEGACY_SANDBOX_IMAGE as LEGACY_SANDBOX_IMAGE,
+    DEFAULT_VERCEL_IMAGE as DEFAULT_VERCEL_IMAGE,
+    LEGACY_VERCEL_RUNTIME as LEGACY_VERCEL_RUNTIME,
+)
+
 DEFAULT_CRON_MAX_PARALLEL_JOBS = 4
 
 
@@ -777,7 +775,7 @@ DEFAULT_CONFIG = {
         # stream-only.
         "stream_only_base_urls": [],
         # Per-task blocks share one shape (_aux): provider "auto" = inherit the main model; base_url
-        # overrides provider; api_key falls back to OPENAI_API_KEY; reasoning_effort:
+        # overrides provider; api_key falls back to OPENAI_API_KEY (OpenAI hosts only); reasoning_effort:
         # none|minimal|low|medium|high|xhigh|max|ultra ("" = provider default); extra_body =
         # OpenAI-compatible request fields. Vision: download_timeout = image HTTP download (s).
         "vision": _aux(120, download_timeout=30),
@@ -1017,7 +1015,6 @@ DEFAULT_CONFIG = {
         "status_bar": {
             "fields": [],
         },
-        "copy_shortcut": "auto",  # "auto" (platform default) | ctrl_c | ctrl_shift_c | disabled
         # Petdex animated mascot (github.com/crafter-station/petdex): cosmetic sprite across
         # CLI/TUI/desktop, managed with `hermes pets`. No effect on prompt caching.
         "pet": {
@@ -1405,8 +1402,7 @@ DEFAULT_CONFIG = {
         # and every compaction is a chance to lose detail, so the default stays off. A token count >= 16000 enables it;
         # other values (true, "200k") are config errors: warned and ignored.
         "compression_threshold_tokens": 0,
-        # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
-        # toolsets=["web"] doesn't strip MCP). false = strict intersection.
+        # Narrowed child toolsets keep the parent's MCP toolsets (toolsets=["web"] keeps MCP); false = strict
         "inherit_mcp_toolsets": True,
         # When true, delegated children inherit the parent's Fast mode (priority/auto/cold), also
         # under a pinned delegation.provider. Fast fields are re-derived for the child's own route
@@ -1450,10 +1446,11 @@ DEFAULT_CONFIG = {
         # input() from a worker would deadlock). false = auto-deny, true = auto-approve "once"; both
         # log a warning audit line. true only for trusted batch work.
         "subagent_auto_approve": False,
-        # Subagent background processes (task_id "sa-...") route notify_on_complete / watch_pattern
-        # notifications to the PARENT; false suppresses them (the child's result is the
-        # deliverable). Async-delegation results are NEVER suppressed.
+        # Subagent background processes (task_id "sa-...") route notify_on_complete / watch_pattern notifications to
+        # the PARENT; false suppresses them (the child's result is the deliverable). Async-delegation results are NEVER
+        # suppressed. auto_resume: opt-in (spends tokens unattended), gives up with one failure after the deadline.
         "surface_child_process_notifications": False,
+        "resumable_ttl_hours": 48, "max_resumable": 32, "auto_resume": False, "auto_resume_deadline_minutes": 360,
     },
     # Ephemeral prefill messages file — JSON list of {role, content} dicts injected at the start of
     # every API call for few-shot priming. Never saved to sessions/logs/trajectories.
@@ -1717,8 +1714,8 @@ DEFAULT_CONFIG = {
             # Bot API 10.1 native rich messages (tables/task lists/math). Off = legacy MarkdownV2,
             # since rich messages are hard to copy as plain text.
             "rich_messages": False,
-            # Experimental rich DM stream previews; off: Telegram Desktop/macOS overlays draft frames.
-            "rich_drafts": False,
+            # rich_drafts (experimental): rich DM previews; off: Desktop/macOS overlays draft frames.
+            "rich_drafts": False, "plain_drafts": False,  # plain: raw previews that only grow
             # CJK stays on legacy MarkdownV2 (Telegram Desktop/macOS garbles rich CJK, #47653);
             # set True on an unaffected client to get native rich tables for CJK.
             "allow_cjk_rich_messages": False,
@@ -1774,6 +1771,8 @@ DEFAULT_CONFIG = {
         # / mode=off. Quote in YAML when starting with * or containing {}/!/: e.g. "git push
         # --force*".
         "deny": [],
+        # Who may answer a chat approval/slash confirm/clarify: ["*"] any admitted member; [] requester + admins (+ ids).
+        "approvers": ["*"],
         # /reload-mcp confirms before rebuilding the MCP tool set (it invalidates the prompt cache,
         # so the next message re-sends full input). "Always Approve" → false.
         "mcp_reload_confirm": True,
@@ -2108,7 +2107,7 @@ DEFAULT_CONFIG = {
             # tool eager. The runtime fallback in tools/tool_search.py derives from this value.
             "defer": [
                 "computer_use", "session_search", "image_generate",
-                "todo_list", "process_manage", "cronjob_manage", "browser_vault",
+                "todo_list", "process_manage", "cronjob_manage", "browser_vault", "text_to_speech", "manage_connections",
                 # Desktop GUI surface (desktop_ui, project and catalog toolsets)
                 "drive_preview", "gui_tour", "desktop_preview", "annotate_preview", "manage_catalog",
                 "show_tip", "desktop_project", "close_terminal",
@@ -2316,8 +2315,8 @@ DEFAULT_CONFIG = {
         "message_timestamps": {"enabled": False},
         # Max bytes of inbound image/audio/video the gateway buffers into RAM and caches to disk.
         # Media is read fully into memory first, so unbounded uploads (Discord Nitro: 500 MB) or
-        # huge remote URLs can OOM-kill constrained deployments. Enforced in
-        # gateway/platforms/base.py for every adapter. 0 = no cap. Default 128 MiB.
+        # huge remote URLs (incl. image URLs in agent replies) can OOM-kill constrained deployments.
+        # Enforced in gateway/platforms/base.py for every adapter. 0 = no cap. Default 128 MiB.
         "max_inbound_media_bytes": 128 * 1024 * 1024,
         # Let adapters read HTTP_PROXY/HTTPS_PROXY/NO_PROXY/SSL_CERT_FILE from the environment and
         # auto-detect generic/macOS system proxies. False when the gateway inherits a proxy it must

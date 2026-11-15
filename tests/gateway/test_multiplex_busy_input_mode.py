@@ -642,7 +642,7 @@ async def test_meeting_binding_controls_every_busy_boundary(
     agent.interrupt.assert_not_called()
     if steered:
         assert key not in adapter._pending_messages
-        assert not runner._queued_events.get(key)
+        assert not runner._session_state(key).conversation.queued_events
     elif boundary not in ("durable", "replay"):
         assert adapter._pending_messages[key] is event
     assert runner._effective_busy_input_mode(event.source) == "queue"

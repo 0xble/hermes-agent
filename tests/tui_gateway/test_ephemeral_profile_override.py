@@ -71,8 +71,8 @@ def override_calls(monkeypatch):
 
     patch_server_threads(monkeypatch, srv, _InlineThread)
     with patch("tui_gateway.server.threading.Thread", _InlineThread), \
-        patch("tui_gateway.server.set_hermes_home_override", return_value="TOK") as m_set, \
-        patch("tui_gateway.server.reset_hermes_home_override") as m_reset, \
+        patch("tui_gateway.server.set_hermes_home_override", return_value="TOK"), \
+        patch("tui_gateway.server.reset_hermes_home_override"), \
         patch("tui_gateway.server._background_agent_kwargs", return_value={}), \
         patch("tui_gateway.server._ephemeral_preview_agent_kwargs", return_value={}), \
         patch("tui_gateway.server._preview_restart_callbacks", return_value={}), \

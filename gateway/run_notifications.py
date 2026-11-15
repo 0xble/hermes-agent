@@ -35,29 +35,12 @@ from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
-from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin, _local_completion_card
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
-
-
-def _local_completion_card(evt: dict) -> dict[str, str]:
-    """Build the local async-result card for a completion or liveness notice."""
-    from tools.process_registry_notifications import (
-        PROCESS_COMPLETE_DISPLAY_KIND, async_delegation_display_text, process_completion_display_text)
-    evt_type = evt.get("type", "completion")
-    if evt_type == "completion":
-        return {"display_kind": PROCESS_COMPLETE_DISPLAY_KIND,
-                "display_text": evt.get("_display_text") or process_completion_display_text([evt])}
-    if evt_type == "async_delegation":
-        return {"display_kind": "async_delegation_complete", "display_text": async_delegation_display_text(evt)}
-    if evt_type == "heartbeat":
-        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
-        from tools.process_registry_notifications import heartbeat_display_text
-        return {"display_kind": INTERNAL_NOTIFICATION_DISPLAY_KIND, "display_text": heartbeat_display_text(evt)}
-    return {}
 
 
 def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
@@ -76,9 +59,17 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
         metadata["automation_identities"] = evt["_automation_identities"]
     if source.platform == Platform.LOCAL:
         metadata.update(_local_completion_card(evt))
+        from tools.process_registry_notifications import completion_resumes_parent, delegation_wakes_parent
+        if delegation_wakes_parent(evt):
+            metadata["completion_wakes_parent"] = True
+        if completion_resumes_parent(evt) and "notification_category" not in metadata:
+            metadata["completion_resumes_parent"] = True
     proven_session_id = str(evt.get("proven_session_id") or "").strip()
     if proven_session_id:
         metadata["gateway_proven_session_id"] = proven_session_id
+    requester_user_id = str(evt.get("user_id") or "").strip()
+    if requester_user_id:
+        metadata["requester_user_id"] = requester_user_id
     if completion_ids := evt.get("completion_ids"):
         metadata["gateway_completion_ids"] = list(completion_ids)
     return metadata
@@ -459,7 +450,8 @@ class GatewayNotificationsMixin(
         return _media_send_succeeded(result)
 
     async def _deliver_media_from_response(
-        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[dict[str, Any]] = None
+        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[dict[str, Any]] = None,
+        footer_line: str = "", footer_captioned: Optional[list] = None,
     ) -> bool:
         """Deliver explicit attachments from an already-streamed response (text already delivered).
         EXPLICIT-ONLY, unlike the non-streaming path in ``gateway/platforms/base.py``: a bare local
@@ -469,17 +461,24 @@ class GatewayNotificationsMixin(
 
         Explicit means ``MEDIA:`` directives and markdown/HTML image tags — the two contracts the
         non-streaming chain turns into attachments. See #20834 and #141806.
-        Returns True when at least one upload was confirmed delivered.
+        Returns True when at least one upload was confirmed delivered. ``footer_line`` rides the last
+        photo's caption when the adapter allows it (``runtime_footer``, #74547); a caller passing a
+        ``footer_captioned`` list reads ``[True]`` back only once that send confirmed the caption, so it
+        does not send the footer a second time as its own message.
         """
         from urllib.parse import quote as _quote
         from gateway.checkin_delivery import delivery_metadata
         delivered_any = False
+        from gateway.runtime_footer import caption_landed, caption_with_footer
+        captioned = False
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
             force_document_attachments = "[[as_document]]" in response
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            from gateway.platforms.docker_media_paths import hand_back_unreadable_media
+            await hand_back_unreadable_media([p for p, _ in media_files])
             # Strip image URLs (parity with the non-streaming chain); no extract_local_files here.
             # Do NOT deduplicate explicit MEDIA tags against prior turns here (#73771). This rescan is
             # already EXPLICIT-ONLY (see docstring): a MEDIA: directive in the final streamed reply is the
@@ -511,10 +510,11 @@ class GatewayNotificationsMixin(
             if image_paths or url_images:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    images.extend(url_images)
+                    images, _ = caption_with_footer(adapter, [*images, *url_images], footer_line)
                     _res = await adapter.send_multiple_images(
                         chat_id=chat_id, images=images, metadata=adapter_meta)
                     delivered_any = delivered_any or _media_send_succeeded(_res)
+                    captioned = caption_landed(_res, images)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
@@ -533,6 +533,8 @@ class GatewayNotificationsMixin(
                         delivered_any = delivered_any or _media_send_succeeded(_res)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+        if footer_captioned is not None:
+            footer_captioned.append(captioned)
         return delivered_any
 
 
@@ -556,6 +558,13 @@ class GatewayNotificationsMixin(
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        if text_already_delivered and session_key and getattr(stream_consumer, "delivery_uncertain", False) is True:
+            # The stream counted a timed-out send as shown. The follow-up's result replaces this
+            # turn's, so the completion path never sees the flag: ledger it now under THIS turn's
+            # inbound id, through the same adapter-owned bracket the completion path uses.
+            await self._ledger_uncertain_streamed_final(
+                MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
+                session_key, response, adapter)
         note_event = MessageEvent(text="", source=source, message_id=event_message_id)
         delivered_confirmed = text_already_delivered
         from gateway.copy_blocks import split_copy_blocks_for
@@ -573,9 +582,14 @@ class GatewayNotificationsMixin(
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await adapter.edit_message(
-                            chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
-                        )
+                        from gateway.run_turn_final_reconcile import TURN_REPLACED, edit_preview_to_final
+                        _edit_res = await edit_preview_to_final(
+                            adapter, source.chat_id, _sc_msg_id, text_content, metadata,
+                            still_current=getattr(stream_consumer, "_run_still_current", None))
+                        if _edit_res is TURN_REPLACED:
+                            # The turn was replaced (/new, /stop) during a flood wait: nothing more is
+                            # owed, and False would make the caller re-send this stale answer.
+                            return True
                         if getattr(_edit_res, "success", False):
                             from gateway.reply_latency import current_receipt, record_final_reply
                             record_final_reply(current_receipt(), text_content, _edit_res, kind="text_edit")
@@ -610,51 +624,12 @@ class GatewayNotificationsMixin(
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
                     delivered_confirmed = True
-        if copy_blocks and session_key and isinstance(adapter, BasePlatformAdapter):
-            from gateway.reply_latency import current_receipt
-            queued_copy_event = MessageEvent(
-                text="", source=source, message_id=event_message_id, ledger_message_id=inbound_message_id)
-            queued_copy_event._reply_latency_receipt = current_receipt()
-            copy_results = []
-            await adapter._send_copy_blocks(
-                queued_copy_event, session_key, copy_blocks, _mark_notify_metadata(metadata),
-                copy_results.append)
-            if any(getattr(result, "success", False) for result in copy_results):
-                delivered_confirmed = True
-            if any(not getattr(result, "success", False) for result in copy_results):
-                from gateway.delivery_ledger import ledger_enabled
-                if not await asyncio.to_thread(ledger_enabled):
-                    # No ledger owns the refused blocks. With nothing landed, the caller's
-                    # whole-response fallback is the only retry; after a partial delivery it would
-                    # duplicate, so the gap is reported and the turn stops here.
-                    if not delivered_confirmed:
-                        return False
-                    logger.error(
-                        "Queued-lane copy block delivery incomplete for %s and no delivery ledger "
-                        "is enabled; the undelivered blocks are lost.", source.chat_id)
-                else:
-                    # Each block has its own ledger row, so a refused block is redelivered from
-                    # the ledger. A whole-response fallback here would resend delivered parts.
-                    logger.warning(
-                        "Queued-lane copy block delivery incomplete for %s; ledger redelivery owns the rest.",
-                        source.chat_id)
-        else:
-            for copy_block_index, copy_block in enumerate(copy_blocks):
-                copy_metadata = dict(metadata or {})
-                copy_metadata["copy_block"] = True
-                copy_metadata["copy_block_index"] = copy_block_index
-                copy_metadata["plain"] = True
-                _sent = await self._send_queued_final_text(
-                    adapter, source, copy_block, copy_metadata, event_message_id, None, session_key, inbound_message_id)
-                if not getattr(_sent, "success", False):
-                    logger.warning("Queued-lane copy block send failed to %s: %s", source.chat_id,
-                                   getattr(_sent, "error", None) or "no result")
-                    # Only a turn where nothing landed may fall back to the whole-response send;
-                    # after a partial delivery that resend would duplicate what already arrived.
-                    if not delivered_confirmed:
-                        return False
-                    break
-                delivered_confirmed = True
+        from gateway.run_notifications_copy import deliver_queued_copy_blocks
+        delivered_confirmed, may_continue = await deliver_queued_copy_blocks(
+            self, adapter, source, session_key, copy_blocks, metadata, event_message_id,
+            inbound_message_id, delivered_confirmed)
+        if not may_continue:
+            return False
         if (delivered_confirmed and session_key
                 and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
             if not hasattr(note_event, "_restart_note_marker_api_available"):

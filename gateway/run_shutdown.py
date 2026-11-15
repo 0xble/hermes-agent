@@ -35,6 +35,12 @@ from gateway.run_common import _UNSET
 from agent.async_utils import cancel_task_with_grace
 from gateway.run_runtime import interrupt_side_agents, managed_turn_count, stop_managed_turns
 from gateway.session_runtime_workers import uncounted_runtime_work_units
+from gateway.run_shutdown_home_notice import (
+    HOME_NOTICE_MUTED,
+    HOME_NOTICE_SENT,
+    GatewayHomeShutdownNoticeMixin,
+    settle_home_online_notice_debt,
+)
 from gateway.run_shutdown_session_end import GatewaySessionEndMixin
 from gateway.run_shutdown_deadlines import GatewayShutdownDeadlinesMixin, bounded_stop_requested
 from gateway.shutdown_watchdog import arm_shutdown_watchdog, resolve_shutdown_watchdog_delay, session_store_lock_snapshot
@@ -186,7 +192,7 @@ def _persist_shutdown_pending_messages(runner):
     return GatewayShutdownMixin._persist_shutdown_pending_messages(runner)
 
 
-class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, GatewayShutdownDeadlinesMixin, GatewayShutdownExternalDrainMixin):
+class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, GatewayShutdownDeadlinesMixin, GatewayShutdownExternalDrainMixin, GatewayHomeShutdownNoticeMixin):
     """Stop/drain/restart, scale-to-zero and active-work accounting methods for GatewayRunner."""
 
     @dataclasses.dataclass
@@ -1328,8 +1334,20 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                         profile=restart_profile,
                     )
         notified: set[tuple[str, str, Optional[str]]] = set()
+        delivered: set[tuple[str, str, Optional[str]]] = set()  # the subset that really got the notice
         # A DM topic reaches its private parent, but a forum topic does not replace a group broadcast.
         private_topic_parents: set[tuple[int, str]] = set()
+        # Record the loop before sending active-chat notices: a running task in a home chat must not
+        # bypass the same restart-loop cap that applies to the home broadcast (#60438).
+        home_skip_reason = self._home_shutdown_broadcast_skip_reason() if include_home_channels else None
+        muted_home_targets = set()
+        if self._home_shutdown_notice == HOME_NOTICE_MUTED:
+            muted_home_targets = {
+                _delivery_target_key(platform.value, cfg.home_channel.chat_id,
+                                     cfg.home_channel.thread_id, profile=profile)
+                for profile, platform, cfg in self._served_home_channel_configs()
+                if cfg.home_channel and cfg.home_channel.chat_id
+            }
         if update_notified and update_record:
             data = update_record[1]
             update_target = self._resolve_update_target(self._update_paths())
@@ -1341,35 +1359,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                 ))
         for session_key in (self._snapshot_running_agents() if session_keys is None else list(session_keys)):
             if session_key in getattr(self, "_s2_note_session_keys", set()):
-                # Reserve the S2 note's destination in the same dedup set used by the
-                # home-channel pass. The note is sent after a timed-out drain; without this
-                # reservation an active session that is also the home channel receives the
-                # ordinary broadcast before the S2 note. A failed S2 send clears this fence by
-                # replacing _s2_note_session_keys with the delivered set before the fallback pass.
-                target = await self._shutdown_notification_target(session_key)
-                if target is None:
-                    continue
-                if len(target) == 4:
-                    source, platform_str, chat_id, thread_id = target
-                    profile = None
-                else:
-                    source, platform_str, chat_id, thread_id, profile = target
-                try:
-                    platform = Platform(platform_str)
-                    adapter = self._delivery_adapter_for(source) if source is not None else None
-                    if adapter is None:
-                        adapter = self._authorization_adapter(platform, profile)
-                    if adapter is None:
-                        continue
-                    _, delivery_profile = self._owning_profile(adapter, platform)
-                    notified.add(_delivery_target_key(
-                        platform_str, chat_id, thread_id, profile=delivery_profile,
-                    ))
-                    if (platform == Platform.TELEGRAM and thread_id is not None
-                            and getattr(source, "chat_type", None) in {"dm", "private"}):
-                        private_topic_parents.add((id(adapter), str(chat_id)))
-                except Exception as e:
-                    logger.debug("Failed to reserve S2 shutdown target for %s: %s", session_key, e)
+                from gateway.run_shutdown_targets import reserve_shutdown_note_target
+                await reserve_shutdown_note_target(self, session_key, notified, private_topic_parents, logger)
                 continue
             target = await self._shutdown_notification_target(session_key)
             if target is None:
@@ -1391,6 +1382,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     continue
                 _, delivery_profile = self._owning_profile(adapter, platform)
                 dedup_key = _delivery_target_key(platform_str, chat_id, thread_id, profile=delivery_profile)
+                if dedup_key in muted_home_targets:
+                    notified.add(dedup_key)  # a loop-muted home chat hears nothing, active task or not
+                    continue
                 if dedup_key in notified:
                     continue
                 if not self._notice_allowed(platform, "active session"):
@@ -1414,6 +1408,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                                    and getattr(source, "chat_type", None) in {"dm", "private"}):
                 if await self._send_shutdown_notice(adapter, chat_id, shutdown_message(adapter), "active chat", platform_str, metadata=metadata):
                     notified.add(dedup_key)
+                    delivered.add(dedup_key)
                     if private_topic:
                         private_topic_parents.add((id(adapter), chat_id))
             from gateway.warning_notifications import present_notification
@@ -1426,18 +1421,14 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                 notified.add(dedup_key)  # suppressed: latch so the home-channel pass does not re-target it
         if not include_home_channels:
             return
-        if self._restart_requested and restart_source is not None:
-            logger.debug("Skipping home-channel shutdown notifications for in-chat restart")
+        # A home chat the active-session pass already told is owed "Gateway online" like one this pass reaches.
+        if self._home_got_active_session_notice(delivered):
+            self._home_shutdown_notice = HOME_NOTICE_SENT
+        # In-chat restart, planned --replace takeover, quiet drain (suppresses ONLY the home-channel
+        # broadcast; per-session pings above stay) and restart-loop mute all skip the broadcast.
+        if home_skip_reason is not None:
+            logger.info("Home-channel shutdown broadcast suppressed: %s", home_skip_reason)
             return
-        # A quiet drain (routine fleet auto-update) suppresses ONLY the home-channel broadcast; per-session
-        # pings above stay. Current-epoch marker only; a failing check fails toward the louder behaviour.
-        with _log_suppressed(logging.DEBUG, "drain_notification_suppressed check failed: %s"):
-            from gateway.drain_control import drain_notification_suppressed
-            if drain_notification_suppressed():
-                logger.info(
-                    "Home-channel shutdown broadcast suppressed by drain marker (suppress_notification=true)"
-                )
-                return
         # EVERY served profile's home channel, through that profile's OWN bot: ``self.adapters`` and
         # ``self.config`` are the launch profile's alone, so iterating them left the secondaries'
         # channels silent (#118233). ``list(...)`` snapshots the adapter maps: adapter.send() can hit
@@ -1472,6 +1463,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     **({"metadata": metadata} if metadata else {}),
                 ):
                     notified.add(dedup_key)
+                    delivered.add(dedup_key)
+                    self._home_shutdown_notice = HOME_NOTICE_SENT
             from gateway.warning_notifications import present_notification
             from gateway.run import _async_profile_runtime_scope
             # present_notification reads the ACTIVE profile's display settings: bind the served one's.
@@ -2579,77 +2572,9 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             return flush_pending_to_file({session_key: value}, reason=reason)
 
     def _persist_shutdown_pending_messages(self) -> int:
-        """Durably spool every queued inbound before cancellable shutdown cleanup starts.
-
-        This is deliberately synchronous and called before the bounded finalization task: a timed-out
-        restart may cancel all best-effort cleanup, but it must not cancel the only copy of a user
-        follow-up. Successfully spooled slots are removed by identity so later fallback phases do not
-        replay them; failed slots remain available to a subsequent best-effort pass.
-        """
-        persisted = 0
-
-        def _slot(mapping, key, value, *, source_value=None, overflow: bool = False) -> None:
-            nonlocal persisted
-            try:
-                if self._flush_owned_pending(
-                    key, value, reason="shutdown", overflow=overflow,
-                ):
-                    current = mapping.get(key)
-                    expected = value if source_value is None else source_value
-                    # SessionFieldView is a live Mapping, not a dict. Remove only the
-                    # exact slot we flushed; a concurrent replacement must survive.
-                    if current is expected:
-                        remover = getattr(mapping, "pop", None)
-                        if callable(remover):
-                            remover(key, None)
-                    persisted += 1
-            except Exception:
-                logger.exception("Failed to durably spool shutdown-pending message for %s", key)
-
-        pending = getattr(self, "_pending_messages", None)
-        if isinstance(pending, Mapping):
-            for key, value in list(pending.items()):
-                _slot(pending, key, value)
-
-        queued_events = getattr(self, "_queued_events", None)
-        if isinstance(queued_events, Mapping):
-            for key, events in list(queued_events.items()):
-                if events:
-                    _slot(queued_events, key, list(events), source_value=events, overflow=True)
-
-        profile_adapters = getattr(self, "_profile_adapters", {})
-        adapters = [*list(getattr(self, "adapters", {}).items())]
-        adapters.extend(
-            (platform, adapter)
-            for amap in profile_adapters.values()
-            for platform, adapter in list(amap.items())
-        )
-        for platform, adapter in adapters:
-            adapter_pending = getattr(adapter, "_pending_messages", None)
-            if not isinstance(adapter_pending, Mapping):
-                continue
-            for key, value in list(adapter_pending.items()):
-                _slot(adapter_pending, key, value)
-
-        startup_queue = getattr(self, "_startup_restore_queue", None)
-        if isinstance(startup_queue, list):
-            for event in list(startup_queue):
-                spool = getattr(event, "_hermes_recovery_spool", None)
-                if spool is not None and spool.exists():
-                    continue
-                try:
-                    key = self._session_key_for_source(event.source)
-                    if self._flush_owned_pending(key, event, reason="restore_shutdown"):
-                        for index, current in enumerate(startup_queue):
-                            if current is event:
-                                del startup_queue[index]
-                                break
-                        persisted += 1
-                except Exception:
-                    logger.exception("Failed to preserve startup-restore queued event during shutdown")
-        if persisted:
-            logger.info("Shutdown phase: durably spooled %d queued inbound message(s) before cleanup", persisted)
-        return persisted
+        """Spool owned inbound slots before entering cancellable shutdown cleanup."""
+        from gateway.run_shutdown_pending import persist_shutdown_pending_messages
+        return persist_shutdown_pending_messages(self)
 
     async def _stop_finalize_agents_and_adapters(
         self, ctx: GatewayShutdownMixin._StopContext,
@@ -2834,10 +2759,12 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             with suppress(Exception):
                 self._flush_owned_pending(session_key, value, reason="shutdown")
         # The overflow FIFO tail lives in SessionState.conversation.queued_events — flush it too.
-        for session_key, events in dict(getattr(self, "_queued_events", None) or {}).items():
-            if events:
+        for session_key, state in dict(self.__dict__.get("_sessions") or {}).items():
+            if state.conversation.queued_events:
                 with suppress(Exception):
-                    self._flush_owned_pending(session_key, list(events), reason="shutdown", overflow=True)
+                    self._flush_owned_pending(
+                        session_key, list(state.conversation.queued_events), reason="shutdown", overflow=True,
+                    )
         # Claimed follow-ups still have their original spool until replay accepts them.
         # Fresh inbound held by the restore gate has no spool yet and must be persisted now.
         for event in list(getattr(self, "_startup_restore_queue", None) or []):
@@ -2851,12 +2778,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                 logger.exception("Failed to preserve startup-restore queued event during shutdown")
         # Live SessionState views: clear() resets one field per session (never a wholesale dict swap).
         self._running_agents.clear()
-        self._running_agents_ts.clear()
         self._pending_messages.clear()
-        self._pending_approvals.clear()
         for _state in list((self.__dict__.get("_sessions") or {}).values()):
             _state.turn.lease = None
-        getattr(self, "_busy_ack_ts", {}).clear()  # absent on bare shutdown-path doubles
+            _state.turn.started_ts = _state.turn.busy_ack_ts = 0.0
+            _state.persistent.approvals = None
         self._shutdown_event.set()
         # Global catch-all subprocess kill (safe to repeat) for the graceful path and late respawns.
         # Off-loop: same blocking sweep as the post-interrupt kill (#116327).
