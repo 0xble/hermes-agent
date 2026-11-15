@@ -325,6 +325,21 @@ def _spawn_orphaned(binary: Path, socket_path: Path) -> int:
     return int(pidfile.read_text(encoding="utf-8-sig").strip())
 
 
+def test_driver_scan_uses_the_profile_store_when_pm_selection_fails(tmp_path, monkeypatch):
+    """A non-default HERMES_HOME keeps its tool store there, not under ``~/.hermes/tools``."""
+    hermes_home = tmp_path / "custom-home"
+    binary = hermes_home / "tools" / "cua-driver-0.21.0-darwin-arm64" / "CuaDriver.app" / "Contents" / "MacOS" / "cua-driver"
+    binary.parent.mkdir(parents=True)
+    binary.write_text("#!/bin/sh\n")
+    monkeypatch.setenv("HOME", str(tmp_path / "user"))
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.delenv("HERMES_RUNTIME_DIR", raising=False)
+    monkeypatch.delenv("HERMES_CUA_DRIVER_CMD", raising=False)
+    monkeypatch.setattr(life, "_APP_BINARY", str(tmp_path / "missing" / "cua-driver"))
+    monkeypatch.setattr(life, "_selected_driver", lambda: None)  # PM resolution unavailable
+    assert life.driver_executables() == {life._realpath(str(binary))}
+
+
 def test_socket_parser_rejects_non_hc_and_non_serve():
     assert life.socket_from_argv(("cua-driver", "serve", "--embedded", "--socket", "/tmp/hc-a.sock")) == "/tmp/hc-a.sock"
     assert life.socket_from_argv(("cua-driver", "serve", "--embedded", "--socket", "/tmp/other.sock")) is None

@@ -379,3 +379,87 @@ async def test_a_storage_failure_recording_a_refusal_retains_the_unexecuted_inpu
         assert seen == []
     finally:
         authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_a_failed_retry_clock_cleanup_never_fails_the_executed_turn(tmp_path, monkeypatch):
+    """The retried completion ran and answered: losing the write that clears its old refusal clock
+    must not settle it ``failed`` without its response, nor leave a clock that retries it. The next
+    automation settle sweeps the leftover clock."""
+    import sqlite3
+    from gateway import session_automation_retry as retry
+    from gateway.session_results import execution_result
+    from gateway.session_settlement_recovery import settle_and_deliver
+    from hermes_state_runtime import get_session_admission
+    runner, authority, _adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    ref = SessionRef(authority.profile_id, metadata['gateway_session_id'])
+    clock = SimpleNamespace(now=1000.0)
+    seen, failures, sent = [], [], []
+    unavailable = True
+
+    async def execute(event):
+        if event.internal and unavailable:
+            execution_result.get()['result'] = {'pre_execution_runtime_refusal': True,
+                'failed': True, 'messages': [], 'tools': [], 'api_calls': 0}
+            return None
+        seen.append(event.text)
+        execution_result.get()['result'] = {'final_response': f'answer {len(seen)}', 'messages': [], 'api_calls': 1}
+        return f'answer {len(seen)}'
+
+    clear = retry._clear_refusal
+
+    def flaky(*args, **kwargs):
+        if not failures:
+            failures.append(True)
+            raise sqlite3.OperationalError('database is locked')
+        return clear(*args, **kwargs)
+
+    async def send(chat_id, content, *args, **kwargs):
+        sent.append(content)
+        return SimpleNamespace(success=True, message_id=f'm{len(sent)}', error=None)
+
+    monkeypatch.setattr(runner, '_handle_message', execute)
+    monkeypatch.setattr(retry, 'time', SimpleNamespace(time=lambda: clock.now))
+    monkeypatch.setattr(retry, '_clear_refusal', flaky)
+    monkeypatch.setattr(_adapter, 'send', send)
+
+    def inject(name):
+        return runner._inject_watch_notification(name, dict(type='completion', event_id=name,
+            session_id=name, started_at=1.0, session_key=metadata['gateway_session_key'],
+            parent_session_id=ref.session_id))
+
+    try:
+        await authority._drain(ref)
+        seen.clear()
+        sent.clear()
+        live = authority.sessions[ref.session_id]
+        assert await inject('retried result') is True
+        identity = list_session_admissions(authority.db, session_id=ref.session_id)[0]['admission_id']
+        row, _ = await authority._claim_next(ref, live)
+        assert await authority._execute_claimed(ref, live, row) == (None, 'deferred')
+        assert retry_state(authority.db, identity)['attempt'] == 1
+
+        clock.now = retry_state(authority.db, identity)['due_at']
+        unavailable = False
+        row, _ = await authority._claim_next(ref, live)
+        assert row['admission_id'] == identity
+        response, outcome = await authority._execute_claimed(ref, live, row)
+        assert failures == [True]
+        assert (response, outcome) == ('answer 1', 'completed')
+        await settle_and_deliver(authority, live, ref, row, response, outcome)
+        settled = get_session_admission(authority.db, admission_id=identity)
+        assert (settled['status'], settled['outcome']) == ('terminal', 'completed')
+        assert sent == ['answer 1']
+        assert retry_state(authority.db, identity)  # The lost cleanup left its clock behind.
+        # The settled admission is never claimed again, whatever its leftover clock says.
+        assert list_session_admissions(authority.db, session_id=ref.session_id) == []
+        await authority._drain(ref)
+        assert seen == [seen[0]] and 'retried result' in seen[0]
+
+        # The next automation turn's settle sweeps the orphaned clock.
+        assert await inject('later result') is True
+        await authority._drain(ref)
+        assert len(seen) == 2 and 'later result' in seen[1]
+        assert retry_state(authority.db, identity) == {}
+    finally:
+        authority.db.close()

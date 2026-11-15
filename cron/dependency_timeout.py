@@ -21,11 +21,17 @@ def model_proxy_endpoint(base_url: str | None) -> str | None:
     text = str(base_url or "").strip()
     if not text:
         return None
-    parts = urlsplit(text if "://" in text else f"http://{text}")
-    host = parts.hostname
+    try:
+        parts = urlsplit(text if "://" in text else f"http://{text}")
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        # This runs inside the scheduler's failure handler: a malformed URL (bad IPv6
+        # brackets, non-numeric or out-of-range port) is not the proxy, and must not
+        # replace the job's real failure.
+        return None
     if not host or host.lower() not in _LOOPBACK:
         return None
-    port = parts.port
     if port is None:
         port = 443 if parts.scheme == "https" else 80
     return f"{host}:{port}"
@@ -48,6 +54,17 @@ def name_gateway_handshake_timeout(exc: BaseException) -> BaseException:
     return exc
 
 
+def agent_reported_failure(message: str) -> RuntimeError:
+    """The error for a failure the agent returned from its own model calls (retries exhausted).
+
+    The agent summarizes the provider error as text, so the request is gone; this marks that the
+    failure came from the agent's model route rather than a tool or the job's own code.
+    """
+    error = RuntimeError(message)
+    error.agent_reported = True  # type: ignore[attr-defined]
+    return error
+
+
 def annotate_job_failure(exc: BaseException, *, base_url: str | None, elapsed: float | None) -> BaseException:
     """Name a model-proxy timeout or 503. Job-owned timeouts are not rewritten."""
     text = str(exc)
@@ -58,6 +75,9 @@ def annotate_job_failure(exc: BaseException, *, base_url: str | None, elapsed: f
         return exc
     detail = _proxy_unavailable_detail(exc)
     if detail:
+        if not _from_model_route(exc, endpoint):
+            # A matching 503 from a tool or another external call stays that job's failure.
+            return exc
         named = RuntimeError(model_proxy_unavailable_message(endpoint, detail))
         named.__cause__ = exc
         return named
@@ -81,12 +101,27 @@ def _is_transport_timeout(exc: BaseException) -> bool:
     return isinstance(exc, TimeoutError) and text in {"", "timed out"}
 
 
+def _from_model_route(exc: BaseException, endpoint: str) -> bool:
+    """Whether ``exc`` came from the model proxy call: its request went to ``endpoint``, or it
+    carries no request and the agent reported it from its own model route."""
+    url = _request_url(exc)
+    if url is not None:
+        return model_proxy_endpoint(url) == endpoint
+    return getattr(exc, "agent_reported", False) is True
+
+
 def _request_endpoint(exc: BaseException) -> str | None:
     """Loopback ``host:port`` of the HTTP request that raised ``exc`` (or caused it), if any.
 
     httpx and openai timeouts carry the request they were sending; that is the proof the
     timeout came from the model proxy call rather than some other socket in the run.
     """
+    url = _request_url(exc)
+    return None if url is None else model_proxy_endpoint(url)
+
+
+def _request_url(exc: BaseException) -> str | None:
+    """URL of the HTTP request carried by ``exc`` or its cause/context chain, if any."""
     seen: set[int] = set()
     current: BaseException | None = exc
     while current is not None and id(current) not in seen:
@@ -97,7 +132,7 @@ def _request_endpoint(exc: BaseException) -> str | None:
             request = None
         url = getattr(request, "url", None)
         if url is not None:
-            return model_proxy_endpoint(str(url))
+            return str(url)
         current = current.__cause__ or current.__context__
     return None
 

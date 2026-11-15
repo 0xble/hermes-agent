@@ -607,7 +607,8 @@ class SessionEntry:
     attended_pin_until: Optional[float] = None
     incognito: bool = False
     _incognito_persisted: Optional[dict[str, Any]] = field(default=None, repr=False)
-    # Temporary progress cards still on the platform: ``{"chat_id", "message_id", "pid"}``. Their
+    # Temporary progress cards still on the platform: ``{"chat_id", "message_id", "pid"}``, plus
+    # ``attempts`` once a boot delete has failed. Their
     # deletion is an in-memory post-delivery callback a restart drops, so boot deletes the cards a
     # dead process recorded. Omitted from JSON when empty.
     progress_cards: list[dict[str, Any]] = field(default_factory=list)
@@ -774,7 +775,8 @@ class SessionEntry:
             prompt_pin=sanitize_prompt_pin(data.get("prompt_pin")),
             transport_profile=transport_profile if isinstance(transport_profile, str) and transport_profile else None,
             progress_cards=[
-                {"chat_id": str(card["chat_id"]), "message_id": str(card["message_id"]), "pid": card.get("pid")}
+                {"chat_id": str(card["chat_id"]), "message_id": str(card["message_id"]), "pid": card.get("pid"),
+                 **({"attempts": card["attempts"]} if isinstance(card.get("attempts"), int) else {})}
                 for card in data.get("progress_cards") or []
                 if isinstance(card, dict) and card.get("chat_id") and card.get("message_id")
             ],

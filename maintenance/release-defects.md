@@ -61,6 +61,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `failed`. A write that committed before raising is recognized by its requeued row and held
   retry clock, so the attempt is not counted twice. If the drain stops first, the claim stays
   started for the next owner's recovery to fence.
+- Clearing an executed automation turn's old retry clock is best-effort: a failure there is logged
+  and the turn still settles with its response. A settled admission is never claimed again, so its
+  leftover clock is inert, and the next automation settle sweeps every clock whose admission is no
+  longer queued, started or steered.
 - Source: `gateway/session_automation_retry.py`, `gateway/session_authority.py`,
   `gateway/session_ingress.py`, `gateway/session_automation.py`, `gateway/run_turn.py`,
   `gateway/run_turn_runner.py`.

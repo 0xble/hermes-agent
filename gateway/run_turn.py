@@ -3354,10 +3354,12 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         in memory, and a restart before it fires would strand the card (boot deletes orphans).
         Tracking sites run on the loop or a worker thread, so the write is handed to the loop and
         then off it."""
-        loop, pending = asyncio.get_running_loop(), turn_ctx._card_writes
+        loop, pending, forgotten = asyncio.get_running_loop(), turn_ctx._card_writes, turn_ctx._card_forgotten
         key, chat_id = turn_ctx.session_key, turn_ctx.source.chat_id
 
         def spawn(message_id: str) -> None:
+            if message_id in forgotten:  # its forget ran while this record was queued: it must not outlive it
+                return
             task = self._retain_background_task(asyncio.ensure_future(
                 self._persist_progress_cards("record_progress_card", key, chat_id, message_id)))
             pending.add(task)
@@ -3375,7 +3377,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             logger.warning("Progress card %s failed for session %s: %s", method, session_key, exc, exc_info=True)
 
     async def _forget_turn_progress_cards(self, turn_ctx: TurnContext, message_ids: list[str]) -> None:
-        # A record still in flight would otherwise land after its forget and outlive it.
+        # A record still in flight would otherwise land after its forget and outlive it: wait for the
+        # spawned ones, and mark the ids first so one still queued for the loop is dropped when it runs.
+        turn_ctx._card_forgotten.update(message_ids)
         pending = list(turn_ctx._card_writes)
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)

@@ -232,16 +232,15 @@ def driver_executables() -> set[str]:
     selected = _selected_driver()
     if selected:
         candidates.append(selected)
-    home_tools = os.path.expanduser("~/.hermes/tools")
-    if os.path.isdir(home_tools):
+    for store in _tool_stores():
         try:
-            names = os.listdir(home_tools)
-        except OSError:
+            names = os.listdir(store)
+        except OSError:  # absent or unreadable store: nothing installed there
             names = []
         for name in names:
             if name.startswith("cua-driver-"):
                 candidates.append(os.path.join(
-                    home_tools, name, "CuaDriver.app", "Contents", "MacOS", "cua-driver"))
+                    store, name, "CuaDriver.app", "Contents", "MacOS", "cua-driver"))
     for raw in candidates:
         if not raw:
             continue
@@ -249,6 +248,18 @@ def driver_executables() -> set[str]:
         if os.path.isfile(path):
             found.add(path)
     return found
+
+
+def _tool_stores() -> list[str]:
+    # The roots PM's installed-package lookup searches. They follow HERMES_HOME, the runtime
+    # override and payload stores, so the scan still finds drivers when the selection read fails.
+    try:
+        from pm import paths
+        return list(dict.fromkeys(str(root) for root in (paths.store_root(), paths.writable_store_root())))
+    except Exception:  # the package manager's paths are outside this module: never fail the sweep on them
+        logger.debug("PM store lookup failed", exc_info=True)
+        from hermes_constants import get_default_hermes_root
+        return [str(get_default_hermes_root() / "tools")]
 
 
 def _selected_driver() -> str | None:

@@ -742,6 +742,11 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
     try:
         raw_response = method(**api_kwargs)
     except Exception as exc:
+        # Evicting a dead pool sends nothing, so it is not a retry: do it even when the
+        # independent attempt forbids one, or later turns keep reusing the stale client.
+        if is_stale_connection_error(exc):
+            invalidate_runtime_client(region)
+            raise
         if not allow_retry:
             raise
         retry_kwargs = (recover_from_cache_point_rejection(exc, api_kwargs)
@@ -750,8 +755,6 @@ def _bedrock_converse_call(api_kwargs: dict, *, stream: bool, on_stream_denied=N
             return finish(method(**retry_kwargs))
         if on_stream_denied is not None and is_streaming_access_denied_error(exc):
             return on_stream_denied(client, api_kwargs, exc)
-        if is_stale_connection_error(exc):
-            invalidate_runtime_client(region)
         raise
     return finish(raw_response)
 

@@ -116,7 +116,7 @@ def test_memory_watch_skips_access_denied_descendant(monkeypatch, denied_operati
     assert watch.exceeded(final=True) == 20
 
 
-@pytest.mark.skipif(sys.platform != "darwin", reason="libproc child lookup is the macOS path")
+@pytest.mark.platforms("macos")  # the libproc child lookup is the macOS path
 def test_macos_tree_sample_never_scans_every_host_process(monkeypatch):
     """psutil's recursive children() asks every host process for its parent with the GIL held;
     with thousands of host processes each 1 s sample took seconds and starved the gateway. The

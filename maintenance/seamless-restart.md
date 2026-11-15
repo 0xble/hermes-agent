@@ -212,10 +212,15 @@ callback, stranded every card the turn posted (about 215 deleted by hand on
   final reply never is.
 - The cleanup callback forgets its ids after one attempt; a cancelled cleanup
   keeps them. A failed run forgets them too, because failed runs keep their cards.
+  A forget waits for the record writes already spawned and marks its ids on the
+  turn first, so a worker-thread record still queued for the loop is dropped
+  instead of landing after the forget.
 - Boot (`_start_finish_wiring`, after adapters connect) deletes, in the
   background, every recorded card whose recording pid is dead, one
-  `delete_messages` batch per chat, then forgets them whatever the outcome:
-  Telegram reports a card already gone or past its 48h window as a plain False.
+  `delete_messages` batch per chat. It forgets the cards that were deleted and
+  keeps the rest with a failed-attempt count, forgetting a card after 3 failed
+  boots. A False can be final (Telegram: already gone or past its 48h window)
+  or a flood refusal, which reports every id False so a later boot retries.
   A live pid (a zero-cut predecessor finishing its turn) keeps its own cards.
 
 Proof: `tests/gateway/test_progress_card_restart_cleanup.py`.

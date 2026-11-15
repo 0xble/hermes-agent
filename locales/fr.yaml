@@ -1048,7 +1048,7 @@ gateway:
     interrupted_turn: "↻ Interrompu parce que Hermes s'est arrêté. Je continuerai ici automatiquement dès qu'il sera de retour."
   startup:
     handoff_thread_title: "Hermes — {title}"
-    restarted: "♻ Gateway redémarré avec succès. Votre session continue."
+    restarted: "♻ Gateway redémarré avec succès."
     online: "♻️ Gateway en ligne — Hermes est de retour et prêt."
     db_corrupt: |-
       ⚠️ Corruption détectée dans la base de données des sessions. Les messages risquent de ne pas être persistés. Options de récupération :

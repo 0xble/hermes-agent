@@ -251,6 +251,21 @@ class SessionLifecycleMixin:
         return self._replace_progress_cards(
             session_key, lambda cards: [c for c in cards if (c["chat_id"], c["message_id"]) not in gone])
 
+    def settle_swept_progress_cards(self, session_key: str, chat_id: str, outcome: dict, max_attempts: int) -> bool:
+        """Apply one boot delete attempt (``{message_id: deleted}``): drop the deleted cards and count
+        a failed attempt on the rest, dropping a card once ``max_attempts`` deletes have failed. A
+        flood refusal reports every id as not deleted, so a single failure is no reason to forget."""
+        def change(cards):
+            kept = []
+            for card in cards:
+                done = outcome.get(card["message_id"]) if card["chat_id"] == str(chat_id) else None
+                if done is None:
+                    kept.append(card)
+                elif not done and (attempts := int(card.get("attempts") or 0) + 1) < max_attempts:
+                    kept.append({**card, "attempts": attempts})
+            return kept
+        return self._replace_progress_cards(session_key, change)
+
     def _replace_progress_cards(self, session_key: str, change) -> bool:
         """Persist ``change(cards)`` before publishing it, through the single-entry fast save."""
         with self._lock:
