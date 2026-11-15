@@ -1,4 +1,8 @@
-"""The delegation ledger shares state.db's startup/quarantine boundary."""
+"""The delegation ledger shares state.db's startup/quarantine boundary.
+
+The startup lock is fcntl on POSIX and msvcrt on Windows, so every ledger test
+carries a platforms() mark and runs in the native macOS and Windows lanes too.
+"""
 
 from concurrent.futures import ThreadPoolExecutor
 import sqlite3
@@ -7,6 +11,7 @@ import threading
 import pytest
 
 
+@pytest.mark.platforms("any")
 @pytest.mark.parametrize("module", ["tools.async_delegation", "gateway.delivery_ledger"])
 def test_ledger_first_open_is_not_quarantined_by_sessiondb(tmp_path, monkeypatch, module):
     """Pause a real ledger connection in the empty-file -> schema-commit window.
@@ -102,6 +107,7 @@ def test_ledger_first_open_is_not_quarantined_by_sessiondb(tmp_path, monkeypatch
         db.close()
 
 
+@pytest.mark.platforms("any")
 @pytest.mark.parametrize("module", ["tools.async_delegation", "gateway.delivery_ledger"])
 def test_ledger_connection_is_visible_to_byte_probe_guard(tmp_path, monkeypatch, module):
     import importlib
@@ -118,6 +124,7 @@ def test_ledger_connection_is_visible_to_byte_probe_guard(tmp_path, monkeypatch,
     assert not has_live_connection(tmp_path / "state.db")
 
 
+@pytest.mark.platforms("any")
 @pytest.mark.parametrize("module", ["tools.async_delegation", "gateway.delivery_ledger"])
 @pytest.mark.parametrize("damage", [b"", b"not a SQLite header" * 100], ids=["empty", "clobbered"])
 def test_ledger_refuses_invalid_existing_db_without_moving_evidence(tmp_path, monkeypatch, damage, module):
@@ -133,6 +140,7 @@ def test_ledger_refuses_invalid_existing_db_without_moving_evidence(tmp_path, mo
     assert path.read_bytes() == damage
     assert not list(tmp_path.glob("state.db.*.bak"))
 
+@pytest.mark.platforms("any")
 @pytest.mark.parametrize("module", ["tools.async_delegation", "gateway.delivery_ledger"])
 def test_ledger_startup_lock_failure_leaves_no_database(tmp_path, monkeypatch, module):
     import contextlib
@@ -153,12 +161,13 @@ def test_ledger_startup_lock_failure_leaves_no_database(tmp_path, monkeypatch, m
     assert not (tmp_path / "state.db").exists()
 
 
+@pytest.mark.platforms("posix")  # chmod(0) denies reads only under POSIX permissions
 def test_ledger_rechecks_invalid_header_after_permission_repair(tmp_path, monkeypatch):
     import os
     from tools import async_delegation as ledger
 
-    if os.name == "nt" or not hasattr(os, "geteuid") or os.geteuid() == 0:
-        pytest.skip("requires POSIX non-root permission checks")
+    if os.geteuid() == 0:
+        pytest.skip("root bypasses POSIX permission checks")
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     path = tmp_path / "state.db"
     path.write_bytes(b"")
@@ -171,6 +180,7 @@ def test_ledger_rechecks_invalid_header_after_permission_repair(tmp_path, monkey
     finally:
         path.chmod(0o600)
 
+@pytest.mark.platforms("any")
 @pytest.mark.parametrize("module", ["tools.async_delegation", "gateway.delivery_ledger"])
 @pytest.mark.parametrize("stage", ["connect", "initialize"])
 def test_failed_first_ledger_open_can_be_retried(tmp_path, monkeypatch, module, stage):
@@ -212,6 +222,7 @@ def test_failed_first_ledger_open_can_be_retried(tmp_path, monkeypatch, module, 
     assert not list(tmp_path.glob("state.db.*.bak"))
 
 
+@pytest.mark.platforms("any")
 @pytest.mark.parametrize("origin", ["existing", "replacement", "initialized"])
 def test_failed_ledger_open_preserves_unowned_or_nonempty_files(tmp_path, monkeypatch, origin):
     import hermes_state as hs
@@ -255,6 +266,7 @@ def test_failed_ledger_open_preserves_unowned_or_nonempty_files(tmp_path, monkey
         assert path.stat().st_size > 0
 
 
+@pytest.mark.platforms("any")
 def test_failed_first_ledger_open_retains_nonempty_sidecars(tmp_path, monkeypatch):
     import hermes_state as hs
     from tools import async_delegation as ledger
@@ -298,6 +310,7 @@ def _process_ledger_first_open(home, connected, release):
         conn.close()
 
 
+@pytest.mark.platforms("any")
 def test_separate_process_ledger_startup_is_not_quarantined(tmp_path, monkeypatch):
     import contextlib
     import multiprocessing
