@@ -229,7 +229,10 @@ def defer_retirement(db, select, sessions_dir, *, label="deferred retirement"):
         return ids
 
     def record_attempt(conn):
-        ids, derived = prunable_ids(conn, attempted)
+        # The staged selection rolled back. A foreground writer may have pinned,
+        # reactivated or guarded a session since, so recheck before fencing.
+        eligible = set(select(conn))
+        ids, derived = prunable_ids(conn, [sid for sid in attempted if sid in eligible])
         for sid in ids:
             key = RETIRED_PREFIX + sid
             _mark_retired(conn, key, expires=sid not in derived, own=True)
@@ -249,9 +252,12 @@ def defer_retirement(db, select, sessions_dir, *, label="deferred retirement"):
         ids = []
     if not ids and attempted:
         ids = db._execute_write(record_attempt, skip_result=[]) or []
-        if stage_expired or ids:
+        if ids:
             logger.error("Session cleanup group %r could not complete its retirement stage within the writer ceiling; "
                          "deferred with a durable attempt record", label() if callable(label) else label)
+        elif stage_expired:
+            logger.warning("Session cleanup group %r could not complete its retirement stage within the writer "
+                           "ceiling and is no longer eligible; nothing was fenced", label() if callable(label) else label)
     current_budget().deferred_ids.update(ids)
     return ids
 
