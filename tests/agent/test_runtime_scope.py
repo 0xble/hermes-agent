@@ -636,9 +636,10 @@ def test_claim_fence_reads_the_claimed_admission(tmp_path):
 
     import hermes_state_runtime as rt
     from hermes_state import SessionDB
+    from gateway.runtime_ownership import exclusive_maintenance
     from tests.hermes_state.test_target_advance_fence import _local_session
 
-    with closing(SessionDB(tmp_path / "state.db")) as db:
+    with closing(SessionDB(tmp_path / "state.db")) as db, exclusive_maintenance([tmp_path]):
         rt.begin_runtime_epoch(db, instance_id="owner")
         epoch = rt.begin_runtime_epoch(db, instance_id="owner")  # a restarted owner: epoch 2
         sid = _local_session(db, epoch, tmp_path)
