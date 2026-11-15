@@ -58,9 +58,19 @@ def _failure_key(home: Path) -> str:
         return f"{__file__}:{home}"
 
 
+def _primary_home(runner) -> Path:
+    """Home behind the ``(None, None)`` scope. A multiplexed gateway serves the default root
+    there even when a named profile launched it. A single-profile gateway serves only its
+    launch home, which may be a named profile rather than the default root."""
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    if getattr(getattr(runner, "config", None), "multiplex_profiles", False):
+        return get_default_hermes_root()
+    return get_hermes_home()
+
+
 async def check_memory_health(runner) -> None:
     from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
-    from hermes_constants import get_default_hermes_root
 
     lock = getattr(runner, "_memory_health_lock", None)
     if lock is None:
@@ -70,7 +80,7 @@ async def check_memory_health(runner) -> None:
     async with lock:
         for profile, home in await _resolve_handoff_watch_scopes(runner):
             try:
-                home = Path(home or get_default_hermes_root())
+                home = Path(home or _primary_home(runner))
                 async with _async_profile_runtime_scope(home):
                     await _check_profile_health(runner, profile, home)
             except Exception:  # health: allow BLE001 -- advisory profile probes must isolate failures
