@@ -963,6 +963,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             logger.debug("failed internal turn requeue failed", exc_info=True)
             return False
 
+    # health: allow CC -- retry exhaustion warning/pause must remain adjacent to post-turn settlement to preserve the one-retry contract.
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
         invalidation_epoch: Optional[int] = None, existing_session_only: bool = False,
@@ -979,14 +980,20 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         )
         if not successful:
             final_text = ""
+        retry_scheduled = False
         if not successful:
             try:
-                await self._retry_failed_synthetic_event(
+                retry_scheduled = await self._retry_failed_synthetic_event(
                     event, source, agent_result, invalidation_epoch=invalidation_epoch,
                 )
             except Exception:
                 # Recovery is best-effort and must never mask goal/loop settlement.
                 logger.debug("failed internal turn recovery hook failed", exc_info=True)
+        exhausted_synthetic = (
+            not successful and not retry_scheduled and event is not None
+            and (getattr(event, "internal", False) or is_goal_continuation_event(event))
+            and (getattr(event, "metadata", None) or {}).get("gateway_internal_retry_count", 0) >= 1
+        )
         try:
             if existing_session_only:
                 # Settlement can precede a stop that suspends this route. Deferred
@@ -1002,6 +1009,22 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
+        if exhausted_synthetic:
+            from gateway.platforms.event import turn_origin_for_event
+            origin = turn_origin_for_event(event)
+            logger.warning(
+                "synthetic turn retry exhausted: session=%s origin=%s",
+                getattr(session_entry, "session_id", "unknown"), origin,
+            )
+            if origin == "goal_loop":
+                try:
+                    manager, _ = await self._get_goal_manager_for_event(event)
+                    if manager is not None and manager.is_active():
+                        await asyncio.to_thread(
+                            manager.pause, "synthetic turn retry exhausted", by="system",
+                        )
+                except Exception:
+                    logger.debug("pausing goal after synthetic retry exhaustion failed", exc_info=True)
         # Failed/interrupted turns stay out of /goal. Successful empty turns still carry
         # tool evidence; an in-flight /loop tick always needs release/rescheduling.
         # The terminal turn's identity: a queued chain carries its last turn's, not the head's.

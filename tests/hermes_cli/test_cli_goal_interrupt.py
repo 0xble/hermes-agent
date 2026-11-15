@@ -111,6 +111,8 @@ class TestHealthyTurnStillRuns:
         sid = f"sid-failed-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)
         cli._goal_turn_user_initiated = False
+        cli._last_turn_origin = "goal_loop"
+        cli._last_turn_is_goal_continuation = True
         cli._last_turn_failed = True
         cli._last_turn_started = True
         cli._last_turn_result = {

@@ -113,6 +113,25 @@ def _is_explicit_synthetic_turn(text: Any) -> bool:
     return text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
 
 
+def _turn_origin_for_cli_message(text: Any) -> str:
+    """Match gateway provenance using the CLI's runtime markers, not message wording."""
+    try:
+        from tools.process_registry_notifications import TimelineNotification
+        if isinstance(text, TimelineNotification):
+            return "process"
+        from hermes_cli.goals import is_goal_continuation_text
+        from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX
+        from hermes_cli.loops import WAKEUP_PROMPT_PREFIX
+        if isinstance(text, str) and (
+            is_goal_continuation_text(text)
+            or text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
+        ):
+            return "goal_loop"
+    except ImportError:
+        logging.getLogger(__name__).debug("CLI turn-origin markers unavailable", exc_info=True)
+    return "user"
+
+
 def _is_self_injected_turn(text: Any) -> bool:
     # Standing-goal prompt forms are registered centrally; the remaining frames are
     # runtime-specific notifications that never represent user input.
@@ -984,8 +1003,12 @@ class CLILoopsMixin:
             # A failed goal continuation is an internal work item, not a user request. Preserve
             # the active goal and retry its generated prompt once the current failure is settled;
             # never print the generic resend boundary as the continuation's answer.
+            # Only a goal continuation is retried here. Process notifications and heartbeat/loop
+            # wakeups have their own gateway scheduling semantics; feeding them a fresh goal prompt
+            # would turn a failed notification into unrelated goal work.
             if (
-                not getattr(self, "_goal_turn_user_initiated", True)
+                getattr(self, "_last_turn_origin", "user") == "goal_loop"
+                and getattr(self, "_last_turn_is_goal_continuation", False)
                 and not getattr(self, "_last_turn_interrupted", False)
                 and getattr(self, "_last_turn_failed", False)
                 and getattr(self, "_goal_failed_retry_count", 0) < 1

@@ -529,6 +529,7 @@ class GatewayTurnPersistenceMixin:
             _user_entry["platform_message_id"] = str(event._hermes_recovery_id)
         return _user_entry
 
+    # health: allow CC -- fallback boundary copy must classify synthetic origin before writing; keep this persistence seam intact.
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -616,7 +617,14 @@ class GatewayTurnPersistenceMixin:
                 # into an unrelated future message and replay stale side effects (#107070).
                 supervisor_status = bool(response) and agent_result.get(
                     "queued_terminal_display_kind", prepared.persist_user_display_kind) == "supervisor_checkin"
+                from gateway.run_turn import _failed_turn_copy_is_user_facing
                 notice = response if supervisor_status else self._hmwa_failed_turn_notice(agent_result)
+                if not _failed_turn_copy_is_user_facing(
+                    event, prepared.persist_user_display_kind,
+                ):
+                    # The fallback writer is also a boundary owner. Synthetic turns must keep an
+                    # empty failed boundary even when the agent-core closer wrote nothing.
+                    notice = ""
                 await self._hmwa_close_failed_turn(
                     sid, notice, self._hmwa_own_failed_boundary_row_id(agent_result) if supervisor_status else None)
             else:

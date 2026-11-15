@@ -1,12 +1,12 @@
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 from gateway.config import Platform
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
-from gateway.run_turn import _failed_turn_copy_is_user_facing
+from gateway.run_turn import _apply_failed_turn_response, _failed_turn_copy_is_user_facing
 
 
 @pytest.mark.asyncio
@@ -124,3 +124,52 @@ async def test_failed_human_turn_is_not_requeued():
     ) is False
     runner._enqueue_fifo.assert_not_called()
     assert _failed_turn_copy_is_user_facing(event, None) is True
+
+
+@pytest.mark.asyncio
+async def test_post_turn_hooks_retries_unsuccessful_synthetic_turn_and_suppresses_copy():
+    runner = object.__new__(GatewayRunner)
+    source = SimpleNamespace(platform=Platform.SLACK, chat_id="chat")
+    event = MessageEvent(
+        text="[Continuing toward your standing goal]\\nGoal: test",
+        source=source, internal=True, reply_expected=False, metadata={},
+    )
+    retry = AsyncMock(return_value=True)
+    runner._retry_failed_synthetic_event = retry
+    runner._final_text_for_post_turn_hooks = lambda result, event: result.get("final_response", "")
+    runner._turn_failed = lambda: True
+    runner._session_key_for_source = lambda source: "session-key"
+    object.__setattr__(runner, "session_store", object())
+    object.__setattr__(runner, "_async_session_store", SimpleNamespace(
+        _store=runner.session_store,
+        lookup_by_session_key=AsyncMock(return_value=None),
+        get_or_create_session=AsyncMock(return_value=SimpleNamespace(session_id="session-id")),
+    ))
+
+    with patch("gateway.session_authorities.active_authority", return_value=None), \
+         patch("gateway.session_viewer_automation.viewer_driven", return_value=False):
+        await GatewayRunner._run_post_turn_hooks(
+            runner, agent_result={"failed": True, "completed": False, "final_response": "provider detail"},
+            source=source, is_internal=True, event=event, existing_session_only=True,
+        )
+
+    retry.assert_awaited_once()
+    assert _apply_failed_turn_response(
+        "provider detail", event, None, agent_failed_early=True,
+        is_context_overflow_failure=False, automatic_notice_allowed=True,
+        notice="Your request was not processed. Send it again if you still want me to carry it out.",
+    ) == ""
+
+
+@pytest.mark.parametrize("origin_text, expected", [
+    ("[Continuing toward your standing goal]\\nGoal: x", "goal_loop"),
+])
+def test_cli_synthetic_origin_markers_are_goal_loop(origin_text, expected):
+    from hermes_cli.cli_loops_mixin import _turn_origin_for_cli_message
+    assert _turn_origin_for_cli_message(origin_text) == expected
+
+
+def test_cli_loop_wakeup_marker_maps_to_goal_loop():
+    from hermes_cli.cli_loops_mixin import _turn_origin_for_cli_message
+    from hermes_cli.loops import WAKEUP_PROMPT_PREFIX
+    assert _turn_origin_for_cli_message(WAKEUP_PROMPT_PREFIX + "test") == "goal_loop"
