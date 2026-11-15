@@ -177,6 +177,47 @@ async def test_untrusted_automation_cannot_borrow_owned_allowance(monkeypatch):
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize('kind', ['async_delegation', 'delegation_auto_resume'])
+async def test_delegation_notice_remains_owned_across_preflight(monkeypatch, kind):
+    from unittest.mock import AsyncMock
+    from gateway.run_notifications_delegation import GatewayNotificationsMixin as DelegationNotices
+
+    executed = []
+    runner, adapter, authority, source = await owned_route(monkeypatch, executed)
+    await start_human_turn(runner, adapter, authority, source, None)
+    await asyncio.gather(*(live.task for live in authority.sessions.values() if live.task))
+    await async_wait_until(lambda: not adapter._active_sessions, what='initial send to settle')
+    release_handover(runner)
+    checking, release = asyncio.Event(), asyncio.Event()
+
+    async def preflight(*args):
+        checking.set()
+        await release.wait()
+        return 0 if kind == 'async_delegation' else 'retry'
+
+    evt = notice(runner, source, kind)
+    if kind == 'async_delegation':
+        monkeypatch.setattr(runner, '_completion_hold_seconds', preflight)
+        monkeypatch.setattr(runner, '_deliver_async_delegation_group', AsyncMock(return_value=True))
+        delivery = getattr(runner, '_enqueue_async_delegation_group')
+        payload, expected = [evt], True
+    else:
+        monkeypatch.setattr(runner, '_classify_completion_target', preflight)
+        delivery = runner._deliver_auto_resume_notice
+        payload, expected = evt, False
+    # The facade must resolve the canonical sibling, not a shadowing copied implementation.
+    assert delivery.__func__ is getattr(DelegationNotices, delivery.__name__)
+    delivering = asyncio.create_task(delivery(payload))
+    try:
+        await asyncio.wait_for(checking.wait(), 10)
+        assert not drain.status(runner)['idle'], 'detached notices own their yielding preflight'
+    finally:
+        release.set()
+        assert await delivering is expected
+    assert drain.status(runner)['idle']
+
+
+@pytest.mark.asyncio
 async def test_watch_notice_remains_owned_while_route_resolution_yields(monkeypatch):
     import queue
     import threading

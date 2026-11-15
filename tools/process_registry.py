@@ -874,6 +874,15 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
         with suppress(Exception):
             sink(session, chunk)
 
+    def _arm_promoted_completion_watcher(self, session: ProcessSession) -> None:
+        """Give a gateway-routed watch promotion the normal completion owner."""
+        if not session.watcher_platform or session.watcher_interval:
+            return
+        # Direct completion requests use this registration path too. Keep the
+        # import lazy to avoid the registry/tool import cycle at startup.
+        from tools.terminal_tool_background import _register_completion_watcher
+        _register_completion_watcher(self, session, session.session_key)
+
     def _check_watch_patterns(self, session: ProcessSession, new_text: str) -> None:
         """Scan a freshly-read chunk for watch patterns and queue notifications.
         Per-session rate limiting (see WATCH_* constants): one match per cooldown
@@ -909,6 +918,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 # Promote so the agent still gets exactly one notification on exit,
                 # plus exactly one summary so it sees why things went quiet.
                 session.notify_on_complete = True
+                self._arm_promoted_completion_watcher(session)
                 self._emit_watch_disabled(
                     session, session._watch_suppressed,
                     f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -929,6 +939,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             if lifetime_exhausted:
                 session._watch_disabled = True
                 session.notify_on_complete = True
+                self._arm_promoted_completion_watcher(session)
         output = "\n".join(matched_lines[:20])
         if len(output) > 2000:
             output = output[:2000] + "\n...(truncated)"
