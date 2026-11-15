@@ -104,7 +104,11 @@ def test_one_expensive_statement_releases_writer_without_waiting_for_pass_end(tm
         _slow_delete(db)
         started = time.monotonic()
         assert db.prune_sessions(older_than_days=90, max_seconds=30) == 1
-        assert time.monotonic() - started < 2
+        # The design bound for this path, not a guess: the interrupted unit runs at most one unit
+        # ceiling, then the fallback that records the attempt gets one transaction. Far below the
+        # 30 s pass deadline this test rules out waiting for.
+        from hermes_state_prune_budget import PruneBudget
+        assert time.monotonic() - started < PruneBudget.MIN_UNIT_CEILING_SECONDS + PruneBudget.TRANSACTION_SECONDS
         assert db._read_one("SELECT count(*) FROM messages WHERE session_id='old'")[0] == 1
         db.set_meta("foreground", "ok")
 

@@ -23,10 +23,6 @@ classification.
   boundary becomes a human successor without changing the predecessor's silence
   contract. A prior incorporated human input still requires a predecessor reply.
   The goal's post-turn continuation resumes the autonomous work.
-- The same rule holds when a session authority owns the route: its busy preempt
-  (`_hm_busy_preempt`) admits nothing behind an autonomous turn it can steer. A goal turn that
-  has not built its agent yet cannot take a steer, so the typed message is admitted next and
-  gets the queued acknowledgement instead of waiting with no reply.
 - Once the user has steered or redirected a turn (`_turn_user_intervened`), it
   is theirs and keeps queue semantics.
 - Relays and other agent-origin messages never preempt.
@@ -35,11 +31,10 @@ classification.
 
 `gateway/run_busy.py`: `_human_preempts_autonomous_turn`, the `preempt` branch
 in `_handle_active_session_busy_message` and `_resolve_busy_steer_or_redirect`.
-`gateway/run_inbound.py`: the same branch in `_hm_busy_preempt`, the authority-owned busy path.
 
 ## Verification
 
-`scripts/run_tests.sh tests/gateway/test_busy_human_preempts_autonomous.py tests/gateway/test_late_steer_reply_obligation.py tests/gateway/test_authority_busy_preempt_parity.py`
+`scripts/run_tests.sh tests/gateway/test_busy_human_preempts_autonomous.py tests/gateway/test_late_steer_reply_obligation.py`
 
 The late-steer regression covers declined redirects, buffered successor delivery
 exactly once, incorporated steering through busy/priority/slash/tool-redirect
@@ -52,12 +47,9 @@ routes, and a prior human obligation surviving a later leftover.
 - Evidence (2026-10-11): typed messages waited 57-85 minutes behind boot-resume,
   relay and cron turns in the same topic, including a request to pause the work
   that was running.
-- Evidence (2026-11-15): under the session authority, "check now" was admitted
-  behind a 66-call goal turn and waited 12 minutes with no reply, because the
-  authority busy path skipped this rule.
 - Upstream has no equivalent; upstream defaults to `interrupt`, which applies to
   every turn. Retire this when upstream distinguishes autonomous turns in busy
   admission.
 - Rollback: revert the commit; behavior returns to plain queue semantics.
 
-Contract tests: `tests/gateway/test_busy_human_preempts_autonomous.py`, `tests/gateway/test_late_steer_reply_obligation.py`, `tests/gateway/test_authority_busy_preempt_parity.py`.
+Contract tests: `tests/gateway/test_busy_human_preempts_autonomous.py`, `tests/gateway/test_late_steer_reply_obligation.py`.
