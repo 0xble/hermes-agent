@@ -25,6 +25,7 @@ def restart_invoking_gateway(
             restarted_services.append(current_label)
         else:
             failed_or_stale_units.append(current_label)
+            return protected | {current_label}
         if current_label in protected:
             return protected
     else:

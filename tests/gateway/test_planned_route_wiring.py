@@ -115,6 +115,27 @@ def test_normal_update_reload_routes_through_actual_handover(monkeypatch, tmp_pa
     assert state["promoted"] is True
 
 
+def test_update_fleet_handover_failure_does_not_fall_back_to_drain(monkeypatch):
+    from hermes_cli import update_cmd_fleet_handover
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"gateway": {"zero_cut_handover": {"enabled": True}}},
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway_launchd.get_launchd_slot_labels",
+        lambda: ["ai.hermes.gateway.b"],
+    )
+    monkeypatch.setattr("hermes_cli.gateway_handover.planned_handover", lambda: False)
+    restarted, failed = [], []
+    protected = update_cmd_fleet_handover.restart_invoking_gateway(
+        restarted, failed, "ai.hermes.gateway", set(), None, self_restart_pending=None,
+    )
+    assert not restarted
+    assert failed == ["ai.hermes.gateway"]
+    assert "ai.hermes.gateway" in protected
+
+
 @pytest.mark.asyncio
 async def test_external_restart_request_routes_without_stopping_original(routed_handover):
     from gateway.run_shutdown import GatewayShutdownMixin
