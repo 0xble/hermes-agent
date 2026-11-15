@@ -326,3 +326,56 @@ async def test_a_stop_accepted_before_a_refusal_settles_the_claim_interrupted(tm
         assert seen == []
     finally:
         authority.db.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize('committed', [False, True], ids=['lost_write', 'committed_then_raised'])
+async def test_a_storage_failure_recording_a_refusal_retains_the_unexecuted_input(tmp_path, monkeypatch, committed):
+    """The refusal proved nothing ran: a transient write failure must not settle it ``failed``.
+    A write that committed before raising is recognized, not counted as a second attempt."""
+    import sqlite3
+    from gateway import session_automation_retry as retry
+    from gateway.session_results import execution_result
+    runner, authority, _adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    ref = SessionRef(authority.profile_id, metadata['gateway_session_id'])
+    clock = SimpleNamespace(now=1000.0)
+    seen, failures = [], []
+
+    async def execute(event):
+        if event.internal:
+            execution_result.get()['result'] = {'pre_execution_runtime_refusal': True,
+                'failed': True, 'messages': [], 'tools': [], 'api_calls': 0}
+        else:
+            seen.append(event.text)
+            execution_result.get()['result'] = {'final_response': '', 'messages': [], 'api_calls': 1}
+
+    record = retry._record_refusal
+
+    def flaky(*args, **kwargs):
+        if not failures:
+            failures.append(True)
+            if committed:
+                record(*args, **kwargs)
+            raise sqlite3.OperationalError('disk I/O error')
+        return record(*args, **kwargs)
+
+    monkeypatch.setattr(runner, '_handle_message', execute)
+    monkeypatch.setattr(retry, 'time', SimpleNamespace(time=lambda: clock.now))
+    monkeypatch.setattr(retry, '_record_refusal', flaky)
+    try:
+        await authority._drain(ref)
+        seen.clear()
+        assert await runner._inject_watch_notification('kept result', dict(type='completion',
+            event_id='kept', session_id='kept', started_at=1.0,
+            session_key=metadata['gateway_session_key'], parent_session_id=ref.session_id)) is True
+        identity = list_session_admissions(authority.db, session_id=ref.session_id)[0]['admission_id']
+        live = authority.sessions[ref.session_id]
+        row, _ = await authority._claim_next(ref, live)
+        assert await authority._execute_claimed(ref, live, row) == (None, 'deferred')
+        assert failures == [True]
+        pending = list_session_admissions(authority.db, session_id=ref.session_id)
+        assert [(item['admission_id'], item['status']) for item in pending] == [(identity, 'queued')]
+        assert retry_state(authority.db, identity) == {'attempt': 1, 'due_at': 1010.0}
+        assert seen == []
+    finally:
+        authority.db.close()
