@@ -66,21 +66,65 @@ def test_bare_timeout_is_not_blamed_on_a_loopback_proxy():
     assert incidents._classify_failure_type(f"TimeoutError: {bare}") == "timeout"
 
 
+def _proxy_503(text, url="http://127.0.0.1:8317/v1/chat/completions"):
+    import httpx
+    import openai
+
+    request = _proxy_request(url)
+    return openai.InternalServerError(
+        text, response=httpx.Response(503, request=request), body=None)
+
+
 def test_model_proxy_503_names_auth_unavailable_and_overload():
-    class _Status(Exception):
-        def __init__(self, status, text):
-            super().__init__(text)
-            self.status_code = status
+    from cron.dependency_timeout import agent_reported_failure
 
-    auth = annotate_job_failure(
-        _Status(503, "auth_unavailable: no auth available"),
-        base_url="http://127.0.0.1:8317/v1", elapsed=1)
-    overload = annotate_job_failure(
-        _Status(503, "servers overloaded"),
-        base_url="http://127.0.0.1:8317/v1", elapsed=1)
+    # Raised by the proxy request itself, or reported by the agent after its retries.
+    for auth_exc, overload_exc in (
+        (_proxy_503("auth_unavailable: no auth available"), _proxy_503("servers overloaded")),
+        (agent_reported_failure("HTTP 503: auth_unavailable: no auth available"),
+         agent_reported_failure("HTTP 503: servers overloaded")),
+    ):
+        auth = annotate_job_failure(auth_exc, base_url="http://127.0.0.1:8317/v1", elapsed=1)
+        overload = annotate_job_failure(overload_exc, base_url="http://127.0.0.1:8317/v1", elapsed=1)
 
-    assert str(auth) == "model proxy 127.0.0.1:8317 unavailable: 503 auth_unavailable"
-    assert str(overload) == "model proxy 127.0.0.1:8317 unavailable: 503 servers overloaded"
+        assert str(auth) == "model proxy 127.0.0.1:8317 unavailable: 503 auth_unavailable"
+        assert str(overload) == "model proxy 127.0.0.1:8317 unavailable: 503 servers overloaded"
+
+
+def test_503_from_another_endpoint_stays_the_jobs_failure(monkeypatch, tmp_path):
+    """A loopback base_url is not proof: a tool's or job's own 503 must not join the shared outage."""
+    import httpx
+
+    feed = _proxy_request("https://example.com/feed")
+    elsewhere = httpx.HTTPStatusError(
+        "Server error '503 Service Unavailable': servers overloaded",
+        request=feed, response=httpx.Response(503, request=feed))
+    other_port = _proxy_503("servers overloaded", url="http://127.0.0.1:9000/v1/chat/completions")
+    bare = RuntimeError("HTTP 503: auth_unavailable: no auth available")
+
+    for exc in (elsewhere, other_port, bare):
+        assert annotate_job_failure(exc, base_url="http://127.0.0.1:8317/v1", elapsed=1) is exc
+
+    monkeypatch.setattr(incidents, "EXECUTIONS_FILE", tmp_path / "executions.db")
+    from_proxy = annotate_job_failure(
+        _proxy_503("servers overloaded"), base_url="http://127.0.0.1:8317/v1", elapsed=1)
+    own_id, _ = incidents.upsert_incident("job-a", f"HTTPStatusError: {elsewhere}")
+    shared_id, _ = incidents.upsert_incident("job-b", f"RuntimeError: {from_proxy}")
+    assert incidents.get_incident(own_id)["job_id"] == "job-a"
+    assert incidents.get_incident(shared_id)["job_id"] == "dependency"
+
+
+def test_agent_reported_proxy_503_is_named_by_the_scheduler():
+    """The agent returns its exhausted provider failure as text; the scheduler keeps its provenance."""
+    from cron.scheduler import _final_response_from_result
+
+    result = {"failed": True, "completed": False, "final_response": "",
+              "error": "HTTP 503: servers overloaded"}
+    with pytest.raises(RuntimeError) as raised:
+        _final_response_from_result(result, "job-a", "a", object)
+
+    named = annotate_job_failure(raised.value, base_url="http://127.0.0.1:8317/v1", elapsed=1)
+    assert str(named) == "model proxy 127.0.0.1:8317 unavailable: 503 servers overloaded"
 
 
 def test_job_owned_timeout_is_not_renamed():
