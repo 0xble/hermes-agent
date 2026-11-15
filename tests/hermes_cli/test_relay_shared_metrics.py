@@ -1605,25 +1605,32 @@ def test_concurrent_model_call_updates_are_transactional(tmp_path):
     outbox_directory = tmp_path / "outbox"
     SharedMetricsStore(database_path, outbox_directory)
 
-    def record_calls(count: int) -> int:
-        store = SharedMetricsStore(database_path, outbox_directory)
-        busy_calls = 0
+    def record_calls(store: SharedMetricsStore, count: int) -> SharedMetricsStore:
         for _ in range(count):
-            try:
-                store.record_model_call(_dimensions(), _resource())
-            except sqlite3.OperationalError as exc:
-                assert exc.sqlite_errorcode == sqlite3.SQLITE_BUSY
-                busy_calls += 1
-        return busy_calls
+            # A contended write is kept on this store for its next write or exit drain (never
+            # raised to the caller, never lost); an uncontended one commits now.
+            assert store.record_model_call(_dimensions(), _resource()) is None
+        return store
 
-    with ThreadPoolExecutor(max_workers=2) as executor:
-        futures = [executor.submit(record_calls, 10) for _ in range(2)]
+    writers = [SharedMetricsStore(database_path, outbox_directory) for _ in range(2)]
+    # Another writer holds the store for the whole burst, so every increment is contended.
+    holder = sqlite3.connect(database_path, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            futures = [executor.submit(record_calls, writer, 10) for writer in writers]
+        assert [future.result() for future in futures] == writers
+    finally:
+        holder.execute("COMMIT")
+        holder.close()
+    assert sum(len(writer._deferred) for writer in writers) == 20  # deferred, not dropped or raised
+    assert SharedMetricsStore(database_path, outbox_directory).counter_snapshot() == []
 
-    restarted = SharedMetricsStore(database_path, outbox_directory)
-    # Check lossless increments without requiring contended writes to block.
-    for _ in range(sum(future.result() for future in futures)):
-        restarted.record_model_call(_dimensions(), _resource())
-    assert restarted.counter_snapshot()[0]["value"] == 20
+    # The exit drain each writer registers when it defers: lossless and counted exactly once.
+    for writer in writers:
+        writer.drain_deferred()
+        assert writer._deferred == []
+    assert SharedMetricsStore(database_path, outbox_directory).counter_snapshot()[0]["value"] == 20
 
 
 def test_cross_process_model_call_updates_are_transactional(tmp_path):
