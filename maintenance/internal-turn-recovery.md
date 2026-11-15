@@ -1,0 +1,26 @@
+# Internal Turn Recovery
+
+Fork patch identity: `internal-turn-recovery`.
+
+Load when changing failed-turn boundaries, post-turn hooks, goal continuation, or
+how synthetic gateway and CLI turns settle after an inference failure.
+
+## Contract
+
+A failed turn that no person started (relay, process notification, goal or loop
+continuation, cron) must never show the human "Your request was not processed"
+resend copy. Its durable failed boundary keeps empty content, so the transcript
+sequence stays closed without leaking chat-facing text into the topic or into the
+goal transcript.
+
+The gateway requeues one failed internal or goal-continuation event once, with
+`gateway_internal_retry_count` set to 1. It does not requeue user events, loop ticks
+(loop settlement schedules the next tick), context overflow, content-policy blocks,
+or failures marked non-retryable. A second failure settles silently and does not loop.
+The CLI requeues a failed synthetic continuation without running the goal judge
+against the failed turn.
+
+Human-started failed turns keep the existing visible resend notice.
+
+Contract tests: `tests/gateway/test_internal_failed_turn_recovery.py`,
+`tests/hermes_cli/test_cli_goal_interrupt.py::TestHealthyTurnStillRuns::test_failed_synthetic_continuation_is_requeued_without_judging`.
