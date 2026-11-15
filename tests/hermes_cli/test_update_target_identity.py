@@ -342,7 +342,8 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
         if fetched and not failed and '--abbrev-ref' in command and kwargs.get('check'):
             failed = True
             raise subprocess.CalledProcessError(128, command, '', 'fixture: Git file I/O failed')
-        result = call(command, *args, **kwargs)
+        argv = [*command, *(args[0] if args else [])]
+        result = call(argv, **kwargs)
         if 'fetch' in command:
             fetched = True
         return result
@@ -352,10 +353,15 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
             return real_run(command, *args, **kwargs)
         return guard(command, args, kwargs, real_run)
 
-    def custody_call(command, *args, **kwargs):
+    def custody_call(command, *rest, **kwargs):
+        # update_custody.run receives the fully assembled argv, while the guard exposes the
+        # split (git command, git args) seam to its callback. Reassemble it before invoking the
+        # real runner; passing git args positionally is interpreted as subprocess.Popen bufsize.
+        if rest:
+            command = [*command, *rest[0]]
         seam.custody = True
         try:
-            return real_custody_run(command, *args, **kwargs)
+            return real_custody_run(command, **kwargs)
         finally:
             seam.custody = False
 
