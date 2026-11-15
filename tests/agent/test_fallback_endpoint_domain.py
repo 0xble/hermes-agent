@@ -398,7 +398,8 @@ def test_reserved_route_failure_is_one_request_without_retry_or_further_activati
     agent = _agent(routes)
     routes[3].status = 200 if malformed else 503
     routes[3].malformed = malformed
-    agent._disable_streaming = not streaming
+    # Activation restores _disable_streaming from the seed, so the seed decides the fallback's wire mode.
+    agent._disable_streaming = agent._disable_streaming_seed = not streaming
 
     @wraps(apply_retry_restarts)
     def at_cap(agent, **kwargs):
@@ -412,6 +413,7 @@ def test_reserved_route_failure_is_one_request_without_retry_or_further_activati
     assert result['failed'] is True
     assert activated == ['xai-oauth']
     assert [r['model'] for r in routes[3]] == ['Grok']
+    assert [bool(r.get('stream')) for r in routes[3]] == [streaming], 'the fallback request used the intended wire mode'
     assert [i.model for i in agent._turn_attempted_routes] == ['sol', 'grok']
     if not malformed:
         assert 'Requested routes: Sol via custom:sol, Grok via xai-oauth.' in result['final_response']
