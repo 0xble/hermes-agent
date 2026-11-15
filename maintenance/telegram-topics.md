@@ -109,7 +109,9 @@ authorized for this change.
   the previous opening-message-only upgrade. A candidate is colliding only when a legitimate
   holder keeps its name: the atomic title write reclaims a hidden compression ancestor, a
   retired Bot Chat or an ended empty visible ghost (`_title_conflict_kind`) before the
-  advisory collision read can hold the candidate. Patch identity: `title-hold-until-reply`.
+  advisory collision read can hold the candidate. That reclaim applies the same junk
+  rejection and greeting demotion as an uncontested candidate, so it never stores a title
+  or an authority the normal write would refuse. Patch identity: `title-hold-until-reply`.
 - The model title starts with the turn when the turn's self-hosted endpoint is declared
   multi-slot through `providers.<name>.capabilities.concurrent_requests: true`. The opening
   turn's empty or attachment-only opener is the exception: `auxiliary.title_generation.hold_until_reply`

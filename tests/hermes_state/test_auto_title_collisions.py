@@ -179,3 +179,46 @@ def test_auto_title_worker_reclaims_a_ghost_after_advisory_collision(tmp_path):
 
         assert db.get_session_title("active") == "Billing Review"
         assert db.get_session_title("ghost") is None
+
+
+def _ghost_holding(db, title):
+    db.create_session("ghost", source="telegram")
+    db.set_session_title("ghost", title)
+    db.end_session("ghost", "abandoned")
+    db.create_session("active", source="telegram")
+
+
+def _run_held_auto_title(db, generated, message):
+    from unittest.mock import patch
+    from agent.title_generator import auto_title_session
+
+    with patch("agent.title_generator.generate_title", return_value=generated), \
+         patch("agent.title_generator._hold_until_reply_enabled", return_value=True):
+        auto_title_session(db, "active", message, conversation_history=[{"role": "user", "content": message}])
+
+
+def test_reclaimed_greeting_placeholder_stays_provisional(tmp_path):
+    """A reclaimed greeting keeps derived authority, so a later substantive turn still upgrades it."""
+    with SessionDB(tmp_path / "state.db") as db:
+        _ghost_holding(db, "Friendly greeting")
+
+        _run_held_auto_title(db, "Friendly greeting", "hi there")
+        assert (db.get_session_title("active"), db.get_session_title_source("active")) == (
+            "Friendly greeting", "derived",
+        )
+
+        _run_held_auto_title(db, "Billing Review", "Review billing")
+        assert (db.get_session_title("active"), db.get_session_title_source("active")) == (
+            "Billing Review", "llm",
+        )
+
+
+def test_reclaim_never_persists_a_junk_title(tmp_path):
+    with SessionDB(tmp_path / "state.db") as db:
+        _ghost_holding(db, "Slack")
+
+        _run_held_auto_title(db, "Slack", "slack")
+
+        assert db.get_session_title("active") is None
+        assert db.get_session_title_source("active") is None
+        assert db.get_session_title("ghost") == "Slack"
