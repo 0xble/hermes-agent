@@ -63,12 +63,33 @@ def record_hard_limit_breach(state, reason: str) -> None:
 
 
 def retire_goal(state, reason: str, actor: str, authority: str) -> None:
-    """Clear a goal; a reasoned (agent/autonomy) retirement keeps its reason in the history."""
+    """Clear a goal, recording who retired this instance and why.
+
+    Every clear appends its own row, so the latest clear row always names this retirement's
+    authority. Revisions inherited from an earlier autonomously cleared goal must never make a
+    later user clear look autonomous.
+    """
     if reason:
         state.last_reason = reason
-        state.revisions.append({"at": time.time(), "kind": "clear", "reason": reason,
-                                "actor": actor, "authority": authority})
+    state.revisions.append({"at": time.time(), "kind": "clear", "reason": reason,
+                            "actor": actor, "authority": authority})
     state.status = "cleared"
+
+
+def _retired_by_autonomy(state) -> bool:
+    """Whether this instance's own clear was autonomous.
+
+    Only rows after the inherited-history boundary (the ``set`` row appended when this goal was
+    set) belong to this instance, so an earlier goal's clear can never decide this one.
+    """
+    if state.status != "cleared":
+        return False
+    for row in reversed(state.revisions):
+        if row.get("kind") == "set":
+            return False
+        if row.get("kind") == "clear":
+            return row.get("authority") == "autonomy"
+    return False
 
 
 def migrate_autonomous_goal(state) -> bool:
@@ -263,9 +284,7 @@ class GoalAutonomyMixin:
     def _history_for_next_goal(previous):
         if not goal_autonomy_enabled() or previous is None:
             return []
-        retired = previous.status == "cleared" and any(
-            row.get("kind") == "clear" and row.get("authority") == "autonomy"
-            for row in previous.revisions)
+        retired = _retired_by_autonomy(previous)
         if previous.status != "done" and not retired:
             return []
         reason = "Previous goal cleared" if retired else "Previous goal completed"

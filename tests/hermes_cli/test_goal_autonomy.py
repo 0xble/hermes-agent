@@ -333,6 +333,38 @@ def test_explicit_pauses_and_approval_entry_respect_autonomy(home):
     assert goals.load_goal("autonomy").status == "paused"
 
 
+@pytest.mark.parametrize("clearer", ["user", "agent"])
+def test_only_the_current_retirement_decides_inherited_history(home, monkeypatch, clearer):
+    _, db = home
+    mgr = manager()
+    mgr.clear(reason="Superseded by the B route", actor="agent", authority="autonomy")
+    mgr = goals.GoalManager("autonomy")
+    mgr.set("Goal B", contract=goals.GoalContract(verification="tests pass; release readback matches"))
+    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: (
+        "blocked", "constraint violation: restarted gateway", False, None, False))
+    mgr.evaluate_after_turn("try another route", user_initiated=False)
+    assert any(row["kind"] == "hard_limit_breach" for row in goals.load_goal("autonomy").revisions)
+    if clearer == "user":
+        mgr.clear()
+    else:
+        mgr.clear(reason="Handed off to a verified takeover", actor="agent", authority="autonomy")
+    mgr = goals.GoalManager("autonomy")
+    mgr.set("Goal C", contract=goals.GoalContract(verification="tests pass; release readback matches"))
+    inherited = goals.load_goal("autonomy").revisions
+    result = mgr.complete(reason="verified", evidence=proof(db))
+    if clearer == "user":
+        # B's inherited autonomous clear of A must not make the user's clear of B a retirement.
+        assert inherited == []
+        assert result["ok"], result
+        assert goals.load_goal("autonomy").status == "done"
+    else:
+        assert inherited[-1]["reason"] == "Previous goal cleared"
+        assert inherited[-1]["goal"] == "Goal B"
+        assert any(row.get("reason") == "Handed off to a verified takeover" for row in inherited)
+        assert not result["ok"]
+        assert "hard constraint breach" in result["error"]
+
+
 def test_autonomy_prompt_explains_reasoned_retirement_and_registry_tracks_it(home):
     from hermes_cli.goals_autonomy import AUTONOMY_CONTINUATION_TEMPLATE
     from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY

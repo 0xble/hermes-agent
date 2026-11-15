@@ -14,7 +14,11 @@ Never clear to escape unmet criteria or failing checks. Use complete for an
 achieved outcome. The shared session-control transaction records the reason and
 agent/autonomy authority in existing goal revisions and the control receipt,
 and the applied notice names the reason subject to the configured notice policy.
-Native `/goal clear` and default-off controls are unchanged.
+Every clear, including native `/goal clear`, appends its own clear revision with
+its actor and authority. Only an autonomous clear of the current instance, found
+after that instance's inherited-history boundary, carries history into the next
+goal, so a user clear never inherits an earlier goal's autonomous retirement.
+Native `/goal clear` and default-off controls are otherwise unchanged.
 
 This belongs in core because contract preservation, evidence admission, atomic
 completion, and idle wake admission share durable goal state across CLI, gateway
