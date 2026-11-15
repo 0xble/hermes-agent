@@ -4,8 +4,7 @@ Mirrors ``test_compression_max_attempts_config.py``: the three knobs are
 parsed in ``agent_init`` with the same hardened semantics (booleans rejected,
 fractional floats rejected — not truncated, integral floats and numeric
 strings accepted) and attached to the built-in compressor. Default is
-48000 / 8000 / 4096, so old oversized tool results are pruned deterministically
-while the recent message tail stays protected.
+0 / 8000 / 4096; warm pruning is opt-in.
 """
 
 from __future__ import annotations
@@ -65,12 +64,12 @@ class TestProactivePruneConfig:
 
     def test_explicit_null_trigger_uses_default(self, monkeypatch, tmp_path):
         agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=None)
-        assert agent.context_compressor.proactive_prune_tokens == 48_000
+        assert agent.context_compressor.proactive_prune_tokens == 0
 
-    def test_default_values_enable_prune(self, monkeypatch, tmp_path):
+    def test_default_values_disable_warm_prune(self, monkeypatch, tmp_path):
         agent = _make_agent(monkeypatch, tmp_path)
         cc = agent.context_compressor
-        assert cc.proactive_prune_tokens == 48_000
+        assert cc.proactive_prune_tokens == 0
         assert cc.proactive_prune_min_result_chars == 8_000
         assert cc.proactive_prune_min_reclaim_tokens == 4_096
 
@@ -92,7 +91,7 @@ class TestProactivePruneConfig:
                     "function": {"name": "terminal", "arguments": '{"cmd":"old"}'},
                 }],
             },
-            {"role": "tool", "tool_call_id": old_call_id, "content": "O" * 30_000},
+            {"role": "tool", "tool_call_id": old_call_id, "content": "O" * 100_000},
         ]
         tail = [
             {"role": "user", "content": f"recent-{idx}"}
@@ -101,13 +100,13 @@ class TestProactivePruneConfig:
         messages.extend(tail)
 
         result, pruned = agent.context_compressor.prune_tool_results_only(
-            messages, current_tokens=48_001,
+            messages, current_tokens=48_001, cold_cache=True,
         )
 
         assert pruned >= 1
         assert result is not messages
         old_result = next(m for m in result if m.get("tool_call_id") == old_call_id)
-        assert len(old_result["content"]) < 30_000
+        assert len(old_result["content"]) < 100_000
         assert [m["content"] for m in result[-agent.context_compressor.protect_last_n:]] == [
             m["content"] for m in tail[-agent.context_compressor.protect_last_n:]
         ]
@@ -129,7 +128,7 @@ class TestProactivePruneConfig:
         # bool subclasses int: YAML `proactive_prune_tokens: true` must fall
         # back to the shipped default, never coerce to 1 token.
         agent = _make_agent(monkeypatch, tmp_path, proactive_prune_tokens=True)
-        assert agent.context_compressor.proactive_prune_tokens == 48_000
+        assert agent.context_compressor.proactive_prune_tokens == 0
 
 
 

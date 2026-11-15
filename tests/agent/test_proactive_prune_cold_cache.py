@@ -14,7 +14,8 @@ from agent.turn_proactive_prune import run_proactive_prune, turn_start_cold_prun
 
 def _shipped():
     with patch("agent.context_compressor.get_model_context_length", return_value=1_000_000):
-        return ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=4)
+        return ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=4,
+                                 proactive_prune_tokens=64_000, proactive_prune_min_reclaim_tokens=64_000)
 
 
 def _history(n_pairs, big, chars=20_000, start=0):
@@ -33,8 +34,9 @@ def _small_batch():
     return _history(10, big=set(range(5)))
 
 
-def test_cold_cache_commits_below_the_warm_gate():
+def test_cold_cache_commits_with_the_warm_gate_off():
     c = _shipped()
+    c.proactive_prune_tokens = 0
     msgs = _small_batch()
     warm, n_warm = c.prune_tool_results_only(msgs, current_tokens=100_000)
     assert n_warm == 0 and warm is msgs  # warm cache: 25K is below 64K, no cache break
@@ -44,6 +46,8 @@ def test_cold_cache_commits_below_the_warm_gate():
 
 def test_cold_cache_still_needs_the_cold_gate():
     c = _shipped()
+    c.proactive_prune_tokens = 0
+    c.proactive_prune_min_reclaim_tokens = 4096
     msgs = _history(10, big={0})  # ~5K tokens reclaimable
     out, n = c.prune_tool_results_only(msgs, current_tokens=100_000, cold_cache=True)
     assert n == 0 and out is msgs
@@ -132,6 +136,7 @@ def _site_agent(prune, *, cold, session_db=True, checkpoint=False):
     compressor = MagicMock()
     compressor.prune_tool_results_only = prune
     compressor._session_db = MagicMock() if session_db else None
+    compressor._session_id = "s1"
     agent = MagicMock()
     agent.context_compressor = compressor
     agent.compression_enabled = True

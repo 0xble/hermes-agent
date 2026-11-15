@@ -45,8 +45,12 @@ class ProactivePruneMixin:
 
     def prune_tool_results_only(
         self, messages: list[dict[str, Any]], current_tokens: int | None = None, *, cold_cache: bool = False,
+        turn_start: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Deterministic, no-LLM tool-result prune gated on ``proactive_prune_tokens``.
+        """Prune old tool results on an expired cache, or above the opt-in warm trigger.
+
+        Never shorten the running turn. An invalid anchor means the running turn
+        cannot be identified, so skip rather than guessing from the tail size.
 
         Protects the tail by message COUNT only. A warm commit breaks the prompt cache, so it requires
         ``proactive_prune_min_reclaim_tokens`` (less what cold prunes freed since the last warm one) and a
@@ -69,7 +73,11 @@ class ProactivePruneMixin:
         """
         if self._optional_archive_cooldown_until > time.monotonic():
             return messages, 0
-        if not self.would_proactively_prune(current_tokens):
+        if not (cold_cache or self.would_proactively_prune(current_tokens)):
+            return messages, 0
+        if turn_start is not None and not (type(turn_start) is int and 0 <= turn_start < len(messages)
+                and messages[turn_start].get("role") == "user"):
+            self._warn_reclamation_no_op("prune:running_turn_unknown", current_tokens)
             return messages, 0
         if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
             self._warn_reclamation_no_op("prune:tail_only", current_tokens)
@@ -86,9 +94,22 @@ class ProactivePruneMixin:
         if session_db and session_id and not callable(getattr(session_db, "archive_and_compact", None)):
             self._warn_reclamation_no_op("prune:store_cannot_persist", current_tokens)
             return messages, 0
-        pruned_msgs, pruned_count = self._prune_old_tool_results(
-            messages, protect_tail_count=self.protect_last_n, protect_tail_tokens=None, min_prune_chars=self.proactive_prune_min_result_chars,
+        boundary = len(messages) - self.protect_last_n
+        if 0 < boundary < len(messages) and messages[boundary].get("role") == "tool":
+            boundary = self._align_boundary_backward(messages, boundary)
+        pruned_msgs, _ = self._prune_old_tool_results(
+            messages, protect_tail_count=len(messages) - boundary, protect_tail_tokens=None,
+            min_prune_chars=self.proactive_prune_min_result_chars,
         )
+        if turn_start is not None:
+            pruned_msgs[turn_start:] = messages[turn_start:]
+        # A protected parallel round stays whole, including dedup and image retirement.
+        if 0 <= boundary < len(messages) and messages[boundary].get("tool_calls"):
+            end = boundary + 1
+            while end < len(messages) and messages[end].get("role") == "tool":
+                end += 1
+            pruned_msgs[boundary:end] = messages[boundary:end]
+        pruned_count = sum(a != b for a, b in zip(messages, pruned_msgs))
         from agent.context_compressor_tail import with_pruned_row_skill_safety_rule
         pruned_msgs = with_pruned_row_skill_safety_rule(messages, pruned_msgs)
         if not pruned_count:
@@ -99,7 +120,9 @@ class ProactivePruneMixin:
         after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
         reclaimed = max(0, before - after)
         gate = self.proactive_prune_min_reclaim_tokens
-        cold_gate = min(gate, _cc()._COLD_CACHE_MIN_RECLAIM_TOKENS)
+        cold_gate = _cc()._COLD_CACHE_MIN_RECLAIM_TOKENS
+        if self.proactive_prune_tokens > 0:
+            cold_gate = min(gate, cold_gate)
         if reclaimed < (cold_gate if cold_cache else max(cold_gate, gate - self._proactive_prune_cold_credit)):
             self._warn_reclamation_no_op("prune:reclaim_below_minimum", current_tokens, before=before)
             return messages, 0

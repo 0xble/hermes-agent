@@ -108,7 +108,7 @@ class ContextEngine(ABC):
         """
 
     def prune_tool_results_only(
-        self, messages: list[dict[str, Any]], current_tokens: int | None = None, *, cold_cache: bool = False,
+        self, messages: list[dict[str, Any]], current_tokens: int | None = None, *, cold_cache: bool = False, turn_start: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
         """Deterministically trim old tool-result payloads without an LLM call.
 

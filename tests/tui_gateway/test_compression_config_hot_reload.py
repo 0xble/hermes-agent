@@ -251,7 +251,7 @@ def test_removing_compressor_keys_restores_fresh_build_values(monkeypatch):
     from hermes_cli.config_defaults import DEFAULT_CONFIG
 
     # A fresh agent build reads the MERGED config, so DEFAULT_CONFIG wins over the ctor default for the
-    # int keys (the fork enables the proactive prune at 48000 while the ctor keeps 0).
+    # int keys use the shipped defaults.
     for key in (
         "protect_last_n",
         "proactive_prune_tokens",
@@ -260,7 +260,7 @@ def test_removing_compressor_keys_restores_fresh_build_values(monkeypatch):
         "min_tail_user_messages",
     ):
         setattr(fresh, key, DEFAULT_CONFIG["compression"][key])
-    assert compressor.proactive_prune_tokens == DEFAULT_CONFIG["compression"]["proactive_prune_tokens"] == 48_000
+    assert compressor.proactive_prune_tokens == DEFAULT_CONFIG["compression"]["proactive_prune_tokens"] == 0
     for attr in (
         "tail_mode",
         "summary_target_ratio",
