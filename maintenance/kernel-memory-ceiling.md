@@ -43,6 +43,11 @@
   assert that the runner never installs a virtual-address limit, preserves inherited
   DATA limits, and samples readable descendants after an `AccessDenied` sibling.
   Config tests cover integer-valued floats and warnings for ignored values.
+  On macOS the tree comes from libproc's per-parent `proc_listchildpids`, never
+  psutil's recursive `children()`: that asks every host process for its parent with
+  the GIL held (3 s per sample at ~5,000 host processes, once a second per running cell),
+  which on 2026-11-14 starved the gateway until every `pre_tool_call` hook timed out and
+  all tool calls were refused. A contract test fails if the sample scans the host.
 - **Limits/follow-ups:** Sampling is best-effort, not an OS-enforced aggregate
   reservation; bursts within one second can overshoot. Background allocation while
   idle, aggregate pressure across many kernels, remote kernels, standalone fallback,
