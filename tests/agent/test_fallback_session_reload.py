@@ -72,3 +72,49 @@ def test_legacy_gateway_fallback_rows_return_to_the_configured_model():
     assert json.loads(restored["model_config"]) == {"reasoning_config": {"effort": "high"}}
     plain = {"model": "deepseek-flash", "model_config": json.dumps({"gateway_runtime": {"provider": "deepseek"}})}
     assert fallback_restored_row(plain) is plain
+
+
+def _gateway_synced_fallback_row(db, sid="s1"):
+    """A gateway session whose last turn ran on a fallback: the per-turn sync wrote the fallback's
+    model with ``gateway_runtime.fallback_active`` (and the activation wrote the marker)."""
+    _fallback_turn(db, sid)
+    config = json.loads(db.get_session(sid)["model_config"])
+    config["gateway_runtime"] = {"provider": "deepseek", "base_url": "https://api.deepseek.com/v1",
+                                 "fallback_active": True}
+    db.update_session_meta(sid, json.dumps(config), model="deepseek-flash")
+
+
+def _resumed_model(row):
+    return (fallback_restored_row(row) or {}).get("model")
+
+
+def test_a_pick_on_a_gateway_synced_fallback_row_survives_reload(tmp_path):
+    """Clearing only the marker left ``fallback_active``, so resume restored the profile default
+    (model None) over the user's pick. Every explicit-pick writer clears both."""
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _gateway_synced_fallback_row(db, "provider-less")
+        db.update_session_model("provider-less", "user-selected")  # a /model pick without route knowledge
+        assert _resumed_model(db.get_session("provider-less")) == "user-selected"
+
+        _gateway_synced_fallback_row(db, "with-provider")
+        db.update_session_model("with-provider", "user-selected", provider="zai")
+        assert _resumed_model(db.get_session("with-provider")) == "user-selected"
+    finally:
+        db.close()
+
+
+def test_a_local_policy_model_selection_on_a_gateway_synced_fallback_row_survives_reload(tmp_path, monkeypatch):
+    import hermes_state_mutation_prepared as prepared_mod
+    db = SessionDB(tmp_path / "state.db")
+    try:
+        _gateway_synced_fallback_row(db)
+        # The policy receipt half of the transaction is not under test: only the row it writes.
+        monkeypatch.setattr(prepared_mod, "_commit_policy", lambda db, conn, sid, prepared: ({"target": sid}, 1))
+        prepared = {"policy": {"model": "user-selected", "config_json": json.dumps({"model": {"provider": "zai"}})}}
+        db._execute_write(lambda conn: prepared_mod.model_in_transaction(db, conn, "s1", {}, prepared))
+        row = db.get_session("s1")
+        assert row["model"] == "user-selected"
+        assert _resumed_model(row) == "user-selected"
+    finally:
+        db.close()

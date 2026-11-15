@@ -15,9 +15,9 @@ explicit ``/model`` pick). Every resume reader passes the row through
 the fallback's model. If the primary is still rate limited, its first request fails again and
 the ordinary fallback runs with its usual notice (``Primary retry eligible in ~N s``).
 
-An explicit model pick clears the marker (``update_session_model``, a local policy model
-selection, and any persist of a live agent that is not on a fallback), so a user's choice of the
-same model the fallback used still survives a reload. Gateway rows written before this marker
+An explicit model pick clears the marker and the legacy gateway flag (``clear_fallback_markers``:
+``update_session_model``, a local policy model selection, and any persist of a live agent that is
+not on a fallback), so a user's choice, even of the model the fallback used, survives a reload. Gateway rows written before this marker
 existed carry ``gateway_runtime.fallback_active``; those restore the profile's configured model.
 Credentials are never stored here.
 """
@@ -85,6 +85,19 @@ def fallback_primary(row: dict[str, Any] | None) -> dict[str, Any] | None:
     if isinstance(runtime, dict) and runtime.get("fallback_active") is True:
         return {}
     return None
+
+
+def clear_fallback_markers(config: dict[str, Any]) -> dict[str, Any]:
+    """*config* (a parsed ``model_config``, edited in place) without anything ``fallback_primary``
+    reads as "this route came from a fallback": the marker and the legacy gateway flag. Every
+    writer of a route that is the session's own (an explicit pick, a live agent off any fallback)
+    calls this; clearing only the marker left a gateway-synced row's ``fallback_active`` to restore
+    the profile default over the user's pick."""
+    config.pop(FALLBACK_ROUTE_KEY, None)
+    runtime = config.get("gateway_runtime")
+    if isinstance(runtime, dict) and runtime.get("fallback_active") is True:
+        config["gateway_runtime"] = {**runtime, "fallback_active": False}
+    return config
 
 
 def fallback_restored_row(row: dict[str, Any] | None) -> dict[str, Any] | None:

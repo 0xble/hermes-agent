@@ -257,7 +257,8 @@ def _persist_live_session_runtime(session: dict | None) -> None:
         model_config = _runtime_model_config(agent, _parse_model_config(row.get("model_config")))
         if not getattr(agent, "_provider_fallback_active", False):
             # The live route is the session's own (a pick, or the restored primary), not a fallback's.
-            model_config.pop("_fallback_route", None)
+            from agent.fallback_session_route import clear_fallback_markers
+            clear_fallback_markers(model_config)
         if isinstance(composer_profile := session.get("composer_override_profile"), dict):
             model_config["composer_override_profile"] = composer_profile
         elif "composer_override_profile" in session:
