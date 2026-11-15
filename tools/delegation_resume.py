@@ -647,8 +647,9 @@ def _retry_budget_reason(record: dict[str, Any], now: float, *, check_attempts: 
     return None
 
 
-def _expire_retry(conn, record: dict[str, Any], now: float, *, check_attempts: bool = True) -> Optional[str]:
-    reason = _retry_budget_reason(record, now, check_attempts=check_attempts)
+def _expire_retry(conn, record: dict[str, Any], now: float, *, check_attempts: bool = True,
+                  forced_reason: Optional[str] = None) -> Optional[str]:
+    reason = forced_reason or _retry_budget_reason(record, now, check_attempts=check_attempts)
     if reason:
         conn.execute("""UPDATE async_delegations SET retry_state='terminal', retry_reason=?,
                         retry_due_at=NULL, retry_claim=NULL, retry_claimed_at=NULL, updated_at=?
@@ -859,7 +860,17 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
                 # Avoid racing the provider's reset, but never park beyond the lineage budget.
                 reset_wait = min(candidates) + 30.0 if candidates else 0.0
                 deadline = float(record["retry_root_started_at"] or now) + MAX_LINEAGE_AGE_S
-                due = min(deadline, now + max(_backoff(record["retry_attempt"]), reset_wait))
+                wait = max(_backoff(record["retry_attempt"]), reset_wait)
+                if now + wait >= deadline:
+                    # claim_retry_dispatch/_expire_retry treats the deadline as expired. Do not
+                    # create a row that can only become terminal after waiting until that deadline.
+                    verdict = RETRY_TERMINAL
+                    reason = _expire_retry(
+                        conn, record, now,
+                        forced_reason=_retry_budget_reason(record, deadline, check_attempts=False),
+                    )
+                else:
+                    due = now + wait
         conn.execute(
             """UPDATE async_delegations SET retry_state=?, retry_reason=?, retry_due_at=?, updated_at=?
                WHERE delegation_id=? AND retry_state=?""",

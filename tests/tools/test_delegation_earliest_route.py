@@ -92,7 +92,11 @@ def test_retry_never_parks_past_the_lineage_deadline():
     started = now - dr.MAX_LINEAGE_AGE_S + 600
     with ad._DB_LOCK, ad._transaction() as conn:
         conn.execute("UPDATE async_delegations SET retry_root_started_at=? WHERE delegation_id=?", (started, did))
-    assert dr.schedule_retry(did, now=now)["due_at"] <= started + dr.MAX_LINEAGE_AGE_S
+    plan = dr.schedule_retry(did, now=now)
+    assert plan["retry_state"] == dr.RETRY_TERMINAL
+    assert plan["reason"] == "retry budget exhausted (24h)"
+    assert plan["due_at"] is None
+    assert dr.retry_status(did)["retry_due_at"] is None
 
 
 def test_primary_record_beats_a_long_provider_hint():

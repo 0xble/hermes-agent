@@ -115,6 +115,21 @@ def test_max_retries_exhausted_chat_text_has_next_step_and_no_mechanism_lead():
     assert result["failure_retryable"] is True
 
 
+def test_generic_exhaustion_skips_shared_cooldown_read(monkeypatch):
+    """Earliest-route lookup is only useful for reset-aware rate-limit copy."""
+    from agent import shared_primary_cooldown as spc
+
+    monkeypatch.setattr(spc, "earliest_route_delay", lambda **_kwargs: pytest.fail("unexpected cooldown read"))
+    error = _Http(503, "HTTP 503: upstream unavailable")
+    classified = classify_api_error(error, provider="openrouter", model="m")
+    result = max_retries_exhausted_result(
+        _Agent(), error, classified, attempts=3, is_rate_limited=False, error_msg=str(error).lower(),
+        api_kwargs=None, api_messages=[], messages=[], conversation_history=None, api_call_count=1,
+        approx_tokens=10, provider="openrouter", base_url="https://openrouter.ai/api/v1", model="m",
+    )
+    assert result["failure_reason"] == classified.reason.value
+
+
 def test_exhausted_plan_quota_429_names_the_reset_window_not_wait_a_minute():
     """The real usage-limit envelope: ``_summarize_api_error`` reduces the body to ``HTTP 429: The
     usage limit has been reached``, so the reset must travel through the classifier, not the text (#89401)."""

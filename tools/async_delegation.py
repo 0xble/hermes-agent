@@ -1211,7 +1211,16 @@ def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -
 
 
 def push_task_failure_notice(delegation_id: str, entry: dict[str, Any], *, n_tasks: int) -> None:
-    """Surface each terminal child's failure; suppress only a persisted row that will auto-retry."""
+    """Surface ONE failed child of a still-running detached batch to the parent now, instead of
+    when the slowest sibling finishes. In a 1,393-agent run every wave-1 child died in a 401 storm
+    at 08:29 and the parent learned of it at 09:36, when the batch's "unknown outcome" block finally
+    arrived: 66 minutes of a dead wave with nothing running. The notice rides the same
+    ``type="async_delegation"`` event shape as the batch result (so every drain/route/format path
+    treats it identically) with ``task_failure_notice=True`` and a single-entry ``results`` list; the
+    batch record is NOT finalized and its consolidated result still arrives as before. In-process
+    queue only (never persisted), so the parent's copy honours ``security.redact_secrets: false``.
+    Suppress it only when the persisted row is classified as an in-budget automatic retry; terminal
+    rows, including budget-exhausted rows, still emit the failure notice."""
     will_retry = _failure_notice_will_auto_retry(delegation_id, entry)
     with _records_lock:
         record = _records.get(delegation_id)
