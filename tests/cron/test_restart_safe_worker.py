@@ -116,6 +116,39 @@ def test_launchd_gateway_dispatches_cron_in_detached_session(monkeypatch):
     ).mode == "in_process"
 
 
+@pytest.mark.parametrize("launchd_label,supervised,outlives_parent,expected", [
+    ("ai.hermes.gateway", True, False, "detached"),
+    ("ai.hermes.gateway", False, False, "in_process"),
+    ("application.com.microsoft.VSCode.1", True, False, "in_process"),
+    ("ai.hermes.gateway", True, True, "in_process"),
+])
+def test_darwin_dispatch_detaches_only_the_supervised_launchd_gateways_cron(
+    monkeypatch, launchd_label, supervised, outlives_parent, expected,
+):
+    """Stops a launchd gateway from running cron in its own process group again, where a restart's
+    bootout kills the job (the Darwin host is described as input, so every platform's gate runs this)."""
+    from functools import partial
+
+    from gateway import restart
+    from tools import process_registry
+
+    command = [sys.executable, "-m", "cron.scheduler"]
+    monkeypatch.setattr(process_registry.platform, "system", lambda: "Darwin")
+    for name in ("XPC_SERVICE_NAME", restart.LAUNCHD_LABEL_ENV):
+        monkeypatch.delenv(name, raising=False)
+    # The launchd wrapper re-exports the job label; the real reader takes the host platform as data.
+    monkeypatch.setenv(restart.LAUNCHD_LABEL_ENV, launchd_label)
+    monkeypatch.setattr(restart, "launchd_service_label", partial(restart.launchd_service_label, platform="darwin"))
+    monkeypatch.setattr(process_registry, "_is_supervised_gateway_process", lambda: supervised)
+
+    dispatch = process_registry.restart_safe_gateway_child_argv(
+        command, unit_suffix="cron-macos", require_restart_safe_scope=True, outlives_parent=outlives_parent,
+    )
+
+    assert dispatch.mode == expected
+    assert dispatch.argv is command
+
+
 @pytest.mark.platforms("linux")
 def test_restart_safe_gateway_child_fails_closed_when_required(monkeypatch):
     from tools import process_registry

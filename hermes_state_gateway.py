@@ -11,7 +11,7 @@ from hermes_state_deletion import visible_session_sql
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_state_common import (
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS_SQL, _sql_json_extract,
@@ -468,6 +468,48 @@ class SessionGatewayMixin:
                 wanted + "SELECT key FROM wanted WHERE NOT EXISTS ("
                 "SELECT 1 FROM gateway_routing WHERE scope = :scope AND session_key = wanted.key)", write_params)}
         return self._execute_write(_do, skip_result=set())
+
+    def apply_gateway_routing_delta(
+        self, upserts: dict[str, str], removed: Iterable[str], *, scope: str = ""
+    ) -> Optional[set[str]]:
+        """Write one routing-index diff the caller computed against what it last persisted.
+
+        ``replace_gateway_routing_entries`` parses and checks every route inside the write lock, which
+        held it for seconds on a large index. This touches only *upserts* and *removed*, with the same
+        retired-route skip, and returns the skipped retired keys among *upserts* as replace does.
+        Returns None, writing nothing, when routes may be private: only a full replace preserves
+        private rows byte-exact.
+        """
+        from hermes_state_mutation_retirement import ROUTE_RETIRED_SQL, route_namespace, route_retired_params
+        payload = json.dumps({k: {"entry": v, "ns": route_namespace(k)}
+                              for k, v in upserts.items() if k and v}, ensure_ascii=False)
+        gone = json.dumps([k for k in removed if k and k not in upserts], ensure_ascii=False)
+        params = {**route_retired_params("", "", time.time()), "scope": scope, "payload": payload, "gone": gone}
+        wanted = ("WITH wanted AS (SELECT key, json_extract(value, '$.entry') AS entry, "
+                  "json_extract(value, '$.ns') AS ns FROM json_each(:payload)) ")
+        retired = ROUTE_RETIRED_SQL.replace(":entry", "wanted.entry").replace(":ns", "wanted.ns")
+        private = object()
+
+        def _do(conn):
+            from agent.incognito import any_incognito_sessions
+            if any_incognito_sessions():
+                return private
+            if gone != "[]":
+                conn.execute("DELETE FROM gateway_routing WHERE scope = :scope "
+                             "AND session_key IN (SELECT value FROM json_each(:gone))", params)
+            if payload == "{}":
+                return set()
+            conn.execute(
+                wanted + "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+                "SELECT :scope, key, entry, :now FROM wanted WHERE NOT " + retired +
+                " ON CONFLICT(scope, session_key) DO UPDATE SET "
+                "entry_json=excluded.entry_json, updated_at=excluded.updated_at "
+                "WHERE gateway_routing.entry_json IS NOT excluded.entry_json", params)
+            return {row[0] for row in conn.execute(
+                wanted + "SELECT key FROM wanted WHERE NOT EXISTS ("
+                "SELECT 1 FROM gateway_routing WHERE scope = :scope AND session_key = wanted.key)", params)}
+        result = self._execute_write(_do, skip_result=private)
+        return None if result is private else result
 
     def unbind_gateway_session_peer(self, session_key: str, expected_session_id: str) -> bool:
         """Finish a partial routing unbind without deleting transcript history."""

@@ -253,3 +253,13 @@ also named in retention INSERT/SELECT and defaults safely for old rows.
 
 
 Related upstream PRs [#123893](https://github.com/NousResearch/hermes-agent/pull/123893) and [#123878](https://github.com/NousResearch/hermes-agent/pull/123878) concern restart identity and drain waiting; neither isolates a macOS cron worker. Roll back by reverting this patch's launchd dispatch branch and associated docs/tests, without removing the upstream Linux handoff or execution ledger.
+
+## Delivery Queue Schema Convergence
+
+The delivery queue rebuilds `deliveries` and `delivery_tombstones` to admit new statuses,
+because SQLite cannot widen a CHECK in place. A rebuild that changes nothing leaves its own
+trigger true and repeats on every open, rewriting the file each time, which is how the execution
+ledger failed on its first v0.23.1 night. The queue therefore rebuilds only when the widened
+table definition differs from the stored one.
+
+Contract tests: `tests/cron/test_delivery_queue.py::test_an_older_queue_is_migrated_once_not_on_every_open`.

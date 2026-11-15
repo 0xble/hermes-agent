@@ -42,3 +42,5 @@ Contract tests:
 
 Retire this unit when upstream required authority opens join the same in-flight
 attempt without poisoning fallback caches, and these contracts pass unchanged.
+
+Contract tests: `tests/gateway/test_profile_authority_pending_open.py`, `tests/gateway/test_session_db_recovery.py`, `tests/gateway/test_session_db_required_open.py`, `tests/gateway/test_session_db_handle_sharing.py`, `tests/gateway/test_profile_authority_park_reason.py`, `tests/hermes_cli/test_gateway_snapshot_restore_live.py`, `tests/hermes_cli/test_gateway_snapshot_restore_guards.py`.

@@ -138,3 +138,5 @@ Native behavior tests cover cancellation after admission, during preparation, af
 ## Upstream Disposition and Retirement
 
 This is a fork-only core adaptation for the external `loop_set` plugin contract. An upstream PR is a follow-up once the plugin contract and native `/loop` lifecycle API have stabilized. Retire this unit only when released upstream behavior provides the same versioned revisions, authority split, cross-surface cache freshness, and receipt registry contract; remove the fork implementation and tests after equivalent upstream coverage is verified.
+
+Contract tests: `tests/hermes_cli/test_loop_settlement.py`, `tests/hermes_cli/test_loop_control_atomic.py`, `tests/hermes_cli/test_loop_autonomy.py`, `tests/gateway/test_loop_interruption_recovery.py`, `tests/gateway/test_loop_tick_native_settlement.py`, `tests/gateway/test_loop_tick_reset.py`.

@@ -90,3 +90,6 @@ Retire this patch and its companion reader contract only after the upstream
 replacement proves original-receipt coverage and confirmed-send semantics for
 queued messages and simultaneous threads. Remove the log wiring together with
 its helper if rolling back, leaving attended activity and shared telemetry intact.
+
+
+Contract tests: `tests/gateway/test_reply_latency_attribution.py`, `tests/gateway/test_reply_latency_consumers.py`, `tests/gateway/test_reply_latency_delivery.py`, `tests/gateway/test_reply_latency_logs.py`, `tests/gateway/test_reply_latency_report.py`.

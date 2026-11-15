@@ -51,3 +51,5 @@ iteration-only triggers.
 Retire when released upstream requires a human-authored turn for automatic skill
 review across both finalization paths while preserving this complete behavior.
 Rollback reverts this commit.
+
+Contract tests: `tests/agent/test_skip_background_review.py`.

@@ -57,3 +57,5 @@
   lifecycle evidence, and Linux resource-limit backstops.
 - **Rollback:** Revert the commit carrying `Fork-Patch: kernel-memory-ceiling`.
   Raising the positive config value is an operator override, not a full rollback.
+
+Contract tests: `tests/tools/test_code_kernel_memory.py`, `tests/tools/test_code_kernel.py`, `tests/tools/test_code_kernel_lifetime.py`, `tests/tools/test_code_kernel_remote.py`, `tests/tui_gateway/test_session_finalize_reaps_kernels.py`.

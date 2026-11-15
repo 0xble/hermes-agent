@@ -19,3 +19,5 @@ This patch is deliberately narrower than #134346. It repairs completed items alr
 Focused regressions: `tests/agent/test_codex_generated_images.py`, plus existing Responses adapter and Codex transport tests. Check image-only completion, native/custom issuer, safe persisted replay, malformed payload, storage failure, partial-image status, and coexistence with text/function output. Runtime promotion and real Telegram delivery are separate parent-owned checks.
 
 Retire when a released upstream fix satisfies this contract. Rollback is the commit carrying this fork identity. No migration, proxy reconfiguration, or runtime restart is required for source rollback.
+
+Contract tests: `tests/agent/test_codex_generated_images.py`.

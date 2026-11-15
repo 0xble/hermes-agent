@@ -21,3 +21,6 @@ selection is replaced by upstream delegation backends and Advanced Delegation
 `model_map` options or `profile_routes`. No configured named custom roles need
 translation. Parent-only durable knowledge writes and child lifecycle ownership
 remain with upstream's core lifecycle rather than custom route definitions.
+
+
+Contract tests: none. Retired during the v0.23.1 integration; the record is kept for published trailers.

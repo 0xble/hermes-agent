@@ -155,3 +155,5 @@ removing `gateway.restart_delegation_timeout` from configuration. The resume
 columns on `async_delegations` are additive with safe defaults
 (`resume_state='none'`, `resume_attempts=0`); leaving them in place after a
 rollback is harmless and avoids a destructive table rebuild.
+
+Contract tests: `tests/gateway/test_restart_after_turn.py`, `tests/gateway/test_restart_drain.py`, `tests/gateway/test_cron_active_work_drain.py`, `tests/gateway/test_drain_active_work_report.py`, `tests/tools/test_delegate_interrupt_reason.py`, `tests/tools/test_async_delegation.py`, `tests/tools/test_delegation_resume.py`, `tests/tools/test_delegate_control_actions.py`, `tests/hermes_state/test_hermes_state.py`, `tests/hermes_cli/test_gateway_service.py`, `tests/hermes_cli/test_update_wedged_gateway.py`.

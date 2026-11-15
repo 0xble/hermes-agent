@@ -74,3 +74,5 @@ and passes this regression file without the fork code. Retire the unmatched
 guard separately if upstream ships an equivalent sanitized catch-all.
 
 Roll back by reverting the patch commit. No persistent state changes.
+
+Contract tests: `tests/e2e/core/platforms/test_telegram_rich_message_inbound.py`, `tests/gateway/test_telegram_rich_message_ingress.py`.

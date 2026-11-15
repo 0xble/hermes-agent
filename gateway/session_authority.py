@@ -504,7 +504,8 @@ class SessionAuthority:
         """The FIFO stopped without claiming its head. Committed rows stay queued for a later
         drain; process-local delivery/HTTP/producer waiters on this session are released,
         with the reason instead of a reply, so an adapter loop is never parked on a turn that
-        will not run. The ingress turns that refusal into one user-facing notice per episode.
+        will not run. The ingress turns that refusal into one user-facing notice per episode;
+        an ``unknown_execution`` pause is also announced to the chat (``session_pause_announce``).
         ``session_busy`` is transient (a registered worker finishes and wakes the FIFO), so only
         the messaging delivery waiters are released for it; an API/webhook/Bot observer keeps
         waiting for the answer instead of reporting accepted work as a conflict."""
@@ -516,6 +517,10 @@ class SessionAuthority:
             waiter = self.waiters.pop(admission_id, None)
             if waiter is not None and not waiter.done():
                 waiter.set_exception(RuntimeStoreError(reason))
+        # A lost turn's pause is also told to the chat unprompted (once per episode, shared with
+        # the reply path): input the previous owner admitted has no waiter here to carry it.
+        from gateway.session_pause_announce import schedule_pause_announcement
+        schedule_pause_announcement(self, ref, reason)
 
     async def admit_automation(self, adapter, event, identity, replaces=None, fold=None, *, authorize_write=None):
         from gateway.admission_canary import refusal_evidence
@@ -707,6 +712,9 @@ class SessionAuthority:
                 results[sid] = 'ready'
             except RuntimeStoreError as exc:
                 results[sid] = exc.reason
+                if exc.reason == 'unknown_execution' and sid in self.sessions:
+                    # Paused before any drain: no waiter or new message reports it to the chat.
+                    self._pause(SessionRef(self.profile_id, sid), exc.reason)
         return results
 
     async def submit(self, actor: SessionActor, request: Submission, *, _authorize_write=None, queue_while_restarting=False,
@@ -980,10 +988,11 @@ class SessionAuthority:
             request_hard_interrupt(agent)
         return self._handle(ref)
 
-    def _classic_turn_holds(self, route):
+    async def _classic_turn_holds(self, route):
         """The route's running slot is held by a turn this FIFO did not claim (the drain is serial:
         its own previous turn released the slot before this claim). Leaked and reaped slots are
-        evicted first, so they never block the FIFO; the reaped check reads state.db at most 1/s."""
+        evicted first, so they never block the FIFO; the reaped check reads state.db at most 1/s,
+        off the loop, so it is awaited: an un-awaited call never evicts and the head waits forever."""
         runner = self.runner
         running = getattr(runner, '_is_session_running', None)
         if running is None or not running(route):
@@ -994,7 +1003,7 @@ class SessionAuthority:
             self._classic_evict_at[route] = now
             runner._hm_evict_idle_stale_agent(route)
             if running(route):
-                runner._hm_evict_reaped_agent(route)
+                await runner._hm_evict_reaped_agent(route)
         return running(route)
 
     def _runs_own_agent(self, ref):
@@ -1174,7 +1183,7 @@ class SessionAuthority:
                 from gateway.session_completion_notes import noted_completion, reopen_for_turn
                 if not noted_completion(first):
                     await reopen_for_turn(self, ref)
-            if first is not None and self._classic_turn_holds(live.route):
+            if first is not None and await self._classic_turn_holds(live.route):
                 # A classic turn (fallback wake, CLI handoff, legacy resume) holds the route's slot:
                 # a claim now would hand this row to its busy path and settle it unrun. The head
                 # waits queued, as main's pending slot did; /stop and /new still cancel it.
