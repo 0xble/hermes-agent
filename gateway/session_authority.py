@@ -721,9 +721,9 @@ class SessionAuthority:
                 results[sid] = 'ready'
             except RuntimeStoreError as exc:
                 results[sid] = exc.reason
-                if (exc.reason == 'unknown_execution' and sid in self.sessions
-                        and sid in getattr(self, 'fenced_at_boot', ())):
-                    # Paused by this boot, before any drain: no waiter or new message reports it to the chat.
+                if exc.reason == 'unknown_execution' and sid in self.sessions:
+                    # Paused before any drain: no waiter or new message reports it to the chat. An
+                    # episode an earlier boot already told is not repeated (session_pause_announce).
                     self._pause(SessionRef(self.profile_id, sid), exc.reason)
         return results
 
@@ -1583,11 +1583,7 @@ async def _claim_epoch(authority, *, successor=False):
                                         successor=successor)
         authority.begun_epoch = epoch
     # Hot-serve builds a profile while the loop serves the others: both writes stay off it.
-    # The sessions whose lost turn this boot fenced: only those pauses are new to their chat. A turn an
-    # earlier owner already left ``unknown`` was announced then, or by the next message's reply.
-    fenced = set()
-    await asyncio.to_thread(recover_session_inputs, db, epoch=epoch, fenced=fenced)
-    authority.fenced_at_boot = getattr(authority, 'fenced_at_boot', frozenset()) | fenced
+    await asyncio.to_thread(recover_session_inputs, db, epoch=epoch)
     # A lost automation turn has nobody to resolve it: it settles interrupted before any FIFO runs.
     from gateway.session_unattended_unknown import settle_recovered_unattended
     await asyncio.to_thread(settle_recovered_unattended, db, epoch)

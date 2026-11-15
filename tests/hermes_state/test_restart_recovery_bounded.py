@@ -61,10 +61,7 @@ def test_recovery_reads_only_in_flight_rows_and_keeps_its_effect(db):
     for sql in updates:
         plan = [row[3] for row in db._conn.execute('EXPLAIN QUERY PLAN ' + sql)]
         assert not any(detail in ('SCAN session_admissions', 'SCAN worker_executions') for detail in plan), (sql, plan)
-        # Bounded either way: a covering scan (the fence RETURNs the session ids it fenced) still
-        # reads only the partial index's in-flight entries, never the table.
-        assert any(' USING INDEX idx_' in detail or ' USING COVERING INDEX idx_' in detail
-                   for detail in plan), (sql, plan)
+        assert any(' USING INDEX idx_' in detail for detail in plan), (sql, plan)
 
     with db._read_ctx() as conn:
         counts = dict(((status, outcome, owner), n) for status, outcome, owner, n in conn.execute(

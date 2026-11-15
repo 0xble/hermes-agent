@@ -542,16 +542,11 @@ _RECOVER_WORKERS_SQL = ("UPDATE worker_executions SET status='unknown' WHERE sta
                         "AND status IN ('registered','running') AND owner_epoch!=?")
 _RECOVER_STEERS_SQL = (f"UPDATE session_admissions SET outcome='interrupted' WHERE status = 'terminal' "
                        f"AND outcome = '{STEERING}' AND owner_epoch!=?")
-_RECOVER_STARTED_SQL = ("UPDATE session_admissions SET status='unknown' WHERE status = 'started' AND owner_epoch!=? "
-                        "RETURNING target_session_id")
+_RECOVER_STARTED_SQL = "UPDATE session_admissions SET status='unknown' WHERE status = 'started' AND owner_epoch!=?"
 
 
-def recover_session_inputs(db, *, epoch: int, fenced: set | None = None) -> int:
-    """Never replay started work. Live worker adoption is a separate explicit operation.
-
-    Returns how many started turns this call fenced ``unknown``; ``fenced`` (when given) also
-    collects their sessions, so boot recovery can tell a pause it just caused from one an earlier
-    owner already reported."""
+def recover_session_inputs(db, *, epoch: int) -> int:
+    """Never replay started work. Live worker adoption is a separate explicit operation."""
     def write(conn):
         _epoch(conn, epoch)
         from hermes_state_runtime_workers import retire_stale_children
@@ -559,11 +554,8 @@ def recover_session_inputs(db, *, epoch: int, fenced: set | None = None) -> int:
         conn.execute(_RECOVER_WORKERS_SQL, (epoch,))
         # A steer handed to a lost claim may or may not have reached its agent: never replayed.
         conn.execute(_RECOVER_STEERS_SQL, (epoch,))
-        return [row[0] for row in conn.execute(_RECOVER_STARTED_SQL, (epoch,)).fetchall()]
-    sessions = db._execute_write(write)
-    if fenced is not None:
-        fenced.update(sessions)
-    return len(sessions)
+        return conn.execute(_RECOVER_STARTED_SQL, (epoch,)).rowcount
+    return db._execute_write(write)
 
 
 def mutation_receipt_key(principal_id, session_id, request_id, *, operation, payload, expected_revision,
