@@ -109,3 +109,73 @@ async def test_busy_voice_note_interrupts_with_transcript_in_interrupt_mode(tmp_
         assert sent, 'no busy ack'
     finally:
         authority.db.close()
+
+
+def _goal_turn(runner, source, turn, agent):
+    """The running turn is an unattended goal continuation, as after a restart's goal wake."""
+    turn.agent = agent
+    turn.event = runner._synthetic_prompt_event(
+        source, 'Continue working toward the goal.', reply_expected=False, goal_continuation=True,
+        goal_session_id='goal-session', goal_instance=1.0)
+
+
+@pytest.mark.asyncio
+async def test_typed_text_behind_goal_turn_steers_into_it_in_queue_mode(tmp_path, monkeypatch):
+    """busy_input_mode=queue keeps a person's follow-up behind their own work, not behind a goal
+    turn that may run for an hour: under the authority it steers in and is acknowledged."""
+    runner, authority, source, agent, sent, turn = await _setup(tmp_path, monkeypatch, 'queue')
+    monkeypatch.setattr(runner, '_effective_busy_text_mode', lambda source: 'queue')
+    _goal_turn(runner, source, turn, agent)
+    try:
+        handled = asyncio.ensure_future(runner._handle_message(MessageEvent(
+            text='check now', source=source, message_id='h1', reply_expected=True)))
+        done, _ = await asyncio.wait({handled}, timeout=10)
+        handled.cancel()
+        assert done, 'the typed message was queued silently behind the goal turn'
+        assert len(agent.steers) == 1 and agent.steers[0].endswith('check now'), agent.steers
+        assert turn.event.reply_expected is True  # the goal turn now answers the person
+        assert sent, 'no acknowledgement'
+        assert _admitted(authority) == []  # steered text is inside the run, never replayed
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_typed_text_behind_starting_goal_turn_is_queued_with_an_ack(tmp_path, monkeypatch):
+    """A goal turn that has not built its agent yet cannot take a steer. The input still runs
+    next, and the person is told it was saved instead of seeing nothing."""
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from tests.waiting import async_wait_until
+
+    runner, authority, source, _agent, sent, turn = await _setup(tmp_path, monkeypatch, 'queue')
+    monkeypatch.setattr(runner, '_effective_busy_text_mode', lambda source: 'queue')
+    monkeypatch.setattr(runner, '_handle_message_with_agent', lambda *a, **k: None)
+    _goal_turn(runner, source, turn, _AGENT_PENDING_SENTINEL)
+    try:
+        task = asyncio.ensure_future(runner._handle_message(MessageEvent(
+            text='check now', source=source, message_id='h2', reply_expected=True)))
+        await async_wait_until(lambda: _admitted(authority), timeout=10, what='the typed message admitted')
+        task.cancel()
+        assert [row['request_id'] for row in _admitted(authority)] == ['h2']
+        assert any('Queued' in str(text) for text in sent), sent
+    finally:
+        authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_typed_text_behind_a_persons_own_turn_still_queues_silently(tmp_path, monkeypatch):
+    from tests.waiting import async_wait_until
+
+    runner, authority, source, agent, sent, turn = await _setup(tmp_path, monkeypatch, 'queue')
+    monkeypatch.setattr(runner, '_effective_busy_text_mode', lambda source: 'queue')
+    monkeypatch.setattr(runner, '_handle_message_with_agent', lambda *a, **k: None)
+    turn.event = MessageEvent(text='do the thing', source=source, message_id='t1', reply_expected=True)
+    try:
+        task = asyncio.ensure_future(runner._handle_message(MessageEvent(
+            text='and this too', source=source, message_id='h3', reply_expected=True)))
+        await async_wait_until(lambda: _admitted(authority), timeout=10, what='the follow-up admitted')
+        task.cancel()
+        assert agent.steers == []
+        assert sent == []
+    finally:
+        authority.db.close()

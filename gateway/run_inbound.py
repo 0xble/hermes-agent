@@ -1049,11 +1049,21 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         state = self._peek_session_state(_quick_key)
         running_agent = state.turn.agent if state else None
         adapter = self._delivery_adapter_for(source)
-        if (self._draining or adapter is None or running_agent is None or running_agent is _AGENT_PENDING_SENTINEL
-                or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
-                    and self._effective_busy_text_mode(source) == "queue")):
+        if self._draining or adapter is None or running_agent is None:
             return False
-        outcome = await self._resolve_busy_steer_or_redirect(event, _quick_key, mode, running_agent)
+        # Same queue-mode rule as the in-process busy handler: a person waiting behind a goal,
+        # cron wake or relay turn takes it over at its next tool boundary. If it cannot be
+        # steered yet, the queued ack still tells them the input was saved.
+        preempt = mode == "queue" and self._human_preempts_autonomous_turn(event, state)
+        if preempt:
+            logger.info("Typed message preempts autonomous turn for session %s", _quick_key)
+            mode = "steer"
+        if (running_agent is _AGENT_PENDING_SENTINEL and not preempt) or (
+                event.message_type == MessageType.TEXT and mode != "steer" and not superseded
+                and self._effective_busy_text_mode(source) == "queue"):
+            return False
+        outcome = await self._resolve_busy_steer_or_redirect(
+            event, _quick_key, mode, running_agent, preempt=preempt)
         note_busy_outcome(event, outcome)
         await self._busy_interrupt_and_ack(event, _quick_key, adapter, state, running_agent, outcome)
         return bool(outcome.steered or outcome.redirected)
