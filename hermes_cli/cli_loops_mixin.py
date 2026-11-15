@@ -94,21 +94,23 @@ def _is_explicit_synthetic_turn(text: Any) -> bool:
     """
     try:
         from tools.process_registry_notifications import TimelineNotification
-        if isinstance(text, TimelineNotification):
-            return True
-    except Exception:
-        pass
+    except ImportError:
+        TimelineNotification = None
+    if TimelineNotification is not None and isinstance(text, TimelineNotification):
+        return True
     if not isinstance(text, str):
         return False
     try:
         from hermes_cli.goals import is_goal_continuation_text
-        if is_goal_continuation_text(text):
-            return True
         from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX
         from hermes_cli.loops import WAKEUP_PROMPT_PREFIX
-        return text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
-    except Exception:
+    except ImportError:
+        logging.getLogger(__name__).debug(
+            "synthetic-turn markers unavailable; treating turn as user-initiated", exc_info=True)
         return False
+    if is_goal_continuation_text(text):
+        return True
+    return text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
 
 
 def _is_self_injected_turn(text: Any) -> bool:
