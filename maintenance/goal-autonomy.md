@@ -154,11 +154,11 @@ or loop row keeps the outcome.
 ## Pause Authority
 
 `GoalState.paused_by` records who paused a goal (`agent`, `user` or `system`).
-It is never inferred from `paused_reason`. Under `goals.autonomy` a session-control
-resume lifts only an `agent` pause and refuses any other with `user_paused`, so a
-`/goal pause`, `/stop`, Ctrl+C, quoted or system pause stays the user's. Autonomous
-pauses are timed waits rather than pauses, so in practice the agent never resumes a
-paused goal. A current user quote to resume still applies with quote authority.
+It is never inferred from `paused_reason`. An autonomous session-control pause records
+`agent`. Under `goals.autonomy` a session-control resume or clear lifts or ends only an
+`agent` pause and refuses any other with `user_paused`, so a `/goal pause`, `/stop`,
+Ctrl+C, quoted or system pause stays the user's even when the agent supplies a clear
+reason. A current user quote to resume still applies with quote authority.
 Legacy rows load with an empty owner, which counts as not the agent's.
 
 Upstream preflight read root and affected-subsystem guidance at

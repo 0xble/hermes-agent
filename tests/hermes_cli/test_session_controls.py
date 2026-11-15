@@ -93,6 +93,73 @@ def test_autonomous_clear_records_reason_actor_and_notice(state, target, entry):
     assert load_goal(target).revisions[-1]["reason"] == "Previous goal cleared"
 
 
+@pytest.mark.parametrize("target", ["requester", "target"])
+def test_autonomous_goal_pause_is_agent_owned_and_agent_resumable(state, target):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    GoalManager(target).set("watch the build")
+    paused = session_controls.apply_control("goal", "pause", target, requester_sid="requester",
+                                            reason="waiting on a deploy")
+    assert paused["ok"] and paused["record"]["authority"]["via"] == "autonomy", paused
+    assert load_goal(target).status == "paused" and load_goal(target).paused_by == "agent"
+    resumed = session_controls.apply_control("goal", "resume", target, requester_sid="requester",
+                                             reason="deploy finished")
+    assert resumed["ok"] and resumed["status"] == "applied", resumed
+    assert load_goal(target).status == "active" and load_goal(target).paused_by == ""
+
+
+def _legacy_unowned_pause(manager, target):
+    from hermes_cli.goals import save_goal
+
+    legacy = manager.pause(reason="session-control: paused")
+    legacy.paused_by = ""
+    save_goal(target, legacy)
+
+
+def _autonomous_pause(manager, target):
+    from hermes_cli import session_controls
+
+    assert session_controls.apply_control("goal", "pause", target, requester_sid="requester",
+                                          reason="waiting on a deploy")["ok"]
+
+
+_GOAL_PAUSES = {
+    "slash": lambda manager, target: manager.pause(),
+    "stop": lambda manager, target: manager.pause(reason="user-interrupted (/stop)"),
+    "system": lambda manager, target: manager.pause(reason="session-control: budget", by="system"),
+    "legacy": _legacy_unowned_pause,
+    "agent": _autonomous_pause,
+}
+
+
+@pytest.mark.parametrize("pause", sorted(_GOAL_PAUSES))
+@pytest.mark.parametrize("target", ["requester", "target"])
+def test_autonomous_clear_ends_only_agent_owned_pauses(state, pause, target):
+    from hermes_constants import get_hermes_home
+    from hermes_cli import session_controls
+    from hermes_cli.goals import GoalManager, load_goal
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    manager = GoalManager(target)
+    manager.set("watch the build")
+    _GOAL_PAUSES[pause](manager, target)
+    before = load_goal(target).to_json()
+    reason = "Superseded by the verified takeover in hermes:default/other"
+    result = session_controls.apply_control("goal", "clear", target, requester_sid="requester",
+                                            reason=reason)
+    if pause == "agent":
+        assert result["ok"] and result["status"] == "applied", result
+        cleared = load_goal(target)
+        assert cleared.status == "cleared" and cleared.revisions[-1]["reason"] == reason
+    else:
+        assert not result["ok"] and result["error_code"] == "user_paused", result
+        assert result["record"]["status"] == "failed"
+        assert load_goal(target).to_json() == before
+
+
 @pytest.mark.parametrize("reason", ["", "  \n\t", None, 42])
 @pytest.mark.parametrize("target", ["requester", "target"])
 def test_autonomous_clear_requires_nonempty_reason_without_mutating(state, reason, target):
