@@ -519,6 +519,22 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
 
+    # A symbolic authority profile must never materialize a home in the checkout
+    # that runs the suite. Keep this guard narrow: tests may create arbitrary
+    # temporary directories, but top-level ``owned``/``fixture`` are synthetic
+    # profile ids, not repository artifacts.
+    checkout_root = Path(__file__).resolve().parent.parent
+    forbidden_homes = tuple(checkout_root / name for name in ("owned", "fixture"))
+
+    def assert_no_checkout_homes():
+        leaked = [str(path) for path in forbidden_homes if path.exists()]
+        if leaked:
+            raise AssertionError(f"test created a Hermes home in the checkout root: {leaked}")
+
+    assert_no_checkout_homes()
+    yield
+    assert_no_checkout_homes()
+
 
 # Backward-compat alias — old tests reference this fixture name. Keep it
 # as a no-op wrapper so imports don't break.
