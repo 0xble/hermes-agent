@@ -50,3 +50,5 @@ mid-turn restore and optional stay-limit behavior and the regressions pass
 without the local implementation.
 
 Fork patch identities: `fallback-mid-turn-restore`.
+
+Contract tests: `tests/agent/test_mid_turn_primary_restore.py`.

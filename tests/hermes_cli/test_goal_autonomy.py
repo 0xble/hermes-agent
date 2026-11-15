@@ -132,7 +132,7 @@ def test_blocked_judgment_keeps_a_wake_and_breaches_survive_replacement(home, mo
 
 
 @pytest.mark.parametrize("action", ["pause", "resume", "replace", "clear"])
-def test_model_controls_never_request_approval_or_clear(home, action):
+def test_model_controls_apply_without_approval(home, action):
     manager()
     if action == "resume":
         goals.GoalManager("autonomy").pause()
@@ -141,8 +141,8 @@ def test_model_controls_never_request_approval_or_clear(home, action):
         payload={"goal": "alternate route"} if action == "replace" else None)
     assert result.get("status") != "pending"
     if action == "clear":
-        assert not result["ok"]
-        assert goals.load_goal("autonomy").status == "active"
+        assert result["ok"], result
+        assert goals.load_goal("autonomy").status == "cleared"
     elif action == "resume":
         # The pause above is the user's, which the agent never lifts.
         assert not result["ok"] and result["error_code"] == "user_paused", result
@@ -180,10 +180,11 @@ def test_agent_resumes_only_its_own_goal_pause(home, pause):
 @pytest.mark.parametrize("reason,user_quote", [
     ("temporary dependency wait", ""),
     ("user-paused", ""),
+    ("judge blocked: dependency missing", ""),
     ("session-control", "Pause the goal."),
     ("next step", "Continue the goal."),
 ])
-def test_model_pause_has_a_timed_native_wake(home, monkeypatch, entry, reason, user_quote):
+def test_model_pause_persists_and_never_wakes(home, monkeypatch, entry, reason, user_quote):
     _, db = home
     mgr = manager()
     mgr.add_subgoal("delivery confirmed")
@@ -194,22 +195,18 @@ def test_model_pause_has_a_timed_native_wake(home, monkeypatch, entry, reason, u
     result = control("goal", "pause", "autonomy", requester_sid="autonomy", reason=reason, **kwargs)
     assert result["ok"] and result["status"] == "applied", result
     state = goals.load_goal("autonomy")
-    assert state.status == "active"
-    assert state.waiting_until > time.time()
-    assert not state.waiting_on_user_message and state.paused_reason is None
+    assert state.status == "paused"
+    assert not state.waiting_until and not state.waiting_on_user_message
     assert state.contract == before.contract and state.subgoals == before.subgoals
     assert (state.turns_used, state.max_turns, state.created_at) == (
         before.turns_used, before.max_turns, before.created_at)
-    assert goals.store_has_parked_goal(db)
-    assert any(sid == "autonomy" for sid, _ in goals.list_parked_goals())
+    assert not goals.store_has_parked_goal(db)
+    assert goals.list_parked_goals() == []
     wake = goals.GoalManager("autonomy")
+    monkeypatch.setattr(goals.time, "time", lambda: before.last_turn_at + 86400)
     assert wake.lifted_barrier_prompt() is None
-    monkeypatch.setattr(goals.time, "time", lambda: state.waiting_until + 1)
-    assert wake.lifted_barrier_prompt() is not None
-    assert wake.clear_lifted_wait(state.waiting_since)
-    monkeypatch.setattr(goals, "judge_goal", lambda *a, **k: ("continue", "next route", False, None, False))
-    decision = wake.evaluate_after_turn("try the next route", user_initiated=False)
-    assert decision["status"] == "active" and wake.state.turns_used == before.turns_used + 1
+    assert not wake.is_active()
+    assert "paused" in wake.status_line()
 
 
 @pytest.mark.parametrize("entry", ["slash", "quote", "stale_quote", "default_off"])
@@ -237,13 +234,10 @@ def test_user_pause_authority_stays_explicit(home, monkeypatch, entry):
             requester_sid="autonomy", reason="temporary dependency wait", user_quote=quote)
         assert result["ok"] and result["status"] == "applied", result
     state = goals.load_goal("autonomy")
-    if entry == "stale_quote":
-        assert state.status == "active" and state.waiting_until > time.time()
-    else:
-        assert state.status == "paused" and not state.waiting_until
-        assert not goals.store_has_parked_goal(db)
-        assert goals.list_parked_goals() == []
-        assert goals.GoalManager("autonomy").lifted_barrier_prompt() is None
+    assert state.status == "paused" and not state.waiting_until
+    assert not goals.store_has_parked_goal(db)
+    assert goals.list_parked_goals() == []
+    assert goals.GoalManager("autonomy").lifted_barrier_prompt() is None
 
 
 def test_legacy_blocks_and_user_waits_migrate_but_default_off_does_not(home):
@@ -337,6 +331,21 @@ def test_explicit_pauses_and_approval_entry_respect_autonomy(home):
     assert result.get("status") != "pending"
     assert not result["ok"] and result["error_code"] == "user_paused", result
     assert goals.load_goal("autonomy").status == "paused"
+
+
+def test_autonomy_prompt_explains_reasoned_retirement_and_registry_tracks_it(home):
+    from hermes_cli.goals_autonomy import AUTONOMY_CONTINUATION_TEMPLATE
+    from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
+
+    prompt = manager().next_continuation_prompt()
+    assert prompt is not None
+    assert "Never clear a goal." not in prompt
+    assert "Clear only an obsolete" in prompt
+    assert "verified takeover" in prompt
+    assert "Never clear to escape unmet criteria or failing checks" in prompt
+    assert "Use complete for an achieved goal" in prompt
+    assert any(row["formatter"] == "autonomy" and row["template"] == AUTONOMY_CONTINUATION_TEMPLATE
+               for row in GOAL_PROMPT_REGISTRY)
 
 
 def test_autonomy_reads_the_owning_profile_for_each_activity(home):

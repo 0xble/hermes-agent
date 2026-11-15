@@ -38,6 +38,7 @@ from gateway.run_notifications_ledger import (
 from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
+from gateway.watch_match_coalesce import coalesce_pending_watch_matches
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
@@ -1529,7 +1530,7 @@ class GatewayNotificationsMixin(
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume watches in their owning profile, backing off refusals even during drain."""
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = _drain_gateway_watch_events(completion_queue)
+        watch_events = coalesce_pending_watch_matches(_drain_gateway_watch_events(completion_queue))
         for evt in watch_events:
             next_retry_at = evt.get("_watch_next_retry_at")
             draining = getattr(self, "_draining", False)
@@ -1539,8 +1540,7 @@ class GatewayNotificationsMixin(
             # Offer a held event once per drain for spooling, not on every refused tick.
             if (next_retry_at is not None and next_retry_at > time.monotonic()
                     and (not draining or drain_offered)):
-                # Backoff between refused injections: hold the event for a later drain tick
-                # instead of re-attempting admission every 2 s (#140899).
+                # Refused injections back off to a later drain tick, not every 2 s (#140899).
                 completion_queue.put(evt)
                 continue
             async with self._completion_event_scope(evt):

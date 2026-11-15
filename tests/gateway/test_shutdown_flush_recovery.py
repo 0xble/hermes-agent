@@ -473,6 +473,7 @@ def test_boot_recovery_runs_before_resume_turns_and_queued_inbound(monkeypatch):
         _schedule_resume_pending_sessions=lambda **_kwargs: order.append("resume"),
         _finish_startup_restore=finish_startup_restore, _schedule_auto_resume_delegations=lambda: None,
         _send_session_db_warning_notifications=noop, _spawn_supervised=lambda *a, **k: None,
+        _sweep_orphan_progress_cards=noop, _retain_background_task=lambda task: task,
     )
     runner._recover_pending_shutdown_flush_off_loop = partial(
         gateway_run.GatewayRunner._recover_pending_shutdown_flush_off_loop, runner)

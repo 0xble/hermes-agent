@@ -130,6 +130,8 @@ A deliberate gateway stop writes `<HERMES_HOME>/gateway-guardian-stopped`; a sta
 
 Inspect `<HERMES_HOME>/logs/guardian/` for JSON attempt, result, capped and alert receipts, plus `stdout.log` and `stderr.log`. Identical recent alerts are deduplicated and receipts older than an hour are pruned. The guardian does not retry interrupted work.
 
+The guardian job's program is `/usr/bin/osascript`, through the same `launchd_program_arguments` wrapper as the gateway, which runs `current/.venv/bin/python -m hermes_cli.gateway_guardian run` as its child. launchd records a launch constraint (LWCR) for the program binary, and the release interpreter changes under `current` with interpreter bumps, `hermes update --rollback` and the guardian's own rollback. When the guardian ran the venv Python directly, release `d32adcc2` moved it from Python 3.14.7 to 3.14.9 on 2026-10-29. From then on every spawn failed with `Unable to get updated LWCR ... error 0x3` (`job state = spawn failed`, exit 78), and the promotion's kickstart did not refresh the constraint. A guardian installed before this change keeps its old definition, because `install` refuses a differing plist. To rewrite and re-bootstrap it, run `hermes gateway guardian uninstall` and then `install` with the release CLI. Regressions: `test_gateway_guardian.py::test_guardian_program_survives_a_release_interpreter_change`, plus `test_gateway_guardian_launchd_real.py`, which runs the installer's own definition under real launchd.
+
 ## Blocking state.db work stays off the event loop
 
 Patch identity: `seamless-restart; keep gateway startup and loop off blocking state.db I/O`
@@ -194,6 +196,29 @@ of stranded behind the fresh session. A superseded session stays read-only, exce
 for its own receipts and cancelling its own queued rows (`authorize(superseded_ok=True)`):
 those rows can never run, and cancelling them is what lets the session be deleted.
 Proof: `tests/gateway/test_superseded_queued_rows.py`.
+
+## Progress cards survive a restart only as a record
+
+Patch identity: `seamless-restart; boot deletes progress cards a restart stranded`.
+End-of-turn deletion of temporary progress cards is a post-delivery callback held
+in process memory, so a restart mid-turn, or between the final send and the
+callback, stranded every card the turn posted (about 215 deleted by hand on
+2026-10-29).
+
+- `TurnContext.track_cleanup_id` is the one tracking site. With
+  `cleanup_progress` on it also records `{chat_id, message_id, pid}` on the
+  session's routing entry (`SessionEntry.progress_cards`, single-entry fast save,
+  off the loop). Only ids the in-memory cleanup would delete are recorded, so the
+  final reply never is.
+- The cleanup callback forgets its ids after one attempt; a cancelled cleanup
+  keeps them. A failed run forgets them too, because failed runs keep their cards.
+- Boot (`_start_finish_wiring`, after adapters connect) deletes, in the
+  background, every recorded card whose recording pid is dead, one
+  `delete_messages` batch per chat, then forgets them whatever the outcome:
+  Telegram reports a card already gone or past its 48h window as a plain False.
+  A live pid (a zero-cut predecessor finishing its turn) keeps its own cards.
+
+Proof: `tests/gateway/test_progress_card_restart_cleanup.py`.
 
 ## Bounded terminal shutdown
 
@@ -311,3 +336,5 @@ S3 landed before S2 (its code-SHA ledger column works without releases). S2 is *
 - **The guardian never force-repairs.** It leaves a loaded-but-unhealthy gateway alone, stops after three repairs per hour, and treats a wedged heartbeat older than 120 s as unhealthy. It never repairs a corrupt `current` pointer from the source checkout.
 - **Some hardening paths have only test evidence.** The manual-run kill, double-fork sweep and commit/enqueue-gap paths have regression tests but no live trigger yet.
 - **The full unscoped update path can only be proven live.** Disposable rehearsals cover it with throwaway launchd labels.
+
+Contract tests: `tests/gateway/test_process_exit_after_stop.py`, `tests/tools/test_local_temp_dir.py`, `tests/gateway/test_multiplex_notice_egress_profile_adapter.py`, `tests/gateway/test_native_fifo_outbox_identity.py`, `tests/gateway/test_shutdown_unstarted_turn_replay.py`, `tests/gateway/test_restart_resume_pending.py`, `tests/gateway/test_resume_queued_followup.py`, `tests/gateway/test_turn_state_db_off_loop.py`, `tests/plugins/test_telegram_update_admission.py`, `tests/gateway/test_fifo_media_settlement_no_stall.py`, `tests/gateway/test_superseded_queued_rows.py`, `tests/tools/test_process_registry_shutdown_survivors.py`.

@@ -6,9 +6,15 @@ Fork patch identity: `goal-autonomy`.
 
 `goals.autonomy` defaults to `false`. The existing judge, approval and continuation
 behavior remains the default. When explicitly enabled, native goal management
-supports agent set, revise, replace, pause, resume and complete without approval.
-The external `goal-lifecycle` plugin in `0xble/agents` owns the model tool. Clear
-is user-only on that tool in every mode. Native `/goal clear` remains available.
+supports agent set, revise, replace, pause, resume, clear and complete without approval.
+The external `goal-lifecycle` plugin in `0xble/agents` owns the model tool. Under
+`goals.autonomy`, clear requires a nonempty reason and retires only an obsolete,
+superseded, duplicated or handed-off goal; cite verified takeover for a handoff.
+Never clear to escape unmet criteria or failing checks. Use complete for an
+achieved outcome. The shared session-control transaction records the reason and
+agent/autonomy authority in existing goal revisions and the control receipt,
+and the applied notice names the reason subject to the configured notice policy.
+Native `/goal clear` and default-off controls are unchanged.
 
 This belongs in core because contract preservation, evidence admission, atomic
 completion, and idle wake admission share durable goal state across CLI, gateway
@@ -83,10 +89,11 @@ remain paused. Legacy blocked/input/approval states and automatic pauses migrate
 to active timed waits on load. Idle scans include those rows so migration is not
 dependent on a new user message. Stale resume_pending takeover continues through
 the existing generation-fenced gateway path.
-Agent-requested pauses use the same native retry interval as other timed holds.
-A reason string or unverified quote is not user authority. A current explicit
-user pause quote is revalidated under the session-control write lock and keeps
-the goal paused. Native user pauses and default-off controls remain unchanged.
+Explicit `goal_set action=pause` controls use the native paused transition for both self
+and cross-session targets. They clear wait barriers, survive reload and stay out of the idle
+wake scan until resumed. Session-control pause reasons carry a control prefix so legacy
+judge/budget migration cannot reinterpret model-supplied reason text as an automatic pause.
+Native user pauses and default-off authority requirements remain unchanged.
 The CLI idle hook refreshes its cached goal snapshot before deciding whether a
 tool-authored wait is due. Reload adopts durable state and retains the existing
 snapshot/CAS fences.
@@ -200,3 +207,5 @@ already recorded goal transitions or authorize a service restart.
 
 Stack fit: existing Python, GoalManager, optimistic SQLite snapshots, session
 controls, native idle wake admission and pytest. No new dependencies or services.
+
+Contract tests: `tests/hermes_cli/test_goal_removal_targets.py`, `tests/hermes_cli/test_goal_autonomy.py`, `tests/agent/test_synthetic_prompt_legacy_goals.py`, `tests/agent/test_quiet_goal_receipts.py`, `tests/gateway/test_lifecycle_cards_hidden.py`, `tests/gateway/test_goal_notices_config.py`, `tests/gateway/test_quiet_goal_control_recovery.py`.

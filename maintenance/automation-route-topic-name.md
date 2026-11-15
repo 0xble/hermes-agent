@@ -19,6 +19,10 @@ notice boundary. Direct automation still compares every source field other than
 `chat_topic` and `message_id`. Rebound and legacy routes keep their current-origin
 validation, and local/API paths do not borrow native provenance.
 
+Process-notice preparation refusals are counted by the admission canary under the same
+producer identity as ordinary admission, including their reason/field; retries count once per
+retention window. The ordered admission preparation still rechecks route, session and provenance.
+
 Contract tests: `tests/gateway/test_process_notice_committed_source.py`,
 `tests/gateway/test_automation_route_display_labels.py`,
 `tests/gateway/test_automation_wake_route.py`.

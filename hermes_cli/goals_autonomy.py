@@ -16,7 +16,9 @@ AUTONOMY_CONTINUATION_TEMPLATE = (
     "rather than stopping for input or approval. Preserve every constraint, hard limit and "
     "verification criterion when revising or replacing. Never use complete or replace to escape "
     "constraints, failing checks or unsolved work. Use goal_set complete only with an evidence "
-    "mapping from EVERY verification criterion to concrete recorded tool output. Never clear a goal. "
+    "mapping from EVERY verification criterion to concrete recorded tool output. Clear only an obsolete, "
+    "superseded, duplicated or handed-off goal, with a stated reason; cite verified takeover for a handoff. "
+    "Never clear to escape unmet criteria or failing checks. Use complete for an achieved goal. "
     "If nothing material changed, reply exactly [SILENT]."
 )
 
@@ -58,6 +60,15 @@ def record_hard_limit_breach(state, reason: str) -> None:
             for row in state.revisions):
         state.revisions.append({"at": time.time(), "kind": "hard_limit_breach", "reason": reason,
                                 "actor": "system", "authority": "autonomy"})
+
+
+def retire_goal(state, reason: str, actor: str, authority: str) -> None:
+    """Clear a goal; a reasoned (agent/autonomy) retirement keeps its reason in the history."""
+    if reason:
+        state.last_reason = reason
+        state.revisions.append({"at": time.time(), "kind": "clear", "reason": reason,
+                                "actor": actor, "authority": authority})
+    state.status = "cleared"
 
 
 def migrate_autonomous_goal(state) -> bool:
@@ -250,10 +261,16 @@ class GoalAutonomyMixin:
 
     @staticmethod
     def _history_for_next_goal(previous):
-        if not goal_autonomy_enabled() or previous is None or previous.status != "done":
+        if not goal_autonomy_enabled() or previous is None:
             return []
+        retired = previous.status == "cleared" and any(
+            row.get("kind") == "clear" and row.get("authority") == "autonomy"
+            for row in previous.revisions)
+        if previous.status != "done" and not retired:
+            return []
+        reason = "Previous goal cleared" if retired else "Previous goal completed"
         return [*previous.revisions, {"at": time.time(), "kind": "set", "actor": "agent",
-                "authority": "autonomy", "reason": "Previous goal completed", "goal": previous.goal,
+                "authority": "autonomy", "reason": reason, "goal": previous.goal,
                 "contract": previous.contract.to_dict()}]
 
     def _autonomy_timer_elapsed(self):

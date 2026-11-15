@@ -86,7 +86,7 @@ from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
 from hermes_state_stored_reads import SessionStoredReadsMixin
-from hermes_state_transactions import settle_write_transaction
+from hermes_state_transactions import execute_prune_write, finish_write_maintenance, settle_write_transaction
 from hermes_state_write_stalls import observe_write, write_attempt
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
@@ -1095,8 +1095,8 @@ class SessionDB(
     ) -> T:
         """Run *fn(conn)* in a write transaction; see :meth:`_execute_write_marked`."""
         with observe_write(self.db_path, fn), _storage_write_in_progress(), measure_write():
-            return self._execute_write_marked(
-                fn, patience_s, session_ids=session_ids, skip_result=skip_result, session_id=session_id, input_rows=input_rows)
+            return execute_prune_write(self, fn, patience_s,
+                session_ids=session_ids, skip_result=skip_result, session_id=session_id, input_rows=input_rows)
 
     def _execute_write_marked(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
@@ -1114,6 +1114,9 @@ class SessionDB(
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        from hermes_state_prune_budget import current_budget, prune_sql, write_patience
+        budget = current_budget()
+        patience_s, deadline = write_patience(patience_s, deadline)
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -1154,17 +1157,13 @@ class SessionDB(
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     conn = cast(sqlite3.Connection, self._conn)  # reopen succeeded under the writer guard
-                    conn.execute("BEGIN IMMEDIATE")
-                    fn_started = True
-                    result = settle_write_transaction(conn, fn, clock=time, logger=logger,
-                        warn_s=self._WRITE_LOCK_WARN_S, acquire_s=time.monotonic() - acquisition_started,
-                        session_id=session_id, input_rows=input_rows)
-                # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
+                    with prune_sql(conn, write=True):
+                        conn.execute("BEGIN IMMEDIATE")
+                        fn_started = True
+                        result = settle_write_transaction(conn, fn, clock=time, logger=logger,
+                            warn_s=self._WRITE_LOCK_WARN_S, acquire_s=time.monotonic() - acquisition_started,
+                            session_id=session_id, input_rows=input_rows)
+                finish_write_maintenance(self, bounded=budget is not None)
                 return result
             except SessionCompressionInProgressError as exc:
                 raise_if_nonretryable_contention(exc)
@@ -1260,8 +1259,10 @@ class SessionDB(
         """``fetchall()`` of one read-only statement via ``_read_ctx``."""
         return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchall())
 
-    def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T], *, read_context=None) -> T:
         """Run an idempotent SELECT through ``_read_ctx``, retrying a transient SQLITE_IOERR.
+
+        ``read_context`` selects an independent snapshot reader when writer fallback is deferred.
 
         A warm ``mode=ro`` pooled reader can hit the same millisecond-wide WAL transition window as a
         read-only OPEN (#100436) when its statement executes or steps: a sibling process's checkpoint /
@@ -1272,9 +1273,10 @@ class SessionDB(
         never quarantined (busy is not broken). A persistent IOERR exhausts the budget and propagates."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
-                with self._read_ctx() as conn:
+                with (read_context or self._read_ctx)() as conn:
                     from hermes_state_search_runtime import search_stage
-                    with search_stage(self, "sql_ms"):
+                    from hermes_state_prune_budget import prune_sql
+                    with search_stage(self, "sql_ms"), prune_sql(conn):
                         return fn(conn)
             except sqlite3.OperationalError as exc:
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
@@ -1672,7 +1674,7 @@ class SessionDB(
         ``self._lock`` so it pairs with the WAL lock guard exactly like a writer reopen."""
         if self._checkpoint_conn is not None and self._checkpoint_conn_writer is self._conn:
             return self._checkpoint_conn
-        with self._lock:
+        with state_lock(self._lock, db_path=self.db_path):
             if self._conn is None or self.read_only:
                 return None
             stale, self._checkpoint_conn = self._checkpoint_conn, None

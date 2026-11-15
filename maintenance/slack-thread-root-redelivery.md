@@ -29,3 +29,5 @@ Live verification requires a restarted gateway, a new reply in an existing Slack
 ## Retirement And Rollback
 
 Retire when a released upstream baseline satisfies the complete content-and-edit-evidence contract, including retained-marker and cold-cache cases. Roll back the adapter wiring, normalization sibling, and regression changes together. No state migration or cleanup is needed.
+
+Contract tests: `tests/gateway/test_slack_unfurl_duplicate_turn.py`, `tests/gateway/test_slack.py`.

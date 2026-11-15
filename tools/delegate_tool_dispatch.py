@@ -478,6 +478,15 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
     def _cancel_queued(reason: str = "Queued delegation cancelled"):
         _cleanup_unit(unit, reason, {"status": "interrupted", "exit_reason": "interrupted"})
 
+    from agent.shared_primary_cooldown import route_from_agent
+    route_chain = [route_from_agent(child) for child in child_agents]
+    if child_agents:
+        for entry in list(getattr(child_agents[0], "_fallback_chain", []) or []):
+            if not isinstance(entry, dict):
+                continue
+            route_chain.append((str(entry.get("provider") or "").strip().lower(),
+                                str(entry.get("base_url") or ""), str(entry.get("model") or "").strip()))
+
     return dispatch_async_delegation_batch(
         # Call-wide goals: completion formatting indexes them by task_index.
         goals=[t["goal"] for t in unit.task_list], context=effective_context,
@@ -493,6 +502,7 @@ def _dispatch_unit(unit: _Batch, unit_id: Optional[str], slot_key: Optional[str]
         task_transcripts={str(i): str(unit.live_writers[i].path) for i, _, _ in unit.children
                           if i < len(unit.live_writers) and unit.live_writers[i] is not None
                           and unit.live_writers[i].path is not None},
+        route_chain=route_chain,
         progress_fn=lambda: _batch_progress_token(child_agents), **routing,
     )
 

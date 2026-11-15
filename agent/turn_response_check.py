@@ -202,6 +202,8 @@ def check_api_response(
         _preflight_compression_blocked = False
         _last_preflight_pressure = None
 
+    from agent.fallback_cooldown import clear_noninteractive_transient_retry
+    clear_noninteractive_transient_retry(agent)
     _retry.has_retried_429 = False
     # Clearing Nous rate-limit state proves the limit reset so other sessions may resume.
     if agent.provider == "nous":

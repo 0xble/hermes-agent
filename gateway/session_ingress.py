@@ -496,6 +496,8 @@ async def execute_admission(authority, ref, row):
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
             response = await _handle_compression_deferred_admission(authority, ref, row, event, captured)
             result = captured.get('terminal_result', captured.get('result'))
+            from gateway.session_automation_retry import defer_claimed_refusal
+            await defer_claimed_refusal(authority, row, result)
             if result is None:
                 # No TurnRunner result means the handler answered without executing the turn.
                 # A turn that never ran because it failed (agent initialization raised, history

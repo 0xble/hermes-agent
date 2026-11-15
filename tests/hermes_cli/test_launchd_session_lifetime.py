@@ -34,7 +34,10 @@ def test_explicit_domain_survives_definition_refresh(tmp_path, monkeypatch, mode
     domain = f"{mode}/{gateway_launchd.os.getuid()}"
     guardian = plistlib.loads(gateway_guardian.guardian_plist(home, path, "ai.hermes.gateway", domain=domain))
     assert guardian["LimitLoadToSessionType"] == session
-    assert guardian["ProgramArguments"][0] == str(home / "current/.venv/bin/python")
+    # Like the gateway, the guardian launches through the fixed osascript wrapper, which runs the
+    # release interpreter as its child.
+    assert guardian["ProgramArguments"][0] == "/usr/bin/osascript"
+    assert f"exec {home / 'current/.venv/bin/python'} -m hermes_cli.gateway_guardian run" in guardian["ProgramArguments"][-1]
     assert gateway_launchd.configured_launchd_domain() == domain
 
 

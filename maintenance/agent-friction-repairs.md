@@ -189,3 +189,5 @@ gives the terminal host-exit and missing-pytest failures equivalent no-retry and
 runner guidance, and makes execute_code file-tool error envelopes raise before
 user code can continue, with the proof surface passing without this fork
 implementation.
+
+Contract tests: `tests/agent/test_tool_guardrails.py`, `tests/agent/test_read_dedup_rewrite_boundaries.py`, `tests/tools/test_base_environment.py`, `tests/tools/test_terminal_hints.py`, `tests/agent/test_context_compressor.py`, `tests/agent/test_context_compressor_tail.py`, `tests/agent/test_ghost_skill_pruning.py`, `tests/tools/test_skill_view_dedup.py`, `tests/tools/test_code_kernel.py`, `tests/tools/test_code_execution_file_rpc.py`, `tests/agent/test_protected_tail_pressure.py`, `tests/tools/test_code_kernel_lifetime.py`, `tests/tools/test_code_kernel_remote.py`, `tests/tui_gateway/test_session_finalize_reaps_kernels.py`, `tests/tools/test_terminal_tool_heavy_slot.py`, `tests/tools/test_terminal_heavy_slot_handoff.py`, `tests/hermes_cli/test_plugins.py`, `tests/tools/test_sandbox_failure_hints.py`, `tests/tools/test_skills_tool.py`, `tests/tools/test_terminal_tool.py`, `tests/ci/test_prompt_surface.py`.

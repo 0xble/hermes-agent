@@ -91,7 +91,10 @@ _IDENTITY_LINE = re.compile(r"identit", re.IGNORECASE)
 # A unit pins the behavioural tests that prove its fork behaviour as backticked pytest targets on a
 # ``Contract tests:`` line (or its indented continuation): ``tests/x.py`` or ``tests/x.py::test_name``.
 _CONTRACT_LINE = re.compile(r"^[-*\s]*(?:\*\*)?Contract tests?:", re.IGNORECASE)
-_CONTRACT_TARGET = re.compile(r"^(?P<path>tests/[\w./-]+\.py)(?P<nodes>(?:::\w+)*)$")
+_CONTRACT_TARGET = re.compile(r"^(?P<path>(?:scripts/ci/)?tests/[\w./-]+\.py)(?P<nodes>(?:::\w+)*)$")
+# ``Contract tests: none`` plus a reason: the unit has no pytest proof by nature (retired, a
+# documentation or dependency pin, proof in another language). Stated, so it is not an oversight.
+_CONTRACT_NONE = re.compile(r"^[-*\s]*(?:\*\*)?Contract tests?:(?:\*\*)?\s*none\b\W*\w", re.IGNORECASE)
 MAINTENANCE_ROOT = "MAINTENANCE.md"
 MAINTENANCE_DIR = "maintenance"
 
@@ -155,7 +158,8 @@ def contract_tests(revision: str = "HEAD") -> dict[str, list[str]]:
     """Pinned behavioural tests by unit path, in declaration order."""
     pinned: dict[str, list[str]] = {}
     for name, text in _unit_files(revision):
-        lines = _line_blocks(text, lambda head: _CONTRACT_LINE.match(head) is not None)
+        lines = _line_blocks(text, lambda head: _CONTRACT_LINE.match(head) is not None
+                             and _CONTRACT_NONE.match(head) is None)
         targets = [t.strip() for line in lines for t in _OWNED_TOKEN.findall(line)]
         if targets:
             pinned[name] = list(dict.fromkeys(targets))
@@ -195,11 +199,20 @@ def check_contract_tests(revision: str = "HEAD", contract: str = "HEAD") -> list
 
 
 def uncovered_units(contract: str = "HEAD") -> list[str]:
-    """Units that own a patch identity but pin no contract test: behaviour a sync can drop unseen."""
+    """Units that own a patch identity but neither pin a contract test nor state why none applies:
+    behaviour a sync can drop unseen."""
     pinned = contract_tests(contract)
     return [name for name, text in _unit_files(contract)
-            if name not in pinned and any(_OWNED_TOKEN.findall(line) for line in
-                                          _line_blocks(text, lambda head: _IDENTITY_LINE.search(head) is not None))]
+            if name not in pinned
+            and not any(_CONTRACT_NONE.match(line) for line in text.splitlines())
+            and any(_OWNED_TOKEN.findall(line) for line in
+                    _line_blocks(text, lambda head: _IDENTITY_LINE.search(head) is not None))]
+
+
+def check_units_are_covered(contract: str = "HEAD") -> list[str]:
+    return [f"{unit} owns a fork patch identity but pins no contract test; add a `Contract tests:` "
+            "line naming its pytest proof, or `Contract tests: none` with the reason"
+            for unit in uncovered_units(contract)]
 
 
 def _owned_identities(revision: str = "HEAD") -> set[str] | None:
@@ -582,6 +595,10 @@ def main(argv: list[str] | None = None) -> int:
         args.baseline, args.trailer_floor, floor_subject, revision=revision, contract=contract)
     if not pointer_failure:
         failures += check_contract_tests(revision, contract)
+        if args.source_only:
+            # An authoring rule for the tree being changed. A release that shipped before the
+            # rule existed (a rollback target) is not judged by it after the fact.
+            failures += check_units_are_covered(contract)
     if not args.source_only:
         failures += check_extensions(args.home)
         if not args.skip_config:

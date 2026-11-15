@@ -21,3 +21,5 @@ Run `scripts/run_tests.sh tests/plugins/platforms/slack/test_outbound_budget.py 
 ## Retirement And Rollback
 
 Retire when upstream supplies equivalent recovery and presentation coverage. Revert the patch commit, its matching tests, index row and register entry to roll back. No stored state, schema or configuration migration.
+
+Contract tests: `tests/plugins/platforms/slack/test_outbound_budget.py`, `tests/gateway/test_slack_task_card_recovery.py`, `tests/gateway/test_decline_fallback_suppression.py`, `tests/gateway/test_run_progress_topics.py`, `tests/gateway/test_task_card_destination_preflight.py`, `tests/gateway/test_slack_native_streaming.py`, `tests/gateway/test_stream_final_contract.py`.

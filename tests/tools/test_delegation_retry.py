@@ -26,7 +26,7 @@ def _ledger(tmp_path, monkeypatch):
 T0 = 1_800_000_000.0
 
 
-def _dispatch(delegation_id, *, goal="build the model", dispatched_at=None, goals=None, lineage=None, context="ctx"):
+def _dispatch(delegation_id, *, goal="build the model", dispatched_at=None, goals=None, lineage=None, context="ctx", route_chain=None):
     record = {
         "delegation_id": delegation_id, "goal": goal, "goals": goals or [goal], "is_batch": True,
         "context": context, "toolsets": None, "role": "leaf", "model": "m",
@@ -34,6 +34,7 @@ def _dispatch(delegation_id, *, goal="build the model", dispatched_at=None, goal
         "origin_session_id": "", "parent_session_id": "sess-owner",
         "dispatched_at": dispatched_at or T0,
         "task_transcripts": {"0": f"/live/{delegation_id}/task-0.log"},
+        **({"route_chain": route_chain} if route_chain else {}),
     }
     ad._persist_dispatch(record)
     if lineage:

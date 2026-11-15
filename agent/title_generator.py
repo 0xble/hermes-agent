@@ -40,9 +40,9 @@ def wait_for_title_upgrades(timeout: float = 10.0) -> None:
 
 # (task_name, exception) -> None; surfaces auxiliary failures so silent drops don't pile up as NULL titles.
 FailureCallback = Callable[[str, BaseException], None]
-# (title, source[, display_title=...]) -> None. ``title`` is the persisted
-# alias; ``display_title`` is the unsuffixed label for transports such as
-# Telegram that keep visible topic names separate from session aliases.
+# (title, source[, display_title=...]) -> None. ``title`` and ``display_title``
+# carry the persisted alias so automatic callbacks cannot render duplicate
+# unsuffixed labels after a collision race.
 TitleCallback = Callable[..., None]
 # () -> bool, called right before the LLM request; False skips (e.g. the user switched models and
 # the request would reload one the runtime already evicted).
@@ -1152,6 +1152,18 @@ def auto_title_session(
         rejected = title == "" or bool(title and is_junk_title(title)) or duplicate
         terminal_fallback = rejected and hold_until_reply and user_turns >= 3
         if rejected and hold_until_reply and not terminal_fallback:
+            if duplicate and title:
+                # The advisory collision read cannot classify a reclaimable holder.
+                # Let the atomic write decide before holding the candidate.
+                persisted = _persist_session_title(
+                    session_db, session_id, title, source="llm", reject_collision=True,
+                )
+                if persisted is not None:
+                    _notify_title(
+                        title_callback, persisted, "llm", "Auto-title", display_title=persisted,
+                        icon=(chosen_icon[0] if chosen_icon else None),
+                    )
+                    return
             logger.debug("Auto-title held: unsupported or duplicate subject")
             return
         if duplicate or terminal_fallback:

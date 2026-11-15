@@ -437,6 +437,7 @@ def emit_session_deleted(db, deleted_ids, *, reason, primary=None, sessions_dir=
         return
     try:
         from hermes_cli.lifecycle import invoke_hook
+        from hermes_state_prune_budget import current_budget, without_prune_budget
         from hermes_constants import (
             get_hermes_home, profile_name_for_home, reset_hermes_home_override, set_hermes_home_override,
         )
@@ -451,7 +452,8 @@ def emit_session_deleted(db, deleted_ids, *, reason, primary=None, sessions_dir=
         rebind = profile is not None and os.path.realpath(home) != os.path.realpath(get_hermes_home())
         token = set_hermes_home_override(home) if rebind else None
         try:
-            invoke_hook("on_session_delete", **payload)
+            with without_prune_budget() if current_budget() is not None else contextlib.nullcontext():
+                invoke_hook("on_session_delete", **payload)
         finally:
             if token is not None:
                 reset_hermes_home_override(token)

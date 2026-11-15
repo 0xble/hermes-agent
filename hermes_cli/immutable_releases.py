@@ -494,7 +494,39 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
     return missing
 
 
-def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) -> None:
+_SMOKE_RUNNING_VERSION_ENV = "HERMES_PLUGIN_SMOKE_RUNNING_VERSION"
+_SMOKE_CANDIDATE_VERSION_ENV = "HERMES_PLUGIN_SMOKE_CANDIDATE_VERSION"
+
+
+def _version_regression(manifest) -> str | None:
+    """Why the candidate would stop loading a plugin the running release loads, else None.
+
+    The loader skips a plugin whose ``requires_hermes`` rejects the running version, so an import
+    probe alone passes a candidate that then boots without it (a mis-stamped v0.23.1 dropped
+    delegation this way). A plugin the running release already rejects is not this update's doing.
+    The candidate's version is the one staging stamped, the identity the release will boot with.
+    """
+    from hermes_cli.plugins_manifest import version_satisfies
+    spec = getattr(manifest, "requires_hermes", "") or ""
+    candidate = os.environ.get(_SMOKE_CANDIDATE_VERSION_ENV, "")
+    running = os.environ.get(_SMOKE_RUNNING_VERSION_ENV, "")
+    if not spec or not candidate or not running or version_satisfies(spec, candidate):
+        return None
+    return f"requires hermes {spec}, candidate {candidate}" if version_satisfies(spec, running) else None
+
+
+def _stamped_base_version(release: Path) -> str:
+    """The base version staging stamped into *release*, or "" when it has none."""
+    from pm.paths import install_stamp_path
+    try:
+        value = json.loads(install_stamp_path(release).read_text(encoding="utf-8-sig")).get("baseVersion")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return value if isinstance(value, str) and value != "unknown" else ""
+
+
+def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None,
+                  candidate_version: str | None = None) -> None:
     """Load enabled plugins with the interpreter the candidate will boot, before promotion.
 
     That is its committed PM generation when one exists (a carry commits one), else `.venv`.
@@ -517,6 +549,14 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
         env = _release_subprocess_env(release)
         env.update({"HERMES_HOME": str(isolated), "PYTHONDONTWRITEBYTECODE": "1"})
         env.pop("HERMES_ENABLE_PROJECT_PLUGINS", None)
+        from hermes_cli.version_info import get_version_info
+        running = get_version_info().base_version
+        candidate = _stamped_base_version(release) if candidate_version is None else candidate_version
+        env.pop(_SMOKE_RUNNING_VERSION_ENV, None)
+        env.pop(_SMOKE_CANDIDATE_VERSION_ENV, None)
+        if running != "unknown" and candidate:
+            env[_SMOKE_RUNNING_VERSION_ENV] = running
+            env[_SMOKE_CANDIDATE_VERSION_ENV] = candidate
         result = subprocess.run(
             [str(python), "-m", "hermes_cli.immutable_releases", "--smoke-imports"],
             cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
@@ -573,6 +613,9 @@ def _smoke_imports() -> None:
             continue
         if gate.action not in {"load", "load_now"}:
             continue
+        regression = _version_regression(manifest)
+        if regression:
+            raise RuntimeError(f"enabled plugin {manifest.name}: {regression}")
         if manifest.source == "entrypoint":
             manager._load_entrypoint_module(manifest)
         else:
@@ -581,6 +624,42 @@ def _smoke_imports() -> None:
 
 if __name__ == "__main__" and "--smoke-imports" in sys.argv:
     _smoke_imports()
+
+
+def smoke_schemas(release: Path, home: Path) -> None:
+    """Refuse a candidate whose SQLite migrations never settle on this profile's schemas.
+
+    Runs ``hermes_cli.schema_smoke`` in the candidate's interpreter against schema-only copies in
+    a disposable home, so the installed databases are only read. A probe that cannot run is
+    printed and skipped; only a schema still changing on its second open fails staging.
+    """
+    if not (release / "hermes_cli" / "schema_smoke.py").is_file():
+        return  # a release from before the probe existed (a rollback target) has nothing to run
+    from pm.environments import project_python
+    python = project_python(release)
+    with tempfile.TemporaryDirectory(prefix="hermes-schema-smoke-") as sandbox:
+        env = _release_subprocess_env(release)
+        env.update({"HERMES_HOME": sandbox, "PYTHONDONTWRITEBYTECODE": "1"})
+        try:
+            result = subprocess.run(
+                [str(python), "-m", "hermes_cli.schema_smoke", "--source-home", str(home)],
+                cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                timeout=180, check=False)
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"  ⚠ schema smoke skipped: {type(exc).__name__}: {exc}")
+            return
+    notes = [line for line in (result.stderr or "").splitlines() if line.startswith("schema smoke skipped")]
+    for line in notes:
+        print(f"  ⚠ {line}")
+    from hermes_cli.schema_smoke import _NOT_CONVERGED
+    if result.returncode not in (0, _NOT_CONVERGED):
+        # The probe itself died: that proves nothing about the candidate's migrations.
+        print(f"  ⚠ schema smoke skipped: probe exited {result.returncode}")
+        return
+    if result.returncode:
+        detail = "; ".join(line for line in (result.stderr or result.stdout).splitlines()
+                           if line.strip() and line not in notes) or f"exit {result.returncode}"
+        raise RuntimeError(f"candidate schema smoke failed: {detail}")
 
 
 def _publish_release(staging: Path, target: Path) -> None:
@@ -662,6 +741,7 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
     if _release_is_ready(target, sha):
         carry_active_extras(target, read_pointer(paths.current))
         smoke_plugins(target, paths.home, plugin_dir=plugin_dir)
+        smoke_schemas(target, paths.home)
         return target, "existing"
     if target.exists() or target.is_symlink():
         raise RuntimeError(f"release {target} already exists but is incomplete; refusing to replace a potentially pinned release")
@@ -698,6 +778,7 @@ def stage_release(source: Path, home: Path, *, sha: str | None = None,
         (staging / "install-stamp.json").write_text(json.dumps(stamp) + "\n", encoding="utf-8")
         (staging / ".hermes_build_sha").write_text(sha + "\n", encoding="utf-8")
         smoke_plugins(staging, paths.home, plugin_dir=plugin_dir)
+        smoke_schemas(staging, paths.home)
         _relocate_venv(staging, target)
         (staging / ".release-ready").write_text(sha + "\n", encoding="utf-8")
         if target.exists() or target.is_symlink():

@@ -176,17 +176,9 @@ TOOLSET_REQUIREMENTS: dict[str, dict] = registry.get_toolset_requirements()
 _last_resolved_tool_names: list[str] = []
 
 
-# Legacy toolset names (old _tools-suffixed names -> tool name lists)
-_LEGACY_TOOLSET_MAP = {
-    "web_tools": ["web_search", "web_extract"],
-    "terminal_tools": ["terminal"],
-    "vision_tools": ["vision_analyze"],
-    "image_tools": ["image_generate"],
-    "skills_tools": ["skills_list", "skill_view", "skill_manage"],
-    "cronjob_tools": ["cronjob_manage"],
-    "file_tools": ["read_file", "write_file", "patch", "search_files"],
-    "tts_tools": ["text_to_speech"],
-}
+# Legacy toolset names (old _tools-suffixed names -> tool name lists) live in toolset_compat so
+# cron diagnostics can share them without importing this module.
+from toolset_compat import _LEGACY_TOOLSET_MAP  # noqa: E402
 
 
 # --- get_tool_definitions (the main schema provider) --------------------------

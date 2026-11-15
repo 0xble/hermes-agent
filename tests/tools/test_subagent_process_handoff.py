@@ -66,6 +66,7 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
     child = _Child(parent)
     _register(sid, child)
     try:
+        # Process lifetime follows the handoff, not the host's scheduling speed.
         release_handed = tmp_path / "handed"
         handed = _spawn_blocked(release_handed, sid, "echo ci-green")
         handed.notify_on_complete = True
@@ -73,6 +74,7 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
 
         out = json.loads(_handle_process(
             {"action": "handoff", "session_id": handed.id, "data": "CI watcher for PR 1"}, task_id=sid))
+        assert not out.get("error"), out
         assert out["status"] == "handed_off"
         assert handed.owner_task_id == "parent-turn-1" and handed.session_key == "sess-handoff"
         assert child._handed_off_processes[0]["session_id"] == handed.id
@@ -84,6 +86,7 @@ def test_handed_off_process_completion_reaches_parent_and_leftover_is_reported(c
         release_handed.touch()
         assert handed._completion_event.wait(10)
         assert handed.exited
+        assert handed.exit_code == 0 and "ci-green" in handed.output_buffer
         # The parent drains with the default suppression of sa- owners: the handed-off completion passes it.
         events = process_registry.drain_notifications(owns_event=lambda e: True)
         mine = [(e, text) for e, text in events if e.get("session_id") == handed.id]

@@ -22,6 +22,28 @@ SECRET_STORES = (
 WRITABLE_CONTROL_FILES = ("auth.json", "config.yaml", "webhook_subscriptions.json")
 
 
+@pytest.fixture(autouse=True)
+def scratch_account_home(tmp_path, monkeypatch):
+    """No credential fixture or home lookup may use the operator's account."""
+    import hermes_constants
+
+    home = tmp_path / "account"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
+    monkeypatch.setattr(hermes_constants, "get_real_home", lambda: home)
+    monkeypatch.setattr(hermes_constants, "get_subprocess_home", lambda: home)
+    monkeypatch.setattr(hermes_constants, "_profile_home_path", lambda: home)
+    if os.name == "posix":
+        import pwd
+
+        account = pwd.struct_passwd(("scratch", "x", os.getuid(), os.getgid(), "", str(home), "/bin/sh"))
+        monkeypatch.setattr(pwd, "getpwuid", lambda uid: account)
+        getpwnam = pwd.getpwnam
+        monkeypatch.setattr(pwd, "getpwnam", lambda name: account if name == "root" else getpwnam(name))
+    return home
+
+
 @pytest.fixture()
 def hermes_layout(tmp_path, monkeypatch):
     """Profile HERMES_HOME plus a distinct global root, both patched."""
@@ -58,13 +80,83 @@ def test_control_files_and_lookalikes_outside_home_stay_writable(hermes_layout, 
     assert fs.is_write_denied(str(_touch(tmp_path / "myproject", "vault/vault.key"))) is False
 
 
+@pytest.mark.parametrize("layout", ["ordinary", "leaf", "parent", "nested-parent", "into-credential"])
+def test_credential_symlinks_are_write_denied(scratch_account_home, tmp_path, layout):
+    home = scratch_account_home
+    credential = home / ".config" / "gh" / "hosts.yml"
+    if layout == "parent":
+        outside = tmp_path / "outside-gh"
+        outside.mkdir()
+        credential.parent.parent.mkdir(parents=True)
+        credential.parent.symlink_to(outside, target_is_directory=True)
+    else:
+        credential.parent.mkdir(parents=True)
+    if layout == "leaf":
+        credential.symlink_to(_touch(tmp_path / "outside", "hosts.yml"))
+    elif layout == "nested-parent":
+        outside = tmp_path / "outside-gh"
+        outside.mkdir()
+        (credential.parent / "nested").symlink_to(outside, target_is_directory=True)
+        credential = credential.parent / "nested" / "hosts.yml"
+        credential.write_text("dummy", encoding="utf-8")
+    else:
+        credential.write_text("dummy", encoding="utf-8")
+    if layout == "into-credential":
+        alias = tmp_path / "unrelated.yml"
+        alias.symlink_to(credential)
+        credential = alias
+
+    assert fs.is_write_denied(str(credential)), layout
+    error = fs.get_write_denied_error(str(credential))
+    assert error and "credential" in error
+    assert credential.read_text(encoding="utf-8") == "dummy"
+
+
+@pytest.mark.parametrize("safe_root", [False, True])
+def test_unrelated_symlink_remains_writable(tmp_path, monkeypatch, safe_root):
+    target = _touch(tmp_path / "allowed", "notes.txt")
+    alias = tmp_path / "notes-link.txt"
+    alias.symlink_to(target)
+    if safe_root:
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(target.parent))
+    assert fs.is_write_denied(str(alias)) is False
+    assert fs.get_write_denied_error(str(alias)) is None
+
+
+@pytest.mark.parametrize("layout", ["leaf", "parent"])
+def test_ssh_config_symlink_stays_approval_gated(scratch_account_home, tmp_path, layout):
+    config = scratch_account_home / ".ssh" / "config"
+    outside = tmp_path / "ssh-config-outside"
+    if layout == "parent":
+        outside.mkdir()
+        config.parent.symlink_to(outside, target_is_directory=True)
+        config.write_text("dummy", encoding="utf-8")
+    else:
+        config.parent.mkdir()
+        config.symlink_to(_touch(tmp_path / "outside", "config"))
+    assert fs.is_write_denied(str(config)) is False
+    assert fs.is_write_approval_required(str(config)) is True
+
+
 class TestProfileHomeProcessHome:
     """With the process HOME pinned to ``{HERMES_HOME}/home`` (TERMINAL_HOME_MODE=profile,
     containers, spawned workers) the write guards must still cover every home a write can
     land in: the OS user's real home, the profile home and ``~name`` accounts."""
 
-    @pytest.fixture()
-    def profile_home_env(self, tmp_path, monkeypatch):
+    @pytest.fixture(params=["ordinary", "leaf", "parent"])
+    def profile_home_env(self, tmp_path, monkeypatch, scratch_account_home, request):
+        credential = scratch_account_home / ".config" / "gh" / "hosts.yml"
+        if request.param == "parent":
+            outside = tmp_path / "outside-gh"
+            outside.mkdir()
+            credential.parent.parent.mkdir(parents=True)
+            credential.parent.symlink_to(outside, target_is_directory=True)
+        else:
+            credential.parent.mkdir(parents=True)
+        if request.param == "leaf":
+            credential.symlink_to(_touch(tmp_path / "outside", "hosts.yml"))
+        else:
+            credential.write_text("dummy", encoding="utf-8")
         profile = tmp_path / "profile"
         (profile / "home").mkdir(parents=True)
         monkeypatch.setenv("HERMES_HOME", str(profile))

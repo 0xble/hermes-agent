@@ -21,6 +21,7 @@ import threading
 from hermes_dir_acl import make_user_dir
 
 from hermes_state_runtime import ADMITTED_REQUEST_CONFLICT, RuntimeStoreError
+from hermes_state_prune_budget import check_prune_budget, prune_sql
 from utils import fsync_directory
 
 logger = logging.getLogger(__name__)
@@ -397,6 +398,7 @@ def _held_media_paths(conn):
             OR json_type(payload_json, '$.api_turn_v1.media') IS NOT NULL""").fetchall()
     held = set()
     for status, request_id, encoded, text in rows:
+        check_prune_budget()
         attachments, native, api = json.loads(encoded)
         # API images remain canonical history context after the turn completes.
         references = list(api or ())
@@ -419,6 +421,7 @@ def _held_file_identities(paths, root):
     identities = set()
     try:
         for value in paths:
+            check_prune_budget()
             path = Path(value)
             if path.parent.parent != root or path.parent.resolve() != path.parent:
                 return None
@@ -597,6 +600,7 @@ def _history_mentions(conn, references, after_id=0, *, sessions=None):
     # counts as a mention.
     needles = {}
     for reference in references:
+        check_prune_budget()
         raw = reference['path']
         for tail in (reference['sha256'] + sep + Path(raw).name for sep in ('/', '\\')):
             needles[tail] = needles[json.dumps(tail)[1:-1]] = raw
@@ -618,14 +622,20 @@ def _history_mentions(conn, references, after_id=0, *, sessions=None):
         params.append(after_id)
     mentioned = set()
     for (content,) in conn.execute(query, params):
+        check_prune_budget()
         text = content.decode('utf-8', 'replace') if isinstance(content, bytes) else str(content)
         mentioned.update(raw for needle, raw in needles.items() if needle in text)
     return mentioned
 
 
 def _collectable(references, root):
-    return [reference for reference in references if Path(reference['path']).parent.parent == root
-            and Path(reference['path']).parent.name == reference['sha256'] and Path(reference['path']).exists()]
+    collected = []
+    for reference in references:
+        check_prune_budget()
+        path = Path(reference['path'])
+        if path.parent.parent == root and path.parent.name == reference['sha256'] and path.exists():
+            collected.append(reference)
+    return collected
 
 
 def release_unheld_media(db, references, *, retain_history=True, admitted=False):
@@ -644,7 +654,7 @@ def release_unheld_media(db, references, *, retain_history=True, admitted=False)
         return 0
     seen, last_id = set(), 0
     if retain_history:
-        with db._read_ctx() as conn:
+        with db._read_ctx() as conn, prune_sql(conn):
             conn.execute('BEGIN')  # one snapshot: the id watermark and the scan agree
             try:
                 last_id = conn.execute('SELECT coalesce(max(id), 0) FROM messages').fetchone()[0]
@@ -665,6 +675,7 @@ def release_unheld_media(db, references, *, retain_history=True, admitted=False)
             held |= _history_mentions(conn, references, after_id=last_id)
         released = 0
         for reference in references:
+            check_prune_budget()
             path = Path(reference['path'])
             if reference['path'] in held:
                 continue
