@@ -988,3 +988,50 @@ def test_round4_runtime_resolution_repros_refuse(tmp_path, case, entry):
     assert result.returncode != 0, output
     assert "refusing" in output.lower(), output
     assert _snapshot(live) == before
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("kind", ["gateway-state", "release-pointer", "running-pid"])
+def test_crlf_record_for_live_home_still_refuses(tmp_path, kind):
+    """Native Windows CPython prints CRLF; a trailing '\\r' must not hide markers."""
+    home = tmp_path / "live-home"
+    _mark(home, kind)
+    try:
+        probe = _source(
+            ROOT / "scripts" / "_setup_guard.sh",
+            "source \"$1\"\n"
+            "if reason=\"$(hermes_guard_records_live_reason \"$2\")\"; then\n"
+            "  echo \"LIVE:$reason\"\n"
+            "else\n"
+            "  echo SCRATCH\n"
+            "fi\n",
+            # Command substitution strips the final LF but keeps each CR.
+            f"path\t{home}\r",
+            env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "pinned-home")},
+        )
+    finally:
+        _stop_sleep(home)
+    assert probe.returncode == 0, probe.stdout + probe.stderr
+    expected = {"gateway-state": "gateway_state.json", "release-pointer": "current release pointer",
+                "running-pid": "running gateway pid"}[kind]
+    assert probe.stdout.strip() == f"LIVE:{expected}", probe.stdout + probe.stderr
+
+
+def test_setup_guard_records_are_lf_under_crlf_stdout(tmp_path):
+    """The bridge emits LF records even where text stdout translates to CRLF."""
+    home = tmp_path / "home"
+    home.mkdir()
+    simulate_windows_stdout = (
+        "import io, runpy, sys\n"
+        "sys.stdout = io.TextIOWrapper(sys.stdout.buffer, newline='\\r\\n')\n"
+        "sys.argv = sys.argv[1:]\n"
+        "runpy.run_path(sys.argv[0], run_name='__main__')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-B", "-c", simulate_windows_stdout,
+         str(ROOT / "scripts" / "setup_guard.py"), "paths", str(home), str(tmp_path / "account")],
+        cwd=ROOT, capture_output=True, timeout=20, check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.count(b"\n") >= 2, result.stdout
+    assert b"\r" not in result.stdout, result.stdout

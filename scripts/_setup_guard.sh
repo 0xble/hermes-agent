@@ -103,6 +103,9 @@ hermes_resolve_path() {
 hermes_guard_records_live_reason() {
   local records="$1" kind candidate reason
   while IFS=$'\t' read -r kind candidate; do
+    # A CRLF record (native Windows text stdout) would leave '\r' on the path,
+    # so marker checks would inspect a nonexistent sibling and admit a live home.
+    candidate="${candidate%$'\r'}"
     case "$kind" in
       account) printf '%s\n' "under account default home"; return 0 ;;
       path)
