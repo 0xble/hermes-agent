@@ -211,6 +211,32 @@ def uncovered_units(contract: str = "HEAD") -> list[str]:
                     _line_blocks(text, lambda head: _IDENTITY_LINE.search(head) is not None))]
 
 
+_DROPPED_TARGET = re.compile(r"^`(?:scripts/ci/)?tests/[\w./-]+\.py")
+
+
+def check_contract_continuations(contract: str = "HEAD") -> list[str]:
+    """A test target written on an unindented line after a ``Contract tests:`` line is not part of
+    the block (an unindented line ends it), so the deletion guard silently omits that test."""
+    failures: list[str] = []
+    for name, text in _unit_files(contract):
+        in_block = False
+        for line in text.splitlines():
+            stripped = line.strip()
+            if not stripped:
+                in_block = False
+                continue
+            indented = line[:1] in (" ", "\t") and not stripped.startswith(("-", "*", "|", "#"))
+            if indented and in_block:
+                continue
+            if in_block and _DROPPED_TARGET.match(stripped):
+                failures.append(f"{name}: contract test line {stripped.split('`')[1]!r} continues a "
+                                "`Contract tests:` block without indentation, so it is not pinned; indent it")
+                continue
+            in_block = (_CONTRACT_LINE.match(stripped.split("`", 1)[0]) is not None
+                        and _CONTRACT_NONE.match(stripped) is None)
+    return failures
+
+
 def check_units_are_covered(contract: str = "HEAD") -> list[str]:
     return [f"{unit} owns a fork patch identity but pins no contract test; add a `Contract tests:` "
             "line naming its pytest proof, or `Contract tests: none` with the reason"
@@ -601,6 +627,7 @@ def main(argv: list[str] | None = None) -> int:
             # An authoring rule for the tree being changed. A release that shipped before the
             # rule existed (a rollback target) is not judged by it after the fact.
             failures += check_units_are_covered(contract)
+            failures += check_contract_continuations(contract)
     if not args.source_only:
         failures += check_extensions(args.home)
         if not args.skip_config:

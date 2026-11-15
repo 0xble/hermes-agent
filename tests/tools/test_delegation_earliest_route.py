@@ -139,7 +139,7 @@ def test_all_routes_ready_uses_minimal_backoff():
     _store((PRIMARY, now - 10))
     did = _failed_delegation("deleg_ready", now)
     plan = dr.schedule_retry(did, now=now)
-    assert plan["due_at"] == pytest.approx(now + dr.BASE_BACKOFF_S)
+    assert plan["due_at"] == pytest.approx(now + dr.BASE_BACKOFF_S, rel=0, abs=0.001)
 
 
 def test_no_store_data_falls_back_to_error_hint():

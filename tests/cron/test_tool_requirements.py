@@ -257,18 +257,27 @@ def test_cron_doctor_handles_null_config_sections(tmp_path, monkeypatch, capsys)
 
 def test_cron_doctor_config_read_does_not_create_config_backups(tmp_path, monkeypatch, capsys):
     from cron.jobs import create_job
+    from hermes_cli.config import get_config_path
+    from hermes_cli.config_backups import backups_dir
     from hermes_cli.cron import cron_doctor
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    (tmp_path / "config.yaml").write_text("agent:\n  disabled_toolsets: [terminal]\n")
+    config_path = get_config_path()
+    config_path.write_text("agent:\n  disabled_toolsets: [terminal]\n")
     create_job(
         prompt="Add it with `loops finding add`.", name="active-disabled-terminal",
         schedule="every 1h", enabled_toolsets=["terminal"], deliver="local",
     )
-    assert not (tmp_path / "config").exists()
+    backups = backups_dir(config_path)
+    assert backups.is_relative_to(tmp_path)
+
+    def snapshot():
+        return sorted(path.name for path in backups.iterdir()) if backups.exists() else None
+
+    before = snapshot()
     assert cron_doctor() == 1
     assert "terminal access" in capsys.readouterr().out
-    assert not (tmp_path / "config").exists()
+    assert snapshot() == before
 
 
 def test_attached_non_utf8_skill_does_not_abort_diagnostics(tmp_path, monkeypatch):

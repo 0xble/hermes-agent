@@ -6,7 +6,8 @@ Contract tests: `tests/agent/test_fallback_endpoint_domain.py`.
 
 ## Preserve
 
-- Resolve fallback endpoint identities offline, without credential reads or client activation.
+- Resolve fallback endpoint identities offline, without credential reads or client activation,
+  from every endpoint spelling runtime resolution accepts (`api`, `url`, `base_url`, `baseUrl`).
 - A proven connect refusal, DNS error, unreachable network/host, or connect timeout excludes
   aliases sharing that socket for this turn. Read timeouts, 429, auth and model errors do not.
 - Walk the configured chain monotonically. Explicit endpoint overrides and different ports
@@ -14,7 +15,9 @@ Contract tests: `tests/agent/test_fallback_endpoint_domain.py`.
 - Keep the normal rebuilt-message restart cap. At the cap, allow at most one bounded request
   on an unvisited independent domain after a proven connection failure. Keep that allowance
   through response validation; invalid 200s, streaming retries, Responses reconnects and
-  same-attempt transport repairs cannot turn it into another request/retry loop.
+  same-attempt transport repairs cannot turn it into another request/retry loop. A validated
+  response spends the allowance: the route's tool continuations are normal requests, and no second
+  allowance is granted that turn.
 - Reset domain failures and attempted-route evidence for the next turn. Attempt summaries
   name requested routes, not aliases merely activated, skipped, or configured.
 - Distinguish switch-limit termination from actual route exhaustion.

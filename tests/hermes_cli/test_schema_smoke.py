@@ -86,6 +86,26 @@ def test_the_copy_carries_virtual_tables_and_the_version_row_but_no_data(tmp_pat
         assert conn.execute("SELECT count(*) FROM messages").fetchone() == (0,)
 
 
+def test_a_profile_path_with_uri_characters_is_read_in_place_and_read_only(tmp_path):
+    """``#`` and ``?`` are legal in a profile path but end a raw SQLite URI's filename: the probe then
+    read (or created) an unrelated prefix file and missed the real schema."""
+    home = tmp_path / "home#1?x"
+    home.mkdir()
+    source, target = home / "state.db", tmp_path / "copy" / "state.db"
+    with sqlite3.connect(source) as conn:
+        conn.execute("CREATE TABLE schema_version (version INTEGER NOT NULL)")
+        conn.execute("INSERT INTO schema_version VALUES (7)")
+
+    schema_smoke.copy_schema(source, target)
+    cookie, objects = schema_smoke.snapshot(source)
+
+    assert [name for _type, name, _root, _sql in objects] == ["schema_version"]
+    assert cookie > 0
+    with sqlite3.connect(target) as conn:
+        assert conn.execute("SELECT version FROM schema_version").fetchall() == [(7,)]
+    assert not (tmp_path / "home").exists()  # the URI's truncated filename was never opened or created
+
+
 def test_the_module_entry_point_exits_nonzero_and_names_the_database(tmp_path):
     """The staging step runs this module in the candidate's interpreter; drive it the same way."""
     home, scratch_home = _installed_profile(tmp_path), tmp_path / "scratch"

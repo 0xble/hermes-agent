@@ -6,6 +6,7 @@ imports of the CLI, or bytecode writes: this must work before dependencies exist
 from __future__ import annotations
 
 from pathlib import Path
+import io
 import os
 import sys
 
@@ -49,6 +50,9 @@ def setup_paths(home: Path | None = None) -> list[Path]:
 
 
 def main() -> None:
+    # Shell reads these records; native Windows text stdout would emit CRLF.
+    if isinstance(sys.stdout, io.TextIOWrapper):
+        sys.stdout.reconfigure(newline="\n")
     mode, *args = sys.argv[1:]
     if mode == "resolve":
         print(Path(args[0]).resolve(strict=False))

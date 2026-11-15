@@ -86,4 +86,5 @@ heavy commands plus light read-only negatives.
 
 Retire when the host stops using `heavy-slot` or when Hermes gains a native concurrency limit for heavy terminal work. No stored-state migration is involved. Rollback reverts the commits carrying this identity.
 
-Contract tests: `tests/tools/test_terminal_tool_heavy_slot.py`, `tests/pm/test_environment_parallelism.py`, `tests/scripts/test_runner_parallelism.py`.
+Contract tests: `tests/tools/test_terminal_tool_heavy_slot.py`, `tests/pm/test_environment_parallelism.py`, `tests/scripts/test_runner_parallelism.py`,
+  `tests/cron/test_lifecycle_guard_heavy_slot_urgency.py`.

@@ -315,14 +315,19 @@ async def _release_turn_marker(authority, event):
         await authority.runner._clear_durable_active_turn(event)
 
 
-def pause_notice(authority, ref, reason):
+def pause_notice(authority, ref, reason, *, told=True):
     """The committed input stays queued behind a paused FIFO (a turn lost across an owner
     restart, or a head the preflight refused). Tell the platform user once per pause episode
-    through the ordinary reply path; later messages onto the same pause are admitted silently."""
+    through the ordinary reply path; later messages onto the same pause are admitted silently.
+    ``told``: the reply carries it, so a lost turn's episode is recorded as told for later boots
+    (``session_pause_announce``); the unprompted announcement records only a send that succeeded."""
     live = authority.sessions[ref.session_id]
     if live.pause_notified:
         return None
     live.pause_notified = True
+    if told and reason == 'unknown_execution':
+        from gateway.session_pause_announce import schedule_remember_told
+        schedule_remember_told(authority, ref)
     if reason == 'runtime_draining':
         # Transient: the row runs when the restarted owner drains it, so /reset would be wrong advice.
         return '⏳ Hermes is restarting — your message is saved and will be answered when it is back.'
@@ -497,7 +502,7 @@ async def execute_admission(authority, ref, row):
             response = await _handle_compression_deferred_admission(authority, ref, row, event, captured)
             result = captured.get('terminal_result', captured.get('result'))
             from gateway.session_automation_retry import defer_claimed_refusal
-            await defer_claimed_refusal(authority, row, result)
+            await defer_claimed_refusal(authority, ref, row, result)
             if result is None:
                 # No TurnRunner result means the handler answered without executing the turn.
                 # A turn that never ran because it failed (agent initialization raised, history

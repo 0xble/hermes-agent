@@ -361,6 +361,25 @@ def test_a_unit_must_pin_proof_or_say_why_it_has_none(tmp_path, monkeypatch):
     assert len(checker.check_units_are_covered()) == 1
 
 
+def test_an_unindented_contract_continuation_is_reported_not_silently_dropped(tmp_path, monkeypatch):
+    """An unindented line ends the block, so a target written there is never pinned: deleting that
+    test would pass the guard. The authoring check names it; an indented continuation passes."""
+    _units(tmp_path, "fixture", prose=(
+        "Contract tests: `tests/test_a.py`,\n"
+        "`tests/test_b.py::test_b`.\n"
+        "\n"
+        "Prose naming `tests/test_c.py` after a blank line is not a continuation.\n"
+    ))
+    checker = _checker(tmp_path, monkeypatch)
+    assert checker.contract_tests() == {"maintenance/unit.md": ["tests/test_a.py"]}
+    failures = checker.check_contract_continuations()
+    assert len(failures) == 1 and "'tests/test_b.py::test_b'" in failures[0] and "indent it" in failures[0]
+
+    _units(tmp_path, "fixture", prose="Contract tests: `tests/test_a.py`,\n  `tests/test_b.py::test_b`.\n")
+    assert checker.check_contract_continuations() == []
+    assert checker.contract_tests() == {"maintenance/unit.md": ["tests/test_a.py", "tests/test_b.py::test_b"]}
+
+
 def test_ci_harness_tests_can_be_pinned(tmp_path, monkeypatch):
     _units(tmp_path, "fixture", prose="\nContract tests: `scripts/ci/tests/test_portable.py::test_gate`\n")
     harness = tmp_path / "scripts" / "ci" / "tests"

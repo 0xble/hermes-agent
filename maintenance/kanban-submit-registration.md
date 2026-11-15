@@ -9,8 +9,9 @@ Contract tests: `tests/hermes_cli/test_kanban_submitter_registration.py`.
 A dispatcher submitter keeps the base registration-before-admission contract. This
 hardening makes registration fail closed when `HERMES_KANBAN_DB` is missing or
 unreadable, before SQLite can create or open an unintended path. SQLite errors from
-that registration block are reported as owner refusals. Owner startup and admission
-errors retain their traceback.
+that registration block are reported as owner refusals. SQLite errors from owner startup
+and admission retain their traceback; `KeyError`, `ValueError` and `OSError` there are still
+printed as an owner refusal without one.
 
 ## Diagnosis
 

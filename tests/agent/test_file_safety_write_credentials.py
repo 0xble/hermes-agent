@@ -9,6 +9,7 @@ drifted: ``auth/google_oauth.json``, the plaintext Bitwarden cache, ``vault/`` a
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 
@@ -20,6 +21,13 @@ SECRET_STORES = (
     "auth/google_oauth.json", "cache/bws_cache.json", "vault/vault.key", "browser-profile/Default/Cookies",
 )
 WRITABLE_CONTROL_FILES = ("auth.json", "config.yaml", "webhook_subscriptions.json")
+CREDENTIAL_LAYOUTS = ("ordinary", "leaf", "parent", "nested-parent", "into-credential")
+_SYMLINKS = pytest.mark.require_symlinks
+
+
+def _layouts(*names):
+    """Every layout but ``ordinary`` creates a symlink, so it skips where links cannot exist."""
+    return [name if name == "ordinary" else pytest.param(name, marks=_SYMLINKS) for name in names]
 
 
 @pytest.fixture(autouse=True)
@@ -31,9 +39,8 @@ def scratch_account_home(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.delenv("HERMES_WRITE_SAFE_ROOT", raising=False)
-    monkeypatch.setattr(hermes_constants, "get_real_home", lambda: home)
-    monkeypatch.setattr(hermes_constants, "get_subprocess_home", lambda: home)
-    monkeypatch.setattr(hermes_constants, "_profile_home_path", lambda: home)
+    for lookup in ("get_real_home", "get_subprocess_home", "_profile_home_path"):
+        monkeypatch.setattr(hermes_constants, lookup, lambda *_args, **_kwargs: home)
     if os.name == "posix":
         import pwd
 
@@ -80,38 +87,98 @@ def test_control_files_and_lookalikes_outside_home_stay_writable(hermes_layout, 
     assert fs.is_write_denied(str(_touch(tmp_path / "myproject", "vault/vault.key"))) is False
 
 
-@pytest.mark.parametrize("layout", ["ordinary", "leaf", "parent", "nested-parent", "into-credential"])
-def test_credential_symlinks_are_write_denied(scratch_account_home, tmp_path, layout):
-    home = scratch_account_home
+def _credential_layout(home: Path, tmp_path: Path, layout: str) -> tuple[Path, Path]:
+    """``(path as the caller spells it, file the write would land in)`` for a gh credential."""
     credential = home / ".config" / "gh" / "hosts.yml"
     if layout == "parent":
         outside = tmp_path / "outside-gh"
         outside.mkdir()
         credential.parent.parent.mkdir(parents=True)
         credential.parent.symlink_to(outside, target_is_directory=True)
-    else:
-        credential.parent.mkdir(parents=True)
+        credential.write_text("dummy", encoding="utf-8")
+        return credential, outside / "hosts.yml"
+    credential.parent.mkdir(parents=True)
     if layout == "leaf":
-        credential.symlink_to(_touch(tmp_path / "outside", "hosts.yml"))
-    elif layout == "nested-parent":
+        target = _touch(tmp_path / "outside", "hosts.yml")
+        credential.symlink_to(target)
+        return credential, target
+    if layout in ("nested-parent", "nested-new"):
         outside = tmp_path / "outside-gh"
         outside.mkdir()
         (credential.parent / "nested").symlink_to(outside, target_is_directory=True)
-        credential = credential.parent / "nested" / "hosts.yml"
-        credential.write_text("dummy", encoding="utf-8")
-    else:
-        credential.write_text("dummy", encoding="utf-8")
+        if layout == "nested-parent":
+            _touch(outside, "hosts.yml")
+        return credential.parent / "nested" / "hosts.yml", outside / "hosts.yml"
+    credential.write_text("dummy", encoding="utf-8")
     if layout == "into-credential":
         alias = tmp_path / "unrelated.yml"
         alias.symlink_to(credential)
-        credential = alias
+        return alias, credential
+    return credential, credential
+
+
+@pytest.mark.parametrize("layout", _layouts(*CREDENTIAL_LAYOUTS))
+def test_credential_symlinks_are_write_denied(scratch_account_home, tmp_path, layout):
+    credential, target = _credential_layout(scratch_account_home, tmp_path, layout)
 
     assert fs.is_write_denied(str(credential)), layout
     error = fs.get_write_denied_error(str(credential))
     assert error and "credential" in error
-    assert credential.read_text(encoding="utf-8") == "dummy"
+    assert target.read_text(encoding="utf-8") == "dummy"
 
 
+def _v4a(op: str, path: Path, body: str = "") -> str:
+    return f"*** Begin Patch\n*** {op} File: {path}\n{body}*** End Patch"
+
+
+_TOOL_CALLS = {
+    "write_file": lambda path: _tools().write_file_tool(str(path), "PWNED\n"),
+    "patch": lambda path: _tools().patch_tool(path=str(path), old_string="dummy", new_string="PWNED"),
+    "patch-v4a-update": lambda path: _tools().patch_tool(
+        mode="patch", patch=_v4a("Update", path, "@@\n-dummy\n+PWNED\n")),
+    "patch-v4a-delete": lambda path: _tools().patch_tool(mode="patch", patch=_v4a("Delete", path)),
+}
+
+
+def _tools():
+    from tools import file_tools
+
+    return file_tools
+
+
+@pytest.mark.parametrize("tool", list(_TOOL_CALLS))
+@pytest.mark.parametrize("layout", _layouts(*CREDENTIAL_LAYOUTS, "nested-new"))
+def test_file_tools_refuse_credential_writes_through_symlinks(scratch_account_home, tmp_path, layout, tool):
+    """The real tool entry points resolve the path before the backend guard sees it, so the
+    credential spelling must be refused there too: the write never reaches the target."""
+    spelled, target = _credential_layout(scratch_account_home, tmp_path, layout)
+    existed = target.exists()
+
+    result = json.loads(_TOOL_CALLS[tool](spelled))
+
+    assert "credential" in (result.get("error") or ""), (layout, tool, result)
+    if existed:
+        assert target.read_text(encoding="utf-8") == "dummy"
+    else:
+        assert not target.exists()
+
+
+@_SYMLINKS
+def test_file_tools_still_write_through_unrelated_symlinks(tmp_path):
+    allowed = tmp_path / "allowed"
+    target = _touch(allowed, "notes.txt")
+    link = tmp_path / "links"
+    link.symlink_to(allowed, target_is_directory=True)
+
+    patched = json.loads(_TOOL_CALLS["patch"](link / "notes.txt"))
+    written = json.loads(_tools().write_file_tool(str(link / "new.txt"), "fresh\n"))
+
+    assert not patched.get("error") and not written.get("error"), (patched, written)
+    assert target.read_text(encoding="utf-8") == "PWNED"
+    assert (allowed / "new.txt").read_text(encoding="utf-8") == "fresh\n"
+
+
+@_SYMLINKS
 @pytest.mark.parametrize("safe_root", [False, True])
 def test_unrelated_symlink_remains_writable(tmp_path, monkeypatch, safe_root):
     target = _touch(tmp_path / "allowed", "notes.txt")
@@ -123,6 +190,7 @@ def test_unrelated_symlink_remains_writable(tmp_path, monkeypatch, safe_root):
     assert fs.get_write_denied_error(str(alias)) is None
 
 
+@_SYMLINKS
 @pytest.mark.parametrize("layout", ["leaf", "parent"])
 def test_ssh_config_symlink_stays_approval_gated(scratch_account_home, tmp_path, layout):
     config = scratch_account_home / ".ssh" / "config"
@@ -143,7 +211,7 @@ class TestProfileHomeProcessHome:
     containers, spawned workers) the write guards must still cover every home a write can
     land in: the OS user's real home, the profile home and ``~name`` accounts."""
 
-    @pytest.fixture(params=["ordinary", "leaf", "parent"])
+    @pytest.fixture(params=_layouts("ordinary", "leaf", "parent"))
     def profile_home_env(self, tmp_path, monkeypatch, scratch_account_home, request):
         credential = scratch_account_home / ".config" / "gh" / "hosts.yml"
         if request.param == "parent":

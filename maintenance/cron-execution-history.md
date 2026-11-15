@@ -35,23 +35,30 @@ are eligible. Incidents retain their own error and output-file evidence in
 `cron_incidents`, with no execution-ID reference requiring a ledger-row pin.
 
 Keep cleanup in the shared terminal-transition path. Each call deletes at most
-500 rows across age expiration and ceiling trimming combined, oldest first.
-SQL excludes each job's latest attempt before applying the candidate limit.
-Latest attempts of one-shot or removed jobs may remain protected forever, but
-cannot fill the candidate page and prevent cleanup of other jobs' history.
-The partial numeric-time index serves expiration, ordering, and bounded counting;
-the numeric per-job claim index serves latest-attempt exclusion without repeatedly
-sorting each job's history. Finding candidates may scan past any number of latest
-attempts; the limit bounds the remaining eligibility checks, not all SQLite work.
+500 rows across age expiration and ceiling trimming combined, oldest first
+within each policy's scan. SQL excludes each job's latest attempt before
+applying the candidate limit. Latest attempts of one-shot or removed jobs may
+remain protected forever, but cannot fill the candidate page and prevent cleanup
+of other jobs' history. The partial numeric-time index serves expiration and
+bounded counting; a second partial index of the same key also excludes rows with
+delivery obligations (queued outcome, pending or delivering status, provisional
+marker), so those rows cost no scan work and never enter the candidate page.
+The numeric per-job claim index serves latest-attempt exclusion without
+repeatedly sorting each job's history. Finding candidates may scan past any
+number of latest attempts; the limit bounds the remaining eligibility checks,
+not all SQLite work.
 
-Each policy checks at most four times its deletion budget for delivery state,
-current-transition IDs, and journal presence (2,000 candidates per pass, at most
-4,000 per terminal transition). These protections consume that bounded page and
-have no guaranteed expiry: failed delivery/recovery may leave them indefinitely.
-An entirely protected oldest page can therefore defer cleanup of eligible newer
-rows indefinitely. This intentionally bounds non-SQL work rather than promising
-unconditional ceiling convergence. Once the scanned page contains eligible rows,
-later terminal writes drain the backlog in bounded batches. Compute the cutoff in UTC before subtracting the duration,
+Admission journals are files, so SQL cannot exclude them. Each policy checks at
+most four times its deletion budget for current-transition IDs and journal
+presence (2,000 candidates per pass, at most 4,000 per terminal transition).
+These protections have no guaranteed expiry, so each policy keeps a scan cursor
+(`scan_after_jd`, `scan_after_id` on its `execution_prune_watermarks` row, outside
+the read contract). The next call seeks past the last examined candidate; when
+that range ends with page budget left, the same call wraps to the oldest rows up
+to the old cursor, so rows whose protection has since released are not delayed.
+A page of journal-protected rows therefore costs one bounded pass per call; it
+cannot permanently hide eligible newer rows.
+Compute the cutoff in UTC before subtracting the duration,
 and compare parsed instants so offset changes and DST do not move the window.
 The index is additive, preserving named-column reads/writes by older releases.
 
@@ -134,7 +141,8 @@ contract, with no new core tool, setting, telemetry or runtime activation.
 `tests/cron/test_execution_prune_safety.py` covers terminal durability under
 oversized retention, unknown model presets, and non-mapping cron config through
 all six terminal writers. Its protected-backlog cases bound SQLite VM work for
-delivery/journal pages and prove convergence after those protections release.
+delivery/journal pages and prove convergence after those protections release,
+and that a full page of older protected rows cannot starve newer eligible rows.
 Permanent singleton/latest backlogs cannot starve age or ceiling cleanup,
 including when the ceiling excess is only one row.
 

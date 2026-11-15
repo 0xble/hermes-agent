@@ -11,6 +11,11 @@ shared with the reply path, so a later message does not repeat it) through the c
 adapter. It sends only while a person's input waits (an unattended head with nothing human behind it
 pages nobody), never to a known bot, an app-only (LOCAL) session or a session with no deliverable
 origin, and never from an owner that is draining or no longer holds the store's epoch.
+
+The episode is the session's earliest ``unknown`` admission, and it outlives the process while
+``pause_notified`` does not. A notice that reached the chat (sent here, or carried by a reply) is
+recorded durably against that admission (``state_meta`` ``pause_notice:<admission_id>``), so a later
+boot does not repeat it, while a boot whose send failed leaves it for the next boot to retry.
 """
 from __future__ import annotations
 
@@ -18,6 +23,12 @@ import asyncio
 import logging
 
 logger = logging.getLogger(__name__)
+
+_TOLD = 'pause_notice:'
+# The key range of every marker: ';' sorts right after ':'.
+_TOLD_END = 'pause_notice;'
+_UNKNOWN_HEAD = ("SELECT admission_id FROM session_admissions WHERE target_session_id=? AND status='unknown' "
+                 'ORDER BY seq LIMIT 1')
 
 
 def schedule_pause_announcement(authority, ref, reason):
@@ -48,6 +59,50 @@ def _owns_store(authority) -> bool:
     return _stored_epoch(authority.db) == authority.epoch
 
 
+def _already_told(db, session_id) -> bool:
+    """This pause episode's notice already reached the chat, possibly from an earlier boot."""
+    with db._read_ctx() as conn:
+        head = conn.execute(_UNKNOWN_HEAD, (session_id,)).fetchone()
+        return head is not None and conn.execute(
+            'SELECT 1 FROM state_meta WHERE key=?', (_TOLD + head[0],)).fetchone() is not None
+
+
+def _record_told(authority, session_id) -> None:
+    """Mark the current episode told. Markers of earlier episodes, whose lost turn is no longer
+    unknown, are dropped in the same write, so at most one per paused session remains."""
+    from hermes_state_runtime import _epoch
+
+    def write(conn):
+        _epoch(conn, authority.epoch)
+        conn.execute('DELETE FROM state_meta WHERE key >= ? AND key < ? AND NOT EXISTS ('
+                     "SELECT 1 FROM session_admissions WHERE admission_id=substr(state_meta.key, ?) AND status='unknown')",
+                     (_TOLD, _TOLD_END, len(_TOLD) + 1))
+        head = conn.execute(_UNKNOWN_HEAD, (session_id,)).fetchone()
+        if head is not None:
+            conn.execute("INSERT OR REPLACE INTO state_meta(key,value) VALUES(?,'1')", (_TOLD + head[0],))
+    authority.db._execute_write(write, session_ids=(session_id,))
+
+
+async def remember_told(authority, ref) -> None:
+    """Durably record that the chat was told about this pause (off the loop, never raising: a
+    lost marker costs at most one repeated notice on a later boot)."""
+    from gateway.session_runtime_workers import tracked_write
+    try:
+        await tracked_write(authority, lambda: _record_told(authority, ref.session_id))
+    except Exception:
+        logger.warning('Pause notice for session %s was sent but not recorded', ref.session_id, exc_info=True)
+
+
+def schedule_remember_told(authority, ref):
+    """``remember_told`` from a synchronous reply path that has just claimed the notice."""
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return None
+    from gateway.session_runtime_workers import track_mutation
+    return track_mutation(authority, remember_told(authority, ref))
+
+
 async def announce_pause(authority, ref, reason) -> bool:
     """True when the notice was delivered to the chat."""
     from gateway.bot_peer_notices import automatic_notices_allowed
@@ -63,10 +118,16 @@ async def announce_pause(authority, ref, reason) -> bool:
             or getattr(source, 'platform', None) == Platform.LOCAL or not automatic_notices_allowed(source)):
         return False
 
-    def waiting():
-        return _owns_store(authority) and _person_waiting(
-            list_session_admissions(authority.db, session_id=ref.session_id))
-    if not await asyncio.to_thread(waiting):
+    def due():
+        """None: nobody to tell. False: an earlier notice for this episode already reached the chat."""
+        if not (_owns_store(authority) and _person_waiting(
+                list_session_admissions(authority.db, session_id=ref.session_id))):
+            return None
+        return not _already_told(authority.db, ref.session_id)
+    verdict = await asyncio.to_thread(due)
+    if not verdict:
+        if verdict is False and authority.sessions.get(ref.session_id) is live:
+            live.pause_notified = True  # the reply path must not repeat it either
         return False
     deliver = getattr(runner, '_delivery_adapter_for', None)
     adapter = deliver(source) if deliver is not None else None
@@ -74,7 +135,7 @@ async def announce_pause(authority, ref, reason) -> bool:
         return False
     if authority.sessions.get(ref.session_id) is not live:
         return False  # retired or replaced while the read ran
-    text = pause_notice(authority, ref, reason)  # claims this episode's one notice
+    text = pause_notice(authority, ref, reason, told=False)  # claims this episode's one notice
     if text is None:
         return False  # a message on the reply path already told the chat
     from gateway.run import _interim_metadata
@@ -90,4 +151,5 @@ async def announce_pause(authority, ref, reason) -> bool:
         live.pause_notified = False
         return False
     logger.info('Session %s paused (%s): notice sent to its chat', ref.session_id, reason)
+    await remember_told(authority, ref)
     return True

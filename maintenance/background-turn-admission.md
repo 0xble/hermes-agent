@@ -104,6 +104,8 @@ the gate disabled) or the typed message's model call does not start within 3 s.
 Repeated matches of one process incarnation and parent route coalesce before admission. The held
 notice keeps its original identity and retry clock, carries the latest bounded match output, and
 counts absorbed matches. Fresh output cannot bypass the 10s, 20s, 40s, 60s capped retry backoff.
+Queue order is not match age: a fresh match can be queued before the older refused event is
+requeued, so the held event is the one furthest into its retry backoff, whatever its position.
 Status notices and completions are not folded into a match. The 2s producer-shape regression in
 `tests/gateway/test_background_turn_fairness.py` verifies one pending notice and one delivery when
 capacity returns. Main's #837 provided retry backoff but did not fold fresh matches into the
@@ -130,4 +132,5 @@ held event. No #857 commit was found on the fetched `origin/main` history.
 - Rollback: revert the commit carrying `Fork-Patch: background-turn-admission`. Restart replay
   returns to opening-only admission and wakes start immediately.
 
-Contract tests: `tests/gateway/test_wake_admitted_before_drain.py`, `tests/gateway/test_background_turn_fairness.py`, `tests/gateway/test_background_turn_admission.py`, `tests/gateway/test_replay_scheduler.py`, `tests/gateway/test_restart_resume_admission_identity.py`.
+Contract tests: `tests/gateway/test_wake_admitted_before_drain.py`, `tests/gateway/test_background_turn_fairness.py`, `tests/gateway/test_background_turn_admission.py`, `tests/gateway/test_replay_scheduler.py`, `tests/gateway/test_restart_resume_admission_identity.py`,
+  `tests/gateway/test_restart_storm_canary.py`.

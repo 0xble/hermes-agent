@@ -40,8 +40,8 @@ within-transaction checks during any port. An upstream query that scopes
 candidates only by target session loses active ancestor-lineage matches.
 
 Contract tests: `tests/hermes_state/test_adoption_indexed_lookup.py`,
-`tests/hermes_state/test_runtime_adoption.py`,
-`tests/hermes_state/test_runtime_worker.py`.
+  `tests/hermes_state/test_runtime_adoption.py`,
+  `tests/hermes_state/test_runtime_worker.py`.
 
 The indexed-lookup test checks SQLite's actual execution plan; the session-read
 test traces the actual adoption transaction. The seeded equivalence test covers

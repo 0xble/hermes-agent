@@ -85,6 +85,13 @@ _STATUS_CHECK = "('claimed','running','completed','failed','unknown','cancelled'
 # Outcomes the attempt's own firer booked: receipt recovery, the external-worker waiter and the
 # dead-owner sweep must treat these as final, never replay or re-book them.
 FIRER_FINISHED_STATES = frozenset({"completed", "failed", "cancelled"})
+# Delivery obligations that keep a terminal row out of retention. Shared verbatim by the
+# idx_executions_prunable_age partial index and its query, so SQLite can use the index.
+_PRUNABLE_DELIVERY = (
+    " AND COALESCE({t}delivery_outcome, '') != 'queued'"
+    " AND COALESCE({t}delivery_status, '') NOT IN ('pending','delivering')"
+    " AND {t}delivery_status_provisional=0"
+)
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -174,6 +181,15 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "ON executions(COALESCE(julianday(finished_at), julianday(claimed_at)), id) "
         "WHERE status IN ('completed','failed','unknown','cancelled','missed')"
     )
+    # Delivery obligations live in columns, so the pruning scan excludes them in the index
+    # itself: a backlog of queued or in-flight deliveries costs no scan work and cannot
+    # occupy the bounded candidate page. Must match _PRUNABLE_DELIVERY term for term.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_prunable_age "
+        "ON executions(COALESCE(julianday(finished_at), julianday(claimed_at)), id) "
+        "WHERE status IN ('completed','failed','unknown','cancelled','missed')"
+        + _PRUNABLE_DELIVERY.format(t="")
+    )
     # Retention must preserve the same latest attempt the history/list readers select,
     # including when a profile's UTC offset has changed.
     conn.execute(
@@ -234,6 +250,8 @@ def _widen_status_check(conn: sqlite3.Connection) -> None:
 
 
 def _initialize_coverage(conn: sqlite3.Connection, *, existing_ledger: bool) -> None:
+    from hermes_cli.sqlite_util import add_column_if_missing
+
     conn.execute("""CREATE TABLE IF NOT EXISTS execution_coverage (
         singleton INTEGER PRIMARY KEY CHECK(singleton=1),
         epoch_id TEXT NOT NULL,
@@ -248,6 +266,10 @@ def _initialize_coverage(conn: sqlite3.Connection, *, existing_ledger: bool) -> 
             CHECK(unparseable_claimed_at_count >= 0),
         last_pruned_at TEXT
     )""")
+    # Where each policy's next bounded scan resumes (NULL: from the oldest row). Not part
+    # of the read contract; additive so older releases keep their named-column writes.
+    add_column_if_missing(conn, "execution_prune_watermarks", "scan_after_jd", "scan_after_jd REAL")
+    add_column_if_missing(conn, "execution_prune_watermarks", "scan_after_id", "scan_after_id TEXT")
     if conn.execute("SELECT 1 FROM execution_coverage WHERE singleton=1").fetchone() is not None:
         return
     # Separate schema initialization from callers' explicit BEGIN IMMEDIATE. INSERT OR IGNORE
@@ -398,25 +420,25 @@ def touch_execution_progress(execution_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def _delete_prunable(
-    conn: sqlite3.Connection, limit: int, *, keep_ids: set[str], cutoff: Optional[str] = None,
-) -> int:
-    from cron.scheduler_authority import journal_path
+_PRUNE_AGE_KEY = "COALESCE(julianday(e.finished_at), julianday(e.claimed_at))"
+# Seekable forms of (age_key, id) > / <= a cursor: SQLite does not range-seek a row value.
+_PRUNE_AFTER = f" AND {_PRUNE_AGE_KEY} >= ? AND ({_PRUNE_AGE_KEY} > ? OR e.id > ?)"
+_PRUNE_THROUGH = f" AND {_PRUNE_AGE_KEY} <= ? AND ({_PRUNE_AGE_KEY} < ? OR e.id <= ?)"
 
-    age_clause = (
-        " AND COALESCE(julianday(e.finished_at), julianday(e.claimed_at)) < julianday(?)"
-        if cutoff is not None else ""
-    )
+
+def _prunable_page(
+    conn: sqlite3.Connection, size: int, *, cutoff: Optional[str], bound: str = "",
+    cursor: Optional[tuple[float, str]] = None,
+) -> sqlite3.Cursor:
     # Latest attempts (including one-shot/removed jobs) can be protected forever.
     # Exclude them with the indexed latest-row lookup BEFORE limiting the page,
-    # so they cannot starve eligible history. Bound the remaining delivery and
-    # journal checks: those obligations may also persist indefinitely.
-    ids = []
-    with closing(conn.execute(
-        """SELECT e.id, e.job_id, e.delivery_outcome, e.delivery_status,
-                  e.delivery_status_provisional
-           FROM executions AS e INDEXED BY idx_executions_terminal_age
-           WHERE e.status IN ('completed','failed','unknown','cancelled','missed')
+    # so they cannot starve eligible history. Delivery obligations are excluded
+    # by the partial index, so they never occupy the page either.
+    return conn.execute(
+        f"""SELECT e.id, e.job_id, {_PRUNE_AGE_KEY} AS age_jd
+           FROM executions AS e INDEXED BY idx_executions_prunable_age
+           WHERE e.status IN ('completed','failed','unknown','cancelled','missed')"""
+        + _PRUNABLE_DELIVERY.format(t="e.") + """
              AND NOT EXISTS (
                  SELECT 1 FROM (
                      SELECT newest.id FROM executions AS newest
@@ -424,26 +446,69 @@ def _delete_prunable(
                      ORDER BY julianday(newest.claimed_at) DESC, newest.claimed_at DESC,
                               newest.id DESC LIMIT 1
                  ) AS latest WHERE latest.id=e.id
-             )""" + age_clause + """
-           ORDER BY COALESCE(julianday(e.finished_at), julianday(e.claimed_at)), e.id
-           LIMIT ?""",
-        ((cutoff,) if cutoff is not None else ()) + (limit * 4,),
-    )) as rows:
-        for row in rows:
-            if (row["id"] in keep_ids
-                    or row["delivery_outcome"] == "queued"
-                    or row["delivery_status"] in ("pending", "delivering")
-                    or row["delivery_status_provisional"] != 0):
-                continue
-            # A terminal worker can still owe canonical admission settlement. Keep
-            # its recovery link until the journal's owner removes it, even if old.
-            if journal_path(row["job_id"], row["id"]).exists():
-                continue
-            ids.append((row["id"],))
-            if len(ids) == limit:
-                break
+             )"""
+        + (f" AND {_PRUNE_AGE_KEY} < julianday(?)" if cutoff is not None else "")
+        + (bound if cursor is not None else "")
+        + f" ORDER BY {_PRUNE_AGE_KEY}, e.id LIMIT ?",
+        ((cutoff,) if cutoff is not None else ())
+        + ((cursor[0], cursor[0], cursor[1]) if cursor is not None else ()) + (size,),
+    )
+
+
+def _delete_prunable(
+    conn: sqlite3.Connection, limit: int, *, keep_ids: set[str], cutoff: Optional[str] = None,
+) -> int:
+    """Delete up to ``limit`` eligible rows, checking at most ``4 * limit`` candidates.
+
+    Admission journals are files, so SQL cannot exclude them. The bounded page
+    resumes after the policy's stored cursor and wraps once to the oldest rows,
+    so protected rows cost a bounded page per call instead of hiding newer
+    eligible history forever, and rows released behind the cursor are not delayed.
+    """
+    from cron.scheduler_authority import journal_path
+
+    reason = "age" if cutoff is not None else "cap"
+    stored = conn.execute(
+        "SELECT scan_after_jd, scan_after_id FROM execution_prune_watermarks WHERE reason=?",
+        (reason,),
+    ).fetchone()
+    stored = (stored[0], stored[1]) if None not in tuple(stored) else None
+    ids, remaining, cursor = [], limit * 4, None
+    passes = [(_PRUNE_AFTER, stored), (_PRUNE_THROUGH, stored)] if stored else [("", None)]
+    for bound, start in passes:
+        requested, examined, last = remaining, 0, None
+        with closing(_prunable_page(
+                conn, requested, cutoff=cutoff, bound=bound, cursor=start)) as rows:
+            for row in rows:
+                examined += 1
+                last = (row["age_jd"], row["id"])
+                if row["id"] in keep_ids:
+                    continue
+                # A terminal worker can still owe canonical admission settlement. Keep
+                # its recovery link until the journal's owner removes it, even if old.
+                if journal_path(row["job_id"], row["id"]).exists():
+                    continue
+                ids.append((row["id"],))
+                if len(ids) == limit:
+                    break
+        remaining -= examined
+        if len(ids) == limit or examined == requested:
+            # Stopped mid-history: the next call resumes here. A NULL age key cannot
+            # be resumed after, so that rare case restarts from the oldest row.
+            cursor = last if last is not None and last[0] is not None else None
+            break
+        # A short page reached the end of this range. After the resumed range, wrap
+        # to the oldest rows up to the old cursor; after that, everything was seen.
+        cursor = None
+        if remaining <= 0:
+            break
+    if cursor != stored:
+        conn.execute(
+            "UPDATE execution_prune_watermarks SET scan_after_jd=?, scan_after_id=? WHERE reason=?",
+            (*(cursor or (None, None)), reason),
+        )
     if ids:
-        _record_prune_watermark(conn, ids, reason="age" if cutoff is not None else "cap")
+        _record_prune_watermark(conn, ids, reason=reason)
     return conn.executemany("DELETE FROM executions WHERE id=?", ids).rowcount
 
 

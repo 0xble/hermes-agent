@@ -1152,16 +1152,19 @@ def auto_title_session(
         rejected = title == "" or bool(title and is_junk_title(title)) or duplicate
         terminal_fallback = rejected and hold_until_reply and user_turns >= 3
         if rejected and hold_until_reply and not terminal_fallback:
-            if duplicate and title:
+            if duplicate and title and not is_junk_title(title):
                 # The advisory collision read cannot classify a reclaimable holder.
-                # Let the atomic write decide before holding the candidate.
+                # Let the atomic write decide before holding the candidate, at the
+                # authority the uncontested path would use: a greeting placeholder
+                # stays provisional so a later substantive turn can still upgrade it.
+                reclaim_source = "derived" if _is_provisional_greeting_title(title) else "llm"
                 persisted = _persist_session_title(
-                    session_db, session_id, title, source="llm", reject_collision=True,
+                    session_db, session_id, title, source=reclaim_source, reject_collision=True,
                 )
                 if persisted is not None:
                     _notify_title(
-                        title_callback, persisted, "llm", "Auto-title", display_title=persisted,
-                        icon=(chosen_icon[0] if chosen_icon else None),
+                        title_callback, persisted, reclaim_source, "Auto-title", display_title=persisted,
+                        icon=(chosen_icon[0] if chosen_icon and reclaim_source == "llm" else None),
                     )
                     return
             logger.debug("Auto-title held: unsupported or duplicate subject")

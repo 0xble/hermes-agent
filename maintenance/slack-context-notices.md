@@ -88,7 +88,9 @@ same message, without a duplicate post or a live orphan, through the real gatewa
 response handler and adapter delivery path. A stale-generation exit seals only:
 it never exposes a reconciliation target. Reconciliation also requires a current,
 uninterrupted turn, including when ownership changes after the seal. Consumer
-failure never claims partial text as the final. Relay abandon requires the same
+failure never claims partial text as the final. Native abandon claims its stream
+before awaiting the seal, so a replacement draft opened in the same thread meanwhile
+stays registered and is the one finalized. Relay abandon requires the same
 exact `_draft_id` ownership proof as native Slack, even for its single-open-stream
 routing fallback (`tests/gateway/relay/test_abandoned_draft_reconciliation.py`).
 Relay draft sealing and abandon ownership live together in
@@ -126,4 +128,5 @@ Retire when upstream has equivalent producer-owned metadata classification and
 context rendering across sends and status edits. Never replace classification
 with text matching in the Slack adapter.
 
-Contract tests: `tests/hermes_state/test_storage_import_boundary.py`, `tests/gateway/test_slack_context_notices.py`, `tests/gateway/test_slack_notice_coverage.py`, `tests/gateway/test_telegram_ingress_nonblocking.py`, `tests/gateway/test_restart_resume_admission_identity.py`.
+Contract tests: `tests/hermes_state/test_storage_import_boundary.py`, `tests/gateway/test_slack_context_notices.py`, `tests/gateway/test_slack_notice_coverage.py`, `tests/gateway/test_telegram_ingress_nonblocking.py`, `tests/gateway/test_restart_resume_admission_identity.py`,
+  `tests/gateway/relay/test_abandoned_draft_reconciliation.py`, `tests/gateway/relay/test_draft_identity_metadata.py`, `tests/gateway/test_background_attribution_delivery.py`, `tests/gateway/test_slack_stream_fallback.py`.

@@ -1126,7 +1126,8 @@ without receiving a signal whose ownership cannot be proved. The discovery scan
 still skips inaccessible environments. The containment assertion and final
 case-owned survivor verification remain mandatory.
 
-Contract tests: `tests/e2e/core/tenancy/test_routing_process_races.py`, `tests/e2e/core/tenancy/test_routing_process_cleanup.py`.
+Contract tests: `tests/e2e/core/tenancy/test_routing_process_races.py`, `tests/e2e/core/tenancy/test_routing_process_cleanup.py`,
+  `tests/acp_adapter/test_cold_catalog_socket.py`, `tests/acp_adapter/test_cold_catalog_warming.py`, `tests/acp_adapter/test_gateway_catalog_offline.py`, `tests/e2e/core/cli_tmux/test_composer_readiness.py`, `tests/hermes_cli/test_picker_registry_read_scope.py`.
 
 This extends the fork-local `routing-test-process-cleanup` harness, with no product
 runtime change. Retire when the accepted upstream case teardown handles the same

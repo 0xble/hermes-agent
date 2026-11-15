@@ -381,7 +381,18 @@ def get_write_denied_error(path: str, *, verb: str = "Write", entry: bool = Fals
         )
     if denial == "nt_namespace":
         return get_nt_namespace_error(path, verb=verb)
-    return f"{verb} denied: '{path}' is a protected system/credential file." if denial else None
+    return _credential_write_error(path, verb) if denial else None
+
+
+def get_credential_write_error(path: str, *, verb: str = "Write") -> Optional[str]:
+    """The credential refusal alone, for vetting the path a caller spelled beside the
+    resolved target its backend guard receives. Safe roots describe where the write
+    lands, so they stay with that target's check."""
+    return _credential_write_error(path, verb) if _classify_write_denial(path) == "credential" else None
+
+
+def _credential_write_error(path: str, verb: str) -> str:
+    return f"{verb} denied: '{path}' is a protected system/credential file."
 
 
 def is_write_approval_required(path: str) -> bool:

@@ -174,3 +174,31 @@ def test_native_content_is_public_but_secondary_owners_refuse_before_writes(work
         db._conn.set_trace_callback(None)
         register_session('native', False)
         register_session(PRIVATE, False)
+
+
+@pytest.mark.parametrize('private_holder', [True, False])
+@pytest.mark.parametrize('held_title', ['Ghost #2', 'GHOST'])
+def test_auto_title_reclaim_projects_every_equivalent_holder(worker, private_holder, held_title):
+    """The automatic reclaim clears holders matched by case or ``#N`` alias, so each one is an owner."""
+    db, store = worker
+    db.create_session('ghost', 'cli')
+    db.set_session_title('ghost', held_title)
+    db.end_session('ghost', 'abandoned')
+    held = db.get_session_title('ghost'), db.get_session_title_source('ghost')
+    payload = {'title': 'ghost', 'source': 'llm', 'reject_collision': True}
+    try:
+        if private_holder:
+            register_session('ghost')
+            before = snapshot(db)
+            with pytest.raises((WorkerPersistenceError, rt.RuntimeStoreError), match='privacy_denied'):
+                store._apply('session.title', payload)
+            assert snapshot(db) == before
+            assert (db.get_session_title('ghost'), db.get_session_title_source('ghost')) == held
+            assert db.get_session_title('owned') is None
+        else:
+            # Positive control: a public reclaimable holder still yields its name.
+            assert store._apply('session.title', payload)['value'] is True
+            assert (db.get_session_title('ghost'), db.get_session_title_source('ghost')) == (None, None)
+            assert (db.get_session_title('owned'), db.get_session_title_source('owned')) == ('ghost', 'llm')
+    finally:
+        register_session('ghost', False)
