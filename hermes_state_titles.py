@@ -33,15 +33,22 @@ def _auto_title_matches(stored: str, candidate: str) -> bool:
     return stored.casefold() == candidate or _NUMBERED_TITLE_RE.sub(r'\1', stored).casefold() == candidate
 
 
-def _auto_title_collides(conn, title: str, exclude_session_id: str) -> bool:
-    """True when another session holds *title* under the automatic-title equivalence rule."""
+def auto_title_holders(conn, title: str, exclude_session_id: str, columns: str = "id"):
+    """Cursor over every other session holding *title* under the automatic-title equivalence
+    rule. The one predicate for the collision check, the reclaim write that clears those
+    holders, and the privacy projection that must see each holder the reclaim may clear."""
     # SQLite's lower()/NOCASE do not implement Unicode casefolding.
     conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
     return conn.execute(
-        "SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL "
-        "AND auto_title_matches(title, ?) LIMIT 1",
+        f"SELECT {columns} FROM sessions WHERE id != ? AND title IS NOT NULL "
+        "AND auto_title_matches(title, ?)",
         (exclude_session_id or "", title.casefold()),
-    ).fetchone() is not None
+    )
+
+
+def _auto_title_collides(conn, title: str, exclude_session_id: str) -> bool:
+    """True when another session holds *title* under the automatic-title equivalence rule."""
+    return auto_title_holders(conn, title, exclude_session_id, "1").fetchone() is not None
 
 
 def next_title_in_lineage(conn, base_title: str) -> str:
@@ -147,12 +154,9 @@ class SessionTitlesMixin:
         if not is_user and current["title"] is not None and self._title_rank(current["title_source"]) >= new_rank:
             return []
         if reject_auto_collision and not is_user and title and _auto_title_collides(conn, title, session_id):
-            conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
-            conflicts = conn.execute(
-                "SELECT id, title, archived, auto_archived, hidden, "
-                f"{self._EMPTY_SESSION_WHERE} AS ghost FROM sessions "
-                "WHERE id != ? AND title IS NOT NULL AND auto_title_matches(title, ?)",
-                (session_id, title.casefold()),
+            conflicts = auto_title_holders(
+                conn, title, session_id,
+                f"id, title, archived, auto_archived, hidden, {self._EMPTY_SESSION_WHERE} AS ghost",
             ).fetchall()
             # The advisory read above can be stale, and reclaimable holders are not
             # legitimate automatic-title collisions. Classify every holder before

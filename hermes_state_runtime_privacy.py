@@ -115,25 +115,29 @@ def resolve_worker_owners(conn, owners, operation, payload, execution_id):
         if row:
             owners += tuple(value for value in row if value)
     if operation == 'session.title' and payload.get('title'):
-        # Title conflict repair may clear a stale automatic title on another row.
-        row = _title_owner(conn, owners[0], payload['title'])
-        if row:
-            owners += (row[0],)
+        # Title conflict repair may clear a stale automatic title on another row;
+        # an automatic reclaim clears every equivalent holder (case, ``#N`` alias).
+        owners += _title_owners(conn, owners[0], payload['title'],
+                                automatic=payload.get('reject_collision') is True)
     if operation == 'execution.finish':
         owners += _child_worker_owners(conn, execution_id)
     return session_owners(conn, owners)
 
 
-def _title_owner(conn, session_id, title):
-    from hermes_state_titles import SessionTitlesMixin
+def _title_owners(conn, session_id, title, *, automatic=False):
+    from hermes_state_titles import SessionTitlesMixin, auto_title_holders
     try:
         title = SessionTitlesMixin.sanitize_title(title)
     except ValueError:
         # An invalid title cannot clear another row. Preserve the handler's
         # existing validation/error receipt instead of changing its public API.
-        return None
-    return conn.execute('SELECT id FROM sessions WHERE title=? AND id!=?',
-                        (title, session_id)).fetchone()
+        return ()
+    if not title:
+        return ()
+    # The reclaim's own predicate, which also matches the exact holder.
+    rows = (auto_title_holders(conn, title, session_id) if automatic else
+            conn.execute('SELECT id FROM sessions WHERE title=? AND id!=?', (title, session_id)))
+    return tuple(row[0] for row in rows)
 
 
 def _child_worker_owners(conn, execution_id):
@@ -244,7 +248,5 @@ def resolve_mutation_owners(conn, owners, operation, payload):
         from hermes_state_mutation_guards import delete_targets
         owners += tuple(delete_targets(conn, owners[0]))
     if operation in {'rename', 'sidebar'} and payload.get('title'):
-        row = _title_owner(conn, owners[0], payload['title'])
-        if row:
-            owners += (row[0],)
+        owners += _title_owners(conn, owners[0], payload['title'])
     return session_owners(conn, owners)
