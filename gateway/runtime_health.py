@@ -60,7 +60,12 @@ def _failure_key(home: Path) -> str:
 
 async def check_memory_health(runner) -> None:
     from gateway.run import _async_profile_runtime_scope, _resolve_handoff_watch_scopes
-    from hermes_constants import get_default_hermes_root
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    # Multiplexing serves every profile from the default root. A standalone gateway, including a named
+    # profile launched on its own, serves only its launch home, so the unscoped primary must stay there.
+    multiplexed = bool(getattr(getattr(runner, "config", None), "multiplex_profiles", False))
+    primary_home = get_default_hermes_root if multiplexed else get_hermes_home
 
     lock = getattr(runner, "_memory_health_lock", None)
     if lock is None:
@@ -70,7 +75,7 @@ async def check_memory_health(runner) -> None:
     async with lock:
         for profile, home in await _resolve_handoff_watch_scopes(runner):
             try:
-                home = Path(home or get_default_hermes_root())
+                home = Path(home or primary_home())
                 async with _async_profile_runtime_scope(home):
                     await _check_profile_health(runner, profile, home)
             except Exception:  # health: allow BLE001 -- advisory profile probes must isolate failures

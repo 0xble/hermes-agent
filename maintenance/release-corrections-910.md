@@ -6,7 +6,8 @@ Patch identity: `release-corrections-910`.
 
 Memory-provider readiness at gateway boot is advisory and must never block startup:
 - core memory-provider sentinels are skipped before plugin probes;
-- handoff watch scopes resolve asynchronously, with the primary scope bound to the default root;
+- handoff watch scopes resolve asynchronously, with the primary scope bound to the default root under
+  multiplexing and to the launch home for a standalone gateway, including a named profile;
 - a readiness reason survives malformed optional client package metadata;
 - boot memory health checks are scheduled independently of startup.
 
