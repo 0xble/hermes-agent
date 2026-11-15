@@ -15,7 +15,9 @@ Contract tests: `tests/agent/test_fallback_endpoint_domain.py`.
 - Keep the normal rebuilt-message restart cap. At the cap, allow at most one bounded request
   on an unvisited independent domain after a proven connection failure. Keep that allowance
   through response validation; invalid 200s, streaming retries, Responses reconnects and
-  same-attempt transport repairs cannot turn it into another request/retry loop. A validated
+  same-attempt transport repairs cannot turn it into another request/retry loop. Evicting a
+  stale Bedrock client sends nothing, so it still happens when the allowance forbids a retry,
+  and later turns get a fresh connection pool. A validated
   response spends the allowance: the route's tool continuations are normal requests, and no second
   allowance is granted that turn.
 - Reset domain failures and attempted-route evidence for the next turn. Attempt summaries
