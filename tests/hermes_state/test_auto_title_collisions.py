@@ -138,14 +138,23 @@ def test_auto_title_reclaims_a_retired_hidden_bot_chat(tmp_path):
         db.create_session("retired", source="telegram")
         db.set_session_title("retired", SessionDB.CANONICAL_BOT_CHAT_TITLE)
         db.set_session_hidden("retired", True)
-        db.set_session_archived("retired", True)
+        # A legacy deliberate archive kept the title and hidden flag: today's
+        # set_session_archived() releases both itself, which would leave nothing
+        # for set_auto_title() to reclaim.
+        db._execute_write(lambda conn: conn.execute(
+            "UPDATE sessions SET archived = 1, auto_archived = 0 WHERE id = 'retired'"))
         db.create_session("replacement", source="telegram")
+        held = db._read_one(
+            "SELECT title, hidden, archived, auto_archived FROM sessions WHERE id = 'retired'", ())
+        assert tuple(held) == (SessionDB.CANONICAL_BOT_CHAT_TITLE, 1, 1, 0)
+        assert db.has_auto_title_collision(
+            SessionDB.CANONICAL_BOT_CHAT_TITLE, exclude_session_id="replacement")
 
         assert db.set_auto_title(
             "replacement", SessionDB.CANONICAL_BOT_CHAT_TITLE, source="llm", reject_collision=True,
         )
         assert db.get_session_title("replacement") == SessionDB.CANONICAL_BOT_CHAT_TITLE
-        assert db.get_session_title("retired") is None
+        assert db._read_one("SELECT title FROM sessions WHERE id = 'retired'", ())[0] is None
 
 
 def test_auto_title_rejects_a_visible_legitimate_holder(tmp_path):
