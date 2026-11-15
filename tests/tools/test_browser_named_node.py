@@ -10,7 +10,12 @@ import pytest
 
 from tools import browser_tool
 from tools.registry import registry
-from tests.tools.test_computer_use_nodes import endpoint as node_endpoint, home as node_home
+from tests.tools.test_computer_use_nodes import endpoint as endpoint_fixture, home as node_home
+
+
+@pytest.fixture(name="endpoint")
+def _endpoint(request):
+    return request.getfixturevalue("endpoint_fixture")
 
 # These entrypoints register outside browser_tool's table. Exercise their actual
 # registrations too, without calling any handler or replacing the registry.
@@ -44,8 +49,8 @@ def no_other_browser(monkeypatch):
     monkeypatch.setattr(browser_control_broker, "browser_control_enabled", forbidden)
 
 
-def test_named_navigation_refuses_without_fallback(node_endpoint):
-    a, _, _, calls = node_endpoint
+def test_named_navigation_refuses_without_fallback(endpoint):
+    a, _, _, calls = endpoint
     args = {"node": "studio", "chrome_profile": "Personal", "url": "https://example.com"}
     with node_home(a):
         out = dispatch(**args)
@@ -60,8 +65,8 @@ def test_every_registered_browser_refuses_explicit_node(name):
 
 
 @pytest.mark.parametrize("node", [None, "", " ", [], {}, 5, "missing"])
-def test_bad_node_never_falls_back(node_endpoint, node):
-    a, _, _, calls = node_endpoint
+def test_bad_node_never_falls_back(endpoint, node):
+    a, _, _, calls = endpoint
     with node_home(a):
         out = dispatch(node=node, chrome_profile="Personal", url="https://example.com")
     assert_refused(out, node)
@@ -76,9 +81,9 @@ def test_model_dispatch_preserves_node_refusal(name):
     assert_refused(json.loads(str(result)), "studio")
 
 
-def test_omitted_node_preserves_account_and_raw_task_with_node_default(node_endpoint, monkeypatch):
+def test_omitted_node_preserves_account_and_raw_task_with_node_default(endpoint, monkeypatch):
     from gateway import browser_control_broker
-    a, _, _, calls = node_endpoint
+    a, _, _, calls = endpoint
     forwarded = []
 
     def navigate(**args):
