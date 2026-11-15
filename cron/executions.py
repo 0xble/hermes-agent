@@ -421,15 +421,54 @@ def touch_execution_progress(execution_id: str) -> bool:
 
 
 _PRUNE_AGE_KEY = "COALESCE(julianday(e.finished_at), julianday(e.claimed_at))"
-# Seekable forms of (age_key, id) > / <= a cursor: SQLite does not range-seek a row value.
+# The scan walks the prunable index in its own order: rows with an unparseable age key
+# (NULL) first, by id, then dated rows by (age key, id). Each segment below is a seekable
+# index range (SQLite does not range-seek a row value); ``?`` takes cursor values.
+# Ordering the NULL segment by id alone lets SQLite read it straight from the index.
+_PRUNE_DATED_ORDER = f" ORDER BY {_PRUNE_AGE_KEY}, e.id"
+_PRUNE_UNDATED_ORDER = " ORDER BY e.id"
+_PRUNE_UNDATED = f" AND {_PRUNE_AGE_KEY} IS NULL"
+_PRUNE_UNDATED_AFTER = _PRUNE_UNDATED + " AND e.id > ?"
+_PRUNE_UNDATED_THROUGH = _PRUNE_UNDATED + " AND e.id <= ?"
+# IS NOT NULL would scan the NULL segment first; a lower bound seeks past it.
+_PRUNE_DATED = f" AND {_PRUNE_AGE_KEY} > ?"
 _PRUNE_AFTER = f" AND {_PRUNE_AGE_KEY} >= ? AND ({_PRUNE_AGE_KEY} > ? OR e.id > ?)"
 _PRUNE_THROUGH = f" AND {_PRUNE_AGE_KEY} <= ? AND ({_PRUNE_AGE_KEY} < ? OR e.id <= ?)"
+_PruneCursor = tuple[Optional[float], str]
+_PrunePass = tuple[str, tuple[Any, ...], str]
+
+
+def _prune_passes(cursor: Optional[_PruneCursor], *, dated_only: bool) -> list[_PrunePass]:
+    """Index segments from just after ``cursor`` round to it again, in scan order.
+
+    A NULL age key is a real position, so a cursor inside the NULL segment resumes
+    there and a cursor among dated rows wraps through the NULL segment: rows with an
+    unparseable time are visited every cycle instead of being skipped forever.
+    """
+    if cursor is None:
+        return [("", (), _PRUNE_DATED_ORDER)]
+    jd, row_id = cursor
+    undated_all = [] if dated_only else [(_PRUNE_UNDATED, (), _PRUNE_UNDATED_ORDER)]
+    if jd is None:
+        if dated_only:
+            return [(_PRUNE_DATED, (-math.inf,), _PRUNE_DATED_ORDER)]
+        return [
+            (_PRUNE_UNDATED_AFTER, (row_id,), _PRUNE_UNDATED_ORDER),
+            (_PRUNE_DATED, (-math.inf,), _PRUNE_DATED_ORDER),
+            (_PRUNE_UNDATED_THROUGH, (row_id,), _PRUNE_UNDATED_ORDER),
+        ]
+    return [
+        (_PRUNE_AFTER, (jd, jd, row_id), _PRUNE_DATED_ORDER),
+        *undated_all,
+        (_PRUNE_THROUGH, (jd, jd, row_id), _PRUNE_DATED_ORDER),
+    ]
 
 
 def _prunable_page(
-    conn: sqlite3.Connection, size: int, *, cutoff: Optional[str], bound: str = "",
-    cursor: Optional[tuple[float, str]] = None,
+    conn: sqlite3.Connection, size: int, *, cutoff: Optional[str],
+    segment: _PrunePass = ("", (), _PRUNE_DATED_ORDER),
 ) -> sqlite3.Cursor:
+    bound, params, order = segment
     # Latest attempts (including one-shot/removed jobs) can be protected forever.
     # Exclude them with the indexed latest-row lookup BEFORE limiting the page,
     # so they cannot starve eligible history. Delivery obligations are excluded
@@ -448,10 +487,8 @@ def _prunable_page(
                  ) AS latest WHERE latest.id=e.id
              )"""
         + (f" AND {_PRUNE_AGE_KEY} < julianday(?)" if cutoff is not None else "")
-        + (bound if cursor is not None else "")
-        + f" ORDER BY {_PRUNE_AGE_KEY}, e.id LIMIT ?",
-        ((cutoff,) if cutoff is not None else ())
-        + ((cursor[0], cursor[0], cursor[1]) if cursor is not None else ()) + (size,),
+        + bound + order + " LIMIT ?",
+        ((cutoff,) if cutoff is not None else ()) + params + (size,),
     )
 
 
@@ -461,9 +498,10 @@ def _delete_prunable(
     """Delete up to ``limit`` eligible rows, checking at most ``4 * limit`` candidates.
 
     Admission journals are files, so SQL cannot exclude them. The bounded page
-    resumes after the policy's stored cursor and wraps once to the oldest rows,
-    so protected rows cost a bounded page per call instead of hiding newer
-    eligible history forever, and rows released behind the cursor are not delayed.
+    resumes after the policy's stored cursor and wraps once round the index,
+    unparseable-time rows included, so protected rows cost a bounded page per
+    call instead of hiding other eligible history forever, and rows released
+    behind the cursor are not delayed.
     """
     from cron.scheduler_authority import journal_path
 
@@ -472,13 +510,13 @@ def _delete_prunable(
         "SELECT scan_after_jd, scan_after_id FROM execution_prune_watermarks WHERE reason=?",
         (reason,),
     ).fetchone()
-    stored = (stored[0], stored[1]) if None not in tuple(stored) else None
+    # A NULL scan_after_jd with an id is a cursor inside the unparseable-time segment.
+    stored = (stored[0], stored[1]) if stored[1] is not None else None
     ids, remaining, cursor = [], limit * 4, None
-    passes = [(_PRUNE_AFTER, stored), (_PRUNE_THROUGH, stored)] if stored else [("", None)]
-    for bound, start in passes:
+    # The age cutoff never matches a NULL age key, so that policy skips the NULL segment.
+    for segment in _prune_passes(stored, dated_only=cutoff is not None):
         requested, examined, last = remaining, 0, None
-        with closing(_prunable_page(
-                conn, requested, cutoff=cutoff, bound=bound, cursor=start)) as rows:
+        with closing(_prunable_page(conn, requested, cutoff=cutoff, segment=segment)) as rows:
             for row in rows:
                 examined += 1
                 last = (row["age_jd"], row["id"])
@@ -493,12 +531,11 @@ def _delete_prunable(
                     break
         remaining -= examined
         if len(ids) == limit or examined == requested:
-            # Stopped mid-history: the next call resumes here. A NULL age key cannot
-            # be resumed after, so that rare case restarts from the oldest row.
-            cursor = last if last is not None and last[0] is not None else None
+            # Stopped mid-history: the next call resumes here.
+            cursor = last
             break
-        # A short page reached the end of this range. After the resumed range, wrap
-        # to the oldest rows up to the old cursor; after that, everything was seen.
+        # A short page reached the end of this segment. Continue round the cycle to
+        # the old cursor; after the last segment, everything was seen.
         cursor = None
         if remaining <= 0:
             break
