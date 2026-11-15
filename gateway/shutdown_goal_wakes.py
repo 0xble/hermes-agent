@@ -132,6 +132,10 @@ def _ensure_durable_owner(data):
             now = time.time()
             state.waiting_until = state.waiting_since = now
             state.waiting_reason = "Resume goal after superseded shutdown wake"
+            # That evaluator stamped the automatic-chain floor for the successor it was
+            # dispatching. The successor never ran, so the floor would hold this owner for a
+            # whole min_continuation_gap_seconds after the restart instead of resuming now.
+            state.last_automatic_continuation_at = 0.0
             state.mutation_id = uuid.uuid4().hex
             conn.execute("UPDATE state_meta SET value = ? WHERE key = ?", (state.to_json(), target_key))
         return True
