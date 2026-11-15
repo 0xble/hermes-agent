@@ -12,6 +12,7 @@ from gateway.replay_scheduler import REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RE
 logger = logging.getLogger("gateway.run")
 _NOT_SUPPLIED = object()
 _INPUT_DURABLE_POLL_S = 0.25
+_ORPHAN_CARD_DELETE_ATTEMPTS = 3  # boots that may fail to delete a stranded progress card before it is forgotten
 
 
 class ResumeCandidates(list):
@@ -40,11 +41,14 @@ class RestartRecoveryMixin:
             except Exception as exc:
                 logger.warning("Orphan progress-card delete failed for session %s: %s", session_key, exc,
                                exc_info=True)
-                continue
-            deleted += sum(1 for mid in message_ids if outcome.get(str(mid)))
-            # Settled after one attempt: Telegram reports a card that is already gone, or past its 48h
-            # delete window, as a plain False, and retrying either would spend budget on every boot.
-            await self._persist_progress_cards("forget_progress_cards", session_key, chat_id, message_ids)
+                outcome = {}
+            outcome = {str(mid): bool(outcome.get(str(mid))) for mid in message_ids}
+            deleted += sum(outcome.values())
+            # A False is either final (Telegram: already gone, or past its 48h window) or a flood
+            # refusal that keeps every id for a later retry, so a card is forgotten once deleted or
+            # after a few failed boots, never on its first failure.
+            await self._persist_progress_cards(
+                "settle_swept_progress_cards", session_key, chat_id, outcome, _ORPHAN_CARD_DELETE_ATTEMPTS)
         if orphans:
             logger.info("Swept orphan progress cards: chats=%d deleted=%d", len(orphans), deleted)
         return deleted

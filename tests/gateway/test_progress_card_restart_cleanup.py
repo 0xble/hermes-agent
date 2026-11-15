@@ -70,7 +70,7 @@ async def _run_turn(monkeypatch, tmp_path, agent_cls):
 
 async def _reboot_and_sweep(monkeypatch, tmp_path):
     """A new process over the same state: the recording process is gone, then boot sweeps."""
-    import gateway.status as status
+    from gateway import status
     monkeypatch.setattr(status, "_pid_exists", lambda _pid: False)
     adapter = CleanupCaptureAdapter()
     runner = _make_runner(adapter)
@@ -120,7 +120,7 @@ async def test_normal_cleanup_clears_the_record_so_boot_does_not_delete_twice(mo
 
 @pytest.mark.asyncio
 async def test_boot_sweep_never_touches_the_final_reply(monkeypatch, tmp_path):
-    _runner, store, adapter, key, result = await _run_turn(monkeypatch, tmp_path, ProgressAgent)
+    _runner, _store, adapter, _key, result = await _run_turn(monkeypatch, tmp_path, ProgressAgent)
     progress_ids = {sent["message_id"] for sent in adapter.sent}
     # The adapter handler delivers the final reply; the restart lands before cleanup fires.
     final = await adapter.send(SOURCE.chat_id, result["final_response"])
@@ -156,3 +156,56 @@ async def test_boot_leaves_cards_of_a_live_owner(monkeypatch, tmp_path):
     await runner._sweep_orphan_progress_cards()
 
     assert adapter.deleted == []
+
+
+class FloodRefusingAdapter(CleanupCaptureAdapter):
+    """Telegram's batch delete under a flood refusal: nothing deleted, every id reported False so
+    the caller can retry later."""
+
+    async def delete_messages(self, chat_id, message_ids):
+        return {str(mid): False for mid in message_ids}
+
+
+async def _flood_refused_boot(monkeypatch, tmp_path):
+    from gateway import status
+    monkeypatch.setattr(status, "_pid_exists", lambda _pid: False)
+    adapter = FloodRefusingAdapter()
+    runner = _make_runner(adapter)
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    _attach_store(runner, store, adapter)
+    assert await runner._sweep_orphan_progress_cards() == 0
+    await _settle(runner)
+    reloaded = SessionStore(tmp_path / "sessions", GatewayConfig())
+    with reloaded._lock:
+        reloaded._ensure_loaded_locked()
+    return reloaded
+
+
+@pytest.mark.asyncio
+async def test_flood_refused_boot_delete_keeps_the_record_for_a_later_boot(monkeypatch, tmp_path):
+    """A flood refusal at boot deletes nothing; the record must survive so a later boot retries."""
+    _runner, _store, adapter, key, _result = await _run_turn(monkeypatch, tmp_path, ProgressAgent)
+    progress_ids = [sent["message_id"] for sent in adapter.sent]
+    assert progress_ids
+
+    reloaded = await _flood_refused_boot(monkeypatch, tmp_path)
+    assert _cards(reloaded, key) == progress_ids
+
+    rebooted, boot_adapter = await _reboot_and_sweep(monkeypatch, tmp_path)
+    assert [d["message_id"] for d in boot_adapter.deleted] == progress_ids
+    assert _cards(rebooted, key) == []
+
+
+@pytest.mark.asyncio
+async def test_card_that_never_deletes_is_forgotten_after_a_few_boots(monkeypatch, tmp_path):
+    """Retrying is bounded: a card no boot can delete stops costing a request on every boot."""
+    from gateway.run_restart_recovery import _ORPHAN_CARD_DELETE_ATTEMPTS
+    store = SessionStore(tmp_path / "sessions", GatewayConfig())
+    entry = store.get_or_create_session(SOURCE)
+    assert store.record_progress_card(entry.session_key, SOURCE.chat_id, "77")
+
+    for boot in range(1, _ORPHAN_CARD_DELETE_ATTEMPTS):
+        reloaded = await _flood_refused_boot(monkeypatch, tmp_path)
+        assert reloaded._entries[entry.session_key].progress_cards[0]["attempts"] == boot
+    reloaded = await _flood_refused_boot(monkeypatch, tmp_path)
+    assert _cards(reloaded, entry.session_key) == []
