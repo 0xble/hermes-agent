@@ -268,4 +268,5 @@ A goal replacement installs its goal, contract and max turns, so the approval ca
 - Wakes are fenced at admission, at session resolution, and again at the model boundary (`_internal_wake_input_at_execution`, right before `_run_agent` for both the head turn and a queued follow-up, recognizing wakes by their goal-continuation or loop stamp rather than the `internal` flag, since goal continuations are built with `internal=False`), so a control committed while the turn was being prepared still drops the obsolete wake, and an edited goal's continuation runs its refreshed prompt.
 - The latest message must be exactly one sentence, the instruction itself (`user_quote_multi_sentence` otherwise). Another sentence can revoke, correct or reframe it ("Disregard the next sentence. Clear ...", "Clear ... Actually, keep it"), so any multi-sentence message falls back to Approve/Deny instead of being interpreted.
 
-Contract tests: `tests/gateway/test_top_level_delegation_context.py`, `tests/gateway/test_telegram_retire.py`.
+Contract tests: `tests/gateway/test_top_level_delegation_context.py`, `tests/gateway/test_telegram_retire.py`,
+  `tests/gateway/test_loop_response_completion.py`.

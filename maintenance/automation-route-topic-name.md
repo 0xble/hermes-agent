@@ -24,8 +24,8 @@ producer identity as ordinary admission, including their reason/field; retries c
 retention window. The ordered admission preparation still rechecks route, session and provenance.
 
 Contract tests: `tests/gateway/test_process_notice_committed_source.py`,
-`tests/gateway/test_automation_route_display_labels.py`,
-`tests/gateway/test_automation_wake_route.py`.
+  `tests/gateway/test_automation_route_display_labels.py`,
+  `tests/gateway/test_automation_wake_route.py`.
 
 ## Source
 

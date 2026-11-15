@@ -132,4 +132,5 @@ held event. No #857 commit was found on the fetched `origin/main` history.
 - Rollback: revert the commit carrying `Fork-Patch: background-turn-admission`. Restart replay
   returns to opening-only admission and wakes start immediately.
 
-Contract tests: `tests/gateway/test_wake_admitted_before_drain.py`, `tests/gateway/test_background_turn_fairness.py`, `tests/gateway/test_background_turn_admission.py`, `tests/gateway/test_replay_scheduler.py`, `tests/gateway/test_restart_resume_admission_identity.py`.
+Contract tests: `tests/gateway/test_wake_admitted_before_drain.py`, `tests/gateway/test_background_turn_fairness.py`, `tests/gateway/test_background_turn_admission.py`, `tests/gateway/test_replay_scheduler.py`, `tests/gateway/test_restart_resume_admission_identity.py`,
+  `tests/gateway/test_restart_storm_canary.py`.

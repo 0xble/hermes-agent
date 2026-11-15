@@ -44,5 +44,5 @@ Upstream has the same reply-path-only notice (GW-10, #141357). Remove this patch
 upstream announces recovery pauses to the chat and the contract test passes on it.
 
 Contract tests: `tests/gateway/test_restart_pause_announce.py`, `tests/gateway/test_native_pause_notice.py`,
-`tests/gateway/test_session_authority.py::test_native_queue_survives_owner_kill_without_replaying_unknown`,
-`tests/gateway/test_native_ingress_media.py::test_accepted_media_survives_mutation_cleanup_and_owner_kill`.
+  `tests/gateway/test_session_authority.py::test_native_queue_survives_owner_kill_without_replaying_unknown`,
+  `tests/gateway/test_native_ingress_media.py::test_accepted_media_survives_mutation_cleanup_and_owner_kill`.

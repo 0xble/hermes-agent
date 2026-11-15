@@ -18,7 +18,8 @@ wrapper bookkeeping; timed-out async close is cancelled with a warning. Retain
 FIFO/backlog drain and retry semantics stay unchanged. Preserve both behaviors
 until upstream includes equivalent regressions.
 
-Contract tests: `tests/plugins/memory/test_hindsight_shutdown_budget.py`.
+Contract tests: `tests/plugins/memory/test_hindsight_shutdown_budget.py`,
+  `tests/gateway/test_writer_census.py`.
 
 ## Read-Only Writer Census
 

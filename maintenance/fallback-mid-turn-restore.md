@@ -57,4 +57,4 @@ without the local implementation.
 Fork patch identities: `fallback-mid-turn-restore`.
 
 Contract tests: `tests/agent/test_mid_turn_primary_restore.py`,
-`tests/agent/test_fallback_session_reload.py`.
+  `tests/agent/test_fallback_session_reload.py`.

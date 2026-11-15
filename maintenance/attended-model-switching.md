@@ -118,8 +118,9 @@ the owning profile through the alias loaders. Since the v0.23.1 integration a
 stored role whose alias no longer resolves refuses the request with
 `Stored model alias '<role>' is unavailable; request refused` instead of answering
 on the default route: an invalid alias is an operator-visible config error, never a
-silent model change. Restore the alias in `model_aliases` or pick a model in that
-conversation to clear the hold. Inherited reasoning is resolved for that destination from
+silent model change. Restore the alias in `model_aliases`, or clear the hold in that
+conversation with a durable pick (`/model X --session`) or `/model reset`: with attended
+routing or a pick TTL a plain `/model X` is a temporary override that keeps the invalid role. Inherited reasoning is resolved for that destination from
 the same fresh profile snapshot. Explicit session effort wins over preset
 effort, then destination per-model policy and global effort. Keep the canonical
 reasoning dictionaries until effort normalization so disabled values and
