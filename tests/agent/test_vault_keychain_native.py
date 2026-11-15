@@ -19,7 +19,7 @@ from agent.vault_store import VaultStore
 
 
 @pytest.mark.platforms("macos")
-def test_macos_probe_is_cached_after_a_successful_noninteractive_probe(monkeypatch):
+def test_macos_probe_reuses_keychain_selection_but_rechecks_lock_state(monkeypatch):
     backend = type("FakeMacBackend", (), {"__module__": "keyring.backends.macOS"})()
     calls = []
 
@@ -27,17 +27,21 @@ def test_macos_probe_is_cached_after_a_successful_noninteractive_probe(monkeypat
         calls.append(command)
         if command[:2] == ["security", "default-keychain"]:
             return type("Completed", (), {"stdout": '"ci.keychain-db"\n'})()
+        if len([call for call in calls if call[:2] == ["security", "show-keychain-info"]]) == 2:
+            raise kc.subprocess.CalledProcessError(36, command)
         return type("Completed", (), {})()
 
     monkeypatch.setattr(kc, "_stdin_is_tty", lambda: False)
     monkeypatch.setattr(kc.subprocess, "run", fake_run)
-    monkeypatch.setattr(kc, "_macos_probe_ok", False)
+    monkeypatch.setattr(kc, "_macos_keychain_path", None)
 
     kc._probe_macos_keychain(backend)
-    kc._probe_macos_keychain(backend)
+    with pytest.raises(kc.KeychainUnavailable, match="CalledProcessError"):
+        kc._probe_macos_keychain(backend)
 
     assert calls == [
         ["security", "default-keychain", "-d", "user"],
+        ["security", "show-keychain-info", "ci.keychain-db"],
         ["security", "show-keychain-info", "ci.keychain-db"],
     ]
 
@@ -46,7 +50,7 @@ def test_macos_probe_is_cached_after_a_successful_noninteractive_probe(monkeypat
 def test_macos_probe_skips_interactive_stdin(monkeypatch):
     backend = type("FakeMacBackend", (), {"__module__": "keyring.backends.macOS"})()
     monkeypatch.setattr(kc, "_stdin_is_tty", lambda: True)
-    monkeypatch.setattr(kc, "_macos_probe_ok", False)
+    monkeypatch.setattr(kc, "_macos_keychain_path", None)
     monkeypatch.setattr(kc.subprocess, "run", lambda *args, **kwargs: pytest.fail("probe should be skipped"))
 
     kc._probe_macos_keychain(backend)
