@@ -191,10 +191,13 @@ export function macosListeningPids(port: number, candidatePids: number[], query 
   try {
     output = query('/usr/sbin/lsof', ['-nP', '-a', '-p', candidatePids.join(','), `-iTCP:${port}`, '-sTCP:LISTEN', '-Fp'])
   } catch (error) {
-    // lsof reports an empty intersection with exit 1, without a diagnostic.
+    // lsof exits 1 for an empty intersection, but inaccessible mounts can still
+    // emit these non-fatal warnings. Do not swallow any other diagnostic.
+    const mountWarnings = /^(?:lsof: WARNING: can't stat\(\)[^\r\n]*\r?\n\s*Output information may be incomplete\.\s*\r?\n\s*assuming "dev=[^"\r\n]+" from mount table\s*)*$/
+
     if (error instanceof Error && 'status' in error && error.status === 1
       && 'stdout' in error && String(error.stdout).trim() === ''
-      && 'stderr' in error && String(error.stderr).trim() === '') {
+      && 'stderr' in error && mountWarnings.test(String(error.stderr).trim())) {
       return []
     }
 
