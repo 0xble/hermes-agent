@@ -92,8 +92,9 @@ async def admit_message(authority, event):
             del authority.waiters[receipt.admission_id]
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
-        return (None if status == 'terminal' or internal_input(event)
-                else pause_notice(authority, receipt.ref, 'unknown_execution', event=event))
+        if status == 'terminal' or internal_input(event):
+            return None
+        return await _pause_reply(authority, receipt.ref, 'unknown_execution', event)
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
@@ -109,7 +110,7 @@ async def admit_message(authority, event):
                     'queued for moved, so it was dropped. Send it again to continue.')
         if row is not None:
             note_busy_parked(event)  # still queued (saved): answered after the pause, not dropped
-        return pause_notice(authority, receipt.ref, exc.reason, event=event)
+        return await _pause_reply(authority, receipt.ref, exc.reason, event)
     finally:
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
@@ -313,6 +314,16 @@ async def fire_post_delivery(authority, admission_id):
 async def _release_turn_marker(authority, event):
     if getattr(event, '_gateway_active_turn_token', None):
         await authority.runner._clear_durable_active_turn(event)
+
+
+async def _pause_reply(authority, ref, reason, event):
+    """``pause_notice`` for ``event``'s reply, once any unprompted notice already being sent to the
+    chat has its outcome: delivered, this reply stays silent; failed, this reply carries it."""
+    from gateway.session_pause_announce import await_announcement_send
+    await await_announcement_send(authority, ref)
+    if ref.session_id not in authority.sessions:
+        return None  # retired while the announcement was sending (a /reset): no pause left to tell
+    return pause_notice(authority, ref, reason, event=event)
 
 
 def settle_pause_notice(event, delivered):

@@ -22,7 +22,9 @@ An `unknown_execution` pause schedules one unprompted notice per pause episode, 
 generic `pause_notice` text, through the chat's normal delivery adapter, marked interim.
 `LiveSession.pause_notified` is shared with the reply path, so whichever reaches it first sends
 and a later message onto the same pause is saved silently. A failed send clears the flag so
-the next message still carries the notice. No notice is sent when no person's input waits
+the next message still carries the notice. A message whose reply path runs while the unprompted
+send is still in flight waits for that send's outcome (`await_announcement_send`), so a send that
+then fails leaves this message's reply to carry the notice, never silence on both paths. No notice is sent when no person's input waits
 (only unattended rows per `session_unattended_unknown.is_unattended`), to a known bot, to an
 app-only LOCAL session, without a deliverable adapter, while draining, or from an owner whose
 epoch is no longer the store's. Other pause reasons are unchanged.
