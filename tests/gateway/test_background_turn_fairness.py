@@ -174,3 +174,33 @@ async def test_drain_offers_a_held_watch_once_then_honors_backoff(monkeypatch, s
     assert inject.await_count == 4
     assert completions.get_nowait() is evt
     assert completions.empty()
+
+
+@pytest.mark.asyncio
+async def test_fresh_match_queued_before_an_older_refused_retry_keeps_its_backoff(monkeypatch):
+    """The producer can enqueue a fresh match while the older refused one awaits injection."""
+    from gateway.watch_match_coalesce import coalesce_pending_watch_matches
+
+    runner, adapter = _runner(1)
+    completions, evt, clock, inject = _watch_queue(runner, adapter, monkeypatch)
+    completions.get_nowait()
+    old = {**evt, "event_id": "old", "started_at": 1.0, "output": "ready 0", "suppressed": 2,
+           "_watch_retry_step": 2, "_watch_next_retry_at": 30.0, "_watch_injection_attempts": 1}
+    fresh = {**evt, "event_id": "fresh", "started_at": 1.0, "output": "ready 1", "suppressed": 0}
+
+    (folded,) = coalesce_pending_watch_matches([dict(fresh), dict(old)])
+    assert folded["event_id"] == "old"
+    assert folded["_watch_retry_step"] == 2
+    assert folded["_watch_next_retry_at"] == 30.0
+    assert folded["_watch_injection_attempts"] == 1
+    assert folded["output"] == "ready 1"
+    assert folded["suppressed"] == 3
+
+    completions.put(fresh)
+    completions.put(old)
+    clock.now = 5.0
+    await runner._drain_watch_notifications(completions)
+    assert inject.await_count == 0, "a fresh match must not bypass the held event's backoff"
+    assert completions.qsize() == 1
+    pending = completions.get_nowait()
+    assert (pending["event_id"], pending["output"]) == ("old", "ready 1")
