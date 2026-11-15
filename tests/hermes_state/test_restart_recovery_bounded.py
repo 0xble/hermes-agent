@@ -5,6 +5,7 @@ and ``release_handed_off_receipts`` read every local receipt inside the write lo
 finding nothing to release, so no message, receipt or lease could be written for ~50 s.
 """
 import json
+import re
 
 import pytest
 
@@ -58,10 +59,20 @@ def test_recovery_reads_only_in_flight_rows_and_keeps_its_effect(db):
     updates = [sql for sql in statements if sql.upper().startswith('UPDATE')
                and ('session_admissions' in sql or 'worker_executions' in sql)]
     assert len(updates) == 3, statements
+    # Any index over the whole table still visits settled history; only the partial
+    # in-flight indexes (a status predicate in their WHERE) keep recovery bounded.
+    in_flight = {name for name, sql in db._conn.execute(
+        "SELECT name, sql FROM sqlite_master WHERE type = 'index' "
+        "AND tbl_name IN ('session_admissions', 'worker_executions')")
+        if sql and re.search(r'\bWHERE\b.*\bstatus\b', sql, re.DOTALL)}
     for sql in updates:
         plan = [row[3] for row in db._conn.execute('EXPLAIN QUERY PLAN ' + sql)]
-        assert not any(detail in ('SCAN session_admissions', 'SCAN worker_executions') for detail in plan), (sql, plan)
-        assert any(' USING INDEX idx_' in detail for detail in plan), (sql, plan)
+        touched = [detail for detail in plan
+                   if re.match(r'(SCAN|SEARCH) (session_admissions|worker_executions)\b', detail)]
+        assert touched, (sql, plan)
+        for detail in touched:
+            used = re.fullmatch(r'(?:SCAN|SEARCH) \w+ USING (?:COVERING )?INDEX (\w+)(?: \(.*\))?', detail)
+            assert used and used.group(1) in in_flight, (sql, plan)
 
     with db._read_ctx() as conn:
         counts = dict(((status, outcome, owner), n) for status, outcome, owner, n in conn.execute(
