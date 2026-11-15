@@ -1095,6 +1095,15 @@ class ToolRegistry:
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
         results normalized, every exception returned as ``{"error": ...}``."""
+        # Refuse explicit browser nodes before any backend can drop the selector
+        # and act on a controller browser. An omitted node keeps legacy behavior.
+        if name.startswith("browser_") and isinstance(args, dict) and "node" in args:
+            return tool_error(
+                "Named-node browser operations are not implemented. "
+                "No controller browser or Camofox fallback was attempted.",
+                code="node_operation_unsupported", node=args["node"],
+                reason="named_node_browser_not_implemented",
+            )
         from agent.incognito import tool_refusal
         refusal = tool_refusal(name, args)
         if refusal:
