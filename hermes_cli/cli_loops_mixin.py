@@ -84,6 +84,33 @@ _SELF_INJECTED_TURN_PREFIXES = (
 )
 
 
+def _is_explicit_synthetic_turn(text: Any) -> bool:
+    """Classify only runtime-marked CLI injections, never user-authored slash text.
+
+    ``_is_self_injected_turn`` intentionally also recognizes broad notification prose for goal
+    revival. Failure provenance needs the narrower contract: process/delegation rows carry the
+    ``TimelineNotification`` type, while autonomous goal/loop/heartbeat turns carry exact generated
+    prefixes.
+    """
+    try:
+        from tools.process_registry_notifications import TimelineNotification
+        if isinstance(text, TimelineNotification):
+            return True
+    except Exception:
+        pass
+    if not isinstance(text, str):
+        return False
+    try:
+        from hermes_cli.goals import is_goal_continuation_text
+        if is_goal_continuation_text(text):
+            return True
+        from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX
+        from hermes_cli.loops import WAKEUP_PROMPT_PREFIX
+        return text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
+    except Exception:
+        return False
+
+
 def _is_self_injected_turn(text: Any) -> bool:
     # Standing-goal prompt forms are registered centrally; the remaining frames are
     # runtime-specific notifications that never represent user input.
@@ -948,6 +975,10 @@ class CLILoopsMixin:
 
         last_response, successful = self._post_turn_response()
         if not successful or getattr(self, "_last_turn_failed", False):
+            # A user turn starts a fresh retry budget; never let an earlier continuation's failure
+            # suppress the visible notice or consume this continuation's one retry.
+            if getattr(self, "_goal_turn_user_initiated", True):
+                self._goal_failed_retry_count = 0
             # A failed goal continuation is an internal work item, not a user request. Preserve
             # the active goal and retry its generated prompt once the current failure is settled;
             # never print the generic resend boundary as the continuation's answer.

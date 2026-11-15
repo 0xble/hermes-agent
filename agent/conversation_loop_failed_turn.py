@@ -51,10 +51,9 @@ def _close_durable_failed_turn(agent, result: Any) -> None:
         # A machine-origin turn must keep the transcript sequence closed, but its failed boundary is
         # not a reply to a person. Empty content lets the admission retry path own the failure without
         # leaking the human resend copy into Telegram/goal transcripts.
-        automatic = (
-            getattr(agent, "_turn_provenance", "unknown") in {"relay", "process", "goal_loop", "cron"}
-            and not result.get("interrupt_message")
-        )
+        automatic = getattr(agent, "_turn_provenance", "unknown") in {
+            "relay", "process", "goal_loop", "cron"
+        }
         boundary = {
             "role": "assistant",
             "content": "" if automatic else failed_turn_notice(turn_messages),

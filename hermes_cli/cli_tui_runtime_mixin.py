@@ -105,9 +105,8 @@ class CLITuiRuntimeMixin:
             return
         notification_preview = user_input if isinstance(user_input, TimelineNotification) else None
         try:
-            from hermes_cli.cli_loops_mixin import _is_self_injected_turn
-            self._goal_turn_user_initiated = (
-                notification_preview is None and not _is_self_injected_turn(user_input))
+            from hermes_cli.cli_loops_mixin import _is_explicit_synthetic_turn
+            self._goal_turn_user_initiated = not _is_explicit_synthetic_turn(user_input)
         except Exception:
             self._goal_turn_user_initiated = notification_preview is None
         self._status_bar_suppressed_after_resize = False  # input ends post-resize suppression
