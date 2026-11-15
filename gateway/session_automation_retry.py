@@ -36,8 +36,16 @@ async def defer_claimed_refusal(authority, ref, row, result):
     if not (isinstance(result, dict) and result.get('pre_execution_runtime_refusal')):
         # A claim does not prove execution. Keep the attempt count until the executor
         # succeeds, so repeated refusals grow the same admission's backoff.
-        if await asyncio.to_thread(retry_state, authority.db, row['admission_id']):
-            await tracked_write(authority, lambda: _clear_refusal(authority, row))
+        try:
+            if await asyncio.to_thread(_clock_cleanup_due, authority.db, row['admission_id']):
+                await tracked_write(authority, lambda: _clear_refusal(authority, row))
+        except Exception:
+            # The turn already ran: its result settles whatever happens to this metadata. A clock
+            # left behind belongs to a settled admission, which nothing claims again, and the next
+            # automation settle sweeps it (``_clear_refusal``).
+            logging.getLogger(__name__).warning(
+                'Retry clock of admission %s not cleared; the next settle sweeps it',
+                row['admission_id'], exc_info=True)
         return
     if result.get('api_calls') or result.get('tools') or result.get('messages'):
         raise AssertionError('only a proven pre-execution refusal may requeue an admission')
@@ -131,10 +139,25 @@ def _record_refusal(authority, ref, row, *, retried=False):
     return authority.db._execute_write(write)
 
 
+# Clocks no claim can read again: their admission settled (or is gone). A row back in the FIFO
+# (``queued``), under a live claim (``started``) or handed to one as a steer, which can return to
+# its FIFO place, keeps its clock.
+_ORPHANED = (f"key>'{_PREFIX}' AND key<'{_PREFIX[:-1]};' AND substr(key,{len(_PREFIX) + 1}) NOT IN "
+             "(SELECT admission_id FROM session_admissions "
+             "WHERE status IN ('queued','started') OR outcome='steering')")
+
+
+def _clock_cleanup_due(db, admission_id):
+    with db._read_ctx() as conn:
+        return conn.execute(f'SELECT 1 FROM state_meta WHERE key=? OR ({_ORPHANED}) LIMIT 1',
+                            (_PREFIX + admission_id,)).fetchone() is not None
+
+
 def _clear_refusal(authority, row):
+    """Delete this executed admission's clock, and any a failed cleanup left on a settled one."""
     def write(conn):
         _epoch(conn, authority.epoch)
-        conn.execute('DELETE FROM state_meta WHERE key=?', (_PREFIX + row['admission_id'],))
+        conn.execute(f'DELETE FROM state_meta WHERE key=? OR ({_ORPHANED})', (_PREFIX + row['admission_id'],))
     authority.db._execute_write(write)
 
 
