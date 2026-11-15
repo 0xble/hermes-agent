@@ -7,7 +7,9 @@ Fork patch identity: `restart-pause-notice`.
 - Owner: gateway native admission / unknown-execution recovery.
 - Scope: `gateway/session_pause_announce.py`, its call from `SessionAuthority._pause`,
   the `unknown_execution` branch of `SessionAuthority.recover_native_sessions`, and the
-  reply path's `gateway.session_ingress.pause_notice`, which records a notice it carries.
+  reply path's `gateway.session_ingress.pause_notice` and `settle_pause_notice`, which the
+  adapter's `_process_message_background` (`gateway/platforms/base.py`) calls with the outcome
+  of the reply that carried the notice.
 - Incident: after a forced gateway restart, startup recovery paused 4 Telegram topics on
   `unknown_execution`. The person's messages already queued behind each lost turn never ran,
   and the chats stayed silent for about 35 minutes, because `pause_notice` only reaches the
@@ -28,7 +30,9 @@ epoch is no longer the store's. Other pause reasons are unchanged.
 The episode is the session's earliest `unknown` admission. It outlives the process, but
 `pause_notified` does not, so a notice that reached the chat is recorded durably: a
 `state_meta` row `pause_notice:<admission_id>`, written off the loop after a successful
-unprompted send, or when the reply path carries the notice. Every boot schedules the
+unprompted send, or once the adapter reports that a reply carrying the notice was delivered. A
+reply whose send failed leaves the episode untold: `pause_notified` is cleared, so the next
+message carries it, and no marker is written, so the next boot announces it. Every boot schedules the
 announcement for each session paused on `unknown_execution`. A session whose episode already
 has a marker is not told again, and its `pause_notified` is set so a later message does not
 repeat it either. A boot whose send failed leaves no marker, so the next boot announces it.

@@ -93,7 +93,7 @@ async def admit_message(authority, event):
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
         return (None if status == 'terminal' or internal_input(event)
-                else pause_notice(authority, receipt.ref, 'unknown_execution'))
+                else pause_notice(authority, receipt.ref, 'unknown_execution', event=event))
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
@@ -109,7 +109,7 @@ async def admit_message(authority, event):
                     'queued for moved, so it was dropped. Send it again to continue.')
         if row is not None:
             note_busy_parked(event)  # still queued (saved): answered after the pause, not dropped
-        return pause_notice(authority, receipt.ref, exc.reason)
+        return pause_notice(authority, receipt.ref, exc.reason, event=event)
     finally:
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
@@ -315,19 +315,37 @@ async def _release_turn_marker(authority, event):
         await authority.runner._clear_durable_active_turn(event)
 
 
-def pause_notice(authority, ref, reason, *, told=True):
+def settle_pause_notice(event, delivered):
+    """The sender of ``event``'s reply reports whether the ``pause_notice`` it carried reached the
+    chat. Delivered: a lost turn's episode is recorded as told for later boots
+    (``session_pause_announce``). Not delivered: the episode is left untold, so the next message
+    (or the next boot's announcement) carries it instead of the pause staying silent."""
+    claim = getattr(event, '_pause_notice_claim', None)
+    if claim is None:
+        return
+    event._pause_notice_claim = None
+    authority, ref, live, reason = claim
+    if not delivered:
+        if authority.sessions.get(ref.session_id) is live:
+            live.pause_notified = False
+        return
+    if reason == 'unknown_execution':
+        from gateway.session_pause_announce import schedule_remember_told
+        schedule_remember_told(authority, ref)
+
+
+def pause_notice(authority, ref, reason, *, event=None):
     """The committed input stays queued behind a paused FIFO (a turn lost across an owner
     restart, or a head the preflight refused). Tell the platform user once per pause episode
     through the ordinary reply path; later messages onto the same pause are admitted silently.
-    ``told``: the reply carries it, so a lost turn's episode is recorded as told for later boots
-    (``session_pause_announce``); the unprompted announcement records only a send that succeeded."""
+    ``event``: the message whose reply carries the notice. The claim rides it until its sender
+    reports the send (``settle_pause_notice``); the unprompted announcement settles its own."""
     live = authority.sessions[ref.session_id]
     if live.pause_notified:
         return None
     live.pause_notified = True
-    if told and reason == 'unknown_execution':
-        from gateway.session_pause_announce import schedule_remember_told
-        schedule_remember_told(authority, ref)
+    if event is not None:
+        event._pause_notice_claim = (authority, ref, live, reason)
     if reason == 'runtime_draining':
         # Transient: the row runs when the restarted owner drains it, so /reset would be wrong advice.
         return '⏳ Hermes is restarting — your message is saved and will be answered when it is back.'

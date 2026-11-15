@@ -5604,6 +5604,8 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             # Stop typing BEFORE the post-delivery callback: a stuck callback must not keep it
             # alive.
             await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata)
+            from gateway.session_ingress import settle_pause_notice
+            settle_pause_notice(event, delivery_succeeded)  # a pause notice is told only once delivered
             if not (self._pending_messages.get(session_key) is event
                     and getattr(event, "_gateway_compression_deferred", False)):
                 # A FIFO-run turn names its exact owner and generation; the interrupt event's
