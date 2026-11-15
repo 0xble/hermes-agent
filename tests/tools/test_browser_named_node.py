@@ -10,7 +10,7 @@ import pytest
 
 from tools import browser_tool
 from tools.registry import registry
-from tests.tools.test_computer_use_nodes import endpoint, home  # noqa: F401
+from tests.tools.test_computer_use_nodes import endpoint as node_endpoint, home as node_home  # noqa: F401
 
 # These entrypoints register outside browser_tool's table. Exercise their actual
 # registrations too, without calling any handler or replacing the registry.
@@ -44,10 +44,10 @@ def no_other_browser(monkeypatch):
     monkeypatch.setattr(browser_control_broker, "browser_control_enabled", forbidden)
 
 
-def test_named_navigation_refuses_without_fallback(endpoint):
-    a, _, _, calls = endpoint
+def test_named_navigation_refuses_without_fallback(node_endpoint):
+    a, _, _, calls = node_endpoint
     args = {"node": "studio", "chrome_profile": "Personal", "url": "https://example.com"}
-    with home(a):
+    with node_home(a):
         out = dispatch(**args)
     assert_refused(out, "studio")
     assert args == {"node": "studio", "chrome_profile": "Personal", "url": "https://example.com"}
@@ -60,9 +60,9 @@ def test_every_registered_browser_refuses_explicit_node(name):
 
 
 @pytest.mark.parametrize("node", [None, "", " ", [], {}, 5, "missing"])
-def test_bad_node_never_falls_back(endpoint, node):
-    a, _, _, calls = endpoint
-    with home(a):
+def test_bad_node_never_falls_back(node_endpoint, node):
+    a, _, _, calls = node_endpoint
+    with node_home(a):
         out = dispatch(node=node, chrome_profile="Personal", url="https://example.com")
     assert_refused(out, node)
     assert not calls()
@@ -76,9 +76,9 @@ def test_model_dispatch_preserves_node_refusal(name):
     assert_refused(json.loads(str(result)), "studio")
 
 
-def test_omitted_node_preserves_account_and_raw_task_with_node_default(endpoint, monkeypatch):
+def test_omitted_node_preserves_account_and_raw_task_with_node_default(node_endpoint, monkeypatch):
     from gateway import browser_control_broker
-    a, _, _, calls = endpoint
+    a, _, _, calls = node_endpoint
     forwarded = []
 
     def navigate(**args):
@@ -87,7 +87,7 @@ def test_omitted_node_preserves_account_and_raw_task_with_node_default(endpoint,
 
     monkeypatch.setattr(browser_tool, "browser_navigate", navigate)
     monkeypatch.setattr(browser_control_broker, "browser_control_enabled", lambda: False)
-    with home(a):  # This profile has nodes.default=studio. Browsers must ignore it.
+    with node_home(a):  # This profile has nodes.default=studio. Browsers must ignore it.
         out = dispatch(account="personal", url="https://example.com", task="raw-task")
     assert out == {"success": True, "backend": "camofox"}
     assert forwarded == [{"url": "https://example.com", "account": "personal", "task_id": "raw-task"}]
