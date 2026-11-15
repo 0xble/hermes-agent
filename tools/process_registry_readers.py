@@ -34,6 +34,10 @@ class ProcessRegistry:
         self._finish_exited(session, exit_code())
 
 
+    def get(self, session_id: str):
+        """Resolve a handle and refresh its original backend only."""
+        return self._lookup_session(session_id)
+
     def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
         from tools.process_registry import logger
         return _poll_environment(self, session, env, log_path, pid_path, exit_path, logger)

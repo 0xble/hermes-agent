@@ -1448,7 +1448,6 @@ def _deliver_standalone(
     err = None
     delivered_text = False
     delivered_copy_count = 0
-    partial = False
     for payload_content, payload_media, is_copy_block in payloads:
         if is_copy_block:
             result, err = _standalone_send(t, payload_content, payload_media, copy_block=True)
@@ -1456,10 +1455,9 @@ def _deliver_standalone(
             result, err = _standalone_send(t, payload_content, payload_media)
         if err is None and result and result.get("error"):
             err = f"delivery error: {result['error']} (target {t.where})"
-            from gateway.platforms._shared import NONE, PARTIAL, delivery_state
+            from gateway.platforms._shared import NONE, delivery_state
             state = delivery_state(result)
             t.standalone_in_flight = t.standalone_in_flight or state != NONE
-            partial = state == PARTIAL
             logger.error("Job '%s': %s", job["id"], err)
         if err is not None:
             break

@@ -1902,10 +1902,6 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             return None
         return self._refresh_detached_session(session)
 
-    def get(self, session_id: str) -> Optional[ProcessSession]:
-        """Resolve a handle and refresh its original backend only."""
-        return self._lookup_session(session_id)
-
     def _resolve_prefix(self, session_id: str) -> Optional[ProcessSession]:
         """Resolve a unique session-ID prefix (a bare hex tail is normalized to
         ``proc_<tail>``); :meth:`get` tries exact first."""
