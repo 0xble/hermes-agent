@@ -93,6 +93,7 @@ def _alive(pid: int) -> bool:
 
 
 class TestSweepDecisions:
+    @pytest.mark.platforms("posix")  # real AF_UNIX sockets and owner records
     def test_reaps_orphan_and_skips_live_owner(self, short_tmp):
         exe = "/tmp/hct-fake-cua-driver"
         live = short_tmp / "hc-live.sock"
@@ -165,7 +166,7 @@ class TestSweepDecisions:
         )
         assert killed == [9]
 
-
+    @pytest.mark.platforms("posix")  # macOS /var -> /private/var spelling on a real filesystem
     def test_live_driver_socket_survives_a_symlinked_temp_dir_spelling(self, short_tmp, monkeypatch):
         """macOS: the driver is started with ``/var/...`` (here ``/tmp/...``) while the sweep lists
         the real ``/private/...`` directory. A live driver's socket must match either spelling."""
@@ -197,6 +198,7 @@ class TestSweepDecisions:
             shutil.rmtree(link, ignore_errors=True)
 
 
+@pytest.mark.platforms("posix")  # real process groups, fork, and AF_UNIX sockets
 @pytest.mark.live_system_guard_bypass  # these tests kill session-leader and ppid-1 fakes they spawned
 class TestProcessLifetime:
     def test_explicit_terminate_kills_the_driver_group(self, tmp_path, short_tmp):
