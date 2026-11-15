@@ -1054,9 +1054,16 @@ def _restart_launchd_gateway_after_update(
     return [], [current_label]
 
 
-def _restart_macos_launchd_gateways(*args, **kwargs) -> None:
+def _restart_macos_launchd_gateways(
+    restarted_services: list, failed_or_stale_units: list, drain_budget: float, *, require_supervision: bool = False,
+    self_restart_pending: set | None = None, acknowledged_label: str | None = None,
+) -> None:
+    """Preserve the facade seam for the topical macOS fleet implementation."""
     from hermes_cli.update_cmd_fleet_launchd import restart_macos_launchd_gateways
-    return restart_macos_launchd_gateways(*args, **kwargs)
+    return restart_macos_launchd_gateways(
+        restarted_services, failed_or_stale_units, drain_budget,
+        require_supervision=require_supervision, self_restart_pending=self_restart_pending,
+        acknowledged_label=acknowledged_label)
 
 
 def _surviving_gateway_pids_after_failed_restart():
