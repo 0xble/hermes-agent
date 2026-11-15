@@ -76,6 +76,9 @@ not only the command reply.
   owner's actual lineage. A public message, title, tool output or result mentioning
   a private session ID remains public content. Privacy refusal is `privacy_denied`,
   never a successful empty receipt, and consumes no sequence or revision.
+  A title write also owns every row it may clear: the exact holder, and for an
+  automatic reclaim each holder the reclaim's shared `auto_title_holders`
+  predicate matches (case-folded or `#N` alias), so a private holder refuses it.
 - Worker outboxes check producer scope, revoked copied work and typed ownership
   before their first save, replay or adoption save. Public writes still journal
   before send. A definite first-send owner privacy refusal releases its uncommitted
