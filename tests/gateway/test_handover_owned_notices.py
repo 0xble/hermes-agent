@@ -251,3 +251,33 @@ async def test_watch_notice_remains_owned_while_route_resolution_yields(monkeypa
         await draining
     await async_wait_until(lambda: drain.status(runner)['idle'], what='watch admission and send to settle')
     assert len(executed) == 2 and 'RESULT' in executed[-1]
+
+
+@pytest.mark.asyncio
+async def test_process_completion_remains_owned_while_batch_admission_yields(monkeypatch):
+    from unittest.mock import AsyncMock
+
+    executed = []
+    runner, adapter, authority, source = await owned_route(monkeypatch, executed)
+    await start_human_turn(runner, adapter, authority, source, None)
+    await asyncio.gather(*(live.task for live in authority.sessions.values() if live.task))
+    await async_wait_until(lambda: not adapter._active_sessions, what='initial send to settle')
+    release_handover(runner)
+    checking, release = asyncio.Event(), asyncio.Event()
+
+    async def hold_after_pop(*args, **kwargs):
+        checking.set()
+        await release.wait()
+        return 0
+
+    monkeypatch.setattr(runner, '_completion_hold_seconds', hold_after_pop)
+    monkeypatch.setattr(runner, '_deliver_completion_notification', AsyncMock(return_value=True))
+    delivering = asyncio.create_task(
+        runner._enqueue_process_completion_notification('RESULT', notice(runner, source, 'completion')))
+    try:
+        await asyncio.wait_for(checking.wait(), 10)
+        assert not drain.status(runner)['idle'], 'a popped process completion owns its admission'
+    finally:
+        release.set()
+        assert await delivering is True
+    await async_wait_until(lambda: drain.status(runner)['idle'], what='process completion to settle')
