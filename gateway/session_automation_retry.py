@@ -26,7 +26,7 @@ def held_runtime_refusal(event, result):
     return True
 
 
-async def defer_claimed_refusal(authority, row, result):
+async def defer_claimed_refusal(authority, ref, row, result):
     if not is_automation(row):
         return
     from gateway.session_runtime_workers import tracked_write
@@ -38,8 +38,21 @@ async def defer_claimed_refusal(authority, row, result):
         return
     if result.get('api_calls') or result.get('tools') or result.get('messages'):
         raise AssertionError('only a proven pre-execution refusal may requeue an admission')
-    await tracked_write(authority, lambda: _record_refusal(authority, row))
+    if not await tracked_write(authority, lambda: _record_refusal(authority, ref, row)):
+        # A Stop this claim accepted ends the work: it settles interrupted, never retried later
+        # when the model or credentials recover.
+        result.pop('failed', None)
+        result.update(interrupted=True, completed=False)
+        return
     raise AutomationRuntimeDeferred()
+
+
+def _stop_accepted(authority, ref, row):
+    """``interrupt`` accepted a Stop for this exact claim: latched before an agent existed, or
+    delivered to the route's agent. Both are loop-side dicts; a read here is atomic."""
+    generation = row['generation']
+    return generation in (authority.pending_stops.get(ref.session_id),
+                          authority.delivered_stops.get(ref.session_id))
 
 
 def is_automation(row):
@@ -63,13 +76,19 @@ class AutomationRuntimeDeferred(Exception):
     """The FIFO retained a pre-execution refusal, not an executed or unknown turn."""
 
 
-def _record_refusal(authority, row):
+def _record_refusal(authority, ref, row):
+    """Requeue the refused claim with its next backoff: True. False, writing only the cleared
+    retry clock, when a Stop was accepted for the claim; it is checked inside the write, so a Stop
+    that lands while the write waits for the writer lock is honored too."""
     def write(conn):
         _epoch(conn, authority.epoch)
         current = _admission(conn, row['admission_id'])
         if (current['status'] != 'started' or current['owner_epoch'] != authority.epoch
                 or current['generation'] != row['generation']):
             raise RuntimeStoreError('stale_generation')
+        if _stop_accepted(authority, ref, row):
+            conn.execute('DELETE FROM state_meta WHERE key=?', (_PREFIX + row['admission_id'],))
+            return False
         conn.execute("UPDATE session_admissions SET status='queued',owner_epoch=NULL,generation=NULL "
                      "WHERE admission_id=?", (row['admission_id'],))
         old = conn.execute('SELECT value FROM state_meta WHERE key=?', (_PREFIX + row['admission_id'],)).fetchone()
@@ -78,7 +97,8 @@ def _record_refusal(authority, row):
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?) '
                      'ON CONFLICT(key) DO UPDATE SET value=excluded.value',
                      (_PREFIX + row['admission_id'], json.dumps(state)))
-    authority.db._execute_write(write)
+        return True
+    return authority.db._execute_write(write)
 
 
 def _clear_refusal(authority, row):

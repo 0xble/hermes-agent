@@ -52,6 +52,10 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   behind it (`claimable_head`). The claim may overtake only the rows the drain named, checked in
   the claim transaction. Later automation rows keep their place behind the refused one. Without
   this, a refusal that never clears held every human message in the topic behind it with no reply.
+- A Stop accepted for the refused claim (latched in `pending_stops` or delivered) wins over the
+  retry: the claim settles `interrupted` and its retry clock is deleted, checked inside the requeue
+  write so a Stop that lands while the write waits for the writer lock counts too. Requeueing it
+  would run work the person stopped once the model or credentials recover.
 - Source: `gateway/session_automation_retry.py`, `gateway/session_authority.py`,
   `gateway/session_ingress.py`, `gateway/session_automation.py`, `gateway/run_turn.py`,
   `gateway/run_turn_runner.py`.
