@@ -75,8 +75,9 @@ not only the command reply.
   A SIGKILL of the outgoing zero-cut gateway can leave its interval until the next startup sweep.
   The default parent is outside `HERMES_HOME`, in the account cache root and scoped to the
   process Hermes home (`~/Library/Caches/Hermes/incognito/<home-hash>/` on macOS,
-  `$XDG_CACHE_HOME/Hermes/incognito/<home-hash>/` elsewhere), because the startup sweep
-  removes everything under the parent and must never reach another home's live interval.
+  `$XDG_CACHE_HOME/Hermes/incognito/<home-hash>/` elsewhere), so the startup sweep
+  cannot reach another home's live interval. Zero-cut promotion preserves directories
+  owned by another live gateway process; clean shutdown removes its own intervals.
   `incognito.private_dir` may override that parent (for example, to a RAM-backed volume)
   and must not be shared between Hermes homes. Kernel scripts, spill files and temporary
   content stay inside the interval. The random 0600 AF_UNIX RPC endpoint uses
@@ -90,6 +91,12 @@ not only the command reply.
   creates one. Cleanup that cannot delete a directory records a content-free failure
   through `log_private_failure` and does not fail `/incognito off`; the startup sweep
   reports how many directories it removed.
+- Local terminal commands preserve private `TMPDIR`, `TMP` and `TEMP` values when
+  sourcing a public shell snapshot. Remote media downloads resolve the document cache
+  inside the active interval rather than using an import-time public path.
+  Private Docker turns create no cache bind mounts from the private interval.
+  `execute_code` is available only on the local execution backend while private;
+  remote execution is refused because remote kernels can outlive the interval.
 - Picker dispatch and ingress share 1 callback-family registry. Only exact chat
   and sent-message IDs may resolve existing RAM prompt state and its session lane.
   Stale buttons cannot run or consume a newer prompt. Unmatched pickers remain

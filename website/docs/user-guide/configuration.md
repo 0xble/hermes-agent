@@ -52,6 +52,9 @@ cache root (`~/Library/Caches/Hermes/incognito/` on macOS) in a folder specific 
 Hermes home. Set `incognito.private_dir` to override it, with a different path for each
 Hermes home.
 
+`execute_code` works in incognito only with the local execution backend. Remote
+execution backends are refused because their kernels can outlive the private interval.
+
 Optionally choose a private model using the same model-route syntax as `/model`:
 
 ```yaml
