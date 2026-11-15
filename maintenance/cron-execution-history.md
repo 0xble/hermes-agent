@@ -16,7 +16,10 @@ This is a row ceiling, not a strict byte quota: output sizes can change.
 (default `8`, `0` disables age expiration while retaining the row backstop).
 Read it in the owning profile at each terminal transition. Retention is best-effort:
 any configuration-resolution failure falls back to the default window and must
-not roll back the execution's terminal state. A duration that overflows the
+not roll back the execution's terminal state. An unavailable config backend
+(`ConfigBackendUnavailable`, a `SystemExit` subclass) is caught explicitly and
+skips only age pruning for that call, because the selected backend may hold a
+longer window than the default. A duration that overflows the
 UTC cutoff disables only age pruning for that call; the row backstop still runs.
 The virtual-clock
 DST soak configures a window longer than its full simulated span: it proves
