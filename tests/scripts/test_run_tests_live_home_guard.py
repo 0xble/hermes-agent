@@ -7,12 +7,14 @@ refuse, write nothing, and tell the caller how to rebuild the checkout venv
 or point ``HERMES_HOME`` at a scratch directory.
 """
 from pathlib import Path
+import contextlib
 import json
 import os
 import shutil
 import subprocess
 import sys
 import shlex
+import uuid
 
 import pytest
 
@@ -492,15 +494,23 @@ def test_account_default_home_matches_passwd_lookup_and_suffix(tmp_path):
     plain = _source(script, "source \"$1\"; hermes_account_default_home", env=env)
     assert plain.returncode == 0, plain.stdout + plain.stderr
     assert plain.stdout.strip() == str(account / ".hermes")
-    suffixed = _source(
-        script,
-        "source \"$1\"; hermes_account_default_home",
-        env={**env, "HERMES_DATA_DIR_SUFFIX": "-probe"},
-    )
-    assert suffixed.returncode == 0, suffixed.stdout + suffixed.stderr
-    assert suffixed.stdout.strip() == str(account / ".hermes-probe")
-    assert not pinned.exists()
-    assert not (account / ".hermes-probe").exists()
+    # The account home is real: pick a suffix no live home can already hold.
+    suffix = f"-probe-{uuid.uuid4().hex}"
+    probed = account / f".hermes{suffix}"
+    assert not os.path.lexists(probed)
+    try:
+        suffixed = _source(
+            script,
+            "source \"$1\"; hermes_account_default_home",
+            env={**env, "HERMES_DATA_DIR_SUFFIX": suffix},
+        )
+        assert suffixed.returncode == 0, suffixed.stdout + suffixed.stderr
+        assert suffixed.stdout.strip() == str(probed)
+        assert not pinned.exists()
+        assert not os.path.lexists(probed)
+    finally:
+        with contextlib.suppress(OSError):
+            probed.rmdir()  # only if a broken lookup created it; the name is ours alone
 
 
 @pytest.mark.platforms("posix")

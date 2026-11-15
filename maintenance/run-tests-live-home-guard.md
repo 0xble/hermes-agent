@@ -46,7 +46,9 @@ then run `env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv/bin/python" script
 with their original test arguments. Rebuilding alone does not select `.venv`;
 the explicit interpreter must contain pytest, and a stale activation must be
 cleared for that command because activation takes precedence over `HERMES_PYTHON`.
-The alternative is to set `HERMES_HOME` to a scratch directory.
+The alternative is to point both `HERMES_HOME` and `HERMES_RUNTIME_DIR` at scratch
+directories. With `HERMES_HOME` alone, the pre-PM store check still sees the default
+bootstrap store (`~/.hermes/tools`) beneath the account's live home and refuses.
 `HERMES_ALLOW_LIVE_HOME_SETUP=1` is the only opt-in to setup against a live home,
 and only for a deliberate setup against that home.
 
