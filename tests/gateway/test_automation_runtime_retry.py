@@ -270,3 +270,59 @@ def test_real_turn_runner_stamps_resolution_refusal_before_agent_construction(mo
         assert not held_runtime_refusal(SimpleNamespace(internal=False), result)
     finally:
         execution_result.reset(token)
+
+
+@pytest.mark.asyncio
+async def test_a_stop_accepted_before_a_refusal_settles_the_claim_interrupted(tmp_path, monkeypatch):
+    """A refusal must not requeue work a Stop already ended: it would run once the model or
+    credentials recover, after the person stopped it."""
+    from gateway import session_automation_retry as retry
+    from gateway.session_contract import SessionActor
+    from gateway.session_results import execution_result
+    from hermes_state_runtime import get_session_admission
+    runner, authority, _adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    ref = SessionRef(authority.profile_id, metadata['gateway_session_id'])
+    actor = SessionActor('app-viewer', authority.profile_id, frozenset({'session:control'}), 'viewer')
+    clock = SimpleNamespace(now=1000.0)
+    seen, stop = [], SimpleNamespace(on=False, handle=None)
+
+    async def execute(event):
+        if event.internal:
+            if stop.on:
+                stop.handle = await authority.interrupt(actor, ref, authority._handle(ref).execution_generation)
+            execution_result.get()['result'] = {'pre_execution_runtime_refusal': True,
+                'failed': True, 'messages': [], 'tools': [], 'api_calls': 0}
+        else:
+            seen.append(event.text)
+            execution_result.get()['result'] = {'final_response': '', 'messages': [], 'api_calls': 1}
+
+    monkeypatch.setattr(runner, '_handle_message', execute)
+    monkeypatch.setattr(retry, 'time', SimpleNamespace(time=lambda: clock.now))
+    try:
+        await authority._drain(ref)
+        seen.clear()
+        assert await runner._inject_watch_notification('stopped result', dict(type='completion',
+            event_id='stopped', session_id='stopped', started_at=1.0,
+            session_key=metadata['gateway_session_key'], parent_session_id=ref.session_id)) is True
+        identity = list_session_admissions(authority.db, session_id=ref.session_id)[0]['admission_id']
+        live = authority.sessions[ref.session_id]
+        row, _ = await authority._claim_next(ref, live)
+        assert await authority._execute_claimed(ref, live, row) == (None, 'deferred')
+        assert retry_state(authority.db, identity)['attempt'] == 1
+
+        clock.now = retry_state(authority.db, identity)['due_at']
+        stop.on = True
+        row, _ = await authority._claim_next(ref, live)
+        assert row['admission_id'] == identity
+        response, outcome = await authority._execute_claimed(ref, live, row)
+        assert stop.handle is not None and stop.handle.execution_state == 'running'  # Accepted.
+        assert outcome != 'deferred'
+        from gateway.session_settlement_recovery import settle_and_deliver
+        await settle_and_deliver(authority, live, ref, row, response, outcome)
+        settled = get_session_admission(authority.db, admission_id=identity)
+        assert (settled['status'], settled['outcome']) == ('terminal', 'interrupted')
+        assert list_session_admissions(authority.db, session_id=ref.session_id) == []
+        assert retry_state(authority.db, identity) == {}  # No orphaned retry clock.
+        assert seen == []
+    finally:
+        authority.db.close()
