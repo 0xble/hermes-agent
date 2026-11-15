@@ -619,11 +619,12 @@ class GatewayTurnPersistenceMixin:
                     "queued_terminal_display_kind", prepared.persist_user_display_kind) == "supervisor_checkin"
                 from gateway.run_turn import _failed_turn_copy_is_user_facing
                 notice = response if supervisor_status else self._hmwa_failed_turn_notice(agent_result)
-                if not _failed_turn_copy_is_user_facing(
+                if not supervisor_status and not _failed_turn_copy_is_user_facing(
                     event, prepared.persist_user_display_kind,
                 ):
-                    # The fallback writer is also a boundary owner. Synthetic turns must keep an
-                    # empty failed boundary even when the agent-core closer wrote nothing.
+                    # Only the generic resend boundary is human-facing copy. A supervisor's
+                    # normalized status is explicit durable work content and must survive even on
+                    # a synthetic origin; synthetic failures without status content stay empty.
                     notice = ""
                 await self._hmwa_close_failed_turn(
                     sid, notice, self._hmwa_own_failed_boundary_row_id(agent_result) if supervisor_status else None)
