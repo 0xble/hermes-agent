@@ -46,6 +46,33 @@ async def test_scope_discovery_is_off_loop_and_uses_served_primary_home(tmp_path
 
 
 @pytest.mark.asyncio
+async def test_single_profile_gateway_checks_its_named_launch_profile(tmp_path, monkeypatch, caplog):
+    from hermes_constants import get_default_hermes_root
+    root = tmp_path / ".hermes"
+    work = root / "profiles" / "work"
+    work.mkdir(parents=True)
+    (root / "config.yaml").write_text("memory: {provider: builtin}\n")
+    (work / "config.yaml").write_text("memory: {provider: fixture}\n")
+    monkeypatch.setenv("HERMES_HOME", str(work))
+    monkeypatch.setattr("hermes_cli.version_info.get_code_identity", lambda: {"sha": "A"})
+    assert get_default_hermes_root() == root
+    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda *args, **kwargs: SimpleNamespace(
+        is_available=lambda: False, unavailable_reason=lambda: "SDK client is missing"))
+    monkeypatch.setattr("hermes_cli.memory_setup.memory_provider_dependency_inputs",
+                        Mock(return_value=({}, {})))
+    gateway = SimpleNamespace(config=SimpleNamespace(multiplex_profiles=False),
+                              _served_home_channel_transports=lambda: [(None, "fixture", None, "operator", object())],
+                              _send_home_channel_message=AsyncMock(return_value=True))
+    caplog.set_level(logging.ERROR, logger="gateway.runtime_health")
+    await health.check_memory_health(gateway)
+    gateway._send_home_channel_message.assert_awaited_once()
+    assert "Memory provider fixture is unavailable: SDK client is missing" in (
+        gateway._send_home_channel_message.call_args.args[3])
+    assert health._marker(work).with_suffix(".notified").exists()
+    assert not (root / "state").exists()
+
+
+@pytest.mark.asyncio
 async def test_startup_does_not_await_blocked_advisory_health(monkeypatch):
     entered, release = asyncio.Event(), asyncio.Event()
 
