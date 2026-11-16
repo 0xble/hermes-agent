@@ -36,26 +36,27 @@ _ROUTE_KEYS = ("provider", "base_url", "api_mode")
 
 def mark_fallback_route(agent: Any, fallback_model: str) -> None:
     """Record on the session row that its route now comes from a provider fallback (best effort)."""
-    if getattr(agent, "_persist_disabled", False):
-        return
-    session_id = getattr(agent, "session_id", None)
-    patcher = getattr(getattr(agent, "_session_db", None), "patch_session_model_config", None)
-    if not session_id or not callable(patcher) or not fallback_model:
-        return
-    rt = getattr(agent, "_primary_runtime", None) or {}
-    primary_model = str(rt.get("model") or "").strip()
-    primary: dict[str, Any] = {}
-    if primary_model:
-        from hermes_cli.runtime_provider_custom import session_provider_identity
-        primary = {
-            "model": primary_model,
-            "provider": session_provider_identity(
-                rt.get("provider"), rt.get("requested_provider"), rt.get("base_url"), primary_model) or None,
-            "base_url": rt.get("base_url") or None,
-            "api_mode": rt.get("api_mode") or None,
-        }
-        primary = {k: v for k, v in primary.items() if v}
     try:
+        if getattr(agent, "_persist_disabled", False):
+            return
+        session_id = getattr(agent, "session_id", None)
+        patcher = getattr(getattr(agent, "_session_db", None), "patch_session_model_config", None)
+        if not session_id or not callable(patcher) or not fallback_model:
+            return
+        rt = getattr(agent, "_primary_runtime", None)
+        rt = rt if isinstance(rt, dict) else {}
+        primary_model = str(rt.get("model") or "").strip()
+        primary: dict[str, Any] = {}
+        if primary_model:
+            from hermes_cli.runtime_provider_custom import session_provider_identity
+            primary = {
+                "model": primary_model,
+                "provider": session_provider_identity(
+                    rt.get("provider"), rt.get("requested_provider"), rt.get("base_url"), primary_model) or None,
+                "base_url": rt.get("base_url") or None,
+                "api_mode": rt.get("api_mode") or None,
+            }
+            primary = {k: v for k, v in primary.items() if v}
         patcher(session_id, {FALLBACK_ROUTE_KEY: {"model": str(fallback_model), "primary": primary}})
     except Exception:
         logger.debug("fallback route marker could not be stored on the session row", exc_info=True)

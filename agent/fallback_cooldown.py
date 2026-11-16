@@ -49,8 +49,10 @@ def noninteractive_transient_retry_window_seconds(agent) -> float:
     override = getattr(agent, "_noninteractive_transient_retry_window_seconds", None)
     if override is not None:
         try:
-            return max(0.0, float(override))
-        except (TypeError, ValueError):
+            value = float(override)
+            if math.isfinite(value) and value >= 0:
+                return value
+        except (OverflowError, TypeError, ValueError):
             pass
     try:
         from hermes_cli.config import load_config

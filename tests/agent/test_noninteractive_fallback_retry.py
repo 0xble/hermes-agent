@@ -115,6 +115,7 @@ def test_delegation_fallback_window_has_three_minute_default_and_allows_zero_ove
     assert DEFAULT_NONINTERACTIVE_TRANSIENT_RETRY_WINDOW_SECONDS == 180.0
     assert noninteractive_transient_retry_window_seconds(_stub("subagent")) == 180.0
     assert noninteractive_transient_retry_window_seconds(_stub("subagent", window=0)) == 0.0
+    assert noninteractive_transient_retry_window_seconds(_stub("subagent", window=float("inf"))) == 180.0
 
 
 # --- integration: the real retry loop ------------------------------------------------------

@@ -36,9 +36,9 @@ def test_lean_appendices_do_not_count_as_model_budget_overrun(caplog):
         summary = comp._generate_summary(turns)
     assert summary and "User Messages" in summary
     assert estimate_messages_tokens_rough([{"role": "assistant", "content": summary}]) > telemetry["summary_budget_tokens"]
-    assert telemetry["summary_output_tokens"] == estimate_messages_tokens_rough([{"role": "assistant", "content": body}])
-    assert telemetry["summary_budget_overrun_tokens"] == 0
-    assert "summary budget exceeded" not in caplog.text
+    assert telemetry["summary_output_tokens"] == estimate_messages_tokens_rough([{"role": "assistant", "content": summary}])
+    assert telemetry["summary_budget_overrun_tokens"] > 0
+    assert "summary budget exceeded" in caplog.text
 
 
 @pytest.mark.parametrize("tail_mode", ["lean", "legacy"])

@@ -47,6 +47,12 @@ def test_reload_after_a_fallback_turn_restores_the_primary_route(tmp_path):
         db.close()
 
 
+def test_fallback_marker_is_best_effort_for_malformed_primary_runtime():
+    patcher = SimpleNamespace(patch_session_model_config=lambda *args: (_ for _ in ()).throw(AssertionError("not reached")))
+    agent = SimpleNamespace(session_id="s1", _session_db=patcher, _persist_disabled=False, _primary_runtime="stale")
+    mark_fallback_route(agent, "deepseek-flash")
+
+
 def test_an_explicit_model_pick_of_the_fallback_model_survives_reload(tmp_path):
     db = SessionDB(tmp_path / "state.db")
     try:
