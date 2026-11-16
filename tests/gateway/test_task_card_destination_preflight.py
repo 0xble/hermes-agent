@@ -125,6 +125,26 @@ async def test_destination_preflight_survives_transport_recovery(
 
 
 @pytest.mark.asyncio
+async def test_tool_progress_off_never_publishes_native_task_card(monkeypatch):
+    """An explicit tool-progress off turn must not leak a native Slack card."""
+    adapter, client = make_adapter("native", monkeypatch)
+    adapter._app = SimpleNamespace(client=client)
+    events = queue.Queue()
+    events.put({"type": "tool.started", "tool_call_id": "call-1", "tool_name": "terminal"})
+    events.put({"type": "tool.completed", "tool_call_id": "call-1", "tool_name": "terminal"})
+    ctx = SimpleNamespace(
+        source=SimpleNamespace(chat_id="D1"), _progress_reply_to="100.2",
+        _progress_metadata={"thread_id": "100.1"}, _cleanup_progress=False,
+        progress_queue=events, tool_progress_enabled=False, tool_progress_explicit=True,
+        _run_still_current=lambda: not events.empty(), agent_holder=[None],
+    )
+
+    await TurnRunner(None, ctx)._send_native_task_card_progress(adapter)
+
+    assert client.api_call.await_args_list == []
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error,suppressed", [
     ("slack task_card requires a thread anchor", True),
     ("slack task_card requires a thread anchor (Slack streams are thread replies)", True),
