@@ -35,8 +35,27 @@ def usage_snapshot_document(snapshot) -> dict:
     }
 
 
+def cmd_ledger(args: argparse.Namespace) -> int:
+    """Read local size/route-only provider request rows; no provider calls are made."""
+    from hermes_cli.observability.request_usage_ledger import request_usage_rows
+
+    rows = request_usage_rows(
+        source=getattr(args, "source", None), model=getattr(args, "model", None),
+        cron_job_id=getattr(args, "cron_job_id", None), since=getattr(args, "since", None),
+        limit=getattr(args, "limit", 1000),
+    )
+    if getattr(args, "json", False):
+        print(json.dumps(rows, indent=2, sort_keys=True))
+    else:
+        for row in rows:
+            print(json.dumps(row, sort_keys=True))
+    return 0
+
+
 def cmd_usage(args: argparse.Namespace) -> int:
     """Print the configured (or ``--provider``) account's usage windows; exit 1 when nothing could be fetched."""
+    if getattr(args, "usage_command", None) == "ledger":
+        return cmd_ledger(args)
     from agent.account_usage import fetch_account_usage, render_account_usage_lines
     from hermes_cli.runtime_provider import resolve_requested_provider
 
@@ -71,3 +90,16 @@ def build_usage_parser(subparsers) -> None:
     usage_parser.add_argument(
         "--json", action="store_true", help="Print one JSON document instead of the human-readable block")
     usage_parser.set_defaults(func=cmd_usage)
+    ledger_parser = usage_parser.add_subparsers(dest="usage_command")
+    ledger = ledger_parser.add_parser(
+        "ledger", help="Read local size/route-only provider request telemetry")
+    ledger.add_argument("--source", default=None)
+    ledger.add_argument("--model", default=None)
+    ledger.add_argument("--cron-job-id", default=None)
+    ledger.add_argument("--since", default=None, help="Only rows at or after this ISO-8601 timestamp")
+    ledger.add_argument("--limit", type=int, default=1000, help="Maximum rows to print (default: 1000)")
+    # Keep the parent --json value when it appears before ``ledger`` while also accepting
+    # the conventional ``usage ledger --json`` spelling.
+    ledger.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="Print a JSON array")
+    ledger.set_defaults(func=cmd_usage, usage_command="ledger")
