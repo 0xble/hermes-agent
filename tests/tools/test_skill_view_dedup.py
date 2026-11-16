@@ -2,10 +2,12 @@
 
 import json
 import os
+import re
 import time
 
 import pytest
 
+from agent.conversation_compression_boundary import mark_context_loss_boundary
 from tools.skills_tool import (
     _skill_view_with_bump,
     reset_skill_view_dedup,
@@ -57,6 +59,8 @@ class TestSkillViewDedup:
         assert r2.get("dedup") is True
         assert r2.get("content_returned") is False
         assert "content" not in r2
+        assert r2["name"] == "demo-dedup-skill"
+        assert r2["path"] == _view("demo-dedup-skill").get("path")
 
     def test_modified_skill_returns_full_content(self, skills_home):
         _view("demo-dedup-skill")
@@ -76,16 +80,63 @@ class TestSkillViewDedup:
         r2 = _view("demo-dedup-skill", file_path="references/guide.md")
         assert r2.get("dedup") is True
 
+    def test_changed_linked_file_returns_full_content(self, skills_home):
+        _view("demo-dedup-skill", file_path="references/guide.md")
+        ref = skills_home / "skills" / "demo-dedup-skill" / "references" / "guide.md"
+        ref.write_text("# Guide\n\nUpdated reference content.\n", encoding="utf-8")
+        r2 = _view("demo-dedup-skill", file_path="references/guide.md")
+        assert "Updated reference" in r2.get("content", "")
+        assert r2.get("dedup") is None
+
     def test_different_tasks_do_not_share_cache(self, skills_home):
         _view("demo-dedup-skill", task="task-A")
         r = _view("demo-dedup-skill", task="task-B")
         assert "Step one" in r.get("content", "")
 
-    def test_reset_returns_full_content(self, skills_home):
+    def test_context_generation_returns_full_content(self, skills_home):
         _view("demo-dedup-skill")
-        reset_skill_view_dedup("t-svd")
+        assert _view("demo-dedup-skill").get("dedup") is True
+        mark_context_loss_boundary(type("Agent", (), {"session_id": "session-svd"})(), "t-svd")
         r2 = _view("demo-dedup-skill")
         assert "Step one" in r2.get("content", "")
+        assert r2.get("dedup") is None
+        # The reloaded body is the new baseline: the next repeat points at it again.
+        assert _view("demo-dedup-skill").get("dedup") is True
+
+    def test_pointer_carries_hash_name_file_and_path(self, skills_home):
+        full = _view("demo-dedup-skill", file_path="references/guide.md")
+        ptr = _view("demo-dedup-skill", file_path="references/guide.md")
+        assert ptr["success"] is True and ptr["dedup"] is True
+        assert ptr["name"] == full["name"]
+        assert ptr["file"] == "references/guide.md"
+        assert re.fullmatch(r"[0-9a-f]{64}", ptr["content_hash"])
+        main = _view("demo-dedup-skill")
+        main_ptr = _view("demo-dedup-skill")
+        assert main_ptr["file"] == "SKILL.md" and main_ptr["path"] == main["path"]
+        assert main_ptr["content_hash"] != ptr["content_hash"]
+
+    def test_linked_files_are_tracked_independently_across_boundaries(self, skills_home):
+        guide2 = skills_home / "skills" / "demo-dedup-skill" / "references" / "other.md"
+        guide2.write_text("# Other\n\nSecond reference body.\n", encoding="utf-8")
+        _view("demo-dedup-skill")
+        _view("demo-dedup-skill", file_path="references/guide.md")
+        # Loading a different linked file does not satisfy the first one's repeat.
+        assert "Second reference" in _view("demo-dedup-skill", file_path="references/other.md")["content"]
+        # Changing one file reloads only that file; the others still point.
+        guide2.write_text("# Other\n\nSecond reference, edited.\n", encoding="utf-8")
+        assert "edited" in _view("demo-dedup-skill", file_path="references/other.md")["content"]
+        assert _view("demo-dedup-skill").get("dedup") is True
+        assert _view("demo-dedup-skill", file_path="references/guide.md").get("dedup") is True
+
+    def test_boundary_in_one_session_does_not_touch_another(self, skills_home):
+        _view("demo-dedup-skill", task="sess-A")
+        _view("demo-dedup-skill", task="sess-B")
+        mark_context_loss_boundary(type("Agent", (), {"session_id": "sess-A"})(), "sess-A")
+        # A lost its context -> full body; B's context is intact -> pointer.
+        assert "Step one" in _view("demo-dedup-skill", task="sess-A")["content"]
+        assert _view("demo-dedup-skill", task="sess-B").get("dedup") is True
+        # A pointer in one session is never served from another session's load.
+        assert "Step one" in _view("demo-dedup-skill", task="sess-C")["content"]
 
     def test_no_task_id_never_dedups(self, skills_home):
         args = {"name": "demo-dedup-skill"}

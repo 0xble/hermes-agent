@@ -2,16 +2,17 @@
 digest of the skill_view result served. A repeat view whose result is byte-identical returns a short
 stub — the earlier tool result already carries the content verbatim. Content digests need no file
 timestamps, so a same-size rewrite in one coarse mtime tick (or on a host whose clock disagrees with
-the filesystem's) is never mistaken for "unchanged". Cleared via ``reset_skill_view_dedup()`` on
-context compression AND on a committed proactive tool-result prune, because both replace the
-original content with a one-line marker.
+its filesystem) is never mistaken for "unchanged". The per-task context generation is advanced by
+``mark_context_loss_boundary`` when compaction or committed pruning removes tool results; explicit
+``reset_skill_view_dedup()`` remains available for session/test cleanup.
 """
 
 import hashlib
 import json
 import threading
 
-_skill_view_tracker: dict[str, dict[tuple, str]] = {}
+_skill_view_tracker: dict[str, dict[tuple, tuple[int, str]]] = {}
+_skill_view_generation: dict[str, int] = {}
 _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
 
@@ -32,19 +33,38 @@ def dedup_skill_view(task_id, name, file_path, payload: dict, result: str) -> st
         return None
     resolved = str(payload.get("name") or name)
     key = (resolved, file_path or "")
-    digest = hashlib.sha256(result.encode("utf-8")).hexdigest()
+    # Hash only the returned body, not volatile metadata such as readiness notes or
+    # absolute paths. The key already separates SKILL.md from each linked file.
+    body = payload.get("content")
+    digest_input = body if isinstance(body, str) else result
+    digest = hashlib.sha256(digest_input.encode("utf-8")).hexdigest()
     with _skill_view_tracker_lock:
+        generation = _skill_view_generation.setdefault(str(task_id), 0)
         cache = _skill_view_tracker.setdefault(str(task_id), {})
-        if cache.get(key) == digest:
-            return json.dumps({
+        if cache.get(key) == (generation, digest):
+            pointer = {
                 "success": True, "status": "unchanged", "name": resolved,
                 "file": file_path or "SKILL.md", "dedup": True, "content_returned": False,
-                "message": _SKILL_VIEW_DEDUP_MESSAGE}, ensure_ascii=False)
-        cache.pop(key, None)  # re-insert at the end: FIFO eviction keeps the recently served
-        cache[key] = digest
-        while len(cache) > _SKILL_VIEW_DEDUP_CAP:  # FIFO eviction
+                "content_hash": digest, "message": _SKILL_VIEW_DEDUP_MESSAGE,
+            }
+            if "path" in payload:
+                pointer["path"] = payload["path"]
+            return json.dumps(pointer, ensure_ascii=False)
+        cache.pop(key, None)
+        cache[key] = (generation, digest)
+        while len(cache) > _SKILL_VIEW_DEDUP_CAP:
             del cache[next(iter(cache))]
     return None
+
+
+def advance_skill_view_dedup_generation(task_id: str | None) -> None:
+    """Advance the per-session generation after context content is removed."""
+    if not task_id:
+        return
+    with _skill_view_tracker_lock:
+        key = str(task_id)
+        _skill_view_generation[key] = _skill_view_generation.get(key, 0) + 1
+        _skill_view_tracker.pop(key, None)
 
 
 def reset_skill_view_dedup(task_id: str | None = None) -> None:
@@ -52,5 +72,8 @@ def reset_skill_view_dedup(task_id: str | None = None) -> None:
     with _skill_view_tracker_lock:
         if task_id is None:
             _skill_view_tracker.clear()
+            _skill_view_generation.clear()
         else:
-            _skill_view_tracker.pop(str(task_id), None)
+            key = str(task_id)
+            _skill_view_tracker.pop(key, None)
+            _skill_view_generation.pop(key, None)
