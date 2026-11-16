@@ -20,7 +20,7 @@ def _agent(**kwargs):
         requested_provider="openai", _fallback_index=0, _fallback_activated=False,
         _primary_runtime={"provider": "openai", "requested_provider": "openai", "model": "gpt-5"},
         _cached_system_prompt_parts={"stable": "abc", "context": "de", "volatile": "f"},
-        _cached_system_prompt="abcdef",
+        _cached_system_prompt="abc\n\nde\n\nf",
     )
     values.update(kwargs)
     return SimpleNamespace(**values)
@@ -217,3 +217,27 @@ def test_attended_switch_uses_agent_session_and_destination_model(monkeypatch):
     assert note_attended_switch(runner, ctx, agent, previous, "smart")
     assert captured[0]["session_id"] == "agent-session"
     assert captured[0]["resolved_model"] == "smart"
+
+
+def test_tier_sizes_match_the_real_system_prompt_join():
+    from agent.system_prompt import build_system_prompt
+    parts = {"stable": "You are Hermes.", "context": "", "volatile": "Today is Monday."}
+    agent = _agent(_cached_system_prompt_parts=None, _cached_system_prompt=None)
+    agent._emit_diagnostic_status = lambda *_: None
+    import agent.system_prompt as sp
+    original = sp.build_system_prompt_parts
+    sp.build_system_prompt_parts = lambda *_a, **_k: dict(parts)
+    try:
+        agent._cached_system_prompt = build_system_prompt(agent)
+    finally:
+        sp.build_system_prompt_parts = original
+    row = row_for_response(agent)
+    assert row["system_prompt_tier_sizes"] == {"stable": 15, "context": 0, "volatile": 16}
+
+
+def test_default_ledger_is_recreated_after_fork(monkeypatch):
+    import hermes_cli.observability.request_usage_ledger as module
+    first = module.get_request_usage_ledger()
+    assert module.get_request_usage_ledger() is first
+    monkeypatch.setattr(module.os, "getpid", lambda: -1)
+    assert module.get_request_usage_ledger() is not first

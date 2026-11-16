@@ -107,13 +107,17 @@ def _request_context(agent: Any, *, failure_class: str | None = None, usage: Any
     source = "cron" if get_session_env("HERMES_CRON_SESSION", "") == "1" else session_source_for(getattr(agent, "platform", None))
     parts = getattr(agent, "_cached_system_prompt_parts", None)
     cached_prompt = getattr(agent, "_cached_system_prompt", None)
+    tiers = ("stable", "context", "volatile")
+    # Trust the tier breakdown only while it still describes the prompt being sent:
+    # build_system_prompt joins the non-empty tiers with "\n\n", and some paths reassign the
+    # cached prompt directly without refreshing the parts.
     if (
         isinstance(parts, dict)
         and isinstance(cached_prompt, str)
-        and all(isinstance(parts.get(key), str) for key in ("stable", "context", "volatile"))
-        and sum(len(parts[key]) for key in ("stable", "context", "volatile")) == len(cached_prompt)
+        and all(isinstance(parts.get(key), str) for key in tiers)
+        and "\n\n".join(parts[key] for key in tiers if parts[key]) == cached_prompt
     ):
-        prompt_sizes = {key: len(parts[key]) for key in ("stable", "context", "volatile")}
+        prompt_sizes = {key: len(parts[key]) for key in tiers}
     else:
         prompt_sizes = {"total": len(cached_prompt)} if isinstance(cached_prompt, str) else None
     usage_dict = usage if isinstance(usage, dict) else {}
@@ -306,15 +310,20 @@ class RequestUsageLedger:
 
 
 _default_ledger: RequestUsageLedger | None = None
+_default_pid: int | None = None
 _default_lock = threading.Lock()
 
 
 def get_request_usage_ledger() -> RequestUsageLedger:
-    global _default_ledger
-    if _default_ledger is None:
+    """The process's ledger. A forked child gets its own: it inherits the queue but not the
+    writer thread, so reusing the parent's ledger would silently drop every row."""
+    global _default_ledger, _default_pid
+    pid = os.getpid()
+    if _default_ledger is None or _default_pid != pid:
         with _default_lock:
-            if _default_ledger is None:
+            if _default_ledger is None or _default_pid != pid:
                 _default_ledger = RequestUsageLedger()
+                _default_pid = pid
     return _default_ledger
 
 
