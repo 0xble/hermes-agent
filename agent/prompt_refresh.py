@@ -81,6 +81,7 @@ def rebuild_for_refresh(agent: Any, system_message: Any, conversation_history: A
     """Rebuild the session's prompt from current sources and persist it with ``epoch``."""
     from agent.prompt_builder import clear_skills_system_prompt_cache
     from agent.surface_switch import stage_surface_switch_note
+    from tools.mcp_tool_agent import refresh_agent_delegation_tool
     from hermes_cli.observability.shared_metrics_efficiency import record_cache_break
 
     logger.info("Operator requested a system prompt refresh (epoch %d) for session %s; rebuilding it "
@@ -91,6 +92,9 @@ def rebuild_for_refresh(agent: Any, system_message: Any, conversation_history: A
     agent._auto_load_skills_resolved = False  # pinned skills (skills.auto_load) re-read too
     # As in the Bot Chat capability refresh: build the index from disk, not a cached render.
     clear_skills_system_prompt_cache(clear_snapshot=True)
+    # This boundary already breaks the prompt prefix, so converge the cached
+    # delegate_task schema and its dispatch mode from current gateway config.
+    refresh_agent_delegation_tool(agent)
     agent._cached_system_prompt = agent._build_system_prompt(system_message)
     record_cache_break(agent, "system_prompt_rebuild")
     stage_surface_switch_note(agent, agent._cached_system_prompt, conversation_history)

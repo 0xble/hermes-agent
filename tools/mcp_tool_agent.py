@@ -195,6 +195,54 @@ def refresh_agent_mcp_tools(
     return added
 
 
+def refresh_agent_delegation_tool(agent) -> bool:
+    """Replace only the pinned ``delegate_task`` schema after a gateway-mode change.
+
+    Prompt refresh already has a cache-breaking boundary, but it must not
+    rewrite unrelated tool pins just because a dynamic schema changed. The
+    delegation mode is re-derived first, then the one model-facing entry and
+    its dispatch decision are persisted together.
+    """
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    if not refresh_gateway_delegation_mode(agent):
+        return False
+    current_defs = _agent_tool_defs(agent)
+    if not any(_def_name(tool) == "delegate_task" for tool in current_defs):
+        return False
+
+    try:
+        from model_tools import get_tool_definitions
+        from toolsets import agent_tool_surface
+
+        fresh_defs = agent_tool_surface(agent, list(get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+        ) or []))
+    except Exception:
+        logger.debug("delegate_task schema refresh skipped", exc_info=True)
+        return False
+    fresh_delegate = next((tool for tool in fresh_defs if _def_name(tool) == "delegate_task"), None)
+    if fresh_delegate is None:
+        return False
+    if next(tool for tool in current_defs if _def_name(tool) == "delegate_task") == fresh_delegate:
+        return False
+
+    with _agent_tools_lock:
+        published = _agent_tool_defs(agent)
+        for index, tool in enumerate(published):
+            if _def_name(tool) == "delegate_task":
+                published[index] = fresh_delegate
+                agent.tools = published
+                agent.valid_tool_names = {_def_name(item) for item in published if _def_name(item)}
+                break
+        else:
+            return False
+    persist_agent_tool_names(agent)
+    return True
+
+
 def reprobe_tool_availability() -> None:
     """Explicit ``/reload-mcp`` hatch out of the tools[] freeze: drop the ``check_fn`` verdict
     cache AND the ``get_tool_definitions`` memo (keyed on registry generation, so it would
