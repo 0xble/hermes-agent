@@ -519,7 +519,7 @@ class PlatformRegistry:
         adapter_class = self.adapter_class(name)
         if adapter_class is None:
             return None
-        declared = adapter_class.__dict__.get("SUPPORTS_REACTIONS")
+        declared = getattr(adapter_class, "SUPPORTS_REACTIONS", None)
         if declared is not None:
             return bool(declared)
         from gateway.platforms.base import BasePlatformAdapter

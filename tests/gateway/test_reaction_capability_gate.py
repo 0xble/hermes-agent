@@ -46,6 +46,42 @@ def test_gateway_gate_drops_known_unsupported_and_keeps_explicit_disable(monkeyp
     assert (session_disabled_toolsets(["reactions"], "unsupported") or []).count("reactions") == 1
 
 
+def test_pin_carry_keeps_react_only_for_the_capability_gate(monkeypatch):
+    """A pinned react survives restore when only adapter capability removed it, never when config,
+    or the desktop opt-in, disabled it."""
+    import gateway.platform_registry as platforms
+    from tools.mcp_tool_agent import _config_permitted_names
+
+    registry = PlatformRegistry()
+    _register(registry, "unsupported", _UnsupportedAdapter)
+    _register(registry, "supported", _SupportedAdapter)
+    monkeypatch.setattr(platforms, "platform_registry", registry)
+
+    def agent(platform, configured):
+        # The session's resolved disables always include "reactions" here: from capability, config or opt-in.
+        disabled = list(dict.fromkeys([*configured, "reactions"]))
+        return SimpleNamespace(platform=platform, enabled_toolsets=None, disabled_toolsets=disabled,
+                               _configured_disabled_toolsets=list(configured))
+
+    assert "react" in _config_permitted_names(agent("unsupported", []))
+    assert "react" not in _config_permitted_names(agent("unsupported", ["reactions"]))
+    assert "react" not in _config_permitted_names(agent("supported", ["reactions"]))
+    assert "react" not in _config_permitted_names(agent("local", []))
+    assert "react" not in _config_permitted_names(agent(None, []))
+
+
+def test_inherited_supports_reactions_flag_counts():
+    class _Declared(_UnsupportedAdapter):
+        SUPPORTS_REACTIONS = True
+
+    class _Inherits(_Declared):
+        pass
+
+    registry = PlatformRegistry()
+    _register(registry, "inherits", _Inherits)
+    assert registry.reactions_supported("inherits") is True
+
+
 def test_unknown_adapter_fails_open(monkeypatch):
     import gateway.platform_registry as platforms
     from toolsets import session_disabled_toolsets
