@@ -16,11 +16,10 @@ _skill_view_tracker_lock = threading.Lock()
 _SKILL_VIEW_DEDUP_CAP = 200
 _SKILL_VIEW_DEDUP_TASK_CAP = 512
 
-# Stable fields the model acts on besides the body. A change to any of them must reach the model,
-# so they are part of the digest. Volatile fields (readiness notes, absolute paths) are left out.
-_DIGEST_FIELDS = ("content", "linked_files", "dependencies_ok", "dependency_note",
-                  "missing_required_environment_variables", "missing_required_commands",
-                  "missing_credential_files", "trust", "tier")
+# The digest covers everything the model acts on: every payload field except those that vary with
+# no change the model needs to see (absolute install paths). Deriving it from the payload instead
+# of a field list keeps new fields such as ``deps_note`` covered automatically.
+_DIGEST_EXCLUDED_FIELDS = frozenset({"skill_dir"})
 
 _SKILL_VIEW_DEDUP_MESSAGE = (
     "Skill content unchanged since it was loaded earlier in this "
@@ -32,7 +31,7 @@ _SKILL_VIEW_DEDUP_MESSAGE = (
 def _view_digest(payload: dict, result: str) -> str:
     if not isinstance(payload.get("content"), str):
         return hashlib.sha256(result.encode("utf-8")).hexdigest()
-    stable = {field: payload[field] for field in _DIGEST_FIELDS if field in payload}
+    stable = {field: value for field, value in payload.items() if field not in _DIGEST_EXCLUDED_FIELDS}
     encoded = json.dumps(stable, sort_keys=True, ensure_ascii=False, default=str)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
