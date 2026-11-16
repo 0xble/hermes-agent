@@ -169,9 +169,10 @@ def settle_recovered_unattended(db, epoch) -> int:
         if defer_detached(db, row):
             continue
         try:
+            notice = interrupted_notice(row)
             resolve_unknown_session_input(
                 db, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'],
-                _terminal_write=lambda conn, lost, row=row: close_discarded_turn(db, conn, lost, interrupted_notice(row)))
+                _terminal_write=lambda conn, lost, notice=notice: close_discarded_turn(db, conn, lost, notice))
         except RuntimeStoreError as exc:
             logger.warning('Lost automation admission %s left unknown: %s', row['admission_id'], exc.reason)
             continue

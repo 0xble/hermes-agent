@@ -18,7 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.plugin_live_notes import queue_plugin_notice
+from agent.plugin_live_notes import queue_plugin_notice, with_plugin_notices
 from run_agent import AIAgent
 from tools.budget_config import BudgetConfig
 
@@ -142,3 +142,19 @@ def test_the_notice_survives_the_turn_budget_spilling_its_tool_result():
     assert big not in tool_row["content"]  # spilled to a file, a preview stays inline
     assert NOTE not in tool_row["content"]
     assert requests[1][-1]["role"] == "user" and NOTE in requests[1][-1]["content"]
+
+
+def test_notice_preserves_multimodal_parts_and_null_metadata():
+    agent = SimpleNamespace()
+    queue_plugin_notice(agent, "blender", NOTE)
+    row = with_plugin_notices(agent, {
+        "role": "user",
+        "content": [{"type": "image_url", "image_url": {"url": "data:image/png;base64,x"}}],
+        "api_content": [{"type": "input_image", "image_url": "data:image/png;base64,x"}],
+        "display_metadata": None,
+    })
+
+    assert NOTE in row["content"][0]["text"]
+    assert row["content"][1]["type"] == "image_url"
+    assert NOTE in row["api_content"][0]["text"]
+    assert row["api_content"][1]["type"] == "input_image"

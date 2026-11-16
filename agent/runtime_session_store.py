@@ -403,9 +403,9 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.scope = candidate['scope']
         self.journal = candidate
 
-    def _save(self, journal):
+    def _save(self, journal, *, skip_privacy=False):
         from agent.runtime_session_journal import save_journal
-        save_journal(self, journal)
+        save_journal(self, journal, skip_privacy=skip_privacy)
 
     def _session(self, session_id):
         if session_id != self.scope['session_id']:

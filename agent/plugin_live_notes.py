@@ -56,11 +56,17 @@ def with_plugin_notices(agent: Any, row: dict[str, Any]) -> dict[str, Any]:
     if not notes:
         return row
     prefix = RUNTIME_NOTICE_TEMPLATE.format(notes=notes)
-    content = row.get("content") or ""
-    combined = {**row, "content": f"{prefix}\n\n{content}" if content else prefix,
-                "display_metadata": {**row.get("display_metadata", {}), RUNTIME_NOTICE: True}}
-    if isinstance(row.get("api_content"), str):
-        combined["api_content"] = f"{prefix}\n\n{row['api_content']}"
+    def prepend(value):
+        if isinstance(value, str):
+            return f"{prefix}\n\n{value}" if value else prefix
+        if isinstance(value, list):
+            return [{"type": "text", "text": prefix}, *value]
+        return prefix
+
+    combined = {**row, "content": prepend(row.get("content")),
+                "display_metadata": {**(row.get("display_metadata") or {}), RUNTIME_NOTICE: True}}
+    if "api_content" in row:
+        combined["api_content"] = prepend(row.get("api_content"))
     return combined
 
 

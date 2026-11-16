@@ -76,7 +76,7 @@ def discard_refused_entry(store, entry):
     # The owner explicitly refused BEFORE commit. This is not an ambiguous transport
     # failure: the same sequence remains available for the next public operation.
     candidate = dict(store.journal, pending=store.journal['pending'][1:], next_sequence=entry['sequence'])
-    store._save(candidate)
+    store._save(candidate, skip_privacy=True)
     store.journal = candidate
     store.failure = None
 

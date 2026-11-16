@@ -1,5 +1,7 @@
 """Regression tests for cron prompt/toolset capability diagnostics."""
 
+from unittest.mock import Mock
+
 import pytest
 
 from cron.tool_requirements import job_tool_requirement_issues
@@ -21,6 +23,22 @@ def test_cron_doctor_flags_file_only_finding_job(tmp_path, monkeypatch, capsys):
     assert "synthetic-file-only-finding" in output
     assert "enabled_toolsets" in output and "terminal" in output
     assert get_job(job["id"]) == before
+
+
+def test_cron_doctor_skips_tool_checks_when_config_is_unreadable(tmp_path, monkeypatch, capsys):
+    from cron.jobs import create_job
+    from hermes_cli import config
+    from hermes_cli.cron import cron_doctor
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    create_job(
+        prompt="Run `custom-check --json`.", name="unreadable-config", schedule="every 1h",
+        enabled_toolsets=["file"], deliver="local",
+    )
+    monkeypatch.setattr(config, "read_raw_config_readonly", Mock(side_effect=OSError("locked")))
+
+    assert cron_doctor() == 0
+    assert "found no issues" in capsys.readouterr().out
 
 
 @pytest.mark.parametrize("tools", [["terminal"], ["coding"], ["all"], ["*"]])

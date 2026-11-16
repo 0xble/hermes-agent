@@ -625,7 +625,7 @@ def holding_dir(scratch_root: Path) -> Path:
 
 
 def _utc_stamp(now: float) -> tuple[str, str]:
-    moment = datetime.datetime.fromtimestamp(now, datetime.timezone.utc)
+    moment = datetime.datetime.fromtimestamp(now, datetime.UTC)
     return moment.strftime("%Y-%m-%d"), moment.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -638,7 +638,7 @@ def _parse_pruned_at(value: object) -> float | None:
         parsed = datetime.datetime.strptime(value, "%Y-%m-%dT%H:%M:%SZ")
     except ValueError:
         return None
-    return parsed.replace(tzinfo=datetime.timezone.utc).timestamp()
+    return parsed.replace(tzinfo=datetime.UTC).timestamp()
 
 
 def _ensure_real_dir(path: Path, *, home: Path) -> bool:
@@ -679,7 +679,7 @@ def _ensure_real_dir(path: Path, *, home: Path) -> bool:
 def _unique_hold_dest(dest: Path) -> Path:
     if not os.path.lexists(dest):
         return dest
-    stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%H%M%S")
+    stamp = datetime.datetime.now(datetime.UTC).strftime("%H%M%S")
     candidate = dest.with_name(f"{dest.name}-{stamp}")
     n = 0
     while os.path.lexists(candidate):
@@ -847,7 +847,7 @@ def _day_start(name: str) -> float | None:
         day = datetime.datetime.strptime(name, "%Y-%m-%d")
     except ValueError:
         return None
-    return day.replace(tzinfo=datetime.timezone.utc).timestamp()
+    return day.replace(tzinfo=datetime.UTC).timestamp()
 
 
 def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -> int:  # health: allow CC -- explicit no-follow retention purge phases
@@ -862,6 +862,10 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
         return 0
     if stat.S_ISLNK(st.st_mode) or not stat.S_ISDIR(st.st_mode) or _is_dir_link(trash):
         audit.info("scratch prune: holding dir %r is a symlink; not followed", os.fspath(trash))
+        return 0
+    home = scratch_root.parent.parent
+    if not _ensure_real_dir(trash, home=home):
+        audit.info("scratch prune: holding dir failed private-directory validation")
         return 0
     purged = 0
     repos: set[str] = set()
@@ -885,6 +889,8 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
                     purged += 1
             continue
         if not stat.S_ISDIR(child_st.st_mode):
+            continue
+        if not _ensure_real_dir(day_dir, home=home):
             continue
         manifest = day_dir / _TRASH_MANIFEST
         manifest_text: str | None = None
@@ -912,6 +918,8 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
             continue
         if stat.S_ISLNK(entries_st.st_mode) or not stat.S_ISDIR(entries_st.st_mode) or _is_dir_link(entries_dir):
             continue
+        if not _ensure_real_dir(entries_dir, home=home):
+            continue
         try:
             held_children = list(os.scandir(entries_dir))
         except OSError:
@@ -926,7 +934,7 @@ def purge_expired_holds(scratch_root: Path, now: float, audit: logging.Logger) -
             except OSError:
                 continue
             pruned_at = ages.get(os.path.abspath(held_path))
-            age_from = pruned_at if pruned_at is not None else day_age
+            age_from = pruned_at if pruned_at is not None else day_age + 24 * 3600
             if now - age_from <= _TRASH_HOLD_SECONDS:
                 continue
             held_repos = _linked_worktree_repos(held_path) if stat.S_ISDIR(held_st.st_mode) else set()
@@ -1109,6 +1117,10 @@ def _prune_idle_entries(  # health: allow CC -- preserves ordered fail-closed pr
     *, restorable_hold: bool = False,
 ) -> int:
     now = time.time()
+    if restorable_hold and not hasattr(os, "getuid"):
+        # Native Windows has no portable owner/mode proof for a private hold.
+        # Use the existing direct-delete path rather than retaining every entry forever.
+        restorable_hold = False
     cutoff = now - max_idle_hours * 3600
     if restorable_hold:
         purge_expired_holds(root, now, audit)
@@ -1227,7 +1239,10 @@ def _prune_idle_entries(  # health: allow CC -- preserves ordered fail-closed pr
             audit.info("scratch prune: could not confirm removal of %r", os.fspath(entry))
             continue
         if restorable_hold:
-            assert held_at is not None
+            if held_at is None:
+                audit.info("scratch prune: held entry %r disappeared during rename reconciliation",
+                           os.fspath(entry))
+                continue
             audit.info("scratch prune: removed %r (%d bytes), held at %r",
                        os.fspath(entry), size, os.fspath(held_at))
         else:
