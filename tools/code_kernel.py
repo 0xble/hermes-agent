@@ -583,11 +583,27 @@ def shutdown_kernels_for_owners(*owners: str) -> None:
     incognito interval cannot retire only one backend or identity.
     """
     unique = tuple(dict.fromkeys(owner for owner in owners if owner))
-    for owner in unique:
-        shutdown_kernels_for_owner(owner)
-    from tools.code_kernel_remote import shutdown_remote_kernels_for_owner
-    for owner in unique:
-        shutdown_remote_kernels_for_owner(owner)
+    if not unique:
+        return
+    def owner_matches(candidate: str) -> bool:
+        return any(
+            candidate == owner or candidate.startswith(f"{owner}{_CHILD_OWNER_QUALIFIER}")
+            for owner in unique
+        )
+    errors: list[Exception] = []
+    try:
+        _REGISTRY.shutdown(owner_matches=owner_matches)
+    except Exception as exc:
+        errors.append(exc)
+    finally:
+        _forget_kernel_evictions(owner_matches)
+    try:
+        from tools.code_kernel_remote import shutdown_remote_kernels_where
+        shutdown_remote_kernels_where(owner_matches)
+    except Exception as exc:
+        errors.append(exc)
+    if errors:
+        raise errors[0]
 
 
 def delegated_child_owner_matcher(child_session_id: str) -> Callable[[str], bool]:
@@ -766,8 +782,11 @@ def _spawn_locked(kernel: SessionKernel, *, child_python: str, child_cwd: str,
     kernel.ensure_open()
     kernel.current_task = task_id
     kernel.current_caller = _current_caller(task_id)
+    from agent.incognito import is_incognito
     from agent.incognito_private_dir import private_subdir_for_current_session
     private_root = private_subdir_for_current_session("kernel")
+    if is_incognito() and private_root is None:
+        raise RuntimeError("Incognito code kernel has no bound private interval")
     kernel.tmpdir = (tempfile.mkdtemp(prefix="hermes_kernel_", dir=str(private_root))
                      if private_root is not None else tempfile.mkdtemp(prefix="hermes_kernel_"))
     kernel.rpc_token = secrets.token_urlsafe(32)

@@ -154,6 +154,44 @@ class TestSessionStatePersistence(unittest.TestCase):
             finally:
                 reset_current_session_key(session_token)
 
+    def test_unbound_incognito_kernel_fails_closed(self):
+        from agent.incognito import incognito_scope
+
+        with _kernel_config(), incognito_scope(session_id="unbound-private-session"):
+            result = _run("print('must not use public scratch')")
+
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("no bound private interval", result.get("error", "").lower())
+        self.assertFalse(_KERNELS)
+
+    def test_incognito_boundary_retires_delegated_child_kernels(self):
+        from agent.delegation_context import delegated_child_context
+        from agent.incognito import incognito_scope, register_session
+        from agent.incognito_private_dir import bind_private_session, discard_private_dir
+        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.code_kernel import shutdown_kernels_for_owners
+
+        sid = "private-delegated-child"
+        session_token = set_current_session_key(sid)
+        with tempfile.TemporaryDirectory(prefix="hermes-incognito-" + "b" * 32 + "-") as interval_dir:
+            interval = Path(interval_dir)
+            register_session(sid, True)
+            bind_private_session(sid, interval)
+            try:
+                with _kernel_config(), incognito_scope(session_id=sid):
+                    with delegated_child_context("child-1"):
+                        result = _run("child_state = 1", task_id="child-task")
+                    self.assertEqual(result["status"], "success", result)
+                    self.assertEqual(len(_KERNELS), 1)
+                    owner = next(iter(_KERNELS))[0]
+                    self.assertTrue(owner.startswith(sid + "::child::"), owner)
+                    shutdown_kernels_for_owners(sid)
+                    self.assertFalse(_KERNELS)
+            finally:
+                register_session(sid, False)
+                discard_private_dir(sid)
+                reset_current_session_key(session_token)
+
     def test_reset_discards_state(self):
         with _kernel_config():
             _run("x = 41")
