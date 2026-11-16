@@ -100,6 +100,11 @@ def _note_response_usage(agent: Any, usage: Any = None) -> None:
         note_response(agent, usage)
 
 
+def _note_response_if_needed(agent: Any, usage: Any, already_recorded: bool) -> None:
+    if not already_recorded:
+        _note_response_usage(agent, usage)
+
+
 def record_response_ledger(agent: Any, response: Any) -> None:
     """Queue the ledger row for a provider response before retry branching.
 
@@ -142,14 +147,12 @@ def record_response_usage(
             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
             effort_log_label(getattr(agent, "reasoning_config", None)),
         )
-        if not ledger_already_recorded:
-            _note_response_usage(agent)
+        _note_response_if_needed(agent, None, ledger_already_recorded)
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
     canonical_usage = with_served_service_tier(
         normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode), response)
-    if not ledger_already_recorded:
-        _note_response_usage(agent, canonical_usage)
+    _note_response_if_needed(agent, canonical_usage, ledger_already_recorded)
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage
