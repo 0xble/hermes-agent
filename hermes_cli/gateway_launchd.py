@@ -1050,16 +1050,17 @@ def _wait_for_launchd_service_pid(
 def launchd_restart():
     from hermes_cli.gateway_handover import planned_handover
     handed_over = planned_handover()
-    if handed_over is not None:
-        if not handed_over:
-            # A stopped gateway has no owner to hand over.  Use the ordinary
-            # start/reload path in that case, but never hide a refusal from a
-            # live gateway by falling back to a drain.
-            from gateway.status import get_running_pid
-            if get_running_pid() is None:
-                return _launchd_restart_locked()
-            raise RuntimeError("planned handover refused, existing work left intact")
+    if handed_over:
         return
+    if handed_over is not None:
+        # A stopped gateway has no owner to hand over.  Use the ordinary
+        # start/reload path in that case, but never hide a refusal from a
+        # live gateway by falling back to a drain.
+        from gateway.status import get_running_pid
+        if get_running_pid() is not None:
+            raise RuntimeError("planned handover refused, existing work left intact")
+        # Continue through the ordinary restart route below so a configured
+        # lifetime domain still serializes the start with stop/migrate work.
     if configured_launchd_domain() is None:
         return _launchd_restart_locked()
     from hermes_cli.gateway_launchd_lifetime import lifetime_lock

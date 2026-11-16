@@ -81,6 +81,29 @@ def test_stopped_gateway_falls_back_to_normal_launchd_start(monkeypatch):
     assert launchd.launchd_restart() == "started"
 
 
+def test_stopped_gateway_start_uses_lifetime_lock(monkeypatch):
+    events = []
+
+    class Lock:
+        def __enter__(self):
+            events.append("enter")
+
+        def __exit__(self, *_):
+            events.append("exit")
+
+    monkeypatch.setattr(handover, "planned_handover", lambda: False)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(launchd, "configured_launchd_domain", lambda: "gui/501")
+    monkeypatch.setattr(launchd, "_gw", lambda: SimpleNamespace(get_hermes_home=lambda: "home"))
+    monkeypatch.setattr(launchd, "_launchd_restart_locked", lambda: events.append("restart") or "started")
+    monkeypatch.setattr(
+        "hermes_cli.gateway_launchd_lifetime.lifetime_lock",
+        lambda *args, **kwargs: Lock(),
+    )
+    assert launchd.launchd_restart() == "started"
+    assert events == ["enter", "restart", "exit"]
+
+
 def test_live_gateway_handover_refusal_does_not_fall_back(monkeypatch):
     monkeypatch.setattr(handover, "planned_handover", lambda: False)
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 1234)
