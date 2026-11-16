@@ -169,6 +169,33 @@ class TestSendDraft:
         (stream,) = _open_streams(adapter)
         assert stream["ts"] == "124.000"
 
+    @pytest.mark.asyncio
+    async def test_new_draft_does_not_overwrite_replacement_opened_while_sealing(self):
+        adapter, client = _make_adapter()
+        await adapter.send_draft("D1", 7, "Segment one", metadata=META)
+        client.chat_startStream = AsyncMock(side_effect=[{"ok": True, "ts": "124.000"},
+                                                          {"ok": True, "ts": "125.000"}])
+        sealing = asyncio.Event()
+        release = asyncio.Event()
+
+        async def delayed_seal(*args, **kwargs):
+            sealing.set()
+            await release.wait()
+            return True
+
+        adapter._seal_stream = delayed_seal
+        old = asyncio.create_task(adapter.send_draft("D1", 8, "Segment two", metadata=META))
+        await sealing.wait()
+        replacement = await adapter.send_draft("D1", 9, "Segment three", metadata=META)
+        release.set()
+        result = await old
+
+        assert replacement.success and replacement.message_id == "124.000"
+        assert result.success and result.message_id == "124.000"
+        assert client.chat_startStream.await_count == 1
+        (stream,) = _open_streams(adapter)
+        assert stream["draft_id"] == 9 and stream["ts"] == "124.000"
+
 
     @pytest.mark.asyncio
     async def test_expired_stream_reopens_seeded_with_only_the_unsent_tail(self):

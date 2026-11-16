@@ -47,6 +47,21 @@ def test_admitted_prune_has_no_expired_fallback_deadline(tmp_path, monkeypatch, 
         assert not transcript.exists()
 
 
+def test_invalid_window_is_normalized_once_for_prune_deadline(monkeypatch, caplog):
+    import hermes_time
+    import hermes_cli.maintenance_window as window
+    from hermes_state_prune_budget import PruneBudget
+
+    monkeypatch.setattr(window, "deletion_window_spec", lambda: "not-a-window")
+    monkeypatch.setattr(window, "deletion_window_open",
+                        lambda: window.window_contains(window.deletion_window_spec(), hermes_time.now()))
+    monkeypatch.setattr(hermes_time, "now", lambda: datetime(2026, 11, 10, 3))
+    with caplog.at_level("WARNING", logger="hermes_cli.maintenance_window"):
+        PruneBudget(within_window=True, max_seconds=10)
+    warnings = [record for record in caplog.records if "deletion_window" in record.getMessage()]
+    assert len(warnings) == 1
+
+
 @pytest.mark.parametrize("pending", [False, True])
 def test_window_end_interrupts_inflight_cleanup_and_next_pass_resumes(tmp_path, monkeypatch, pending):
     import hermes_time

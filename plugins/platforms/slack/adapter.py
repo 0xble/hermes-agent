@@ -2486,6 +2486,12 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 # awaiting so a concurrent registration survives the seal.
                 self._active_streams.pop(stream_key, None)
                 await self._seal_stream(stream_key, stream)
+                # A replacement draft may have opened while the old stream was
+                # sealing. It owns this thread now, so never overwrite it with
+                # a second startStream call from the stale sender.
+                replacement = self._active_streams.get(stream_key)
+                if replacement is not None:
+                    return SendResult(success=True, message_id=replacement["ts"])
                 stream = None
             if stream is None:
                 return await self._start_stream(client, stream_key, draft_id, text, metadata)

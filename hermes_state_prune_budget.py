@@ -43,12 +43,15 @@ class PruneBudget:
         self.next_contention_warning = time.monotonic() + 30
         if within_window:
             import hermes_time
-            from hermes_cli.maintenance_window import deletion_window_open, deletion_window_spec, window_contains
-            now, spec = hermes_time.now(), deletion_window_spec()
+            from hermes_cli.maintenance_window import (
+                deletion_window_open, deletion_window_spec, normalize_window_spec, window_contains,
+            )
+            admitted_open = deletion_window_open()
+            now, spec = hermes_time.now(), normalize_window_spec(deletion_window_spec(), warn=False)
             if not window_contains(spec, now):
                 # Admission belongs to the same policy the caller checked. A closed
                 # fallback spec must not cancel an admitted always-open policy.
-                if not deletion_window_open():
+                if not admitted_open:
                     self.deadline = time.monotonic()
             elif spec is not None and str(spec).strip():
                 # Find the first closed minute, including windows crossing midnight.
