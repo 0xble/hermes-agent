@@ -224,3 +224,20 @@ def test_exhausted_copy_does_not_tell_user_to_wait_out_a_far_reset_when_primary_
     assert "earlier recorded reset" in text and "available now" not in text
     plain = exhausted_copy("rate_limit", label="Muse", attempts=3, summary="429")
     assert "available now" not in plain
+
+
+def test_batch_route_chain_keeps_each_distinct_route_once_in_order():
+    from types import SimpleNamespace
+    from agent.shared_primary_cooldown import route_from_agent
+    from tools.delegate_tool_dispatch import batch_route_chain
+
+    def child(model, fallbacks=()):
+        return SimpleNamespace(provider="custom:openai-proxy", base_url="http://p", model=model,
+                               _primary_runtime={}, _fallback_chain=list(fallbacks))
+
+    sonnet = {"provider": "custom:claude-proxy", "base_url": "http://c", "model": "claude-sonnet-5-5"}
+    children = [child("gpt-6.1-sol", [sonnet, sonnet]) for _ in range(200)] + [child("gpt-6.1-terra")]
+    chain = batch_route_chain(children)
+    assert chain == [route_from_agent(children[0]), route_from_agent(children[-1]),
+                     ("custom:claude-proxy", "http://c", "claude-sonnet-5-5")]
+    assert batch_route_chain([]) == []
