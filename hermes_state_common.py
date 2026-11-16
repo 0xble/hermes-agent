@@ -300,7 +300,9 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
 # executescript(SCHEMA_SQL) + _reconcile_columns() every writable open already runs (additive,
 # idempotent). The bump only records that the declared shape changed; a new table or column needs no bump.
 # v33: data-only — re-tag delegate subagent rows that lost ``_delegate_from`` (see _run_data_migrations).
-SCHEMA_VERSION = 33
+# v34: no data migration — declare the partial worker-adoption candidate index below. The declarative
+# SCHEMA_SQL pass installs it on existing stores without rewriting any table.
+SCHEMA_VERSION = 34
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -621,6 +623,13 @@ CREATE TABLE IF NOT EXISTS session_admissions (
 );
 CREATE INDEX IF NOT EXISTS session_admissions_pending
     ON session_admissions(target_session_id, status, seq);
+-- Worker adoption searches by generation/epoch and only ever considers started or unknown admissions.
+-- Keep terminal and queued history out of that writer-transaction candidate scan; the literal predicate
+-- is intentional because SQLite can only prove a parameterized status list satisfies a partial index at
+-- prepare time when the values are written into the SQL.
+CREATE INDEX IF NOT EXISTS idx_session_admissions_worker_adoption
+    ON session_admissions(generation, owner_epoch, status, seq)
+    WHERE status IN ('started', 'unknown');
 -- Cron run history finds a job's unified-runtime runs by the scheduler principal's request ids
 -- (``cron:<job>:<execution>``); without this a lookup walked
 -- every cron admission of every job. Partial: interactive turns, the bulk of admissions, pay
