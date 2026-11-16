@@ -560,8 +560,7 @@ def shutdown_all_kernels() -> None:
 
 
 def shutdown_kernels_for_owner(owner: str) -> None:
-    """Dispose every kernel a session owns — wired into ``tools.approval.clear_session``
-    so kernels die at the same boundary that clears approval/yolo state (/new, session close).
+    """Dispose every local kernel a session owns.
 
     Eviction tombstones die with the owner too. ``clear_session`` is the boundary for
     /new, /reset and auto-reset, which reuse the session key for a different
@@ -574,6 +573,21 @@ def shutdown_kernels_for_owner(owner: str) -> None:
     if owner:
         _REGISTRY.shutdown(owner)
         _forget_kernel_evictions(lambda candidate: candidate == owner)
+
+
+def shutdown_kernels_for_owners(*owners: str) -> None:
+    """Dispose local and remote kernels for each identity at a privacy boundary.
+
+    A routing key and its session id can be separate owners of kernels for one
+    conversation. Keep this fan-out in one path so entering and leaving an
+    incognito interval cannot retire only one backend or identity.
+    """
+    unique = tuple(dict.fromkeys(owner for owner in owners if owner))
+    for owner in unique:
+        shutdown_kernels_for_owner(owner)
+    from tools.code_kernel_remote import shutdown_remote_kernels_for_owner
+    for owner in unique:
+        shutdown_remote_kernels_for_owner(owner)
 
 
 def delegated_child_owner_matcher(child_session_id: str) -> Callable[[str], bool]:

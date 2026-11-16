@@ -90,6 +90,10 @@ class SessionIncognitoMixin:
         history = self.load_transcript(entry.session_id) if enabled else None
         if enabled:
             self._flush_public_token_counts()
+            # A public execute_code kernel may already contain public state and use public
+            # scratch. Retire both routing identities before this interval can admit a cell.
+            from tools.code_kernel import shutdown_kernels_for_owners
+            shutdown_kernels_for_owners(session_key, entry.session_id)
         with self._lock:
             records = deepcopy(getattr(self, "_incognito_records", {}))
             if enabled:

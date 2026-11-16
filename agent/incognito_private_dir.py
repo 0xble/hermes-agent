@@ -37,7 +37,7 @@ def _configured_root() -> Path:
     config_errors: tuple[type[BaseException], ...] = (OSError, UnicodeDecodeError, ModuleNotFoundError)
     try:
         import importlib
-        yaml_error = getattr(importlib.import_module("ruamel.yaml.error"), "YAMLError")
+        yaml_error = vars(importlib.import_module("ruamel.yaml.error"))["YAMLError"]
     except ModuleNotFoundError:
         pass
     else:
@@ -224,17 +224,12 @@ def discard_private_dir(session_id: str | None) -> None:
         for key in aliases:
             _session_dirs.pop(key, None)
     from agent.incognito import any_incognito_sessions, register_session
-    # A topic key and its restored session id can own different kernels for the same interval.
+    # A topic key and its restored session id can own different local or remote kernels for the same interval.
     try:
-        from tools.code_kernel import shutdown_kernels_for_owner
+        from tools.code_kernel import shutdown_kernels_for_owners
+        shutdown_kernels_for_owners(session_id, *aliases)
     except Exception:
         logger.debug("Could not dispose private kernels during interval cleanup", exc_info=True)
-    else:
-        for owner in dict.fromkeys((session_id, *aliases)):
-            try:
-                shutdown_kernels_for_owner(owner)
-            except Exception:
-                logger.debug("Could not dispose private kernels during interval cleanup", exc_info=True)
     for key in aliases:
         register_session(key, False)
     root = path.parent if path is not None else _configured_root()
