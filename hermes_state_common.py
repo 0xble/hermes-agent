@@ -621,6 +621,13 @@ CREATE TABLE IF NOT EXISTS session_admissions (
 );
 CREATE INDEX IF NOT EXISTS session_admissions_pending
     ON session_admissions(target_session_id, status, seq);
+-- Worker adoption searches by generation/epoch and only ever considers started or unknown admissions.
+-- Keep terminal and queued history out of that writer-transaction candidate scan; the literal predicate
+-- is intentional because SQLite can only prove a parameterized status list satisfies a partial index at
+-- prepare time when the values are written into the SQL.
+CREATE INDEX IF NOT EXISTS idx_session_admissions_worker_adoption
+    ON session_admissions(generation, owner_epoch, status, seq)
+    WHERE status IN ('started', 'unknown');
 -- Cron run history finds a job's unified-runtime runs by the scheduler principal's request ids
 -- (``cron:<job>:<execution>``); without this a lookup walked
 -- every cron admission of every job. Partial: interactive turns, the bulk of admissions, pay
