@@ -3947,8 +3947,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
             # A detached stale attempt must not publish its late summary onto shared compressor state:
             # the fallback already advanced _previous_summary and owns the cooldown/error fields. The
             # candidate itself is discarded downstream by the working-attempt check; bail here so the
-            # attribute writes never land. Entry-generation claims (lock sit-outs) do not count; the
-            # working marker is the ownership boundary for summary state.
+            # Entry-generation claims (lock sit-outs) do not count; the working marker owns summary state.
             from agent.conversation_compression import _raise_if_stale_attempt
 
             _raise_if_stale_attempt(self)
