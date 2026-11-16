@@ -483,10 +483,10 @@ def session_disabled_toolsets(
         from tools.react_tool import check_react_requirements
         if not check_react_requirements():
             disabled = [*(disabled or ()), "reactions"]
-    elif platform_registry.reactions_supported(name) is False:
-        # A known adapter that inherits BasePlatformAdapter.add_reaction cannot deliver this tool, so
-        # like other platform-gated toolsets no pin can bring it back. Unknown/deferred adapter classes
-        # fail open, preserving the old behavior without importing plugin manifests during tool selection.
+    elif platform_registry.reactions_supported(name) is False and "reactions" not in (disabled or ()):
+        # A known adapter that inherits BasePlatformAdapter.add_reaction cannot deliver this tool. A session
+        # whose tools[] were pinned earlier keeps its pinned react (tools.mcp_tool_agent). Unknown/deferred
+        # adapter classes fail open, preserving the old behavior without importing manifests during selection.
         disabled = [*(disabled or ()), "reactions"]
     gated = [name for name, platforms in TOOLSET_SESSION_PLATFORMS.items() if platform not in platforms]
     gated += ONESHOT_DISABLED_TOOLSETS if oneshot else ()

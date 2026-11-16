@@ -276,6 +276,11 @@ def _config_permitted_names(agent) -> set:
     if enabled is not None:
         enabled = [*enabled, *CLIENT_SURFACE_TOOLSETS]
     disabled = getattr(agent, "disabled_toolsets", None)
+    # Adapter capability is no config choice either, and may only become known after the pin (a deferred
+    # platform plugin loads later): a pinned react stays unless config disables it.
+    if disabled and "reactions" in disabled:
+        configured = set(getattr(agent, "_configured_disabled_toolsets", None) or ())
+        disabled = [name for name in disabled if name != "reactions" or name in configured]
     if disabled and agent_is_oneshot(agent):  # the one-shot gate is no config choice either: a pinned clarify stays,
         configured = set(getattr(agent, "_configured_disabled_toolsets", None) or ())  # unless config disables it
         disabled = [name for name in disabled if name not in ONESHOT_DISABLED_TOOLSETS or name in configured]
