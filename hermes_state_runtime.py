@@ -826,13 +826,14 @@ def _linked_worker_admission(conn, session_id, generation, owner_epoch, statuses
         placeholders = ','.join('?' for _ in statuses)
         status_clause = f"status IN ({placeholders})"
         status_params = statuses
-    # Filter the narrow covering index before fetching historical payload/lineage rows.
-    rows = conn.execute(f"""SELECT * FROM session_admissions
-        WHERE seq IN (SELECT seq FROM session_admissions WHERE {status_clause})
-          AND generation=? AND owner_epoch=?
-          AND (target_session_id=? OR EXISTS (
-              SELECT 1 FROM json_each(session_admissions.lineage_json) WHERE value=?
-          )) ORDER BY seq""",
+    # Drive from the narrow covering index before fetching historical payload/lineage rows.
+    rows = conn.execute(f"""SELECT admission.* FROM session_admissions AS live INDEXED BY idx_session_admissions_worker_adoption
+        JOIN session_admissions AS admission ON admission.seq=live.seq
+        WHERE {status_clause.replace('status', 'live.status')}
+          AND admission.generation=? AND admission.owner_epoch=?
+          AND (admission.target_session_id=? OR EXISTS (
+              SELECT 1 FROM json_each(admission.lineage_json) WHERE value=?
+          )) ORDER BY admission.seq""",
         (*status_params, generation, owner_epoch, session_id, session_id)).fetchall()
     if len(rows) > 1:
         raise RuntimeStoreError('admission_conflict')
