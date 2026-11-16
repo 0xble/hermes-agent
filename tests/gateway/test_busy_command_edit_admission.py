@@ -62,6 +62,9 @@ async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
     await adapter.handle_message(MessageEvent(text='hello', source=source, message_id='H'))
     await async_wait_until(lambda: ran and idle(), what='a session for the goal')
     async def run_command(event):
+        # _start_session_processing replaces a live guard rather than queueing like handle_message,
+        # so the session must already be idle. Callers await idle() first. Fail here, not by race.
+        assert idle(), 'run_command needs an idle session'
         assert adapter._start_session_processing(event, key)
         owner = adapter._session_tasks[key]
         while True:
@@ -86,6 +89,8 @@ async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
                 mgr, _entry = await runner._get_goal_manager_for_event(MessageEvent(text='', source=source))
                 return not mgr.has_goal()
             await async_wait_until(cleared_goal, what='the clear goal command to finish')
+            # The clear's owner task may still be finalizing after the goal state changes.
+            await async_wait_until(idle, what='the clear goal command to release the session')
         await run_command(MessageEvent(text=text, message_type=MessageType.COMMAND,
                                         source=source, message_id='G', edit_revision=revision))
         # ``run_command`` awaits the task through its finalizer, so polling a separately updated
