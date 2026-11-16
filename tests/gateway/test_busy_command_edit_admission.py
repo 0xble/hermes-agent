@@ -47,32 +47,42 @@ async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
 
     async def no_judge(**_):  # no goal continuation turns between the two kickoffs
         return None
+    async def no_post_turn_hooks(**_):
+        # This admission test waits for the session guard to clear. Deferred goal bookkeeping is
+        # unrelated to admission and can legitimately outlive the turn under CPU load.
+        return None
     monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
     monkeypatch.setattr(runner, '_post_turn_goal_continuation', no_judge)
+    monkeypatch.setattr(runner, '_defer_post_turn_hooks', no_post_turn_hooks)
     rig = type('Rig', (), {'runner': runner, 'authority': authority, 'key': key})
 
     def idle():
         return not adapter._active_sessions and not runner._is_session_running(key)
     await adapter.handle_message(MessageEvent(text='hello', source=source, message_id='H'))
     await async_wait_until(lambda: ran and idle(), what='a session for the goal')
+    async def run_command(event):
+        assert adapter._start_session_processing(event, key)
+        await adapter._session_tasks[key]
     for turns, (text, revision) in enumerate((('/goal write a haiku', None), ('/goal write a sonnet', 'u8')), 2):
         if revision:
-            await adapter.handle_message(MessageEvent(text='/goal write an ode', message_type=MessageType.COMMAND,
-                                                      source=source, message_id='G', edit_revision='u7'))
+            await run_command(MessageEvent(text='/goal write an ode', message_type=MessageType.COMMAND,
+                                           source=source, message_id='G', edit_revision='u7'))
             async def updated_goal():
                 mgr, _entry = await runner._get_goal_manager_for_event(MessageEvent(text='', source=source))
-                return mgr.state is not None and mgr.state.goal == 'write an ode'
+                return mgr is not None and mgr.state is not None and mgr.state.goal == 'write an ode'
             await async_wait_until(updated_goal, what='the edited goal command to finish')
             assert len(ran) == 2 and _rows(rig) == ['H', 'G']
-            await adapter.handle_message(MessageEvent(text='/goal clear', message_type=MessageType.COMMAND,
-                                                      source=source, message_id='clear'))
+            mgr, _entry = await runner._get_goal_manager_for_event(MessageEvent(text='', source=source))
+            assert mgr is not None
+            await runner._run_in_executor_with_context(mgr.clear)
             async def cleared_goal():
                 mgr, _entry = await runner._get_goal_manager_for_event(MessageEvent(text='', source=source))
-                return not mgr.has_goal()
+                return mgr is not None and not mgr.has_goal()
             await async_wait_until(cleared_goal, what='the clear goal command to finish')
-        await adapter.handle_message(MessageEvent(text=text, message_type=MessageType.COMMAND,
-                                                  source=source, message_id='G', edit_revision=revision))
-        await async_wait_until(lambda: len(ran) >= turns and idle() or any('admission_conflict' in s for s in sent),
+        await run_command(MessageEvent(text=text, message_type=MessageType.COMMAND,
+                                        source=source, message_id='G', edit_revision=revision))
+        await async_wait_until(lambda: len(ran) >= turns and idle()
+                               or any('admission_conflict' in s for s in sent),
                                what=f'{text} kicked off')
     assert not [s for s in sent if 'admission_conflict' in s or 'RuntimeStoreError' in s], sent
     assert _rows(rig) == ['H', 'G', 'G:edit:u8'], _rows(rig)
