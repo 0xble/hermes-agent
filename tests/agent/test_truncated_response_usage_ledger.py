@@ -7,13 +7,13 @@ import pytest
 from tests.agent.test_run_agent import _mock_response, agent as run_agent_fixture
 
 
-@pytest.fixture
-def ledger_agent(run_agent_fixture):
+@pytest.fixture(name="agent_fixture")
+def configured_agent(run_agent_fixture):
     return run_agent_fixture
 
 
-def test_length_finish_reason_requests_continuation_records_each_response(ledger_agent):
-    agent = ledger_agent
+def test_length_finish_reason_requests_continuation_records_each_response(agent_fixture):
+    agent = agent_fixture
     agent._cached_system_prompt = "You are helpful."
     agent._use_prompt_caching = False
     agent.compression_enabled = False
