@@ -8,17 +8,29 @@ from tests.fakes.runtime_owner import begin_runtime_epoch
 _INDEX_NAME = "idx_session_admissions_worker_adoption"
 
 
+class _RecordingConnection:
+    """Record the SQL text and bound parameters exactly as the caller passes them.
+
+    sqlite3's trace callback logs SQL with bound values expanded, which would turn a parameterized
+    ``IN (?,?)`` into literals and hide a query that cannot use the partial index.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self.calls = []
+
+    def execute(self, sql, params=()):
+        self.calls.append((sql, tuple(params)))
+        return self._conn.execute(sql, params)
+
+
 def _adoption_candidate_plan(db, *, generation, owner_epoch, session_id):
-    """EXPLAIN the exact candidate SQL _linked_worker_admission executes, captured by tracing."""
-    executed = []
+    """EXPLAIN the exact candidate SQL and parameters _linked_worker_admission executes."""
     with db._read_ctx() as conn:
-        conn.set_trace_callback(executed.append)
-        try:
-            runtime._linked_worker_admission(conn, session_id, generation, owner_epoch, ("started", "unknown"))
-        finally:
-            conn.set_trace_callback(None)
-        candidate = next(sql for sql in executed if "FROM session_admissions" in sql)
-        return [row["detail"] for row in conn.execute("EXPLAIN QUERY PLAN " + candidate)]
+        recorder = _RecordingConnection(conn)
+        runtime._linked_worker_admission(recorder, session_id, generation, owner_epoch, ("started", "unknown"))
+        sql, params = next(call for call in recorder.calls if "FROM session_admissions" in call[0])
+        return [row["detail"] for row in conn.execute("EXPLAIN QUERY PLAN " + sql, params)]
 
 
 def test_worker_adoption_uses_partial_index_and_ignores_terminal_history(tmp_path):
