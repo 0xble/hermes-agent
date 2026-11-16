@@ -115,6 +115,33 @@ def test_a_restored_mode_survives_a_later_tools_refresh(refresh, pinned_inline):
     assert _delegate(fresh) == _delegate(first)
 
 
+@pytest.mark.parametrize(
+    ("initial_inline", "current_mode"),
+    [(True, "background"), (False, "inline")],
+    ids=["inline-to-background", "background-to-inline"],
+)
+def test_cache_break_rederives_gateway_mode_from_current_config(initial_inline, current_mode, monkeypatch):
+    """Prompt refresh and compaction boundaries adopt a changed gateway_mode in both directions."""
+    from agent.conversation_compression import _refresh_agent_tool_definitions
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+    from tools.delegate_tool import session_joins_delegation
+    from tools.mcp_tool_agent import refresh_agent_mcp_tools
+
+    agent = _built(inline=initial_inline)
+    agent._notification_config = {"delegation": {"gateway_mode": current_mode}}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    assert refresh_gateway_delegation_mode(agent) is True
+    refresh_agent_mcp_tools(agent, quiet_mode=True, content_aware=True)
+    assert session_joins_delegation(agent) is (current_mode == "inline")
+
+    # The compaction-owned helper performs the same convergence before its rebuild.
+    agent._notification_config = {"delegation": {
+        "gateway_mode": "inline" if current_mode == "background" else "background",
+    }}
+    _refresh_agent_tool_definitions(agent)
+    assert session_joins_delegation(agent) is (current_mode == "background")
+
+
 def _parent(tools, depth=0):
     parent = MagicMock()
     parent._delegate_depth = depth
