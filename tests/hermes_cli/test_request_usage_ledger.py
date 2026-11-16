@@ -88,3 +88,26 @@ def test_ledger_read_filters_by_source_model_and_job(tmp_path):
     assert ledger.flush()
     assert len(ledger.read(source="cron", model="gpt-5", cron_job_id="job-1")) == 1
     assert ledger.read(source="gateway") == []
+
+
+def test_incognito_scope_persists_no_row(tmp_path):
+    from agent.incognito import incognito_scope
+    ledger = RequestUsageLedger(tmp_path)
+    with incognito_scope():
+        assert ledger.record(row_for_response(_agent())) is False
+    assert ledger.flush()
+    assert ledger.read() == []
+    assert not list(tmp_path.rglob("*.jsonl"))
+
+
+def test_registered_incognito_session_persists_no_row(tmp_path):
+    from agent.incognito import register_session
+    ledger = RequestUsageLedger(tmp_path)
+    register_session("private-1")
+    try:
+        assert ledger.record(row_for_response(_agent(session_id="private-1"))) is False
+    finally:
+        register_session("private-1", enabled=False)
+    assert ledger.record(row_for_response(_agent(session_id="public-1"))) is True
+    assert ledger.flush()
+    assert [row["session_id"] for row in ledger.read()] == ["public-1"]

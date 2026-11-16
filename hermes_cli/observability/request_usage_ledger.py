@@ -204,8 +204,16 @@ class RequestUsageLedger:
             self._errors += 1
 
     def record(self, row: dict[str, Any]) -> bool:
-        """Queue a sanitized row; never waits and never raises into a request."""
+        """Queue a sanitized row; never waits and never raises into a request.
+
+        Incognito sessions persist nothing, so their rows are dropped here, in the request's own
+        context: the writer thread does not inherit the incognito scope.
+        """
         try:
+            from agent.incognito import is_incognito
+            session_id = row.get("session_id")
+            if is_incognito(session_id if isinstance(session_id, str) and session_id else None):
+                return False
             # Resolve the home here: the worker thread does not inherit context-local overrides.
             self._queue.put_nowait((self.root, sanitize_request_row(row)))
             return True
