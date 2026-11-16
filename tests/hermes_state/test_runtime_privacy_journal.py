@@ -14,9 +14,9 @@ from hermes_state_runtime import RuntimeStoreError
 def _capture_saves(store, monkeypatch):
     saved, save = [], store._save
 
-    def traced_save(journal):
+    def traced_save(journal, **kwargs):
         encoded = json.dumps(journal).encode()
-        result = save(journal)
+        result = save(journal, **kwargs)
         # Keep every completed save in RAM, including files later overwritten/deleted.
         saved.append(encoded)
         return result
