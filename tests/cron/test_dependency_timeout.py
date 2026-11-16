@@ -35,6 +35,18 @@ def test_control_socket_timeout_names_the_gateway_handshake(monkeypatch):
         private_control_query(Path("/tmp/hermes-home"), b"{}\n", timeout=1)
 
 
+def test_windows_control_socket_timeout_names_the_gateway_handshake(monkeypatch):
+    from hermes_cli import gateway_client
+
+    monkeypatch.setattr(gateway_client.os, "name", "nt")
+    monkeypatch.setattr(
+        "gateway.runtime_bootstrap_windows.query_runtime_control",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(TimeoutError("timed out")),
+    )
+    with pytest.raises(TimeoutError, match="gateway handshake timed out"):
+        gateway_client.private_control_query(Path("/tmp/hermes-home"), b"{}\n", timeout=1)
+
+
 def _proxy_request(url="http://127.0.0.1:8317/v1/chat/completions"):
     import httpx
 

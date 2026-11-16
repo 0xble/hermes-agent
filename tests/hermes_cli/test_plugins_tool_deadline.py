@@ -30,7 +30,7 @@ def test_register_tool_execution_timeout_extends_executor_deadline(tmp_path, mon
         assert registry.get_entry(long_name, scope=mgr.scope_key).execution_timeout == 1200.0
         assert _extend_tool_timeout(long_name, 420.0) == 1200.0
         assert _extend_tool_timeout(plain_name, 420.0) == 420.0
-        for bad in (0, -5, float("inf"), float("nan"), True, "1200"):
+        for bad in (0, -5, float("inf"), float("nan"), True, "1200", 10**1000):
             with pytest.raises(ValueError, match="execution_timeout"):
                 ctx.register_tool(name="deadline_bad_tool", toolset="deadline_plugin",
                                   schema=_schema("deadline_bad_tool"),

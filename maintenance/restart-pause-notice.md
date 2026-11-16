@@ -30,7 +30,7 @@ app-only LOCAL session, without a deliverable adapter, while draining, or from a
 epoch is no longer the store's. Other pause reasons are unchanged.
 
 The episode is the session's earliest `unknown` admission. It outlives the process, but
-`pause_notified` does not, so a notice that reached the chat is recorded durably: a
+`pause_notified` does not, so a successfully delivered notice is recorded durably: a
 `state_meta` row `pause_notice:<admission_id>`, written off the loop after a successful
 unprompted send, or once the adapter reports that a reply carrying the notice was delivered. A
 reply whose send failed leaves the episode untold: `pause_notified` is cleared, so the next

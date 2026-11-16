@@ -127,7 +127,7 @@ def _publish_tool_snapshot(
 
 def refresh_agent_mcp_tools(
     agent, *, enabled_override=None, disabled_override=None, quiet_mode: bool = True,
-    content_aware: bool = False, preserve_prefix: bool = False) -> set:
+    content_aware: bool = False, preserve_prefix: bool = False, converge_delegation: bool = False) -> set:
     """Re-derive an already-built agent's tool snapshot from the live registry; returns the
     newly-added tool names (empty when unchanged). The agent snapshots ``agent.tools`` at build
     time, so servers that connect later (slow OAuth, ``/reload-mcp``) are invisible until
@@ -153,6 +153,8 @@ def refresh_agent_mcp_tools(
     from tools.registry import registry
     from toolsets import agent_tool_surface, tool_selection_key
     enabled, disabled = _resolve_refresh_toolsets(agent, enabled_override, disabled_override)
+    if converge_delegation:
+        refresh_agent_delegation_tool(agent)
     # Generation captured BEFORE the slow get_tool_definitions call (a slower caller holding an
     # OLDER set must not clobber a newer one); definitions computed OUTSIDE the lock.
     snapshot_generation = registry._generation
@@ -193,6 +195,54 @@ def refresh_agent_mcp_tools(
         return set()
     persist_agent_tool_names(agent)  # re-pin so a rebuild after agent-cache eviction restores this order
     return added
+
+
+def refresh_agent_delegation_tool(agent) -> bool:
+    """Replace only the pinned ``delegate_task`` schema after a gateway-mode change.
+
+    Prompt refresh already has a cache-breaking boundary, but it must not
+    rewrite unrelated tool pins just because a dynamic schema changed. The
+    delegation mode is re-derived first, then the one model-facing entry and
+    its dispatch decision are persisted together.
+    """
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    if not refresh_gateway_delegation_mode(agent):
+        return False
+    current_defs = _agent_tool_defs(agent)
+    if not any(_def_name(tool) == "delegate_task" for tool in current_defs):
+        return False
+
+    try:
+        from model_tools import get_tool_definitions
+        from toolsets import agent_tool_surface
+
+        fresh_defs = agent_tool_surface(agent, list(get_tool_definitions(
+            enabled_toolsets=getattr(agent, "enabled_toolsets", None),
+            disabled_toolsets=getattr(agent, "disabled_toolsets", None),
+            quiet_mode=True,
+        ) or []))
+    except Exception:
+        logger.debug("delegate_task schema refresh skipped", exc_info=True)
+        return False
+    fresh_delegate = next((tool for tool in fresh_defs if _def_name(tool) == "delegate_task"), None)
+    if fresh_delegate is None:
+        return False
+    if next(tool for tool in current_defs if _def_name(tool) == "delegate_task") == fresh_delegate:
+        return False
+
+    with _agent_tools_lock:
+        published = _agent_tool_defs(agent)
+        for index, tool in enumerate(published):
+            if _def_name(tool) == "delegate_task":
+                published[index] = fresh_delegate
+                agent.tools = published
+                agent.valid_tool_names = {_def_name(item) for item in published if _def_name(item)}
+                break
+        else:
+            return False
+    persist_agent_tool_names(agent)
+    return True
 
 
 def reprobe_tool_availability() -> None:

@@ -201,6 +201,8 @@ def stuck_entries(root: Path) -> list[Path]:
     result = [root / name for name in sorted(load_skips(root, persist=False))]
     trash = Path(os.path.realpath(root)).parent / ".scratch-trash"
     try:
+        if trash.is_symlink() or not trash.is_dir():
+            return result
         days = list(trash.iterdir())
     except OSError:
         return result

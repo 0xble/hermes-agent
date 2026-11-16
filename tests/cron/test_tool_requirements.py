@@ -200,7 +200,7 @@ def test_registered_plugin_skill_is_read_from_its_plugin_path(tmp_path, monkeypa
         def find_plugin_skill(self, name):
             return skill if name == "acme:ship" else None
 
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
     monkeypatch.setattr(plugins, "discover_plugins", lambda *a, **k: None)
     monkeypatch.setattr(plugins, "get_plugin_manager", lambda: _PM())
     assert "custom-check" in tool_requirements._attached_skill_content("acme:ship")
@@ -211,7 +211,7 @@ def test_registered_plugin_skill_is_read_from_its_plugin_path(tmp_path, monkeypa
 def test_cron_doctor_passes_live_config_to_tool_requirements(tmp_path, monkeypatch, capsys):
     from cron.jobs import create_job
     from hermes_cli.cron import cron_doctor
-    import hermes_cli.config as config
+    from hermes_cli import config
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     create_job(
@@ -227,7 +227,7 @@ def test_cron_doctor_passes_live_config_to_tool_requirements(tmp_path, monkeypat
 def test_cron_doctor_expands_environment_config(tmp_path, monkeypatch, capsys):
     from cron.jobs import create_job
     from hermes_cli.cron import cron_doctor
-    import hermes_cli.config as config
+    from hermes_cli import config
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     monkeypatch.setenv("REVIEW_DISABLED_TS", "terminal")
@@ -243,7 +243,7 @@ def test_cron_doctor_expands_environment_config(tmp_path, monkeypatch, capsys):
 def test_cron_doctor_handles_null_config_sections(tmp_path, monkeypatch, capsys):
     from cron.jobs import create_job
     from hermes_cli.cron import cron_doctor
-    import hermes_cli.config as config
+    from hermes_cli import config
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     create_job(
@@ -290,7 +290,7 @@ def test_attached_non_utf8_skill_does_not_abort_diagnostics(tmp_path, monkeypatc
 
 
 def test_capability_diagnostics_do_not_discover_plugins(monkeypatch):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     monkeypatch.setattr(plugins, "discover_plugins", lambda: (_ for _ in ()).throw(AssertionError("discovery")))
     job = {"enabled_toolsets": ["terminal"], "prompt": "Add with `loops finding add`."}
@@ -386,6 +386,31 @@ def test_project_skill_diagnosis_persists_nothing_under_home(tmp_path, monkeypat
         su._external_dirs_cache_clear()
     assert len(issues) == 1 and "terminal" in issues[0]
     assert sorted(p.relative_to(home) for p in home.rglob("*")) == before
+
+
+def test_project_skill_read_only_scan_bypasses_cached_verdict(tmp_path, monkeypatch):
+    import agent.skill_utils as su
+    from tools.skills_guard import ScanResult
+
+    skill_dir = tmp_path / "skills" / "audit"
+    skill_dir.mkdir(parents=True)
+    skill = skill_dir / "SKILL.md"
+    skill.write_text("---\nname: audit\n---\nUnsafe.\n")
+    key = str(skill_dir.resolve())
+    su._PROJECT_QUARANTINE_CACHE[key] = False
+    calls = []
+
+    def scan(path, *, source):
+        calls.append((path, source))
+        return ScanResult("audit", source, "community", "dangerous")
+
+    monkeypatch.setattr("tools.skills_guard.scan_skill", scan)
+    try:
+        with su.project_skill_scans_read_only():
+            assert su.is_quarantined_project_skill(skill) is True
+    finally:
+        su._PROJECT_QUARANTINE_CACHE.pop(key, None)
+    assert calls == [(skill_dir, "project-local")]
 
 
 def test_plugin_skill_lookup_failure_keeps_traceback(monkeypatch, caplog):

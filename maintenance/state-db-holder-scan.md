@@ -17,7 +17,9 @@ to reject reuse races. No SQLite descriptor is opened or closed by that check.
 Foreign scans retain the existing fail-open timeout policy. Completed scans are
 judged against each sidecar path immediately after reading its descriptor, then
 filtered by each caller's watched paths. This avoids interpreting a healthy
-connection's later close as a lost generation. No completed result is cached.
+connection's later close as a lost generation. Clean completed verdicts may be
+cached briefly while both sidecar identities remain unchanged; holder/error
+results retain their existing cache behavior.
 Non-vnode descriptors are skipped before libproc reads. Before rethrowing a
 completed scan's error, detach that exact worker from the shared slot under its
 lock. Otherwise the cached exception acquires and retains each caller's frames.

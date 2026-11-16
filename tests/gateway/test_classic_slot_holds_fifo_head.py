@@ -71,7 +71,7 @@ async def _classic_wake_holding_the_slot(monkeypatch):
 async def test_message_during_classic_wake_runs_after_it_not_inside_it(monkeypatch, stop):
     from gateway.platforms.event import MessageEvent
 
-    runner, adapter, source, key, release, started, fallback, rows = await _classic_wake_holding_the_slot(monkeypatch)
+    _runner, adapter, source, _key, release, started, fallback, rows = await _classic_wake_holding_the_slot(monkeypatch)
     if stop:
         await adapter.handle_message(MessageEvent(text='/stop', source=source, message_id='stop'))
     release.set()
@@ -89,7 +89,7 @@ async def test_reaped_classic_slot_is_evicted_so_the_queued_head_runs(monkeypatc
     """The classic turn's durable row is ended while it still holds the slot (ws_orphan_reap,
     agent_close) and it never releases. The drain's reaped probe must evict the dead slot, or the
     queued head waits behind it until the next restart."""
-    runner, adapter, source, key, release, started, fallback, rows = await _classic_wake_holding_the_slot(monkeypatch)
+    runner, _adapter, _source, _key, release, started, fallback, rows = await _classic_wake_holding_the_slot(monkeypatch)
     try:
         assert ('B', True) not in started  # a live classic turn still holds the head
         monkeypatch.setattr(runner.session_store, '_is_session_ended_in_db', lambda *args, **kwargs: True)

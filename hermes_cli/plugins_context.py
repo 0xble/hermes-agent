@@ -281,9 +281,13 @@ class PluginContext(PluginCapabilityCtxMixin):
         any enabled plugin could silently replace a privileged built-in like ``write_file`` (#23194).
         ``execution_timeout`` declares a finite per-tool budget in seconds; the executor uses it
         when it exceeds the generic tool deadline, as it already does for MCP server timeouts."""
+        try:
+            invalid_timeout = not math.isfinite(execution_timeout) if execution_timeout is not None else False
+        except (OverflowError, TypeError):
+            invalid_timeout = True
         if execution_timeout is not None and (
             isinstance(execution_timeout, bool) or not isinstance(execution_timeout, (int, float))
-            or not math.isfinite(execution_timeout) or execution_timeout <= 0
+            or invalid_timeout or execution_timeout <= 0
         ):
             raise ValueError(f"tool {name!r}: execution_timeout must be a finite positive number of seconds")
         if override and not self._tool_override_allowed(name):

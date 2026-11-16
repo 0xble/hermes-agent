@@ -668,8 +668,6 @@ def is_quarantined_project_skill(skill_md) -> bool:
         key = str(skill_dir.resolve())
     except OSError:
         key = str(skill_dir)
-    if key in _PROJECT_QUARANTINE_CACHE:
-        return _PROJECT_QUARANTINE_CACHE[key]
     if _PROJECT_SCAN_READ_ONLY.get():
         try:
             from tools.skills_guard import scan_skill
@@ -678,6 +676,8 @@ def is_quarantined_project_skill(skill_md) -> bool:
             logger.warning("Read-only project skill scan failed — quarantining (fail closed): %s",
                            skill_dir, exc_info=True)
             return True
+    if key in _PROJECT_QUARANTINE_CACHE:
+        return _PROJECT_QUARANTINE_CACHE[key]
     try:
         from tools.skills_guard import scan_skill_cached
         from hermes_constants import get_hermes_home

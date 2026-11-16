@@ -147,6 +147,11 @@ async def announce_pause(authority, ref, reason) -> bool:
         return False
     if authority.sessions.get(ref.session_id) is not live:
         return False  # retired or replaced while the read ran
+    # The adapter lookup awaited above. Recheck the durable human waiter and
+    # episode immediately before claiming so a reply or discard that resolved
+    # the pause during that await cannot send a stale notice.
+    if not await asyncio.to_thread(due):
+        return False
     text = pause_notice(authority, ref, reason)  # claims this episode's one notice
     if text is None:
         return False  # a message on the reply path already told the chat

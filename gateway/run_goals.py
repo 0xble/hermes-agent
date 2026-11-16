@@ -890,7 +890,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 try:
                     # The delivered signal rides the cosmetic cleanup chain, which can time out.
                     await asyncio.wait_for(delivered.wait(), POST_TURN_DELIVERY_WAIT_S)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning("post-turn bookkeeping for %s ran without a delivery signal after %.0fs",
                                    session_key, POST_TURN_DELIVERY_WAIT_S)
                 await finish(deferred=True)
@@ -1221,7 +1221,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             )
             if message:
                 if source is not None:
-                    await self._defer_goal_status_notice_after_delivery(source, message, goal_notice=False)
+                    await self._defer_goal_status_notice_after_delivery(source, message, section="loops", stall=False)
                 return
         def _load():
             from hermes_cli.loops import LoopManager

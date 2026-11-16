@@ -178,7 +178,7 @@ _last_resolved_tool_names: list[str] = []
 
 # Legacy toolset names (old _tools-suffixed names -> tool name lists) live in toolset_compat so
 # cron diagnostics can share them without importing this module.
-from toolset_compat import _LEGACY_TOOLSET_MAP  # noqa: E402
+from toolset_compat import _LEGACY_TOOLSET_MAP
 
 
 # --- get_tool_definitions (the main schema provider) --------------------------

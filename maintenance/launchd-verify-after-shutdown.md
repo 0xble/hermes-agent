@@ -109,12 +109,6 @@ launchd reload from an external kill.
 
 ## Verification and retirement
 
-Contract tests: `tests/hermes_cli/test_update_launchd_restart_verification.py::TestWaitForLaunchdGatewaySupervision::test_slow_graceful_shutdown_does_not_consume_the_respawn_window`,
-  `tests/hermes_cli/test_update_launchd_restart_verification.py::TestWaitForLaunchdGatewaySupervision::test_respawn_window_still_bounds_a_job_that_never_comes_back`,
-  `tests/hermes_cli/test_update_launchd_restart_verification.py::TestWaitForLaunchdGatewaySupervision::test_old_pid_that_never_exits_fails_after_the_shutdown_budget`,
-  `tests/hermes_cli/test_launchd_reload_exit_budget.py`, `tests/hermes_cli/test_launchd_reload_handoff.py`,
-  `tests/gateway/test_planned_restart_signal.py`
-
 Commit `d389ff3baa` (a sync regression-batch repair that landed with the v0.22.5 sync, #776, on 2026-10-26) restored upstream's
 single-window verifier body and deleted the three drain-window tests while keeping the
 `shutdown_timeout` parameter and its docstring, so a drain longer than the respawn window

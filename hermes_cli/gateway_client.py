@@ -256,7 +256,11 @@ def private_control_query(home: Path, request: bytes, timeout: float = 5) -> byt
     """
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
-        return query_runtime_control(home, request, timeout)
+        try:
+            return query_runtime_control(home, request, timeout)
+        except TimeoutError as exc:
+            from cron.dependency_timeout import name_gateway_handshake_timeout
+            raise name_gateway_handshake_timeout(exc) from exc
     from hermes_cli.gateway_runtime_discovery import connect_private
     deadline = time.monotonic() + timeout
     try:
