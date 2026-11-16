@@ -105,7 +105,7 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
 
     try:
         raw_config = read_user_config_raw(get_config_path())
-    except Exception:
+    except Exception:  # health: allow BLE001 -- a broken config read must preserve the live gateway's fail-closed no-refresh behavior.
         return False
     raw_delegation = raw_config.get("delegation") if isinstance(raw_config, dict) else None
     # An absent key means the agent's original surface decision remains the

@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the live gateway baseline adds the delegation schema refresh at this established compaction seam; extract the facade before adding unrelated behavior.
 """Context compression: feasibility probe, warning replay, compress, image fix.
 
 Thread-safety contract for extension points: with ``compression.context_timeout_seconds > 0`` (default) the

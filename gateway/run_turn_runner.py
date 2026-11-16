@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the live gateway baseline adds the interim-message mode marker at this established turn seam; extract the facade before adding unrelated behavior.
 """Per-turn callback runner (progress/status/voice/run_sync) for the gateway agent turn.
 
 ``TurnRunner`` owns the per-turn callbacks ``GatewayRunner._run_agent_inner`` binds. ``gateway.run``
