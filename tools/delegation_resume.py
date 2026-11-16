@@ -979,7 +979,8 @@ def _claimable_retry_rows(conn, now: float, limit: int) -> list:
         return []
     # SELECT above is autocommit/read-only. Recheck delivery, stop, seal and
     # claim eligibility after acquiring the writer, restricted to these ids.
-    conn.execute("BEGIN IMMEDIATE")
+    if not conn.in_transaction:
+        conn.execute("BEGIN IMMEDIATE")
     return conn.execute(
         _RETRY_SELECT + where + f" AND delegation_id IN ({','.join('?' for _ in candidates)})"
         + " ORDER BY updated_at ASC",
@@ -1016,7 +1017,7 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     actions = []
     with ad._DB_LOCK, _best_effort_retry_transaction(ad) as conn:
         if conn is None:
-            return actions
+            return RetrySweepDeferred()
         rows = _claimable_retry_rows(conn, now, limit)
         for row in rows:
             record = _retry_record(row)
