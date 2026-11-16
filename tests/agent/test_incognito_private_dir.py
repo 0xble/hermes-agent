@@ -181,11 +181,11 @@ def test_discard_shuts_down_kernels_for_session_and_aliases_before_removal(monke
     calls = []
     removed = []
 
-    def shutdown(owner):
-        calls.append(owner)
+    def shutdown(*owners):
+        calls.extend(owners)
         assert removed == []
 
-    monkeypatch.setattr("tools.code_kernel.shutdown_kernels_for_owner", shutdown, raising=False)
+    monkeypatch.setattr("tools.code_kernel.shutdown_kernels_for_owners", shutdown, raising=False)
     register_session("session-id")
     with incognito_scope(True, "session-id"):
         interval = private_dirs.private_path_for_current_session()
