@@ -233,7 +233,7 @@ def _resolve_worktree_base(repo_root: str, fetch_timeout: float = 5,
     def _ref_exists(ref: str) -> bool:
         try:
             return _run(["rev-parse", "--verify", "--quiet", ref + "^{commit}"]).returncode == 0
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             return False
 
     def _fetch_head_age() -> Optional[float]:
@@ -433,7 +433,7 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
                             stdin=subprocess.DEVNULL, env=env)
                 branch_created = (created.returncode == 0 and base.returncode == 0
                                   and created.stdout.strip() == base.stdout.strip())
-            except Exception:
+            except (OSError, subprocess.SubprocessError):
                 branch_created = False
             raise
         if result.returncode != 0:
