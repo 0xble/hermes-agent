@@ -418,8 +418,24 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
         # Separate ref creation from checkout: a clean Git rollback must not erase
         # ownership proof. Native branch creation preserves tracking setup and
         # atomically refuses a name acquired by a concurrent launcher.
-        result = _git([*cfg, "branch", branch_name, base_ref], repo_root, timeout=120,
-                      stdin=subprocess.DEVNULL, env=env, tree_timeout=True)
+        try:
+            result = _git([*cfg, "branch", branch_name, base_ref], repo_root, timeout=120,
+                          stdin=subprocess.DEVNULL, env=env, tree_timeout=True)
+        except Exception:
+            # Git may have committed the ref before the bounded process wrapper timed out.
+            # Reconcile the ref itself before cleanup, but only claim it when it still points
+            # at the requested base. A failed probe leaves ownership unknown and therefore
+            # preserves the ref for a later operator check.
+            try:
+                created = _git(["rev-parse", "--verify", f"refs/heads/{branch_name}"],
+                               repo_root, timeout=5, stdin=subprocess.DEVNULL, env=env)
+                base = _git(["rev-parse", base_ref], repo_root, timeout=5,
+                            stdin=subprocess.DEVNULL, env=env)
+                branch_created = (created.returncode == 0 and base.returncode == 0
+                                  and created.stdout.strip() == base.stdout.strip())
+            except Exception:
+                branch_created = False
+            raise
         if result.returncode != 0:
             return result
         branch_created = True

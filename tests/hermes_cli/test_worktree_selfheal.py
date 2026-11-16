@@ -509,6 +509,28 @@ class TestCleanupFailedWorktreeAdd:
         assert ops._worktree_add(str(repo), wt, branch, "HEAD", "HEAD") == ("HEAD", "HEAD")
         assert _git(wt, "status", "--porcelain").stdout == ""
 
+    def test_branch_created_before_timeout_is_removed(self, repo, monkeypatch):
+        from hermes_cli import worktree_ops as ops
+
+        wt = repo / ".worktrees" / "branch-timeout"
+        branch = "hermes/branch-timeout"
+        real_git = ops._git
+        timed_out = False
+
+        def branch_then_timeout(args, cwd, **kwargs):
+            nonlocal timed_out
+            if not timed_out and "branch" in args and branch in args:
+                timed_out = True
+                result = real_git(args, cwd, **kwargs)
+                assert result.returncode == 0
+                raise subprocess.TimeoutExpired(args, kwargs.get("timeout", 120))
+            return real_git(args, cwd, **kwargs)
+
+        monkeypatch.setattr(ops, "_git", branch_then_timeout)
+        assert ops._worktree_add(str(repo), wt, branch, "HEAD", "HEAD") is None
+        assert not wt.exists()
+        assert not _git(repo, "branch", "--list", branch).stdout.strip()
+
     def test_noop_when_nothing_exists(self, repo):
         """Fail-soft on an error path where git never created anything."""
         from hermes_cli.worktree_ops import _cleanup_failed_worktree_add
