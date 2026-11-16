@@ -14,6 +14,8 @@ Only recognized FTS5 parser diagnostics may become misses or language-route fall
 
 The slow log retains the served profile's existing threshold. Timings use a monotonic clock: `reader_queue_ms` includes admission and connection opening, `sql_ms` measures read-statement execution/fetch, `hydration_ms` measures context preparation and tool shaping exclusive of SQL, and `total_ms` includes the entire recall scope. Nested calls reuse the scope and do not produce duplicate logs. The line identifies caller, filters, sort, route, and raw search-hit count. SQL runners record the actual route, overriding the query-only predictor. Filters containing `tool` require a canonical LIKE scan to preserve hits beyond the indexed 8,192-character tool-body prefix, so they must not be labeled `fts5`. Queryless browse, transcript reads, and scrolling identify their own route and successful result count instead of appearing as failed admission. Their direct SQL, including compression-tip lookup and anchored windows, uses the same SQL timer as MATCH and is excluded from hydration time.
 
+Typed `lookup` (title substring, topic or display name, platform with chat and thread) resolves a session through the same reader-only scope, so agents never need raw SQL against `state.db`. It is read-only, capped at 20 rows, and returns session identity and routing metadata without hydrating messages.
+
 ## Upstream Disposition
 
 The independent starting hypothesis was reader-pool exhaustion reaching the locked-writer fallback, not slow FTS computation. It follows the production convoy evidence and was tested before widening execution architecture.

@@ -47,6 +47,28 @@ def test_only_fts_syntax_errors_are_misses(db, monkeypatch, message, is_syntax):
         assert message in result["error"]
 
 
+def test_typed_lookup_resolves_title_and_slack_route(db):
+    db.create_session(
+        "slack-route", source="slack", session_key="agent:main:slack:C123:171.42",
+        chat_id="C123", chat_type="channel", thread_id="171.42", display_name="Incident topic",
+    )
+    db.set_session_title("slack-route", "PartyDAO relay delivery")
+
+    by_title = json.loads(session_search(lookup={"title": "partydao"}, db=db))
+    assert by_title["success"] and by_title["mode"] == "lookup"
+    assert by_title["results"][0]["session_id"] == "slack-route"
+
+    by_route = json.loads(session_search(
+        lookup={"platform": "slack", "chat_id": "C123", "thread_id": "171.42"}, db=db,
+    ))
+    assert by_route["success"] and by_route["results"][0]["session_id"] == "slack-route"
+
+
+def test_typed_lookup_rejects_empty_selector(db):
+    result = json.loads(session_search(lookup={}, db=db))
+    assert result["success"] is False and "lookup requires" in result["error"]
+
+
 def test_search_and_tool_hydration_bypass_writer_at_reader_capacity(db):
     # Occupy every existing reader. The search must wait for a reader to return,
     # not fall back to the writer. Keep the writer held until ALL recall finishes.
