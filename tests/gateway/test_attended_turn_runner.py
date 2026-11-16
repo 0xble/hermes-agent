@@ -68,6 +68,29 @@ def test_fallback_is_not_undone_when_desired_route_changes_mid_turn(
     assert agent._gateway_attended_decision_key == decision.decision_key
 
 
+def test_cron_execution_never_switches_to_attended_route():
+    """The attended request-boundary hook is disabled while a cron fire is active."""
+    turn, runner, _state = _runner(
+        AttendedResolution("opus", "anthropic", "medium", "attended", True),
+    )
+    turn._ctx.source = SimpleNamespace(platform=Platform.LOCAL)
+    runner._attended_resolution_for_session = lambda **_kwargs: pytest.fail(
+        "cron execution must not resolve attended routing"
+    )
+    agent = SimpleNamespace(
+        model="gpt-6.1-sol", provider="openai", api_mode="chat_completions",
+    )
+
+    from cron.execution_identity import enter_cron_execution, exit_cron_execution
+    token = enter_cron_execution({"id": "job-1", "name": "test"}, "fire-1", {})
+    try:
+        turn._apply_attended_before_api_call(agent)
+    finally:
+        exit_cron_execution(token)
+
+    assert agent.model == "gpt-6.1-sol"
+
+
 def test_committed_api_boundary_persists_attended_route_marker():
     decision = AttendedResolution("opus", "anthropic", "medium", "attended", True)
     turn, runner, _state = _runner(decision)

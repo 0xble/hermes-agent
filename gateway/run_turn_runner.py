@@ -837,6 +837,11 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         """Apply a changed desired route at the real request boundary, never on fallback retries."""
         runner = self._runner
         ctx = self._ctx
+        # Cron owns its route at construction. The execution identity is bound around the whole
+        # gateway-owned turn, so attended chat state must not rewrite the cron agent at request time.
+        from cron.execution_identity import current_cron_execution
+        if current_cron_execution() is not None:
+            return
         from gateway.session_policy import policy_for_source
         # Launch-policy sessions resolve their own frozen or followed route and effort.
         # Messaging attended routing must not replace that owner's explicit choices.
