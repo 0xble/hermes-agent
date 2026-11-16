@@ -8,3 +8,5 @@
 - **Focused regression:** `uv run --group dev pytest -q tests/agent/test_native_preflight_estimate.py tests/agent/test_provider_output_cap_preflight.py tests/agent/test_preflight_gate_output_cap.py tests/agent/test_anthropic_adapter.py tests/agent/transports/test_chat_completions.py`.
 - **Retirement:** Remove this unit and its row when upstream provides equivalent provider-accurate request-fit and turn-scoped output-cap behavior.
 - **Rollback:** Revert the commits carrying `Fork-Patch: provider-output-cap-preflight`.
+
+Contract tests: `tests/agent/test_native_preflight_estimate.py`, `tests/agent/test_provider_output_cap_preflight.py`, `tests/agent/test_preflight_gate_output_cap.py`, `tests/agent/test_anthropic_adapter.py`, `tests/agent/transports/test_chat_completions.py`.

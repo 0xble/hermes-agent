@@ -19,3 +19,5 @@ Run `tests/hermes_cli/test_shared_metrics_exit_flush.py`, `tests/hermes_cli/test
 The runtime suite's parked export-flush fixture must stay parked until the test explicitly releases it, so later task ends all arrive during the same flush and coalesce into exactly 1 extra pass. An unchecked 3-second wait could expire on a slow runner and create 3 passes instead of 2. Use a 60-second guard with an explicit assertion, and retain a timeout failure through fixture teardown because the runtime catches and logs flush exceptions. Keep the `attempts == 2` assertion. Retire this fixture adaptation when upstream preserves the same scheduling precondition and fails loudly on timeout.
 
 Retire when upstream rechecks owning-profile consent during asynchronous persistence and passes these regressions without changing collection, send, or exit bounds.
+
+Contract tests: `tests/hermes_cli/test_shared_metrics_shutdown_worker.py`, `tests/hermes_cli/test_shared_metrics_exit_flush.py`, `tests/hermes_cli/test_relay_shared_metrics_runtime.py`, `tests/hermes_cli/test_relay_shared_metrics.py`.

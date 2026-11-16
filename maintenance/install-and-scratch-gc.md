@@ -22,3 +22,5 @@ preserving the PM project's dependency inputs. Related historical upgrade
 seams are owned by [historical upgrade compatibility](nightly-upgrade-e2e.md).
 
 Retire when equivalent upstream behavior is present and the guard tests pass without this fork patch.
+
+Contract tests: `tests/pm/test_install_gc.py`, `tests/gateway/test_install_orphan_housekeeping.py`, `tests/test_scratch_dir.py`, `tests/pm/test_runtime.py`.

@@ -52,3 +52,5 @@ fallbacks through real caller imports. Run these with `tests/tools/test_credenti
 Retire the fork patch when upstream satisfies the same full-policy contract.
 Rollback reverts the patch and returns to automatic collection. It cannot remove
 mounts from an already-created container.
+
+Contract tests: `tests/tools/test_docker_auto_mount_host_state.py`, `tests/tools/test_docker_cache_path_policy.py`, `tests/tools/test_credential_files.py`, `tests/tools/test_truncation_footer_sandbox_paths.py`, `tests/tools/test_image_generation_artifacts.py`, `tests/tools/test_terminal_config_env_sync.py`, `tests/tools/test_terminal_scope_multiplex.py`.

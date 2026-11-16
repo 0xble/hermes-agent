@@ -20,3 +20,5 @@ Native-image syntax must not also be extracted/uploaded as attachments. Other im
 Run `scripts/run_tests.sh tests/plugins/platforms/slack tests/gateway/test_slack_block_kit.py tests/gateway/test_slack_block_kit_adapter.py tests/tools/test_send_message_slack.py` plus focused platform-hint and delivery tests. Test both live-adapter and standalone routes, disabled mode, image de-duplication and rejected-block fallback.
 
 Retire only when the selected upstream release passes these behavior tests without the local patch. Roll back the owned renderer, delivery and hint changes together. Runtime promotion and restart remain separate decisions.
+
+Contract tests: `tests/gateway/test_slack_block_kit.py`, `tests/gateway/test_slack_block_kit_adapter.py`, `tests/tools/test_send_message_slack.py`.

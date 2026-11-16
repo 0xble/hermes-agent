@@ -62,3 +62,44 @@ def test_an_unfetchable_release_tag_is_reported_never_fatal(tmp_path, capsys, gi
     update_cmd_check.fetch_release_tag(git_cmd, tmp_path, {"release_tag": "v9.9.9"})
 
     assert "Could not fetch the v9.9.9 tag" in capsys.readouterr().out
+
+
+def _fork_on_an_untagged_release(tmp_path, *, recorded_sha=None, recorded="v0.23.1"):
+    """A fork checkout whose only local tag is an older release than the one it has merged."""
+    repo = tmp_path / "fork"
+    repo.mkdir()
+    _git(repo, "init", "-q", "-b", "main")
+    (repo / "f").write_text("1")
+    _git(repo, "add", "f")
+    _git(repo, "commit", "-qm", "old release")
+    _git(repo, "tag", "v0.20.0")
+    (repo / "f").write_text("2")
+    _git(repo, "commit", "-qam", "new release, tag never fetched")
+    release = _git(repo, "rev-parse", "HEAD")
+    (repo / "MAINTENANCE.md").write_text(
+        f"Accepted release baseline:\n`{recorded}`, `{recorded_sha or release}`.\n")
+    _git(repo, "add", "MAINTENANCE.md")
+    _git(repo, "commit", "-qm", "fork work")
+    return repo
+
+
+def test_a_fork_is_named_by_its_recorded_baseline_when_the_release_tag_is_missing(tmp_path):
+    """A branch update fetches no tags and the fork remote carries none, so the newest local tag
+    is an older release. Naming the install by it made ``requires_hermes`` reject a plugin the
+    installed release satisfies. The tree's own recorded baseline names it instead."""
+    info = _git_version_info(_fork_on_an_untagged_release(tmp_path))
+
+    assert (info.base_version, info.distance, info.display_version) == ("0.23.1", 1, "0.23.1+1")
+
+
+def test_a_recorded_baseline_the_revision_does_not_contain_is_ignored(tmp_path):
+    """The record is text in the tree: only a commit the revision really contains may name it."""
+    info = _git_version_info(_fork_on_an_untagged_release(tmp_path, recorded_sha="0" * 40))
+
+    assert (info.base_version, info.distance) == ("0.20.0", 2)
+
+
+def test_a_newer_local_tag_outranks_an_older_recorded_baseline(tmp_path):
+    info = _git_version_info(_fork_on_an_untagged_release(tmp_path, recorded="v0.19.0"))
+
+    assert (info.base_version, info.distance) == ("0.20.0", 2)

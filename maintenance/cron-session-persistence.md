@@ -17,3 +17,5 @@ Fork base: `9371a3ebcdffd3c4bcf44be49dbc7e3989feee44`. Upstream main inspected o
 Source surfaces: `cron/scheduler.py`, `cron/scheduler_session_store.py`, `cron/jobs.py`, `cron/job_run_retry.py`. Proof: `tests/cron/test_session_store_required.py`, `tests/cron/test_sessiondb_init_hang.py` and `tests/cron/test_finalize_title_timeout.py`, plus the cron suite. Preserve profile context propagation, late-result cleanup, failure routing, repeat refunds and script-only behavior together when adopting upstream changes.
 
 Retire this divergence when an upstream release satisfies those contracts. Reverting it restores sessionless execution, including its persistence and caller-identity failure. This unit does not introduce shared gateway identity fallback or model-supplied session identity, and publication does not imply runtime adoption.
+
+Contract tests: `tests/cron/test_session_store_required.py`, `tests/cron/test_sessiondb_init_hang.py`, `tests/cron/test_finalize_title_timeout.py`.
