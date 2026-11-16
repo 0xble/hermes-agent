@@ -45,6 +45,80 @@ async def test_failed_internal_turn_is_requeued_once_instead_of_becoming_a_refus
 
 
 @pytest.mark.asyncio
+async def test_local_failed_internal_retry_keeps_retry_stamp_through_admission(monkeypatch):
+    """A LOCAL admission must retain the one-retry stamp on an unmarked internal wake."""
+    from gateway import session_automation, session_route_wake
+
+    runner = object.__new__(GatewayRunner)
+    runner._is_goal_continuation_event = lambda event: False
+    runner._delivery_adapter_for = lambda source: object()
+    runner._session_key_for_source = lambda source: "session-key"
+    source = SimpleNamespace(platform=Platform.LOCAL, chat_id="chat")
+    authority = SimpleNamespace(runner=runner)
+    admitted = []
+
+    monkeypatch.setattr(
+        "gateway.session_detached.route_entry",
+        lambda _authority, _key: SimpleNamespace(session_id="session-id"),
+    )
+
+    async def local_admit(_runner, adapter, source, text, producer, metadata=None, *, event=None):
+        wake = session_route_wake._capture(
+            authority, adapter, source, text, "session-key", "retry-id", metadata, event,
+        )
+        admitted.append(wake)
+        return wake is not None
+
+    monkeypatch.setattr(session_automation, "admit_route_wake", local_admit)
+    event = MessageEvent(
+        text="background result", message_type=MessageType.TEXT, source=source,
+        internal=True, reply_expected=False, metadata={},
+    )
+    failure = {"failed": True, "completed": False, "failure_retryable": True}
+
+    assert await GatewayRunner._retry_failed_synthetic_event(runner, event, source, failure) is True
+    retry = admitted[-1]
+    assert retry.metadata["gateway_internal_retry_count"] == 1
+    assert await GatewayRunner._retry_failed_synthetic_event(runner, retry, source, failure) is False
+    assert len(admitted) == 1
+
+
+def test_unknown_provenance_internal_failed_turn_has_empty_durable_boundary(tmp_path, monkeypatch):
+    """Notification-category wakes are internal even when provenance classification is unknown."""
+    from agent.conversation_loop import _close_durable_failed_turn
+    from gateway.platforms.event import MessageEvent
+    from gateway.response_filters import display_kind_for_event
+    from gateway.session import SessionSource
+    from hermes_state import SessionDB
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    db = SessionDB(tmp_path / "state.db")
+    sid = "unknown-internal"
+    db.create_session(session_id=sid, source="telegram", model="m")
+    db.append_message(sid, "user", "background wake")
+    messages = [{"role": "user", "content": "background wake"}]
+    wake = MessageEvent(
+        text="background wake", source=SessionSource(platform=Platform.TELEGRAM, chat_id="chat"),
+        internal=True, metadata={"notification_category": "diagnostic"},
+    )
+    assert display_kind_for_event(wake) == "internal_notification"
+    agent = SimpleNamespace(
+        _session_db=db, session_id=sid, _turn_provenance="unknown", _turn_display_kind="internal_notification",
+        _flush_messages_to_session_db=lambda rows: db.append_message(
+            sid, rows[-1]["role"], rows[-1]["content"]),
+    )
+
+    _close_durable_failed_turn(agent, {
+        "completed": False, "failed": True, "failure_reason": "server_error",
+        "messages": messages, "current_turn_user_idx": 0,
+    })
+
+    assert messages[-1]["content"] == ""
+    assert db.get_messages(sid)[-1]["content"] == ""
+    db.close()
+
+
+@pytest.mark.asyncio
 async def test_interrupted_synthetic_turn_is_not_requeued_even_with_retryable_result():
     runner = object.__new__(GatewayRunner)
     runner._is_goal_continuation_event = lambda event: False

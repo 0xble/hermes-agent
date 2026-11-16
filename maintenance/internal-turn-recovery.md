@@ -8,9 +8,9 @@ how synthetic gateway and CLI turns settle after an inference failure.
 ## Contract
 
 A failed turn that no person started (relay, process notification, goal or loop
-continuation, cron) must never show the human "Your request was not processed"
-resend copy. Its durable failed boundary keeps empty content, so the transcript
-sequence stays closed without leaking chat-facing text into the topic or into the
+continuation, cron, or any event the gateway marks `internal`) must never show the human
+"Your request was not processed" resend copy. Its durable failed boundary keeps empty content,
+so the transcript sequence stays closed without leaking chat-facing text into the topic or into the
 goal transcript.
 
 The gateway requeues one failed internal or goal-continuation event once, with

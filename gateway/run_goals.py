@@ -946,7 +946,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             if getattr(source, "platform", None) == Platform.LOCAL:
                 from gateway.session_automation import admit_route_wake
                 accepted = await admit_route_wake(
-                    self, adapter, source, retry.text, "internal-failure-retry", event=retry,
+                    self, adapter, source, retry.text, "internal-failure-retry",
+                    metadata=retry.metadata, event=retry,
                 )
                 if not accepted:
                     return False
