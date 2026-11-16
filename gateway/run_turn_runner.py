@@ -837,14 +837,8 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         """Apply a changed desired route at the real request boundary, never on fallback retries."""
         runner = self._runner
         ctx = self._ctx
-        from gateway.session_policy import policy_for_source
-        # Launch-policy sessions resolve their own frozen or followed route and effort.
-        # Messaging attended routing must not replace that owner's explicit choices.
-        if policy_for_source(runner, ctx.source) is not None:
-            return
-        if getattr(agent, "is_subagent", False) or getattr(agent, "_is_auxiliary", False):
-            return
-        if ctx.session_key in (getattr(runner, "_bulk_reset_pending_sessions", set()) or set()):
+        from gateway.run_turn_runner_attended import attended_switch_exempt
+        if attended_switch_exempt(runner, ctx, agent):
             return
         def _handoff(*, conversation=None, runner_state=None):
             handoff = getattr(runner, "_handoff_attended_state", None)
@@ -966,6 +960,9 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
                     agent, model, runtime.get("provider", agent.provider), runtime.get("api_key", ""),
                     runtime.get("base_url", ""), runtime.get("api_mode", ""), runtime.get("capabilities"),
                 )
+                if decision.switched_back and previous_decision is not None:
+                    from hermes_cli.observability.request_usage_ledger import note_attended_switch
+                    note_attended_switch(runner, ctx, agent, previous_decision, model)
             if decision.reasoning_effort:
                 # The committed decision already carries the destination effort. Re-resolving here
                 # would read session state whose handoff to the gateway loop may not have landed yet,

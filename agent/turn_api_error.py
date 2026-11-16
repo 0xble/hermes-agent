@@ -86,6 +86,15 @@ def handle_api_error(
         active_system_prompt=active_system_prompt,
     )
     if _recovered:
+        # Pre-classification recovery still means the physical provider request failed.
+        # Record it here because the classified hook below is intentionally bypassed.
+        agent._invoke_api_request_error_hook(
+            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+            api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,
+            error_type=type(api_error).__name__, error_message=str(api_error),
+            status_code=getattr(api_error, "status_code", None), retry_count=retry_count,
+            max_retries=max_retries, retryable=True, reason="pre_classification_recovery",
+        )
         return _verdict("continue")
 
     status_code = getattr(api_error, "status_code", None)
