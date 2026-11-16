@@ -24,6 +24,8 @@ def _counting_compositions(monkeypatch):
 
 def test_repeated_terminal_commands_compose_the_store_path_once(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_RUNTIME_DIR", str(tmp_path / "runtime"))
+    # Freeze just before a 30s bucket boundary, as below: a real clock can roll the bucket mid-test.
+    monkeypatch.setattr(pm.install, "_clock", lambda: pm.install._STORE_PATH_DIRS_TTL_S - 1e-9)
     calls = _counting_compositions(monkeypatch)
 
     first = pm.install.cached_store_path_dirs()
