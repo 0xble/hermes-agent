@@ -838,6 +838,7 @@ def build_system_prompt(agent: Any, system_message: Optional[str] = None) -> str
     only rebuilt after compression.  Tiers are ordered stable -> context ->
     volatile so implicit longest-prefix caches keep the unchanged scaffold."""
     parts = build_system_prompt_parts(agent, system_message=system_message)
+    agent._cached_system_prompt_parts = dict(parts)
     agent._cached_system_prompt_static = parts["stable"]
     # Surface context-file truncation warnings in chat, not only in logs.
     for warning in drain_truncation_warnings():

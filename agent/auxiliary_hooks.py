@@ -146,8 +146,6 @@ class _AuxCallHooks:
     ) -> None:
         """``normalized`` = ``(assistant_message, finish_reason, usage_summary)`` for a response
         that is not chat.completions-shaped (an agent transport's native reply)."""
-        if not _has_hook(POST_AUXILIARY_CALL):
-            return
         from agent.api_request_hooks import ApiRequestHooksMixin as _Sanitize
 
         ended_at = time.time()
@@ -182,6 +180,25 @@ class _AuxCallHooks:
                 assistant_content_chars=len(content) if isinstance(content, str) else 0,
                 assistant_tool_call_count=len(tool_calls),
             )
+        # Auxiliary calls use the same physical-attempt hook, including retries/fallbacks. Keep
+        # only route, task label, failure class, and numeric usage; never copy payload or errors.
+        try:
+            from hermes_cli.observability.request_usage_ledger import record_request_row
+            usage = payload.get("usage") or {}
+            record_request_row({
+                "session_id": payload.get("session_id"),
+                "source": "cron" if payload.get("platform") == "cron" else payload.get("platform"),
+                "role_task_label": payload.get("aux_task") or "auxiliary",
+                "requested_provider": payload.get("provider"), "requested_model": payload.get("model"),
+                "resolved_provider": payload.get("provider"), "resolved_model": payload.get("model"),
+                "failure_class": payload.get("error_type"),
+                "input_tokens": usage.get("prompt_tokens"),
+                "cache_read_tokens": usage.get("cache_read_tokens"),
+                "cache_write_tokens": usage.get("cache_write_tokens"),
+                "output_tokens": usage.get("completion_tokens"),
+            })
+        except Exception:
+            pass
         _fire(POST_AUXILIARY_CALL, **payload)
 
 
@@ -192,6 +209,11 @@ def _has_hook(name: str) -> bool:
         return has_hook(name)
     except Exception:
         return False
+
+
+def _request_usage_ledger_enabled() -> bool:
+    # The local ledger is always observation-only and fail-open; unlike plugin hooks it is not consent-gated.
+    return True
 
 
 def _fire(name: str, **payload: Any) -> None:
@@ -209,7 +231,8 @@ def _fire(name: str, **payload: Any) -> None:
 def start_aux_call_hooks(**kw: Any) -> Optional[_AuxCallHooks]:
     """Fire ``pre_auxiliary_call`` for one attempt; the handle for :func:`finish_aux_call_hooks`,
     or None when nothing subscribes. For callers that drive the provider call themselves."""
-    if not (_has_hook(PRE_AUXILIARY_CALL) or _has_hook(POST_AUXILIARY_CALL)):
+    if not (_has_hook(PRE_AUXILIARY_CALL) or _has_hook(POST_AUXILIARY_CALL) or
+            _request_usage_ledger_enabled()):
         return None
     try:
         hooks = _AuxCallHooks(**kw)
