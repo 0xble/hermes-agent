@@ -6,10 +6,12 @@ Fork patch identity: `adopt-worker-indexed-lookup`.
 
 `adopt_worker_execution` must not materialize historical admissions while holding
 its writer transaction merely to find the active worker's linked admission.
-Use the existing all-status `session_admissions_pending` covering index to build
-candidate primary keys, then check generation, epoch and direct-target/JSON
-lineage against those rows. The index still scans: status is not its leading
-column. This patch removes the wide table scan, not all history-dependent work.
+Use the partial `idx_session_admissions_worker_adoption` covering index for the
+`started`/`unknown` adoption path to build candidate primary keys, then check
+generation, epoch and direct-target/JSON lineage against those rows. Other
+status sets retain the parameterized query because SQLite cannot prove the
+partial-index predicate for arbitrary bound values. This patch removes the
+wide table scan, not all history-dependent work.
 
 Keep both assignment revalidations, retirement visibility, secret and epoch
 checks, conflict cardinality and conditional-update row-count checks inside the

@@ -47,7 +47,7 @@ def test_adoption_candidate_plan_uses_covering_index_not_admissions_table_scan(w
     query, = [sql for sql in statements if 'json_each(session_admissions.lineage_json)' in sql]
     plan = [row[3] for row in db._conn.execute('EXPLAIN QUERY PLAN ' + query)]
     assert not any(detail == 'SCAN session_admissions' for detail in plan), plan
-    assert any('USING COVERING INDEX session_admissions_pending' in detail for detail in plan), plan
+    assert any('USING COVERING INDEX idx_session_admissions_worker_adoption' in detail for detail in plan), plan
     assert any('SEARCH session_admissions USING INTEGER PRIMARY KEY' in detail for detail in plan), plan
 
 

@@ -826,15 +826,24 @@ def _linked_worker_admission(conn, session_id, generation, owner_epoch, statuses
         placeholders = ','.join('?' for _ in statuses)
         status_clause = f"status IN ({placeholders})"
         status_params = statuses
-    # Drive from the narrow covering index before fetching historical payload/lineage rows.
-    rows = conn.execute(f"""SELECT admission.* FROM session_admissions AS live INDEXED BY idx_session_admissions_worker_adoption
-        JOIN session_admissions AS admission ON admission.seq=live.seq
-        WHERE {status_clause.replace('status', 'live.status')}
-          AND admission.generation=? AND admission.owner_epoch=?
-          AND (admission.target_session_id=? OR EXISTS (
-              SELECT 1 FROM json_each(admission.lineage_json) WHERE value=?
-          )) ORDER BY admission.seq""",
-        (*status_params, generation, owner_epoch, session_id, session_id)).fetchall()
+    if statuses == ('started', 'unknown'):
+        # Drive from the narrow covering index before fetching historical payload/lineage rows.
+        rows = conn.execute("""SELECT session_admissions.* FROM session_admissions AS live
+            INDEXED BY idx_session_admissions_worker_adoption
+            JOIN session_admissions ON session_admissions.seq=live.seq
+            WHERE live.status IN ('started','unknown')
+              AND session_admissions.generation=? AND session_admissions.owner_epoch=?
+              AND (session_admissions.target_session_id=? OR EXISTS (
+                  SELECT 1 FROM json_each(session_admissions.lineage_json) WHERE value=?
+              )) ORDER BY session_admissions.seq""",
+            (generation, owner_epoch, session_id, session_id)).fetchall()
+    else:
+        rows = conn.execute(f"""SELECT * FROM session_admissions
+            WHERE generation=? AND owner_epoch=? AND {status_clause}
+              AND (target_session_id=? OR EXISTS (
+                  SELECT 1 FROM json_each(session_admissions.lineage_json) WHERE value=?
+              )) ORDER BY seq""",
+            (generation, owner_epoch, *status_params, session_id, session_id)).fetchall()
     if len(rows) > 1:
         raise RuntimeStoreError('admission_conflict')
     return rows[0] if rows else None
