@@ -28,9 +28,11 @@ SESSION_STATE_SCHEMA = {
     "description": (
         "Read-only typed inspection of Hermes session state. Use resolve_topic to map a Telegram DM "
         "chat and thread to its session, inspect_session for bounded session metadata and lineage, "
-        "and inspect_delivery for bounded delivery status. This is for durable Hermes state that "
-        "session_search does not expose. It never accepts SQL or arbitrary selectors, never returns "
-        "delivery content unless include_content=true, and never creates or migrates state.db."
+        "and inspect_delivery for bounded delivery status. Use this instead of sqlite3 or direct "
+        "state.db reads. To find a session by title or topic name, or to resolve a Slack channel "
+        "plus thread_ts, use session_search with lookup instead. This is for durable Hermes state "
+        "that session_search does not expose. It never accepts SQL or arbitrary selectors, never "
+        "returns delivery content unless include_content=true, and never creates or migrates state.db."
     ),
     "parameters": {
         "type": "object",

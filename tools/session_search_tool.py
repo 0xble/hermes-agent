@@ -751,6 +751,7 @@ SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
         "Find Hermes sessions by title, topic, or route. "
+        "Use typed lookup to resolve a named owner or relay target before reading or sending. "
         "A named owner or delegated worker can use typed lookup to resolve the right session before reading or relaying. "
         "Use `lookup` for deterministic title/topic/platform resolution, including Slack channel+thread_ts "
         "or Telegram chat+topic/thread; use `query` for discovery (top-N matching sessions, top result fully hydrated); "
