@@ -2,6 +2,8 @@
 the edit's revision, so native admission keys it ``<message_id>:edit:<revision>`` instead of
 refusing it as a changed replay of the original command (``admission_conflict``)."""
 
+import asyncio
+
 import pytest
 
 from tests.gateway.test_messaging_slash_command_fifo import _rows, _start_a
@@ -68,7 +70,8 @@ async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
         assert adapter._start_session_processing(event, key)
         owner = adapter._session_tasks[key]
         while True:
-            await owner
+            # Bounded so a wedged owner or successor fails with a message instead of hanging.
+            await asyncio.wait_for(asyncio.shield(owner), timeout=30)
             successor = adapter._session_tasks.get(key)
             if successor is None or successor is owner:
                 break
@@ -82,6 +85,8 @@ async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
                 mgr, _entry = await runner._get_goal_manager_for_event(MessageEvent(text='', source=source))
                 return mgr.state is not None and mgr.state.goal == 'write an ode'
             await async_wait_until(updated_goal, what='the edited goal command to finish')
+            # Goal state saves before the edit's owner task finishes replying and finalizing.
+            await async_wait_until(idle, what='the edited goal command to release the session')
             assert len(ran) == 2 and _rows(rig) == ['H', 'G']
             await adapter.handle_message(MessageEvent(text='/goal clear', message_type=MessageType.COMMAND,
                                                       source=source, message_id='clear'))
