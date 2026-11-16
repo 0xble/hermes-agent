@@ -860,6 +860,7 @@ def invalidate_system_prompt(agent: Any) -> None:
     """
     agent._cached_system_prompt = None
     agent._cached_system_prompt_static = None
+    agent._cached_system_prompt_parts = None
     if hasattr(agent, "_plugin_system_prompt_sections_snapshot"):
         agent._plugin_system_prompt_sections_previous = agent._plugin_system_prompt_sections_snapshot
         del agent._plugin_system_prompt_sections_snapshot
@@ -888,6 +889,7 @@ def reconstruct_static_prefix(agent: Any, system_message: Optional[str] = None, 
         static = build_system_prompt_parts(agent, system_message=system_message)["stable"]
         if static and stored.startswith(static):
             agent._cached_system_prompt_static = static
+            agent._cached_system_prompt_parts = None
             agent._static_rebuild_failed_for = None
             return
     except Exception:

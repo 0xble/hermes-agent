@@ -52,12 +52,15 @@ def _nonnegative_int(value: Any) -> int | None:
 def _tier_sizes(value: Any) -> dict[str, int] | None:
     if not isinstance(value, dict):
         return None
+    total = _nonnegative_int(value.get("total"))
+    if total is not None:
+        return {"total": total} if set(value) <= {"total"} else None
     result = {}
     for key in ("stable", "context", "volatile"):
         size = _nonnegative_int(value.get(key))
         if size is not None:
             result[key] = size
-    return result or None
+    return result if set(result) == {"stable", "context", "volatile"} else None
 
 
 def _utc_timestamp() -> str:
@@ -101,7 +104,12 @@ def _request_context(agent: Any, *, failure_class: str | None = None, usage: Any
     if cron_job_id is None and cron_session_id.startswith("cron_"):
         cron_job_id = cron_session_id[5:].split("_", 1)[0] or None
     source = "cron" if get_session_env("HERMES_CRON_SESSION", "") == "1" else session_source_for(getattr(agent, "platform", None))
-    parts = getattr(agent, "_cached_system_prompt_parts", None) or {}
+    parts = getattr(agent, "_cached_system_prompt_parts", None)
+    if isinstance(parts, dict) and all(isinstance(parts.get(key), str) for key in ("stable", "context", "volatile")):
+        prompt_sizes = {key: len(parts[key]) for key in ("stable", "context", "volatile")}
+    else:
+        cached_prompt = getattr(agent, "_cached_system_prompt", None)
+        prompt_sizes = {"total": len(cached_prompt)} if isinstance(cached_prompt, str) else None
     usage_dict = usage if isinstance(usage, dict) else {}
     role_task_label = getattr(agent, "_delegate_role", None) or getattr(agent, "_turn_route_task", None)
     if not role_task_label:
@@ -122,9 +130,7 @@ def _request_context(agent: Any, *, failure_class: str | None = None, usage: Any
         "cache_read_tokens": usage_dict.get("cache_read_tokens"),
         "cache_write_tokens": usage_dict.get("cache_write_tokens"),
         "output_tokens": usage_dict.get("output_tokens"),
-        "system_prompt_tier_sizes": {
-            key: len(value) for key, value in parts.items() if key in {"stable", "context", "volatile"} and isinstance(value, str)
-        } or None,
+        "system_prompt_tier_sizes": prompt_sizes,
         "switch_from_model": None,
         "switch_to_model": None,
         "idle_gap_bucket": None,
@@ -151,6 +157,7 @@ def row_for_attended_switch(*, session_id: str, source: str, from_model: str, to
                              idle_gap_bucket: str, role_task_label: str = "attended_model_switch") -> dict[str, Any]:
     return sanitize_request_row({
         "session_id": session_id, "source": source, "role_task_label": role_task_label,
+        "resolved_model": to_model,
         "from_model": from_model, "to_model": to_model,
         "idle_gap_bucket": idle_gap_bucket,
     })
@@ -186,6 +193,7 @@ class RequestUsageLedger:
         self._fixed_root = root
         self._queue: queue.Queue[tuple[Path, dict[str, Any]] | object] = queue.Queue(maxsize=_QUEUE_SIZE)
         self._errors = 0
+        self._pruned_days: set[tuple[Path, str]] = set()
         self._lock = threading.Lock()
         self._worker = threading.Thread(target=self._run, name="hermes-request-usage-ledger", daemon=True)
         self._worker.start()
@@ -244,7 +252,10 @@ class RequestUsageLedger:
             os.write(fd, payload)
         finally:
             os.close(fd)
-        self._prune(root)
+        prune_key = (root, day)
+        if prune_key not in self._pruned_days:
+            self._prune(root)
+            self._pruned_days.add(prune_key)
 
     def _prune(self, root: Path) -> None:
         cutoff = datetime.now(UTC).date() - timedelta(days=_RETENTION_DAYS)
@@ -339,10 +350,10 @@ def _auxiliary_row(payload: dict[str, Any]) -> dict[str, Any]:
         "requested_provider": payload.get("provider"), "requested_model": payload.get("model"),
         "resolved_provider": payload.get("provider"), "resolved_model": payload.get("model"),
         "failure_class": payload.get("error_type"),
-        "input_tokens": usage.get("prompt_tokens"),
+        "input_tokens": usage.get("input_tokens"),
         "cache_read_tokens": usage.get("cache_read_tokens"),
         "cache_write_tokens": usage.get("cache_write_tokens"),
-        "output_tokens": usage.get("completion_tokens"),
+        "output_tokens": usage.get("output_tokens"),
     }
 
 
@@ -358,7 +369,7 @@ def note_attended_switch(runner: Any, ctx: Any, agent: Any, previous_decision: A
         state = runner._session_state(ctx.session_key) if ctx.session_key else None
         last = getattr(getattr(state, "conversation", None), "last_user_activity_at", None)
         return row_for_attended_switch(
-            session_id=ctx.session_key or getattr(agent, "session_id", ""),
+            session_id=getattr(agent, "session_id", ""),
             source=session_source_for(getattr(agent, "platform", None)),
             from_model=getattr(previous_decision, "model", "") or getattr(agent, "model", ""),
             to_model=to_model,
@@ -367,5 +378,13 @@ def note_attended_switch(runner: Any, ctx: Any, agent: Any, previous_decision: A
     return _guarded(build)
 
 
-def request_usage_rows(**filters: str | None) -> list[dict[str, Any]]:
-    return get_request_usage_ledger().read(**filters)
+def request_usage_rows(*, source: str | None = None, model: str | None = None,
+                       cron_job_id: str | None = None, since: str | None = None,
+                       limit: int | None = 1000) -> list[dict[str, Any]]:
+    rows = get_request_usage_ledger().read(source=source, model=model, cron_job_id=cron_job_id)
+    if since:
+        rows = [row for row in rows if str(row.get("timestamp", "")) >= since]
+    if limit is None:
+        return rows
+    limit = max(0, int(limit))
+    return rows[-limit:] if limit else []

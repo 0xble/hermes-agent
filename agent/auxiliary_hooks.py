@@ -154,6 +154,7 @@ class _AuxCallHooks:
             error=None if error is None else f"{type(error).__name__}: {error}"[:2000],
             error_type=None if error is None else type(error).__name__,
         )
+        post_hook = _has_hook(POST_AUXILIARY_CALL)
         # A streamed response is handed back unconsumed (the MoA facade owns reassembly), so
         # there is no usage/finish_reason to report yet; ``streaming`` tells the observer why.
         if error is not None or self.streaming:
@@ -163,28 +164,28 @@ class _AuxCallHooks:
             message, finish_reason, usage = normalized or (*_first_choice_message(response), _usage_summary(response))
             content = _field(message, "content") if message is not None else None
             tool_calls = (_field(message, "tool_calls") if message is not None else None) or []
-            payload.update(
-                finish_reason=finish_reason,
-                response_model=_field(response, "model"),
-                usage=usage,
-                response=_Sanitize._sanitize_hook_payload({
-                    "model": _field(response, "model"),
-                    "finish_reason": finish_reason,
-                    "assistant_message": {
-                        "role": (_field(message, "role") if message is not None else None) or "assistant",
-                        "content": content,
-                        "tool_calls": tool_calls,
-                    },
-                    "usage": payload.get("usage"),
-                }),
-                assistant_content_chars=len(content) if isinstance(content, str) else 0,
-                assistant_tool_call_count=len(tool_calls),
-            )
+            payload.update(finish_reason=finish_reason, response_model=_field(response, "model"), usage=usage)
+            if post_hook:
+                payload.update(
+                    response=_Sanitize._sanitize_hook_payload({
+                        "model": _field(response, "model"),
+                        "finish_reason": finish_reason,
+                        "assistant_message": {
+                            "role": (_field(message, "role") if message is not None else None) or "assistant",
+                            "content": content,
+                            "tool_calls": tool_calls,
+                        },
+                        "usage": payload.get("usage"),
+                    }),
+                    assistant_content_chars=len(content) if isinstance(content, str) else 0,
+                    assistant_tool_call_count=len(tool_calls),
+                )
         # Auxiliary calls use the same physical-attempt hook, including retries/fallbacks. Keep
         # only route, task label, failure class, and numeric usage; never copy payload or errors.
         from hermes_cli.observability.request_usage_ledger import note_auxiliary
         note_auxiliary(payload)
-        _fire(POST_AUXILIARY_CALL, **payload)
+        if post_hook:
+            _fire(POST_AUXILIARY_CALL, **payload)
 
 
 def _has_hook(name: str) -> bool:

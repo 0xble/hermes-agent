@@ -41,7 +41,8 @@ def cmd_ledger(args: argparse.Namespace) -> int:
 
     rows = request_usage_rows(
         source=getattr(args, "source", None), model=getattr(args, "model", None),
-        cron_job_id=getattr(args, "cron_job_id", None),
+        cron_job_id=getattr(args, "cron_job_id", None), since=getattr(args, "since", None),
+        limit=getattr(args, "limit", 1000),
     )
     if getattr(args, "json", False):
         print(json.dumps(rows, indent=2, sort_keys=True))
@@ -95,5 +96,10 @@ def build_usage_parser(subparsers) -> None:
     ledger.add_argument("--source", default=None)
     ledger.add_argument("--model", default=None)
     ledger.add_argument("--cron-job-id", default=None)
-    ledger.add_argument("--json", action="store_true", help="Print a JSON array")
+    ledger.add_argument("--since", default=None, help="Only rows at or after this ISO-8601 timestamp")
+    ledger.add_argument("--limit", type=int, default=1000, help="Maximum rows to print (default: 1000)")
+    # Keep the parent --json value when it appears before ``ledger`` while also accepting
+    # the conventional ``usage ledger --json`` spelling.
+    ledger.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                        help="Print a JSON array")
     ledger.set_defaults(func=cmd_usage, usage_command="ledger")
