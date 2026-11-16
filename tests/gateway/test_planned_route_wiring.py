@@ -74,6 +74,21 @@ def test_launchd_restart_routes_to_handover_before_service_manager(monkeypatch):
     assert launchd.launchd_restart() is None
 
 
+def test_stopped_gateway_falls_back_to_normal_launchd_start(monkeypatch):
+    monkeypatch.setattr(handover, "planned_handover", lambda: False)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(launchd, "_launchd_restart_locked", lambda: "started")
+    assert launchd.launchd_restart() == "started"
+
+
+def test_live_gateway_handover_refusal_does_not_fall_back(monkeypatch):
+    monkeypatch.setattr(handover, "planned_handover", lambda: False)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: 1234)
+    monkeypatch.setattr(launchd, "_launchd_restart_locked", lambda: pytest.fail("unsafe fallback"))
+    with pytest.raises(RuntimeError, match="planned handover refused"):
+        launchd.launchd_restart()
+
+
 def test_update_fleet_route_uses_one_handover_for_slot_labels(monkeypatch):
     from hermes_cli import update_cmd_fleet
 
@@ -113,6 +128,22 @@ def test_normal_update_reload_routes_through_actual_handover(monkeypatch, tmp_pa
     assert launchd._reload_installed_launchd_plist(tmp_path / "gateway.plist") is True
     assert ("a", "handover") in calls
     assert state["promoted"] is True
+
+
+def test_immutable_reload_keeps_the_recorded_launchd_label(monkeypatch, tmp_path):
+    called = []
+    monkeypatch.setattr(handover, "planned_handover", lambda: called.append(True) or pytest.fail("slot handover"))
+    fake_gateway = SimpleNamespace(
+        get_launchd_label=lambda: "ai.hermes.gateway",
+        _launchd_domain=lambda: "gui/501",
+        get_hermes_home=lambda: tmp_path,
+        _get_restart_drain_timeout=lambda: 0,
+    )
+    monkeypatch.setattr(launchd, "_gw", lambda: fake_gateway)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(launchd, "_bootout_drain_and_rebootstrap", lambda *args: True)
+    assert launchd._reload_installed_launchd_plist(tmp_path / "gateway.plist", use_planned_handover=False) is True
+    assert not called
 
 
 def test_update_fleet_handover_failure_does_not_fall_back_to_drain(monkeypatch):

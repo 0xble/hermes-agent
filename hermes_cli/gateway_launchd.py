@@ -747,12 +747,20 @@ def _bootout_drain_and_rebootstrap(domain, plist_path, label, old_pid, budget: f
         domain, plist_path, label, deadline=time.monotonic() + budget)
 
 
-def _reload_installed_launchd_plist(plist_path: Path) -> bool | str:
-    """Re-register the installed bytes (including a saved source-checkout plist)."""
-    from hermes_cli.gateway_handover import planned_handover
-    handed_over = planned_handover()
-    if handed_over is not None:
-        return handed_over
+def _reload_installed_launchd_plist(
+    plist_path: Path, *, use_planned_handover: bool = True
+) -> bool | str:
+    """Re-register the installed bytes (including a saved source-checkout plist).
+
+    Immutable-release transactions must reload the exact plist recorded in their
+    write-ahead transaction.  A slot handover would instead promote the sibling
+    slot, so those callers explicitly use the single-label reload path.
+    """
+    if use_planned_handover:
+        from hermes_cli.gateway_handover import planned_handover
+        handed_over = planned_handover()
+        if handed_over is not None:
+            return handed_over
     label = _gw().get_launchd_label()
     domain = _gw()._launchd_domain()
     target = f"{domain}/{label}"
@@ -1044,6 +1052,12 @@ def launchd_restart():
     handed_over = planned_handover()
     if handed_over is not None:
         if not handed_over:
+            # A stopped gateway has no owner to hand over.  Use the ordinary
+            # start/reload path in that case, but never hide a refusal from a
+            # live gateway by falling back to a drain.
+            from gateway.status import get_running_pid
+            if get_running_pid() is None:
+                return _launchd_restart_locked()
             raise RuntimeError("planned handover refused, existing work left intact")
         return
     if configured_launchd_domain() is None:

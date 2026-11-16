@@ -255,7 +255,8 @@ def _finish_pending_release_transaction(home: Path | None = None) -> dict | None
         return None
     from hermes_cli import gateway, gateway_launchd
     plist = gateway.get_launchd_plist_path() if sys.platform == "darwin" else None
-    callback = (lambda: gateway_launchd._reload_installed_launchd_plist(plist)) if plist else None
+    callback = (lambda: gateway_launchd._reload_installed_launchd_plist(
+        plist, use_planned_handover=False)) if plist else None
     result = recover_pending_transaction(home, reload_callback=callback)
     if result and result.get("reload_pending"):
         if _await_release_acknowledgement(home):
@@ -318,7 +319,8 @@ def _activate_immutable_release(*, defer: bool = False, sha: str | None = None,
                 plist = gateway.get_launchd_plist_path()
                 if plist.exists():
                     plist_body = gateway.generate_launchd_plist(release_target=candidate).encode("utf-8")
-                    reload_callback = lambda: gateway_launchd._reload_installed_launchd_plist(plist)
+                    reload_callback = lambda: gateway_launchd._reload_installed_launchd_plist(
+                        plist, use_planned_handover=False)
                 else:
                     plist = None
             result = activate_release(home, candidate, source=source if first else None,
@@ -1493,7 +1495,8 @@ def _catch_up_immutable_release(*, defer: bool, sha: str | None = None,
                 raise RuntimeError("cannot repair launchd service without current release and plist")
             body = gateway.generate_launchd_plist(release_target=current).encode("utf-8")
             result = activate_release(paths.home, current, plist_path=plist, plist_body=body,
-                                      reload_callback=lambda: gateway_launchd._reload_installed_launchd_plist(plist),
+                                      reload_callback=lambda: gateway_launchd._reload_installed_launchd_plist(
+                                          plist, use_planned_handover=False),
                                       force_reload=True)
             if result.get("reload_pending"):
                 if _await_release_acknowledgement(paths.home):
