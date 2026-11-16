@@ -132,6 +132,14 @@ class GatewayGoalCommandsMixin:
                     # stamped synthetic goal-continuation metadata.
                     turn.inherit_channel_pin = True
                 self._enqueue_fifo(quick_key, turn, adapter)
+                # The kickoff is normally enqueued by an owning session task. A goal command can
+                # finish its slow manager dispatch after that task's guard has been released,
+                # though; in that race the FIFO slot has no owner left to drain it. Start the
+                # exact queued event here rather than leaving an orphaned pending message.
+                if quick_key not in adapter._active_sessions:
+                    pending = adapter.get_pending_message(quick_key)
+                    if pending is not None:
+                        adapter._start_session_processing(pending, quick_key)
         except Exception as exc:
             logger.debug("goal %s failed: %s", label, exc)
 
