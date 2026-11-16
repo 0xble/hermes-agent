@@ -6,6 +6,8 @@ from types import SimpleNamespace
 from hermes_cli.observability.request_usage_ledger import (
     REQUEST_ROW_KEY_SET,
     RequestUsageLedger,
+    _auxiliary_row,
+    note_attended_switch,
     row_for_attended_switch,
     row_for_error,
     row_for_response,
@@ -111,3 +113,73 @@ def test_registered_incognito_session_persists_no_row(tmp_path):
     assert ledger.record(row_for_response(_agent(session_id="public-1"))) is True
     assert ledger.flush()
     assert [row["session_id"] for row in ledger.read()] == ["public-1"]
+
+
+def test_record_response_usage_calls_note_response_with_nonzero_usage(monkeypatch):
+    from agent import turn_usage
+    from run_agent import AIAgent
+
+    captured = []
+    monkeypatch.setattr(
+        "hermes_cli.observability.request_usage_ledger.note_response",
+        lambda agent, usage=None: captured.append((agent, usage)) or True,
+    )
+    agent = AIAgent(
+        api_key="k", base_url="https://openrouter.ai/api/v1", provider="openrouter",
+        api_mode="chat_completions", model="openai/gpt-5.4-mini", session_id="response-session",
+        platform="cli", quiet_mode=True, skip_context_files=True, skip_memory=True,
+        save_trajectories=False,
+    )
+    try:
+        usage = SimpleNamespace(
+            prompt_tokens=120, completion_tokens=9, total_tokens=129,
+            prompt_tokens_details=SimpleNamespace(cached_tokens=20),
+            completion_tokens_details=None,
+        )
+        turn_usage.record_response_usage(
+            agent, SimpleNamespace(usage=usage, model=getattr(agent, "model", "")),
+            messages=[{"role": "user", "content": "hello"}], api_call_count=1,
+            api_duration=0.01, compression_attempts=0, max_compression_attempts=3,
+        )
+    finally:
+        agent.close()
+    assert len(captured) == 1
+    assert captured[0][0].session_id == "response-session"
+    assert captured[0][1].output_tokens == 9
+
+
+def test_restored_prompt_uses_total_size_fallback():
+    row = row_for_response(_agent(_cached_system_prompt_parts=None, _cached_system_prompt="abcdef"))
+    assert row["system_prompt_tier_sizes"] == {"total": 6}
+
+
+def test_auxiliary_row_reads_canonical_usage_buckets():
+    row = _auxiliary_row({
+        "session_id": "s1", "platform": "cli", "aux_task": "title",
+        "provider": "openai", "model": "gpt-5",
+        "usage": {
+            "input_tokens": 78, "cache_read_tokens": 20,
+            "cache_write_tokens": 3, "output_tokens": 44,
+            "prompt_tokens": 101, "total_tokens": 145,
+        },
+    })
+    assert row["input_tokens"] == 78
+    assert row["cache_read_tokens"] == 20
+    assert row["cache_write_tokens"] == 3
+    assert row["output_tokens"] == 44
+
+
+def test_attended_switch_uses_agent_session_and_destination_model(monkeypatch):
+    captured = []
+    monkeypatch.setattr(
+        "hermes_cli.observability.request_usage_ledger.get_request_usage_ledger",
+        lambda: SimpleNamespace(record=lambda row: captured.append(row) or True),
+    )
+    agent = _agent(session_id="agent-session", platform="cli", model="fast")
+    runner = SimpleNamespace(_session_state=lambda _key: SimpleNamespace(
+        conversation=SimpleNamespace(last_user_activity_at=None)))
+    ctx = SimpleNamespace(session_key="routing-key")
+    previous = SimpleNamespace(model="fast")
+    assert note_attended_switch(runner, ctx, agent, previous, "smart")
+    assert captured[0]["session_id"] == "agent-session"
+    assert captured[0]["resolved_model"] == "smart"

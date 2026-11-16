@@ -94,6 +94,12 @@ def log_response_service_tier(agent: Any, response: Any, api_kwargs: dict[str, A
     )
 
 
+def _note_response_usage(agent: Any, usage: Any = None) -> None:
+    if not getattr(agent, "_request_usage_ledger_owned_by_auxiliary", False):
+        from hermes_cli.observability.request_usage_ledger import note_response
+        note_response(agent, usage)
+
+
 def record_response_usage(
     agent: Any, response: Any, *, messages: list[dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,
@@ -121,16 +127,12 @@ def record_response_usage(
             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
             effort_log_label(getattr(agent, "reasoning_config", None)),
         )
-        from hermes_cli.observability.request_usage_ledger import note_response
-        if not getattr(agent, "_request_usage_ledger_owned_by_auxiliary", False):
-            note_response(agent)
+        _note_response_usage(agent)
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
     canonical_usage = with_served_service_tier(
         normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode), response)
-    from hermes_cli.observability.request_usage_ledger import note_response
-    if not getattr(agent, "_request_usage_ledger_owned_by_auxiliary", False):
-        note_response(agent, canonical_usage)
+    _note_response_usage(agent, canonical_usage)
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage

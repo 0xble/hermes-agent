@@ -497,7 +497,6 @@ _SESSION_STATE: dict[str, Any] = {
     # prefix, kept separately only to place an early cache marker.
     "_cached_system_prompt": None,
     "_cached_system_prompt_static": None,
-    "_cached_system_prompt_parts": None,
     # skills.auto_load rendered ONCE per agent: every rebuild (model switch, compression,
     # static-prefix restoration) reuses these exact bytes instead of re-reading config/skills.
     "_auto_load_skills_resolved": False,
