@@ -811,6 +811,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         user_config: Optional[dict] = None,
     ) -> tuple[str, dict]:
         """Off-loop reads/credentials, on-loop snapshots and compare-and-set commits."""
+        # Slash commands such as manual /compress resolve a session without an inbound turn
+        # config snapshot. Role holds are still live persisted routes, so normalize that
+        # omission through the same gateway loader used by ordinary turns before resolving
+        # aliases. An empty config would make a valid stored alias look unavailable.
+        if user_config is None:
+            from gateway.run import _load_gateway_config
+            user_config = _load_gateway_config()
         from gateway.session_policy import policy_for_source
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
