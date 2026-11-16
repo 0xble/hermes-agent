@@ -61,3 +61,12 @@ def test_backoff_wait_returns_immediately_on_interrupt():
     start = time.monotonic()
     call._retry_after_drop(httpx.ConnectError("x"), 5, 10, mid_tool_call=False, reason="t")
     assert time.monotonic() - start < 1.0
+
+
+def test_independent_attempt_interrupt_preserves_clean_cancellation():
+    agent = _agent(_turn_independent_attempt_active=True)
+    call = _bare_call(agent)
+    call._request_cancelled["value"] = True
+
+    assert call._handle_stream_error(httpx.ConnectError("closed by stop"), 0, 0) is False
+    assert "error" not in call.result

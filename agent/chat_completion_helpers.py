@@ -3760,15 +3760,15 @@ class _StreamingCall(StreamingWaitMonitor):
         """Classify a failed attempt: True = retry; False = stop with
         ``result["error"]`` set (unless our own interrupt force-closed the
         socket). Runs inside the ``except`` so ``logger.exception`` works."""
-        if getattr(self.agent, "_turn_independent_attempt_active", False) is True:
-            self.result["error"] = e
-            return False
-        import httpx as _httpx
         # Our own interrupt force-close: no retry/fallback/"reconnecting" (the
         # poll loop raises InterruptedError).
         if self._request_cancelled["value"]:
             logger.debug("Streaming worker caught %s after request cancellation — exiting without retry.", type(e).__name__)
             return False
+        if getattr(self.agent, "_turn_independent_attempt_active", False) is True:
+            self.result["error"] = e
+            return False
+        import httpx as _httpx
         e = self._as_lifetime_error(e)  # a cap kill: transient, and its copy names the setting
         _is_timeout = isinstance(e, (_httpx.ReadTimeout, _httpx.ConnectTimeout, _httpx.PoolTimeout, StreamLifetimeExceeded))
         # ReadError: abort/reset mid-body (stale-kill shutdown under a parked reader, ECONNRESET) — retry loop owns it.
