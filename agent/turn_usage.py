@@ -100,9 +100,24 @@ def _note_response_usage(agent: Any, usage: Any = None) -> None:
         note_response(agent, usage)
 
 
+def record_response_ledger(agent: Any, response: Any) -> None:
+    """Queue the ledger row for a provider response before retry branching.
+
+    Response handling can return early for truncation/refusal, before the normal
+    accounting fold below.  This helper deliberately does only the content-free
+    ledger side effect; full accounting still happens in ``record_response_usage``.
+    """
+    usage = getattr(response, "usage", None)
+    canonical = with_served_service_tier(
+        normalize_usage(usage, provider=agent.provider, api_mode=agent.api_mode), response
+    ) if usage else None
+    _note_response_usage(agent, canonical)
+
+
 def record_response_usage(
     agent: Any, response: Any, *, messages: list[dict[str, Any]], api_call_count: int,
     api_duration: float, compression_attempts: int, max_compression_attempts: int,
+    ledger_already_recorded: bool = False,
 ) -> ResponseUsageOutcome:
     """Fold ``response.usage`` into compressor, anchors, session counters, state.db
     and the API-call log line (see module docstring). No-usage responses only
@@ -127,12 +142,14 @@ def record_response_usage(
             agent.session_api_calls, agent.model, agent.provider or "unknown", api_duration,
             effort_log_label(getattr(agent, "reasoning_config", None)),
         )
-        _note_response_usage(agent)
+        if not ledger_already_recorded:
+            _note_response_usage(agent)
         return ResponseUsageOutcome(compression_attempts=compression_attempts, rearmed=rearmed)
 
     canonical_usage = with_served_service_tier(
         normalize_usage(response.usage, provider=agent.provider, api_mode=agent.api_mode), response)
-    _note_response_usage(agent, canonical_usage)
+    if not ledger_already_recorded:
+        _note_response_usage(agent, canonical_usage)
     # Aggregator-only usage kept for pricing: advisor tokens are priced at each advisor's
     # OWN model rate and added as dollars below.
     aggregator_usage = canonical_usage

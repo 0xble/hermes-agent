@@ -4250,6 +4250,7 @@ class TestRunConversation:
         agent.client.chat.completions.create.side_effect = [first, second]
 
         with (
+            patch("hermes_cli.observability.request_usage_ledger.note_response") as note_response,
             patch.object(agent, "_persist_session"),
             patch.object(agent, "_save_trajectory"),
             patch.object(agent, "_cleanup_task_resources"),
@@ -4259,6 +4260,7 @@ class TestRunConversation:
         assert result["completed"] is True
         assert result["api_calls"] == 2
         assert result["final_response"] == "Part 1 Part 2"
+        assert note_response.call_count == 2
 
         second_call_messages = agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
         assert second_call_messages[-1]["role"] == "user"
