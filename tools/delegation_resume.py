@@ -69,6 +69,12 @@ INELIGIBLE_CLAIMED = "already_claimed"
 INELIGIBLE_SEALED = "execution_sealed"
 
 
+class RetrySweepDeferred(list):
+    """An empty sweep result whose busy deferral remains visible to the gateway owner."""
+
+    busy = True
+
+
 def _ad():
     """Late import: the ledger connection helpers live with the async registry."""
     from tools import async_delegation
@@ -1073,7 +1079,7 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     stale = now - RETRY_CLAIM_TTL_S
     with ad._DB_LOCK, _best_effort_retry_transaction(ad) as conn:
         if conn is None:
-            return actions
+            return RetrySweepDeferred()
         conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
         rows = conn.execute(
             _RETRY_SELECT + """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)

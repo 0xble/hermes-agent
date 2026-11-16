@@ -294,7 +294,7 @@ class GatewayNotificationsMixin:
         import sqlite3
         from hermes_constants import hermes_home_key
         from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
-        from tools.delegation_resume import RETRY_CLAIM_TTL_S, sweep_retries
+        from tools.delegation_resume import RETRY_CLAIM_TTL_S, RetrySweepDeferred, sweep_retries
 
         key = hermes_home_key()
         busy = getattr(self, "_delegation_retry_busy_sweeps", None)
@@ -302,6 +302,14 @@ class GatewayNotificationsMixin:
             busy = self._delegation_retry_busy_sweeps = {}
         try:
             actions = sweep_retries()
+            if isinstance(actions, RetrySweepDeferred):
+                count = busy[key] = busy.get(key, 0) + 1
+                threshold = max(1, math.ceil(RETRY_CLAIM_TTL_S / ORPHAN_SWEEP_INTERVAL_S))
+                logger.log(
+                    logging.WARNING if count >= threshold else logging.INFO,
+                    "Delegation retry sweep deferred: database busy; retrying next sweep "
+                    "(profile=%s consecutive=%d warning_after=%d)", profile, count, threshold)
+                return []
         except sqlite3.OperationalError as exc:
             # Extended BUSY codes share the primary low byte. Other storage
             # errors are failures, not an expected competing-writer deferral.
