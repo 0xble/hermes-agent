@@ -463,9 +463,10 @@ def site_copy(code: str, **fields: Any) -> str:
 
 
 def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None,
-                   error: Any = None) -> str:
+                   earliest_route_seconds: Optional[float] = None, error: Any = None) -> str:
     """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
     limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401).
+    ``earliest_route_seconds`` must belong to a different configured route than the failing one.
     A stream cut by ``agent.stream_max_lifetime`` names the setting: the provider was responding,
     so neither waiting nor a backup provider helps."""
     if isinstance(error, StreamLifetimeExceeded):
@@ -476,7 +477,14 @@ def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, rese
     lead = (_EXHAUSTED_FIRST_ATTEMPT_LEADS if first_attempt else _EXHAUSTED_LEADS).get(
         reason, _EXHAUSTED_DEFAULT_LEAD).format(label=label, attempts=attempts)
     # The free-tier cutoff (one attempt) fires on any cooldown over a minute, so it always names the reset.
-    if reset_seconds is not None and (reset_seconds >= 120 or first_attempt and reset_seconds > 0):
+    if (reset_seconds is not None and earliest_route_seconds is not None
+            and earliest_route_seconds < reset_seconds - 60):
+        # Another configured route recovers sooner than the failing one: do not tell the user to wait out the long reset.
+        from agent.retry_utils import format_reset_window
+        situation = (f"another configured model has an earlier recorded reset (in "
+                     f"{format_reset_window(max(0.0, earliest_route_seconds))})")
+        situation += f" (this one's limit resets in {format_reset_window(reset_seconds)}). Send /retry then, or switch models with /model."
+    elif reset_seconds is not None and (reset_seconds >= 120 or first_attempt and reset_seconds > 0):
         from agent.retry_utils import format_reset_window
         situation = (f"its usage limit resets in {format_reset_window(reset_seconds)}. "
                      "Send /retry after that, or switch models with /model.")
