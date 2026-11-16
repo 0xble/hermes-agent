@@ -93,6 +93,27 @@ class TestSkillViewDedup:
         r = _view("demo-dedup-skill", task="task-B")
         assert "Step one" in r.get("content", "")
 
+    def test_new_linked_file_with_same_body_returns_full_view(self, skills_home):
+        first = _view("demo-dedup-skill")
+        refs = skills_home / "skills" / "demo-dedup-skill" / "references"
+        (refs / "extra.md").write_text("# Extra\n", encoding="utf-8")
+        r2 = _view("demo-dedup-skill")
+        assert r2.get("dedup") is None
+        assert r2.get("linked_files") != first.get("linked_files")
+
+    def test_tracked_tasks_are_bounded(self, skills_home, monkeypatch):
+        from tools import skills_tool_dedup
+        monkeypatch.setattr(skills_tool_dedup, "_SKILL_VIEW_DEDUP_TASK_CAP", 3)
+        for n in range(6):
+            _view("demo-dedup-skill", task=f"task-{n}")
+        assert len(skills_tool_dedup._skill_view_tracker) == 3
+        assert "task-0" not in skills_tool_dedup._skill_view_tracker
+
+    def test_boundary_on_untracked_task_leaves_no_state(self, skills_home):
+        from tools import skills_tool_dedup
+        mark_context_loss_boundary(type("Agent", (), {"session_id": "s"})(), "never-viewed")
+        assert "never-viewed" not in skills_tool_dedup._skill_view_tracker
+
     def test_context_generation_returns_full_content(self, skills_home):
         _view("demo-dedup-skill")
         assert _view("demo-dedup-skill").get("dedup") is True
