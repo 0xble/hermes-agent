@@ -664,9 +664,7 @@ def test_waiting_room_does_not_block_an_independent_room(tmp_path: Path):
         transport_resolver=lambda binding, _task: waiting if binding.room_id == "room-waiting" else healthy,
         turn_lock=RecordingTurnLocks(),
         clock=lambda now=time.time(): now,  # frozen: lease expiry is not the fault under test
-        # Lease expiry is not under test. On a 0.4s wall-clock lease, a start that stalls longer
-        # than the lease is fenced at the pre-submit renewal and the turn is never submitted.
-        lease_ttl_seconds=30,
+        lease_ttl_seconds=30,  # lease expiry is not under test; a short lease fences slow starts
         poll_interval_seconds=0.01,
         max_concurrent_rooms=2,
     )
