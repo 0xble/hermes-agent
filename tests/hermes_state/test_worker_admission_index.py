@@ -8,19 +8,17 @@ from tests.fakes.runtime_owner import begin_runtime_epoch
 _INDEX_NAME = "idx_session_admissions_worker_adoption"
 
 
-def _candidate_plan(db, *, generation, owner_epoch, session_id):
+def _adoption_candidate_plan(db, *, generation, owner_epoch, session_id):
+    """EXPLAIN the exact candidate SQL _linked_worker_admission executes, captured by tracing."""
+    executed = []
     with db._read_ctx() as conn:
-        return [
-            row["detail"]
-            for row in conn.execute(
-                """EXPLAIN QUERY PLAN SELECT * FROM session_admissions
-                   WHERE generation=? AND owner_epoch=? AND status IN ('started','unknown')
-                     AND (target_session_id=? OR EXISTS (
-                         SELECT 1 FROM json_each(session_admissions.lineage_json) WHERE value=?
-                     )) ORDER BY seq""",
-                (generation, owner_epoch, session_id, session_id),
-            )
-        ]
+        conn.set_trace_callback(executed.append)
+        try:
+            runtime._linked_worker_admission(conn, session_id, generation, owner_epoch, ("started", "unknown"))
+        finally:
+            conn.set_trace_callback(None)
+        candidate = next(sql for sql in executed if "FROM session_admissions" in sql)
+        return [row["detail"] for row in conn.execute("EXPLAIN QUERY PLAN " + candidate)]
 
 
 def test_worker_adoption_uses_partial_index_and_ignores_terminal_history(tmp_path):
@@ -79,7 +77,7 @@ def test_worker_adoption_uses_partial_index_and_ignores_terminal_history(tmp_pat
         )
         db._execute_write(seed)
 
-        plan = _candidate_plan(db, generation=generation, owner_epoch=epoch, session_id="target")
+        plan = _adoption_candidate_plan(db, generation=generation, owner_epoch=epoch, session_id="target")
         assert any(_INDEX_NAME in detail for detail in plan), plan
         assert not any("SCAN session_admissions" in detail for detail in plan), plan
 

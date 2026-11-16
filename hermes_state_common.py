@@ -300,9 +300,7 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
 # executescript(SCHEMA_SQL) + _reconcile_columns() every writable open already runs (additive,
 # idempotent). The bump only records that the declared shape changed; a new table or column needs no bump.
 # v33: data-only — re-tag delegate subagent rows that lost ``_delegate_from`` (see _run_data_migrations).
-# v34: no data migration — declare the partial worker-adoption candidate index below. The declarative
-# SCHEMA_SQL pass installs it on existing stores without rewriting any table.
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 33
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
