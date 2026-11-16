@@ -967,21 +967,8 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
                     runtime.get("base_url", ""), runtime.get("api_mode", ""), runtime.get("capabilities"),
                 )
                 if decision.switched_back and previous_decision is not None:
-                    try:
-                        from agent.session_source import session_source_for
-                        from hermes_cli.observability.request_usage_ledger import record_attended_switch
-                        _state = runner._session_state(ctx.session_key) if ctx.session_key else None
-                        _last_activity = getattr(getattr(_state, "conversation", None), "last_user_activity_at", None)
-                        _idle_seconds = time.time() - float(_last_activity) if _last_activity is not None else None
-                        record_attended_switch(
-                            session_id=ctx.session_key or getattr(agent, "session_id", ""),
-                            source=session_source_for(getattr(agent, "platform", None)),
-                            from_model=getattr(previous_decision, "model", "") or getattr(agent, "model", ""),
-                            to_model=model,
-                            idle_seconds=_idle_seconds,
-                        )
-                    except Exception:
-                        pass
+                    from hermes_cli.observability.request_usage_ledger import note_attended_switch
+                    note_attended_switch(runner, ctx, agent, previous_decision, model)
             if decision.reasoning_effort:
                 # The committed decision already carries the destination effort. Re-resolving here
                 # would read session state whose handoff to the gateway loop may not have landed yet,

@@ -300,5 +300,31 @@ def record_request_row(row: dict[str, Any]) -> bool:
         return False
 
 
+def note_response(agent: Any, usage: Any = None) -> bool:
+    """Record one response row for ``agent``. Never raises into the request path."""
+    try:
+        return record_request_row(row_for_response(agent, usage))
+    except Exception:
+        return False
+
+
+def note_attended_switch(runner: Any, ctx: Any, agent: Any, previous_decision: Any, to_model: str) -> bool:
+    """Record an attended switch-back from the gateway turn. Never raises into the request path."""
+    try:
+        import time
+        from agent.session_source import session_source_for
+        state = runner._session_state(ctx.session_key) if ctx.session_key else None
+        last = getattr(getattr(state, "conversation", None), "last_user_activity_at", None)
+        return record_attended_switch(
+            session_id=ctx.session_key or getattr(agent, "session_id", ""),
+            source=session_source_for(getattr(agent, "platform", None)),
+            from_model=getattr(previous_decision, "model", "") or getattr(agent, "model", ""),
+            to_model=to_model,
+            idle_seconds=time.time() - float(last) if last is not None else None,
+        )
+    except Exception:
+        return False
+
+
 def request_usage_rows(**filters: str | None) -> list[dict[str, Any]]:
     return get_request_usage_ledger().read(**filters)
