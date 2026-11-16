@@ -953,6 +953,40 @@ def classify_armed(*, now: Optional[float] = None, limit: int = 64) -> int:
     return len(armed)
 
 
+def _claimable_retry_rows(conn, now: float, limit: int) -> list:
+    """Read without writer admission, then revalidate only the selected ids under it."""
+    stale = now - RETRY_CLAIM_TTL_S
+    conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
+    where = """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
+             OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
+             OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
+             OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
+           AND (event_json IS NULL OR delivery_state != 'pending')
+           AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
+                           WHERE e.delegation_id=async_delegations.delegation_id
+                             AND e.delivery_state='pending')
+           AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
+                                           json_extract(result_json, '$.cut_reason')))
+                    AND (delivery_state='delivered' OR retry_notices > 0)
+                    AND retry_state IN ('scheduled','notified')
+                    AND COALESCE(retry_root_started_at, dispatched_at) > ?)
+           """
+    params = (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S)
+    candidates = conn.execute(
+        "SELECT delegation_id FROM async_delegations" + where + " ORDER BY updated_at ASC LIMIT ?",
+        (*params, limit)).fetchall()
+    if not candidates:
+        return []
+    # SELECT above is autocommit/read-only. Recheck delivery, stop, seal and
+    # claim eligibility after acquiring the writer, restricted to these ids.
+    conn.execute("BEGIN IMMEDIATE")
+    return conn.execute(
+        _RETRY_SELECT + where + f" AND delegation_id IN ({','.join('?' for _ in candidates)})"
+        + " ORDER BY updated_at ASC",
+        (*params, *(row[0] for row in candidates))).fetchall()
+
+
+
 @contextmanager
 def _best_effort_retry_transaction(ad):
     """Yield no connection when the idle sweep cannot begin under writer contention."""
