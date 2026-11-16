@@ -593,14 +593,16 @@ def shutdown_kernels_for_owners(*owners: str) -> None:
     errors: list[Exception] = []
     try:
         _REGISTRY.shutdown(owner_matches=owner_matches)
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- teardown must attempt both backends before surfacing the first failure.
+        logger.exception("Local kernel teardown failed at an incognito boundary")
         errors.append(exc)
     finally:
         _forget_kernel_evictions(owner_matches)
     try:
         from tools.code_kernel_remote import shutdown_remote_kernels_where
         shutdown_remote_kernels_where(owner_matches)
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- teardown must attempt both backends before surfacing the first failure.
+        logger.exception("Remote kernel teardown failed at an incognito boundary")
         errors.append(exc)
     if errors:
         raise errors[0]
