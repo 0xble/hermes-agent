@@ -35,7 +35,8 @@ class PruneBudget:
     TRANSACTION_SECONDS = 0.25
     MIN_UNIT_CEILING_SECONDS = 2.0
 
-    def __init__(self, within_window=False, max_seconds=None, *, db_path=None):
+    def __init__(self, within_window=False, max_seconds=None, *, db_path=None,
+                 window_already_admitted=None):
         validate_max_seconds(max_seconds)
         self.deadline = math.inf if max_seconds is None else time.monotonic() + max_seconds
         self.deferred_ids = set()
@@ -46,7 +47,8 @@ class PruneBudget:
             from hermes_cli.maintenance_window import (
                 deletion_window_open, deletion_window_spec, normalize_window_spec, window_contains,
             )
-            admitted_open = deletion_window_open()
+            admitted_open = (deletion_window_open() if window_already_admitted is None
+                             else bool(window_already_admitted))
             now, spec = hermes_time.now(), normalize_window_spec(deletion_window_spec(), warn=False)
             if not window_contains(spec, now):
                 # Admission belongs to the same policy the caller checked. A closed

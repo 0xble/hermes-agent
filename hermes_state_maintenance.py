@@ -383,7 +383,10 @@ class SessionMaintenanceMixin:
         from hermes_state_prune_budget import PruneBudget, PruneBudgetExpired, PruneWriteContended, prune_budget
         from hermes_state_transactions import finish_prune_maintenance
         removed_ids = []
-        budget = PruneBudget(within_deletion_window, max_seconds, db_path=self.db_path)
+        budget = PruneBudget(
+            within_deletion_window, max_seconds, db_path=self.db_path,
+            window_already_admitted=within_deletion_window,
+        )
         try:
             with prune_pass(self.db_path), prune_budget(budget):
                 result = self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
