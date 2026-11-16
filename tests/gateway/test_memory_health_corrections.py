@@ -27,31 +27,6 @@ def test_optional_metadata_cannot_hide_provider_reason(tmp_path, monkeypatch, ca
     monkeypatch.setattr("hermes_cli.memory_setup.memory_provider_dependency_inputs", inputs)
     assert "SDK client is missing" in health._readiness_issue()
     assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
-"""Advisory health must not hold gateway startup or lose provider diagnostics."""
-import logging
-from types import SimpleNamespace
-from unittest.mock import Mock
-
-import pytest
-
-from gateway import runtime_health as health
-
-
-@pytest.mark.parametrize("metadata", ["missing", "invalid-requirement"])
-def test_optional_metadata_cannot_hide_provider_reason(tmp_path, monkeypatch, caplog, metadata):
-    home = tmp_path / "home"
-    home.mkdir()
-    (home / "config.yaml").write_text("memory: {provider: fixture}\n")
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    monkeypatch.setattr("plugins.memory.load_memory_provider", lambda *args, **kwargs: SimpleNamespace(
-        is_available=lambda: False, unavailable_reason=lambda: "SDK client is missing"))
-    inputs = Mock(side_effect=ValueError("bad optional manifest")) if metadata == "missing" else Mock(
-        return_value=({"python_dependencies": ["not a requirement !!!"]}, {}))
-    monkeypatch.setattr("hermes_cli.memory_setup.memory_provider_dependency_inputs", inputs)
-    assert "SDK client is missing" in health._readiness_issue()
-    assert not [record for record in caplog.records if record.levelno >= logging.ERROR]
-
-
 @pytest.mark.asyncio
 async def test_scope_discovery_is_off_loop_and_uses_served_primary_home(tmp_path, monkeypatch):
     primary, launch = tmp_path / "primary", tmp_path / "launch"
