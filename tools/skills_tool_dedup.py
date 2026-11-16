@@ -1,8 +1,8 @@
 """skill_view repeat-view dedup registry: per-task cache of (resolved skill name, file_path) ->
-digest of the skill_view result served. A repeat view whose result is byte-identical returns a short
-stub — the earlier tool result already carries the content verbatim. Content digests need no file
-timestamps, so a same-size rewrite in one coarse mtime tick (or on a host whose clock disagrees with
-its filesystem) is never mistaken for "unchanged". The per-task context generation is advanced by
+digest of the skill body served. A repeat view whose body hash is unchanged returns a short stub — the
+earlier tool result already carries the content verbatim. Content digests need no file timestamps,
+so a same-size rewrite in one coarse mtime tick (or on a host whose clock disagrees with its
+filesystem) is never mistaken for "unchanged". The per-task context generation is advanced by
 ``mark_context_loss_boundary`` when compaction or committed pruning removes tool results; explicit
 ``reset_skill_view_dedup()`` remains available for session/test cleanup.
 """
