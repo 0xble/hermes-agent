@@ -738,6 +738,11 @@ hermes usage ledger --source cron --model gpt-5
 | Option | Description |
 |--------|-------------|
 | `--provider NAME` | Provider to query (default: the configured `model.provider`). Supported: `openai-codex`, `anthropic`, `openrouter`. |
+| `--source NAME` | For `hermes usage ledger`, include only rows from this session source. |
+| `--model NAME` | For `hermes usage ledger`, include only rows resolved to this model. |
+| `--cron-job-id ID` | For `hermes usage ledger`, include only rows from this cron job. |
+| `--since TIMESTAMP` | For `hermes usage ledger`, include rows at or after this ISO timestamp. |
+| `--limit N` | For `hermes usage ledger`, return at most `N` rows (default: 1000). |
 | `--json` | Print one JSON document instead of the human-readable block. |
 
 Credentials resolve exactly as they do for `/usage` in a session with no live agent (the auth store, then

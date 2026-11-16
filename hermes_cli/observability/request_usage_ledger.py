@@ -8,6 +8,7 @@ rotated, and retained for a bounded period.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import queue
@@ -105,10 +106,15 @@ def _request_context(agent: Any, *, failure_class: str | None = None, usage: Any
         cron_job_id = cron_session_id[5:].split("_", 1)[0] or None
     source = "cron" if get_session_env("HERMES_CRON_SESSION", "") == "1" else session_source_for(getattr(agent, "platform", None))
     parts = getattr(agent, "_cached_system_prompt_parts", None)
-    if isinstance(parts, dict) and all(isinstance(parts.get(key), str) for key in ("stable", "context", "volatile")):
+    cached_prompt = getattr(agent, "_cached_system_prompt", None)
+    if (
+        isinstance(parts, dict)
+        and isinstance(cached_prompt, str)
+        and all(isinstance(parts.get(key), str) for key in ("stable", "context", "volatile"))
+        and sum(len(parts[key]) for key in ("stable", "context", "volatile")) == len(cached_prompt)
+    ):
         prompt_sizes = {key: len(parts[key]) for key in ("stable", "context", "volatile")}
     else:
-        cached_prompt = getattr(agent, "_cached_system_prompt", None)
         prompt_sizes = {"total": len(cached_prompt)} if isinstance(cached_prompt, str) else None
     usage_dict = usage if isinstance(usage, dict) else {}
     role_task_label = getattr(agent, "_delegate_role", None) or getattr(agent, "_turn_route_task", None)
@@ -342,11 +348,27 @@ def note_error(agent: Any, failure_class: str | None) -> bool:
 
 
 def _auxiliary_row(payload: dict[str, Any]) -> dict[str, Any]:
+    from agent.session_source import session_source_for
+    from gateway.session_context import get_session_env
+
     usage = payload.get("usage") or {}
+    session_id = payload.get("session_id") or get_session_env("HERMES_SESSION_ID", "") or None
+    cron_session_id = get_session_env("HERMES_SESSION_ID", "")
+    cron_job_id = get_session_env("HERMES_CRON_JOB_ID", "") or None
+    if cron_job_id is None:
+        for candidate in (session_id, cron_session_id):
+            if isinstance(candidate, str) and candidate.startswith("cron_"):
+                cron_job_id = candidate[5:].split("_", 1)[0] or None
+                break
+    source = (
+        "cron" if get_session_env("HERMES_CRON_SESSION", "") == "1"
+        else session_source_for(payload.get("platform"))
+    )
     return {
-        "session_id": payload.get("session_id"),
-        "source": payload.get("platform"),
+        "session_id": session_id,
+        "source": source,
         "role_task_label": payload.get("aux_task") or "auxiliary",
+        "cron_job_id": cron_job_id,
         "requested_provider": payload.get("provider"), "requested_model": payload.get("model"),
         "resolved_provider": payload.get("provider"), "resolved_model": payload.get("model"),
         "failure_class": payload.get("error_type"),
@@ -376,6 +398,16 @@ def note_attended_switch(runner: Any, ctx: Any, agent: Any, previous_decision: A
             idle_gap_bucket=idle_gap_bucket(time.time() - float(last) if last is not None else None),
         )
     return _guarded(build)
+
+
+def _flush_default_ledger_at_exit() -> None:
+    """Give the daemon writer a bounded chance to persist queued rows at process exit."""
+    ledger = _default_ledger
+    if ledger is not None:
+        ledger.flush(timeout=2.0)
+
+
+atexit.register(_flush_default_ledger_at_exit)
 
 
 def request_usage_rows(*, source: str | None = None, model: str | None = None,

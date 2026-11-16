@@ -20,6 +20,7 @@ def _agent(**kwargs):
         requested_provider="openai", _fallback_index=0, _fallback_activated=False,
         _primary_runtime={"provider": "openai", "requested_provider": "openai", "model": "gpt-5"},
         _cached_system_prompt_parts={"stable": "abc", "context": "de", "volatile": "f"},
+        _cached_system_prompt="abcdef",
     )
     values.update(kwargs)
     return SimpleNamespace(**values)
@@ -66,6 +67,16 @@ def test_write_failure_is_swallowed_and_counted(tmp_path):
     assert ledger.record(row_for_error(_agent(), "network")) is True
     assert ledger.flush()
     assert ledger.error_count == 1
+
+
+def test_default_ledger_exit_drain_is_bounded(monkeypatch):
+    from hermes_cli.observability import request_usage_ledger as module
+
+    flush = SimpleNamespace(flush=lambda **kwargs: calls.append(kwargs))
+    calls = []
+    monkeypatch.setattr(module, "_default_ledger", flush)
+    module._flush_default_ledger_at_exit()
+    assert calls == [{"timeout": 2.0}]
 
 
 def test_attended_switch_is_a_separate_row_with_route_and_idle_bucket():
@@ -153,6 +164,14 @@ def test_restored_prompt_uses_total_size_fallback():
     assert row["system_prompt_tier_sizes"] == {"total": 6}
 
 
+def test_stale_prompt_parts_use_total_size_fallback():
+    row = row_for_response(_agent(
+        _cached_system_prompt_parts={"stable": "abc", "context": "de", "volatile": "f"},
+        _cached_system_prompt="prompt was reassigned directly",
+    ))
+    assert row["system_prompt_tier_sizes"] == {"total": 30}
+
+
 def test_auxiliary_row_reads_canonical_usage_buckets():
     row = _auxiliary_row({
         "session_id": "s1", "platform": "cli", "aux_task": "title",
@@ -167,6 +186,21 @@ def test_auxiliary_row_reads_canonical_usage_buckets():
     assert row["cache_read_tokens"] == 20
     assert row["cache_write_tokens"] == 3
     assert row["output_tokens"] == 44
+
+
+def test_auxiliary_row_uses_cron_context_source_and_job_id():
+    from gateway.session_context import clear_session_vars, set_session_vars
+
+    tokens = set_session_vars(session_id="cron_nightly", cron_session="1")
+    try:
+        row = _auxiliary_row({
+            "session_id": "cron_nightly", "platform": "", "aux_task": "title",
+            "provider": "openai", "model": "gpt-5", "usage": {},
+        })
+    finally:
+        clear_session_vars(tokens)
+    assert row["source"] == "cron"
+    assert row["cron_job_id"] == "nightly"
 
 
 def test_attended_switch_uses_agent_session_and_destination_model(monkeypatch):
