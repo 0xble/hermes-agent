@@ -1,6 +1,7 @@
 """An edit of a busy ``/queue`` or ``/steer`` command is its own input: the queued turn it becomes keeps
 the edit's revision, so native admission keys it ``<message_id>:edit:<revision>`` instead of
 refusing it as a changed replay of the original command (``admission_conflict``)."""
+
 import pytest
 
 from tests.gateway.test_messaging_slash_command_fifo import _rows, _start_a
@@ -47,14 +48,29 @@ async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
 
     async def no_judge(**_):  # no goal continuation turns between the two kickoffs
         return None
+    async def no_post_turn_hooks(**_):
+        # This admission test waits for the session guard to clear. Deferred goal bookkeeping is
+        # unrelated to admission and can legitimately outlive the turn under CPU load.
+        return None
     monkeypatch.setattr(runner, '_handle_message_with_agent', turn)
     monkeypatch.setattr(runner, '_post_turn_goal_continuation', no_judge)
+    monkeypatch.setattr(runner, '_defer_post_turn_hooks', no_post_turn_hooks)
     rig = type('Rig', (), {'runner': runner, 'authority': authority, 'key': key})
 
     def idle():
         return not adapter._active_sessions and not runner._is_session_running(key)
     await adapter.handle_message(MessageEvent(text='hello', source=source, message_id='H'))
     await async_wait_until(lambda: ran and idle(), what='a session for the goal')
+    async def run_command(event):
+        assert adapter._start_session_processing(event, key)
+        owner = adapter._session_tasks[key]
+        while True:
+            await owner
+            successor = adapter._session_tasks.get(key)
+            if successor is None or successor is owner:
+                break
+            owner = successor
+        assert not adapter._active_sessions and not runner._is_session_running(key)
     for turns, (text, revision) in enumerate((('/goal write a haiku', None), ('/goal write a sonnet', 'u8')), 2):
         if revision:
             await adapter.handle_message(MessageEvent(text='/goal write an ode', message_type=MessageType.COMMAND,
@@ -70,10 +86,12 @@ async def test_edited_goal_kickoff_is_admitted_as_its_own_turn(monkeypatch):
                 mgr, _entry = await runner._get_goal_manager_for_event(MessageEvent(text='', source=source))
                 return not mgr.has_goal()
             await async_wait_until(cleared_goal, what='the clear goal command to finish')
-        await adapter.handle_message(MessageEvent(text=text, message_type=MessageType.COMMAND,
-                                                  source=source, message_id='G', edit_revision=revision))
-        await async_wait_until(lambda: len(ran) >= turns and idle() or any('admission_conflict' in s for s in sent),
-                               what=f'{text} kicked off')
+        await run_command(MessageEvent(text=text, message_type=MessageType.COMMAND,
+                                        source=source, message_id='G', edit_revision=revision))
+        # ``run_command`` awaits the task through its finalizer, so polling a separately updated
+        # guard here only adds a wall-clock scheduling dependency. A refusal is the only valid
+        # outcome without another turn; the final assertions below reject it.
+        assert len(ran) >= turns or any('admission_conflict' in s for s in sent), (ran, sent)
     assert not [s for s in sent if 'admission_conflict' in s or 'RuntimeStoreError' in s], sent
     assert _rows(rig) == ['H', 'G', 'G:edit:u8'], _rows(rig)
     assert 'write a sonnet' in ran[-1], ran
