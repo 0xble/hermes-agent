@@ -209,7 +209,7 @@ class RequestUsageLedger:
             # Resolve the home here: the worker thread does not inherit context-local overrides.
             self._queue.put_nowait((self.root, sanitize_request_row(row)))
             return True
-        except (queue.Full, Exception):
+        except Exception:  # health: allow BLE001 -- telemetry must never fail or slow a provider request; errors are counted
             self._error()
             return False
 
@@ -221,7 +221,7 @@ class RequestUsageLedger:
                     return
                 root, row = item  # type: ignore[misc]
                 self._append(root, row)
-            except Exception:
+            except Exception:  # health: allow BLE001 -- telemetry must never fail or slow a provider request; errors are counted
                 self._error()
             finally:
                 self._queue.task_done()
@@ -293,37 +293,70 @@ def get_request_usage_ledger() -> RequestUsageLedger:
     return _default_ledger
 
 
-def record_request_row(row: dict[str, Any]) -> bool:
+def _guarded(build) -> bool:
+    """Build and queue one row. Never raises into the request path; failures are counted."""
     try:
-        return get_request_usage_ledger().record(row)
-    except Exception:
+        return get_request_usage_ledger().record(build())
+    except Exception:  # health: allow BLE001 -- telemetry must never fail or slow a provider request; errors are counted
+        _count_hook_error()
         return False
+
+
+def _count_hook_error() -> None:
+    ledger = _default_ledger
+    if ledger is not None:
+        ledger._error()
+
+
+def record_request_row(row: dict[str, Any]) -> bool:
+    return _guarded(lambda: row)
 
 
 def note_response(agent: Any, usage: Any = None) -> bool:
     """Record one response row for ``agent``. Never raises into the request path."""
-    try:
-        return record_request_row(row_for_response(agent, usage))
-    except Exception:
-        return False
+    return _guarded(lambda: row_for_response(agent, usage))
+
+
+def note_error(agent: Any, failure_class: str | None) -> bool:
+    """Record one failed-request row for ``agent``. Never raises into the request path."""
+    return _guarded(lambda: row_for_error(agent, failure_class))
+
+
+def _auxiliary_row(payload: dict[str, Any]) -> dict[str, Any]:
+    usage = payload.get("usage") or {}
+    return {
+        "session_id": payload.get("session_id"),
+        "source": payload.get("platform"),
+        "role_task_label": payload.get("aux_task") or "auxiliary",
+        "requested_provider": payload.get("provider"), "requested_model": payload.get("model"),
+        "resolved_provider": payload.get("provider"), "resolved_model": payload.get("model"),
+        "failure_class": payload.get("error_type"),
+        "input_tokens": usage.get("prompt_tokens"),
+        "cache_read_tokens": usage.get("cache_read_tokens"),
+        "cache_write_tokens": usage.get("cache_write_tokens"),
+        "output_tokens": usage.get("completion_tokens"),
+    }
+
+
+def note_auxiliary(payload: dict[str, Any]) -> bool:
+    """Record one auxiliary-call row (route, label, failure class, numeric usage only)."""
+    return _guarded(lambda: _auxiliary_row(payload))
 
 
 def note_attended_switch(runner: Any, ctx: Any, agent: Any, previous_decision: Any, to_model: str) -> bool:
     """Record an attended switch-back from the gateway turn. Never raises into the request path."""
-    try:
-        import time
+    def build() -> dict[str, Any]:
         from agent.session_source import session_source_for
         state = runner._session_state(ctx.session_key) if ctx.session_key else None
         last = getattr(getattr(state, "conversation", None), "last_user_activity_at", None)
-        return record_attended_switch(
+        return row_for_attended_switch(
             session_id=ctx.session_key or getattr(agent, "session_id", ""),
             source=session_source_for(getattr(agent, "platform", None)),
             from_model=getattr(previous_decision, "model", "") or getattr(agent, "model", ""),
             to_model=to_model,
-            idle_seconds=time.time() - float(last) if last is not None else None,
+            idle_gap_bucket=idle_gap_bucket(time.time() - float(last) if last is not None else None),
         )
-    except Exception:
-        return False
+    return _guarded(build)
 
 
 def request_usage_rows(**filters: str | None) -> list[dict[str, Any]]:

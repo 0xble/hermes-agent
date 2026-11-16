@@ -182,23 +182,8 @@ class _AuxCallHooks:
             )
         # Auxiliary calls use the same physical-attempt hook, including retries/fallbacks. Keep
         # only route, task label, failure class, and numeric usage; never copy payload or errors.
-        try:
-            from hermes_cli.observability.request_usage_ledger import record_request_row
-            usage = payload.get("usage") or {}
-            record_request_row({
-                "session_id": payload.get("session_id"),
-                "source": "cron" if payload.get("platform") == "cron" else payload.get("platform"),
-                "role_task_label": payload.get("aux_task") or "auxiliary",
-                "requested_provider": payload.get("provider"), "requested_model": payload.get("model"),
-                "resolved_provider": payload.get("provider"), "resolved_model": payload.get("model"),
-                "failure_class": payload.get("error_type"),
-                "input_tokens": usage.get("prompt_tokens"),
-                "cache_read_tokens": usage.get("cache_read_tokens"),
-                "cache_write_tokens": usage.get("cache_write_tokens"),
-                "output_tokens": usage.get("completion_tokens"),
-            })
-        except Exception:
-            pass
+        from hermes_cli.observability.request_usage_ledger import note_auxiliary
+        note_auxiliary(payload)
         _fire(POST_AUXILIARY_CALL, **payload)
 
 
