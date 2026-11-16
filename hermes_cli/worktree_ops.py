@@ -421,7 +421,7 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
         try:
             result = _git([*cfg, "branch", branch_name, base_ref], repo_root, timeout=120,
                           stdin=subprocess.DEVNULL, env=env, tree_timeout=True)
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             # Git may have committed the ref before the bounded process wrapper timed out.
             # Reconcile the ref itself before cleanup, but only claim it when it still points
             # at the requested base. A failed probe leaves ownership unknown and therefore
