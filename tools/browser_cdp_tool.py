@@ -382,6 +382,16 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
                            vault_tab=task_id)}, ensure_ascii=False)
 
 
+def _pinned_target_error(exc: BaseException) -> Optional[str]:
+    try:
+        from tools import browser_tool_cloud as cloud
+        if cloud.pinned_browser_target_refuses():
+            return json.dumps(cloud.browser_target_error(exc, cloud.browser_target()), ensure_ascii=False)
+    except Exception:
+        pass
+    return None
+
+
 def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id: Optional[str] = None,
                 frame_id: Optional[str] = None, timeout: float = 30.0, task_id: Optional[str] = None) -> str:
     """Send a raw CDP command (see ``CDP_DOCS_URL``). ``target_id`` attaches a fresh stateless connection
@@ -424,6 +434,8 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
                           "Brave, Chromium, or Edge browser, or set 'browser.cdp_url' in config.yaml. The Camofox "
                           "backend is REST-only and does not expose CDP.", cdp_docs=CDP_DOCS_URL)
     if not endpoint.startswith(("ws://", "wss://")):
+        if (target_error := _pinned_target_error(RuntimeError("CDP discovery failed"))):
+            return target_error
         return tool_error(f"CDP endpoint is not a WebSocket URL: {endpoint!r}. Expected ws://... or wss://... — "
                           "the /browser connect resolver should have rewritten this. Check that a Chromium-family "
                           "browser is actually listening on the debug port.")
@@ -444,15 +456,15 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     try:
         result = _run_async(_cdp_call(endpoint, method, call_params, target_id, safe_timeout))
     except TimeoutError as exc:
-        return tool_error(f"CDP call timed out after {safe_timeout}s: {exc}", method=method)
+        return _pinned_target_error(exc) or tool_error(f"CDP call timed out after {safe_timeout}s: {exc}", method=method)
     except RuntimeError as exc:
-        return tool_error(str(exc), method=method)
+        return _pinned_target_error(exc) or tool_error(str(exc), method=method)
     except WebSocketException as exc:
-        return tool_error(f"WebSocket error talking to CDP at {endpoint}: {exc}. The browser may have "
+        return _pinned_target_error(exc) or tool_error(f"WebSocket error talking to CDP at {endpoint}: {exc}. The browser may have "
                           "disconnected — try '/browser connect' again.", method=method)
     except Exception as exc:  # pragma: no cover — unexpected
         logger.exception("browser_cdp unexpected error")
-        return tool_error(f"Unexpected error: {type(exc).__name__}: {exc}", method=method)
+        return _pinned_target_error(exc) or tool_error(f"Unexpected error: {type(exc).__name__}: {exc}", method=method)
 
     payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),

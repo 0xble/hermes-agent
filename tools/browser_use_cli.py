@@ -123,6 +123,11 @@ def _camofox_active(context: str = "") -> bool:
     return _lazy_call("tools.browser_camofox", "is_camofox_mode", False, f"Camofox activity check failed{context}")
 
 
+def _cloud_refuses_pinned_target() -> bool:
+    return _lazy_call("tools.browser_tool_cloud", "pinned_browser_target_refuses", False,
+                      "pinned browser target policy lookup failed")
+
+
 def _real_profile_consented() -> bool:
     return _lazy_call("tools.browser_tool_cloud", "_use_real_profile", False, "real-profile consent lookup failed")
 
@@ -503,7 +508,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
                          force_local_sidecar: bool = False) -> Optional[str]:
     """Point the harness at the configured backend's CDP endpoint; error string on failure.
 
-    Precedence: (1) ``BU_CDP_WS``/``BU_CDP_URL`` already in env (operator override); (2) ``BROWSER_CDP_URL``
+    A refused pinned target is resolved before even operator CDP, cloud, or local selection.
     env / ``browser.cdp_url`` (``/browser connect``); (3) a cloud provider via the legacy ``_get_session_info()``
     so browser_exec shares the SAME session machinery (per-task cache, expiry, reaper, atexit);
     (4) the local engine — ``browser.engine: lightpanda`` or Hermes' packaged Chromium via agent-browser
@@ -516,10 +521,24 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     ``force_local_sidecar`` skips step (3): the call runs on the local engine under the ``::local`` cache
     key (hybrid routing; see ``_hybrid_routes_locally``). It sits BELOW the two operator overrides, and the
     sidecar verdict never fires while a CDP override is set."""
+    if _cloud_refuses_pinned_target():
+        from tools import browser_tool_cloud as cloud
+        try:
+            target = cloud.browser_target()
+            if not target:
+                raise cloud.BrowserTargetUnavailable("<unset>", "no pinned browser target configured")
+            if cloud.browser_target_is_camofox():
+                raise cloud.BrowserTargetUnavailable(target, "Camofox targets use the built-in Camofox tools")
+            env.pop("BU_CDP_URL", None)
+            env.pop("BU_CDP_WS", None)
+            _set_cdp_env(env, cloud.pinned_browser_target_or_raise())
+            return None
+        except Exception as exc:
+            return json.dumps(cloud.browser_target_error(exc), ensure_ascii=False)
     if _has_cdp_env(env):
         return None
     try:
-        from tools.browser_tool_cloud import _get_cloud_provider
+        from tools import browser_tool_cloud as cloud
         from tools.browser_tool_session import _get_session_info
         from tools.browser_tool_cdp import _get_cdp_override
     except Exception as e:  # pragma: no cover — stubbed browser_tool in tests
@@ -531,7 +550,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
         return None
     if force_local_sidecar:
         return _resolve_local_engine_cdp(env, task_id, session_name, sidecar=True)
-    provider = _quiet(_get_cloud_provider, None, "Cloud provider lookup failed")
+    provider = _quiet(cloud._get_cloud_provider, None, "Cloud provider lookup failed")
     if provider is None:
         return _resolve_local_engine_cdp(env, task_id, session_name)
 
@@ -905,6 +924,10 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     cmd = _find_cli()
     if not cmd:
+        if _cloud_refuses_pinned_target():
+            from tools import browser_tool_cloud as cloud
+            return tool_result(cloud.browser_target_error(
+                RuntimeError("browser-harness is unavailable"), cloud.browser_target()))
         return tool_error("browser-harness is missing from Hermes's Python environment. "
                           "Run `hermes update` to re-sync it.")
 
@@ -917,6 +940,12 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     env, route_err, local_sidecar, generation = _route_exec_current(
         env, session, task_id, bool(local), local_sidecar, route_key)
     if route_err:
+        try:
+            route_payload = json.loads(route_err)
+        except (TypeError, json.JSONDecodeError):
+            route_payload = None
+        if isinstance(route_payload, dict) and route_payload.get("error_type") == "browser_target_unavailable":
+            return tool_result(route_payload)
         return tool_error(route_err)
     if local_sidecar:
         env["BU_NAME"] = _sidecar_daemon_name(session)
@@ -940,7 +969,8 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
 
     # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no local
     # Chrome/CDP endpoint is reachable (their API key authenticates it)
-    if "BU_AUTOSPAWN" not in env and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
+    if "BU_AUTOSPAWN" not in env and not _cloud_refuses_pinned_target() \
+            and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
         env["BU_AUTOSPAWN"] = "1"
 
     timeout = _clamp_timeout(timeout_s)

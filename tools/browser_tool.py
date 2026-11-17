@@ -320,7 +320,8 @@ def _hybrid_routes_locally(url: str) -> bool:
     configured, ``browser.auto_local_for_private_urls`` on, a private URL, no CDP override (it owns the
     whole session), Camofox off (already local-only). Shared by browser_navigate and browser_exec."""
     return (
-        not _cdp._get_cdp_override_raw()
+        not _cloud.pinned_browser_target_refuses()
+        and not _cdp._get_cdp_override_raw()
         and not _is_camofox_mode()
         and _cloud._get_cloud_provider() is not None
         and _cloud._auto_local_for_private_urls()
@@ -939,7 +940,7 @@ def _json_with_fallback(response: dict[str, Any], result: dict[str, Any]) -> str
 
 def _failed_response(result: dict[str, Any], default_error: str) -> str:
     # ``code`` = machine-readable refusal (human_has_control), same shape as computer_use's.
-    extra = {"code": result["code"]} if result.get("code") else {}
+    extra = {key: result[key] for key in ("code", "error_type", "target", "reason") if result.get(key)}
     return _json_with_fallback(_err(result.get("error", default_error), **extra), result)
 
 

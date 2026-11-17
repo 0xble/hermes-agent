@@ -443,6 +443,10 @@ DEFAULT_CONFIG = {
         # Cloud provider: LAN/localhost URLs open in a local Chromium (ignores allow_private_urls; False refuses)
         "auto_local_for_private_urls": True,
         "cdp_url": "",  # persistent CDP endpoint for attaching to an existing Chromium/Chrome
+        # Fail-closed browser selection for business-agent profiles. target is an HTTP(S)/WS(S)
+        # endpoint (Unix sockets must be fronted by a loopback proxy); fallback defaults to legacy behavior.
+        "target": "",
+        "fallback": "allow",  # allow = legacy provider/local fallback; refuse = never select another browser
         # Consent to browse with the user's REAL logins locally: runs on a Hermes-managed SNAPSHOT
         # of the ACTIVE default-Chromium profile (Local State -> profile.last_used; cookies, logins,
         # prefs copied and re-synced per fresh session) driven by Hermes' packaged Chromium. The
