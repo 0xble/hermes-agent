@@ -56,7 +56,7 @@ class RateLimitState:
     # (provider, endpoint, model) the headers came from. One provider label can front several
     # upstreams, so anything that acts on a bucket matches the whole route. Set by the capture
     # site, which knows the live route; a state built anywhere else matches no route.
-    route: tuple = field(default=(), init=False)
+    route: tuple = field(default=(), init=False, compare=False)
 
     @property
     def has_data(self) -> bool:

@@ -31,6 +31,12 @@ _RECHECK_REASONS = frozenset({
 })
 
 
+def _recheck_delay(agent: Any) -> float:
+    """The agent's current spacing; anything that is not a positive number means none yet."""
+    raw = getattr(agent, "_uncooled_recheck_delay", 0)
+    return float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0 else 0.0
+
+
 def begin_uncooled_episode(agent: Any, reason: Any) -> None:
     """Start a fallback episode as uncooled and schedule its first re-check when transient.
 
@@ -44,7 +50,7 @@ def begin_uncooled_episode(agent: Any, reason: Any) -> None:
         agent._uncooled_recheck_at = None
         return
     now = time.monotonic()
-    delay = float(getattr(agent, "_uncooled_recheck_delay", 0) or 0)
+    delay = _recheck_delay(agent)
     # Failing again soon after a re-check put the primary back means the outage persists: double
     # the spacing. A primary that held for a full window has earned a fresh start.
     relapsed = (isinstance(restored_at, (int, float)) and delay > 0
@@ -73,5 +79,4 @@ def settle_uncooled_recheck(agent: Any, *, restored: bool) -> None:
         agent._uncooled_recheck_at = None
         agent._uncooled_restored_at = now
         return
-    delay = float(getattr(agent, "_uncooled_recheck_delay", 0) or 0) or UNCOOLED_RECHECK_BASE_S
-    agent._uncooled_recheck_at = now + delay
+    agent._uncooled_recheck_at = now + (_recheck_delay(agent) or UNCOOLED_RECHECK_BASE_S)

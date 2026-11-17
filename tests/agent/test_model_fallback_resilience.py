@@ -147,7 +147,7 @@ def test_failure_copy_names_the_owning_chain_and_only_routes_that_ran_out():
     assert "hermes fallback add" not in single
 
 
-def test_one_off_fallback_hints_point_at_config_not_the_removed_command():
+def test_one_off_fallback_hint_names_the_config_list():
     from agent.turn_failure_copy import site_copy
     hint = site_copy("nous_rate_limit")
     assert "`fallback_providers` in `" in hint and "config.yaml`" in hint
