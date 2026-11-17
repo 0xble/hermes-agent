@@ -85,7 +85,7 @@ def test_moved_receipts_is_indexed_and_matches_not_indexed_for_all_target_modes(
             )
             expected = {
                 owner: (target, source)
-                for owner, target, source in db._conn.execute(reference_sql, params).fetchall()
+                for owner, target, source in db._conn.execute(reference_sql, plan_params).fetchall()
             }
             assert actual == expected
 
