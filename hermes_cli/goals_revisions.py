@@ -196,8 +196,10 @@ def stop_condition_only(state: Any, *, goal: str, contract: Any,
 class GoalRevisionsMixin:
     def revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
                contract: Optional[dict[str, str]] = None, subgoals: Optional[list[str]] = None,
-               evidence: str = "", user_quote: str = "",
-               user_messages: Optional[list[str]] = None) -> dict[str, Any]:
+               evidence: str = "", user_quote: str = "", user_messages: Optional[list[str]] = None,
+               due: Optional[str] = None, next_check: Optional[str] = None, done_when: Optional[str] = None,
+               log_path: Optional[str] = None, plan_path: Optional[str] = None,
+               baseline: Optional[list[dict[str, Any]]] = None, ownership: Optional[bool] = None) -> dict[str, Any]:
         """Apply an additive revision through the durable snapshot/CAS boundary.
 
         Default mode is additive-only and quotes do not grant removal authority. Opt-in autonomy
@@ -208,6 +210,8 @@ class GoalRevisionsMixin:
         return revise_goal_snapshot(
             self, reason=reason, actor=actor, goal=goal, contract=contract,
             subgoals=subgoals, evidence=evidence, user_quote=user_quote,
+            due=due, next_check=next_check, done_when=done_when, log_path=log_path,
+            plan_path=plan_path, baseline=baseline, ownership=ownership,
         )
 
     def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
@@ -220,7 +224,10 @@ class GoalRevisionsMixin:
 
     def _revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
                 contract: Optional[dict[str, str]] = None, subgoals: Optional[list[str]] = None,
-                evidence: str = "", user_quote: str = "") -> dict[str, Any]:
+                evidence: str = "", user_quote: str = "", due: Optional[str] = None,
+                next_check: Optional[str] = None, done_when: Optional[str] = None,
+                log_path: Optional[str] = None, plan_path: Optional[str] = None,
+                baseline: Optional[list[dict[str, Any]]] = None, ownership: Optional[bool] = None) -> dict[str, Any]:
         """Validate and apply an additive revision to this manager's (staged) state."""
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
         from hermes_cli.lifecycle_authority import LifecycleAuthority
@@ -238,7 +245,7 @@ class GoalRevisionsMixin:
                              autonomous=caller is LifecycleAuthority.AUTONOMY) == A
         if actor == "agent" and permitted:
             return autonomous_edit(self, reason=reason, goal=goal, contract=contract,
-                                   subgoals=subgoals, user_quote=user_quote, authority=caller.value)
+                                   subgoals=subgoals, user_quote=user_quote, authority=caller.value, due=due, next_check=next_check, done_when=done_when, log_path=log_path, plan_path=plan_path, baseline=baseline, ownership=ownership)
         state = self._require_goal()
         reason = (reason or "").strip()
         if not reason:
@@ -247,7 +254,10 @@ class GoalRevisionsMixin:
         # The transcript read runs before the CAS commit, which still rejects a racing write.
         evidence_error = self._recorded_evidence_error(evidence, state) if evidence else None
         result = self._revise_state(state, reason=reason, actor=actor, goal=goal, contract=contract,
-                                    subgoals=subgoals, evidence=evidence, evidence_error=evidence_error)
+                                    subgoals=subgoals, evidence=evidence, evidence_error=evidence_error,
+                                    due=due, next_check=next_check, done_when=done_when,
+                                    log_path=log_path, plan_path=plan_path, baseline=baseline,
+                                    ownership=ownership)
         if result.get("ok"):
             result["revision"]["lifecycle_authority"] = caller.value
             if actor == "user" and contract and "stop_when" in contract:
