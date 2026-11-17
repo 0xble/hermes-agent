@@ -8018,8 +8018,7 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
             health_provider,
             ttl=fallback_candidate_quarantine_ttl(reason),
             base_url=sender_url or route.base_info,
-            model=route.final_model if reason == "auth unavailable" else (
-                route.final_model if reason == "rate limit" else None),
+            model=route.final_model if reason in {"auth unavailable", "rate limit"} else None,
             reason=reason,
         )
     if reason == "request timed out":
@@ -8039,10 +8038,8 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
     _chain_failed_model = None if reason in {"auth error", "payment error"} else route.final_model
     from agent.backend_identity import FailureScope
     custom_payment = reason == "payment error" and _custom_health_base_url(resolved_provider, route.base_info)
-    _chain_failure_scope = (
-        FailureScope.CREDENTIAL if credential_failure
-        else FailureScope.ENDPOINT if custom_payment else None
-    )
+    _chain_failure_scope = (FailureScope.CREDENTIAL if credential_failure
+                            else FailureScope.ENDPOINT if custom_payment else None)
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
