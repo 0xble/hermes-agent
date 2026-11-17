@@ -2224,9 +2224,9 @@ def try_activate_fallback(
     shared_adoption = isinstance(_shared_cooldown_record, dict)
     new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
     if new_fallback_episode and not shared_adoption:
-        # A stale monotonic deadline from an older episode must not authorize
-        # mid-turn recovery for an uncooled fallback.
-        agent._fallback_episode_cooled = False
+        # An older episode's deadline must not authorize recovery; an uncooled one gets a bounded re-check.
+        from agent.fallback_route_recovery_uncooled import begin_uncooled_episode
+        begin_uncooled_episode(agent, reason)
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     if shared_adoption:
