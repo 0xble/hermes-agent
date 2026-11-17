@@ -124,10 +124,18 @@ async def recover_probe(runner, adapter, source, peer):
     assert authority.agent(SessionRef('default', blocked_sid)) is None
     already_completed = initial[0]['status'] == 'terminal'
     assert len(peer.requests) == (0 if already_completed else 1), peer.requests
+    # Recovery fences the blocked session's lost turn `unknown` and pauses it; the chat is told
+    # once, unprompted (GW-10 follow-up). That notice is a distinct delivery from the safe
+    # row's reply, which must still land only in its own chat.
+    pause = [d for d in adapter.deliveries if 'This conversation is paused' in d['content']]
+    replies = [d for d in adapter.deliveries if d not in pause]
+    assert [d['chat_id'] for d in pause] == [source.chat_id], adapter.deliveries
     if not already_completed:
         assert 'RECOVER_EXACTLY_ONCE' in json.dumps(peer.requests[0])
-        assert adapter.deliveries and all(d['chat_id'] == 'recover-chat' for d in adapter.deliveries)
-        assert any('LOCAL_ACK' in d['content'] for d in adapter.deliveries)
+        assert replies and all(d['chat_id'] == 'recover-chat' for d in replies)
+        assert any('LOCAL_ACK' in d['content'] for d in replies)
+    else:
+        assert not replies, adapter.deliveries
     evidence = {'safe': safe, 'blocked': blocked, 'model_calls': len(peer.requests),
                 'deliveries': adapter.deliveries, 'recovery': recovered}
     Path(os.environ['HERMES_HOME'], 'recovery-receipt.json').write_text(json.dumps(evidence, indent=2))

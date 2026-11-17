@@ -165,7 +165,11 @@ async def probe(mode, peer):
             assert delivery['chat_id'] == source.chat_id and delivery['reply_to'] == 'media-1', delivery
             assert delivery['metadata']['thread_id'] == 'topic-7', delivery
         else:
-            assert not peer.requests and not adapter.deliveries
+            assert not peer.requests
+            # Startup recovery pauses the unknown row and tells that chat once (GW-10 follow-up);
+            # nothing else is delivered for an already-completed head.
+            assert [d['chat_id'] for d in adapter.deliveries] == ['unknown-media'], adapter.deliveries
+            assert 'This conversation is paused' in adapter.deliveries[0]['content'], adapter.deliveries
         (state / 'recovered.json').write_text(json.dumps(dict(model_calls=len(peer.requests),
             deliveries=adapter.deliveries, recovery=result, retained=before['retained'], rows=after)))
         return
