@@ -152,7 +152,7 @@ def iter_sync_files(container_base: str = "/root/.hermes") -> list[tuple[str, st
         from agent.incognito_private_dir import PRIVATE_DIR_PREFIX, _configured_root
         private_prefix = PRIVATE_DIR_PREFIX
         private_root = _configured_root().expanduser().resolve()
-    except Exception:
+    except (ImportError, OSError, RuntimeError, TypeError, ValueError):
         if private:
             # Do not continue with an incomplete allowlist while a private turn is active.
             return []
