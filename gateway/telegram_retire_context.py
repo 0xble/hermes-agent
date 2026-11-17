@@ -14,7 +14,7 @@ DEFINITION_FIELDS = frozenset({
     "repeat", "mode", "interval_seconds", "times", "until", "max_ticks", "max_turns",
     "skills", "skill", "deliver", "failure_deliver", "model", "provider", "base_url",
     "script", "no_agent", "monitor_script", "monitor_url", "context_from", "origin",
-    "enabled_toolsets", "workdir", "attach_to_session", "reasoning_effort", "keep_pinned_lane",
+    "enabled_toolsets", "workdir", "attach_to_session", "reasoning_effort", "keep_pinned_lane", "priority",
     "review", "output_local_only", "interpreter", "hard_wall_timeout_seconds", "route",
     "contract", "subgoals", "gates", "revisions",
 })

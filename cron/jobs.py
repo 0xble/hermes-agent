@@ -2019,6 +2019,24 @@ def _normalize_catch_up(value: Any) -> Optional[bool]:
     raise ValueError("catch_up must be true, false, or null (use the default).")
 
 
+def _normalize_priority(value: Any) -> Optional[str]:
+    """Normalize a business-impact lane; ``None`` means the legacy production default."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if text in {"live", "production", "background"}:
+        return text
+    raise ValueError(
+        "priority must be one of live, production, or background "
+        "(empty string clears the override on update).")
+
+
+def _normalize_priority_update(value: Any) -> Optional[str]:
+    if value == "":
+        return None
+    return _normalize_priority(value)
+
+
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
@@ -2039,6 +2057,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "priority": _normalize_priority,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -2057,6 +2076,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "priority": _normalize_priority_update,
 }
 
 
@@ -2105,6 +2125,7 @@ def create_job(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
     keep_pinned_lane: bool = False,
+    priority: Optional[str] = None,
     review: Optional[dict[str, Any]] = None,
     catch_up: Optional[bool] = None,
     paused: bool = False,
@@ -2225,6 +2246,7 @@ def create_job(
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
         ("keep_pinned_lane", bool(keep_pinned_lane)),
+        ("priority", f["priority"]),
         ("review", f["review"]), ("output_local_only", True if f["review"] else None),
         ("interpreter", f["interpreter"]),
         ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),
@@ -2439,6 +2461,8 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if "priority" in updates and updates["priority"] is None:
+            updated.pop("priority", None)
         apply_review_update(updated, updates)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
