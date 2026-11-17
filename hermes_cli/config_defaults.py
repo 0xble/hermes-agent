@@ -6,19 +6,10 @@ docs of config.yaml.
 
 from hermes_cli.config_defaults_auxiliary import _aux
 from hermes_cli.config_defaults_vault import DEFAULT_VAULT_CONFIG
-
-
-#: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
-#: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
-#: (the 3.14 pin shipped between the two without a migration); a saved config still holding one
-#: is the template copied, and the config migration unsets it, never a user's own pin.
-DEFAULT_SANDBOX_IMAGE = "nousresearch/hermes-sandbox:desktop"
-LEGACY_SANDBOX_IMAGES = ("nikolaik/python-nodejs:python3.11-nodejs20", "nikolaik/python-nodejs:python3.14-nodejs22")
-LEGACY_SANDBOX_IMAGE = LEGACY_SANDBOX_IMAGES[0]
-# Vercel Sandbox managed image (Vercel deprecated its `runtime` presets in Aug 2026).
-DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
-LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
-DEFAULT_CRON_MAX_PARALLEL_JOBS = 4
+from hermes_cli.config_defaults_runtime import (
+    DEFAULT_CRON_MAX_PARALLEL_JOBS, DEFAULT_SANDBOX_IMAGE, DEFAULT_VERCEL_IMAGE,
+    LEGACY_SANDBOX_IMAGE, LEGACY_SANDBOX_IMAGES, LEGACY_VERCEL_RUNTIME,
+)
 
 
 DEFAULT_CONFIG = {

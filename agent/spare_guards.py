@@ -60,7 +60,8 @@ def _load_config() -> dict[str, Any]:
     try:
         from hermes_cli.config import load_config_readonly
         loaded = load_config_readonly()
-    except Exception:
+    except (ImportError, OSError, TypeError, ValueError):
+        logger.debug("Could not load spare fallback guard configuration", exc_info=True)
         return {}
     return loaded if isinstance(loaded, dict) else {}
 
@@ -109,7 +110,7 @@ def _empty_state() -> dict[str, Any]:
 
 def _read_state(path: Path) -> dict[str, Any]:
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
+        raw = json.loads(path.read_text(encoding="utf-8-sig"))
     except FileNotFoundError:
         return _empty_state()
     except (OSError, ValueError):
@@ -148,13 +149,12 @@ def _write_state(path: Path, state: dict[str, Any]) -> None:
 
 
 def _pid_alive(pid: Any) -> bool:
+    from gateway.status import _pid_exists
+
     try:
-        os.kill(int(pid), 0)
-    except ProcessLookupError:
-        return False
-    except (PermissionError, OSError, TypeError, ValueError):
+        return _pid_exists(int(pid))
+    except (OSError, TypeError, ValueError):
         return True
-    return True
 
 
 def _prune(state: dict[str, Any], now: float, day: str) -> None:
@@ -188,7 +188,8 @@ def _in_delegated_child() -> bool:
     try:
         from agent.delegation_context import is_delegated_child_context
         return bool(is_delegated_child_context())
-    except Exception:
+    except (ImportError, OSError, TypeError, ValueError):
+        logger.debug("Could not determine delegated-child context", exc_info=True)
         return False
 
 

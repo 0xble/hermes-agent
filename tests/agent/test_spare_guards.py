@@ -1,6 +1,7 @@
 """Shared spare-fallback admission and daily-budget guards."""
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import agent.spare_guards as guards
 
@@ -59,6 +60,76 @@ def test_primary_spare_is_not_capped_or_budgeted(monkeypatch, tmp_path):
     agent._provider_fallback_active = False
     guards.record_fallback_usage(agent, SimpleNamespace(input_tokens=100, cache_read_tokens=100, output_tokens=100))
     assert guards.used_today("meta") == 0
+
+
+def test_primary_spare_route_is_exempt_from_child_cap(monkeypatch, tmp_path):
+    monkeypatch.setattr(guards, "_state_path", lambda: tmp_path / "state.json")
+    monkeypatch.setattr(guards, "_load_config", lambda: _config(cap=1, budget=1))
+    monkeypatch.setattr(guards, "_in_delegated_child", lambda: False)
+    first, second = _agent(), _agent()
+    assert guards.reserve_fallback_route(first, _route())
+    assert guards.reserve_fallback_route(second, _route())
+
+
+def test_real_try_activate_skips_capped_spare_and_moves_down_chain(monkeypatch, tmp_path):
+    """The real fallback walker skips a third delegated child over the spare cap.
+
+    The next non-spare route remains eligible, and releasing the first child's lease makes
+    the spare eligible again.  This exercises ``try_activate_fallback`` rather than only the
+    admission helper.
+    """
+    from run_agent import AIAgent
+
+    monkeypatch.setattr(guards, "_state_path", lambda: tmp_path / "state.json")
+    monkeypatch.setattr(guards, "_load_config", lambda: _config(cap=2))
+    monkeypatch.setattr(guards, "_in_delegated_child", lambda: True)
+    client = MagicMock()
+    client.base_url = "https://openrouter.ai/api/v1"
+    client.api_key = "fallback-key"
+    with (
+        patch("model_tools.get_tool_definitions", return_value=[]),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.auxiliary_client.resolve_provider_client", return_value=(client, "resolved")),
+    ):
+        agents = [
+            AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
+                    skip_context_files=True, skip_memory=True,
+                    fallback_model=[{"provider": "openrouter", "model": "muse-1"}])
+            for _ in range(3)
+        ]
+        for agent in agents:
+            agent.client = client
+        assert agents[0]._try_activate_fallback()
+        assert agents[1]._try_activate_fallback()
+        agents[2]._fallback_chain.append({"provider": "openai", "model": "gpt-4o"})
+        assert agents[2]._try_activate_fallback()
+        assert agents[2].provider == "openai"
+        guards.release_fallback_route(agents[0])
+        replacement = AIAgent(api_key="test-key", base_url="https://openrouter.ai/api/v1", quiet_mode=True,
+                              skip_context_files=True, skip_memory=True,
+                              fallback_model=[{"provider": "openrouter", "model": "muse-3"}])
+        replacement.client = client
+        assert replacement._try_activate_fallback()
+        guards.release_fallback_route(agents[1])
+        guards.release_fallback_route(replacement)
+
+
+def test_deferred_spare_guard_waits_primary_cooldown(monkeypatch):
+    from agent.turn_spare_guard_wait import wait_for_deferred_spare_guard
+
+    agent = SimpleNamespace(_spare_guard_deferred=True, _rate_limited_until=110.0)
+    retry = SimpleNamespace()
+    monkeypatch.setattr("agent.turn_spare_guard_wait.time.monotonic", lambda: 100.0)
+    seen = {}
+
+    def _sleep(agent, seconds, retry, **kwargs):
+        seen["seconds"] = seconds
+
+    monkeypatch.setattr("agent.turn_recovery.interruptible_backoff_sleep", _sleep)
+    assert wait_for_deferred_spare_guard(agent, retry, messages=[], conversation_history=[], api_call_count=1) is None
+    assert seen["seconds"] == 10.0
+    assert not agent._spare_guard_deferred
 
 
 def test_daily_budget_rolls_over(monkeypatch, tmp_path):

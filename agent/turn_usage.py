@@ -315,11 +315,8 @@ def record_response_usage(
     # loop); drained at finalize via _persist_session.
     # Keep spare fallback budgets aligned with the same canonical usage object that
     # is persisted to state.db; direct primary use never sets this marker.
-    try:
-        from agent.spare_guards import record_fallback_usage
-        record_fallback_usage(agent, canonical_usage)
-    except Exception:
-        logger.debug("Spare fallback usage accounting failed", exc_info=True)
+    from agent.turn_usage_spare import record_spare_fallback_usage
+    record_spare_fallback_usage(agent, canonical_usage)
 
     if agent._session_db and agent.session_id:
         try:
