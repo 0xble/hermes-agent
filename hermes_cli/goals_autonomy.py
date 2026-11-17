@@ -238,7 +238,7 @@ def validate_removal_quote(state, expected, cursor, *, controlled_session_id=Non
     from hermes_cli.session_controls import _read_current_user_quote
     check = _read_current_user_quote if revision.get("quote_kind") == "stop_condition" else current_removal_quote
     checked = check(revision["quote_session_id"], revision["user_quote"],
-                                    requirements=_existing_removal_requirements(prior), cursor=cursor)
+                    requirements=_existing_removal_requirements(prior), cursor=cursor) if revision.get("quote_kind") != "stop_condition" else check(revision["quote_session_id"], revision["user_quote"], cursor=cursor)
     if (isinstance(checked, str) or checked[1] != revision["quote_message"]
             or checked.relay_receipt != revision.get("relay_receipt", "")
             or checked.source_session_id != revision.get("quote_source_session_id", checked.source_session_id)):
