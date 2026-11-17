@@ -35,12 +35,12 @@ def runner(tmp_path):
         f"#!{sys.executable}\nimport json, os, sys\n"
         "stage = 'probe' if sys.argv[1] == '-c' else 'compile' if sys.argv[1] == '-m' else 'runner'\n"
         f"with open({str(log)!r}, 'a') as out:\n"
-        "    out.write(json.dumps({'stage': stage, 'args': sys.argv[1:], 'held': os.environ.get('HEAVY_SLOT_HELD'), 'workers': os.environ.get('HERMES_TEST_WORKERS')}) + '\\n')\n"
+        "    out.write(json.dumps({'stage': stage, 'args': sys.argv[1:], 'held': os.environ.get('SEMAPHORE_HELD'), 'workers': os.environ.get('HERMES_TEST_WORKERS')}) + '\\n')\n"
         "if stage == 'runner': sys.exit(23)\n"
     )
     python.chmod(0o755)
     # Supply only the shell tools used by the runner. In particular, host shell
-    # functions and the installed heavy-slot cannot affect the absent-tool case.
+    # functions and the installed semaphore cannot affect the absent-tool case.
     for name in ("bash", "dirname", "env", "sed", "head"):
         commands.joinpath(name).symlink_to(shutil.which(name))
     commands.joinpath("git").write_text("#!/bin/bash\nexit 0\n")
@@ -59,16 +59,16 @@ def slot_commands(runner, request):
 
 
 def install_slot(commands, log, mode):
-    commands.joinpath("heavy-slot").write_text(
+    commands.joinpath("semaphore").write_text(
         f"#!{sys.executable}\nimport json, os, sys\n"
         f"with open({str(log)!r}, 'a') as out: out.write(json.dumps('slot') + '\\n')\n"
         "assert sys.argv[1] == '--label'\n"
         "assert sys.argv[3] == '--'\n"
         f"if {mode!r} == 'denied': sys.exit(75)\n"
-        f"if {mode!r} == 'held': os.environ['HEAVY_SLOT_HELD'] = '0'\n"
+        f"if {mode!r} == 'held': os.environ['SEMAPHORE_HELD'] = '0'\n"
         "os.execvp(sys.argv[4], sys.argv[4:])\n"
     )
-    commands.joinpath("heavy-slot").chmod(0o755)
+    commands.joinpath("semaphore").chmod(0o755)
 
 
 @pytest.mark.platforms("posix")
@@ -101,7 +101,7 @@ def test_admission_reexec_preserves_arguments_budget_and_failure(runner, slot_co
     if mode != "absent":
         install_slot(slot_commands, log, "held" if mode == "activation" else mode)
     if mode == "reuse":
-        env["HEAVY_SLOT_HELD"] = "0"
+        env["SEMAPHORE_HELD"] = "0"
     if mode == "activation":
         # A stale activation skips the explicit-interpreter shortcut on first entry.
         env["__HERMES_ACTIVATED"] = "stale"

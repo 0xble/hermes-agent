@@ -360,7 +360,7 @@ def register(ctx) -> None:
     """Plugin entry point — called by the Hermes plugin system at startup."""
     ctx.register_platform(
         target_ref_syntax_fn=parse_nonempty,
-        name="ntfy", label="ntfy", adapter_factory=lambda cfg: NtfyAdapter(cfg),
+        name="ntfy", label="ntfy", adapter_factory=lambda cfg: NtfyAdapter(cfg), adapter_class=NtfyAdapter,
         dashboard_description="Chat with Hermes over ntfy push topics (ntfy.sh or self-hosted).",
         docs_url="https://hermes-agent.nousresearch.com/docs/user-guide/messaging/ntfy",
         check_fn=check_requirements, validate_config=validate_config, is_connected=is_connected,

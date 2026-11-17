@@ -313,6 +313,15 @@ def _pin_restore_held(agent, registered: set) -> tuple[bool, frozenset]:
     return True, _frozen_tool_names(registered)
 
 
+def _reactions_capability_gated(agent) -> bool:
+    """Whether this agent's gateway adapter is known not to support reactions (the capability gate).
+    Non-gateway sources (desktop opt-in) never count: there is no registered adapter for them."""
+    from gateway.platform_registry import platform_registry
+    platform = getattr(agent, "platform", None)
+    name = str(getattr(platform, "value", platform) or "").strip().lower()
+    return bool(name) and platform_registry.reactions_supported(name) is False
+
+
 def _config_permitted_names(agent) -> set:
     """Tool names this agent's toolset selection allows before ``check_fn``: all a pin may carry
     forward. A client-surface toolset counts as allowed (only its client can add it, so its absence
@@ -324,6 +333,13 @@ def _config_permitted_names(agent) -> set:
     if enabled is not None:
         enabled = [*enabled, *CLIENT_SURFACE_TOOLSETS]
     disabled = getattr(agent, "disabled_toolsets", None)
+    # Adapter capability is no config choice either, and may only become known after the pin (a deferred
+    # platform plugin loads later): a pinned react stays on a gateway whose adapter cannot react, unless
+    # config disables it. Every other source of a "reactions" entry (config, the desktop opt-in) still strips.
+    if disabled and "reactions" in disabled and _reactions_capability_gated(agent):
+        configured = set(getattr(agent, "_configured_disabled_toolsets", None) or ())
+        if "reactions" not in configured:
+            disabled = [name for name in disabled if name != "reactions"]
     if disabled and agent_is_oneshot(agent):  # the one-shot gate is no config choice either: a pinned clarify stays,
         configured = set(getattr(agent, "_configured_disabled_toolsets", None) or ())  # unless config disables it
         disabled = [name for name in disabled if name not in ONESHOT_DISABLED_TOOLSETS or name in configured]

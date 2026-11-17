@@ -158,6 +158,28 @@ def test_cross_session_goal_replace_without_an_active_goal_fails_before_any_requ
     assert self_result["status"] == "failed"
 
 
+def test_self_replace_exposes_missing_requirement_details(state):
+    from hermes_constants import get_hermes_home
+    from hermes_cli.goals import GoalContract, GoalManager, load_goal
+    from hermes_cli.session_controls import apply_control
+
+    get_hermes_home().joinpath("config.yaml").write_text("goals:\n  autonomy: true\n")
+    limits = "Never restart the gateway\nNever weaken the canary"
+    GoalManager("target").set("Ship the repair", contract=GoalContract(
+        verification="The repair is live", constraints=limits))
+    result = apply_control(
+        "goal", "replace", "target", requester_sid="target", reason="trim the contract",
+        payload={"goal": "Ship the repair", "contract": {"constraints": "Never restart the gateway"}},
+    )
+    assert result["ok"] is False
+    assert result["status"] == "failed"
+    assert result["error_code"] == "constraint_quote_required"
+    assert result["error"] == "Retain each requirement or quote the user's exact removal instruction: Never weaken the canary"
+    assert result["missing_requirements"] == ["Never weaken the canary"]
+    saved = load_goal("target")
+    assert saved is not None and saved.contract.constraints == limits
+
+
 def test_cross_session_replace_rechecks_goal_before_recording_failure(state, monkeypatch):
     from hermes_cli import session_controls
     from hermes_cli.goals import GoalManager, load_goal

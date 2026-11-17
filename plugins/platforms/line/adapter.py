@@ -976,7 +976,8 @@ def interactive_setup() -> None:
 
 def register(ctx) -> None:
     ctx.register_platform(
-        name="line", label="LINE", adapter_factory=lambda cfg: LineAdapter(cfg), check_fn=check_requirements,
+        name="line", label="LINE", adapter_factory=lambda cfg: LineAdapter(cfg), adapter_class=LineAdapter,
+        check_fn=check_requirements,
         dashboard_description="Use Hermes from LINE via the LINE Messaging API webhook.",
         docs_url="https://hermes-agent.nousresearch.com/docs/user-guide/messaging/line",
         validate_config=validate_config, is_connected=is_connected,
