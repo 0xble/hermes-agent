@@ -71,7 +71,8 @@ def test_moved_receipts_is_indexed_and_matches_not_indexed_for_all_target_modes(
             actual = moved_receipts(recorder, target_ids)
             sql, params = next(call for call in recorder.calls if "FROM state_meta" in call[0])
             assert "INDEXED BY idx_state_meta_local_policy_route" in sql
-            assert "m.key GLOB 'gateway.local_policy.v1:*'" in sql
+            assert "m.key GLOB ?" in sql
+            assert POLICY_PREFIX + "*" in params
             assert ("json_each(?)" in sql) is (target_ids is not None)
             assert "idx_state_meta_local_policy_route" in " ".join(_plan(db._conn, sql, params))
 
