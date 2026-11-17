@@ -185,8 +185,27 @@ MINUTE_RATE_LIMIT_COOLDOWN_CAP_S = 120.0
 TPM_WINDOW_SECONDS = 60.0
 
 
+_PER_MINUTE_LIMIT_RE = re.compile(r"per\s+min|\((?:TPM|RPM)\)", re.IGNORECASE)
+# ``x-ratelimit-reset-*`` durations: ``60s``, ``6m0s``, ``1m30s``, ``20ms``, ``1h2m3s``.
+_RESET_DURATION_RE = re.compile(r"(?:\d+(?:\.\d+)?(?:ms|h|m|s))+")
+_RESET_DURATION_PART_RE = re.compile(r"(\d+(?:\.\d+)?)(ms|h|m|s)")
+_RESET_UNIT_SECONDS = {"h": 3600.0, "m": 60.0, "s": 1.0, "ms": 0.001}
+
+
+def _reset_header_seconds(raw: Any) -> Optional[float]:
+    """Seconds named by one reset header: a bare number, or one or more unit parts."""
+    text = str(raw).strip().lower()
+    try:
+        return float(text)
+    except ValueError:
+        pass
+    if not _RESET_DURATION_RE.fullmatch(text):
+        return None
+    return sum(float(amount) * _RESET_UNIT_SECONDS[unit] for amount, unit in _RESET_DURATION_PART_RE.findall(text))
+
+
 def tpm_overage_cooldown_seconds(error: Any) -> Optional[float]:
-    """Return a short token-per-minute window for an explicit OpenAI TPM overage.
+    """Return a short per-minute window for an explicit OpenAI per-minute overage.
 
     The proxy commonly leaves this in plain text (``Limit N, Used U, Requested R``).
     Do not interpret unrelated ``try again in 138h`` prose as a reset for a minute
@@ -200,7 +219,9 @@ def tpm_overage_cooldown_seconds(error: Any) -> Optional[float]:
     parts.extend((str(error),) + tuple(str(getattr(error, name, "") or "") for name in ("message", "response")))
     text = " ".join(parts)
     match = re.search(r"Limit\s*([\d,]+).*?Used\s*([\d,]+).*?Requested\s*([\d,]+)", text, re.IGNORECASE | re.DOTALL)
-    if not match:
+    # Daily and other long windows (TPD, RPD) print the same accounting line. Only a limit the
+    # text names as per-minute resets inside a minute.
+    if not match or not _PER_MINUTE_LIMIT_RE.search(text):
         return None
     limit, used, requested = (int(value.replace(",", "")) for value in match.groups())
     return TPM_WINDOW_SECONDS if used + requested > limit else None
@@ -215,17 +236,8 @@ def _minute_rate_limit_headers(headers: Any) -> bool:
         raw = getter(name) or getter(name.title())
         if raw is None:
             continue
-        text = str(raw).strip().lower()
-        try:
-            if text.endswith("m"):
-                amount = float(text[:-1]) * 60
-            elif text.endswith("s"):
-                amount = float(text[:-1])
-            else:
-                amount = float(text)
-        except ValueError:
-            continue
-        if 0 < amount <= 120:
+        amount = _reset_header_seconds(raw)
+        if amount is not None and 0 < amount <= 120:
             return True
     return False
 

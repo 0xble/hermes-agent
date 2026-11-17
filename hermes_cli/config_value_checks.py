@@ -78,7 +78,7 @@ def _validate_model_map_options(options: Any, issues: list[ConfigIssue], path: s
 
 
 def _validate_model_maps(config: dict[str, Any], issues: list[ConfigIssue]) -> None:
-    """Validate model maps plus top-level, cron, and auxiliary fallback chains."""
+    """Validate model maps plus top-level, cron, delegation, and auxiliary fallback chains."""
     def walk(value: Any, path: str) -> None:
         if isinstance(value, dict):
             for key, child in value.items():
@@ -106,6 +106,18 @@ def _validate_model_maps(config: dict[str, Any], issues: list[ConfigIssue]) -> N
                         "model": cron.get("model") or primary.get("model"),
                         "base_url": None if cron_provider else primary.get("base_url")}
         _validate_chain("cron.fallback_providers", cron_primary, cron.get("fallback_providers"), config, issues)
+
+    delegation = config.get("delegation")
+    if isinstance(delegation, dict):
+        # The delegation-wide chain backs the delegation default route, which is the main route
+        # unless delegation names its own. As with cron, a named provider never borrows the
+        # main endpoint.
+        child_provider = delegation.get("provider")
+        child_primary = {"provider": child_provider or primary.get("provider"),
+                         "model": delegation.get("model") or primary.get("model"),
+                         "base_url": delegation.get("base_url") or (None if child_provider else primary.get("base_url"))}
+        _validate_chain("delegation.fallback_providers", child_primary, delegation.get("fallback_providers"),
+                        config, issues)
 
     auxiliary = config.get("auxiliary")
     if isinstance(auxiliary, dict):

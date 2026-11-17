@@ -13,8 +13,8 @@ Both apply only to the fallback walk. A spare that is the role PRIMARY (the quot
 deliberate drain) never passes through :func:`reserve_fallback_route`, and usage is recorded only
 while ``_provider_fallback_active`` is set.
 
-NOTE: :func:`resolve_upstream_family` is a deliberately minimal local helper; deduplicate it with
-the upstream-family resolver on the model-fallback-resilience branch when the two merge.
+:func:`resolve_upstream_family` delegates to ``hermes_cli.fallback_config.infer_upstream_family``,
+the resolver config validation uses, so a route is one family to both.
 """
 from __future__ import annotations
 
@@ -60,12 +60,6 @@ class FallbackRouteReservation:
 
     def __bool__(self) -> bool:
         return True
-
-_MODEL_PREFIX_FAMILIES = (("gpt", "openai"), ("claude", "anthropic"), ("muse", "meta"), ("grok", "xai"))
-_PROVIDER_FAMILIES = {
-    "openai": "openai", "openai-codex": "openai", "anthropic": "anthropic",
-    "xai": "xai", "xai-oauth": "xai", "meta": "meta",
-}
 
 
 def _state_path() -> Path:
@@ -123,14 +117,8 @@ def spare_settings(config: dict[str, Any] | None = None) -> tuple[frozenset[str]
 
 def resolve_upstream_family(provider: Any, model: Any, entry: dict[str, Any] | None = None) -> str:
     """Upstream family of a route: explicit ``upstream:``, else the model name, else the provider."""
-    if isinstance(entry, dict) and (explicit := str(entry.get("upstream") or "").strip().lower()):
-        return explicit
-    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
-    for prefix, family in _MODEL_PREFIX_FAMILIES:
-        if name.startswith(prefix):
-            return family
-    provider_name = str(provider or "").strip().lower()
-    return _PROVIDER_FAMILIES.get(provider_name, provider_name)
+    from hermes_cli.fallback_config import infer_upstream_family
+    return infer_upstream_family(provider, model, entry.get("upstream") if isinstance(entry, dict) else None)
 
 
 def _empty_state() -> dict[str, Any]:

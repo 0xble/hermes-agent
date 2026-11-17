@@ -30,6 +30,37 @@ def test_upstream_family_is_judged_by_model_not_provider_label_with_explicit_ove
     assert upstream_family({"provider": proxy, "model": "muse-x", "upstream": "Custom-Vendor"}) == "custom-vendor"
 
 
+def test_validation_and_the_spare_guards_resolve_one_family_per_route():
+    from agent.spare_guards import resolve_upstream_family
+    from hermes_cli.fallback_config import upstream_family
+    routes = [
+        ({"provider": "openrouter", "model": "anthropic/claude-sonnet-5-5"}, "anthropic"),
+        ({"provider": "openrouter", "model": "openai/gpt-6.1-sol"}, "openai"),
+        ({"provider": "openrouter", "model": "x-ai/grok-4.7"}, "xai"),
+        ({"provider": "openrouter", "model": "x-ai/grok-4.7", "upstream": "Elsewhere"}, "elsewhere"),
+        ({"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0"}, "meta"),
+        ({"provider": "xai-oauth", "model": "some-new-name"}, "xai"),
+    ]
+    for route, family in routes:
+        assert upstream_family(route) == family, route
+        assert resolve_upstream_family(route["provider"], route["model"], route) == family, route
+
+
+def test_a_three_vendor_chain_on_one_aggregator_meets_the_bar():
+    option = {"name": "deep", "provider": "openrouter", "model": "google/gemini-3-pro", "fallback_providers": [
+        {"provider": "openrouter", "model": "anthropic/claude-sonnet-5-5"},
+        {"provider": "openrouter", "model": "openai/gpt-6.1-sol"},
+        {"provider": "openrouter", "model": "x-ai/grok-4.7"},
+    ]}
+    assert validate_config_structure({"delegation": {"backends": {"model_map": {"options": [option]}}}}) == []
+    # Without the vendor the names say nothing, and one aggregator is one family.
+    option["fallback_providers"] = [{"provider": "openrouter", "model": f"vendor/m-{n}"} for n in "abc"]
+    option["model"] = "vendor/m-primary"
+    messages = [i.message for i in validate_config_structure(
+        {"delegation": {"backends": {"model_map": {"options": [option]}}}})]
+    assert any("spans only 1 upstream families" in m for m in messages), messages
+
+
 def _user_option(chain):
     return {"name": "coder", "description": "x", "provider": "custom:openai-proxy",
             "model": "gpt-6.1-sol", "fallback_providers": chain}
@@ -67,6 +98,27 @@ def test_migration_keeps_a_user_chain_that_fails_the_bar_and_reports_it():
     reported = [c for c in changes if "kept as written" in c]
     assert reported and all("options[0].fallback_providers" in c for c in reported)
     assert any("at least 3 fallback entries" in c for c in reported)
+
+
+def test_migration_keeps_a_declared_delegation_chain_beside_a_user_map():
+    from hermes_cli.config_migrations_delegation_roles import install_role_routes
+    declared = [dict(route) for route in _GOOD_CHAIN]
+
+    def migrate(delegation):
+        config = {"delegation": {"backends": {"model_map": {"options": [_user_option(_GOOD_CHAIN)]}}, **delegation}}
+        install_role_routes(config, {}, [])
+        return config["delegation"]
+
+    assert migrate({"fallback_providers": declared})["fallback_providers"] == _GOOD_CHAIN
+    # An explicit null (inherit the parent chain) is a declaration too.
+    assert migrate({"fallback_providers": None})["fallback_providers"] is None
+    # Nothing declared: the opt-out is still written, as before.
+    assert migrate({})["fallback_providers"] == []
+    # With no user map the role defaults are installed, each with its own chain, and the
+    # delegation-wide list is turned off beside them.
+    config = {"delegation": {"fallback_providers": declared}}
+    install_role_routes(config, {}, [])
+    assert config["delegation"]["fallback_providers"] == []
 
 
 @pytest.mark.parametrize("delegation", [{}, {"backends": {}}, {"backends": {"model_map": {"options": []}}}])
@@ -168,6 +220,27 @@ def test_main_and_cron_chains_are_checked_against_the_model_default(scope, chain
                    for message in messages), messages
 
 
+@pytest.mark.parametrize(("delegation", "chain", "problem"), [
+    ({}, _DUPLICATE_OF_MAIN, "[0] duplicates the primary route custom:openai-proxy:gpt-6.1-sol"),
+    ({}, _TWO_FAMILIES, " spans only 2 upstream families"),
+    ({}, _GOOD_CHAIN[:1], " needs at least 3 fallback entries"),
+    ({}, _GOOD_CHAIN, None),
+    ({}, [], None),
+    ({}, None, None),
+    # Delegation naming its own route is checked against that route, not the main one.
+    ({"provider": "custom:claude-proxy", "model": "claude-sonnet-5-5"}, _GOOD_CHAIN,
+     "[0] duplicates the primary route custom:claude-proxy:claude-sonnet-5-5"),
+    ({"provider": "custom:claude-proxy", "model": "claude-opus-5-5"}, _DUPLICATE_OF_MAIN, None),
+])
+def test_a_declared_delegation_chain_is_checked(delegation, chain, problem):
+    config = {"model": dict(_MAIN_MODEL), "delegation": {**delegation, "fallback_providers": chain}}
+    messages = [issue.message for issue in validate_config_structure(config)]
+    if problem is None:
+        assert messages == []
+    else:
+        assert any(m.startswith(f"delegation.fallback_providers{problem}") for m in messages), messages
+
+
 def test_cron_chain_is_checked_against_crons_own_model_when_it_names_one():
     config = {"model": {**_MAIN_MODEL, "base_url": "http://127.0.0.1:8317/v1"},
               "cron": {"model": "claude-sonnet-5-5", "model_provider": "custom:claude-proxy",
@@ -204,12 +277,34 @@ def test_absurd_retry_after_on_minute_window_is_bounded():
     assert provider_retry_after_seconds(error) == MINUTE_RATE_LIMIT_COOLDOWN_CAP_S
 
 
-def test_explicit_tpm_overage_arms_one_minute_window_not_retry_after_prose():
+@pytest.mark.parametrize(("reset", "expected"), [
+    ("1m30s", MINUTE_RATE_LIMIT_COOLDOWN_CAP_S), ("20ms", MINUTE_RATE_LIMIT_COOLDOWN_CAP_S),
+    ("6m0s", 138 * 3600.0), ("1h0m0s", 138 * 3600.0),
+])
+def test_composite_reset_durations_decide_the_minute_window(reset, expected):
+    error = SimpleNamespace(response=SimpleNamespace(headers={
+        "Retry-After": str(138 * 3600), "x-ratelimit-reset-tokens": reset,
+    }), body={})
+    assert provider_retry_after_seconds(error) == expected
+
+
+_OVERAGE = "Limit 100000, Used 99000, Requested 5000. Please try again in 138h46m."
+
+
+@pytest.mark.parametrize(("window", "expected"), [
+    ("on tokens per min (TPM): ", 60.0),
+    ("on requests per min (RPM): ", 60.0),
+    ("on tokens per minute: ", 60.0),
+    ("on tokens per day (TPD): ", None),
+    ("on requests per day (RPD): ", None),
+    ("", None),
+])
+def test_only_a_per_minute_overage_arms_the_one_minute_window(window, expected):
+    # A daily limit prints the same Limit/Used/Requested line; a 60 s cooldown there would
+    # re-probe a spent daily quota every minute.
     error = SimpleNamespace(
-        message="Limit 100000, Used 99000, Requested 5000. Try again in 138h46m.",
-        body={}, response=None,
-    )
-    assert tpm_overage_cooldown_seconds(error) == 60.0
+        message=f"Rate limit reached for gpt in organization org-x {window}{_OVERAGE}", body={}, response=None)
+    assert tpm_overage_cooldown_seconds(error) == expected
 
 
 def test_tpm_admission_blocks_request_that_will_not_fit():

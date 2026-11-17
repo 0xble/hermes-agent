@@ -237,7 +237,10 @@ def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None
                        for issue in existing_issues)
     delegation["backend"] = "model_map"
     delegation["inherit_service_tier"] = False
-    delegation["fallback_providers"] = []
+    # The installed defaults give every role its own chain, so the delegation-wide list is
+    # turned off beside them. Beside a kept user map, a declared list is the user's and stays.
+    if not preserve_existing or "fallback_providers" not in delegation:
+        delegation["fallback_providers"] = []
     install_cron_fallbacks(config, changes, install_missing=True)
     if not preserve_existing:
         for option in settings["options"]:

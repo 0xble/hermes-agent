@@ -16,13 +16,41 @@ MIN_UPSTREAM_FAMILIES = 3
 # several vendors (for example muse-* is Meta behind custom:openai-proxy).
 _MODEL_UPSTREAM_PREFIXES: tuple[tuple[str, str], ...] = (
     ("claude", "anthropic"),
-    ("gpt-", "openai"), ("gpt_", "openai"), ("o1", "openai"), ("o3", "openai"),
+    ("gpt", "openai"), ("o1", "openai"), ("o3", "openai"),
     ("o4", "openai"), ("o-series", "openai"), ("codex", "openai"),
     ("muse", "meta"), ("llama", "meta"),
     ("grok", "xai"), ("gemini", "google"), ("gemma", "google"),
     ("mistral", "mistral"), ("mixtral", "mistral"), ("deepseek", "deepseek"),
     ("qwen", "alibaba"), ("kimi", "moonshot"), ("minimax", "minimax"),
 )
+# First-party provider ids whose vendor is known even when the model name is not. Read before
+# alias collapse: ``openai`` is also a legacy alias of an aggregator id.
+_PROVIDER_UPSTREAM_FAMILIES = {
+    "openai": "openai", "openai-codex": "openai", "anthropic": "anthropic",
+    "xai": "xai", "xai-oauth": "xai", "meta": "meta",
+}
+
+
+def infer_upstream_family(provider: Any, model: Any, explicit: Any = None) -> str:
+    """Upstream family of one concrete route: *explicit*, else the model name, else the provider.
+
+    The single resolver behind config validation and the spare-route guards, so both judge a
+    route the same way. A vendor segment is dropped before the model name is read
+    (``anthropic/claude-x`` on an aggregator is Anthropic, not the aggregator). No alias is
+    expanded here; :func:`upstream_family` does that first for config routes.
+    """
+    declared = str(explicit or "").strip().lower()
+    if declared:
+        return declared
+    name = str(model or "").strip().lower().rsplit("/", 1)[-1]
+    for prefix, family in _MODEL_UPSTREAM_PREFIXES:
+        if name.startswith(prefix):
+            return family
+    provider_id = str(provider or "").strip().lower()
+    if provider_id in _PROVIDER_UPSTREAM_FAMILIES:
+        return _PROVIDER_UPSTREAM_FAMILIES[provider_id]
+    # _normalize_provider_id already degrades to the bare lowercase id when it cannot load.
+    return _normalize_provider_id(provider_id) or f"model:{name}"
 
 
 def _resolved_route(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
@@ -55,16 +83,7 @@ def upstream_family(route: Mapping[str, Any] | None, config: Mapping[str, Any] |
     inference; provider labels are only the final fallback for unknown model names.
     """
     item = _resolved_route(route, config)
-    explicit = str(item.get("upstream") or "").strip().lower()
-    if explicit:
-        return explicit
-    model = str(item.get("model") or "").strip().lower()
-    for prefix, family in _MODEL_UPSTREAM_PREFIXES:
-        if model.startswith(prefix):
-            return family
-    provider = str(item.get("provider") or "").strip().lower()
-    # _normalize_provider_id already degrades to the bare lowercase id when it cannot load.
-    return _normalize_provider_id(provider) or f"model:{model}"
+    return infer_upstream_family(item.get("provider"), item.get("model"), item.get("upstream"))
 
 
 def route_identity(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> tuple[str, str, str]:

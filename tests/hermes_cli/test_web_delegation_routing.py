@@ -189,6 +189,39 @@ def test_routes_without_a_chain_save_beside_one_that_declares_a_chain(client, ho
     assert (work / "config.yaml").read_text(encoding="utf-8") == before
 
 
+_CLAUDE = {"provider": "custom:claude-proxy", "model": "claude-sonnet-5-5"}
+_GROK = {"provider": "xai-oauth", "model": "grok-4.7"}
+
+
+@pytest.mark.parametrize(("chain", "problem"), [
+    # The alias's real route, written out: a duplicate of the primary.
+    ([{"provider": "custom:openai-proxy", "model": "gpt-6.1-sol"}, _CLAUDE, _GROK], "duplicates the primary route"),
+    # GPT primary, GPT and Claude backups: two real families, whatever the alias is called.
+    ([{"provider": "custom:openai-proxy", "model": "gpt-6.1-terra"}, _CLAUDE,
+      {"provider": "custom:claude-proxy", "model": "claude-haiku-5-5"}], "spans only 2 upstream families"),
+    ([_CLAUDE, {"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0"}, _GROK], None),
+])
+def test_an_alias_named_route_is_expanded_before_its_chain_is_checked(client, homes, chain, problem):
+    """A model-map route names a ``model_aliases`` entry (the migrated shape). The alias lives at the
+    config root, so the save has to judge the chain against the whole config, not the block."""
+    _root, work = homes
+    path = work / "config.yaml"
+    config = yaml.safe_load(path.read_text(encoding="utf-8"))
+    config["model_aliases"] = {"coder": {"provider": "custom:openai-proxy", "model": "gpt-6.1-sol"}}
+    path.write_text(yaml.safe_dump(config), encoding="utf-8")
+    before = path.read_text(encoding="utf-8")
+    route = {"name": "coder", "description": "Builds", "provider": "custom:openai-proxy", "model": "coder",
+             "fallback_providers": chain}
+    resp = client.put("/api/delegation/backends/model_map?profile=work", json={"options": [route]})
+    if problem is None:
+        assert resp.status_code == 200, resp.text
+        assert _delegation(work)["backends"]["model_map"]["options"][0]["model"] == "coder"
+    else:
+        assert resp.status_code == 400, resp.text
+        assert problem in resp.json()["detail"]
+        assert path.read_text(encoding="utf-8") == before
+
+
 def test_saving_model_routes_replaces_the_block_and_keeps_the_stored_key(client, homes):
     root, work = homes
     shown = client.get("/api/delegation/routing?profile=work").json()["model_map"]["options"][0]

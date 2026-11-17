@@ -75,7 +75,8 @@ get back, or cannot say why):
   is sent on the primary and the chain cursor and cooldown flags are untouched.
 - `agent/retry_utils.py`, `agent/nous_rate_guard.py`: a days-long `Retry-After`
   on a per-minute bucket is bounded to the minute-window cap before it is used
-  or persisted. The persisted Nous wait is also held to the 600 s retry cap;
+  or persisted. The 60 s overage window is armed only when the error text
+  names a per-minute limit; a daily limit prints the same accounting line. The persisted Nous wait is also held to the 600 s retry cap;
   only a structured welcome-tier `rate_limited` refusal keeps its stated wait.
 - `agent/turn_failure_routes.py`: the failure card names the `fallback_providers`
   list that feeds the failing agent and only the routes that ran out this episode.
@@ -83,8 +84,15 @@ get back, or cannot say why):
   `hermes_cli/config_migrations_delegation_roles.py`: fallback chains are checked
   for at least three entries across three upstream families. Only a declared
   list is checked: an absent or null chain is skipped and `[]` opts out. The
-  main and cron primaries are read from `model.default`. A migration keeps a
-  user-authored model map as written and reports any chain below the bar.
+  checked lists are the model-map options, the top-level list, `cron`,
+  `delegation` and the auxiliary chains. The main and cron primaries are read
+  from `model.default`. A migration keeps a user-authored model map and a
+  declared `delegation.fallback_providers` as written and reports any chain
+  below the bar. One resolver, `infer_upstream_family`, names a route's family
+  for validation and for the spare guards; it drops a vendor segment
+  (`anthropic/claude-x`) before reading the model name. The web model-map save
+  runs the same check against the whole config, so alias-named routes are
+  expanded. `PUT /api/config` does not run it.
 - `tools/delegate_tool_config.py`: a child is always built on its role primary.
   When another process already cooled that primary, construction adopts the
   shared cooldown, so the child starts on the first admissible chain entry
