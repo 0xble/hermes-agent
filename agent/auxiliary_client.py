@@ -3176,7 +3176,7 @@ def _normalize_chain_label(provider: str) -> str:
         return ""
     p = str(provider).strip().lower()
     if p.startswith("custom:"):
-        return "local/custom"
+        return p
     return _AUX_UNHEALTHY_LABEL_ALIASES.get(p, p)
 
 
@@ -4793,12 +4793,11 @@ def _health_provider_for_route(
     # A custom route owns its endpoint even when that endpoint uses a hostname also known to a
     # credential pool (for example a task-specific custom proxy at openrouter.ai). Never infer a
     # provider-wide pool from the URL in that case.
-    if (
-        raw_provider.startswith("custom:")
-        or _normalize_aux_provider(raw_provider) == "custom"
-        or effective_raw.startswith("custom:")
-        or _normalize_aux_provider(effective_raw) == "custom"
-    ):
+    if raw_provider.startswith("custom:"):
+        return raw_provider
+    if effective_raw.startswith("custom:"):
+        return effective_raw
+    if _normalize_aux_provider(raw_provider) == "custom" or _normalize_aux_provider(effective_raw) == "custom":
         return "local/custom"
     backend = getattr(client, "_hermes_aux_backend_provider", "")
     if isinstance(backend, str) and backend:
@@ -8004,20 +8003,22 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
     task_chain = _get_auxiliary_task_config(task).get("fallback_chain") if task else None
     has_task_fallback_chain = isinstance(task_chain, list) and bool(task_chain)
     explicit_auth_with_task_chain = (
-        reason == aux_errors.AUTH_ERROR and not is_auto and has_task_fallback_chain
+        reason in {aux_errors.AUTH_ERROR, "auth unavailable"} and not is_auto and has_task_fallback_chain
     )
     if reason is None or not (is_auto or is_capacity_error or explicit_auth_with_task_chain):
         return None
     # Capacity/auth failures quarantine the concrete auxiliary route across callers/processes: mark the backend
     # that sent the failed request (not the "auto" label); a rebuilt retry may have reached another backend.
-    if reason in {"payment error", "auth error", "rate limit"}:
-        sender = _failure_sender(route, failure)
+    sender = _failure_sender(route, failure)
+    health_provider = _health_provider_for_route(resolved_provider, sender, main_runtime=route.main_runtime)
+    named_custom_route = health_provider.startswith("custom:")
+    if reason in {"payment error", "auth error", "auth unavailable", "rate limit"}:
         sender_url = "" if sender is route.client else str(getattr(sender, "base_url", "") or "")
         _mark_provider_unhealthy(
-            _health_provider_for_route(resolved_provider, sender, main_runtime=route.main_runtime),
+            health_provider,
             ttl=fallback_candidate_quarantine_ttl(reason),
             base_url=sender_url or route.base_info,
-            model=route.final_model if reason not in {"auth error", "payment error"} else None,
+            model=route.final_model if reason not in {"auth error", "auth unavailable", "payment error"} else None,
             reason=reason,
         )
     if reason == "request timed out":
@@ -8031,16 +8032,15 @@ def _ladder_provider_fallback(failure: aux_errors.Failure, route: _LadderRoute, 
     else:
         logger.info("Auxiliary %s%s: %s on %s (%s), trying fallback",
                     task or "call", tag, reason, resolved_provider, first_err)
-    # Skip only the failed model for model-specific failures; 401/402 are provider-wide, so
-    # auth keeps skipping the credential surface, while billing is scoped to the endpoint:
-    # separate custom URLs can carry separate credentials (or no billing relationship at all).
-    _chain_failed_model = None if reason in ("auth error", "payment error") else route.final_model
+    # Skip only the failed model for model-specific failures; auth/payment failures are credential-wide
+    # for one configured custom label, while transport failures are endpoint-wide by URL.
+    credential_failure = named_custom_route and reason in {"auth error", "auth unavailable", "payment error"}
+    _chain_failed_model = None if credential_failure else route.final_model
     from agent.backend_identity import FailureScope
-    _chain_failure_scope = (
-        FailureScope.ENDPOINT
-        if reason == "payment error" and _custom_health_base_url(resolved_provider, route.base_info)
-        else None
-    )
+    transport_failure = reason in {"connection error", "request timed out"}
+    custom_payment = reason == "payment error" and _custom_health_base_url(resolved_provider, route.base_info)
+    _chain_failure_scope = (FailureScope.CREDENTIAL if credential_failure
+                            else FailureScope.ENDPOINT if transport_failure or custom_payment else None)
     fb_client, fb_model, fb_label = _try_configured_fallback_chain(
         task, resolved_provider or "auto", reason=reason, failed_model=_chain_failed_model,
         failed_base_url=route.base_info, failure_scope=_chain_failure_scope)
