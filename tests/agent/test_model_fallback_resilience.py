@@ -154,17 +154,23 @@ def test_one_off_fallback_hint_names_the_config_list():
     assert "hermes fallback add" not in hint and "model_map" not in hint
 
 
+def _sans_home(text):
+    """Failure copy embeds the Hermes home path; keep that path out of substring checks."""
+    from hermes_constants import display_hermes_home
+    return text.replace(display_hermes_home(), "<home>")
+
+
 def test_chain_path_names_the_list_that_feeds_the_failing_agent():
     from agent.turn_failure_routes import fallback_chain_path
     child = SimpleNamespace(_delegate_model_map_option="coder", _delegate_depth=1, _delegate_role="leaf")
     assert "the `coder` option in `delegation.backends.model_map.options`" in fallback_chain_path(child)
-    assert "leaf" not in fallback_chain_path(child)
+    assert "leaf" not in _sans_home(fallback_chain_path(child))
     plain_child = SimpleNamespace(_delegate_model_map_option=None, _delegate_depth=2, _delegate_role="orchestrator")
     assert "`delegation.fallback_providers`" in fallback_chain_path(plain_child)
-    assert "orchestrator" not in fallback_chain_path(plain_child)
+    assert "orchestrator" not in _sans_home(fallback_chain_path(plain_child))
     assert "`cron.fallback_providers`" in fallback_chain_path(SimpleNamespace(platform="cron"))
-    main = fallback_chain_path(SimpleNamespace(_delegate_depth=0, platform="telegram"))
-    assert main.startswith("`fallback_providers` in `") and "delegation" not in main and "cron" not in main
+    main = _sans_home(fallback_chain_path(SimpleNamespace(_delegate_depth=0, platform="telegram")))
+    assert main == "`fallback_providers` in `<home>/config.yaml`"
 
 
 def test_exhausted_routes_list_only_what_this_episode_ran_out_of(monkeypatch):
@@ -244,7 +250,7 @@ def test_delegated_child_failure_card_names_its_model_map_option_not_leaf(monkey
                            {"provider": "custom:claude-proxy", "model": "claude-sonnet-5-5"})
         _fallback_index = 1
 
-    text = _exhausted_card(_Child())
+    text = _sans_home(_exhausted_card(_Child()))
     assert "the `coder` option in `delegation.backends.model_map.options`" in text
     assert "gpt-6.1-sol via custom:openai-proxy, grok-4.7 via xai-oauth" in text
     assert "claude-sonnet-5-5" not in text  # configured but never reached this episode
@@ -252,8 +258,8 @@ def test_delegated_child_failure_card_names_its_model_map_option_not_leaf(monkey
 
 
 def test_main_agent_failure_card_points_at_top_level_fallback_providers():
-    text = _exhausted_card(_CardAgent())
-    assert "list backup providers under `fallback_providers` in `" in text
+    text = _sans_home(_exhausted_card(_CardAgent()))
+    assert "list backup providers under `fallback_providers` in `<home>/config.yaml`." in text
     assert "delegation" not in text and "Routes that ran out" not in text
     assert "hermes fallback add" not in text
 
@@ -357,7 +363,8 @@ def test_admission_route_stays_out_of_the_serialized_rate_limit_state():
     # The usage payload serializes this state; an endpoint URL must not ride along in it.
     import dataclasses
     agent, _calls = _guard_agent()
-    assert "8317" not in repr(dataclasses.asdict(agent._rate_limit_state))
+    serialized = dataclasses.asdict(agent._rate_limit_state)
+    assert "route" not in serialized and "http" not in repr(serialized)
 
 
 _PRIMARY = ("custom:openai-proxy", "http://127.0.0.1:8317/v1", "gpt-6.1-sol")
