@@ -243,6 +243,7 @@ def _build_child_agent(
     override_reasoning_effort: Any = None,
     profile_home: Optional[Path] = None,
     override_service_tier: Optional[str] = None,  # a route's checked speed tier (tools/delegate_tool_tuning.py)
+    model_map_option: Optional[str] = None,  # the model-map option that chose this route, if one did
 ):
     """Build (don't run) a child AIAgent on the main thread. override_* (from delegation config) replace parent
     inheritance so children can run on a different provider:model pair. ``profile_home`` builds (and later runs,
@@ -358,6 +359,9 @@ def _build_child_agent(
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
+    # The model-map option that routed this child, for failure copy. ``_delegate_role`` is the
+    # depth/permission role (leaf/orchestrator), never a config entry the user can edit.
+    child._delegate_model_map_option = model_map_option
     # Plugins see one conversation per delegation tree.
     from agent.prompt_cache_scope import conversation_id
     child._inherited_conversation_id = conversation_id(parent_agent)
@@ -496,6 +500,9 @@ def _route_overrides(route: Any) -> dict[str, Any]:
         **_credential_overrides(route.creds, route.routing_cfg),
         "override_reasoning_effort": route.reasoning_effort, "profile_home": route.profile_home,
         "reasoning_cfg": route.reasoning_cfg,
+        # The route label is the option name only under the model-map backend; a profile
+        # route's label is a profile, and the cached routing_cfg can carry a sibling's label.
+        "model_map_option": route.label if route.backend == "model_map" else None,
     }
 
 
