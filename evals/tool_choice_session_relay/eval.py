@@ -17,6 +17,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -64,44 +65,48 @@ def seed_state(home: Path) -> None:
     db.close()
 
 
-def tool_defs(variant: str) -> list[dict[str, Any]]:
-    fixed = variant == "fixed"
-    return [
-        {
-            "name": "session_search",
-            "description": (
-                "Search or read past Hermes conversations. Find a session by title or topic name, "
-                "resolve a Slack channel plus thread_ts or Telegram topic to its session, or read a "
-                "session's messages. Use this typed tool instead of sqlite3 or direct state.db reads."
-                if fixed else "Search past Hermes conversations and recall messages."
-            ),
-            "params": {"query": ("string", "Search terms or session id"), "lookup": ("object", "Typed lookup by title, topic_name, platform, chat_id, and thread_id; use for Slack channel/thread resolution.")},
+def _relay_status_schema(relay_tree: Path, relay_ref: str) -> dict[str, Any]:
+    """Read the MCP status operation's schema fields from relay's Go source."""
+    source = subprocess.check_output(
+        ["git", "-C", str(relay_tree), "show", f"{relay_ref}:ops/status.go"],
+        text=True,
+        stderr=subprocess.STDOUT,
+    )
+    summary = re.search(r'(?m)^\s*Summary:\s*"([^"]+)"', source)
+    receipt = re.search(r'`json:"receipt[^`]*help:"([^"]+)"`', source)
+    wait = re.search(r'`json:"wait[^`]*help:"([^"]+)"`', source)
+    if not summary or not receipt or not wait:
+        raise RuntimeError(f"could not extract relay status schema from {relay_ref}")
+    return {
+        "name": "mcp__relay__status",
+        "description": summary.group(1),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "receipt": {"type": "string", "description": receipt.group(1)},
+                "wait": {"type": "string", "description": wait.group(1)},
+            },
+            "required": [],
         },
-        {
-            "name": "session_state",
-            "description": (
-                "Read-only typed inspection of Hermes session state, including Slack threads and "
-                "session metadata. Use inspect_session for a session id and inspect_delivery for a "
-                "relay delivery record; never query state.db directly."
-                if fixed else "Read-only inspection of Hermes session state."
-            ),
-            "params": {"action": ("string", "resolve_topic, inspect_session, or inspect_delivery"), "session_id": ("string", "Exact session id"), "chat_id": ("string", "Slack channel id"), "thread_id": ("string", "Slack thread_ts")},
-        },
-        {
-            "name": "mcp__relay__status",
-            "description": (
-                "Check or wait for delivery of a relay receipt. Pass the exact receipt id and "
-                "optional wait duration; delivery means the target transcript received it."
-                if fixed else "Get the status of a relay receipt."
-            ),
-            "params": {"receipt": ("string", "Exact relay receipt id"), "wait": ("string", "Optional duration to wait for delivery")},
-        },
-    ]
+    }
 
 
-def register_tools(variant: str, log: list[dict[str, Any]]) -> None:
+def tool_defs(variant: str, relay_tree: Path) -> list[dict[str, Any]]:
     from tools.registry import registry
-    defs = tool_defs(variant)
+    defs = []
+    for name in ("session_search", "session_state"):
+        entry = registry.get_entry(name)
+        if entry is None:
+            raise RuntimeError(f"{name} was not registered by the tree under test")
+        defs.append({"name": name, "schema": entry.schema, "toolset": entry.toolset})
+    relay_ref = "fix/tool-choice-status-description" if variant == "fixed" else "main"
+    defs.append({"name": "mcp__relay__status", "schema": _relay_status_schema(relay_tree, relay_ref), "toolset": "mcp-relay"})
+    return defs
+
+
+def register_tools(variant: str, relay_tree: Path, log: list[dict[str, Any]]) -> None:
+    from tools.registry import registry
+    defs = tool_defs(variant, relay_tree)
     def make_handler(tdef: dict[str, Any]):
         def handler(args: dict[str, Any] | None = None, **kwargs: Any) -> str:
             args = args or {}
@@ -121,12 +126,10 @@ def register_tools(variant: str, log: list[dict[str, Any]]) -> None:
         return handler
     for tdef in defs:
         entry = registry.get_entry(tdef["name"])
-        if tdef["name"] in {"session_search", "session_state"} and entry is not None:
-            # Keep the production schema from the tree under test; only the backend is faked.
-            registry.register(name=tdef["name"], toolset=entry.toolset, schema=entry.schema, handler=make_handler(tdef), override=True)
-            continue
-        props = {name: {"type": typ, "description": desc} for name, (typ, desc) in tdef["params"].items()}
-        registry.register(name=tdef["name"], toolset="mcp-fake", schema={"name": tdef["name"], "description": tdef["description"], "parameters": {"type": "object", "properties": props}}, handler=make_handler(tdef), override=True)
+        registry.register(
+            name=tdef["name"], toolset=entry.toolset if entry else tdef["toolset"],
+            schema=entry.schema if entry else tdef["schema"], handler=make_handler(tdef), override=True,
+        )
 
 
 def score_trial(calls: list[dict[str, Any]], wire_calls: list[dict[str, Any]], case_id: str) -> dict[str, Any]:
@@ -151,7 +154,7 @@ def score_trial(calls: list[dict[str, Any]], wire_calls: list[dict[str, Any]], c
     return {"first_state_tool": first_state, "expected_tool": expected, "raw_state_db_attempt": bad, "passed": bool(first_state == expected and not bad and typed)}
 
 
-def run_one(tree: Path, variant: str, prompt: str, model: str, provider: str, base_url: str | None, api_key: str | None, api_mode: str | None) -> dict[str, Any]:
+def run_one(tree: Path, relay_tree: Path, variant: str, prompt: str, model: str, provider: str, base_url: str | None, api_key: str | None, api_mode: str | None) -> dict[str, Any]:
     # Fresh imports are required because Hermes binds HERMES_HOME at import time and
     # the registry is process-global. This keeps every prompt/trial isolated.
     for name in list(sys.modules):
@@ -186,7 +189,7 @@ def run_one(tree: Path, variant: str, prompt: str, model: str, provider: str, ba
     agent = AIAgent(provider=provider, model=model, base_url=base_url, api_key=api_key, api_mode=api_mode, enabled_toolsets=None, quiet_mode=True, skip_context_files=True, skip_memory=True, platform="cli", max_iterations=15)
     # Built-in tools register during AIAgent construction. Override their handlers/schema
     # only after that registration, so the fixture remains the sole observable backend.
-    register_tools(variant, calls)
+    register_tools(variant, relay_tree, calls)
     error = None
     result: Any = None
     try:
@@ -211,6 +214,7 @@ def run_one(tree: Path, variant: str, prompt: str, model: str, provider: str, ba
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--tree", type=Path, required=True)
+    ap.add_argument("--relay-tree", type=Path, default=Path("~/Repos/relay"))
     ap.add_argument("--variant", choices=("baseline", "fixed"), required=True)
     ap.add_argument("--model", default="anthropic/claude-haiku-4.5")
     ap.add_argument("--api-mode")
@@ -227,7 +231,7 @@ def main() -> int:
         provider = "openrouter"
     for trial in range(args.trials):
         for cid, prompt in prompts:
-            row = run_one(args.tree.expanduser().resolve(), args.variant, prompt, args.model, provider, base_url, api_key, args.api_mode)
+            row = run_one(args.tree.expanduser().resolve(), args.relay_tree.expanduser().resolve(), args.variant, prompt, args.model, provider, base_url, api_key, args.api_mode)
             row["case"] = cid
             row["trial"] = trial + 1
             rows.append(row)
