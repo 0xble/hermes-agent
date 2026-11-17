@@ -17,10 +17,16 @@ def wait_for_deferred_spare_guard(
     the same failure armed.  Reuse the interruptible wait rail and return an interruption result;
     otherwise the caller continues its existing terminal path.
     """
-    if not getattr(agent, "_spare_guard_deferred", False):
+    # Test doubles and lightweight agent shims often expose missing attributes as callables.
+    # Only the guard's concrete ``True`` marker authorizes this extra wait; a truthy arbitrary
+    # attribute must never alter the terminal, fallback, or auto-recovery paths.
+    if getattr(agent, "_spare_guard_deferred", False) is not True:
         return None
     agent._spare_guard_deferred = False
-    remaining = max(0.0, float(getattr(agent, "_rate_limited_until", 0) or 0) - time.monotonic())
+    deadline = getattr(agent, "_rate_limited_until", 0)
+    if isinstance(deadline, bool) or not isinstance(deadline, (int, float)):
+        return None
+    remaining = max(0.0, float(deadline) - time.monotonic())
     if remaining <= 0:
         return None
     from agent.turn_recovery import interruptible_backoff_sleep
