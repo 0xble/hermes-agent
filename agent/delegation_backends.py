@@ -100,6 +100,15 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
     if getattr(agent, "_oneshot_session", None) is True:
         return False
 
+    # Only messaging gateway sessions may change this mode at a cache-break
+    # boundary. CLI, TUI, desktop, cron, API, and subagent agents use their
+    # own delegation contract and must never be flipped by gateway config.
+    from gateway.session_context import NON_MESSAGING_SESSION_SURFACES
+    if str(getattr(agent, "platform", "") or "").strip().lower() in (
+        NON_MESSAGING_SESSION_SURFACES | {"cron", "subagent"}
+    ):
+        return False
+
     user_config = getattr(agent, "_notification_config", None)
     from hermes_cli.config import get_config_path, read_user_config_raw
 
@@ -119,7 +128,9 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
     configured_mode = str(delegation.get("gateway_mode") or "").strip().lower()
     if configured_mode not in {"auto", "inline", "background", "async"}:
         return False
-    interim_enabled = getattr(agent, "_gateway_interim_messages_enabled", None)
+    interim_enabled = getattr(agent, "_session_interim_assistant_messages_enabled", None)
+    if interim_enabled is None:
+        interim_enabled = getattr(agent, "_gateway_interim_messages_enabled", None)
     if interim_enabled is None:
         interim_enabled = getattr(agent, "interim_assistant_callback", None) is not None
 

@@ -142,6 +142,31 @@ def test_cache_break_rederives_gateway_mode_from_current_config(initial_inline, 
     assert session_joins_delegation(agent) is (current_mode == "background")
 
 
+@pytest.mark.parametrize("platform", ["cli", "tui", "desktop", "cron", "subagent", ""])
+def test_cache_break_does_not_flip_non_gateway_agents(platform, monkeypatch):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent.platform = platform
+    agent._notification_config = {"delegation": {"gateway_mode": "inline"}}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert not hasattr(agent, "_delegation_inline") or agent._delegation_inline is False
+
+
+def test_cache_break_uses_session_interim_setting_for_heartbeat(monkeypatch):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent.platform = "telegram"
+    agent._gateway_interim_messages_enabled = False
+    agent._session_interim_assistant_messages_enabled = True
+    agent._notification_config = {"delegation": {"gateway_mode": "auto"}}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert agent._delegation_inline is False
+
+
 def _parent(tools, depth=0):
     parent = MagicMock()
     parent._delegate_depth = depth

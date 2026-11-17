@@ -1028,6 +1028,10 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
         agent._gateway_interim_messages_enabled = bool(want_interim_messages)
+        # Preserve the session-shaped setting. The per-turn callback is muted
+        # for heartbeats and held streams, but a cache refresh must not treat
+        # that delivery detail as a session config change.
+        agent._session_interim_assistant_messages_enabled = bool(ctx.interim_assistant_messages_enabled)
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
             self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
         agent.reasoning_callback = None
