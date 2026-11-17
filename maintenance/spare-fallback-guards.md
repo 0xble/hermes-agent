@@ -14,4 +14,6 @@ A delegated child can activate at most the configured number of routes for each 
 
 The state file under `$HERMES_HOME/state` is guarded by an OS file lock and atomically rewritten. `tests/agent/test_spare_guards.py` covers cap enforcement and release, budget skipping, primary exclusion, and day rollover. The minimal upstream-family resolver in `agent/spare_guards.py` must be deduplicated with the model-fallback-resilience branch when the branches merge.
 
+Contract tests: `tests/agent/test_spare_guards.py::test_spare_cap_and_lease_release`, `tests/agent/test_spare_guards.py::test_skip_when_daily_budget_is_exhausted`, `tests/agent/test_spare_guards.py::test_primary_spare_is_not_capped_or_budgeted`, `tests/agent/test_spare_guards.py::test_real_try_activate_skips_capped_spare_and_moves_down_chain`, `tests/agent/test_spare_guards.py::test_pid_dead_and_expired_leases_are_pruned`, `tests/agent/test_spare_guards.py::test_daily_budget_rolls_over`.
+
 Fork patch identity: `spare-fallback-guards`.
