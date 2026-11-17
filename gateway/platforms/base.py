@@ -70,7 +70,17 @@ def transcode_to_ogg_opus(path: str, *, bitrate: str = "32k", timeout: int = 60,
     if not ffmpeg:
         return None
     if output_path is None:
-        fd, ogg_path = tempfile.mkstemp(prefix="voice_transcode_", suffix=".ogg")
+        from agent.incognito import is_incognito
+        from agent.incognito_private_dir import disposable_path_for_current_session
+
+        private = is_incognito()
+        parent = disposable_path_for_current_session() if private else None
+        if private and parent is None:
+            logger.warning("Refusing voice transcode: private interval is unresolved")
+            return None
+        fd, ogg_path = tempfile.mkstemp(
+            prefix="voice_transcode_", suffix=".ogg",
+            dir=str(parent) if parent is not None else None)
         os.close(fd)
     else:
         ogg_path = output_path
