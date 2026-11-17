@@ -761,6 +761,9 @@ def _resolve_child_runtime(
         "reasoning_config": child_reasoning,
         # Resolve routing and recovery policy from the same configuration owner. A pinned provider, endpoint, or
         # model never borrows the parent's chain; an explicitly declared child chain still remains available.
+        # The role primary always stays the child's primary, even when another process already cooled
+        # it: construction adopts the shared cooldown (``_adopt_shared_primary_cooldown``), which walks
+        # this chain through the spare guards and lets the child return to the primary mid-turn.
         "fallback_model": _resolve_child_fallback_chain(
             parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
             pinned=bool(override_provider or override_base_url or model)),

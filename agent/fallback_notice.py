@@ -34,7 +34,12 @@ def buffer_fallback_route_notice(agent, reason, shared_adoption, old_model, old_
         _buffer_fallback_notice, _fallback_reason_text, _rate_limit_fallback_notice,
     )
     from agent.redact import redact_sensitive_text
+    from agent.fallback_route_recovery_uncooled import note_fallback_activated
+    from agent.turn_failure_routes import note_route_left
 
+    # Reached only once a fallback is bound, so both record a switch that really happened.
+    note_route_left(agent, old_provider, old_model)
+    note_fallback_activated(agent)
     new_route = resolved_route(agent)
     same_route = (all(old_route) and old_route == new_route
                   and not distinct_credential_surface(BackendIdentity.build(provider=old_provider),
@@ -65,8 +70,15 @@ def buffer_fallback_route_notice(agent, reason, shared_adoption, old_model, old_
 def finish_fallback_restore(agent, was_active, held_shared_record, previous_model, previous_provider):
     """End the episode, retaining silence only for its pending successful-primary receipt."""
     from agent.notice_style import ContextNotice
+    from agent.turn_failure_routes import reset_routes_left
 
+    reset_routes_left(agent)
     silent_retry = bool(getattr(agent, "_provider_fallback_silent_retry", False))
+    try:
+        from agent.spare_guards import release_fallback_route
+        release_fallback_route(agent)
+    except Exception:
+        logger.debug("Spare lease release during primary restore failed", exc_info=True)
     agent._provider_fallback_active = False
     agent._provider_fallback_silent_retry = False
     agent._provider_fallback_route = None

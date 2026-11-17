@@ -1140,20 +1140,24 @@ def apply_control(kind: str, action: str, target_sid: str, *, requester_sid: str
                                 authority=authority, cursor=conn)
         manager_result = result.get("result")
         code = ""
+        error = ""
+        details = {}
         if isinstance(manager_result, dict) and not manager_result.get("ok", True):
             code = manager_result.get("error_code") or manager_result.get("error") or "apply_failed"
+            error = manager_result.get("error") or code
+            details = {key: manager_result[key] for key in ("missing_requirements",) if key in manager_result}
             conn.execute(f"ROLLBACK TO {savepoint}")
         conn.execute(f"RELEASE {savepoint}")
         now = _now()
         record = _new_record(kind, action, target_sid, requester_sid, reason=reason, payload=payload,
                              authority=authority, status="failed" if code else "applied", now=now,
                              expires_at=None, affected_text=affected_before, cursor=conn)
-        record["resolved_at"], record["error"] = now, code or None
+        record["resolved_at"], record["error"] = now, error or None
         record["current_max_turns"] = _current_max_turns(kind, raw)
         _bind_control_result(record, result, conn)
         _save_record(record, cursor=conn)
         return {"ok": not bool(code), "status": record["status"], "record": record,
-                **({"error_code": code, "error": code} if code else {}), **result}
+                **({"error_code": code, "error": error} if code else {}), **details, **result}
 
     if autonomous:
         # No route/approval requirement: goal and loop writes use the same transaction and wake

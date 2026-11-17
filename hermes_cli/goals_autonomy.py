@@ -208,8 +208,9 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
             target for _verb, target, _quoted in _bound_removal_instruction_units(checked[1], requirements)]
         missing = [item for item in removed if _normalize_authority_value(item) not in targets]
         if missing:
+            detail = "Retain each requirement or quote the user's exact removal instruction: " + "; ".join(missing)
             return {"ok": False, "error_code": "constraint_quote_required",
-                    "error": "Retain each requirement or quote the user's exact removal instruction: " + "; ".join(missing)}
+                    "error": detail, "missing_requirements": missing}
     if before == after:
         return {"ok": False, "error_code": "no_change", "error": "the revision changes nothing"}
     state.goal = after["goal"]

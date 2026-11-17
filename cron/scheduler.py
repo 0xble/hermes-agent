@@ -147,7 +147,7 @@ def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
             "for an explicit cron backup chain."
         )
     return (
-        "No backup provider is configured — check `cron.fallback_providers` or add a global backup with `hermes fallback add`, "
+        "No backup provider is configured — configure at least three ordered providers from independent domains under `cron.fallback_providers`, "
         "or set a cron fleet default via `cron.model` + `cron.model_provider` in config.yaml."
     )
 

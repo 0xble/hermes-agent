@@ -6,19 +6,10 @@ docs of config.yaml.
 
 from hermes_cli.config_defaults_auxiliary import _aux
 from hermes_cli.config_defaults_vault import DEFAULT_VAULT_CONFIG
-
-
-#: Image every container terminal backend (docker/modal/daytona, the singularity plugin) uses unless the
-#: user pins one. LEGACY_SANDBOX_IMAGES are the plain defaults that preceded the desktop stack
-#: (the 3.14 pin shipped between the two without a migration); a saved config still holding one
-#: is the template copied, and the config migration unsets it, never a user's own pin.
-DEFAULT_SANDBOX_IMAGE = "nousresearch/hermes-sandbox:desktop"
-LEGACY_SANDBOX_IMAGES = ("nikolaik/python-nodejs:python3.11-nodejs20", "nikolaik/python-nodejs:python3.14-nodejs22")
-LEGACY_SANDBOX_IMAGE = LEGACY_SANDBOX_IMAGES[0]
-# Vercel Sandbox managed image (Vercel deprecated its `runtime` presets in Aug 2026).
-DEFAULT_VERCEL_IMAGE = "vercel/sandbox/universal:latest"
-LEGACY_VERCEL_RUNTIME = "node24"  # the seeded pre-49 default, never a user choice
-DEFAULT_CRON_MAX_PARALLEL_JOBS = 4
+from hermes_cli.config_defaults_runtime import (
+    DEFAULT_CRON_MAX_PARALLEL_JOBS, DEFAULT_SANDBOX_IMAGE, DEFAULT_VERCEL_IMAGE,
+    LEGACY_SANDBOX_IMAGE, LEGACY_SANDBOX_IMAGES, LEGACY_VERCEL_RUNTIME,
+)
 
 
 DEFAULT_CONFIG = {
@@ -30,6 +21,9 @@ DEFAULT_CONFIG = {
     "incognito": {"model": ""},
     "providers": {},
     "fallback_providers": [],
+    # Daily input + cache-read + output token ceilings for fallback-only spare upstreams.
+    # Defaults protect Meta/Muse and xAI/Grok from storms; set per family to tune or 0 to disable.
+    "fallback_budgets": {"meta": 30_000_000, "xai": 30_000_000},
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
     # of switching the turn to a fallback model.
@@ -1431,6 +1425,11 @@ DEFAULT_CONFIG = {
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it enter a bounded pending queue. Floor 1, no ceiling.
         "max_concurrent_children": 10,
+        # Maximum parallel children that may be running on a fallback route owned by a spare
+        # upstream family. This shared cross-process lease protects the default spare families
+        # (Meta/Muse and xAI/Grok) from fan-out storms; 2 is intentionally conservative.
+        "max_concurrent_on_spare": 2,
+        "spare_upstreams": ["meta", "xai"],
         # Maximum pending background delegation calls while the async pool is full.
         # Zero rejects at capacity without blocking the parent turn.
         "max_queued_delegations": 8,
