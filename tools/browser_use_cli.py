@@ -533,7 +533,7 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
             env.pop("BU_CDP_WS", None)
             _set_cdp_env(env, cloud.pinned_browser_target_or_raise())
             return None
-        except Exception as exc:
+        except cloud.BrowserTargetUnavailable as exc:
             return json.dumps(cloud.browser_target_error(exc), ensure_ascii=False)
     if _has_cdp_env(env):
         return None
@@ -903,77 +903,20 @@ def browser_exec(code: str, session: str = "", timeout_s: int = _DEFAULT_TIMEOUT
     """Run Python code through the browser-use CLI, and return its output"""
     from agent.redact import redact_sensitive_text
     from tools.registry import tool_error, tool_result
-    # Full Python can capture and print image bytes without calling the named
-    # screenshot helper, so a code-text check cannot secure this path.
-    from tools.browser_tool_vision import blocked_protected_date_pixels
-    blocked_pixels = blocked_protected_date_pixels(task_id or "default")
-    if blocked_pixels is not None:
-        return blocked_pixels
-    if not code or not code.strip():
-        return tool_error("No code provided. Pass Python that uses the pre-imported helpers, e.g. new_tab(\"https://example.com\") then print(page_info()).")
+    from tools.browser_use_cli_route import prepare_browser_exec
 
-    # The verdict is carried into the route, never re-derived: the predicate resolves DNS, so a second
-    # evaluation could relax the floor and still pick the cloud for a rebinding host.
-    verdict = _code_url_verdict(code)
-    if verdict.blocked:
-        return tool_error(verdict.blocked)
-    # One endpoint per call: any private URL sends the whole call to the local sidecar. A call with no URL
-    # literal stays on the route the previous call took (browser_navigate's _last_session_key twin).
-    route_key = _backend_cache_key(task_id, session)
-    local_sidecar = verdict.local_sidecar if _URL_RE.search(code) else _exec_route_is_sidecar.get(route_key, False)
+    prepared = prepare_browser_exec(code, session, timeout_s, task_id, local)
+    if "error" in prepared:
+        return prepared["error"]
+    code = prepared["code"]
+    cmd = prepared["cmd"]
+    env = prepared["env"]
+    route_key = prepared["route_key"]
+    generation = prepared["generation"]
+    bot_desktop_browser = prepared["bot_desktop_browser"]
+    workspace = prepared["workspace"]
+    timeout = prepared["timeout"]
 
-    cmd = _find_cli()
-    if not cmd:
-        if _cloud_refuses_pinned_target():
-            from tools import browser_tool_cloud as cloud
-            return tool_result(cloud.browser_target_error(
-                RuntimeError("browser-harness is unavailable"), cloud.browser_target()))
-        return tool_error("browser-harness is missing from Hermes's Python environment. "
-                          "Run `hermes update` to re-sync it.")
-
-    env = _base_subprocess_env()
-    if session:
-        if not _SESSION_RE.match(session):
-            return tool_error(f"Invalid session name {session!r}: use 1-64 letters, digits, "
-                              "dashes, or underscores (e.g. 'r7k2').")
-        env["BU_NAME"] = session
-    env, route_err, local_sidecar, generation = _route_exec_current(
-        env, session, task_id, bool(local), local_sidecar, route_key)
-    if route_err:
-        try:
-            route_payload = json.loads(route_err)
-        except (TypeError, json.JSONDecodeError):
-            route_payload = None
-        if isinstance(route_payload, dict) and route_payload.get("error_type") == "browser_target_unavailable":
-            return tool_result(route_payload)
-        return tool_error(route_err)
-    if local_sidecar:
-        env["BU_NAME"] = _sidecar_daemon_name(session)
-    fit_default_socket_dir(env)  # BU_NAME is final: a deep HOME's socket would overflow sun_path
-    _exec_route_is_sidecar[route_key] = local_sidecar
-    bot_desktop_browser = bool(env.pop(_BOT_DESKTOP_BROWSER_SENTINEL, None))
-
-    # SHARED browser (/browser connect CDP override): pin each named session to its own tab (see
-    # _OWN_TAB_PREAMBLE). Private per-name browsers skip this — nothing to collide with.
-    private_browser = env.pop(_PRIVATE_BROWSER_SENTINEL, None)  # always pop: never exported to the CLI
-    if session and not private_browser:
-        code = _OWN_TAB_PREAMBLE + code
-    # Every backend: capture_screenshot() falls back to jpeg instead of hanging on a png a hidden tab never
-    # renders; only on a cloud browser does it (and new_tab) bring the tab to the front (tools/browser_use_shot.py).
-    from tools.browser_use_shot import ACTIVATE_NEVER, harness_command
-    cmd = harness_command(cmd, activate=env.pop(_CLOUD_BROWSER_SENTINEL, None) or ACTIVATE_NEVER)
-
-    workspace = _workspace_dir(task_id)
-    if workspace:
-        env["BH_AGENT_WORKSPACE"] = workspace
-
-    # BU_AUTOSPAWN makes the CLI start a Browser Use cloud browser when no local
-    # Chrome/CDP endpoint is reachable (their API key authenticates it)
-    if "BU_AUTOSPAWN" not in env and not _cloud_refuses_pinned_target() \
-            and is_legacy_browser_use_cloud_config(_read_browser_cfg()):
-        env["BU_AUTOSPAWN"] = "1"
-
-    timeout = _clamp_timeout(timeout_s)
     started = time.time()
 
     def dispatch() -> dict[str, Any]:

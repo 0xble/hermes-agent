@@ -105,6 +105,13 @@ def browser_target_error(exc: BaseException, target: str = "") -> dict:
             "error": f"Pinned browser target {(target or browser_target())!r} unavailable: {reason}"}
 
 
+def pinned_browser_target_error(exc: BaseException) -> Optional[dict]:
+    """Return a fail-closed error only when the active profile refuses target fallback."""
+    if not pinned_browser_target_refuses():
+        return None
+    return browser_target_error(exc, browser_target())
+
+
 def _memo(_bt, resolved_attr: str, cache_attr: str, compute: Callable[[], object]):
     """Process-lifetime cache on ``_bt``: the resolved flag is set BEFORE computing, then the final value is stored.
 

@@ -383,13 +383,9 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
 
 
 def _pinned_target_error(exc: BaseException) -> Optional[str]:
-    try:
-        from tools import browser_tool_cloud as cloud
-        if cloud.pinned_browser_target_refuses():
-            return json.dumps(cloud.browser_target_error(exc, cloud.browser_target()), ensure_ascii=False)
-    except Exception:
-        pass
-    return None
+    from tools import browser_tool_cloud as cloud
+    payload = cloud.pinned_browser_target_error(exc)
+    return json.dumps(payload, ensure_ascii=False) if payload is not None else None
 
 
 def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id: Optional[str] = None,

@@ -115,13 +115,10 @@ def _get_cdp_override_raw() -> str:
     :func:`_get_cdp_override`: its 10s HTTP discovery against a stale ``cdp_url`` would stall every startup's
     schema build with no error.
     """
-    try:
-        from tools import browser_tool_cloud as cloud
-        target = cloud.browser_target()
-        if target and not cloud.browser_target_is_camofox():
-            return target
-    except Exception:
-        pass
+    from tools import browser_tool_cloud as cloud
+    target = cloud.browser_target()
+    if target and not cloud.browser_target_is_camofox():
+        return target
     env_override = live_cdp_override() or env_cdp_url()
     return env_override or _origin()._browser_cfg("cdp_url", "", lambda v: str(v or "").strip(), "browser.cdp_url from config")
 
