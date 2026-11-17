@@ -73,6 +73,7 @@ def _relay_op_schema(relay_tree: Path, relay_ref: str, op: str) -> dict[str, Any
         ["git", "-C", str(relay_tree), "show", f"{relay_ref}:{filename}"],
         text=True,
         stderr=subprocess.STDOUT,
+        timeout=30,
     )
     summary = re.search(r'(?m)^\s*Summary:\s*"([^"]+)"', source)
     if not summary:
@@ -204,6 +205,7 @@ def run_one(tree: Path, relay_tree: Path, variant: str, prompt: str, model: str,
     try:
         result = agent.run_conversation(prompt)
     except Exception as exc:
+        logging.exception("tool-choice trial failed")
         error = f"{type(exc).__name__}: {exc}"
     messages = (result or {}).get("messages", []) if isinstance(result, dict) else getattr(agent, "messages", [])
     # Registry log captures the real underlying calls. Transcript captures terminal and bridge calls.
@@ -212,7 +214,6 @@ def run_one(tree: Path, relay_tree: Path, variant: str, prompt: str, model: str,
         for call in msg.get("tool_calls", []) or []:
             fn = call.get("function", {})
             transcript_calls.append({"name": fn.get("name", ""), "args": fn.get("arguments", "")})
-    raw = json.dumps(transcript_calls + calls, ensure_ascii=False)
     case_id = next((cid for cid, base_prompt, _expected in CASES if prompt == base_prompt or prompt in PARAPHRASES.get(cid, [])), "")
     score = score_trial(calls, transcript_calls, case_id)
     out = {"prompt": prompt, "variant": variant, "model": model, **score, "typed_calls": calls, "wire_calls": transcript_calls, "error": error}
