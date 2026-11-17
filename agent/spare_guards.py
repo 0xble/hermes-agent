@@ -337,6 +337,9 @@ def commit_fallback_route(agent: Any, reservation: FallbackRouteReservation | No
     if reservation.family not in spare_settings()[0]:
         agent._spare_fallback_lease = None
         agent._spare_fallback_upstream = None
+    else:
+        agent._spare_fallback_lease = reservation.lease
+        agent._spare_fallback_upstream = reservation.family
 
 
 def release_fallback_route(
