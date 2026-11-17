@@ -17,12 +17,17 @@ caps, queues, pauses, or chunking:
   referenced by either session prompt or tool-name column. The upsert's
   `COALESCE(sessions.system_prompt_hash, excluded.system_prompt_hash)` means an
   existing session hash is never replaced, so the targeted delete is equivalent to
-  the previous unbounded cleanup for this call site.
+  the previous unbounded cleanup for the hash this call stores. Other orphaned prompts are
+  no longer reclaimed here; the maintenance pass and session deletion still sweep them.
 
-The declarative indexes are created on every writable open for existing stores.
-Their one-time build cost is an index scan of existing `state_meta` or
-`session_admissions` rows; subsequent opens use `IF NOT EXISTS`. No schema-version
-bump is required.
+The declarative indexes are created on the first writable open of an existing store
+(`CREATE INDEX IF NOT EXISTS`). The receipt index build parses every
+`gateway.local_policy.v1:*` value with `json_valid`/`json_extract`, which on a cron-heavy
+store means reading every receipt's JSON once (about 2 GB at 40k receipts), comparable to a
+single pre-index boot heal. The held-media index build scans `session_admissions` once. If
+the receipt index is missing, `moved_receipts` falls back to the unforced query, so a store
+without it is slower but never fails the boot heal or an explicit repoint. No
+schema-version bump is required.
 
 ## Hold measurements
 

@@ -84,9 +84,11 @@ def test_moved_receipts_is_indexed_and_matches_not_indexed_for_all_target_modes(
             }
             assert actual == expected
 
+        indexed = moved_receipts(db._conn)
         db._conn.execute("DROP INDEX idx_state_meta_local_policy_route")
-        with pytest.raises(sqlite3.OperationalError, match="no such index|no query solution"):
-            moved_receipts(db._conn)
+        # Without the index the scan is slower but must still answer, never fail the boot heal or repoint.
+        assert moved_receipts(db._conn) == indexed
+        assert moved_receipts(db._conn, {"s2"}) == {k: v for k, v in indexed.items() if v[0] == "s2"}
     finally:
         db.close()
 
@@ -162,7 +164,7 @@ def test_targeted_prompt_delete_plan_and_reupsert_behavior(tmp_path):
         db.create_session("prompt-session", "cli", system_prompt=original)
         original_hash = hashlib.sha256(original.encode()).hexdigest()
         replacement_hash = hashlib.sha256(replacement.encode()).hexdigest()
-        assert db._conn.execute("SELECT hash FROM system_prompts").fetchone()[0] == original_hash
+        assert db._conn.execute("SELECT 1 FROM system_prompts WHERE hash=?", (original_hash,)).fetchone()
 
         recorder = _RecordingConnection(db._conn)
         insert_session_row_in_transaction(

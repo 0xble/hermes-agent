@@ -1,5 +1,6 @@
 """Private local creation receipts in the canonical runtime transaction owner."""
 import json
+import sqlite3
 import threading
 import time
 from collections import OrderedDict
@@ -191,7 +192,13 @@ def moved_receipts(conn, target_ids=None):
     if target_ids is not None:
         sql += " AND s.id IN (SELECT value FROM json_each(?))"
         params += (json.dumps(list(target_ids)),)
-    rows = conn.execute(sql, params).fetchall()
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as exc:
+        # A store opened without the declarative index still answers correctly, only slower.
+        if 'idx_state_meta_local_policy_route' not in str(exc) and 'no query solution' not in str(exc):
+            raise
+        rows = conn.execute(sql.replace(' INDEXED BY idx_state_meta_local_policy_route', ''), params).fetchall()
     return {owner: (target, source) for owner, target, source in rows}
 
 
