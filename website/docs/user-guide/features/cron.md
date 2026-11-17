@@ -1302,6 +1302,11 @@ lateness. For a one-shot, the field widens the catch-up window to
 at the resulting limit is still eligible. To clear the field through the update
 tool, pass an empty string.
 
+An interval of 2 minutes or less needs a limit of at least its interval plus
+60 seconds, such as `120` for `every 1m`. Under ordinary load such jobs start up
+to about one scheduler tick late, so a tighter deadline would skip routine
+occurrences. Create and update refuse a smaller value and name the minimum.
+
 Hermes checks the original scheduled instant both before admission and again
 when the worker starts, including after a wait for capacity or detached-worker
 startup. An expired occurrence does not execute or consume its repeat budget.

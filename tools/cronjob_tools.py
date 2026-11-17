@@ -1244,7 +1244,7 @@ CRONJOB_SCHEMA = {
                     {"type": "number", "minimum": 0},
                     {"type": "string", "enum": [""]},
                 ],
-                "description": "For create/update: finite nonnegative catch-up limit in seconds. Recurring: strict deadline; 0 allows no lateness and unset is unlimited. One-shot: widens the catch-up window to max(120, value); 0 keeps 120. Omit or null leaves an existing value unchanged; pass '' to clear it."
+                "description": "For create/update: finite nonnegative catch-up limit in seconds. Recurring: strict deadline; 0 allows no lateness and unset is unlimited. Intervals of 2 minutes or less require at least the interval plus 60 s. One-shot: widens the catch-up window to max(120, value); 0 keeps 120. Omit or null leaves an existing value unchanged; pass '' to clear it."
             },
             "action": {
                 "type": "string",

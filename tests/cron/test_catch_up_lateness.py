@@ -275,3 +275,45 @@ def test_policy_round_trip_and_clear(store):
     assert jobs.update_job(job["id"], {FIELD: 1.5})[FIELD] == 1.5
     assert jobs.update_job(job["id"], {FIELD: None}).get(FIELD) is None
     assert jobs.update_job(job["id"], {FIELD: ""}).get(FIELD) is None
+
+
+@pytest.mark.parametrize("schedule, limit", [("every 1m", 50), ("every 1m", 0), ("every 2m", 179)])
+def test_protected_interval_rejects_a_deadline_below_one_cadence_plus_tick(store, schedule, limit):
+    """james-reply-watch (every 1m, limit 50) skipped 3 routine ticks 54-83 s late. A strict
+    deadline below cadence + one tick cannot be met by a <= 2 min interval, so both doors refuse
+    it and name the minimum instead of skipping occurrences later."""
+    with pytest.raises(ValueError, match=r"at least \d+"):
+        jobs.create_job("run", schedule, **{FIELD: limit})
+    assert jobs.load_jobs() == []
+    job = jobs.create_job("run", schedule)
+    with pytest.raises(ValueError, match=FIELD):
+        jobs.update_job(job["id"], {FIELD: limit})
+    assert jobs.get_job(job["id"]).get(FIELD) is None
+
+
+@pytest.mark.parametrize("schedule, limit", [
+    ("every 1m", 120), ("every 2m", 180), ("every 1m", None), ("every 5m", 0), ("every 1h", 50),
+    ("0 3 * * *", 0),
+])
+def test_floor_leaves_meetable_and_longer_schedules_alone(store, schedule, limit):
+    kwargs = {} if limit is None else {FIELD: limit}
+    job = jobs.create_job("run", schedule, **kwargs)
+    assert jobs.get_job(job["id"]).get(FIELD) == limit
+
+
+def test_schedule_change_onto_protected_interval_rechecks_existing_deadline(store):
+    job = jobs.create_job("run", "every 1h", **{FIELD: 50})
+    with pytest.raises(ValueError, match=FIELD):
+        jobs.update_job(job["id"], {"schedule": "every 1m"})
+    current = jobs.get_job(job["id"])
+    assert current["schedule"]["minutes"] == 60 and current[FIELD] == 50
+    updated = jobs.update_job(job["id"], {"schedule": "every 1m", FIELD: 120})
+    assert updated["schedule"]["minutes"] == 1 and updated[FIELD] == 120
+
+
+def test_protected_interval_at_floor_dispatches_a_routinely_late_tick(store):
+    """The replayed miss: a 1-minute occurrence starting 54.7 s late runs under the floor."""
+    job = recurring(54.7, limit=120)
+    job["schedule"] = {"kind": "interval", "minutes": 1}
+    jobs.save_jobs([job])
+    assert [d["id"] for d in jobs.get_due_jobs()] == ["window-job"]

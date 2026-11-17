@@ -34,7 +34,10 @@ from agent.deadline import poll_until
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
-from cron.jobs_invariants import NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants, validate_schedule_knobs
+from cron.jobs_invariants import (
+    NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants, validate_catch_up_floor,
+    validate_schedule_knobs,
+)
 from cron.jobs_model_pin import _main_model_pin
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
@@ -2157,6 +2160,7 @@ def create_job(
 
     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
     validate_schedule_knobs(parsed_schedule, f["timezone"], f["grace_minutes"])
+    validate_catch_up_floor(parsed_schedule, f["max_catch_up_lateness_seconds"])
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
         raise ValueError(EMPTY_PAYLOAD_ERROR)
@@ -2451,6 +2455,11 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
                 updated.get("schedule") or {}, updated.get("timezone"),
                 updated.get("grace_minutes"))
             jobs_time.prune_inherited_knobs(updated)
+        if {"schedule", "max_catch_up_lateness_seconds"}.intersection(updates):
+            schedule = updated.get("schedule") or {}
+            validate_catch_up_floor(
+                parse_schedule(schedule) if isinstance(schedule, str) else schedule,
+                updated.get("max_catch_up_lateness_seconds"))
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield
