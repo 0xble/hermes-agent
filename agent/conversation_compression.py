@@ -36,6 +36,7 @@ from agent.conversation_compression_boundary import _reset_read_dedup_caches, ma
 from agent.conversation_compression_codex import _compress_context_via_codex_app_server
 from agent.conversation_compression_deadline import resolve_context_compression_timeouts
 from agent.conversation_compression_scaffolding import _SYNTHETIC_USER_FLAGS, _message_text, is_user_role_scaffolding
+from agent.conversation_compression_stall import _stall_source_fingerprint
 from agent.conversation_compression_telemetry import (
     _emit_aborted_attempt_telemetry, _emit_blocked_attempt_telemetry, _emit_bypassed_attempt_telemetry,
     _emit_compression_attempt_telemetry, _record_committed_attempt_effect, _snapshot_compression_effect_input,
@@ -850,17 +851,6 @@ def compression_attempt_stalled(
         return (time.monotonic() - float(started_at)) >= idle
     except (TypeError, ValueError):
         return False
-
-
-def _stall_source_fingerprint(agent: Any, messages: Any, approx_tokens: Optional[int]) -> str:
-    """Identity of the stalled source context + summary strategy."""
-    compressor = getattr(agent, "context_compressor", None)
-    model = getattr(compressor, "summary_model", None) or getattr(agent, "model", None) or ""
-    n_messages = len(messages) if isinstance(messages, list) else 0
-    tokens = 0
-    with contextlib.suppress(TypeError, ValueError):
-        tokens = int(approx_tokens or 0)
-    return f"msgs={n_messages}:tokens={tokens}:model={model}"
 
 
 def _record_stall_interrupted_backoff(

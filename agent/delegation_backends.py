@@ -102,10 +102,12 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
 
     user_config = getattr(agent, "_notification_config", None)
     from hermes_cli.config import get_config_path, read_user_config_raw
+    from hermes_yaml import YAMLError
 
     try:
         raw_config = read_user_config_raw(get_config_path())
-    except Exception:
+    except (OSError, ValueError, YAMLError):
+        # Unreadable, undecodable or unparseable config: the agent's built surface stays the contract.
         return False
     raw_delegation = raw_config.get("delegation") if isinstance(raw_config, dict) else None
     # An absent key means the agent's original surface decision remains the

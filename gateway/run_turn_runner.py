@@ -238,23 +238,6 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         except Exception:
             logger.debug("subagent failure notice failed", exc_info=True)
 
-    def _progress_onboarding_hint(self, kwargs: dict) -> None:
-        """First-touch onboarding: the first time a tool exceeds _LONG_TOOL_THRESHOLD_S while
-        streaming every tool (progress_mode == "all"), append a one-time /verbose hint."""
-        from gateway.run import _hermes_home, _load_gateway_config
-        ctx = self._ctx
-        try:
-            if (kwargs.get("duration") or 0) >= ctx._LONG_TOOL_THRESHOLD_S and ctx.progress_mode == "all":
-                from agent.onboarding import TOOL_PROGRESS_FLAG, is_seen, mark_seen, tool_progress_hint_gateway
-                cfg = _load_gateway_config()
-                gate_on = is_truthy_value(cfg_get(cfg, "display", "tool_progress_command"), default=False)
-                if gate_on and not is_seen(cfg, TOOL_PROGRESS_FLAG):
-                    ctx.long_tool_hint_fired[0] = True
-                    ctx.progress_queue.put(tool_progress_hint_gateway())
-                    mark_seen(_hermes_home / "config.yaml", TOOL_PROGRESS_FLAG)
-        except Exception as err:
-            logger.debug("tool-progress onboarding hint failed: %s", err)
-
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
 
     @dataclasses.dataclass
