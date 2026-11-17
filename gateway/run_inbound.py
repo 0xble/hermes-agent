@@ -926,7 +926,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         claimed generation: a turn still constructing its agent latches the Stop for adopt_agent."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        sid = self._hm_mounted_owner(authority, _quick_key) if authority else None
+        # SessionStore's routing map is guarded by a blocking lock. Keep the probe and any
+        # recovery mount off the gateway event-loop thread while a busy command stops a turn.
+        sid = await asyncio.to_thread(self._hm_mounted_owner, authority, _quick_key) if authority else None
         if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.

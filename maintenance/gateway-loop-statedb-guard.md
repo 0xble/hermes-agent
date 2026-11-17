@@ -123,6 +123,10 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   full-table replace. On 2026-11-14 the full replace of a 37,670-route index held the writer
   lock 9-113 s per save and stalled every session's writes. Proof:
   `tests/gateway/test_routing_save_delta.py`.
+- Busy messaging stop now resolves the mounted owner through the worker executor before fencing
+  the route, so `/stop` and `/new` cannot park the gateway loop on `SessionStore._lock` while a
+  Telegram turn is settling. The regression is in
+  `tests/gateway/test_native_admission_arrival_order.py`.
 - Sites the live guard named on 2026-11-14 run their state.db step off the loop: the process
   watcher's survivor acknowledgement (it loads retained results, whose `_owns_result` opens
   state.db), the WebSocket handler's first backend heartbeat write, and the cron RPC's route
