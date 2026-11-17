@@ -1,5 +1,7 @@
 # Gateway delegation mode convergence
 
+Fork patch identity: `delegation-mode-convergence`.
+
 Load this unit when changing how a continuing gateway session switches between
 joined and background `delegate_task` execution after an operator config change.
 
