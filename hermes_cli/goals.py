@@ -1095,6 +1095,13 @@ class GoalState:
     last_automatic_continuation_at: float = 0.0
     created_by: str = ""  # trusted creation caller, empty on legacy rows
     stop_condition_owner: str = ""
+    due: str = ""
+    next_check: str = ""
+    done_when: str = ""
+    log_path: str = ""
+    plan_path: str = ""
+    baseline: list[dict[str, Any]] = field(default_factory=list)
+    ownership: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -1111,6 +1118,11 @@ class GoalState:
             "last_automatic_continuation_at")}
         return cls(
             goal=data.get("goal", ""),
+            due=str(data.get("due") or ""), next_check=str(data.get("next_check") or ""),
+            done_when=str(data.get("done_when") or ""), log_path=str(data.get("log_path") or ""),
+            plan_path=str(data.get("plan_path") or ""),
+            baseline=[row for row in (data.get("baseline") or []) if isinstance(row, dict)],
+            ownership=bool(data.get("ownership")),
             created_by=str(data.get("created_by") or ""),
             stop_condition_owner=str(data.get("stop_condition_owner") or ""),
             mutation_id=str(data.get("mutation_id") or ""),
@@ -2969,7 +2981,9 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
     @snapshot_control
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None,
-            actor: str = "user") -> GoalState:
+            actor: str = "user", due: str = "", next_check: str = "", done_when: str = "",
+            log_path: str = "", plan_path: str = "", baseline: Optional[list[dict[str, Any]]] = None,
+            ownership: Optional[bool] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -2991,6 +3005,11 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             stop_condition_owner="agent" if actor == "agent" else "user",
             max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
             contract=contract if contract is not None else GoalContract(),
+            due=str(due or "").strip(), next_check=str(next_check or "").strip(),
+            done_when=str(done_when or "").strip() or (contract.verification.strip() if contract else ""),
+            log_path=str(log_path or "").strip(), plan_path=str(plan_path or "").strip(),
+            baseline=[dict(row) for row in (baseline or []) if isinstance(row, dict)],
+            ownership=bool(ownership) if ownership is not None else bool(due or done_when or log_path or plan_path or baseline),
             revisions=self._history_for_next_goal(live),
         )
         return self._save()

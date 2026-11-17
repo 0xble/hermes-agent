@@ -128,7 +128,9 @@ def current_removal_quote(session_id, quote, *, requirements=(), cursor=None):
 
 
 def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
-                    max_turns=None, user_quote="", kind="revise", authority="autonomy"):
+                    max_turns=None, user_quote="", kind="revise", authority="autonomy",
+                    due=None, next_check=None, done_when=None, log_path=None, plan_path=None,
+                    baseline=None, ownership=None):
     """Validate the entire delta before changing the staged snapshot."""
     from hermes_cli.goals import GoalContract, contract_items
     from hermes_cli.goals_authority import (
