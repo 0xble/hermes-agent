@@ -168,6 +168,9 @@ def _try_reclaim_earlier_fallback(agent, before_index):
         model = (entry.get("model") or "").strip()
         if _should_skip_fallback_candidate(agent, entry, _fallback_entry_key(entry), provider, model, unavailable):
             continue
+        from agent.spare_guards import reserve_fallback_route, release_fallback_route
+        if not reserve_fallback_route(agent, entry):
+            continue
         attempt = _capture_route_state(agent)
         try:
             bound = bind_route_entry(agent, entry, provider, model)
@@ -175,6 +178,7 @@ def _try_reclaim_earlier_fallback(agent, before_index):
             logger.debug("Earlier fallback %s could not be rebound", model, exc_info=True)
             bound = None
         if bound is None:
+            release_fallback_route(agent)
             # Each candidate starts from the pre-attempt route, never a partial failed bind.
             _restore_route_state(agent, attempt)
             continue

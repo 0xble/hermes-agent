@@ -30,6 +30,9 @@ DEFAULT_CONFIG = {
     "incognito": {"model": ""},
     "providers": {},
     "fallback_providers": [],
+    # Daily input + cache-read + output token ceilings for fallback-only spare upstreams.
+    # Defaults protect Meta/Muse and xAI/Grok from storms; set per family to tune or 0 to disable.
+    "fallback_budgets": {"meta": 30_000_000, "xai": 30_000_000},
     # min_switch_reset_seconds: opt-in (0 = off). When a rate-limited primary declares a reset
     # sooner than this many seconds, stay on it (the retry backoff rides out the window) instead
     # of switching the turn to a fallback model.
@@ -1431,6 +1434,11 @@ DEFAULT_CONFIG = {
         # Max parallel children per batch AND max concurrent background delegation units; async
         # dispatches beyond it enter a bounded pending queue. Floor 1, no ceiling.
         "max_concurrent_children": 10,
+        # Maximum parallel children that may be running on a fallback route owned by a spare
+        # upstream family. This shared cross-process lease protects the default spare families
+        # (Meta/Muse and xAI/Grok) from fan-out storms; 2 is intentionally conservative.
+        "max_concurrent_on_spare": 2,
+        "spare_upstreams": ["meta", "xai"],
         # Maximum pending background delegation calls while the async pool is full.
         # Zero rejects at capacity without blocking the parent turn.
         "max_queued_delegations": 8,

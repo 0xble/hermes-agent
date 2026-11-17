@@ -2254,6 +2254,14 @@ def try_activate_fallback(
         fb_model = (fb.get("model") or "").strip()
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
+        # Spare admission is deliberately checked after the ordinary route-health checks:
+        # a malformed or known-dead route must not consume a scarce delegated-child slot.
+        try:
+            from agent.spare_guards import reserve_fallback_route
+            if not reserve_fallback_route(agent, fb):
+                continue
+        except Exception:
+            logger.debug("Spare fallback admission check failed; keeping the route available", exc_info=True)
 
         try:
             from agent.route_binding import bind_route_entry
@@ -2262,6 +2270,7 @@ def try_activate_fallback(
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
+                _release_spare_lease(agent)
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
@@ -2281,8 +2290,18 @@ def try_activate_fallback(
         except Exception as e:
             if fb_provider == "nous":
                 unavailable.add(fb_key)
+            _release_spare_lease(agent)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)
             continue  # try next in chain
+
+
+def _release_spare_lease(agent) -> None:
+    """Return a spare lease taken by an admission whose route then failed to bind."""
+    try:
+        from agent.spare_guards import release_fallback_route
+        release_fallback_route(agent)
+    except Exception:
+        logger.debug("Spare lease release failed", exc_info=True)
 
 
 # Keys outside the Chat Completions schema that strict gateways (Fireworks-backed OpenCode

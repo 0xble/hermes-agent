@@ -984,9 +984,18 @@ class _ChildRun:
                 parent_session_id=str(getattr(child, "_parent_session_id", "") or ""),
                 root_session_id=getattr(child, "_delegation_root_session_id", None),
             ):
-                return child.run_conversation(
-                    user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
-                )
+                try:
+                    return child.run_conversation(
+                        user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    )
+                finally:
+                    # Release when the child actually exits; the parent may have already
+                    # returned a timeout while this worker is still unwinding.
+                    try:
+                        from agent.spare_guards import release_fallback_route
+                        release_fallback_route(child)
+                    except Exception:
+                        logger.debug("Failed to release spare fallback lease in child worker", exc_info=True)
 
         future = self.conversation_future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.
