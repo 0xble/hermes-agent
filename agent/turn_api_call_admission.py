@@ -15,9 +15,12 @@ state is serialized into the usage payload, and an endpoint URL does not belong 
 """
 from __future__ import annotations
 
+import logging
 from typing import Any, Optional
 
 from agent.rate_limit_tracker import tpm_admission_delay
+
+logger = logging.getLogger(__name__)
 
 
 def admission_route(agent: Any) -> tuple[str, str, str]:
@@ -32,6 +35,34 @@ def admission_route(agent: Any) -> tuple[str, str, str]:
 def remember_bucket_route(agent: Any, state: Any) -> None:
     """Pair a freshly captured header state with the route it was captured on."""
     agent._rate_limit_state_route = (state, admission_route(agent))
+
+
+def has_admissible_fallback(agent: Any) -> bool:
+    """Whether a chain entry not yet tried could take this turn now.
+
+    Asked before a predicted overage moves the turn. ``try_activate_fallback`` walks the chain
+    for real: with nothing to land on it still spends the chain cursor and arms the exhausted
+    cooldown, and the request then goes to the primary with its fallback state already used up.
+    This reads the same skip rules and spare guards and changes nothing.
+    """
+    from agent.chat_completion_helpers import _fallback_entry_key, _should_skip_fallback_candidate
+    from agent.spare_guards import fallback_route_admissible
+
+    chain = getattr(agent, "_fallback_chain", None) or []
+    # A copy: the skip check records locally unusable entries in the set it is given.
+    unavailable = set(getattr(agent, "_unavailable_fallback_keys", None) or ())
+    for entry in chain[int(getattr(agent, "_fallback_index", 0) or 0):]:
+        provider = str(entry.get("provider") or "").strip().lower()
+        model = str(entry.get("model") or "").strip()
+        try:
+            if (not _should_skip_fallback_candidate(agent, entry, _fallback_entry_key(entry), provider, model, unavailable)
+                    and fallback_route_admissible(agent, entry)):
+                return True
+        except Exception:
+            # The probe is advisory: an entry it cannot judge is left to the real walk.
+            logger.debug("Fallback admissibility probe failed; deferring to the chain walk", exc_info=True)
+            return True
+    return False
 
 
 def predicted_tpm_overage(agent: Any, approx_tokens: Any) -> Optional[str]:

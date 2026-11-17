@@ -31,10 +31,13 @@ _RECHECK_REASONS = frozenset({
 })
 
 
+def _positive(raw: Any) -> float:
+    return float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0 else 0.0
+
+
 def _recheck_delay(agent: Any) -> float:
     """The agent's current spacing; anything that is not a positive number means none yet."""
-    raw = getattr(agent, "_uncooled_recheck_delay", 0)
-    return float(raw) if isinstance(raw, (int, float)) and not isinstance(raw, bool) and raw > 0 else 0.0
+    return _positive(getattr(agent, "_uncooled_recheck_delay", 0))
 
 
 def begin_uncooled_episode(agent: Any, reason: Any) -> None:
@@ -44,20 +47,27 @@ def begin_uncooled_episode(agent: Any, reason: Any) -> None:
     cleared here; arming a cooldown afterwards sets it again and takes precedence.
     """
     agent._fallback_episode_cooled = False
-    restored_at = getattr(agent, "_uncooled_restored_at", None)
-    agent._uncooled_restored_at = None
     if reason is not None and reason not in _RECHECK_REASONS:
         agent._uncooled_recheck_at = None
         return
     now = time.monotonic()
-    delay = _recheck_delay(agent)
+    restored_at = getattr(agent, "_uncooled_restored_at", None)
+    # The spacing in force when the primary was put back, not the live one: this runs before the
+    # chain is walked, so an attempt that binds no fallback must leave the relapse readable, and
+    # counted once, for the attempt that does (``note_fallback_activated`` then clears it).
+    held = _positive(getattr(agent, "_uncooled_restored_delay", 0))
     # Failing again soon after a re-check put the primary back means the outage persists: double
     # the spacing. A primary that held for a full window has earned a fresh start.
-    relapsed = (isinstance(restored_at, (int, float)) and delay > 0
-                and now - restored_at < max(delay, UNCOOLED_RECHECK_BASE_S))
-    delay = min(delay * 2, UNCOOLED_RECHECK_CAP_S) if relapsed else UNCOOLED_RECHECK_BASE_S
+    relapsed = (isinstance(restored_at, (int, float)) and held > 0
+                and now - restored_at < max(held, UNCOOLED_RECHECK_BASE_S))
+    delay = min(held * 2, UNCOOLED_RECHECK_CAP_S) if relapsed else UNCOOLED_RECHECK_BASE_S
     agent._uncooled_recheck_delay = delay
     agent._uncooled_recheck_at = now + delay
+
+
+def note_fallback_activated(agent: Any) -> None:
+    """A fallback now carries the turn, so the relapse that led to it has been counted."""
+    agent._uncooled_restored_at = None
 
 
 def uncooled_recheck_due(agent: Any) -> bool:
@@ -78,5 +88,6 @@ def settle_uncooled_recheck(agent: Any, *, restored: bool) -> None:
     if restored:
         agent._uncooled_recheck_at = None
         agent._uncooled_restored_at = now
+        agent._uncooled_restored_delay = _recheck_delay(agent)
         return
     agent._uncooled_recheck_at = now + (_recheck_delay(agent) or UNCOOLED_RECHECK_BASE_S)

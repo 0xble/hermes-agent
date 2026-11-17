@@ -1,6 +1,11 @@
 """Regression coverage for resilient model-map admission and fallback cooldowns."""
 
+import json
+import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from agent.rate_limit_tracker import RateLimitBucket, RateLimitState, tpm_admission_delay
 from agent.retry_utils import MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, provider_retry_after_seconds, tpm_overage_cooldown_seconds
@@ -47,14 +52,30 @@ def test_migration_keeps_a_user_chain_that_already_meets_the_bar():
     assert not any("installed upstream-aware" in c for c in changes)
 
 
-def test_migration_replaces_a_user_chain_that_fails_the_bar():
+def test_migration_keeps_a_user_chain_that_fails_the_bar_and_reports_it():
     from hermes_cli.config_migrations_delegation_roles import install_role_routes
-    config = {"delegation": {"backends": {"model_map": {"options": [_user_option(
-        [{"provider": "custom:openai-proxy", "model": "gpt-6.1-terra"}])]}}}}
-    changes = []
-    install_role_routes(config, {}, changes)
+    weak = _user_option([{"provider": "custom:openai-proxy", "model": "gpt-6.1-terra"}])
+    no_chain = {"name": "quick", "description": "x", "provider": "custom:openai-proxy", "model": "gpt-6.1-luna"}
+    config = {"delegation": {"backends": {"model_map": {"options": [weak, no_chain], "default": "quick"}}}}
+    changes, aliases = [], {}
+    install_role_routes(config, aliases, changes)
+    kept = config["delegation"]["backends"]["model_map"]
+    # The user's map is theirs: nothing is replaced, reordered or aliased.
+    assert kept == {"options": [weak, no_chain], "default": "quick"} and aliases == {}
+    assert not any("installed upstream-aware" in c or "official model_map" in c for c in changes)
+    # Only the option that declares a weak chain is reported; the one without a chain is not.
+    reported = [c for c in changes if "kept as written" in c]
+    assert reported and all("options[0].fallback_providers" in c for c in reported)
+    assert any("at least 3 fallback entries" in c for c in reported)
+
+
+@pytest.mark.parametrize("delegation", [{}, {"backends": {}}, {"backends": {"model_map": {"options": []}}}])
+def test_migration_installs_the_role_defaults_when_no_map_exists(delegation):
+    from hermes_cli.config_migrations_delegation_roles import install_role_routes
+    config, changes, aliases = {"delegation": delegation}, [], {}
+    install_role_routes(config, aliases, changes)
     names = [o["name"] for o in config["delegation"]["backends"]["model_map"]["options"]]
-    assert names == ["worker", "explorer", "coder"]
+    assert names == ["worker", "explorer", "coder"] and set(aliases) == set(names)
     assert any("installed upstream-aware" in c for c in changes)
 
 
@@ -90,6 +111,76 @@ def test_model_map_rejects_exact_primary_route_duplicate():
     issues = []
     _validate_model_maps(config, issues)
     assert any("duplicates the primary route" in issue.message for issue in issues)
+
+
+_GOOD_CHAIN = [
+    {"provider": "custom:claude-proxy", "model": "claude-sonnet-5-5"},
+    {"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0"},
+    {"provider": "xai-oauth", "model": "grok-4.7"},
+]
+
+
+def test_only_an_option_that_declares_a_chain_is_validated():
+    route = {"description": "x", "provider": "custom:openai-proxy", "model": "gpt-6.1-sol"}
+    options = [
+        {**route, "name": "absent"},
+        {**route, "name": "null", "fallback_providers": None},
+        {**route, "name": "opted-out", "fallback_providers": []},
+        {**route, "name": "declared", "fallback_providers": _GOOD_CHAIN},
+    ]
+    config = {"delegation": {"backends": {"model_map": {"options": options}}}}
+    assert validate_config_structure(config) == []
+
+    options.append({**route, "name": "weak", "fallback_providers": _GOOD_CHAIN[:1]})
+    messages = [issue.message for issue in validate_config_structure(config)]
+    assert messages and all("options[4].fallback_providers" in message for message in messages)
+    # Absent and null at the top level and under cron declare nothing either.
+    assert validate_config_structure({"model": {"default": "gpt-6.1-sol"}, "fallback_providers": None,
+                                      "cron": {"fallback_providers": None}}) == []
+
+
+_MAIN_MODEL = {"default": "gpt-6.1-sol", "provider": "custom:openai-proxy"}
+_DUPLICATE_OF_MAIN = [{"provider": "custom:openai-proxy", "model": "gpt-6.1-sol"}, *_GOOD_CHAIN[::2]]
+_TWO_FAMILIES = [{"provider": "custom:openai-proxy", "model": "gpt-6.1-terra"},
+                 {"provider": "custom:claude-proxy", "model": "claude-sonnet-5-5"},
+                 {"provider": "custom:claude-proxy", "model": "claude-haiku-5-5"}]
+
+
+@pytest.mark.parametrize("scope", ["fallback_providers", "cron.fallback_providers"])
+@pytest.mark.parametrize(("chain", "problem"), [
+    (_DUPLICATE_OF_MAIN, "duplicates the primary route custom:openai-proxy:gpt-6.1-sol"),
+    (_TWO_FAMILIES, "spans only 2 upstream families"),
+    (_GOOD_CHAIN, None),
+])
+def test_main_and_cron_chains_are_checked_against_the_model_default(scope, chain, problem):
+    # The main model lives under ``model.default``; read as ``model.model`` the primary had no
+    # name, so a duplicate went unseen and its provider label counted as a third family.
+    config = {"model": dict(_MAIN_MODEL)}
+    if scope.startswith("cron"):
+        config["cron"] = {"fallback_providers": chain}
+    else:
+        config["fallback_providers"] = chain
+    messages = [issue.message for issue in validate_config_structure(config)]
+    if problem is None:
+        assert messages == []
+    else:
+        assert any(message.startswith(f"{scope}[0] {problem}") or message.startswith(f"{scope} {problem}")
+                   for message in messages), messages
+
+
+def test_cron_chain_is_checked_against_crons_own_model_when_it_names_one():
+    config = {"model": {**_MAIN_MODEL, "base_url": "http://127.0.0.1:8317/v1"},
+              "cron": {"model": "claude-sonnet-5-5", "model_provider": "custom:claude-proxy",
+                       "fallback_providers": [_GOOD_CHAIN[0], {"provider": "custom:openai-proxy", "model": "gpt-6.1-sol"},
+                                              _GOOD_CHAIN[2]]}}
+    messages = [issue.message for issue in validate_config_structure(config)]
+    assert any("cron.fallback_providers[0] duplicates the primary route custom:claude-proxy:claude-sonnet-5-5" in m
+               for m in messages), messages
+    # A main endpoint entry carrying the main base_url duplicates the main route, not cron's.
+    config["fallback_providers"] = [{**_MAIN_MODEL, "model": "gpt-6.1-sol", "base_url": "http://127.0.0.1:8317/v1/"},
+                                    *_GOOD_CHAIN[::2]]
+    messages = [issue.message for issue in validate_config_structure(config)]
+    assert any(m.startswith("fallback_providers[0] duplicates the primary route") for m in messages), messages
 
 
 def test_same_proxy_muse_route_is_not_skipped_when_gpt_route_is_cooled():
@@ -276,8 +367,10 @@ def test_model_map_option_reaches_the_child_only_from_a_model_map_route():
     assert _route_overrides(TaskRoute(creds, {}))["model_map_option"] is None
 
 
-def _guard_agent(*, pending=True, fallback_ok=True, route_scoped=True):
-    import time
+_GUARD_SPARE = {"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0", "base_url": "http://127.0.0.1:8317/v1"}
+
+
+def _guard_agent(*, chain=(_GUARD_SPARE,), fallback_ok=True, route_scoped=True):
     from agent.turn_api_call_admission import remember_bucket_route
     calls = []
     now = time.time()
@@ -289,7 +382,7 @@ def _guard_agent(*, pending=True, fallback_ok=True, route_scoped=True):
         provider="custom:openai-proxy", base_url="http://127.0.0.1:8317/v1", model="gpt-6.1-sol",
         _rate_limit_state=state,
         _buffer_diagnostic_status=lambda *_a: calls.append("status"), _flush_status_buffer=lambda: None,
-        _has_pending_fallback=lambda: pending,
+        _fallback_chain=[dict(entry) for entry in chain], _fallback_index=0, _credential_pool=None,
         _try_activate_fallback=lambda: calls.append("fallback") or fallback_ok,
     )
     if route_scoped:
@@ -314,12 +407,71 @@ def test_dispatch_guard_switches_route_before_oversized_request(monkeypatch):
     assert calls == ["status", "fallback"]
 
 
-def test_dispatch_guard_sends_when_no_fallback_is_left(monkeypatch):
-    # A prediction is not a refusal: with nowhere to switch, the provider decides.
-    agent, calls = _guard_agent(pending=False)
+def _cool(entry):
+    from agent.error_classifier import FailoverReason
+    from agent.shared_primary_cooldown import arm_cooldown, canonical_route
+    assert arm_cooldown(canonical_route((entry["provider"], entry["base_url"], entry["model"])),
+                        reason=FailoverReason.rate_limit, reset_at=time.time() + 60, backoff_count=0, request_id="peer")
+
+
+def _spare_guards(monkeypatch, tmp_path, *, cap=2, budget=30_000_000, delegated=True):
+    import agent.spare_guards as guards
+    monkeypatch.setattr(guards, "_state_path", lambda: tmp_path / "spare_guards.json")
+    monkeypatch.setattr(guards, "_load_config", lambda: {
+        "delegation": {"spare_upstreams": ["meta", "xai"], "max_concurrent_on_spare": cap},
+        "fallback_budgets": {"meta": budget, "xai": budget}})
+    monkeypatch.setattr(guards, "_in_delegated_child", lambda: delegated)
+    return guards
+
+
+def test_dispatch_guard_sends_on_the_primary_when_no_fallback_could_take_the_turn(monkeypatch, tmp_path):
+    # A prediction is not a refusal: with nowhere to switch, the provider decides, and the
+    # chain is not walked, so its cursor and the cooldown flags are left for a real failure.
+    def sends_untouched(agent, calls):
+        assert _run_guard(agent, 20_000, monkeypatch).action == "fallthrough"
+        assert calls == [] and agent._fallback_index == 0
+        assert not hasattr(agent, "_rate_limited_until") and not hasattr(agent, "_fallback_episode_cooled")
+        assert not hasattr(agent, "_unavailable_fallback_keys")
+
+    sends_untouched(*_guard_agent(chain=()))
+
+    agent, calls = _guard_agent()
+    agent._fallback_index = 1  # the only entry was already tried this turn
     assert _run_guard(agent, 20_000, monkeypatch).action == "fallthrough"
-    assert calls == []
-    agent, calls = _guard_agent(fallback_ok=False)  # every remaining entry cooled or unusable
+    assert calls == [] and agent._fallback_index == 1
+
+    # Every remaining entry sits in a cooldown another process recorded.
+    _cool(_GUARD_SPARE)
+    sends_untouched(*_guard_agent())
+
+    # The spare guards would refuse it: over its daily budget, or its child cap is full.
+    other = {**_GUARD_SPARE, "model": "muse-other"}
+    guards = _spare_guards(monkeypatch, tmp_path, budget=1)
+    guards.record_fallback_usage(SimpleNamespace(_spare_fallback_upstream="meta", _provider_fallback_active=True,
+                                                 _spare_fallback_lease=None), SimpleNamespace(input_tokens=5))
+    sends_untouched(*_guard_agent(chain=(other,)))
+    guards = _spare_guards(monkeypatch, tmp_path, cap=1)
+    holder = SimpleNamespace(_spare_fallback_lease=None, _spare_fallback_upstream=None)
+    assert guards.reserve_fallback_route(holder, other)
+    sends_untouched(*_guard_agent(chain=(other,)))
+    # Asking took no lease: the holder's is still the only one, and it may renew its own.
+    leases = json.loads((tmp_path / "spare_guards.json").read_text(encoding="utf-8"))["leases"]
+    assert list(leases["meta"]) == [holder._spare_fallback_lease[1]]
+    assert guards.fallback_route_admissible(holder, other)
+    guards.release_fallback_route(holder)
+    agent, calls = _guard_agent(chain=(other,))
+    assert _run_guard(agent, 20_000, monkeypatch).action == "break"
+    assert calls == ["status", "fallback"]
+
+
+def test_dispatch_guard_skips_past_a_cooled_entry_to_one_that_can_take_the_turn(monkeypatch):
+    _cool(_GUARD_SPARE)
+    agent, calls = _guard_agent(chain=(_GUARD_SPARE, {"provider": "custom:claude-proxy", "model": "claude-sonnet-5-5",
+                                                      "base_url": "http://127.0.0.1:8318/v1"}))
+    assert _run_guard(agent, 20_000, monkeypatch).action == "break"
+    assert calls == ["status", "fallback"]
+    # The walk itself can still come back empty (a bind that fails): the request is then sent.
+    agent, calls = _guard_agent(chain=(dict(_GUARD_SPARE, model="muse-other"),), fallback_ok=False)
     assert _run_guard(agent, 20_000, monkeypatch).action == "fallthrough"
     assert calls == ["status", "fallback"]
 
@@ -394,35 +546,14 @@ def test_child_runtime_keeps_a_healthy_primary_and_its_whole_chain(monkeypatch):
     assert [entry["model"] for entry in runtime["fallback_model"]] == ["claude-sonnet-5-5", "muse-wonder-full-1.0"]
 
 
-def test_child_runtime_starts_on_first_non_cooled_route_when_primary_is_cooled(monkeypatch):
-    runtime = _child_runtime(monkeypatch, cooled={_PRIMARY[2]})
-    assert (runtime["model"], runtime["base_url"]) == ("claude-sonnet-5-5", "http://127.0.0.1:8318/v1")
-    # No key of its own: the parent's key is inherited, never the cooled primary's.
-    assert runtime["api_key"] == "parent-key"
-    assert [entry["model"] for entry in runtime["fallback_model"]] == ["muse-wonder-full-1.0"]
-
-    runtime = _child_runtime(monkeypatch, cooled={_PRIMARY[2], "claude-sonnet-5-5"})
-    assert (runtime["model"], runtime["api_key"]) == ("muse-wonder-full-1.0", "spare-b-key")
-    assert runtime["fallback_model"] == []
-
-
-def test_child_runtime_keeps_the_primary_when_every_route_is_cooled(monkeypatch):
-    runtime = _child_runtime(monkeypatch, cooled={_PRIMARY[2], "claude-sonnet-5-5", "muse-wonder-full-1.0"})
-    assert (runtime["provider"], runtime["model"], runtime["base_url"]) == _PRIMARY[0:1] + (_PRIMARY[2], _PRIMARY[1])
+@pytest.mark.parametrize("cooled", [
+    {_PRIMARY[2]}, {_PRIMARY[2], "claude-sonnet-5-5"}, {_PRIMARY[2], "claude-sonnet-5-5", "muse-wonder-full-1.0"},
+])
+def test_child_runtime_keeps_the_role_primary_even_when_it_is_cooled(monkeypatch, cooled):
+    # Building the child on a spare left it no primary to return to and skipped the spare
+    # guards. The cooled primary is handled where every other agent handles it: construction
+    # adopts the shared cooldown (tests/agent/test_mid_turn_primary_restore.py).
+    runtime = _child_runtime(monkeypatch, cooled=cooled)
+    assert (runtime["provider"], runtime["base_url"], runtime["model"]) == _PRIMARY
     assert runtime["api_key"] == "primary-key"
-    assert [entry["model"] for entry in runtime["fallback_model"]] == ["claude-sonnet-5-5", "muse-wonder-full-1.0"]
-
-
-def test_child_runtime_skips_a_spare_that_cannot_be_credentialed(monkeypatch):
-    from tools import delegate_tool_config
-
-    real = delegate_tool_config._resolve_delegation_credentials
-
-    def resolve(cfg, parent):
-        if cfg.get("model") == "claude-sonnet-5-5":
-            raise ValueError("no credentials for custom:claude-proxy")
-        return real(cfg, parent)
-
-    monkeypatch.setattr(delegate_tool_config, "_resolve_delegation_credentials", resolve)
-    runtime = _child_runtime(monkeypatch, cooled={_PRIMARY[2]})
-    assert (runtime["model"], runtime["api_key"]) == ("muse-wonder-full-1.0", "spare-b-key")
+    assert runtime["fallback_model"] == [_SPARE_A, _SPARE_B]

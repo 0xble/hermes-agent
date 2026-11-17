@@ -16,7 +16,7 @@ import time
 from typing import Any, Mapping, Optional
 from utils import atomic_write_text
 from agent.retry_utils import (
-    MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, _minute_rate_limit_headers, parse_retry_after_seconds,
+    MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, RETRY_AFTER_CAP_S, _minute_rate_limit_headers, parse_retry_after_seconds,
 )
 from agent.rate_limit_tracker import (
     _BUCKET_TAGS, _fmt_seconds, _safe_float, _safe_int, has_rate_limit_headers, lower_headers,
@@ -66,7 +66,7 @@ def _clamp_to_minute_window(seconds: float, headers: Optional[Mapping[str, str]]
     would block every session on this home for days, so it is cut to the minute-window cap the
     in-process retry path uses. A wait that fits inside a window the response describes (the
     body's own retry time, an hourly bucket) is plausible and kept; an exhausted longer bucket
-    keeps its own reset.
+    keeps its own reset. The caller then applies the overall cap to whatever this returns.
     """
     lowered = lower_headers(headers)
     if seconds <= MINUTE_RATE_LIMIT_COOLDOWN_CAP_S or not _minute_rate_limit_headers(lowered):
@@ -99,10 +99,15 @@ def record_nous_rate_limit(
         reset_at = now + header_seconds
     if reset_at is None:
         reset_at = now + default_cooldown
-    # A structured welcome-tier refusal names its own wait and stays authoritative (the body
-    # wins); only header- or prose-derived waits are bounded to the window the headers describe.
+    # Header- and prose-derived waits are bounded twice: to the minute window when the headers
+    # describe one, then to the cap the in-process retry path uses. This file blocks every
+    # session on the home, so a wrong long wait costs far more than one early probe that
+    # re-records the limit. The one exception is a structured welcome-tier refusal: the gateway
+    # states in a parsed field when the free allowance refreshes, that can honestly be hours
+    # away, and a request sent sooner is certain to be refused while the user is told the
+    # wrong refresh time.
     if not is_long_welcome_rate_limit(error_context):
-        reset_at = now + _clamp_to_minute_window(reset_at - now, headers)
+        reset_at = now + min(_clamp_to_minute_window(reset_at - now, headers), RETRY_AFTER_CAP_S)
 
     state = {"reset_at": reset_at, "recorded_at": now, "reset_seconds": reset_at - now}
     try:

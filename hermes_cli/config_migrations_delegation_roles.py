@@ -222,18 +222,19 @@ def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None
     delegation = config.setdefault("delegation", {})
     backends = delegation.setdefault("backends", {})
     existing = backends.get("model_map")
-    existing_issues: list = []
-    if isinstance(existing, dict) and isinstance(existing.get("options"), list):
-        _validate_model_map_options(existing["options"], existing_issues, "delegation.backends.model_map", config)
-    preserve_existing = not existing_issues and isinstance(existing, dict) and bool(existing.get("options"))
+    preserve_existing = isinstance(existing, dict) and bool(existing.get("options"))
     if not preserve_existing:
         settings = role_settings()
         backends["model_map"] = settings
         changes.append("delegation: installed upstream-aware model_map fallback chains")
     else:
-        # A user-authored map that already meets the resilience bar is authoritative;
-        # migrations must not silently reorder or replace it.
+        # A user-authored map is authoritative: a migration never reorders or replaces it. A
+        # chain below the resilience bar is reported for the user to fix, and left as written.
         settings = existing
+        existing_issues: list = []
+        _validate_model_map_options(existing["options"], existing_issues, "delegation.backends.model_map", config)
+        changes.extend(f"delegation: your model_map is kept as written, but {issue.message}. {issue.hint}"
+                       for issue in existing_issues)
     delegation["backend"] = "model_map"
     delegation["inherit_service_tier"] = False
     delegation["fallback_providers"] = []
@@ -250,4 +251,5 @@ def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None
     disabled = plugins.get("disabled", [])
     if "advanced-delegation" in disabled:
         disabled.remove("advanced-delegation")
-    changes.append("delegation: official model_map worker default, explorer and coder enabled; 5 Claude routes commented pending reserve protection")
+    if not preserve_existing:
+        changes.append("delegation: official model_map worker default, explorer and coder enabled; 5 Claude routes commented pending reserve protection")

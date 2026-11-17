@@ -260,12 +260,12 @@ def nous_rate_limit_guard(
 
     # A response header can tell us that the next request cannot fit in the current TPM
     # bucket. Check before any SDK call; otherwise a large prompt predictably produces a
-    # second 429. With a fallback left the turn restarts cleanly on it. With none the request
-    # is sent anyway: the estimate is approximate, and the provider's own 429 carries the real
-    # reset into the normal wait-and-retry path instead of ending the turn on a guess.
-    from agent.turn_api_call_admission import predicted_tpm_overage
+    # second 429. With a fallback that can take the turn it restarts cleanly there. With none
+    # the request is sent anyway and no fallback state is touched: the estimate is approximate,
+    # and the provider's own 429 carries the real reset into the normal wait-and-retry path.
+    from agent.turn_api_call_admission import has_admissible_fallback, predicted_tpm_overage
     overage = predicted_tpm_overage(agent, approx_tokens)
-    if overage and agent._has_pending_fallback():
+    if overage and has_admissible_fallback(agent):
         agent._buffer_diagnostic_status(f"⏳ {overage} Trying fallback.")
         if agent._try_activate_fallback():
             active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)

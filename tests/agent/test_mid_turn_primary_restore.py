@@ -810,6 +810,126 @@ def test_child_started_with_cooled_primary_adopts_spare_then_restores_in_same_tu
     assert requested[-1] == "primary-model", requested
 
 
+def test_delegated_child_built_on_a_cooled_role_primary_adopts_a_leased_spare_and_returns(tmp_path, monkeypatch):
+    """A child whose role primary another process already cooled is still built on that primary.
+    Construction adopts the outage: it walks the chain past a cooled entry, takes the spare's
+    concurrency lease, never sends request 1 to the cooled primary, and returns to the role
+    primary (releasing the lease) once the cooldown ends inside the same turn."""
+    from agent.delegation_context import delegated_child_context
+    from agent.shared_primary_cooldown import arm_cooldown, canonical_route, route_from_agent
+
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    primary = ("custom", "https://primary.invalid/v1", "primary-model")
+    cooled_backup = {"provider": "openai", "model": "backup", "base_url": "https://backup.invalid/v1"}
+    spare = {"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0", "base_url": "https://spare.invalid/v1"}
+    for provider, base_url, model in (primary, (cooled_backup["provider"], cooled_backup["base_url"], cooled_backup["model"])):
+        assert arm_cooldown(canonical_route((provider, base_url, model)), reason=FailoverReason.rate_limit,
+                            reset_at=time.time() + 60, backoff_count=0, request_id=f"peer-{model}")
+    guard_state = tmp_path / "state" / "spare_fallback_guards.json"
+
+    def leases():
+        return json.loads(guard_state.read_text(encoding="utf-8"))["leases"] if guard_state.exists() else {}
+
+    tool_defs = [{"type": "function", "function": {
+        "name": "web_search", "description": "x", "parameters": {"type": "object", "properties": {}}}}]
+    requested = []
+    resolved = []
+    tool_calls = 0
+
+    def resolve(provider, model=None, **kw):
+        resolved.append((model, kw.get("explicit_api_key")))
+        return MagicMock(api_key="spare-key", base_url=kw.get("explicit_base_url")), model
+
+    with (
+        patch("model_tools.get_tool_definitions", return_value=tool_defs),
+        patch("model_tools.check_toolset_requirements", return_value={}),
+        patch("agent.process_bootstrap.OpenAI"),
+        patch("agent.auxiliary_client.resolve_provider_client", side_effect=resolve),
+        delegated_child_context(),
+    ):
+        agent = AIAgent(
+            api_key="role-primary-key", base_url=primary[1], provider=primary[0], model=primary[2],
+            api_mode="chat_completions", quiet_mode=True, skip_context_files=True, skip_memory=True,
+            fallback_model=[cooled_backup, spare],
+        )
+        try:
+            # Built on the role primary, already serving from the first route that is not cooled.
+            assert route_from_agent(agent) == canonical_route(primary)
+            assert agent._primary_runtime["model"] == "primary-model"
+            assert (agent.model, agent._provider_fallback_active) == ("muse-wonder-full-1.0", True)
+            assert agent._spare_fallback_upstream == "meta"
+            assert list(leases()["meta"]) == [agent._spare_fallback_lease[1]]
+            # The spare is credentialed as its own route: the role primary's key never follows it.
+            assert resolved == [("muse-wonder-full-1.0", None)] and agent.api_key == "spare-key"
+            assert agent._primary_runtime["api_key"] == "role-primary-key"
+
+            agent._cached_system_prompt = "Model: primary-model\nProvider: custom"
+            agent._use_prompt_caching = False
+            agent.compression_enabled = False
+            agent.save_trajectories = False
+            agent.valid_tool_names = {"web_search"}
+            agent._api_max_retries = 1
+            agent._disable_streaming = True
+
+            def request(kwargs):
+                requested.append(agent.model)
+                return _tool_loop_response(None if agent.model == "primary-model" else f"spare_call_{len(requested)}")
+
+            def tool(*args, **kwargs):
+                nonlocal tool_calls
+                tool_calls += 1
+                if tool_calls == 2:
+                    path = tmp_path / "state" / "model_cooldowns.json"
+                    state = json.loads(path.read_text(encoding="utf-8-sig"))
+                    for record in state["routes"].values():
+                        record["reset_at"] = time.time() - 1
+                    path.write_text(json.dumps(state))
+                return "tool result"
+
+            with (
+                patch.object(agent, "_persist_session"), patch.object(agent, "_save_trajectory"),
+                patch.object(agent, "_cleanup_task_resources"),
+                patch.object(agent, "_interruptible_api_call", side_effect=request),
+                patch("model_tools.handle_function_call", side_effect=tool),
+            ):
+                result = agent.run_conversation("long delegated task")
+        finally:
+            agent.close()
+
+    assert result["final_response"] == "finished"
+    assert requested == ["muse-wonder-full-1.0", "muse-wonder-full-1.0", "primary-model"], requested
+    assert agent.model == "primary-model" and not agent._provider_fallback_active
+    assert agent.api_key == "role-primary-key"
+    assert agent._spare_fallback_lease is None and leases() == {}
+
+
+def test_relapse_still_widens_the_recheck_when_an_activation_attempt_binds_nothing(tool_loop_agent, recovery_runtime):
+    """The relapse marker is spent when a fallback takes over, not when one is merely tried:
+    an attempt that binds nothing (a spare over its cap, a failed client) must leave the next,
+    successful attempt able to see that the primary failed again right after its re-check."""
+    agent = tool_loop_agent
+    assert agent._try_activate_fallback(FailoverReason.server_error)
+    assert agent._uncooled_recheck_delay == 60 and agent._uncooled_restored_at is None
+
+    agent._uncooled_recheck_at = time.monotonic() - 1
+    assert recovery_runtime._restore_primary_if_allowed(agent)
+    assert agent.model == "primary-model" and agent._uncooled_restored_at is not None
+
+    # The primary fails again at once, and this walk of the chain binds nothing.
+    with patch("agent.route_binding.bind_route_entry", side_effect=RuntimeError("client could not be built")):
+        assert not agent._try_activate_fallback(FailoverReason.server_error)
+    assert agent.model == "primary-model" and not agent._provider_fallback_active
+    assert agent._uncooled_restored_at is not None
+
+    agent._fallback_index = 0  # what the next turn's restore does before the chain is walked again
+    assert agent._try_activate_fallback(FailoverReason.server_error)
+    assert agent.model == "backup"
+    # Doubled once for the one relapse: neither reset to the base nor compounded by the retry.
+    assert agent._uncooled_recheck_delay == 120
+    assert agent._uncooled_recheck_at > time.monotonic() + 60
+    assert agent._uncooled_restored_at is None
+
+
 def _primary_500():
     response = httpx.Response(500, request=httpx.Request("POST", "https://primary.invalid/v1"))
     return InternalServerError("internal server error", response=response, body={})

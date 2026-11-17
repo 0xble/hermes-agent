@@ -25,8 +25,12 @@ def _missing_family_hint(path: str, families: set[str]) -> str:
 
 def _validate_chain(path: str, primary: dict[str, Any], raw_chain: Any,
                     config: dict[str, Any], issues: list[ConfigIssue]) -> None:
-    """Validate one ordered fallback map. Explicit [] is the documented opt-out."""
-    if raw_chain == []:
+    """Validate one ordered fallback map.
+
+    An absent or null chain declares nothing (the route inherits or has no fallback), and an
+    explicit [] is the documented opt-out, so only a declared list is held to the bar.
+    """
+    if raw_chain is None or raw_chain == []:
         return
     if not isinstance(raw_chain, list):
         _issue(issues, "error", f"{path} must be a list of fallback routes",
@@ -49,6 +53,14 @@ def _validate_chain(path: str, primary: dict[str, Any], raw_chain: Any,
     if len(families) < MIN_UPSTREAM_FAMILIES:
         _issue(issues, "error", f"{path} spans only {len(families)} upstream families (need {MIN_UPSTREAM_FAMILIES})",
                _missing_family_hint(path, families))
+
+
+def _main_route(model: Any) -> dict[str, Any]:
+    """The main ``model`` setting as a route. Its usual shape is ``{default, provider, base_url}``:
+    the model name sits under ``default``, which route identity and family checks do not read."""
+    if not isinstance(model, dict):
+        return {"model": model}
+    return {**model, "model": model.get("default") or model.get("model") or model.get("name")}
 
 
 def _validate_model_map_options(options: Any, issues: list[ConfigIssue], path: str,
@@ -79,18 +91,20 @@ def _validate_model_maps(config: dict[str, Any], issues: list[ConfigIssue]) -> N
                 walk(child, f"{path}[{index}]")
     walk(config, "")
 
-    model = config.get("model")
-    primary = model if isinstance(model, dict) else {"model": model}
-    if "fallback_providers" in config:
-        _validate_chain("fallback_providers", primary, config.get("fallback_providers"), config, issues)
+    primary = _main_route(config.get("model"))
+    _validate_chain("fallback_providers", primary, config.get("fallback_providers"), config, issues)
     # ``fallback_model`` is the legacy single-route setting; keep accepting it for
     # backwards compatibility. The resilience policy applies to ordered chains
     # (`fallback_providers`), not that legacy scalar.
 
     cron = config.get("cron")
-    if isinstance(cron, dict) and "fallback_providers" in cron:
-        cron_primary = {"provider": cron.get("model_provider") or cron.get("provider") or primary.get("provider"),
-                        "model": cron.get("model") or primary.get("model")}
+    if isinstance(cron, dict):
+        # Cron runs the main route unless it names its own; the main endpoint belongs to the
+        # main provider only, so a cron provider never inherits it.
+        cron_provider = cron.get("model_provider") or cron.get("provider")
+        cron_primary = {"provider": cron_provider or primary.get("provider"),
+                        "model": cron.get("model") or primary.get("model"),
+                        "base_url": None if cron_provider else primary.get("base_url")}
         _validate_chain("cron.fallback_providers", cron_primary, cron.get("fallback_providers"), config, issues)
 
     auxiliary = config.get("auxiliary")

@@ -164,6 +164,31 @@ def test_model_route_chains_below_the_resilience_bar_are_refused_before_anything
     assert (work / "config.yaml").read_text(encoding="utf-8") == before
 
 
+def test_routes_without_a_chain_save_beside_one_that_declares_a_chain(client, homes):
+    """Only a route that declares a chain is held to the resilience bar. One with no chain, or an
+    explicit empty one, saves as before; a weak chain on a sibling still refuses the whole save."""
+    _root, work = homes
+    chain = [{"provider": "anthropic", "model": "claude-opus-5-5"},
+             {"provider": "custom:openai-proxy", "model": "muse-wonder-full-1.0"},
+             {"provider": "xai-oauth", "model": "grok-4.7"}]
+    base = {"description": "x", "provider": "openai", "model": "gpt-6-sol"}
+    options = [{**base, "name": "plain"}, {**base, "name": "opted-out", "fallback_providers": []},
+               {**base, "name": "chained", "fallback_providers": chain}]
+    resp = client.put("/api/delegation/backends/model_map?profile=work", json={"options": options})
+    assert resp.status_code == 200, resp.text
+    saved = {o["name"]: o for o in _delegation(work)["backends"]["model_map"]["options"]}
+    assert "fallback_providers" not in saved["plain"]
+    assert saved["opted-out"]["fallback_providers"] == []
+    assert saved["chained"]["fallback_providers"] == chain
+
+    before = (work / "config.yaml").read_text(encoding="utf-8")
+    options.append({**base, "name": "weak", "fallback_providers": chain[:1]})
+    resp = client.put("/api/delegation/backends/model_map?profile=work", json={"options": options})
+    assert resp.status_code == 400
+    assert "options[3].fallback_providers needs at least 3 fallback entries" in resp.json()["detail"]
+    assert (work / "config.yaml").read_text(encoding="utf-8") == before
+
+
 def test_saving_model_routes_replaces_the_block_and_keeps_the_stored_key(client, homes):
     root, work = homes
     shown = client.get("/api/delegation/routing?profile=work").json()["model_map"]["options"][0]

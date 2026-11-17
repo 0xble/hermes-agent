@@ -239,8 +239,8 @@ async def save_model_routes(body: DelegationModelMapUpdate, profile: Optional[st
         block: dict[str, Any] = {"options": options}
         from hermes_cli.config_value_checks import _validate_model_map_options
         validation_issues: list[Any] = []
-        if any("fallback_providers" in option for option in options):
-            _validate_model_map_options(options, validation_issues, "delegation.backends.model_map", current)
+        # Only an option that declares a chain is held to the bar; one without is left alone.
+        _validate_model_map_options(options, validation_issues, "delegation.backends.model_map", current)
         if validation_issues:
             first = validation_issues[0]
             raise _bad_request(f"{first.message} Hint: {first.hint}")

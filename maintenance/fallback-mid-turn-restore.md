@@ -69,18 +69,27 @@ get back, or cannot say why):
 
 - `agent/turn_api_call_admission.py`: pre-send token-per-minute admission. A
   minute bucket is matched on provider, endpoint and model, and the check fails
-  open whenever headers, an estimate, or a remaining fallback is missing.
+  open whenever headers or an estimate is missing. Before a predicted overage
+  moves the turn, a read-only probe asks whether any untried chain entry could
+  take it (not cooled, within the spare cap and budget). With none, the request
+  is sent on the primary and the chain cursor and cooldown flags are untouched.
 - `agent/retry_utils.py`, `agent/nous_rate_guard.py`: a days-long `Retry-After`
   on a per-minute bucket is bounded to the minute-window cap before it is used
-  or persisted.
+  or persisted. The persisted Nous wait is also held to the 600 s retry cap;
+  only a structured welcome-tier `rate_limited` refusal keeps its stated wait.
 - `agent/turn_failure_routes.py`: the failure card names the `fallback_providers`
   list that feeds the failing agent and only the routes that ran out this episode.
 - `hermes_cli/fallback_config.py`, `hermes_cli/config_value_checks.py`,
   `hermes_cli/config_migrations_delegation_roles.py`: fallback chains are checked
-  for at least three entries across three upstream families.
-- `tools/delegate_tool_config.py`: a child whose role primary is already cooled
-  starts on the first non-cooled chain entry. That entry becomes the child's
-  primary, so such a child does not return to the role primary.
+  for at least three entries across three upstream families. Only a declared
+  list is checked: an absent or null chain is skipped and `[]` opts out. The
+  main and cron primaries are read from `model.default`. A migration keeps a
+  user-authored model map as written and reports any chain below the bar.
+- `tools/delegate_tool_config.py`: a child is always built on its role primary.
+  When another process already cooled that primary, construction adopts the
+  shared cooldown, so the child starts on the first admissible chain entry
+  through the spare guards and returns to the role primary mid-turn.
 
-Proof: `tests/agent/test_model_fallback_resilience.py` and
-`tests/agent/test_nous_rate_guard.py`.
+Proof: `tests/agent/test_model_fallback_resilience.py`,
+`tests/agent/test_nous_rate_guard.py` and the delegated-child and relapse
+regressions in `tests/agent/test_mid_turn_primary_restore.py`.

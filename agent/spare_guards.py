@@ -315,6 +315,28 @@ def reserve_fallback_route(agent: Any, entry: dict[str, Any]) -> FallbackRouteRe
     )
 
 
+def fallback_route_admissible(agent: Any, entry: dict[str, Any]) -> bool:
+    """Whether ``reserve_fallback_route`` would admit *entry* now. Reads only: no lease is
+    taken and nothing is written, so a caller can ask before it commits to a switch."""
+    family = resolve_upstream_family(entry.get("provider"), entry.get("model"), entry)
+    spares, cap, budgets = spare_settings()
+    if family not in spares:
+        return True
+    day, now, budget = _local_day(), time.time(), budgets.get(family, 0)
+    try:
+        with _locked_state() as (_path, state):
+            _prune(state, now, day)  # on the in-memory copy only
+            if budget > 0 and _used_today(state, day, family) >= budget:
+                return False
+            if not _in_delegated_child():
+                return True
+            rows = state["leases"].get(family) or {}
+            held = _held_lease(agent)
+            return bool(held and held[0] == family and held[1] in rows) or len(rows) < cap
+    except OSError:
+        return True  # advisory state, same as the reservation: unreadable admits
+
+
 def _remove_lease(lease: tuple[str, str]) -> None:
     family, token = lease
     try:
