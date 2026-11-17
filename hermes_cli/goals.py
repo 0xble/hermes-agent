@@ -2473,7 +2473,6 @@ def _relay_ledger_receipts(receipt_ids: Iterable[str]) -> dict[str, dict[str, An
 _NON_HUMAN_SESSION_SOURCES = frozenset({"subagent", "cron", "tool", "kanban", "oneshot", "dryrun"})
 
 
-<<<<<<< HEAD
 def _authenticated_relay_sender(db: Any, relay: dict[str, Any], goal_session_id: str,
                                 profile: str, receipts: dict[str, dict[str, Any]]) -> Optional[str]:
     """The sender session of a relay row when relay's ledger proves this exact delivery, else None.
@@ -2521,56 +2520,7 @@ def _authenticated_relay_sender(db: Any, relay: dict[str, Any], goal_session_id:
     return sender[1]
 
 
-||||||| parent of 87600cb1095 (fix(controls): allow reasoned agent-owned edits and verified relay quotes)
-def _authenticated_relay_sender(db: Any, relay: Dict[str, Any], goal_session_id: str,
-                                profile: str, receipts: Dict[str, Dict[str, Any]]) -> Optional[str]:
-    """The sender session of a relay row when relay's ledger proves this exact delivery, else None.
 
-    Requires a typed-shaped row (no runtime display_kind, not a synthetic/continuation prompt), a
-    Hermes header naming this profile, a ledger receipt with the same sender delivered to this goal
-    session at this exact row, and a sender that is a human topic session."""
-    content = str(relay.get("content") or "")
-    if str(relay.get("display_kind") or "") not in _USER_TYPED_KINDS or relay.get("compressed_summary"):
-        return None
-    if content.lstrip().startswith(_SYNTHETIC_USER_PREFIXES):
-        return None
-    sender = _relay_sender(content)
-    if sender is None or not profile or sender[0] != profile or sender[1] == goal_session_id:
-        return None
-    receipt = receipts.get(_relay_receipt_id(content))
-    if not receipt or str(receipt.get("status") or "") not in ("delivered", "replied"):
-        return None
-    if receipt.get("sender") != f"hermes:{profile}/{sender[1]}":
-        return None
-    if receipt.get("target") != f"hermes:{profile}/{goal_session_id}":
-        return None
-    # The header is agent-writable text, so only a receipt bound to this exact transcript row proves
-    # delivery; an unbound (legacy) receipt could be replayed under a forged header. Fail closed.
-    row_id = receipt.get("target_user_row")
-    if row_id is None or str(row_id) != str(relay.get("id")):
-        return None
-    try:
-        info = db.get_session(sender[1]) or {}
-    except Exception:
-        return None
-    if not info or str(info.get("source") or "") in _NON_HUMAN_SESSION_SOURCES:
-        return None
-    # Delegate children inherit the gateway source (e.g. telegram); the creation marker is the proof.
-    # Continuations copy model_config verbatim, so a delegate child's continuation carries it too.
-    raw_config = info.get("model_config")
-    config: Any = raw_config
-    if isinstance(raw_config, str) and raw_config:
-        try:
-            config = json.loads(raw_config)
-        except ValueError:
-            return None
-    if isinstance(config, dict) and config.get("_delegate_from"):
-        return None
-    return sender[1]
-
-
-=======
->>>>>>> 87600cb1095 (fix(controls): allow reasoned agent-owned edits and verified relay quotes)
 def _unwrap_steer(content: str) -> str:
     """The steer payload without the OUT-OF-BAND markers, so its own edge lines can be inspected."""
     text = content.strip()
