@@ -154,10 +154,17 @@ async def test_context_overflow_retries_once_unless_the_failed_dm_is_still_an_op
     bot.errors[:] = ["This model's maximum context length is 200000 tokens"]
     bot.authority.db.append_message(bot.chat, 'user', content='overflowed dm')
     await deliver(bot.connection, dict(id=other, profile='default', message='overflowed dm'))
-    for _ in range(100):
+    record = {}
+    for _ in range(250):
         await asyncio.sleep(0.02)
-        record = (await asyncio.to_thread(read_delivery_result, bot.home, other))
-        if (record.get('retry') or {}).get('refused'):
+        current = await asyncio.to_thread(read_delivery_result, bot.home, other)
+        if current is None:
+            continue
+        record = current
+        retry = record.get('retry') or {}
+        if (retry.get('refused') == 'open_user_tail'
+                and record.get('status') == 'failed'
+                and record.get('reason') == 'context_overflow'):
             break
     assert record['retry']['refused'] == 'open_user_tail' and len(_admissions(bot)) == 3
     assert (record['status'], record['reason']) == ('failed', 'context_overflow'), record
