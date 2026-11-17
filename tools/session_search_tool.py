@@ -750,9 +750,10 @@ def check_session_search_requirements() -> bool:
 SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
-        "Search or read past Hermes conversations (FTS5), find a session by title or topic, resolve the session for a Slack thread or Telegram topic, or scroll inside one. Shapes are picked by args: `query` = discovery "
-        "(top-N matching sessions, top result fully hydrated); `lookup` = deterministic title/topic/platform route resolution "
-        "for Slack channel+thread_ts or Telegram chat+topic/thread; `session_id` + "
+        "Find Hermes sessions by title, topic, or route. "
+        "A named owner or delegated worker can use typed lookup to resolve the right session before reading or relaying. "
+        "Use `lookup` for deterministic title/topic/platform resolution, including Slack channel+thread_ts "
+        "or Telegram chat+topic/thread; use `query` for discovery (top-N matching sessions, top result fully hydrated); "
         "`around_message_id` = scroll (window of messages around an anchor); "
         "`session_id` alone = read a whole session — how you resolve an "
         "`@session:<profile>/<id>` link (split on '/' into profile + id); no "
