@@ -131,6 +131,11 @@ def current_removal_quote(session_id, quote, *, requirements=(), cursor=None, co
             return "user_quote_qualified"
     quoted_removal = re.search(r"(?i)\b(?:remove|drop|delete|clear|disable)\b", source) and re.search(r"['\"“”][^'\"“”]+['\"”]", source)
     if quoted_removal:
+        if not re.fullmatch(
+                r"\s*(?:please\s+)?(?:remove|drop|delete|clear|disable)\s+['\"“”][^'\"“”]+['\"”]"
+                r"(?:\s+from\s+(?:the\s+)?[\w:-]+(?:\s+(?:goal|loop))?)?[.!;\s]*",
+                source, re.IGNORECASE | re.DOTALL):
+            return "user_quote_qualified"
         masked_source = re.sub(r"['\"“”][^'\"“”]+['\"”]", " ", source)
         if _is_negated(masked_source, masked_source) or "?" in masked_source or any(word in _QUALIFIER_TOKENS for word in _negation_words(masked_source)):
             return "user_quote_qualified"
