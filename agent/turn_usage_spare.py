@@ -13,5 +13,5 @@ def record_spare_fallback_usage(agent: Any, usage: Any) -> None:
     try:
         from agent.spare_guards import record_fallback_usage
         record_fallback_usage(agent, usage)
-    except (ImportError, OSError, TypeError, ValueError):
+    except Exception:
         logger.debug("Spare fallback usage accounting failed", exc_info=True)

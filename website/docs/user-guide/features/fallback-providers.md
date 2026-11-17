@@ -60,7 +60,9 @@ to `0` to disable that family's budget. A fallback entry may explicitly set `ups
 another family) when provider/model naming is ambiguous. The budget is charged only while the route
 is a fallback. A spare used as the primary route is not capped or budgeted, which preserves deliberate
 quota-burn cron jobs. Over-budget routes are skipped and the chain continues; active lease slots are
-released on child exit and expire after a crash.
+released on child exit and expire after a crash. Lease heartbeats run with fallback usage accounting,
+and the one-hour TTL covers a child blocked in a long tool call. Guard-state lock or write failures
+fail open so a damaged local guard cannot create a new terminal provider error.
 
 When a rate-limit response names its reset time, the primary is benched until exactly then (a provider that says nothing gets the exponential 60 s → 4 h backoff). Optionally, skip the switch when the primary reopens soon:
 

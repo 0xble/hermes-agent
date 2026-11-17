@@ -2254,15 +2254,16 @@ def try_activate_fallback(
         fb_model = (fb.get("model") or "").strip()
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
-        # Spare admission is deliberately checked after the ordinary route-health checks:
-        # a malformed or known-dead route must not consume a scarce delegated-child slot.
+        reservation = None
         try:
             from agent.spare_guards import reserve_fallback_route
-            if not reserve_fallback_route(agent, fb):
+            reservation = reserve_fallback_route(agent, fb)
+            if not reservation:
                 continue
         except Exception:
             logger.debug("Spare fallback admission check failed; keeping the route available", exc_info=True)
 
+        reservation_committed = False
         try:
             from agent.route_binding import bind_route_entry
             old_route = resolved_route(agent)
@@ -2270,13 +2271,16 @@ def try_activate_fallback(
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
-                _release_spare_lease(agent)
+                _release_spare_lease(agent, reservation)
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
             if getattr(agent, "_shared_primary_probe_token", None):
                 from agent.shared_primary_cooldown import settle_primary_probe_on_exit
                 settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)
+            from agent.spare_guards import commit_fallback_route
+            commit_fallback_route(agent, reservation)
+            reservation_committed = True
             buffer_fallback_route_notice(
                 agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds)
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
@@ -2290,16 +2294,20 @@ def try_activate_fallback(
         except Exception as e:
             if fb_provider == "nous":
                 unavailable.add(fb_key)
-            _release_spare_lease(agent)
+            if not reservation_committed:
+                _release_spare_lease(agent, reservation)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)
             continue  # try next in chain
 
 
-def _release_spare_lease(agent) -> None:
-    """Return a spare lease taken by an admission whose route then failed to bind."""
+def _release_spare_lease(agent, reservation=None) -> None:
+    """Roll back an admission or release the child's currently held lease."""
     try:
         from agent.spare_guards import release_fallback_route
-        release_fallback_route(agent)
+        if reservation is not None:
+            release_fallback_route(agent, _lease=reservation)
+        else:
+            release_fallback_route(agent)
     except Exception:
         logger.debug("Spare lease release failed", exc_info=True)
 

@@ -4,7 +4,7 @@ This unit owns the shared admission and daily token protections for spare fallba
 
 ## Guarantee
 
-A delegated child can activate at most the configured number of routes for each spare upstream family across Hermes processes. The lease is released when the child exits or restores the primary and is removed after expiry or an orphaned process. A fallback route whose family has exhausted its local-day input + cache-read + output token budget is skipped, while a spare configured as the primary is never charged against this budget.
+A delegated child can activate at most the configured number of routes for each spare upstream family across Hermes processes. The lease is released when the child exits or restores the primary and is removed after expiry or an orphaned process. API usage refreshes the lease; its one-hour TTL is only a backstop for a child stuck in a long tool call. A fallback route whose family has exhausted its local-day input + cache-read + output token budget is skipped, while a spare configured as the primary is never charged against this budget.
 
 ## Configuration
 

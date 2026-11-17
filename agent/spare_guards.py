@@ -20,11 +20,14 @@ from __future__ import annotations
 
 import contextlib
 import datetime as _datetime
+import errno
 import json
 import logging
+import math
 import os
 import time
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -37,9 +40,26 @@ DEFAULT_SPARE_UPSTREAMS = ("meta", "xai")
 DEFAULT_MAX_CONCURRENT_ON_SPARE = 2
 DEFAULT_DAILY_BUDGET_TOKENS = 30_000_000
 # A lease is refreshed by every API call the child makes on the spare; a child silent for this
-# long (or whose pid is gone) loses it.
-LEASE_TTL_SECONDS = 900.0
+# long (or whose pid is gone) loses it. Tool calls can legitimately run for many minutes, so the
+# TTL is a backstop rather than the normal heartbeat.
+LEASE_TTL_SECONDS = 3600.0
+_LOCK_TIMEOUT_SECONDS = 2.0
+_LOCK_RETRY_SECONDS = 0.05
 _STATE_VERSION = 1
+
+
+@dataclass(frozen=True)
+class FallbackRouteReservation:
+    """Admission token used to commit or roll back one fallback bind attempt."""
+
+    family: str
+    lease: tuple[str, str] | None = None
+    prior_lease: tuple[str, str] | None = None
+    prior_upstream: str | None = None
+    newly_acquired: bool = False
+
+    def __bool__(self) -> bool:
+        return True
 
 _MODEL_PREFIX_FAMILIES = (("gpt", "openai"), ("claude", "anthropic"), ("muse", "meta"), ("grok", "xai"))
 _PROVIDER_FAMILIES = {
@@ -68,8 +88,13 @@ def _load_config() -> dict[str, Any]:
 
 def _positive_int(value: Any, default: int) -> int:
     try:
+        if isinstance(value, bool):
+            return default
+        numeric = float(value)
+        if not math.isfinite(numeric):
+            return default
         parsed = int(value)
-    except (TypeError, ValueError):
+    except (OverflowError, TypeError, ValueError):
         return default
     return parsed if parsed >= 1 else default
 
@@ -87,8 +112,12 @@ def spare_settings(config: dict[str, Any] | None = None) -> tuple[frozenset[str]
     raw_budgets = cfg.get("fallback_budgets")
     if isinstance(raw_budgets, dict):
         for family, value in raw_budgets.items():
-            with contextlib.suppress(TypeError, ValueError):
+            try:
+                if isinstance(value, bool) or not math.isfinite(float(value)):
+                    continue
                 budgets[str(family).strip().lower()] = int(value)
+            except (OverflowError, TypeError, ValueError):
+                continue
     return spares, cap, budgets
 
 
@@ -136,12 +165,23 @@ def _locked_state() -> Iterator[tuple[Path, dict[str, Any]]]:
         except ImportError:  # Windows: single-process best effort
             fcntl = None
         if fcntl is not None:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+            deadline = time.monotonic() + _LOCK_TIMEOUT_SECONDS
+            while True:
+                try:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    break
+                except OSError as exc:
+                    if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                        raise
+                    if time.monotonic() >= deadline:
+                        raise OSError("timed out acquiring spare fallback guard lock") from exc
+                    time.sleep(_LOCK_RETRY_SECONDS)
         try:
             yield path, _read_state(path)
         finally:
             if fcntl is not None:
-                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+                with contextlib.suppress(OSError):
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
 
 
 def _write_state(path: Path, state: dict[str, Any]) -> None:
@@ -163,9 +203,11 @@ def _prune(state: dict[str, Any], now: float, day: str) -> None:
         live = {}
         if isinstance(rows, dict):
             for token, row in rows.items():
+                if not isinstance(row, dict):
+                    continue
                 try:
-                    fresh = float(row["expires_at"]) > now
-                except (KeyError, TypeError, ValueError):
+                    fresh = math.isfinite(float(row["expires_at"])) and float(row["expires_at"]) > now
+                except (KeyError, TypeError, ValueError, OverflowError):
                     fresh = False
                 if fresh and _pid_alive(row.get("pid")):
                     live[token] = row
@@ -177,10 +219,14 @@ def _prune(state: dict[str, Any], now: float, day: str) -> None:
 
 
 def _used_today(state: dict[str, Any], day: str, family: str) -> int:
-    rows = state["usage"].get(day)
+    rows = state.get("usage", {}).get(day)
+    raw = rows.get(family, 0) if isinstance(rows, dict) else 0
     try:
-        return max(0, int(rows.get(family, 0))) if isinstance(rows, dict) else 0
-    except (TypeError, ValueError):
+        numeric = float(raw)
+        if not math.isfinite(numeric):
+            return 0
+        return max(0, int(raw))
+    except (OverflowError, TypeError, ValueError):
         return 0
 
 
@@ -211,63 +257,66 @@ def _log_once(agent: Any, key: str, message: str, *args: Any) -> None:
         logger.warning(message, *args)
 
 
-def reserve_fallback_route(agent: Any, entry: dict[str, Any]) -> bool:
-    """Admit *entry* as a fallback route for *agent*; False means skip it and walk on.
+def reserve_fallback_route(agent: Any, entry: dict[str, Any]) -> FallbackRouteReservation | None:
+    """Admit *entry* and return a token for the bind attempt, or ``None`` to skip it.
 
-    Non-spare families always pass. A spare is refused over its daily budget (any agent) or over the
-    concurrency cap (delegated children only); admission takes a cross-process lease released by
-    :func:`release_fallback_route`. A refusal flags the agent so the turn waits instead of failing.
+    The token keeps a prior spare lease alive until the route bind succeeds. This is important when
+    a child rotates from one spare to another: a failed bind must not release the lease it was already
+    holding.
     """
     family = resolve_upstream_family(entry.get("provider"), entry.get("model"), entry)
     spares, cap, budgets = spare_settings()
-    if family not in spares:
-        # Moving to a non-spare route ends this agent's spare tenure.
-        release_fallback_route(agent)
-        agent._spare_fallback_upstream = None
-        return True
-    day, now, budget = _local_day(), time.time(), budgets.get(family, 0)
     held = _held_lease(agent)
+    prior_upstream = getattr(agent, "_spare_fallback_upstream", None)
+    if family not in spares:
+        return FallbackRouteReservation(family, prior_lease=held, prior_upstream=prior_upstream)
+
+    day, now, budget = _local_day(), time.time(), budgets.get(family, 0)
     delegated = _in_delegated_child()
-    with _locked_state() as (path, state):
-        _prune(state, now, day)
-        if budget > 0 and _used_today(state, day, family) >= budget:
-            _write_state(path, state)
-            agent._spare_guard_deferred = True
-            _log_once(agent, f"budget:{family}",
-                      "Fallback skip: spare upstream %s is over its daily token budget (%d)", family, budget)
-            return False
-        if delegated:
-            rows = state["leases"].setdefault(family, {})
-            if held and held[0] == family and held[1] in rows:
-                rows[held[1]]["expires_at"] = now + LEASE_TTL_SECONDS
-            elif len(rows) >= cap:
-                if not rows:
-                    state["leases"].pop(family, None)
+    lease = None
+    newly_acquired = False
+    try:
+        with _locked_state() as (path, state):
+            _prune(state, now, day)
+            if budget > 0 and _used_today(state, day, family) >= budget:
                 _write_state(path, state)
-                agent._spare_guard_deferred = True
-                _log_once(agent, f"cap:{family}",
-                          "Fallback skip: spare upstream %s already has %d/%d delegated children", family, len(rows), cap)
-                return False
-            else:
-                token = uuid.uuid4().hex
-                rows[token] = {"pid": os.getpid(), "expires_at": now + LEASE_TTL_SECONDS}
-                agent._spare_fallback_lease = (family, token)
-        _write_state(path, state)
-    if delegated and held and held[0] != family:
-        release_fallback_route(agent, _lease=held)
+                _log_once(agent, f"budget:{family}",
+                          "Fallback skip: spare upstream %s is over its daily token budget (%d)", family, budget)
+                return None
+            if delegated:
+                rows = state["leases"].setdefault(family, {})
+                if held and held[0] == family and held[1] in rows:
+                    rows[held[1]]["expires_at"] = now + LEASE_TTL_SECONDS
+                    lease = held
+                elif len(rows) >= cap:
+                    if not rows:
+                        state["leases"].pop(family, None)
+                    _write_state(path, state)
+                    _log_once(agent, f"cap:{family}",
+                              "Fallback skip: spare upstream %s already has %d/%d delegated children", family, len(rows), cap)
+                    return None
+                else:
+                    token = uuid.uuid4().hex
+                    lease = (family, token)
+                    rows[token] = {"pid": os.getpid(), "expires_at": now + LEASE_TTL_SECONDS}
+                    newly_acquired = True
+            _write_state(path, state)
+    except OSError:
+        # Guard state is advisory: a filesystem or lock failure must not turn a provider fallback
+        # into a terminal error.
+        logger.debug("Spare fallback admission state unavailable; allowing route", exc_info=True)
+
+    if newly_acquired:
+        agent._spare_fallback_lease = lease
     agent._spare_fallback_upstream = family
-    agent._spare_guard_deferred = False
-    return True
+    return FallbackRouteReservation(
+        family, lease=lease, prior_lease=held, prior_upstream=prior_upstream,
+        newly_acquired=newly_acquired,
+    )
 
 
-def release_fallback_route(agent: Any, *, _lease: tuple[str, str] | None = None) -> None:
-    """Return the agent's spare lease (child exit, restore to primary, failed activation)."""
-    lease = _lease or _held_lease(agent)
-    if lease is None:
-        return
+def _remove_lease(lease: tuple[str, str]) -> None:
     family, token = lease
-    if _lease is None:
-        agent._spare_fallback_lease = None
     try:
         with _locked_state() as (path, state):
             rows = state["leases"].get(family)
@@ -279,6 +328,36 @@ def release_fallback_route(agent: Any, *, _lease: tuple[str, str] | None = None)
         logger.debug("Could not release spare fallback lease", exc_info=True)
 
 
+def commit_fallback_route(agent: Any, reservation: FallbackRouteReservation | None) -> None:
+    """Commit a successfully bound route and retire any lease from its prior route."""
+    if not isinstance(reservation, FallbackRouteReservation):
+        return
+    if reservation.prior_lease and reservation.prior_lease != reservation.lease:
+        _remove_lease(reservation.prior_lease)
+    if reservation.family not in spare_settings()[0]:
+        agent._spare_fallback_lease = None
+        agent._spare_fallback_upstream = None
+
+
+def release_fallback_route(
+    agent: Any, *, _lease: tuple[str, str] | FallbackRouteReservation | None = None,
+) -> None:
+    """Return a child lease, or roll back one failed bind using its admission token."""
+    if isinstance(_lease, FallbackRouteReservation):
+        if _lease.newly_acquired and _lease.lease:
+            _remove_lease(_lease.lease)
+        agent._spare_fallback_lease = _lease.prior_lease
+        agent._spare_fallback_upstream = _lease.prior_upstream
+        return
+    lease = _lease or _held_lease(agent)
+    if lease is None:
+        return
+    if _lease is None:
+        agent._spare_fallback_lease = None
+        agent._spare_fallback_upstream = None
+    _remove_lease(lease)
+
+
 def record_fallback_usage(agent: Any, usage: Any) -> None:
     """Add one API call's input + cache-read + output tokens to the active spare's daily total."""
     family = getattr(agent, "_spare_fallback_upstream", None)
@@ -286,7 +365,7 @@ def record_fallback_usage(agent: Any, usage: Any) -> None:
         return
     total = 0
     for field in ("input_tokens", "cache_read_tokens", "output_tokens"):
-        with contextlib.suppress(TypeError, ValueError):
+        with contextlib.suppress(OverflowError, TypeError, ValueError):
             total += max(0, int(getattr(usage, field, 0) or 0))
     held = _held_lease(agent)
     if total <= 0 and not held:
@@ -307,5 +386,9 @@ def record_fallback_usage(agent: Any, usage: Any) -> None:
 
 
 def used_today(family: str) -> int:
-    with _locked_state() as (_, state):
-        return _used_today(state, _local_day(), family)
+    try:
+        with _locked_state() as (_, state):
+            return _used_today(state, _local_day(), family)
+    except OSError:
+        logger.debug("Could not read spare fallback usage", exc_info=True)
+        return 0

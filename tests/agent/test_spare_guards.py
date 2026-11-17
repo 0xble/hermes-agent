@@ -1,5 +1,6 @@
 """Shared spare-fallback admission and daily-budget guards."""
 
+import os
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -115,21 +116,64 @@ def test_real_try_activate_skips_capped_spare_and_moves_down_chain(monkeypatch, 
         guards.release_fallback_route(replacement)
 
 
-def test_deferred_spare_guard_waits_primary_cooldown(monkeypatch):
-    from agent.turn_spare_guard_wait import wait_for_deferred_spare_guard
+def test_pid_dead_and_expired_leases_are_pruned(monkeypatch):
+    state = {"leases": {"meta": {
+        "dead": {"pid": 10, "expires_at": 999.0},
+        "expired": {"pid": os.getpid(), "expires_at": 1.0},
+        "live": {"pid": os.getpid(), "expires_at": 999.0},
+    }}, "usage": {}}
+    monkeypatch.setattr(guards, "_pid_alive", lambda pid: pid != 10)
+    guards._prune(state, now=100.0, day="2026-11-16")
+    assert set(state["leases"]["meta"]) == {"live"}
 
-    agent = SimpleNamespace(_spare_guard_deferred=True, _rate_limited_until=110.0)
-    retry = SimpleNamespace()
-    monkeypatch.setattr("agent.turn_spare_guard_wait.time.monotonic", lambda: 100.0)
-    seen = {}
 
-    def _sleep(agent, seconds, retry, **kwargs):
-        seen["seconds"] = seconds
+def test_corrupt_state_and_infinity_fail_open(monkeypatch, tmp_path):
+    path = tmp_path / "state.json"
+    path.write_text(
+        '{"leases":{"meta":{"bad":{"pid":1,"expires_at":Infinity}}},'
+        '"usage":{"2026-11-16":{"meta":Infinity}}}', encoding="utf-8",
+    )
+    monkeypatch.setattr(guards, "_state_path", lambda: path)
+    monkeypatch.setattr(guards, "_local_day", lambda: "2026-11-16")
+    monkeypatch.setattr(guards, "_load_config", lambda: _config())
+    monkeypatch.setattr(guards, "_in_delegated_child", lambda: True)
+    assert guards.used_today("meta") == 0
+    assert guards.reserve_fallback_route(_agent(), _route())
+    assert guards.spare_settings({"fallback_budgets": {"meta": float("inf")}})[2]["meta"] == 30_000_000
 
-    monkeypatch.setattr("agent.turn_recovery.interruptible_backoff_sleep", _sleep)
-    assert wait_for_deferred_spare_guard(agent, retry, messages=[], conversation_history=[], api_call_count=1) is None
-    assert seen["seconds"] == 10.0
-    assert not agent._spare_guard_deferred
+
+def test_lock_oserror_fails_open(monkeypatch, tmp_path):
+    monkeypatch.setattr(guards, "_state_path", lambda: tmp_path / "state.json")
+    monkeypatch.setattr(guards, "_load_config", lambda: _config())
+    monkeypatch.setattr(guards, "_in_delegated_child", lambda: True)
+    monkeypatch.setattr(guards, "_locked_state", lambda: (_ for _ in ()).throw(OSError("lock")))
+    assert guards.reserve_fallback_route(_agent(), _route())
+
+
+def test_failed_bind_rolls_back_only_new_lease(monkeypatch, tmp_path):
+    monkeypatch.setattr(guards, "_state_path", lambda: tmp_path / "state.json")
+    monkeypatch.setattr(guards, "_load_config", lambda: _config(cap=2))
+    monkeypatch.setattr(guards, "_in_delegated_child", lambda: True)
+    agent = _agent()
+    prior = guards.reserve_fallback_route(agent, _route("muse-prior"))
+    assert prior and agent._spare_fallback_lease
+    next_reservation = guards.reserve_fallback_route(agent, _route("grok-next"))
+    assert next_reservation and next_reservation.newly_acquired
+    guards.release_fallback_route(agent, _lease=next_reservation)
+    assert agent._spare_fallback_lease == prior.lease
+    assert guards.used_today("meta") == 0
+    guards.release_fallback_route(agent)
+
+
+def test_cap_refusal_follows_exhausted_chain_without_sleep(monkeypatch, tmp_path):
+    monkeypatch.setattr(guards, "_state_path", lambda: tmp_path / "state.json")
+    monkeypatch.setattr(guards, "_load_config", lambda: _config(cap=1))
+    monkeypatch.setattr(guards, "_in_delegated_child", lambda: True)
+    holder = _agent()
+    assert guards.reserve_fallback_route(holder, _route())
+    refused = _agent()
+    assert guards.reserve_fallback_route(refused, _route()) is None
+    guards.release_fallback_route(holder)
 
 
 def test_daily_budget_rolls_over(monkeypatch, tmp_path):

@@ -400,14 +400,6 @@ def settle_unrecovered_error(
                 active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
                 retry_count = compression_attempts = 0
                 return _verdict("break")
-        from agent.turn_spare_guard_wait import wait_for_deferred_spare_guard
-        _spare_wait = wait_for_deferred_spare_guard(
-            agent, _retry, messages=messages, conversation_history=conversation_history,
-            api_call_count=api_call_count,
-        )
-        if _spare_wait is not None:
-            _settle_primary_exit()
-            return _verdict("return", _spare_wait)
         # Terminal from here: collapse the continuation trail once, before the persist.
         _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
@@ -462,14 +454,6 @@ def settle_unrecovered_error(
             active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
             retry_count = compression_attempts = 0
             return _verdict("break")
-        from agent.turn_spare_guard_wait import wait_for_deferred_spare_guard
-        _spare_wait = wait_for_deferred_spare_guard(
-            agent, _retry, messages=messages, conversation_history=conversation_history,
-            api_call_count=api_call_count,
-        )
-        if _spare_wait is not None:
-            _settle_primary_exit()
-            return _verdict("return", _spare_wait)
         # Fallback first (above); only with nothing left to move to does the bounded auto-recovery
         # ladder park the turn on a transient outage instead of ending it (#85426, #107307).
         from agent.turn_recovery_autorecover import auto_recover_after_exhaustion
