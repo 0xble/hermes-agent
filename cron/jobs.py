@@ -2457,9 +2457,11 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
             jobs_time.prune_inherited_knobs(updated)
         if {"schedule", "max_catch_up_lateness_seconds"}.intersection(updates):
             schedule = updated.get("schedule") or {}
-            validate_catch_up_floor(
-                parse_schedule(schedule) if isinstance(schedule, str) else schedule,
-                updated.get("max_catch_up_lateness_seconds"))
+            schedule = parse_schedule(schedule) if isinstance(schedule, str) else schedule
+            # Recheck only a real change, so re-sending a record's own schedule beside an
+            # unrelated edit never strands a legacy limit that predates the floor.
+            if "max_catch_up_lateness_seconds" in updates or schedule != job.get("schedule"):
+                validate_catch_up_floor(schedule, updated.get("max_catch_up_lateness_seconds"))
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield

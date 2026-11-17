@@ -317,3 +317,29 @@ def test_protected_interval_at_floor_dispatches_a_routinely_late_tick(store):
     job["schedule"] = {"kind": "interval", "minutes": 1}
     jobs.save_jobs([job])
     assert [d["id"] for d in jobs.get_due_jobs()] == ["window-job"]
+
+
+def test_legacy_record_below_floor_keeps_working_until_its_limit_changes(store):
+    """Records stored before the floor (the live 1-minute job had 50) load and survive
+    lifecycle, next_run_at, unrelated and same-schedule edits; '' still clears the limit."""
+    legacy = recurring(0, limit=50)
+    legacy["schedule"] = {"kind": "interval", "minutes": 1, "display": "every 1m"}
+    jobs.save_jobs([legacy])
+    assert jobs.get_job("window-job")[FIELD] == 50
+    jobs.pause_job("window-job")
+    jobs.resume_job("window-job")
+    later = (NOW + timedelta(minutes=5)).isoformat()
+    jobs.update_job("window-job", {"next_run_at": later})
+    jobs.update_job("window-job", {"prompt": "promote again", "schedule": "every 1m"})
+    assert jobs.get_job("window-job")[FIELD] == 50
+    with pytest.raises(ValueError, match="at least 120"):
+        jobs.update_job("window-job", {FIELD: 60})
+    assert jobs.update_job("window-job", {FIELD: ""}).get(FIELD) is None
+
+
+def test_refused_schedule_change_leaves_record_untouched(store):
+    job = jobs.create_job("run", "every 1h", **{FIELD: 50})
+    before = jobs.get_job(job["id"])
+    with pytest.raises(ValueError, match=FIELD):
+        jobs.update_job(job["id"], {"schedule": "every 1m", "repeat": {"times": 3, "completed": 0}})
+    assert jobs.get_job(job["id"]) == before

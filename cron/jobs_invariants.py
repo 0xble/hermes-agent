@@ -67,6 +67,9 @@ def validate_schedule_knobs(
             f"missed); this job's schedule kind is {kind!r}.")
 
 
+CATCH_UP_TICK_SECONDS = 60  # the ticker's default scan interval (cron/scheduler_provider.py)
+
+
 def validate_catch_up_floor(schedule: dict, limit: Optional[float]) -> None:
     """Reject a catch-up deadline a protected interval (<= 2 min) cannot meet.
 
@@ -88,9 +91,6 @@ def validate_catch_up_floor(schedule: dict, limit: Optional[float]) -> None:
             f"lateness of an interval of {PROTECTED_INTERVAL_MAX_SECONDS // 60} minutes or less "
             f"(one cadence plus one {CATCH_UP_TICK_SECONDS}s scheduler tick); occurrences would "
             f"be skipped routinely. Use at least {floor:g}, or omit it to never skip.")
-
-
-CATCH_UP_TICK_SECONDS = 60
 
 
 def _script_is_command_line(script: str) -> bool:
