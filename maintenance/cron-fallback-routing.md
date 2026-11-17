@@ -54,3 +54,5 @@ and the routing regressions pass there. A PR merge alone does not establish
 release-baseline coverage. To roll back source, revert this logical patch;
 profiles using an explicit cron override must be reconciled before activation
 because older code would resume global inheritance.
+
+Contract tests: `tests/agent/test_provider_fallback.py`, `tests/cron/test_script_context_propagation.py`, `tests/cron/test_cron_script.py`, `tests/cron/test_cron_fallback_config.py`, `tests/hermes_cli/test_fallback_config.py`.

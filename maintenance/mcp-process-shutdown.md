@@ -29,3 +29,5 @@ The process-exit regression creates a real DNS executor and returns from main wi
 ## Rollback
 
 Remove only the `concurrent.futures.thread` state check in `tools/interpreter_shutdown.py`, the process-state guard, PID attribution and their imports in `tools/mcp_tool_server_run.py`, the focused regression file, this unit and its index row. The aggregate audit commit may contain unrelated fixes and must not be reverted wholesale.
+
+Contract tests: `tests/tools/test_mcp_process_shutdown.py`, `tests/tools/test_mcp_cancelled_error_propagation.py`, `tests/tools/test_mcp_park_log_dedupe.py`, `tests/agent/test_interpreter_shutdown_turn_exit.py`, `tests/cron/test_scheduler_shutdown_guard.py`.

@@ -200,3 +200,5 @@ already recorded goal transitions or authorize a service restart.
 
 Stack fit: existing Python, GoalManager, optimistic SQLite snapshots, session
 controls, native idle wake admission and pytest. No new dependencies or services.
+
+Contract tests: `tests/hermes_cli/test_goal_removal_targets.py`, `tests/hermes_cli/test_goal_autonomy.py`, `tests/agent/test_synthetic_prompt_legacy_goals.py`, `tests/agent/test_quiet_goal_receipts.py`, `tests/gateway/test_lifecycle_cards_hidden.py`, `tests/gateway/test_goal_notices_config.py`, `tests/gateway/test_quiet_goal_control_recovery.py`.

@@ -20,6 +20,10 @@ from hermes_cli.checkins import (
 
 logger = logging.getLogger(__name__)
 
+# poll_checkins groups every routed session on the event loop each tick (tens of thousands on a
+# long-lived home); yield between slices so one pass cannot hold the loop.
+_SCAN_YIELD_EVERY = 512
+
 
 def _manager(runner, entry, config=None):
     return CheckinManager(runner.session_store._db_for_key(entry.session_key), entry.session_id,
@@ -87,7 +91,10 @@ async def poll_checkins(runner):
         seen = runner._checkin_seen = {}
     scope_key = functools.partial(GatewayTurnMixin._profile_scope_key_for_source, runner)
     by_scope = {}
-    for entry in await runner._run_in_executor_with_context(runner.session_store.list_sessions):
+    entries = await runner._run_in_executor_with_context(runner.session_store.list_sessions)
+    for index, entry in enumerate(entries):
+        if index and not index % _SCAN_YIELD_EVERY:
+            await asyncio.sleep(0)  # the roster is every routed session: let the loop breathe
         if entry.suspended or not entry.origin:
             continue
         source = runner._restored_source(entry)

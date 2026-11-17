@@ -58,3 +58,5 @@ Also run `scripts/check-windows-footguns.py --all` and `git diff --check`.
 Retire when upstream or the host no longer requires terminal admission handoff.
 Revert the commit carrying `Fork-Patch: heavy-slot-ticket-handoff`.
 No persistent-state migration or live queue changes are involved.
+
+Contract tests: `tests/tools/test_terminal_heavy_slot_handoff.py`, `tests/tools/test_terminal_tool_heavy_slot.py`, `tests/tools/test_terminal_foreground_timeout_cap.py`, `tests/tools/test_base_environment.py`, `tests/tools/test_local_interrupt_cleanup.py`, `tests/tools/test_terminal_bounded_execute.py`.
