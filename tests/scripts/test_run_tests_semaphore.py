@@ -48,7 +48,7 @@ def runner(tmp_path):
     # functions and the installed semaphore cannot affect the absent-tool case.
     # id/dscl/getent let the live-home guard resolve the account default. A
     # missing lookup is itself live, which would hide the admission behavior.
-    for name in ("bash", "dirname", "env", "sed", "head", "id", "cut", "uname")
+    for name in ("bash", "dirname", "env", "sed", "head", "id", "cut", "uname"):
         commands.joinpath(name).symlink_to(shutil.which(name))
     for name in ("getent", "dscl"):
         source = shutil.which(name)
