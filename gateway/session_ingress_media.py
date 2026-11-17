@@ -21,6 +21,7 @@ import threading
 from hermes_dir_acl import make_user_dir
 
 from hermes_state_runtime import ADMITTED_REQUEST_CONFLICT, RuntimeStoreError
+from hermes_state_common import HELD_MEDIA_WHERE
 from utils import fsync_directory
 
 logger = logging.getLogger(__name__)
@@ -393,8 +394,7 @@ def _held_media_paths(conn):
             '$.attachments_v1.media', '$.native_text_v1.media', '$.api_turn_v1.media'),
             CASE WHEN status!='terminal' AND request_id LIKE 'hosted:%'
                  THEN json_extract(payload_json, '$.text') END
-            FROM session_admissions WHERE status!='terminal'
-            OR json_type(payload_json, '$.api_turn_v1.media') IS NOT NULL""").fetchall()
+            FROM session_admissions WHERE """ + HELD_MEDIA_WHERE).fetchall()
     held = set()
     for status, request_id, encoded, text in rows:
         attachments, native, api = json.loads(encoded)
