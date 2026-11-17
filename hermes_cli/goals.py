@@ -2999,6 +2999,15 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             )
         if (goal_autonomy_enabled() or actor == "agent") and live is not None and live.status in {"active", "paused"}:
             raise ValueError("Use revise or replace to preserve the existing goal contract")
+        owned = bool(ownership) if ownership is not None else bool(due or next_check or done_when or log_path or plan_path or baseline)
+        if owned:
+            from hermes_cli.goal_lints import enforce_ownership
+            enforce_ownership(due=due, done_when=done_when,
+                              verification=getattr(contract, "verification", "") if contract else "",
+                              plan_path=plan_path, log_path=log_path,
+                              constraints=getattr(contract, "constraints", "") if contract else "",
+                              stop_when=getattr(contract, "stop_when", "") if contract else "",
+                              ownership=True)
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(), last_turn_at=0.0,
             created_by="agent" if actor == "agent" else "user",
