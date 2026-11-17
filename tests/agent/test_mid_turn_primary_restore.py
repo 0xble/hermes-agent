@@ -808,3 +808,137 @@ def test_child_started_with_cooled_primary_adopts_spare_then_restores_in_same_tu
     assert result["final_response"] == "finished"
     assert requested[0] == "backup", requested
     assert requested[-1] == "primary-model", requested
+
+
+def _primary_500():
+    response = httpx.Response(500, request=httpx.Request("POST", "https://primary.invalid/v1"))
+    return InternalServerError("internal server error", response=response, body={})
+
+
+def test_uncooled_5xx_fallback_returns_to_primary_at_its_bounded_recheck(tool_loop_agent, tmp_path):
+    """The production sequence behind the sticky spare: the primary's attempts end on a plain
+    5xx, the turn moves to its spare, and because a 5xx arms no cooldown nothing ever sent it
+    back. One delegated child then made 189 spare calls over an hour after its primary recovered.
+    """
+    agent = tool_loop_agent
+    requested = []
+    seconds_until_recheck = []
+    primary_healthy = False
+    tool_calls = 0
+
+    def request(kwargs):
+        requested.append(agent.model)
+        if agent.model == "primary-model":
+            if primary_healthy:
+                return _tool_loop_response()
+            raise _primary_500()
+        return _tool_loop_response(f"spare_call_{len(requested)}")
+
+    def tool(*args, **kwargs):
+        nonlocal tool_calls, primary_healthy
+        tool_calls += 1
+        if tool_calls == 3:
+            seconds_until_recheck.append(agent._uncooled_recheck_at - time.monotonic())
+            # The re-check window elapses while the same turn keeps issuing tool calls.
+            agent._uncooled_recheck_at = time.monotonic() - 1
+            primary_healthy = True
+        return "tool result"
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", side_effect=tool),
+    ):
+        result = agent.run_conversation("long delegated task")
+
+    assert result["final_response"] == "finished"
+    # Not due during the first requests, so they stayed on the spare; one re-check, then primary.
+    assert len(seconds_until_recheck) == 1 and 0 < seconds_until_recheck[0] <= 60
+    assert requested == ["primary-model"] + ["backup"] * 3 + ["primary-model"]
+    assert agent.model == "primary-model" and not agent._provider_fallback_active
+    # The re-check is local: it arms no cooldown and writes no shared outage record.
+    assert getattr(agent, "_rate_limited_until", 0) == 0
+    assert not (tmp_path / "state" / "model_cooldowns.json").exists()
+
+
+def test_uncooled_recheck_that_fails_again_widens_its_spacing_instead_of_thrashing(tool_loop_agent):
+    agent = tool_loop_agent
+    requested = []
+    backup_calls = 0
+    tool_calls = 0
+
+    def request(kwargs):
+        nonlocal backup_calls
+        requested.append(agent.model)
+        if agent.model == "primary-model":
+            raise _primary_500()
+        backup_calls += 1
+        return _tool_loop_response(f"relapse_call_{backup_calls}" if backup_calls < 5 else None)
+
+    def tool(*args, **kwargs):
+        nonlocal tool_calls
+        tool_calls += 1
+        if tool_calls == 2:
+            agent._uncooled_recheck_at = time.monotonic() - 1
+        return "tool result"
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", side_effect=tool),
+    ):
+        result = agent.run_conversation("primary is still down")
+
+    assert result["final_response"] == "finished"
+    # One re-check, one failed primary request, then the spare for the rest of the turn.
+    assert requested == ["primary-model", "backup", "backup", "primary-model", "backup", "backup", "backup"]
+    assert agent.model == "backup"
+    assert agent._uncooled_recheck_delay == 120
+    assert agent._uncooled_recheck_at > time.monotonic() + 60
+
+
+def test_uncooled_recheck_is_attempted_once_per_window(recovery_runtime):
+    from agent.fallback_route_recovery_uncooled import (
+        UNCOOLED_RECHECK_BASE_S, UNCOOLED_RECHECK_CAP_S, begin_uncooled_episode, settle_uncooled_recheck,
+    )
+
+    restore = Mock(return_value=False)
+    agent = SimpleNamespace(
+        _fallback_activated=True, _provider_fallback_active=True, _fallback_episode_cooled=True,
+        _cached_system_prompt="Model: primary", _restore_primary_runtime=restore,
+    )
+    begin_uncooled_episode(agent, FailoverReason.server_error)
+    assert agent._fallback_episode_cooled is False
+
+    # Before the deadline no request probes the primary.
+    assert recovery_runtime._restore_primary_runtime_for_iteration(agent, "Model: fallback") == "Model: fallback"
+    restore.assert_not_called()
+
+    # At the deadline exactly one probe runs; a refused restore waits a full window again.
+    agent._uncooled_recheck_at = time.monotonic() - 1
+    for _ in range(3):
+        assert recovery_runtime._restore_primary_runtime_for_iteration(agent, "Model: fallback") == "Model: fallback"
+    restore.assert_called_once_with()
+    assert agent._uncooled_recheck_at > time.monotonic() + UNCOOLED_RECHECK_BASE_S - 5
+
+    # Repeated relapses double the spacing up to the cap; a primary that held starts over.
+    for _ in range(8):
+        settle_uncooled_recheck(agent, restored=True)
+        begin_uncooled_episode(agent, FailoverReason.timeout)
+    assert agent._uncooled_recheck_delay == UNCOOLED_RECHECK_CAP_S
+    agent._uncooled_restored_at = time.monotonic() - 2 * UNCOOLED_RECHECK_CAP_S
+    begin_uncooled_episode(agent, None)
+    assert agent._uncooled_recheck_delay == UNCOOLED_RECHECK_BASE_S
+
+
+def test_deterministic_refusal_fallback_stays_turn_scoped(recovery_runtime):
+    from agent.fallback_route_recovery_uncooled import begin_uncooled_episode
+
+    restore = Mock(return_value=True)
+    agent = SimpleNamespace(
+        _fallback_activated=True, _provider_fallback_active=True,
+        _cached_system_prompt="Model: primary", _restore_primary_runtime=restore,
+    )
+    # The primary would refuse the same conversation the same way on every re-check.
+    begin_uncooled_episode(agent, FailoverReason.content_policy_blocked)
+    assert agent._uncooled_recheck_at is None
+    assert recovery_runtime._restore_primary_runtime_for_iteration(agent, "Model: fallback") == "Model: fallback"
+    restore.assert_not_called()

@@ -60,18 +60,22 @@ def _parse_reset_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float
 
 
 def _clamp_to_minute_window(seconds: float, headers: Optional[Mapping[str, str]]) -> float:
-    """Bound a wait that outlasts the minute bucket the 429's own headers describe.
+    """Bound a wait that no rate-limit window in the 429's own headers can explain.
 
     Some gateways answer a per-minute limit with a days-long ``Retry-After``. Persisting that
-    would block every session on this home for days, so it gets the same cap the in-process
-    retry path applies. An exhausted longer bucket is a real wait and keeps its own reset.
+    would block every session on this home for days, so it is cut to the minute-window cap the
+    in-process retry path uses. A wait that fits inside a window the response describes (the
+    body's own retry time, an hourly bucket) is plausible and kept; an exhausted longer bucket
+    keeps its own reset.
     """
     lowered = lower_headers(headers)
     if seconds <= MINUTE_RATE_LIMIT_COOLDOWN_CAP_S or not _minute_rate_limit_headers(lowered):
         return seconds
-    exhausted = [reset for remaining, reset in _parse_buckets_from_headers(lowered).values()
-                 if remaining is not None and remaining <= 0 and reset]
-    return min(seconds, max([MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, *exhausted]))
+    buckets = list(_parse_buckets_from_headers(lowered).values())
+    if seconds <= max((reset or 0.0 for _remaining, reset in buckets), default=0.0) + 1.0:
+        return seconds
+    exhausted = [reset for remaining, reset in buckets if remaining is not None and remaining <= 0 and reset]
+    return max([MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, *exhausted])
 
 
 def record_nous_rate_limit(

@@ -258,6 +258,18 @@ def test_main_agent_failure_card_points_at_top_level_fallback_providers():
     assert "hermes fallback add" not in text
 
 
+def test_model_map_option_reaches_the_child_only_from_a_model_map_route():
+    from tools.delegate_tool import _route_overrides
+    from tools.delegate_tool_routes import TaskRoute
+
+    creds = {"provider": "custom:openai-proxy", "base_url": "http://127.0.0.1:8317/v1", "api_key": None,
+             "api_mode": None, "model": "gpt-6.1-sol"}
+    assert _route_overrides(TaskRoute(creds, {}, label="coder", backend="model_map"))["model_map_option"] == "coder"
+    # A profile route's label is a profile name, and the default route has none.
+    assert _route_overrides(TaskRoute(creds, {}, label="coder", backend="profiles"))["model_map_option"] is None
+    assert _route_overrides(TaskRoute(creds, {}))["model_map_option"] is None
+
+
 def _guard_agent(*, pending=True, fallback_ok=True, route_scoped=True):
     import time
     from agent.turn_api_call_admission import admission_route

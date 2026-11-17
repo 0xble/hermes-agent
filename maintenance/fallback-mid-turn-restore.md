@@ -26,10 +26,18 @@ explicit model routes. It skips a request rebuild that is still retrying a
 just-activated fallback. Mid-turn primary probes require a local cooldown
 deadline or a held shared cooldown record: the normal restore path reads the
 cross-process record and honors an active outage, expiry, or clearance elsewhere.
-A generic-500/transport primary that never armed a cooldown stays benched until
-the next user turn, not merely until the fallback's first request. An expired
+A generic-500/transport primary that never armed a cooldown has no such deadline,
+so it gets a local one (`agent/fallback_route_recovery_uncooled.py`): the first
+re-check is 60 seconds after the fallback, and a primary that fails again soon
+after a re-check doubles the spacing up to 15 minutes. Without it the episode
+lasted until the next user turn, and a delegated child is a single turn of
+hundreds of requests, so it never left its spare. The re-check is per agent and
+in memory: it arms no cooldown and writes no shared record, and the restore
+still runs through `restore_primary_runtime`, so an outage another process
+recorded still blocks it. A deterministic refusal (content policy, missing
+model, entitlement) gets no re-check and stays turn-scoped. An expired
 `max_stay_seconds` may still retry earlier fallback entries from index zero,
-but cannot retry that uncooled primary. Runtime re-evaluation failures roll back
+and retries that uncooled primary only at its re-check. Runtime re-evaluation failures roll back
 the route and reset the per-entry timer instead of disrupting the turn.
 
 ## Proof and retirement
@@ -39,7 +47,9 @@ prompt provenance, active shared-cooldown blocking, cross-session shared-record
 clearance, ordered-chain recovery after a failed primary retry, stay-limit
 re-evaluation, unchanged behavior for unset limits, and rollback on errors.
 Real conversation-loop regressions also cover voice routing across a tool call,
-uncooled generic-500 failures across several tool iterations, an uncooled
+uncooled generic-500 failures across several tool iterations, the bounded
+uncooled re-check (return to a recovered primary, wider spacing after a relapse,
+one probe per window, none for a deterministic refusal), an uncooled
 stay-limit fallback re-walk, non-last-entry stay limits without demotion,
 quiet earlier-backup reclamation, and bookkeeping reset on restore or explicit
 switch. Voice turns that start on a provider fallback remain pinned across a
@@ -50,3 +60,27 @@ mid-turn restore and optional stay-limit behavior and the regressions pass
 without the local implementation.
 
 Fork patch identities: `fallback-mid-turn-restore`.
+
+## Companion resilience surfaces
+
+The same identity carries the changes that shipped with the uncooled re-check,
+because they share its failure mode (a turn that leaves its primary and cannot
+get back, or cannot say why):
+
+- `agent/turn_api_call_admission.py`: pre-send token-per-minute admission. A
+  minute bucket is matched on provider, endpoint and model, and the check fails
+  open whenever headers, an estimate, or a remaining fallback is missing.
+- `agent/retry_utils.py`, `agent/nous_rate_guard.py`: a days-long `Retry-After`
+  on a per-minute bucket is bounded to the minute-window cap before it is used
+  or persisted.
+- `agent/turn_failure_routes.py`: the failure card names the `fallback_providers`
+  list that feeds the failing agent and only the routes that ran out this episode.
+- `hermes_cli/fallback_config.py`, `hermes_cli/config_value_checks.py`,
+  `hermes_cli/config_migrations_delegation_roles.py`: fallback chains are checked
+  for at least three entries across three upstream families.
+- `tools/delegate_tool_config.py`: a child whose role primary is already cooled
+  starts on the first non-cooled chain entry. That entry becomes the child's
+  primary, so such a child does not return to the role primary.
+
+Proof: `tests/agent/test_model_fallback_resilience.py` and
+`tests/agent/test_nous_rate_guard.py`.

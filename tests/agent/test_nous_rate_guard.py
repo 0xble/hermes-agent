@@ -67,6 +67,48 @@ class TestRecordNousRateLimit:
             state = json.load(f)
         assert state["reset_seconds"] == pytest.approx(410, abs=2)
 
+    def test_days_long_retry_after_on_a_minute_bucket_is_clamped_before_persisting(self, rate_guard_env):
+        # A gateway answered a per-minute limit with "retry after 138 h". Persisted as-is, that
+        # blocked every session on this home for days; the minute bucket's headers bound it.
+        from agent.nous_rate_guard import nous_rate_limit_remaining, record_nous_rate_limit, _state_path
+        from agent.retry_utils import MINUTE_RATE_LIMIT_COOLDOWN_CAP_S
+
+        record_nous_rate_limit(
+            headers={"retry-after": str(138 * 3600), "x-ratelimit-remaining-requests": "0",
+                     "x-ratelimit-reset-requests": "60"},
+            error_context={"reset_at": time.time() + 138 * 3600},
+        )
+
+        with open(_state_path(), encoding="utf-8-sig") as f:
+            state = json.load(f)
+        assert state["reset_seconds"] == pytest.approx(MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, abs=2)
+        remaining = nous_rate_limit_remaining()
+        assert remaining is not None and 0 < remaining <= MINUTE_RATE_LIMIT_COOLDOWN_CAP_S
+
+    def test_clamp_keeps_a_real_long_wait(self, rate_guard_env):
+        from agent.nous_rate_guard import record_nous_rate_limit, _state_path
+
+        def recorded(**kwargs):
+            record_nous_rate_limit(**kwargs)
+            with open(_state_path(), encoding="utf-8-sig") as f:
+                return json.load(f)["reset_seconds"]
+
+        # An exhausted hourly bucket is a real wait even when a minute bucket rides along.
+        assert recorded(
+            headers={"x-ratelimit-remaining-requests-1h": "0", "x-ratelimit-reset-requests-1h": "1800",
+                     "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "30"},
+        ) == pytest.approx(1800, abs=2)
+        # No minute bucket in the headers: nothing says the long wait is wrong.
+        assert recorded(headers={"retry-after": "7200"}) == pytest.approx(7200, abs=2)
+        assert recorded(headers=None, error_context={"reset_at": time.time() + 900}) == pytest.approx(900, abs=2)
+        # The body's own wait fits inside the hourly window the response describes, so a healthy
+        # minute bucket riding along does not shorten it.
+        assert recorded(
+            headers={"x-ratelimit-remaining-requests-1h": "37", "x-ratelimit-reset-requests-1h": "3594",
+                     "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "30"},
+            error_context={"reset_at": time.time() + 410},
+        ) == pytest.approx(410, abs=2)
+
     def test_custom_default_cooldown(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, _state_path
 

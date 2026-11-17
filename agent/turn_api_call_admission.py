@@ -29,10 +29,11 @@ def admission_route(agent: Any) -> tuple[str, str, str]:
 def predicted_tpm_overage(agent: Any, approx_tokens: Any) -> Optional[str]:
     """Describe a predicted minute-bucket overage on the live route, or None to admit."""
     state = getattr(agent, "_rate_limit_state", None)
-    route = getattr(state, "route", None)
-    if state is None or not route or tuple(route) != admission_route(agent):
+    if state is None:
         return None
     try:
+        if tuple(getattr(state, "route", None) or ()) != admission_route(agent):
+            return None
         if tpm_admission_delay(state, approx_tokens) <= 0:
             return None
         remaining, estimate = int(state.tokens_min.remaining), int(approx_tokens)

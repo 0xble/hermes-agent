@@ -30,10 +30,11 @@ def _resolved_route(route: Mapping[str, Any] | None, config: Mapping[str, Any] |
     item = dict(route or {})
     model = str(item.get("model") or "").strip()
     if model:
-        from hermes_cli.model_alias_runtime import ModelAliasError, resolve_model_alias
+        from hermes_cli.model_alias_runtime import resolve_model_alias
         try:
             resolved = resolve_model_alias(model, config or {})
-        except (ModelAliasError, KeyError, TypeError, AttributeError):
+        except Exception:
+            # Config validation runs at every startup and must never fail on one route's alias.
             # An unresolvable alias is reported by validation as the malformed route it is;
             # identity and family checks fall back to the name as written.
             logger.debug("Fallback route alias %r did not resolve", model, exc_info=True)
