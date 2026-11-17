@@ -753,6 +753,7 @@ SESSION_SEARCH_SCHEMA = {
         "Find Hermes sessions by title, topic, or routing identity. "
         "Use typed lookup to resolve a named owner or relay target before reading or sending. "
         "A named owner or delegated worker can use typed lookup to resolve the right session before reading or relaying. "
+        "Use this for relay or send to an owner, recipient, target, topic, or thread: look up the named target first, then pass the returned Hermes session address to relay send. "
         "Use `lookup` for deterministic title/topic/platform resolution, including Slack channel+thread_ts "
         "or Telegram chat+topic/thread; use `query` for discovery (top-N matching sessions, top result fully hydrated); "
         "`around_message_id` = scroll (window of messages around an anchor); "

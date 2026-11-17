@@ -270,7 +270,9 @@ def _search_description(deferred_count: int, listing: Optional[str], listing_for
          if deferred_count else "Search remote connector tools (email, calendars, issue trackers, and more). ")
         + "Send one keyword query per capability you need; returns matching tool names "
         f"and descriptions. Then `{TOOL_DESCRIBE_NAME}` loads schemas and `{TOOL_CALL_NAME}` "
-        "invokes. Tools already in your tool list need no search."
+        "invokes. Tools already in your tool list need no search. "
+        "When a user names an owner, recipient, topic, thread, or target session for a relay or send, "
+        "search for `session_search` first to resolve the name to a Hermes session address."
         + (_CONNECTIONS_HINT if connections_granted else ""))
     if not listing:
         return desc

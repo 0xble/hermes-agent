@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import os
 import re
 import shutil
@@ -65,30 +66,34 @@ def seed_state(home: Path) -> None:
     db.close()
 
 
-def _relay_status_schema(relay_tree: Path, relay_ref: str) -> dict[str, Any]:
-    """Read the MCP status operation's schema fields from relay's Go source."""
+def _relay_op_schema(relay_tree: Path, relay_ref: str, op: str) -> dict[str, Any]:
+    """Read an MCP relay operation summary and input help from relay source."""
+    filename = f"ops/{op}.go"
     source = subprocess.check_output(
-        ["git", "-C", str(relay_tree), "show", f"{relay_ref}:ops/status.go"],
+        ["git", "-C", str(relay_tree), "show", f"{relay_ref}:{filename}"],
         text=True,
         stderr=subprocess.STDOUT,
     )
     summary = re.search(r'(?m)^\s*Summary:\s*"([^"]+)"', source)
-    receipt = re.search(r'`json:"receipt[^`]*help:"([^"]+)"`', source)
-    wait = re.search(r'`json:"wait[^`]*help:"([^"]+)"`', source)
-    if not summary or not receipt or not wait:
-        raise RuntimeError(f"could not extract relay status schema from {relay_ref}")
-    return {
-        "name": "mcp__relay__status",
-        "description": summary.group(1),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "receipt": {"type": "string", "description": receipt.group(1)},
-                "wait": {"type": "string", "description": wait.group(1)},
-            },
-            "required": [],
-        },
-    }
+    if not summary:
+        raise RuntimeError(f"could not extract relay {op} schema from {relay_ref}")
+    properties: dict[str, Any] = {}
+    for field, typ, tag in re.findall(r'(?m)^\s*([A-Z]\w*)\s+([\w\[\]]+)\s+`([^`]+)`', source):
+        json_name = re.search(r'json:"([^,\"]+)', tag)
+        help_text = re.search(r'help:"([^\"]*)"', tag)
+        if json_name and json_name.group(1) != "-":
+            properties[json_name.group(1)] = {"type": {"string": "string", "bool": "boolean"}.get(typ, "string")}
+            if help_text:
+                properties[json_name.group(1)]["description"] = help_text.group(1)
+    return {"name": f"mcp__relay__{op}", "description": summary.group(1), "parameters": {"type": "object", "properties": properties}}
+
+
+def _relay_status_schema(relay_tree: Path, relay_ref: str) -> dict[str, Any]:
+    """Read the MCP status operation's schema fields from relay's Go source."""
+    schema = _relay_op_schema(relay_tree, relay_ref, "status")
+    if not {"receipt", "wait"}.issubset(schema["parameters"]["properties"]):
+        raise RuntimeError(f"relay status schema missing receipt/wait in {relay_ref}")
+    return schema
 
 
 def tool_defs(variant: str, relay_tree: Path) -> list[dict[str, Any]]:
@@ -100,6 +105,7 @@ def tool_defs(variant: str, relay_tree: Path) -> list[dict[str, Any]]:
             raise RuntimeError(f"{name} was not registered by the tree under test")
         defs.append({"name": name, "schema": entry.schema, "toolset": entry.toolset})
     relay_ref = "fix/tool-choice-status-description" if variant == "fixed" else "main"
+    defs.append({"name": "mcp__relay__send", "schema": _relay_op_schema(relay_tree, relay_ref, "send"), "toolset": "mcp-relay"})
     defs.append({"name": "mcp__relay__status", "schema": _relay_status_schema(relay_tree, relay_ref), "toolset": "mcp-relay"})
     return defs
 
@@ -135,18 +141,21 @@ def register_tools(variant: str, relay_tree: Path, log: list[dict[str, Any]]) ->
 def score_trial(calls: list[dict[str, Any]], wire_calls: list[dict[str, Any]], case_id: str) -> dict[str, Any]:
     """Score the first underlying typed state lookup, including tool_call bridge batches."""
     typed_names = {"session_search", "session_state", "mcp__relay__status"}
-    observed: list[dict[str, Any]] = list(calls)
+    observed: list[dict[str, Any]] = []
+    # The transcript preserves model/tool-call order. Registry logs only the
+    # fixture backend calls and can lag bridge calls, so do not use it to infer
+    # which typed lookup happened first.
     for call in wire_calls:
-        if call.get("name") != "tool_call":
-            continue
-        try:
-            payload = json.loads(call.get("args", "{}"))
-        except (TypeError, json.JSONDecodeError):
-            continue
-        for nested in payload.get("calls", []) or []:
-            if nested.get("name") in typed_names:
-                observed.append(nested)
-    typed = [c for c in observed if c.get("name") in typed_names]
+        if call.get("name") == "tool_call":
+            try:
+                payload = json.loads(call.get("args", "{}"))
+            except (TypeError, json.JSONDecodeError):
+                continue
+            observed.extend(nested for nested in payload.get("calls", []) or [] if nested.get("name") in typed_names)
+        elif call.get("name") in typed_names:
+            observed.append(call)
+    observed.extend(c for c in calls if c.get("name") in typed_names and c not in observed)
+    typed = observed
     first_state = typed[0]["name"] if typed else None
     raw = json.dumps(wire_calls + calls, ensure_ascii=False)
     bad = bool(re.search(r"sqlite3|state\\.db|select .* from sessions|PRAGMA", raw, re.I))
@@ -174,7 +183,7 @@ def run_one(tree: Path, relay_tree: Path, variant: str, prompt: str, model: str,
     env_file = Path.home() / ".hermes" / ".env"
     if auth.is_file(): shutil.copy(auth, home / "auth.json")
     if env_file.is_file(): shutil.copy(env_file, home / ".env")
-    config = {"model": {"provider": provider, "model": model}, "providers": {"openai": {"api_mode": api_mode or "codex_responses", "base_url": base_url or "http://127.0.0.1:8317/v1", "key_env": "CLIPROXYAPI_API_KEY"}}, "tools": {"tool_search": {"enabled": "on", "threshold_pct": 10, "search_default_limit": 10, "max_search_limit": 25, "defer": ["session_search", "session_state", "mcp__relay__status"]}}}
+    config = {"model": {"provider": provider, "model": model}, "providers": {"openai": {"api_mode": api_mode or "codex_responses", "base_url": base_url or "http://127.0.0.1:8317/v1", "key_env": "CLIPROXYAPI_API_KEY"}}, "tools": {"tool_search": {"enabled": "on", "threshold_pct": 10, "search_default_limit": 10, "max_search_limit": 25, "defer": ["session_search", "session_state", "mcp__relay__send", "mcp__relay__status"]}}}
     (home / "config.yaml").write_text(_yaml_or_json(config), encoding="utf-8")
     os.environ["HERMES_HOME"] = str(home)
     os.environ["CUSTOM:OPENAI_PROXY_API_KEY"] = os.environ.get("CLIPROXYAPI_API_KEY", "")
@@ -207,6 +216,7 @@ def run_one(tree: Path, relay_tree: Path, variant: str, prompt: str, model: str,
     case_id = next((cid for cid, base_prompt, _expected in CASES if prompt == base_prompt or prompt in PARAPHRASES.get(cid, [])), "")
     score = score_trial(calls, transcript_calls, case_id)
     out = {"prompt": prompt, "variant": variant, "model": model, **score, "typed_calls": calls, "wire_calls": transcript_calls, "error": error}
+    logging.shutdown()
     shutil.rmtree(root, ignore_errors=True)
     return out
 
