@@ -35,6 +35,7 @@ from agent.turn_failure_copy import (
     CONTENT_POLICY_NEXT_STEPS, content_policy_copy, exhausted_copy, limit_reset_copy, nonretryable_copy, provider_label_for, site_copy, stamp_failure,
 )
 from agent.route_verdicts import route_visit
+from agent.turn_failure_routes import exhausted_route_labels, fallback_chain_path
 from agent.turn_retry_state import TurnRetryState
 from agent.notice_style import ContextNotice
 from agent.turn_recovery_codex import _codex_soft_failure_error, _is_codex_token_expired, _recover_stale_codex_reasoning
@@ -969,8 +970,7 @@ def nonretryable_client_error_result(
         _vlines(
             agent,
             f"   💡 {CONTENT_POLICY_NEXT_STEPS}",
-            "      To route future blocks automatically, add three independent ordered providers under",
-            "      delegation.backends.model_map.<role>.fallback_providers, then retry.",
+            f"      To route future blocks to another provider, list backups under {fallback_chain_path(agent)}.",
         )
     # TLS certificate failures are environment problems — name the knobs for each cause.
     if classified.reason == FailoverReason.ssl_cert_verification:
@@ -1159,14 +1159,8 @@ def max_retries_exhausted_result(
         _final_response = exhausted_copy(
             classified.reason.value, label=provider_label_for(provider), attempts=attempts, error=api_error,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
-            earliest_route_seconds=_earliest_s,
-            delegation_role=(getattr(agent, "_delegation_model_map_role", None)
-                              or getattr(agent, "_delegate_role", None)),
-            exhausted_routes=[
-                f"{entry.get('provider')}:{entry.get('model')}"
-                for entry in (getattr(agent, "_fallback_chain", None) or [])
-                if isinstance(entry, dict)
-            ],
+            earliest_route_seconds=_earliest_s, chain_path=fallback_chain_path(agent),
+            exhausted_routes=exhausted_route_labels(agent, provider, model),
         )
         if _welcome_hint:
             _final_response = _welcome_tier_guidance(classified, model=model, in_chat=True)

@@ -770,12 +770,19 @@ def _resolve_child_runtime(
                 candidate_base_url = str(entry.get("base_url") or "").strip() or None
                 if not candidate_model or fallback_route_is_active(candidate_provider, candidate_base_url, candidate_model):
                     continue
-                candidate = _resolve_delegation_credentials({
-                    "provider": candidate_provider, "model": candidate_model,
-                    "base_url": candidate_base_url, "api_key": entry.get("api_key"),
-                    "api_mode": entry.get("api_mode"),
-                    "request_overrides": entry.get("request_overrides"),
-                }, parent_agent)
+                try:
+                    candidate = _resolve_delegation_credentials({
+                        "provider": candidate_provider, "model": candidate_model,
+                        "base_url": candidate_base_url, "api_key": entry.get("api_key"),
+                        "api_mode": entry.get("api_mode"),
+                        "request_overrides": entry.get("request_overrides"),
+                    }, parent_agent)
+                except ValueError:
+                    # An entry that cannot be credentialed here is not a route to start on;
+                    # the next one may be, and the primary remains the last resort.
+                    logger.warning("Delegation fallback %s/%s has no usable credentials; trying the next entry",
+                                   candidate_provider, candidate_model)
+                    continue
                 effective_model = candidate.get("model") or candidate_model
                 effective_provider = candidate.get("provider") or candidate_provider
                 effective_base_url = candidate.get("base_url")
