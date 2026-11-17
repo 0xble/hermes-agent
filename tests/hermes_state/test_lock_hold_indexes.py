@@ -74,9 +74,13 @@ def test_moved_receipts_is_indexed_and_matches_not_indexed_for_all_target_modes(
             assert "m.key GLOB ?" in sql
             assert POLICY_PREFIX + "*" in params
             assert ("json_each(?)" in sql) is (target_ids is not None)
-            assert "idx_state_meta_local_policy_route" in " ".join(_plan(db._conn, sql, params))
+            # SQLite cannot plan a forced partial index from a bound GLOB parameter. Keep the
+            # production query parameterized, but use the equivalent literal only for plan proof.
+            plan_sql = sql.replace("m.key GLOB ?", f"m.key GLOB '{POLICY_PREFIX}*'")
+            plan_params = (params[0], *params[2:])
+            assert "idx_state_meta_local_policy_route" in " ".join(_plan(db._conn, plan_sql, plan_params))
 
-            reference_sql = sql.replace(
+            reference_sql = plan_sql.replace(
                 "state_meta m INDEXED BY idx_state_meta_local_policy_route", "state_meta m NOT INDEXED"
             )
             expected = {
