@@ -465,6 +465,12 @@ def _run_single_child(
             preview=str(exc), summary=str(exc), status="failed",
         )
     finally:
+        if not _child_close_deferred:
+            try:
+                from agent.spare_guards import release_fallback_route
+                release_fallback_route(child)
+            except Exception:
+                logger.debug("Failed to release spare fallback lease", exc_info=True)
         run.cleanup(heartbeat=heartbeat, child_pool=child_pool, leased_cred_id=leased_cred_id, close_deferred=_child_close_deferred)
         # This is the driver's final boundary, including any synchronous schema-retry turn.
         # An abandoned conversation can publish only after its genuine done callback.

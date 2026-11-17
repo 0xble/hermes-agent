@@ -67,6 +67,11 @@ def finish_fallback_restore(agent, was_active, held_shared_record, previous_mode
     from agent.notice_style import ContextNotice
 
     silent_retry = bool(getattr(agent, "_provider_fallback_silent_retry", False))
+    try:
+        from agent.spare_guards import release_fallback_route
+        release_fallback_route(agent)
+    except Exception:
+        logger.debug("Spare lease release during primary restore failed", exc_info=True)
     agent._provider_fallback_active = False
     agent._provider_fallback_silent_retry = False
     agent._provider_fallback_route = None

@@ -313,6 +313,11 @@ def record_response_usage(
     # accounting; gateway/session-store writes use absolute totals and safely overwrite
     # these deltas. Enqueued, not written (a cold state.db UPDATE here stalled the tool
     # loop); drained at finalize via _persist_session.
+    # Keep spare fallback budgets aligned with the same canonical usage object that
+    # is persisted to state.db; direct primary use never sets this marker.
+    from agent.turn_usage_spare import record_spare_fallback_usage
+    record_spare_fallback_usage(agent, canonical_usage)
+
     if agent._session_db and agent.session_id:
         try:
             # Ensure the row exists: under concurrent SQLite load the initial
