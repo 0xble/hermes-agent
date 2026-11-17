@@ -48,10 +48,10 @@ def _resolve_repo() -> Path:
 
 REPO = _resolve_repo()
 EXTENSION_TOOLS = ("goal_set", "loop_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
-# key -> (expected, or None meaning "must be set")
+# key -> (expected, or None meaning "must be set"). Delegation is checked separately because
+# legacy ``delegation.model`` and Advanced Delegation's model-map route are both supported.
 EXPECTED_CONFIG = {
     "memory.write_approval": "false",
-    "delegation.model": None,
     "auxiliary.review.model": None,
 }
 # Fallback only: the accepted baseline is read from MAINTENANCE.md (scripts/ci/release_baseline.py),
@@ -362,6 +362,18 @@ def check_extensions(home: Path) -> list[str]:
     return failures
 
 
+def _config_get(python: Path, code_root: Path, env: dict[str, str], key: str) -> tuple[subprocess.CompletedProcess[str], str]:
+    """Read one value through the release CLI, keeping config resolution in one place."""
+    run = subprocess.run([str(python), "-m", "hermes_cli.main", "config", "get", key], cwd=str(code_root), env=env,
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
+    value = (run.stdout.strip().splitlines() or [""])[-1].strip()
+    return run, value
+
+
+def _is_set(run: subprocess.CompletedProcess[str], value: str) -> bool:
+    return run.returncode == 0 and bool(value) and value.lower() not in ("none", "null")
+
+
 def check_config(home: Path) -> list[str]:
     failures: list[str] = []
     context = _runtime_context(home)
@@ -370,14 +382,30 @@ def check_config(home: Path) -> list[str]:
     python, code_root = context
     env = _runtime_env(home, code_root)
     for key, expected in EXPECTED_CONFIG.items():
-        run = subprocess.run([str(python), "-m", "hermes_cli.main", "config", "get", key], cwd=str(code_root), env=env,
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
-        value = (run.stdout.strip().splitlines() or [""])[-1].strip()
+        run, value = _config_get(python, code_root, env, key)
         if expected is None:
-            if run.returncode != 0 or not value or value.lower() in ("none", "null", ""):
+            if not _is_set(run, value):
                 failures.append(f"config {key} is not set")
         elif value.lower() != expected.lower():
             failures.append(f"config {key} = {value!r}, expected {expected!r}")
+
+    # ``delegation.model`` is the legacy route. Advanced Delegation stores the selected
+    # provider and its effective default route separately; ask the same config resolver that
+    # the CLI uses instead of reading YAML or deleting the route requirement altogether.
+    legacy_run, legacy_model = _config_get(python, code_root, env, "delegation.model")
+    if not _is_set(legacy_run, legacy_model):
+        backend_run, backend = _config_get(python, code_root, env, "delegation.backend")
+        default_run, default_route = _config_get(python, code_root, env, "delegation.backends.model_map.default")
+        advanced_route = (
+            _is_set(backend_run, backend)
+            and backend.lower() == "model_map"
+            and _is_set(default_run, default_route)
+        )
+        if not advanced_route:
+            failures.append(
+                "config delegation route is not resolvable: set delegation.model or "
+                "delegation.backend='model_map' with a non-empty delegation.backends.model_map.default"
+            )
     return failures
 
 

@@ -390,6 +390,48 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     assert mod.check_config(tmp_path) == ["config memory.write_approval = 'true', expected 'false'"]
 
 
+def test_check_config_accepts_legacy_delegation_model(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "auxiliary.review.model": "m",
+              "delegation.model": "worker", "delegation.backend": "default",
+              "delegation.backends.model_map.default": ""}
+
+    def fake_run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=values.get(cmd[-1], "") + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+
+
+def test_check_config_accepts_advanced_delegation_model_map(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "auxiliary.review.model": "m",
+              "delegation.model": "", "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker"}
+
+    def fake_run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=values.get(cmd[-1], "") + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+
+
+def test_check_config_rejects_missing_delegation_routes(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "auxiliary.review.model": "m",
+              "delegation.model": "", "delegation.backend": "default",
+              "delegation.backends.model_map.default": ""}
+
+    def fake_run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=values.get(cmd[-1], "") + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == [
+        "config delegation route is not resolvable: set delegation.model or "
+        "delegation.backend='model_map' with a non-empty delegation.backends.model_map.default"
+    ]
+
+
 def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     release = tmp_path / "releases" / ("b" * 40)
