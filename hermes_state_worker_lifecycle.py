@@ -301,7 +301,12 @@ def insert_session_row_in_transaction(
         ),
     )
     if system_prompt_hash is not None:
-        self._delete_unreferenced_system_prompts(conn)
+        conn.execute(
+            "DELETE FROM system_prompts WHERE hash=? AND NOT EXISTS ("
+            "SELECT 1 FROM sessions WHERE system_prompt_hash=system_prompts.hash) AND NOT EXISTS ("
+            "SELECT 1 FROM sessions WHERE tool_names=system_prompts.hash)",
+            (system_prompt_hash,),
+        )
     if parent_session_id:
         self._inherit_parent_session_metadata(conn, session_id)
     # The upsert may have just filled a compression tip's created_source (update_token_counts).

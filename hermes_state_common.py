@@ -11,12 +11,17 @@ import time
 from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
-from hermes_state_keys import CRON_PRINCIPAL_ID
+from hermes_state_keys import CRON_PRINCIPAL_ID, POLICY_PREFIX
 from hermes_state_session_signature import SESSION_SIGNATURE_TABLE_SQL, SESSION_SIGNATURE_TRIGGER_SQL
 from hermes_state_pidns import persistent_record_pidns_checkable, pid_namespace_id
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
 from agent.context_compressor import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER, _SUMMARY_END_MARKER)
+
+
+# The held-media query and its partial index must share this exact predicate: SQLite's partial-index
+# matcher is textual and a harmless-looking rewrite would make the writer scan all admissions.
+HELD_MEDIA_WHERE = "status!='terminal' OR json_type(payload_json, '$.api_turn_v1.media') IS NOT NULL"
 
 
 # Persisted title provenance: automatic display labels are not user-selected identities.
@@ -621,6 +626,8 @@ CREATE TABLE IF NOT EXISTS session_admissions (
 );
 CREATE INDEX IF NOT EXISTS session_admissions_pending
     ON session_admissions(target_session_id, status, seq);
+CREATE INDEX IF NOT EXISTS idx_session_admissions_held
+    ON session_admissions(seq) WHERE """ + HELD_MEDIA_WHERE + """;
 -- Worker adoption searches by generation/epoch and only ever considers started or unknown admissions.
 -- Keep terminal and queued history out of that writer-transaction candidate scan; the literal predicate
 -- is intentional because SQLite can only prove a parameterized status list satisfies a partial index at
@@ -662,6 +669,10 @@ CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_state_meta_local_policy_route ON state_meta(
+    (CASE WHEN json_valid(value) THEN json_extract(value, '$.entry.session_id') END),
+    (CASE WHEN json_valid(value) THEN json_extract(value, '$.route') END), key)
+    WHERE key GLOB '""" + POLICY_PREFIX + """*';
 
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
