@@ -223,7 +223,7 @@ def autonomous_edit(manager, *, reason, goal=None, contract=None, subgoals=None,
     return {"ok": True, "revision": revision, "state": state, "version": len(state.revisions) + 1}
 
 
-def validate_removal_quote(state, expected, cursor):
+def validate_removal_quote(state, expected, cursor, *, controlled_session_id=None):
     from hermes_cli.goals import GoalState
     from hermes_cli.goals_evaluation import GoalEvaluationConflict
 
