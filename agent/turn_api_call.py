@@ -259,38 +259,19 @@ def nous_rate_limit_guard(
         )
 
     # A response header can tell us that the next request cannot fit in the current TPM
-    # bucket.  Check before any SDK call; otherwise a large prompt predictably produces a
-    # second 429.  A fallback gets a clean route restart, while a single-route install gets
-    # an actionable result instead of sending a request known to be inadmissible.
-    try:
-        from agent.rate_limit_tracker import tpm_admission_delay
-        state = getattr(agent, "_rate_limit_state", None)
-        if state is not None and (not state.provider or state.provider == getattr(agent, "provider", "")):
-            wait = tpm_admission_delay(state, approx_tokens)
-            if wait > 0:
-                estimate = int(approx_tokens or 0)
-                detail = (
-                    f"{getattr(agent, 'provider', 'Provider')} has only {state.tokens_min.remaining:,} "
-                    f"tokens left in its minute window; this request needs about {estimate:,}."
-                )
-                agent._buffer_diagnostic_status(f"⏳ {detail} Trying fallback.")
-                if agent._try_activate_fallback():
-                    active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
-                    retry_count = 0
-                    compression_attempts = 0
-                    return _verdict("break")
-                agent._flush_status_buffer()
-                return _verdict("return", {
-                    "final_response": f"⏳ {detail} Try again after the minute window resets.",
-                    "messages": messages,
-                    "api_calls": api_call_count,
-                    "completed": False,
-                    "failed": True,
-                    "error": detail,
-                    "failure_reason": FailoverReason.rate_limit.value,
-                })
-    except Exception:
-        logger.debug("TPM admission check failed open", exc_info=True)
+    # bucket. Check before any SDK call; otherwise a large prompt predictably produces a
+    # second 429. With a fallback left the turn restarts cleanly on it. With none the request
+    # is sent anyway: the estimate is approximate, and the provider's own 429 carries the real
+    # reset into the normal wait-and-retry path instead of ending the turn on a guess.
+    from agent.turn_api_call_admission import predicted_tpm_overage
+    overage = predicted_tpm_overage(agent, approx_tokens)
+    if overage and agent._has_pending_fallback():
+        agent._buffer_diagnostic_status(f"⏳ {overage} Trying fallback.")
+        if agent._try_activate_fallback():
+            active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+            retry_count = 0
+            compression_attempts = 0
+            return _verdict("break")
 
     if agent.provider == "nous":
         # A gateway ``x-nous-model-switch`` recorded on the previous response moves this session
