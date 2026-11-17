@@ -3,9 +3,77 @@
 from __future__ import annotations
 
 import logging
-from typing import Any
+import re
+from typing import Any, Mapping
 
 logger = logging.getLogger(__name__)
+
+# Minimum chain policy is shared by config validation and web-route writes.
+MIN_FALLBACK_ENTRIES = 3
+MIN_UPSTREAM_FAMILIES = 3
+
+# Model names are more reliable than a provider label when a local proxy multiplexes
+# several vendors (for example muse-* is Meta behind custom:openai-proxy).
+_MODEL_UPSTREAM_PREFIXES: tuple[tuple[str, str], ...] = (
+    ("claude", "anthropic"),
+    ("gpt-", "openai"), ("gpt_", "openai"), ("o1", "openai"), ("o3", "openai"),
+    ("o4", "openai"), ("o-series", "openai"), ("codex", "openai"),
+    ("muse", "meta"), ("llama", "meta"),
+    ("grok", "xai"), ("gemini", "google"), ("gemma", "google"),
+    ("mistral", "mistral"), ("mixtral", "mistral"), ("deepseek", "deepseek"),
+    ("qwen", "alibaba"), ("kimi", "moonshot"), ("minimax", "minimax"),
+)
+
+
+def _resolved_route(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> dict[str, Any]:
+    """Return a route copy with model aliases expanded for identity/family checks."""
+    item = dict(route or {})
+    model = str(item.get("model") or "").strip()
+    if model:
+        try:
+            from hermes_cli.model_alias_runtime import resolve_model_alias
+            resolved = resolve_model_alias(model, config or {})
+            if resolved.name and resolved.model:
+                item["model"] = resolved.model
+                if not item.get("provider") and resolved.provider:
+                    item["provider"] = resolved.provider
+                if not item.get("base_url") and resolved.base_url:
+                    item["base_url"] = resolved.base_url
+        except Exception:
+            # Validation must still report the malformed route, not fail config loading.
+            pass
+    return item
+
+
+def upstream_family(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> str:
+    """Resolve the independent upstream family for a route.
+
+    An explicit ``upstream`` wins. Otherwise aliases are expanded before model-name
+    inference; provider labels are only the final fallback for unknown model names.
+    """
+    item = _resolved_route(route, config)
+    explicit = str(item.get("upstream") or "").strip().lower()
+    if explicit:
+        return explicit
+    model = str(item.get("model") or "").strip().lower()
+    for prefix, family in _MODEL_UPSTREAM_PREFIXES:
+        if model.startswith(prefix):
+            return family
+    provider = str(item.get("provider") or "").strip().lower()
+    try:
+        return _normalize_provider_id(provider) or f"model:{model}"
+    except Exception:
+        return provider or f"model:{model}"
+
+
+def route_identity(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> tuple[str, str, str]:
+    """Canonical provider/model/base-url identity, after model-alias expansion."""
+    item = _resolved_route(route, config)
+    return (
+        _normalize_provider_id(str(item.get("provider") or "").strip()).lower(),
+        str(item.get("model") or "").strip().lower(),
+        _normalized_base_url(item.get("base_url")).lower(),
+    )
 
 
 def _normalized_base_url(value: Any) -> str:

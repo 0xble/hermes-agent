@@ -450,7 +450,7 @@ _ONE_OFF_COPY: dict[str, str] = {
     ),
     "nous_rate_limit": (
         "Wait for the reset and send /retry, or switch models with /model. To avoid waits, add "
-        "a backup provider with `hermes fallback add`."
+        "an ordered fallback chain in `delegation.backends.model_map` with three independent providers."
     ),
 }
 _SITE_COPY: dict[str, str] = {**_FAILURE_CODE_COPY, **_ONE_OFF_COPY}
@@ -463,7 +463,8 @@ def site_copy(code: str, **fields: Any) -> str:
 
 
 def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None,
-                   earliest_route_seconds: Optional[float] = None, error: Any = None) -> str:
+                   earliest_route_seconds: Optional[float] = None, error: Any = None,
+                   delegation_role: Optional[str] = None, exhausted_routes: Optional[list[str]] = None) -> str:
     """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
     limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401).
     ``earliest_route_seconds`` must belong to a different configured route than the failing one.
@@ -490,10 +491,15 @@ def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, rese
                      "Send /retry after that, or switch models with /model.")
     else:
         situation = f"it looks temporarily unavailable. {_NEXT_STEPS_RETRY}"
-    return (
-        f"{lead} — {situation} To avoid this in future, "
-        f"add a backup provider with `hermes fallback add`.\n\nProvider said: {summary}"
-    )
+    routes = ", ".join(exhausted_routes or [])
+    if delegation_role:
+        hint = (f"The `{delegation_role}` delegation role exhausted/cooled routes"
+                f"{(': ' + routes) if routes else ''}. Configure at least three upstream-aware "
+                f"fallbacks in `delegation.backends.model_map.options[{delegation_role}].fallback_providers`, then retry.")
+    else:
+        hint = ("To avoid this in future, add a backup provider with `hermes fallback add`"
+                + (f" (routes already tried or cooled: {routes})" if routes else "") + ".")
+    return f"{lead} — {situation} {hint}\n\nProvider said: {summary}"
 
 
 def limit_reset_copy(resets_at: float, now: Optional[float] = None) -> str:

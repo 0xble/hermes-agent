@@ -358,6 +358,15 @@ def _build_child_agent(
     child_session_ref["session_id"] = getattr(child, "session_id", "") or ""
     child._progress_identity_ref = child_session_ref
     child._delegate_depth, child._delegate_role = child_depth, effective_role  # post-degrade role
+    # Preserve the selected model-map option for terminal copy. ``_delegate_role`` is the
+    # depth/permission role (leaf/orchestrator), not the config option users must edit.
+    if isinstance(routing_cfg, dict):
+        model_map_role = next(
+            (str(routing_cfg[key]).strip() for key in ("name", "option", "label")
+             if str(routing_cfg.get(key) or "").strip()),
+            None,
+        )
+        child._delegation_model_map_role = model_map_role
     # Plugins see one conversation per delegation tree.
     from agent.prompt_cache_scope import conversation_id
     child._inherited_conversation_id = conversation_id(parent_agent)

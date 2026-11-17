@@ -969,7 +969,8 @@ def nonretryable_client_error_result(
         _vlines(
             agent,
             f"   💡 {CONTENT_POLICY_NEXT_STEPS}",
-            "      To route future blocks to another provider automatically: hermes fallback add",
+            "      To route future blocks automatically, add three independent ordered providers under",
+            "      delegation.backends.model_map.<role>.fallback_providers, then retry.",
         )
     # TLS certificate failures are environment problems — name the knobs for each cause.
     if classified.reason == FailoverReason.ssl_cert_verification:
@@ -1159,6 +1160,13 @@ def max_retries_exhausted_result(
             classified.reason.value, label=provider_label_for(provider), attempts=attempts, error=api_error,
             summary=_final_summary, reset_seconds=_reset_at - time.time() if _reset_at else None,
             earliest_route_seconds=_earliest_s,
+            delegation_role=(getattr(agent, "_delegation_model_map_role", None)
+                              or getattr(agent, "_delegate_role", None)),
+            exhausted_routes=[
+                f"{entry.get('provider')}:{entry.get('model')}"
+                for entry in (getattr(agent, "_fallback_chain", None) or [])
+                if isinstance(entry, dict)
+            ],
         )
         if _welcome_hint:
             _final_response = _welcome_tier_guidance(classified, model=model, in_chat=True)
@@ -1819,6 +1827,15 @@ def route_classified_error(
             else _ra()._pool_may_recover_from_rate_limit(agent._credential_pool)
         )
         reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+        # OpenAI TPM responses from the local multiplexer include explicit accounting.
+        # That is stronger evidence than a gateway's occasionally absurd prose Retry-After
+        # (e.g. 138h): arm this route for the short token bucket window and let the shared
+        # cooldown record carry the event across child processes.
+        from agent.retry_utils import tpm_overage_cooldown_seconds
+        tpm_window = tpm_overage_cooldown_seconds(api_error)
+        if tpm_window is not None:
+            reset_at = time.time() + tpm_window
+            logger.info("TPM overage detected (Limit/Used/Requested); recording %.0fs route cooldown", tpm_window)
         from agent.fallback_cooldown import _arm_rate_limit_cooldown, switch_deferred_by_reset
         if (
             not pool_may_recover
@@ -1858,6 +1875,10 @@ def route_classified_error(
         if not pool_may_recover:
             agent._buffer_diagnostic_status(_eager_fallback_status(classified, _is_upstream, _is_transport_failure))
             reset_at = error_context.get("reset_at") if isinstance(error_context, dict) else None
+            from agent.retry_utils import tpm_overage_cooldown_seconds
+            tpm_window = tpm_overage_cooldown_seconds(api_error)
+            if tpm_window is not None:
+                reset_at = time.time() + tpm_window
             if agent._try_activate_fallback(reason=classified.reason, reset_at=reset_at):
                 return _fallback_break()
 

@@ -246,6 +246,7 @@ class NousRateGuardVerdict:
 def nous_rate_limit_guard(
     agent: Any, *, _retry: Any, api_messages: Any, messages: Any, conversation_history: Any,
     active_system_prompt: Any, retry_count: Any, compression_attempts: Any, api_call_count: Any,
+    approx_tokens: Any = None,
 ) -> NousRateGuardVerdict:
     """Skip the call if another session recorded a Nous Portal rate limit: every attempt (incl.
     SDK retries) counts against RPH. Never lets the guard itself break the agent loop."""
@@ -256,6 +257,40 @@ def nous_rate_limit_guard(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
             compression_attempts=compression_attempts, result=result,
         )
+
+    # A response header can tell us that the next request cannot fit in the current TPM
+    # bucket.  Check before any SDK call; otherwise a large prompt predictably produces a
+    # second 429.  A fallback gets a clean route restart, while a single-route install gets
+    # an actionable result instead of sending a request known to be inadmissible.
+    try:
+        from agent.rate_limit_tracker import tpm_admission_delay
+        state = getattr(agent, "_rate_limit_state", None)
+        if state is not None and (not state.provider or state.provider == getattr(agent, "provider", "")):
+            wait = tpm_admission_delay(state, approx_tokens)
+            if wait > 0:
+                estimate = int(approx_tokens or 0)
+                detail = (
+                    f"{getattr(agent, 'provider', 'Provider')} has only {state.tokens_min.remaining:,} "
+                    f"tokens left in its minute window; this request needs about {estimate:,}."
+                )
+                agent._buffer_diagnostic_status(f"⏳ {detail} Trying fallback.")
+                if agent._try_activate_fallback():
+                    active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+                    retry_count = 0
+                    compression_attempts = 0
+                    return _verdict("break")
+                agent._flush_status_buffer()
+                return _verdict("return", {
+                    "final_response": f"⏳ {detail} Try again after the minute window resets.",
+                    "messages": messages,
+                    "api_calls": api_call_count,
+                    "completed": False,
+                    "failed": True,
+                    "error": detail,
+                    "failure_reason": FailoverReason.rate_limit.value,
+                })
+    except Exception:
+        logger.debug("TPM admission check failed open", exc_info=True)
 
     if agent.provider == "nous":
         # A gateway ``x-nous-model-switch`` recorded on the previous response moves this session

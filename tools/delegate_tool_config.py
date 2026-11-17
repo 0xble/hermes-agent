@@ -753,6 +753,39 @@ def _resolve_child_runtime(
     child_reasoning = _child_reasoning(parent_agent, delegation_cfg, override_reasoning_effort)
     child_reasoning = dict(child_reasoning) if isinstance(child_reasoning, dict) else child_reasoning
 
+    fallback_chain = _resolve_child_fallback_chain(
+        parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
+        pinned=bool(override_provider or override_base_url or model),
+    )
+    # A delegated child must not spend its first request re-probing a role primary that
+    # another process already cooled. Model-map roles arrive as pinned routes carrying their
+    # own declared chain, so key on that chain: start on the first non-cooled route of
+    # primary + chain. A role with no chain keeps its primary (nothing to start on instead).
+    if fallback_chain:
+        from agent.shared_primary_probe_runtime import fallback_route_is_active
+        if fallback_route_is_active(effective_provider, effective_base_url, effective_model):
+            for position, entry in enumerate(fallback_chain):
+                candidate_provider = str(entry.get("provider") or "").strip() or effective_provider
+                candidate_model = str(entry.get("model") or "").strip()
+                candidate_base_url = str(entry.get("base_url") or "").strip() or None
+                if not candidate_model or fallback_route_is_active(candidate_provider, candidate_base_url, candidate_model):
+                    continue
+                candidate = _resolve_delegation_credentials({
+                    "provider": candidate_provider, "model": candidate_model,
+                    "base_url": candidate_base_url, "api_key": entry.get("api_key"),
+                    "api_mode": entry.get("api_mode"),
+                    "request_overrides": entry.get("request_overrides"),
+                }, parent_agent)
+                effective_model = candidate.get("model") or candidate_model
+                effective_provider = candidate.get("provider") or candidate_provider
+                effective_base_url = candidate.get("base_url")
+                parent_api_key = candidate.get("api_key")
+                override_api_key = candidate.get("api_key")
+                effective_api_mode = candidate.get("api_mode")
+                effective_requested_provider = candidate.get("requested_provider") or candidate_provider
+                fallback_chain = fallback_chain[position + 1:]
+                break
+
     kwargs: dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
         "provider": effective_provider, "requested_provider": effective_requested_provider,
@@ -761,9 +794,7 @@ def _resolve_child_runtime(
         "reasoning_config": child_reasoning,
         # Resolve routing and recovery policy from the same configuration owner. A pinned provider, endpoint, or
         # model never borrows the parent's chain; an explicitly declared child chain still remains available.
-        "fallback_model": _resolve_child_fallback_chain(
-            parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
-            pinned=bool(override_provider or override_base_url or model)),
+        "fallback_model": fallback_chain,
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},

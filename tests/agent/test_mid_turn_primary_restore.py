@@ -718,3 +718,93 @@ def test_explicit_switch_clears_stay_bookkeeping(tool_loop_agent):
     _finish_switch(agent, "custom", "custom", "custom")
     assert agent._active_fallback_entry is None
     assert agent._fallback_stay_started_at is None
+
+
+@pytest.mark.parametrize("spare_model", ["muse-wonder-full-1.0", "grok-4.7"])
+def test_spare_fallback_returns_to_primary_mid_turn_after_tpm_cooldown(tool_loop_agent, tmp_path, spare_model):
+    """A child that 429s onto a spare must not stay there for the rest of one long turn.
+
+    Call 1 hits a TPM 429 on the primary and falls back to the spare; the bounded TPM
+    cooldown then expires while the same turn keeps issuing tool calls, so a later call
+    in the SAME turn goes back to the primary. A fresh 429 would fall back again normally.
+    """
+    agent = tool_loop_agent
+    agent._fallback_chain[0]["model"] = spare_model
+    requested = []
+    tool_calls = 0
+
+    def request(kwargs):
+        requested.append(agent.model)
+        if agent.model == "primary-model" and len(requested) == 1:
+            response = httpx.Response(429, request=httpx.Request("POST", "https://primary.invalid/v1"))
+            raise RateLimitError(
+                "Rate limit reached for gpt in organization on tokens per min (TPM): "
+                "Limit 100000, Used 99000, Requested 5000. Please try again in 138h46m.",
+                response=response, body={})
+        if agent.model == "primary-model":
+            return _tool_loop_response()
+        return _tool_loop_response(f"spare_call_{len(requested)}")
+
+    def tool(*args, **kwargs):
+        nonlocal tool_calls
+        tool_calls += 1
+        if tool_calls == 2:
+            path = tmp_path / "state" / "model_cooldowns.json"
+            state = json.loads(path.read_text(encoding="utf-8-sig"))
+            # The TPM window was armed at ~60s, not 138h: expire it as the wall clock would.
+            for record in state["routes"].values():
+                assert float(record["reset_at"]) - time.time() <= 120
+                record["reset_at"] = time.time() - 1
+            path.write_text(json.dumps(state))
+        return "tool result"
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", side_effect=tool),
+    ):
+        result = agent.run_conversation("long delegated task")
+
+    assert result["final_response"] == "finished"
+    assert requested[0] == "primary-model"
+    assert requested[1] == spare_model, requested
+    assert requested[-1] == "primary-model", requested
+    assert agent.model == "primary-model"
+
+
+def test_child_started_with_cooled_primary_adopts_spare_then_restores_in_same_turn(tool_loop_agent, tmp_path):
+    """Pre-dispatch: a primary another process already cooled is never re-probed on call 1,
+    and the spare it lands on is still short-lived (restores mid-turn once the cooldown ends)."""
+    from agent.shared_primary_cooldown import arm_cooldown, route_from_agent
+
+    agent = tool_loop_agent
+    assert arm_cooldown(route_from_agent(agent), reason=FailoverReason.rate_limit,
+                        reset_at=time.time() + 60, backoff_count=0, request_id="peer-1")
+    requested = []
+    tool_calls = 0
+
+    def request(kwargs):
+        requested.append(agent.model)
+        if agent.model == "primary-model":
+            return _tool_loop_response()
+        return _tool_loop_response(f"spare_call_{len(requested)}")
+
+    def tool(*args, **kwargs):
+        nonlocal tool_calls
+        tool_calls += 1
+        if tool_calls == 2:
+            path = tmp_path / "state" / "model_cooldowns.json"
+            state = json.loads(path.read_text(encoding="utf-8-sig"))
+            for record in state["routes"].values():
+                record["reset_at"] = time.time() - 1
+            path.write_text(json.dumps(state))
+        return "tool result"
+
+    with (
+        patch.object(agent, "_interruptible_api_call", side_effect=request),
+        patch("model_tools.handle_function_call", side_effect=tool),
+    ):
+        result = agent.run_conversation("long delegated task")
+
+    assert result["final_response"] == "finished"
+    assert requested[0] == "backup", requested
+    assert requested[-1] == "primary-model", requested

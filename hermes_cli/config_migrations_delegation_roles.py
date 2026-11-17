@@ -14,8 +14,17 @@ options:
     reasoning_effort: low
     service_tier: normal
     fallback_providers:
+      - provider: custom:claude-proxy
+        model: claude-haiku-5-5
+        reasoning_effort: low
+      - provider: custom:claude-proxy
+        model: claude-sonnet-5-5
+        reasoning_effort: low
       - provider: custom:openai-proxy
-        model: gpt-6.1-terra
+        model: muse-wonder-full-1.0
+        reasoning_effort: low
+      - provider: xai-oauth
+        model: grok-4.7
         reasoning_effort: low
   - name: explorer
     description: "Locate, verify and extract facts from files, official sources, pages, photos or screenshots, returning source locations and gaps. Not recommendations or non-code critique (planner), creating pictures (visual), or interface design (designer)."
@@ -24,8 +33,17 @@ options:
     reasoning_effort: medium
     service_tier: normal
     fallback_providers:
+      - provider: custom:claude-proxy
+        model: claude-haiku-5-5
+        reasoning_effort: medium
+      - provider: custom:claude-proxy
+        model: claude-sonnet-5-5
+        reasoning_effort: medium
       - provider: custom:openai-proxy
-        model: gpt-6.1-sol
+        model: muse-wonder-full-1.0
+        reasoning_effort: medium
+      - provider: xai-oauth
+        model: grok-4.7
         reasoning_effort: medium
   - name: coder
     description: "Implement and debug substantive code with tests, including routine multi-file changes, specified UI and standard charts where the design is already settled. Not interface design judgment (designer), demonstrated hard failures or unresolved irreversible execution risk (critical), or code review (AutoReview)."
@@ -54,6 +72,15 @@ options:
   #     - provider: custom:openai-proxy
   #       model: gpt-6.1-sol
   #       reasoning_effort: high
+  #     - provider: custom:claude-proxy
+  #       model: claude-opus-5-5
+  #       reasoning_effort: high
+  #     - provider: custom:openai-proxy
+  #       model: muse-wonder-full-1.0
+  #       reasoning_effort: high
+  #     - provider: xai-oauth
+  #       model: grok-4.7
+  #       reasoning_effort: high
   # - name: planner
   #   description: "Synthesize evidence, compare options, recommend decisions, define technical architecture or acceptance contracts, and create or critique non-code plans and non-code audits. Not implementation (coder/critical), source-only fact finding (explorer), drawing decided architecture (visual), voice polishing (writer), or code review (AutoReview)."
   #   provider: custom:claude-proxy
@@ -63,6 +90,15 @@ options:
   #   fallback_providers:
   #     - provider: custom:openai-proxy
   #       model: gpt-6.1-sol
+  #       reasoning_effort: high
+  #     - provider: custom:claude-proxy
+  #       model: claude-sonnet-5-5
+  #       reasoning_effort: high
+  #     - provider: custom:openai-proxy
+  #       model: muse-wonder-full-1.0
+  #       reasoning_effort: high
+  #     - provider: xai-oauth
+  #       model: grok-4.7
   #       reasoning_effort: high
   # - name: designer
   #   description: "Design or repair interfaces people use: screen hierarchy, app flows, responsive layouts, interaction, visual polish and screenshot-driven UI fidelity, including dashboards with charts. Not implementing an already-specified UI or standard chart (coder), inspecting a page for facts (explorer), or standalone pictures and diagrams (visual)."
@@ -74,6 +110,15 @@ options:
   #     - provider: custom:openai-proxy
   #       model: gpt-6.1-sol
   #       reasoning_effort: high
+  #     - provider: custom:claude-proxy
+  #       model: claude-sonnet-5-5
+  #       reasoning_effort: high
+  #     - provider: custom:openai-proxy
+  #       model: muse-wonder-full-1.0
+  #       reasoning_effort: high
+  #     - provider: xai-oauth
+  #       model: grok-4.7
+  #       reasoning_effort: high
   # - name: visual
   #   description: "Create or repair pictures rather than interfaces: 3D scenes and geometry, illustrations, and designed standalone diagrams or explanatory data visualizations, including diagrams of an already-decided architecture. Not app/dashboard interfaces (designer), standard chart implementation (coder), architecture decisions (planner), or extracting image facts (explorer)."
   #   provider: custom:claude-proxy
@@ -83,6 +128,15 @@ options:
   #   fallback_providers:
   #     - provider: custom:openai-proxy
   #       model: gpt-6.1-sol
+  #       reasoning_effort: high
+  #     - provider: custom:claude-proxy
+  #       model: claude-opus-5-5
+  #       reasoning_effort: high
+  #     - provider: custom:openai-proxy
+  #       model: muse-wonder-full-1.0
+  #       reasoning_effort: high
+  #     - provider: xai-oauth
+  #       model: grok-4.7
   #       reasoning_effort: high
   # - name: writer
   #   description: "Draft substantial voice-sensitive prose or make substantial editorial revisions from established facts and supplied voice examples. Not routine summaries or replies (worker), research extraction (explorer), or analytical reports whose main work is reaching a recommendation (planner)."
@@ -94,13 +148,22 @@ options:
   #     - provider: custom:openai-proxy
   #       model: gpt-6.1-sol
   #       reasoning_effort: medium
+  #     - provider: custom:claude-proxy
+  #       model: claude-sonnet-5-5
+  #       reasoning_effort: medium
+  #     - provider: custom:openai-proxy
+  #       model: muse-wonder-full-1.0
+  #       reasoning_effort: medium
+  #     - provider: xai-oauth
+  #       model: grok-4.7
+  #       reasoning_effort: medium
 """
 
 # Cron jobs keep Sol as their primary route, then use the same subscription
 # fallback order as delegation without spending the Opus pool by default.
 CRON_FALLBACKS = [
     {"model": "claude-sonnet-5-5", "provider": "custom:claude-proxy", "reasoning_effort": "medium"},
-    {"model": "muse-wonder-full-1.0", "provider": "custom:openai-proxy", "reasoning_effort": "high"},
+    {"model": "muse-wonder-full-1.0", "provider": "custom:openai-proxy", "reasoning_effort": "medium"},
     {"model": "grok-4.7", "provider": "xai-oauth", "reasoning_effort": "medium"},
 ]
 
@@ -117,14 +180,14 @@ def install_cron_fallbacks(config: dict, changes: list[str], *, install_missing:
     if "fallback_providers" not in cron:
         if install_missing:
             cron["fallback_providers"] = [dict(route) for route in CRON_FALLBACKS]
-            changes.append("cron.fallback_providers: claude-sonnet-5-5 -> Muse -> Grok (Opus removed from the default cron chain)")
+            changes.append("cron.fallback_providers: claude-sonnet-5-5 -> Muse -> Grok (Muse and Grok are break-glass spares, last)")
         return
     current = cron["fallback_providers"]
     if (isinstance(current, list) and current and isinstance(current[0], dict)
             and current[0].get("model") == "claude-opus-5-5"
             and current[0].get("provider") == "custom:claude-proxy"):
         cron["fallback_providers"] = [dict(route) for route in CRON_FALLBACKS]
-        changes.append("cron.fallback_providers: claude-sonnet-5-5 -> Muse -> Grok (Opus removed from the default cron chain)")
+        changes.append("cron.fallback_providers: claude-sonnet-5-5 -> Muse -> Grok (Muse and Grok are break-glass spares, last)")
 
 
 # Review routes keep their own effort per entry. Only the Opus head becomes Sonnet,
@@ -154,16 +217,32 @@ def role_settings():
 
 
 def install_role_routes(config: dict, aliases: dict, changes: list[str]) -> None:
-    settings = role_settings()
-    config["delegation"].setdefault("backends", {})["model_map"] = settings
-    config["delegation"]["backend"] = "model_map"
-    config["delegation"]["inherit_service_tier"] = False
-    config["delegation"]["fallback_providers"] = []
+    from hermes_cli.config_value_checks import _validate_model_map_options
+
+    delegation = config.setdefault("delegation", {})
+    backends = delegation.setdefault("backends", {})
+    existing = backends.get("model_map")
+    existing_issues: list = []
+    if isinstance(existing, dict) and isinstance(existing.get("options"), list):
+        _validate_model_map_options(existing["options"], existing_issues, "delegation.backends.model_map", config)
+    preserve_existing = not existing_issues and isinstance(existing, dict) and bool(existing.get("options"))
+    if not preserve_existing:
+        settings = role_settings()
+        backends["model_map"] = settings
+        changes.append("delegation: installed upstream-aware model_map fallback chains")
+    else:
+        # A user-authored map that already meets the resilience bar is authoritative;
+        # migrations must not silently reorder or replace it.
+        settings = existing
+    delegation["backend"] = "model_map"
+    delegation["inherit_service_tier"] = False
+    delegation["fallback_providers"] = []
     install_cron_fallbacks(config, changes, install_missing=True)
-    for option in settings["options"]:
-        name = option["name"]
-        aliases[name] = {"provider": option["provider"], "model": option["model"]}
-        option["model"] = name
+    if not preserve_existing:
+        for option in settings["options"]:
+            name = option["name"]
+            aliases[name] = {"provider": option["provider"], "model": option["model"]}
+            option["model"] = name
     plugins = config.setdefault("plugins", {})
     enabled = plugins.setdefault("enabled", [])
     if "advanced-delegation" not in enabled:

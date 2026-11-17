@@ -4,6 +4,7 @@ Jittered delays (vs. fixed exponential) prevent thundering-herd retry spikes
 when many sessions hit the same rate-limited provider concurrently.
 """
 
+import math
 import random
 import re
 import threading
@@ -180,13 +181,66 @@ LIVE_RETRY_WAIT_CAP_S = 60.0
 # Anthropic Tier 1 input-token buckets reset in ~171s, so a 120s cap re-tripped the limit; 600s
 # covers realistic provider windows while still rejecting pathological values (#26293).
 RETRY_AFTER_CAP_S = 600.0
+MINUTE_RATE_LIMIT_COOLDOWN_CAP_S = 120.0
+TPM_WINDOW_SECONDS = 60.0
+
+
+def tpm_overage_cooldown_seconds(error: Any) -> Optional[float]:
+    """Return a short token-per-minute window for an explicit OpenAI TPM overage.
+
+    The proxy commonly leaves this in plain text (``Limit N, Used U, Requested R``).
+    Do not interpret unrelated ``try again in 138h`` prose as a reset for a minute
+    bucket; the explicit accounting line is the evidence that the request cannot fit.
+    """
+    import re
+    parts = []
+    body = getattr(error, "body", None)
+    if isinstance(body, dict):
+        parts.append(str(body))
+    parts.extend((str(error),) + tuple(str(getattr(error, name, "") or "") for name in ("message", "response")))
+    text = " ".join(parts)
+    match = re.search(r"Limit\s*([\d,]+).*?Used\s*([\d,]+).*?Requested\s*([\d,]+)", text, re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    limit, used, requested = (int(value.replace(",", "")) for value in match.groups())
+    return TPM_WINDOW_SECONDS if used + requested > limit else None
+
+
+def _minute_rate_limit_headers(headers: Any) -> bool:
+    """True when headers describe a short rolling request/token bucket."""
+    getter = getattr(headers, "get", None)
+    if not callable(getter):
+        return False
+    for name in ("x-ratelimit-reset-requests", "x-ratelimit-reset-tokens"):
+        raw = getter(name) or getter(name.title())
+        if raw is None:
+            continue
+        text = str(raw).strip().lower()
+        try:
+            if text.endswith("m"):
+                amount = float(text[:-1]) * 60
+            elif text.endswith("s"):
+                amount = float(text[:-1])
+            else:
+                amount = float(text)
+        except ValueError:
+            continue
+        if 0 < amount <= 120:
+            return True
+    return False
 
 
 def provider_retry_after_seconds(error: Any) -> Optional[float]:
     """Provider-declared cooldown: the ``Retry-After`` header, else a ``retry_after`` body field
     (top level or nested under ``error``). None when absent, unparseable or zero: a zero or expired
     cooldown carries no usable wait, and treating it as one would hot-loop the provider."""
-    value = parse_retry_after_seconds(getattr(getattr(error, "response", None), "headers", None))
+    headers = getattr(getattr(error, "response", None), "headers", None)
+    value = parse_retry_after_seconds(headers)
+    # Some gateways return a weekly-looking Retry-After (for example 138h) for a
+    # per-minute bucket. Prefer the bounded minute window rather than pinning a route
+    # for days; ordinary long quota windows have no short reset header and are unchanged.
+    if value is not None and value > MINUTE_RATE_LIMIT_COOLDOWN_CAP_S and _minute_rate_limit_headers(headers):
+        value = MINUTE_RATE_LIMIT_COOLDOWN_CAP_S
     if value is None:
         body = getattr(error, "body", None)
         if isinstance(body, dict):

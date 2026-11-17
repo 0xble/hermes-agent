@@ -147,6 +147,23 @@ def test_invalid_model_routes_are_refused_before_anything_is_written(client, hom
     assert (work / "config.yaml").read_text(encoding="utf-8") == before
 
 
+@pytest.mark.parametrize(("chain", "problem"), [
+    ([{"provider": "openai", "model": "gpt-6-sol"}], "at least 3 fallback entries"),
+    ([{"provider": "custom:openai-proxy", "model": f"gpt-{n}"} for n in "abc"], "upstream families"),
+    ([{"provider": "openai", "model": "gpt-6-sol"}, {"provider": "anthropic", "model": "claude-opus-5-5"},
+      {"provider": "xai-oauth", "model": "grok-4.7"}], "duplicates the primary route"),
+])
+def test_model_route_chains_below_the_resilience_bar_are_refused_before_anything_is_written(client, homes, chain, problem):
+    _root, work = homes
+    before = (work / "config.yaml").read_text(encoding="utf-8")
+    route = {"name": "deep", "description": "Careful", "provider": "openai", "model": "gpt-6-sol",
+             "fallback_providers": chain}
+    resp = client.put("/api/delegation/backends/model_map?profile=work", json={"options": [route]})
+    assert resp.status_code == 400
+    assert problem in resp.json()["detail"]
+    assert (work / "config.yaml").read_text(encoding="utf-8") == before
+
+
 def test_saving_model_routes_replaces_the_block_and_keeps_the_stored_key(client, homes):
     root, work = homes
     shown = client.get("/api/delegation/routing?profile=work").json()["model_map"]["options"][0]

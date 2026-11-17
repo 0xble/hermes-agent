@@ -1083,7 +1083,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
             return [config_load_issue(exc)]
 
     from hermes_cli.config_value_checks import (
-        _validate_quoted_containers, _validate_timezone, _validate_voice, _validate_web_backends)
+        _validate_model_maps, _validate_quoted_containers, _validate_timezone, _validate_voice, _validate_web_backends)
     issues: list[ConfigIssue] = []
     _validate_voice(config, issues)
     guardian = (config.get("gateway") or {}).get("guardian", {})
@@ -1118,6 +1118,7 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
                    f"Move '{key}' under the appropriate section")
 
     _validate_web_backends(config, issues)
+    _validate_model_maps(config, issues)
     _validate_quoted_containers(config, issues)
     return issues
 
