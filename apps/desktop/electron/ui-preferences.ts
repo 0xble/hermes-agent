@@ -24,7 +24,6 @@ const MAX_KEY_CHARS = 256
 const MAX_VALUE_CHARS = 256 * 1024
 const MAX_KEYS = 512
 const MAX_TOTAL_CHARS = 2 * 1024 * 1024
-const LOCK_WAIT_MS = 3000
 const LOCK_STALE_MS = 10_000
 const LOCK_POLL_MS = 20
 const WATCH_INTERVAL_MS = 1500
@@ -177,17 +176,40 @@ async function owns(lockDir: string, token: string): Promise<boolean> {
   )
 }
 
+async function ownerPid(lockDir: string): Promise<number | null> {
+  const raw = await fs.promises.readFile(ownerFile(lockDir), 'utf8').catch(() => '')
+  const pid = Number.parseInt(raw.split('-', 1)[0] ?? '', 10)
+  return Number.isInteger(pid) && pid > 0 ? pid : null
+}
+
+function pidIsAlive(pid: number | null): boolean {
+  if (pid === null) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'EPERM'
+  }
+}
+
 async function breakIfStale(lockDir: string): Promise<void> {
+  const pid = await ownerPid(lockDir)
+  if (pidIsAlive(pid)) return
+
   const mtime = await fs.promises.stat(lockDir).then(
     stat => stat.mtimeMs,
     () => null
   )
+  if (pid === null && (mtime === null || Date.now() - mtime <= LOCK_STALE_MS)) return
 
-  // A writer that died holding the lock must not wedge every later write.
-  // Writes hold it for milliseconds; the data file is only ever replaced whole.
-  if (mtime !== null && Date.now() - mtime > LOCK_STALE_MS) {
-    await fs.promises.rm(lockDir, { force: true, recursive: true }).catch(() => undefined)
+  const abandoned = `${lockDir}.stale-${process.pid}-${randomBytes(4).toString('hex')}`
+  try {
+    await fs.promises.rename(lockDir, abandoned)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return
+    return
   }
+  await fs.promises.rm(abandoned, { force: true, recursive: true }).catch(() => undefined)
 }
 
 /** Cross-process lock shared with the Python writer: the `<store>.lock`
@@ -196,7 +218,6 @@ async function breakIfStale(lockDir: string): Promise<void> {
 async function withStoreLock<T>(file: string, run: (stillOurs: () => Promise<boolean>) => Promise<T>): Promise<T> {
   const lockDir = `${file}.lock`
   const token = `${process.pid}-${randomBytes(8).toString('hex')}`
-  const deadline = Date.now() + LOCK_WAIT_MS
 
   for (;;) {
     try {
@@ -209,10 +230,6 @@ async function withStoreLock<T>(file: string, run: (stillOurs: () => Promise<boo
       }
 
       await breakIfStale(lockDir)
-
-      if (Date.now() > deadline) {
-        throw new Error('preferences store is busy')
-      }
 
       await sleep(LOCK_POLL_MS)
     }

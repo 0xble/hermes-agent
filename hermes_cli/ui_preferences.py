@@ -30,7 +30,6 @@ import json
 import os
 import secrets
 import shutil
-import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
@@ -44,10 +43,8 @@ MAX_KEY_CHARS = 256
 MAX_VALUE_CHARS = 256 * 1024
 MAX_KEYS = 512
 MAX_TOTAL_CHARS = 2 * 1024 * 1024
-_LOCK_WAIT_S = 3.0
 _LOCK_STALE_S = 10.0
 _LOCK_POLL_S = 0.02
-_thread_lock = threading.Lock()
 
 
 class PreferencesError(ValueError):
@@ -55,8 +52,8 @@ class PreferencesError(ValueError):
 
 
 class PreferencesBusy(RuntimeError):
-    """Another writer held the store lock past the wait; the route answers 503 and the client
-    keeps the change pending for its next attempt."""
+    """The store could not be read safely or a lock was taken over during a write; callers
+    should retry instead of replacing unknown data."""
 
 
 def store_path(root: Optional[Path] = None) -> Path:
@@ -147,20 +144,47 @@ def _owns(lock_dir: Path, token: str) -> bool:
         return False
 
 
+def _owner_pid(lock_dir: Path) -> Optional[int]:
+    try:
+        raw = _owner_file(lock_dir).read_text(encoding="utf-8-sig").split("-", 1)[0]
+        pid = int(raw)
+    except (OSError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def _pid_is_alive(pid: Optional[int]) -> bool:
+    if pid is None:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 def _break_if_stale(lock_dir: Path) -> None:
+    """Atomically quarantine a lock whose recorded owner is no longer alive."""
+    pid = _owner_pid(lock_dir)
+    if _pid_is_alive(pid):
+        return
     try:
         stale = time.time() - lock_dir.stat().st_mtime > _LOCK_STALE_S
     except FileNotFoundError:
         return
-    if not stale:
-        return
-    # A writer that died holding the lock must not wedge every later write. Writes hold it for
-    # milliseconds, and the data file itself is only ever replaced whole.
-    try:
-        _owner_file(lock_dir).unlink(missing_ok=True)
-        os.rmdir(lock_dir)
-    except OSError:
-        pass
+    if pid is not None or stale:
+        abandoned = lock_dir.with_name(f"{lock_dir.name}.stale-{os.getpid()}-{secrets.token_hex(4)}")
+        try:
+            os.rename(lock_dir, abandoned)
+        except FileNotFoundError:
+            return
+        except OSError:
+            return
+        shutil.rmtree(abandoned, ignore_errors=True)
 
 
 @contextmanager
@@ -169,22 +193,18 @@ def _store_lock(path: Path) -> Iterator[Callable[[], bool]]:
     ``owner`` file names the holder."""
     lock_dir = path.with_name(path.name + ".lock")
     token = f"{os.getpid()}-{secrets.token_hex(8)}"
-    deadline = time.monotonic() + _LOCK_WAIT_S
-    with _thread_lock:
-        while True:
-            try:
-                os.mkdir(lock_dir)
-                break
-            except FileExistsError:
-                _break_if_stale(lock_dir)
-                if time.monotonic() > deadline:
-                    raise PreferencesBusy("preferences store is busy")
-                time.sleep(_LOCK_POLL_S)
+    while True:
         try:
-            _owner_file(lock_dir).write_text(token, encoding="utf-8")
-            yield lambda: _owns(lock_dir, token)
-        finally:
-            _release(lock_dir, token)
+            os.mkdir(lock_dir)
+            break
+        except FileExistsError:
+            _break_if_stale(lock_dir)
+            time.sleep(_LOCK_POLL_S)
+    try:
+        _owner_file(lock_dir).write_text(token, encoding="utf-8")
+        yield lambda: _owns(lock_dir, token)
+    finally:
+        _release(lock_dir, token)
 
 
 def _merge(current: Mapping[str, str], changes: Mapping[str, Optional[str]], seed: bool) -> dict[str, str]:

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+import threading
 
 import pytest
 from fastapi.testclient import TestClient
@@ -86,6 +87,44 @@ def test_an_unreadable_or_corrupt_store_is_never_merged_over(tmp_path):
     assert [backup.read_bytes() for backup in backups] == [torn]
     assert after["values"] == {"hermes-desktop-mode-v1": "dark"}
     assert after["generation"] != kept["generation"]
+
+
+def test_lock_waits_for_a_slow_holder_instead_of_failing_after_a_wall_clock_budget(tmp_path, monkeypatch):
+    """A live holder must release a waiter; contention is not data loss."""
+    path = tmp_path / "ui-preferences.json"
+    lock_dir = path.with_name(path.name + ".lock")
+    lock_dir.mkdir()
+    (lock_dir / "owner").write_text(str(os.getpid()))
+    seen_existing = threading.Event()
+    original_break_if_stale = ui_preferences._break_if_stale
+
+    def observe_break(lock_dir):
+        seen_existing.set()
+        return original_break_if_stale(lock_dir)
+
+    monkeypatch.setattr(ui_preferences, "_break_if_stale", observe_break)
+    # The base implementation's wall-clock budget is forced to expire immediately. The fixed
+    # implementation waits for the owner PID's release instead of treating contention as failure.
+    clock = iter((0.0, 4.0))
+    monkeypatch.setattr(ui_preferences.time, "monotonic", lambda: next(clock))
+    errors = []
+
+    def wait_write():
+        try:
+            ui_preferences.write_preferences({"hermes.desktop.waiter": "released"}, path=path)
+        except BaseException as error:  # pragma: no cover - only used to surface thread failures
+            errors.append(error)
+
+    waiter = threading.Thread(target=wait_write)
+    waiter.start()
+    assert seen_existing.wait(10)
+    (lock_dir / "owner").unlink()
+    lock_dir.rmdir()
+    waiter.join(10)
+
+    assert not waiter.is_alive()
+    assert not errors
+    assert ui_preferences.read_preferences(path)["values"] == {"hermes.desktop.waiter": "released"}
 
 
 def test_writes_merge_per_key_and_concurrent_writers_keep_each_others_keys(tmp_path):
