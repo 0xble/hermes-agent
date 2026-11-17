@@ -132,7 +132,7 @@ def current_removal_quote(session_id, quote, *, requirements=(), cursor=None, co
     quoted_removal = re.search(r"(?i)\b(?:remove|drop|delete|clear|disable)\b", source) and re.search(r"['\"“”][^'\"“”]+['\"”]", source)
     if quoted_removal:
         if not re.fullmatch(
-                r"\s*(?:please\s+)?(?:remove|drop|delete|clear|disable)\s+['\"“”][^'\"“”]+['\"”]"
+                r"\s*(?:please\s+)?(?:remove|drop|delete|clear|disable)\s+(?:(?:the\s+)?(?:constraint|criterion|requirement)\s+)?['\"“”][^'\"“”]+['\"”]"
                 r"(?:\s+from\s+(?:the\s+)?[\w:-]+(?:\s+(?:goal|loop))?)?[.!;\s]*",
                 source, re.IGNORECASE | re.DOTALL):
             return "user_quote_qualified"
