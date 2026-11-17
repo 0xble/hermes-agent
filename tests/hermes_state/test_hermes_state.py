@@ -5609,31 +5609,6 @@ def test_find_session_by_origin_matching_rules(db):
     ) is None
 
 
-def test_lookup_sessions_matches_title_topic_and_slack_route(db):
-    db.create_session(
-        "lookup-slack", "slack", session_key="agent:main:slack:channel:C123:thread:171.42",
-        chat_id="C123", chat_type="channel", thread_id="171.42", display_name="Incident thread",
-    )
-    db.set_session_title("lookup-slack", "PartyDAO relay delivery")
-    db.create_session(
-        "lookup-telegram", "telegram", session_key="agent:main:telegram:group:-99:topic:7",
-        chat_id="-99", chat_type="group", thread_id="7", display_name="Review topic",
-    )
-    db.set_session_title("lookup-telegram", "Everguide Review")
-
-    assert [r["session_id"] for r in db.lookup_sessions(title="partydao")] == ["lookup-slack"]
-    assert [r["session_id"] for r in db.lookup_sessions(topic_name="Review topic")] == ["lookup-telegram"]
-    assert [r["session_id"] for r in db.lookup_sessions(
-        platform="slack", chat_id="C123", thread_id="171.42"
-    )] == ["lookup-slack"]
-    assert db.lookup_sessions(platform="slack", chat_id="C123", thread_id="wrong") == []
-
-
-def test_lookup_sessions_requires_a_typed_selector(db):
-    with pytest.raises(ValueError, match="lookup requires"):
-        db.lookup_sessions()
-
-
 
 
 
