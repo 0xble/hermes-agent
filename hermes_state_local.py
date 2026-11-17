@@ -1,5 +1,6 @@
 """Private local creation receipts in the canonical runtime transaction owner."""
 import json
+import sqlite3
 import threading
 import time
 from collections import OrderedDict
@@ -183,14 +184,25 @@ def moved_receipts(conn, target_ids=None, *, owners=None):
         keys, key_params = "m.key GLOB ?", (POLICY_PREFIX + '*',)
     else:
         keys, key_params = "m.key IN (SELECT ? || value FROM json_each(?))", (POLICY_PREFIX, json.dumps(list(owners)))
-    rows = conn.execute(
-        "SELECT substr(m.key, ?), s.id, s.source FROM state_meta m JOIN sessions s "
+    sql = (
+        "SELECT substr(m.key, ?), s.id, s.source FROM state_meta m "
+        "INDEXED BY idx_state_meta_local_policy_route JOIN sessions s "
         "ON s.id = CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.entry.session_id') END "
         f"WHERE {keys} AND s.session_key IS NOT NULL "
-        "AND s.session_key IS NOT CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.route') END",
-        (len(POLICY_PREFIX) + 1, *key_params)).fetchall()
-    return {owner: (target, source) for owner, target, source in rows
-            if target_ids is None or target in target_ids}
+        "AND s.session_key IS NOT CASE WHEN json_valid(m.value) THEN json_extract(m.value, '$.route') END"
+    )
+    params = (len(POLICY_PREFIX) + 1, *key_params)
+    if target_ids is not None:
+        sql += " AND s.id IN (SELECT value FROM json_each(?))"
+        params += (json.dumps(list(target_ids)),)
+    try:
+        rows = conn.execute(sql, params).fetchall()
+    except sqlite3.OperationalError as exc:
+        # Stores created before the index still answer correctly, only slower.
+        if 'idx_state_meta_local_policy_route' not in str(exc) and 'no query solution' not in str(exc):
+            raise
+        rows = conn.execute(sql.replace(' INDEXED BY idx_state_meta_local_policy_route', ''), params).fetchall()
+    return {owner: (target, source) for owner, target, source in rows}
 
 
 def release_receipts(conn, owners):
