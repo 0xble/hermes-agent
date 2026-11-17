@@ -47,7 +47,9 @@ def _cooled_visited_entries(agent: Any) -> list[str]:
             continue
         try:
             active = fallback_route_is_active(entry.get("provider"), entry.get("base_url"), entry.get("model"))
-        except (OSError, TypeError, ValueError):
+        except Exception:
+            # Failure copy is built on a path that is already reporting an error; a lookup
+            # that fails here must never replace that error with its own.
             logger.debug("Cooldown lookup for a failure card failed", exc_info=True)
             continue
         if active:

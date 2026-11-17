@@ -9,6 +9,9 @@ on a different route, no token estimate, or a bucket whose reset has already pas
 the request. One provider label can front several upstreams (a local proxy serving both
 ``gpt-*`` and ``muse-*``), so the bucket is matched on the whole route, never the provider
 alone; otherwise the primary's bucket would also refuse the spare that shares its label.
+
+The route is paired with the header state on the agent, not stored on the state itself: the
+state is serialized into the usage payload, and an endpoint URL does not belong there.
 """
 from __future__ import annotations
 
@@ -26,13 +29,20 @@ def admission_route(agent: Any) -> tuple[str, str, str]:
     )
 
 
+def remember_bucket_route(agent: Any, state: Any) -> None:
+    """Pair a freshly captured header state with the route it was captured on."""
+    agent._rate_limit_state_route = (state, admission_route(agent))
+
+
 def predicted_tpm_overage(agent: Any, approx_tokens: Any) -> Optional[str]:
     """Describe a predicted minute-bucket overage on the live route, or None to admit."""
     state = getattr(agent, "_rate_limit_state", None)
-    if state is None:
+    pair = getattr(agent, "_rate_limit_state_route", None)
+    # The pairing must be for this exact state: one replaced since describes no known route.
+    if state is None or not isinstance(pair, tuple) or len(pair) != 2 or pair[0] is not state:
         return None
     try:
-        if tuple(getattr(state, "route", None) or ()) != admission_route(agent):
+        if pair[1] != admission_route(agent):
             return None
         if tpm_admission_delay(state, approx_tokens) <= 0:
             return None

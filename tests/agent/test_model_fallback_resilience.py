@@ -272,7 +272,7 @@ def test_model_map_option_reaches_the_child_only_from_a_model_map_route():
 
 def _guard_agent(*, pending=True, fallback_ok=True, route_scoped=True):
     import time
-    from agent.turn_api_call_admission import admission_route
+    from agent.turn_api_call_admission import remember_bucket_route
     calls = []
     now = time.time()
     state = RateLimitState(
@@ -287,7 +287,7 @@ def _guard_agent(*, pending=True, fallback_ok=True, route_scoped=True):
         _try_activate_fallback=lambda: calls.append("fallback") or fallback_ok,
     )
     if route_scoped:
-        state.route = admission_route(agent)
+        remember_bucket_route(agent, state)
     return agent, calls
 
 
@@ -344,7 +344,20 @@ def test_dispatch_guard_fails_open_without_headers_estimate_or_matching_route(mo
     agent, calls_reset = _guard_agent()
     agent._rate_limit_state.tokens_min.captured_at -= 120
     assert _run_guard(agent, 20_000, monkeypatch).action == "fallthrough"
-    assert calls == calls_unscoped == calls_spare == calls_reset == []
+
+    # A state swapped in since the pairing was recorded belongs to no known route.
+    agent, calls_swapped = _guard_agent()
+    agent._rate_limit_state = RateLimitState(
+        captured_at=agent._rate_limit_state.captured_at, tokens_min=agent._rate_limit_state.tokens_min)
+    assert _run_guard(agent, 20_000, monkeypatch).action == "fallthrough"
+    assert calls == calls_unscoped == calls_spare == calls_reset == calls_swapped == []
+
+
+def test_admission_route_stays_out_of_the_serialized_rate_limit_state():
+    # The usage payload serializes this state; an endpoint URL must not ride along in it.
+    import dataclasses
+    agent, _calls = _guard_agent()
+    assert "8317" not in repr(dataclasses.asdict(agent._rate_limit_state))
 
 
 _PRIMARY = ("custom:openai-proxy", "http://127.0.0.1:8317/v1", "gpt-6.1-sol")
