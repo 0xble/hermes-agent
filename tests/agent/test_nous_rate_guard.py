@@ -108,6 +108,12 @@ class TestRecordNousRateLimit:
                      "x-ratelimit-remaining-requests": "5", "x-ratelimit-reset-requests": "30"},
             error_context={"reset_at": time.time() + 410},
         ) == pytest.approx(410, abs=2)
+        # A structured welcome-tier refusal names its own wait; minute-only headers do not cut it.
+        assert recorded(
+            headers={"x-ratelimit-remaining-requests": "0", "x-ratelimit-reset-requests": "60"},
+            error_context={"reset_at": time.time() + 410,
+                           "welcome_refusal": {"reason": "rate_limited", "retry_after": 410}},
+        ) == pytest.approx(410, abs=2)
 
     def test_custom_default_cooldown(self, rate_guard_env):
         from agent.nous_rate_guard import record_nous_rate_limit, _state_path

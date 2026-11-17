@@ -99,7 +99,10 @@ def record_nous_rate_limit(
         reset_at = now + header_seconds
     if reset_at is None:
         reset_at = now + default_cooldown
-    reset_at = now + _clamp_to_minute_window(reset_at - now, headers)
+    # A structured welcome-tier refusal names its own wait and stays authoritative (the body
+    # wins); only header- or prose-derived waits are bounded to the window the headers describe.
+    if not is_long_welcome_rate_limit(error_context):
+        reset_at = now + _clamp_to_minute_window(reset_at - now, headers)
 
     state = {"reset_at": reset_at, "recorded_at": now, "reset_seconds": reset_at - now}
     try:
