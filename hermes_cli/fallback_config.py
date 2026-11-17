@@ -30,18 +30,20 @@ def _resolved_route(route: Mapping[str, Any] | None, config: Mapping[str, Any] |
     item = dict(route or {})
     model = str(item.get("model") or "").strip()
     if model:
+        from hermes_cli.model_alias_runtime import ModelAliasError, resolve_model_alias
         try:
-            from hermes_cli.model_alias_runtime import resolve_model_alias
             resolved = resolve_model_alias(model, config or {})
-            if resolved.name and resolved.model:
-                item["model"] = resolved.model
-                if not item.get("provider") and resolved.provider:
-                    item["provider"] = resolved.provider
-                if not item.get("base_url") and resolved.base_url:
-                    item["base_url"] = resolved.base_url
-        except Exception:
-            # Validation must still report the malformed route, not fail config loading.
-            pass
+        except (ModelAliasError, KeyError, TypeError, AttributeError):
+            # An unresolvable alias is reported by validation as the malformed route it is;
+            # identity and family checks fall back to the name as written.
+            logger.debug("Fallback route alias %r did not resolve", model, exc_info=True)
+            return item
+        if resolved.name and resolved.model:
+            item["model"] = resolved.model
+            if not item.get("provider") and resolved.provider:
+                item["provider"] = resolved.provider
+            if not item.get("base_url") and resolved.base_url:
+                item["base_url"] = resolved.base_url
     return item
 
 
@@ -60,10 +62,8 @@ def upstream_family(route: Mapping[str, Any] | None, config: Mapping[str, Any] |
         if model.startswith(prefix):
             return family
     provider = str(item.get("provider") or "").strip().lower()
-    try:
-        return _normalize_provider_id(provider) or f"model:{model}"
-    except Exception:
-        return provider or f"model:{model}"
+    # _normalize_provider_id already degrades to the bare lowercase id when it cannot load.
+    return _normalize_provider_id(provider) or f"model:{model}"
 
 
 def route_identity(route: Mapping[str, Any] | None, config: Mapping[str, Any] | None = None) -> tuple[str, str, str]:

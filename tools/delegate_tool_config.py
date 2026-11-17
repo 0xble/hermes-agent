@@ -779,7 +779,8 @@ def _resolve_child_runtime(
                 effective_model = candidate.get("model") or candidate_model
                 effective_provider = candidate.get("provider") or candidate_provider
                 effective_base_url = candidate.get("base_url")
-                parent_api_key = candidate.get("api_key")
+                # A candidate without a key of its own inherits the parent's, as any direct
+                # endpoint does; the role primary's explicit key never follows it there.
                 override_api_key = candidate.get("api_key")
                 effective_api_mode = candidate.get("api_mode")
                 effective_requested_provider = candidate.get("requested_provider") or candidate_provider

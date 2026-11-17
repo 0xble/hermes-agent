@@ -1117,9 +1117,8 @@ def validate_config_structure(config: Optional[dict[str, Any]] = None) -> list[C
                    f"Root-level key '{key}' looks misplaced — should it be under 'model:' or inside a 'custom_providers' entry?",
                    f"Move '{key}' under the appropriate section")
 
-    _validate_web_backends(config, issues)
-    _validate_model_maps(config, issues)
-    _validate_quoted_containers(config, issues)
+    for validate in (_validate_web_backends, _validate_model_maps, _validate_quoted_containers):
+        validate(config, issues)
     return issues
 
 

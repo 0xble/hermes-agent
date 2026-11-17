@@ -15,7 +15,9 @@ import os
 import time
 from typing import Any, Mapping, Optional
 from utils import atomic_write_text
-from agent.retry_utils import parse_retry_after_seconds
+from agent.retry_utils import (
+    MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, _minute_rate_limit_headers, parse_retry_after_seconds,
+)
 from agent.rate_limit_tracker import (
     _BUCKET_TAGS, _fmt_seconds, _safe_float, _safe_int, has_rate_limit_headers, lower_headers,
 )
@@ -57,6 +59,21 @@ def _parse_reset_seconds(headers: Optional[Mapping[str, str]]) -> Optional[float
     return retry_after if retry_after else None
 
 
+def _clamp_to_minute_window(seconds: float, headers: Optional[Mapping[str, str]]) -> float:
+    """Bound a wait that outlasts the minute bucket the 429's own headers describe.
+
+    Some gateways answer a per-minute limit with a days-long ``Retry-After``. Persisting that
+    would block every session on this home for days, so it gets the same cap the in-process
+    retry path applies. An exhausted longer bucket is a real wait and keeps its own reset.
+    """
+    lowered = lower_headers(headers)
+    if seconds <= MINUTE_RATE_LIMIT_COOLDOWN_CAP_S or not _minute_rate_limit_headers(lowered):
+        return seconds
+    exhausted = [reset for remaining, reset in _parse_buckets_from_headers(lowered).values()
+                 if remaining is not None and remaining <= 0 and reset]
+    return min(seconds, max([MINUTE_RATE_LIMIT_COOLDOWN_CAP_S, *exhausted]))
+
+
 def record_nous_rate_limit(
     *, headers: Optional[Mapping[str, str]] = None, error_context: Optional[dict[str, Any]] = None,
     default_cooldown: float = 300.0,
@@ -78,6 +95,7 @@ def record_nous_rate_limit(
         reset_at = now + header_seconds
     if reset_at is None:
         reset_at = now + default_cooldown
+    reset_at = now + _clamp_to_minute_window(reset_at - now, headers)
 
     state = {"reset_at": reset_at, "recorded_at": now, "reset_seconds": reset_at - now}
     try:
