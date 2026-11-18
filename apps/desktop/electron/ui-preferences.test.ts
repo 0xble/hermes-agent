@@ -17,6 +17,8 @@ const python = process.env.HERMES_PYTHON || 'python3'
 const homes: string[] = []
 
 afterEach(() => {
+  vi.useRealTimers()
+
   for (const home of homes.splice(0)) {
     fs.rmSync(home, { force: true, recursive: true })
   }
@@ -105,6 +107,7 @@ test('a live-owner lock stays pending and unchanged until the owner releases it'
   fs.writeFileSync(owner, String(process.pid))
 
   let settled = false
+
   const pending = writeUiPreferences(file, { values: { 'hermes.desktop.waiter': 'released' } }).finally(() => {
     settled = true
   })
@@ -133,7 +136,9 @@ test('a dead-pid lock is reclaimed', async () => {
 })
 
 test('a live owner hits the bounded backstop and does not wedge later writes', async () => {
-  vi.useFakeTimers()
+  // Fake only the wall clock. The lock loop awaits real fs I/O between polls, so faking
+  // setTimeout would strand a poll scheduled after the jump; real 20 ms polls keep running.
+  vi.useFakeTimers({ toFake: ['Date'] })
   const root = scratchHome()
   const file = uiPreferencesPath(root)
   const lockDir = `${file}.lock`
@@ -141,12 +146,27 @@ test('a live owner hits the bounded backstop and does not wedge later writes', a
   fs.writeFileSync(path.join(lockDir, 'owner'), String(process.pid))
 
   try {
-    const pending = writeUiPreferences(file, { values: { 'hermes.desktop.stuck': 'yes' } })
-    await vi.advanceTimersByTimeAsync(30_001)
-    await assert.rejects(pending, /preferences store is busy/)
+    let outcome: unknown = 'pending'
+
+    const pending = writeUiPreferences(file, { values: { 'hermes.desktop.stuck': 'yes' } }).then(
+      () => {
+        outcome = 'resolved'
+      },
+      (error: unknown) => {
+        outcome = error
+      }
+    )
+
+    for (let step = 0; step < 200 && outcome === 'pending'; step += 1) {
+      vi.setSystemTime(Date.now() + 1_000)
+      await new Promise(resolve => setTimeout(resolve, 25))
+    }
+
+    await pending
+    assert.match(String(outcome), /preferences store is busy/)
   } finally {
-    fs.rmSync(lockDir, { force: true, recursive: true })
     vi.useRealTimers()
+    fs.rmSync(lockDir, { force: true, recursive: true })
   }
 
   const written = await writeUiPreferences(file, { values: { 'hermes.desktop.afterBusy': 'yes' } })
