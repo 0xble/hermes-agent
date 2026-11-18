@@ -88,7 +88,8 @@ async def close_viewer_session(authority, session_id, reason):
         return  # stored history: no route, agent or delegation of its own
     from tools.async_delegation import interrupt_for_session, refuse_for_session
     route = live.route
-    parents = tuple(dict.fromkeys((session_id, _physical_target(authority, session_id))))
+    target = await asyncio.to_thread(_physical_target, authority, session_id)
+    parents = tuple(dict.fromkeys((session_id, target)))
     refuse_for_session((authority.profile_id, session_id), session_key=route, parent_session_ids=parents)
     for parent in parents:
         interrupt_for_session(session_key=route, parent_session_id=parent, reason=f'viewer_close:{reason}')
@@ -291,7 +292,7 @@ async def settle_viewer_close(authority, session_id):
         return
     if not await _resolve_abandoned_unknown(authority, session_id, live, close):
         return  # left paused (a viewer came back, or the resolution was refused)
-    target = _physical_target(authority, session_id)
+    target = await asyncio.to_thread(_physical_target, authority, session_id)
     # Every await below can let a viewer reattach (attach drops the pending close) or another
     # settler run, so the close is re-checked after each one.
     if await asyncio.to_thread(_busy, authority, session_id, target):
