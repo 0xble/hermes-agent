@@ -124,7 +124,7 @@ def test_shutdown_without_cancel_drains_every_queued_entry():
         pool.submit_ranked(0, lambda: None)
 
 
-def test_submit_due_jobs_orders_one_tick_by_rank_and_keeps_fifo_within_rank():
+def test_rank_sort_and_ranked_pool_keep_fifo_within_rank():
     order = []
     pool = admission.PriorityThreadPoolExecutor(1, thread_name_prefix="priority-test")
     due = [{"id": "bg1", "priority": "background"}, {"id": "unset"},
@@ -208,3 +208,9 @@ def test_submit_due_jobs_runs_reserved_first_then_rank_order(tmp_path, monkeypat
         admission.submit_due_jobs(due, object(), lambda job: True)
     assert calls == [("reserved", "protected"), ("general", "live"), ("general", "unset"),
                      ("general", "prod2"), ("general", "bg")]
+
+
+@pytest.mark.parametrize("bad", [["live"], {"x": 1}, 3, "Live", "urgent"])
+def test_malformed_stored_priority_ranks_as_production_and_never_raises(bad):
+    assert job_priority({"priority": bad}) == "production"
+    assert sorted([{"priority": bad}, {"priority": "live"}], key=job_priority_rank)[0] == {"priority": "live"}

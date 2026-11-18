@@ -25,9 +25,11 @@ _WORK_PRIORITY_RANKS = {name: rank for rank, name in enumerate(WORK_PRIORITIES)}
 
 
 def job_priority(job: dict) -> str:
-    """Return the effective business-impact lane; legacy/unset jobs are production."""
+    """Return the effective business-impact lane; unset, legacy or malformed values are production.
+
+    Runs inside admission sorting, so a hand-edited record must never raise here."""
     value = job.get("priority")
-    return value if value in _WORK_PRIORITY_RANKS else "production"
+    return value if isinstance(value, str) and value in _WORK_PRIORITY_RANKS else "production"
 
 
 def job_priority_rank(job: dict) -> int:
