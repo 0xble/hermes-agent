@@ -76,7 +76,8 @@ def test_incognito_admission_can_claim_and_settle(tmp_path):
             row = rt.admit_session_input(
                 db, epoch=epoch, principal_id='private', session_id='s', request_id='private',
                 payload={'text': 'private'})
-            claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
+        with incognito_scope(True, 's'):
             settled = rt.settle_session_input(
                 db, epoch=epoch, admission_id=claimed['admission_id'],
                 generation=claimed['generation'], outcome='completed')
