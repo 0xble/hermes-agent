@@ -231,10 +231,16 @@ def open_state_db(path: Path, db_label: str) -> sqlite3.Connection:
     from hermes_state import _secure_state_db_files
     mkdir_under_hermes_home(path.parent)
     _secure_state_db_files(path, create_main=True)
+    identity = _db_identity(path)
     # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
     conn = open_db(path, db_label=db_label, busy_timeout_ms=10_000,
-                   wal=False, row_factory=None, initialize=_initialize_schema)
-    _secure_state_db_files(path)
+                   wal=False, row_factory=None,
+                   initialize=lambda conn: _initialize_schema(conn, identity=identity))
+    try:
+        _secure_state_db_files(path)
+    except BaseException:
+        conn.close()
+        raise
     return conn
 
 
@@ -1767,9 +1773,13 @@ def _reset_for_tests() -> None:
         _reoffered_at.clear()
     with _held_lock:
         _held_copies.clear()
+    # Defined below (imported from the ledger submodule); resolved at call time.
+    with _SCHEMA_READY_LOCK:
+        _SCHEMA_READY.clear()
 
 
 from tools.async_delegation_ledger import (
+    _SCHEMA_READY, _SCHEMA_READY_LOCK, _db_identity,
     _db_path, _connect, _initialize_schema, _transaction, _capture_routing_origin, _persist_dispatch,
     _persist_transition, _persist_transition_group, _durable_state, _log_pruned_ids,
     _prune_durable_records, _persist_completion, _attach_retry_note, _stamp_resume_availability,

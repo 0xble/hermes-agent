@@ -157,7 +157,7 @@ _PREVIEW_RAW_SELECT = (
     f" THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW)} || '{SKILL_EXCERPT_JOINT}'"
     f" || {_preview_normalized_window_sql(-_PREVIEW_SCAFFOLD_WINDOW, _PREVIEW_SCAFFOLD_WINDOW)}"
     f" WHEN {_PREVIEW_SCAFFOLDED_SQL} THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW * 2)}"
-    f" ELSE SUBSTR({_sql_ltrim_whitespace(_PREVIEW_CONTENT_SQL)}, 1, {_PREVIEW_HEAD_CHARS}) END")
+    f" ELSE {_sql_ltrim_whitespace(_preview_normalized_window_sql(1, _PREVIEW_HEAD_CHARS))} END")
 
 
 def _shape_preview(raw: Any) -> str:
