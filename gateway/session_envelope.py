@@ -433,7 +433,18 @@ def restore_native_source(payload, runner=None):
         from gateway.session_ingress_context import callback_runner, restore_provenance
         runner = runner or callback_runner()
         if runner is not None:
-            restore_provenance(runner, source, envelope['provenance'])
+            provenance = dict(envelope['provenance'])
+            # Native envelopes written before multiplex transport ownership was
+            # persisted have a null transport profile.  The legacy agent:main
+            # namespace is the default profile, so repair only that unambiguous
+            # case.  Named namespaces may be shared-bot satellites and remain
+            # fail-closed until their receiving profile is known.
+            if (getattr(getattr(runner, 'config', None), 'multiplex_profiles', False)
+                    and provenance.get('transport_profile') is None):
+                from hermes_state_keys import profile_from_session_key
+                if profile_from_session_key(envelope.get('route')) == 'default':
+                    provenance['transport_profile'] = 'default'
+            restore_provenance(runner, source, provenance)
     return source
 
 
