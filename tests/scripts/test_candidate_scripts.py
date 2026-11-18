@@ -381,10 +381,13 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     values = {"memory.write_approval": "false", "delegation.model": "",
               "delegation.backend": "model_map",
               "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m",
+              "delegation.backends.model_map.options": [{"name": "worker", "model": "worker-model"}],
               "auxiliary.background_review.enabled": "true"}
 
     def fake_run(cmd, **_kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+        key = cmd[-2] if cmd[-1] == "--json" else cmd[-1]
+        value = json.dumps(values[key]) if cmd[-1] == "--json" else values[key] + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=value, stderr="")
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
     assert mod.check_config(tmp_path) == []
@@ -484,11 +487,14 @@ def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch)
     calls = []
     values = {"memory.write_approval": "false", "delegation.model": "",
               "delegation.backend": "model_map",
-              "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m"}
+              "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m",
+              "delegation.backends.model_map.options": [{"name": "worker", "model": "worker-model"}]}
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+        key = cmd[-2] if cmd[-1] == "--json" else cmd[-1]
+        value = json.dumps(values[key]) if cmd[-1] == "--json" else values[key] + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=value, stderr="")
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
     assert mod.check_config(tmp_path) == []
