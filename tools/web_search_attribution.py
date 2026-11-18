@@ -46,7 +46,7 @@ def _session_identity(session_id: str | None) -> tuple[str, str, str]:
     try:
         from gateway.session_context import bound_session_env
         current = bound_session_env("HERMES_SESSION_ID", "")
-    except Exception:
+    except (ImportError, LookupError, RuntimeError):
         current = ""
     sid = str(session_id or current or "")
     parent = root = ""
@@ -54,8 +54,8 @@ def _session_identity(session_id: str | None) -> tuple[str, str, str]:
         from agent.delegation_context import delegated_child_parent_session_id, delegated_child_root_session_id
         parent = delegated_child_parent_session_id()
         root = delegated_child_root_session_id()
-    except Exception:
-        pass
+    except (ImportError, LookupError, RuntimeError) as exc:
+        logger.debug("web_search attribution: delegation context unavailable: %s", exc)
     return sid, parent, root
 
 
@@ -114,8 +114,8 @@ def record_search_call(
             _rotate_if_needed(path)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(line)
-    except Exception as exc:
-        logger.debug("web_search attribution logging failed: %s", exc)
+    except Exception:  # health: allow BLE001 -- attribution is best-effort telemetry and must never fail a paid search
+        logger.debug("web_search attribution logging failed", exc_info=True)
 
 
 def summarize_records(path: str | os.PathLike[str]) -> list[dict]:
