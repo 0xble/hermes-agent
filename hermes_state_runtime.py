@@ -164,8 +164,10 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
     if intent not in ('queue', 'steer', 'redirect'):
         raise RuntimeStoreError('invalid_params')
     from hermes_state_runtime_privacy import execute_owned_write, input_owners, require_public, session_owners
+    from agent.incognito import is_incognito
     owners = input_owners(session_id, payload)
-    require_public(owners)
+    if not is_incognito():
+        require_public(owners)
     encoded = _json(payload)
     from hermes_state_terminal import retry_terminal_admission
     retired = retry_terminal_admission(db, epoch=epoch, principal_id=principal_id, session_id=session_id,
@@ -198,6 +200,8 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             VALUES(?,?,?,?,?,?,?,?,'queued',?)''',
             (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
         return _row(_admission(conn, admission_id))
+    if is_incognito():
+        return db._execute_write(write, session_ids=(session_id, payload), skip_result={})
     return execute_owned_write(db, write, owners, resolve=lambda conn: session_owners(conn, owners))
 
 
