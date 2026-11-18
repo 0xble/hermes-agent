@@ -8,6 +8,10 @@ and [related implementation](https://github.com/NousResearch/hermes-agent/pull/1
 are comparison candidates, not substitutes for the accepted mid-session contract.
 The CLI's safe mode and rule opt-outs do not establish a persistence boundary.
 
+Runtime admission and settlement retain an internal incognito bypass for the
+current private turn. Public callers still resolve and validate durable owners
+before writing, so the bypass cannot be used to mutate another session.
+
 ## Ownership And Adoption
 
 The user-facing contract and configuration belong to the Incognito Gateway Topics

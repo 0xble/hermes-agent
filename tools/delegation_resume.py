@@ -953,8 +953,8 @@ def classify_armed(*, now: Optional[float] = None, limit: int = 64) -> int:
     return len(armed)
 
 
-def _claimable_retry_rows(conn, now: float, limit: int) -> list:
-    """Read without writer admission, then revalidate only the selected ids under it."""
+def _retry_candidate_ids(conn, now: float, limit: int) -> list[str]:
+    """Read retry candidates without opening a writer transaction."""
     stale = now - RETRY_CLAIM_TTL_S
     conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
     where = """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
@@ -972,19 +972,39 @@ def _claimable_retry_rows(conn, now: float, limit: int) -> list:
                     AND COALESCE(retry_root_started_at, dispatched_at) > ?)
            """
     params = (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S)
-    candidates = conn.execute(
+    return [row[0] for row in conn.execute(
         "SELECT delegation_id FROM async_delegations" + where + " ORDER BY updated_at ASC LIMIT ?",
-        (*params, limit)).fetchall()
-    if not candidates:
+        (*params, limit)).fetchall()]
+
+
+def _claimable_retry_rows(conn, now: float, limit: int, candidate_ids=None) -> list:
+    """Re-read and claim only selected ids after acquiring the writer transaction."""
+    stale = now - RETRY_CLAIM_TTL_S
+    conn.create_function("trusted_restart_cut", 1, is_trusted_restart_cut)
+    where = """ WHERE ((retry_state='scheduled' AND retry_due_at <= ?)
+             OR (retry_state IN ('notified','dispatching') AND retry_claimed_at <= ?)
+             OR (retry_state='terminal' AND (retry_due_at IS NULL OR retry_due_at <= ?))
+             OR (retry_state IN ('noticing','reporting') AND retry_claimed_at <= ?))
+           AND (event_json IS NULL OR delivery_state != 'pending')
+           AND NOT EXISTS (SELECT 1 FROM async_delegation_events e
+                           WHERE e.delegation_id=async_delegations.delegation_id
+                             AND e.delivery_state='pending')
+           AND NOT (trusted_restart_cut(COALESCE(NULLIF(json_extract(event_json, '$.cut_reason'), ''),
+                                           json_extract(result_json, '$.cut_reason')))
+                    AND (delivery_state='delivered' OR retry_notices > 0)
+                    AND retry_state IN ('scheduled','notified')
+                    AND COALESCE(retry_root_started_at, dispatched_at) > ?)
+           """
+    params = (now, now - NOTICE_GRACE_S, now, stale, now - MAX_LINEAGE_AGE_S)
+    if candidate_ids is None:
+        candidate_ids = _retry_candidate_ids(conn, now, limit)
+    if not candidate_ids:
         return []
-    # SELECT above is autocommit/read-only. Recheck delivery, stop, seal and
-    # claim eligibility after acquiring the writer, restricted to these ids.
     if not conn.in_transaction:
         conn.execute("BEGIN IMMEDIATE")
     return conn.execute(
-        _RETRY_SELECT + where + f" AND delegation_id IN ({','.join('?' for _ in candidates)})"
-        + " ORDER BY updated_at ASC",
-        (*params, *(row[0] for row in candidates))).fetchall()
+        _RETRY_SELECT + where + f" AND delegation_id IN ({','.join('?' for _ in candidate_ids)})"
+        + " ORDER BY updated_at ASC", (*params, *candidate_ids)).fetchall()
 
 
 
@@ -1015,78 +1035,81 @@ def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     now = time.time() if now is None else now
     classify_armed(now=now, limit=limit)
     actions = []
-    with ad._DB_LOCK, _best_effort_retry_transaction(ad) as conn:
-        if conn is None:
-            return RetrySweepDeferred()
-        rows = _claimable_retry_rows(conn, now, limit)
-        for row in rows:
-            record = _retry_record(row)
-            # An execution seal blocks recovery work, not an already-owed
-            # terminal delivery. Reporting cannot admit a replacement driver.
-            if (_recovery_admission_error(record) == INELIGIBLE_SEALED
-                    and record["retry_state"] not in (RETRY_TERMINAL, RETRY_REPORTING)):
-                continue
-            dispatch_claim = record["retry_claim"] if record["retry_state"] == RETRY_DISPATCHING else None
-            stopped = _recovery_stopped(record)
-            if stopped:
-                # A user stop revokes recovery, but an already-owed terminal
-                # report still gets one settlement pass. Pending retry notices
-                # are cancelled with an explicit reason and no stale claim.
-                if record["retry_state"] in (RETRY_TERMINAL, RETRY_REPORTING):
-                    if record["retry_state"] == RETRY_REPORTING:
-                        conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_claim=NULL, "
+    with ad._DB_LOCK:
+        with ad._transaction() as read_conn:
+            candidate_ids = _retry_candidate_ids(read_conn, now, limit)
+        with _best_effort_retry_transaction(ad) as conn:
+            if conn is None:
+                return RetrySweepDeferred()
+            rows = _claimable_retry_rows(conn, now, limit, candidate_ids)
+            for row in rows:
+                record = _retry_record(row)
+                # An execution seal blocks recovery work, not an already-owed
+                # terminal delivery. Reporting cannot admit a replacement driver.
+                if (_recovery_admission_error(record) == INELIGIBLE_SEALED
+                        and record["retry_state"] not in (RETRY_TERMINAL, RETRY_REPORTING)):
+                    continue
+                dispatch_claim = record["retry_claim"] if record["retry_state"] == RETRY_DISPATCHING else None
+                stopped = _recovery_stopped(record)
+                if stopped:
+                    # A user stop revokes recovery, but an already-owed terminal
+                    # report still gets one settlement pass. Pending retry notices
+                    # are cancelled with an explicit reason and no stale claim.
+                    if record["retry_state"] in (RETRY_TERMINAL, RETRY_REPORTING):
+                        if record["retry_state"] == RETRY_REPORTING:
+                            conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_claim=NULL, "
+                                         "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
+                                         (now, record["delegation_id"]))
+                            record.update(retry_state=RETRY_TERMINAL, retry_claim="", retry_claimed_at=None)
+                    else:
+                        conn.execute("UPDATE async_delegations SET retry_state='cancelled', retry_reason=?, "
+                                     "retry_claim=NULL, retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? "
+                                     "WHERE delegation_id=?",
+                                     ("stopped by user", now, record["delegation_id"]))
+                        if dispatch_claim is not None:
+                            _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
+                        continue
+                if record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED, RETRY_DISPATCHING):
+                    _expire_retry(conn, record, now)
+                state = record["retry_state"]
+                if (not stopped and is_trusted_restart_cut(_cut_reason(record))
+                        and (record["delivery_state"] == "delivered" or record["retry_notices"] > 0)):
+                    # The cut completion/accepted continuation notice owns the one
+                    # parent wake. Recovery is explicit, not an automatic rerun.
+                    if state == RETRY_TERMINAL:
+                        conn.execute("UPDATE async_delegations SET retry_state='reported', retry_claim=NULL, "
                                      "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
                                      (now, record["delegation_id"]))
-                        record.update(retry_state=RETRY_TERMINAL, retry_claim="", retry_claimed_at=None)
-                else:
-                    conn.execute("UPDATE async_delegations SET retry_state='cancelled', retry_reason=?, "
-                                 "retry_claim=NULL, retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? "
-                                 "WHERE delegation_id=?",
-                                 ("stopped by user", now, record["delegation_id"]))
+                    elif state == RETRY_DISPATCHING:
+                        conn.execute("UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "
+                                     "retry_claimed_at=NULL, retry_due_at=?, updated_at=? WHERE delegation_id=? "
+                                     "AND retry_state='dispatching' AND retry_claim=?",
+                                     (record["retry_root_started_at"] + MAX_LINEAGE_AGE_S, now,
+                                      record["delegation_id"], dispatch_claim))
                     if dispatch_claim is not None:
                         _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
                     continue
-            if record["retry_state"] in (RETRY_SCHEDULED, RETRY_NOTICING, RETRY_NOTIFIED, RETRY_DISPATCHING):
-                _expire_retry(conn, record, now)
-            state = record["retry_state"]
-            if (not stopped and is_trusted_restart_cut(_cut_reason(record))
-                    and (record["delivery_state"] == "delivered" or record["retry_notices"] > 0)):
-                # The cut completion/accepted continuation notice owns the one
-                # parent wake. Recovery is explicit, not an automatic rerun.
+                if state == RETRY_NOTICING:  # crashed mid-injection: same notice again
+                    state, record["retry_state"] = RETRY_SCHEDULED, RETRY_NOTICING
+                if state == RETRY_REPORTING:
+                    state = RETRY_TERMINAL
+                if state in (RETRY_NOTIFIED, RETRY_DISPATCHING) and record["retry_notices"] >= MAX_RETRY_NOTICES:
+                    reason = f"the parent did not dispatch the retry ({record['retry_reason']})"
+                    conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_reason=?, updated_at=? "
+                                 "WHERE delegation_id=? AND retry_state=?",
+                                 (reason, now, record["delegation_id"], record["retry_state"]))
+                    record.update(retry_state=RETRY_TERMINAL, retry_reason=reason)
+                    state = RETRY_TERMINAL
                 if state == RETRY_TERMINAL:
-                    conn.execute("UPDATE async_delegations SET retry_state='reported', retry_claim=NULL, "
-                                 "retry_claimed_at=NULL, retry_due_at=NULL, updated_at=? WHERE delegation_id=?",
-                                 (now, record["delegation_id"]))
-                elif state == RETRY_DISPATCHING:
-                    conn.execute("UPDATE async_delegations SET retry_state='scheduled', retry_claim=NULL, "
-                                 "retry_claimed_at=NULL, retry_due_at=?, updated_at=? WHERE delegation_id=? "
-                                 "AND retry_state='dispatching' AND retry_claim=?",
-                                 (record["retry_root_started_at"] + MAX_LINEAGE_AGE_S, now,
-                                  record["delegation_id"], dispatch_claim))
-                if dispatch_claim is not None:
-                    _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
-                continue
-            if state == RETRY_NOTICING:  # crashed mid-injection: same notice again
-                state, record["retry_state"] = RETRY_SCHEDULED, RETRY_NOTICING
-            if state == RETRY_REPORTING:
-                state = RETRY_TERMINAL
-            if state in (RETRY_NOTIFIED, RETRY_DISPATCHING) and record["retry_notices"] >= MAX_RETRY_NOTICES:
-                reason = f"the parent did not dispatch the retry ({record['retry_reason']})"
-                conn.execute("UPDATE async_delegations SET retry_state='terminal', retry_reason=?, updated_at=? "
-                             "WHERE delegation_id=? AND retry_state=?",
-                             (reason, now, record["delegation_id"], record["retry_state"]))
-                record.update(retry_state=RETRY_TERMINAL, retry_reason=reason)
-                state = RETRY_TERMINAL
-            if state == RETRY_TERMINAL:
-                claim = _claim(conn, record, record["retry_state"], RETRY_REPORTING, now)
-                if claim:
-                    actions.append(_action(record, "terminal", claim))
-            else:
-                claim = _claim(conn, record, record["retry_state"], RETRY_NOTICING, now)
-                if claim:
-                    if dispatch_claim is not None:
-                        _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
-                    actions.append(_action(record, "notice", claim))
+                    claim = _claim(conn, record, record["retry_state"], RETRY_REPORTING, now)
+                    if claim:
+                        actions.append(_action(record, "terminal", claim))
+                else:
+                    claim = _claim(conn, record, record["retry_state"], RETRY_NOTICING, now)
+                    if claim:
+                        if dispatch_claim is not None:
+                            _release_unspent_batch_children(conn, record["delegation_id"], dispatch_claim)
+                        actions.append(_action(record, "notice", claim))
     return actions
 
 

@@ -22,13 +22,14 @@ hermes_pid_from_file() {
 }
 
 hermes_pid_is_alive() {
-  local pid="$1" err
+  local pid="$1" err err_lc
   # LC_ALL=C keeps the EPERM text stable. Discarding stderr would hide a
   # gateway owned by another user: kill -0 then exits 1 for both EPERM and ESRCH.
   if err="$(LC_ALL=C kill -0 "$pid" 2>&1)"; then
     return 0
   fi
-  case "$err" in
+  err_lc="$(printf '%s' "$err" | tr '[:upper:]' '[:lower:]')"
+  case "$err_lc" in
     *"not permitted"*) return 0 ;;
   esac
   return 1

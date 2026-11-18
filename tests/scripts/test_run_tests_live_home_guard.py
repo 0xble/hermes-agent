@@ -464,6 +464,18 @@ def test_gateway_pid_eperm_counts_as_alive_and_esrch_does_not(tmp_path):
     assert missing.returncode == 0, missing.stdout + missing.stderr
     assert missing.stdout.strip() == "DEAD", missing.stdout + missing.stderr
 
+    lowercase = _source(
+        script,
+        "set -euo pipefail\n"
+        "source \"$1\"\n"
+        "kill() { printf '%s\\n' \"kill: ($2) - operation not permitted\" >&2; return 1; }\n"
+        "if hermes_gateway_pid_running \"$2\"; then echo ALIVE; else echo DEAD; fi\n",
+        str(home),
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "pinned-home")},
+    )
+    assert lowercase.returncode == 0, lowercase.stdout + lowercase.stderr
+    assert lowercase.stdout.strip() == "ALIVE", lowercase.stdout + lowercase.stderr
+
 
 def _passwd_account_home() -> Path:
     """The password-database home, not the scripts-suite installer-home patch.

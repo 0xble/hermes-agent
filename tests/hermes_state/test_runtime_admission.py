@@ -44,6 +44,25 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         running = rt.claim_session_input(db, epoch=epoch, session_id='s')
         assert running['admission_id'] == second['admission_id'] and running['generation'] > claimed['generation']
         db.close()
+
+
+def test_incognito_admission_can_claim_and_settle(tmp_path):
+    """Private turn persistence keeps its internal bypass while public writes stay guarded."""
+    import hermes_state_runtime as rt
+    from agent.incognito import incognito_scope
+
+    with store(tmp_path) as db:
+        epoch = _begin_owned_runtime_epoch(db, instance_id='incognito-owner')
+        with incognito_scope(True, 's'):
+            row = rt.admit_session_input(
+                db, epoch=epoch, principal_id='private', session_id='s', request_id='private',
+                payload={'text': 'private'})
+            claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
+            settled = rt.settle_session_input(
+                db, epoch=epoch, admission_id=claimed['admission_id'],
+                generation=claimed['generation'], outcome='completed')
+        assert row['admission_id'] == claimed['admission_id'] == settled['admission_id']
+        assert settled['status'] == 'terminal'
         db = SessionDB(db_path=tmp_path / 'state.db')
         new_epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
         assert new_epoch > epoch
