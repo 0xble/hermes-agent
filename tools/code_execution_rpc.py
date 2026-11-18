@@ -41,12 +41,18 @@ def nested_tool_call_id(task_id) -> str:
 
 def _default_dispatch(task_id):
     from model_tools import handle_function_call
-    return lambda tool_name, tool_args: handle_function_call(
-        tool_name,
-        tool_args,
-        task_id=task_id,
-        tool_call_id=nested_tool_call_id(task_id),
-    )
+    from tools.web_search_attribution import search_call_context
+
+    def dispatch(tool_name, tool_args):
+        with search_call_context("execute_code_rpc"):
+            return handle_function_call(
+                tool_name,
+                tool_args,
+                task_id=task_id,
+                tool_call_id=nested_tool_call_id(task_id),
+            )
+
+    return dispatch
 
 
 def _private_dirs_cmd(root: str, *subdirs: str) -> str:
