@@ -292,6 +292,7 @@ def _bound_removal_instruction_units(source: str, requirements: list[str]) -> li
              r"(?:\s+(?:(?:that|it)(?:'s|\s+is)\s+)?mentioned)?|(?:in\s+)?memory|memories)")
     grammar = (rf"\s*(?:please\s+)?(?P<verb>{_REMOVAL_VERBS})\s+"
                rf"(?:(?:the\s+)?{noun}\s+)?(?P<target>{marker}\d+__)"
+               rf"(?:(?:\s+from\s+(?:the\s+)?[\\w:-]+(?:\\s+(?:goal|loop))?))?"
                rf"(?:\s+{noun})?(?:,\s*including\s+{scope}(?:\s*,?\s*including\s+{scope})*"
                rf"(?:\s*\(invalidate\))?)?[.!;\s]*")
     if _NON_AUTHORITATIVE_SPANS_RE.search(source):

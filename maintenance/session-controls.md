@@ -4,9 +4,11 @@
 
 - **Fork patch identity:** `session-controls`
 
-Session controls let one Hermes session pause, resume, clear, or replace another session's goal, and pause, resume, or stop another session's loop. A fresh verbatim quote from the requester's latest typed message authorizes an action when supplied. Cross-session goal clear and replace without a quote are session-authorized and apply immediately. A supplied quote remains subject to the normal freshness and safety checks. A self-targeted destructive goal change without a fresh quote creates an asynchronous Telegram Approve/Deny request, so the requesting session keeps working while Brian decides.
+Session controls let one Hermes session pause, resume, clear, or replace another session's goal, and pause, resume, or stop another session's loop. A fresh verbatim quote from the requester's latest typed message or a receipt-authenticated relay of the source user's current words authorizes an action when supplied. Reasoned controls of an agent's own loop or goal use the same durable write/audit path without asking for approval. Cross-session goal clear and replace without a quote are session-authorized and apply immediately. A supplied quote remains subject to the normal freshness and safety checks. A self-targeted destructive goal change without a fresh quote creates an asynchronous Telegram Approve/Deny request, so the requesting session keeps working while Brian decides.
 
 Agents reach this primitive through the `goal_set` and `loop_set` tools, which the `goal-lifecycle` and `loop-lifecycle` plugins in the agents repository register. Those plugins call `apply_control` (and `resolve_target`) when a control action carries `target` or `user_quote`; core itself registers no tool, so a build without those plugins has no initiating entry point.
+
+`hermes_cli/lifecycle_authority.py` owns creation provenance, reasoned same-session controls and the shared receipt-bound relay authenticator. `tests/hermes_cli/test_lifecycle_edit_latitude.py` covers positive typed/verified-relay authority, forged/paraphrased sources, protected stop conditions and hard limits, ownership persistence, and reasoned edits/removal with before/after audit.
 
 ## Gateway Turn Ownership
 
@@ -36,14 +38,53 @@ Hermes homes. The core lineage controls alone do not prove plugin permission.
 
 ## Required behavior
 
+- `LifecycleAuthority` is the common lifecycle caller identity (`agent`, `autonomy`, `user`).
+  Both `agent` and `autonomy` act as the agent, never as the user. Revisions and applied
+  control receipts record `lifecycle_authority`; legacy `authority`/`via` fields retain their
+  evidence/quote/button/session provenance so replacement boundaries and migrations remain valid.
+  Owned goal/loop pauses record `paused_by="agent"`; neither owned nor opted-in controls can
+  relabel or lift a user/system pause. Owned loop stop finishes rather than clears, and an
+  agent resume retains the full cadence floor. Hidden approval cards cannot block owned controls.
+- Gateway lifecycle decisions use `LifecycleAuthority`, not a comparison against the legacy
+  `via: autonomy` spelling alone. Owned `agent` controls and opted-in `autonomy` controls
+  never inject a requester outcome into their own target session: the tool result already
+  reported it. Hidden/quiet notices settle their cosmetic receipts durably without changing
+  continuation admission or cleanup; visible owned receipts name the owning agent without
+  claiming approval. Quote/button/session provenance keeps its explicit-authority wording.
+  `tests/gateway/test_session_control_owned_notices.py` covers pause/resume/stop, autonomy
+  on/off and hidden/false/true notices, plus legacy self/cross-session autonomy receipts.
+  Unknown revision/replacement actors return a structured refusal without changing state.
+  Public edit actors are only `agent` and `user`; `autonomy` is a resolved authority derived
+  exclusively from the owning profile's goals/loops autonomy configuration, not caller input.
+- A current user-quoted stop-condition addition becomes user-owned even when an agent applies it.
+  Goal and loop revise/replace bind both direct and relay quotes again under the commit write lock,
+  including the source session, current source message and receipt. A newer refusal rolls back the
+  entire edit; an unchanged goal/loop JSON snapshot alone is not sufficient authority.
+  `tests/hermes_cli/test_lifecycle_authority.py` covers the actor/action/pauser matrix and these races.
+
 - Store one audit/outbox record per control under `state_meta` with a 24-hour pending expiry.
 - An autonomous goal pause that becomes a native timed wait records `outcome="timed_wait"`,
   `wait_seconds`, `waiting_until` and its shared `notice` in that same transaction. Target,
   requester and tool receipts describe the timed wait, no approval and still-active goal,
   not a pause. Fresh quoted user pauses retain their existing paused-state wording.
 - Resolve only bare session IDs or `hermes:<current-profile>/<session-id>` targets; reject unknown and cross-profile targets.
-- Treat relay and gateway-authored rows as non-user text. Quotes must be whitespace-normalized, at least 12 characters, present in the latest typed user message after the gateway `[Replying to…: "…"]` pointer is stripped, and drawn from a source message no longer than 4,000 characters.
-- Refuse a quote (`user_quote_negated`) when it contains a negation token (`not`, `don't`, `never`, `no`, `shouldn't`, …) or one appears earlier in the same sentence (only `.`, `!`, `?`, `;` or a newline ends the clause). `stop` is a control verb, not a negation. Also refuse (`user_quote_qualified`) when the latest message anywhere contains a negation, a `?`, or a condition, timing or hedge word (`if`, `only`, `when`, `after`, `how`, `would`, `explain`, …), so a trailing refusal ("Clear the X goal? Not now") or a conditional or informational mention never authorizes. The control must match the quote's whole sentence, not the agent-chosen span, so one sentence naming two actions or both a goal and a loop falls back to Approve/Deny. The sentence must also be a direct instruction: optional courtesy words, the action verb, a noun phrase naming only the target, then only filler (or, for a replacement, `with`/`to` the new objective). "Keep the X goal and clear the Y goal" or "Print the text clear the X goal" never authorize. A replacement objective longer than `REPLACEMENT_MAX_CHARS` (1500) is refused outright, and approval cards show the current and proposed goal as separately bounded lines so Approve never applies text the card hid. A refused quote (stale, paraphrased, relayed, from another session, or negated) never grants quote authority. For a cross-session goal clear or replace without a quote, the session-control authority applies directly instead of creating an approval request.
+- Ordinary relay and gateway-authored rows are not user authority. A relay quote is eligible only when the existing relay ledger authenticates its exact sender, target and transcript row, and the exact quote also occurs in the sender's latest current typed user message predating that delivery. Store the relay receipt in the revision or control authority record. Never trust a relay body's paraphrase or a receipt-shaped header alone. Quotes must be whitespace-normalized, at least 12 characters, present after the gateway reply pointer is stripped, and drawn from a source message within the validator's limit.
+- Creation APIs accept trusted `actor="agent"` from agent tools and default to `actor="user"` for command/UI callers. Persist `created_by` and `stop_condition_owner` in the existing JSON state, preserving them through revisions and migration. Legacy rows with missing ownership do not become agent-owned merely because an agent requests an edit. The lifecycle plugin schemas and creation calls are owned by the agents repository, not this core tree.
+- An agent may change wording, either cadence direction and run count, replace, pause, resume or stop its own loop with a reason while retaining its intent. It may reword/replace and pause/resume its own goal without weakening constraints, boundaries, verification or user stop conditions. Goal clear remains user-only at the model tool boundary and complete still requires recorded proof. Protected removals require an exact user quote naming each removed item. Keep a reason and before/after audit for agent controls as well as definition revisions.
+- Refuse a quote (`user_quote_negated`) when it contains a negation token (`not`, `don't`, `never`, `no`, `shouldn't`, …) or one appears earlier in the same sentence (only `.`, `!`, `?`, `;` or a newline ends the clause). `stop` is a control verb, not a negation. Also refuse (`user_quote_qualified`) when the latest message anywhere contains a negation, a `?`, or a condition, timing or hedge word (`if`, `only`, `when`, `after`, `how`, `would`, `explain`, …), so a trailing refusal ("Clear the X goal? Not now") or a conditional or informational mention never authorizes. The control must match the quote's whole sentence, not the agent-chosen span, so one sentence naming two actions or both a goal and a loop falls back to Approve/Deny. The sentence must also be a direct instruction: optional courtesy words, the action verb, a noun phrase naming only the target, then only filler (or, for a replacement, `with`/`to` the new objective). "Keep the X goal and clear the Y goal" or "Print the text clear the X goal" never authorize. A replacement objective longer than `REPLACEMENT_MAX_CHARS` (1500) is refused outright, and approval cards show the current and proposed goal as separately bounded lines so Approve never applies text the card hid. A refused quote (stale, paraphrased, unauthenticated relay text, from an unrelated session, or negated) never grants quote authority. For a cross-session goal clear or replace without a quote, the session-control authority applies directly instead of creating an approval request.
+- A quote is scoped to the session where the user typed it, not the session that receives a relay.
+  `quote_authorizes` applies the same cross-session name/id rule to session controls and goal/loop
+  revisions, including their in-transaction rechecks. A quote from A may self-authorize A even
+  when delivered through B; it must explicitly name B (or a third controlled session) to authorize
+  that session. Ambiguous titles refuse, and quoted requirement-name data cannot supply the session
+  name. Applied control records and quoted replacement revisions retain `quote_source_session_id`
+  while preserving the existing legacy authority dictionary shape.
+- Goal and loop revision quotes pass through `check_user_quote` for the same full-message negation,
+  qualification and source-scope checks as controls. Exact quoted requirement names are data;
+  positive `Stop when …` / `Keep checking until …` declarations may bind a nonempty supplied stop
+  condition, but neither their words nor a negated/qualified removal can authorize clearing it.
+  `tests/hermes_cli/test_lifecycle_quote_scope.py` covers origin/receiver/third-session targeting,
+  title uniqueness and commit races, revise/replace removals, actor configuration and these guards.
 - A valid quote must also state this control (`user_quote_mismatch` otherwise): it names the kind (`goal`/`objective` or `loop`), exactly one action's verbs (clear/remove/drop…, pause/hold…, resume/continue…, replace/change/switch… for goals; stop/end/cancel…, pause, resume for loops), and, for another session, that session's id or a title no other named session shares (whole words; "Deploy v2" never names "Deploy"). A replacement's new objective stays agent-authored, so the quote binds the replace intent and the target.
 - A fresh direct removal instruction naming the stop condition, such as "Clear the stop condition" or "Please remove this stop condition now", also authorizes a self-targeted replacement that empties only `stop_when`. The instruction must consist of courtesy words, `remove`/`drop`/`delete`/`clear`, optional determiners, `stop condition`, then optional filler. Compare the objective, all other contract fields and any supplied turn budget under the same write lock. Preserve user-added subgoals for any stop-only edit, including button-approved replacements. When both a goal and a loop exist, callers must resolve which stop condition the user means before selecting a control, because this quote path does not infer referents. A removal never authorizes a nonempty replacement restriction or dropping completion criteria or hard limits in other fields. Deictic instructions such as "Remove what says this" remain in Approve/Deny: the existing quote source strips the gateway reply pointer and supplies no verified referent binding, so neither a pronoun nor assistant-authored reply text grants stop-condition authority.
 - Residual risk: quote authority is a verbatim substring matched against deterministic word sets, not an interpretation of intent. It is mitigated by using only the latest typed message, the negation and control-match checks, the full source message shown in the target-topic notice, and Approve/Deny buttons as the fallback.

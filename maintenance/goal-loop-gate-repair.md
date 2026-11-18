@@ -3,7 +3,7 @@
 ## Identity
 
 - **Fork patch identity:** `goal-loop-gate-repair`
-- **Contract tests:** `tests/hermes_cli/test_goal_ownership_lints.py`
+- **Contract tests:** `tests/hermes_cli/test_lifecycle_policy.py`, `tests/hermes_cli/test_lifecycle_edit_latitude.py`, `tests/hermes_cli/test_goal_ownership_lints.py`
 
 ## Required behavior
 

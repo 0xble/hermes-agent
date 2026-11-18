@@ -97,10 +97,10 @@ def test_quote_overtaken_before_write_lock_falls_back_to_approval(state, monkeyp
     _user(state, "requester", "Please clear the requester goal immediately")
     real = session_controls.check_user_quote
 
-    def overtaken(sid, quote, *, cursor=None):
+    def overtaken(sid, quote, *, cursor=None, **scope):
         if cursor is not None:
             return "user_quote_not_found"
-        return real(sid, quote)
+        return real(sid, quote, **scope)
 
     monkeypatch.setattr(session_controls, "check_user_quote", overtaken)
     result = apply_control("goal", "clear", "requester", requester_sid="requester",

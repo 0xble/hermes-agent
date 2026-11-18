@@ -1093,7 +1093,8 @@ class GoalState:
     # separate from ``last_turn_at`` because user and external-event turns are allowed to pierce
     # the floor without turning the goal into a sub-minute automatic poller.
     last_automatic_continuation_at: float = 0.0
-    # Ownership-watchdog fields. Empty values preserve legacy rows.
+    created_by: str = ""  # trusted creation caller, empty on legacy rows
+    stop_condition_owner: str = ""
     due: str = ""
     next_check: str = ""
     done_when: str = ""
@@ -1117,13 +1118,13 @@ class GoalState:
             "last_automatic_continuation_at")}
         return cls(
             goal=data.get("goal", ""),
-            due=str(data.get("due") or ""),
-            next_check=str(data.get("next_check") or ""),
-            done_when=str(data.get("done_when") or ""),
-            log_path=str(data.get("log_path") or ""),
+            due=str(data.get("due") or ""), next_check=str(data.get("next_check") or ""),
+            done_when=str(data.get("done_when") or ""), log_path=str(data.get("log_path") or ""),
             plan_path=str(data.get("plan_path") or ""),
             baseline=[row for row in (data.get("baseline") or []) if isinstance(row, dict)],
             ownership=bool(data.get("ownership")),
+            created_by=str(data.get("created_by") or ""),
+            stop_condition_owner=str(data.get("stop_condition_owner") or ""),
             mutation_id=str(data.get("mutation_id") or ""),
             status=data.get("status", "active"),
             max_turns=normalize_goal_max_turns(data.get("max_turns", DEFAULT_MAX_TURNS)),
@@ -2531,6 +2532,7 @@ def _authenticated_relay_sender(db: Any, relay: dict[str, Any], goal_session_id:
     return sender[1]
 
 
+
 def _unwrap_steer(content: str) -> str:
     """The steer payload without the OUT-OF-BAND markers, so its own edge lines can be inspected."""
     text = content.strip()
@@ -2655,7 +2657,8 @@ def _render_user_messages_block(session_id: Optional[str], since: float) -> str:
         _relay_receipt_id(str(r.get("content") or "")) for r in relay_rows
         if _relay_sender(str(r.get("content") or "")) is not None)
     for relay in relay_rows:
-        sender_session = _authenticated_relay_sender(db, relay, session_id, active_profile, receipts)
+        from hermes_cli.lifecycle_authority import authenticated_relay_sender
+        sender_session = authenticated_relay_sender(db, relay, session_id, active_profile, receipts)
         if sender_session is None:
             continue
         # Only what the user typed in the sender session before this delivery can be what it carries.
@@ -2978,8 +2981,8 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
 
     @snapshot_control
     def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None,
-            due: str = "", next_check: str = "", done_when: str = "", log_path: str = "",
-            plan_path: str = "", baseline: Optional[list[dict[str, Any]]] = None,
+            actor: str = "user", due: str = "", next_check: str = "", done_when: str = "",
+            log_path: str = "", plan_path: str = "", baseline: Optional[list[dict[str, Any]]] = None,
             ownership: Optional[bool] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
@@ -2994,7 +2997,7 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             raise GoalPersistenceError(
                 "existing goal migration was not saved; refusing to overwrite it; try again"
             )
-        if goal_autonomy_enabled() and live is not None and live.status in {"active", "paused"}:
+        if (goal_autonomy_enabled() or actor == "agent") and live is not None and live.status in {"active", "paused"}:
             raise ValueError("Use revise or replace to preserve the existing goal contract")
         owned = bool(ownership) if ownership is not None else bool(due or next_check or done_when or log_path or plan_path or baseline)
         if owned:
@@ -3007,12 +3010,15 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
                               ownership=True)
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(), last_turn_at=0.0,
+            created_by="agent" if actor == "agent" else "user",
+            stop_condition_owner="agent" if actor == "agent" else "user",
             max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
             contract=contract if contract is not None else GoalContract(),
             due=str(due or "").strip(), next_check=str(next_check or "").strip(),
             done_when=str(done_when or "").strip() or (contract.verification.strip() if contract else ""),
             log_path=str(log_path or "").strip(), plan_path=str(plan_path or "").strip(),
-            baseline=[dict(row) for row in (baseline or []) if isinstance(row, dict)], ownership=owned,
+            baseline=[dict(row) for row in (baseline or []) if isinstance(row, dict)],
+            ownership=bool(ownership) if ownership is not None else bool(due or done_when or log_path or plan_path or baseline),
             revisions=self._history_for_next_goal(live),
         )
         return self._save()
@@ -3022,7 +3028,10 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         """Attach or replace the completion contract on the active goal."""
         def _apply(state):
             if state is not None:
+                before_stop = state.contract.stop_when if state.contract else ""
                 state.contract = contract or GoalContract()
+                if state.contract.stop_when != before_stop:
+                    state.stop_condition_owner = "user"
             return state
         return self._mutate_current(_apply)
 

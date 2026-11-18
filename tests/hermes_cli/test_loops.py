@@ -7,6 +7,8 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.hermes_cli.test_loop_revise import _record_quote
+
 
 # ──────────────────────────────────────────────────────────────────────
 # Fixtures
@@ -541,7 +543,7 @@ class TestTickLifecycle:
         quote = "Please switch the loop to polling the revised target"
         revised = LoopManager(session_id="t-prerev").revise(
             reason="new target", prompt="poll the revised target",
-            user_quote="switch the loop to polling the revised target", user_messages=[quote])
+            user_quote="switch the loop to polling the revised target", user_messages=_record_quote("t-prerev", quote))
         assert revised["ok"] is True, revised
         wakeup = scheduler.fire_tick()
         assert wakeup and "poll the revised target" in wakeup
@@ -562,7 +564,7 @@ class TestTickLifecycle:
         quote = "Please switch the loop to watching B"
         result = LoopManager(session_id="t-revise-backoff").revise(
             reason="new target", prompt="watch B", user_quote="switch the loop to watching B",
-            user_messages=[quote])
+            user_messages=_record_quote("t-revise-backoff", quote))
         assert result["ok"] is True, result
         revised = load_loop("t-revise-backoff")
         assert revised.current_delay == 60
@@ -581,7 +583,7 @@ class TestTickLifecycle:
         revised = LoopManager(session_id="t-oldv").revise(
             reason="new target", prompt="poll prompt B",
             user_quote="switch the loop to polling prompt B",
-            user_messages=["Please switch the loop to polling prompt B now"])
+            user_messages=_record_quote("t-oldv", "Please switch the loop to polling prompt B now"))
         assert revised["ok"] is True, revised
         decision = mgr.complete_tick("All done.\nLOOP_COMPLETE")
         stored = load_loop("t-oldv")
@@ -619,7 +621,7 @@ class TestTickLifecycle:
         revised = LoopManager(session_id="t-cad").revise(
             reason="slow down", interval_seconds=900,
             user_quote="slow the loop down to every fifteen minutes",
-            user_messages=["Please slow the loop down to every fifteen minutes"])
+            user_messages=_record_quote("t-cad", "Please slow the loop down to every fifteen minutes"))
         assert revised["ok"] is True, revised
         assert load_loop("t-cad").next_due_at > time.time() + 60
         assert scheduler.fire_tick() is None
@@ -681,7 +683,7 @@ class TestTickLifecycle:
         revised = LoopManager(session_id="t-cap").revise(
             reason="slow down", interval_seconds=120,
             user_quote="slow the loop down to every two minutes",
-            user_messages=["Please slow the loop down to every two minutes"])
+            user_messages=_record_quote("t-cap", "Please slow the loop down to every two minutes"))
         assert revised["ok"] is True, revised
         decision = mgr.complete_tick(response)
         stored = load_loop("t-cap")
@@ -748,7 +750,7 @@ class TestTickLifecycle:
             quote = "watch the production deploy instead"
             revised = LoopManager(session_id="t-cond").revise(
                 reason="watch the deploy instead", until="production deploy finishes",
-                user_quote=quote, user_messages=[quote])
+                user_quote=quote, user_messages=_record_quote("t-cond", quote))
             assert revised["ok"] is True
             return (verdict, "the build finished", False, None, False)
 
