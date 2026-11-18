@@ -4,7 +4,9 @@ Kept separate from the top-level defaults facade so browser settings can grow wi
 exceeding the facade's line-count ratchet.
 """
 
-DEFAULT_BROWSER_CONFIG = {
+import copy
+
+_BROWSER_DEFAULTS = {
     "backend": "",
     "snapshot_threshold": 15000,
     "record_sessions": False,
@@ -84,3 +86,8 @@ DEFAULT_BROWSER_CONFIG = {
     # browser_cdp / browser_evaluate capabilities.
     "extension_control": {"enabled": False, "developer_mode": False},
 }
+
+
+def default_browser_config() -> dict:
+    """A fresh copy of the browser defaults, so no consumer can alias the shared template."""
+    return copy.deepcopy(_BROWSER_DEFAULTS)

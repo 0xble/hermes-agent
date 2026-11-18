@@ -36,11 +36,30 @@ def browser_target() -> str:
 
 
 def browser_fallback_policy() -> str:
-    """The profile's fallback policy; unset/invalid values preserve legacy behavior."""
+    """Resolve the fallback policy fail-closed on lookup or validation failures.
+
+    Only an absent key and an explicit ``allow`` permit legacy backend selection. A
+    malformed config, an unreadable config, or any other value refuses fallback.
+    """
     _bt = _origin()
-    value = str(_bt._browser_cfg("fallback", "allow", lambda v: str(v or "").strip().lower(),
-                                "browser.fallback from config") or "allow")
-    return "refuse" if value == "refuse" else "allow"
+    try:
+        from hermes_cli.config import read_raw_config
+        config = read_raw_config()
+        if not isinstance(config, dict) or hasattr(config, "read_error"):
+            raise RuntimeError("browser config could not be read")
+        browser_cfg = config.get("browser", {})
+        if not isinstance(browser_cfg, dict):
+            raise TypeError("browser config is not a mapping")
+        if "fallback" not in browser_cfg:
+            return "allow"
+        value = str(browser_cfg["fallback"]).strip().lower()
+        if value in {"allow", "refuse"}:
+            return value
+        _bt.logger.warning("Unknown browser.fallback=%r; refusing backend fallback", browser_cfg["fallback"])
+        return "refuse"
+    except Exception:  # fail-closed boundary: any lookup failure refuses (logged with traceback)
+        _bt.logger.warning("Could not resolve browser.fallback; refusing backend fallback", exc_info=True)
+        return "refuse"
 
 
 def browser_target_refuses() -> bool:
@@ -77,14 +96,25 @@ def _validate_pinned_target(target: str) -> str:
 
 
 def pinned_browser_target_or_raise() -> str:
+    """The validated pinned target; raises when none is configured (callers are fail-closed)."""
     target = browser_target()
     if not target:
-        return ""
+        raise BrowserTargetUnavailable("<unset>", "no pinned browser target configured")
     return _validate_pinned_target(target)
 
 
 def browser_target_error(exc: BaseException, target: str = "") -> dict:
-    """Stable tool payload for a refused pinned target; never suggests another backend."""
+    """Stable tool payload for a refused pinned target; never suggests another backend.
+
+    The target and reason are model-visible, so URL credentials/tokens are redacted."""
+    from agent.redact import redact_cdp_url
+    payload = _browser_target_error_raw(exc, target)
+    for key in ("target", "reason", "error"):
+        payload[key] = redact_cdp_url(payload[key])
+    return payload
+
+
+def _browser_target_error_raw(exc: BaseException, target: str = "") -> dict:
     if isinstance(exc, BrowserTargetUnavailable):
         target = exc.target
         reason = exc.reason

@@ -124,8 +124,9 @@ def _camofox_active(context: str = "") -> bool:
 
 
 def _cloud_refuses_pinned_target() -> bool:
-    return _lazy_call("tools.browser_tool_cloud", "pinned_browser_target_refuses", False,
-                      "pinned browser target policy lookup failed")
+    # Fail closed: if the policy cannot be resolved (import/lookup failure), refuse.
+    return _lazy_call("tools.browser_tool_cloud", "pinned_browser_target_refuses", True,
+                      "pinned browser target policy lookup failed; refusing")
 
 
 def _real_profile_consented() -> bool:
@@ -509,7 +510,8 @@ def _resolve_backend_cdp(env: dict, task_id: Optional[str], session_name: str = 
     """Point the harness at the configured backend's CDP endpoint; error string on failure.
 
     A refused pinned target is resolved before even operator CDP, cloud, or local selection.
-    env / ``browser.cdp_url`` (``/browser connect``); (3) a cloud provider via the legacy ``_get_session_info()``
+    Otherwise: (1) ``BU_CDP_*`` env; (2) the operator override (``/browser connect``, ``BROWSER_CDP_URL``,
+    ``browser.cdp_url``); (3) a cloud provider via the legacy ``_get_session_info()``
     so browser_exec shares the SAME session machinery (per-task cache, expiry, reaper, atexit);
     (4) the local engine — ``browser.engine: lightpanda`` or Hermes' packaged Chromium via agent-browser
     (never the harness's own discovery of the user's installed Chrome); (5) BU direct-API configs WITH
@@ -658,6 +660,9 @@ def _route_backend(env: dict, session: str, task_id: Optional[str], local: bool,
     sidecar; unlike ``local`` (the consent-gated real-profile browser) it never touches the user's profile."""
     # ``real_profile=False``: this route already fell back, so it stays on its fresh browser instead
     # of swapping browsers mid-task once the profile frees up.
+    # Refuse guard first: a pinned target is resolved before real-profile, local-sidecar or any other selection.
+    if _cloud_refuses_pinned_target():
+        return _resolve_backend_cdp(env, task_id, session_name=session)
     rp_err = _resolve_real_profile_cdp(env, force_local=local) if real_profile else None
     # local=True is only served by the real-profile route; consent off must not pretend.
     if local and not _has_cdp_env(env) and not _real_profile_consented():

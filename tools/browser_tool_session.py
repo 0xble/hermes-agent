@@ -314,9 +314,6 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> dict[str, str]:
 
 def _create_pinned_target_session(task_id: str) -> dict[str, Any]:
     """Use only the profile's pinned target; never launch or select another backend."""
-    target = _cloud.browser_target()
-    if not target:
-        raise _cloud.BrowserTargetUnavailable("<unset>", "no pinned browser target configured")
     target = _cloud.pinned_browser_target_or_raise()
     if _cloud.browser_target_is_camofox():
         raise _cloud.BrowserTargetUnavailable(target, "Camofox targets are handled by the Camofox backend")
@@ -353,8 +350,9 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> dict[str, Any]:
 
 def _create_session_for_key(task_id: str, force_local: bool) -> dict[str, Any]:
     """Fresh session for ``task_id`` (runs OUTSIDE the lock: cloud mode makes a network call).
-    A configured target is selected before the legacy CDP/cloud/local chain."""
-    if _cloud.browser_target():
+    A refusing profile is pinned before the legacy CDP/cloud/local chain, even with no target
+    configured (that case raises). Target-without-refuse also pins, as before."""
+    if _cloud.pinned_browser_target_refuses() or _cloud.browser_target():
         return _create_pinned_target_session(task_id)
     cdp_override = _cdp._get_cdp_override()
     if cdp_override and not force_local:
@@ -909,7 +907,10 @@ def _dispatch_browser_command(
     # shared agent-browser's default daemon, so one task's snapshot refs or close hit the others.
     # Engine injection keys off the resolved session backend, not global provider
     # state: hybrid routing can create a local sidecar while a cloud provider stays configured.
-    engine = "auto" if session_info.get("external_task_browser") else _engine_override or _cloud._get_browser_engine()
+    # A pinned target never changes engine: no ``--engine`` flag and no Lightpanda→Chrome retry.
+    pinned = bool(session_info.get("pinned_target")) or _cloud.pinned_browser_target_refuses()
+    engine = ("auto" if pinned or session_info.get("external_task_browser")
+              else _engine_override or _cloud._get_browser_engine())
     backend_args = ["--session", session_info["session_name"]]
     if session_info.get("cdp_url"):
         backend_args += ["--cdp", session_info["cdp_url"]]
@@ -987,7 +988,10 @@ def _run_browser_command(
         break
 
     # Lightpanda automatic Chrome fallback — runs for ALL exit paths (timeout,
-    # empty, non-JSON, nonzero rc, parsed).
+    # empty, non-JSON, nonzero rc, parsed). Never under a refusing pinned target: it would
+    # launch a second, unpinned local Chrome.
+    if _cloud.pinned_browser_target_refuses():
+        return result
     fallback_reason = _lp._lightpanda_fallback_reason(engine, command, result)
     if fallback_reason:
         _bt.logger.info("Lightpanda fallback: retrying '%s' with Chrome (task=%s)", command, task_id)

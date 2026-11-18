@@ -145,8 +145,13 @@ def _auth_headers() -> dict[str, str]:
 
 
 def get_camofox_url() -> str:
-    """Return the configured Camofox server URL, or empty string."""
+    """Return the configured Camofox server URL, or empty string.
+
+    Under ``fallback: refuse`` only a Camofox-pinned ``browser.target`` is an endpoint;
+    ``CAMOFOX_URL`` never substitutes for a CDP-pinned or unset target."""
     from tools import browser_tool_cloud as cloud
+    if cloud.pinned_browser_target_refuses():
+        return cloud.browser_target().rstrip("/") if cloud.browser_target_is_camofox() else ""
     if cloud.browser_target_is_camofox():
         return cloud.browser_target().rstrip("/")
     return (get_secret("CAMOFOX_URL", "") or "").rstrip("/")
@@ -173,6 +178,11 @@ def is_camofox_mode() -> bool:
     written, a set ``CAMOFOX_URL`` still activates Camofox). A CDP override (``BROWSER_CDP_URL``
     env or ``browser.cdp_url``, same precedence as ``browser_tool_cdp._get_cdp_override()``) wins.
     """
+    from tools import browser_tool_cloud as cloud
+    if cloud.pinned_browser_target_refuses():
+        # Fail closed: Camofox only when it is the pinned target; no CDP override or
+        # CAMOFOX_URL/selection can route a CDP-pinned (or unset) profile to Camofox.
+        return cloud.browser_target_is_camofox()
     from tools.browser_tool_cdp import env_cdp_url, live_cdp_override
     if live_cdp_override() or env_cdp_url() or _config_cdp_url():
         return False

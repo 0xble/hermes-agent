@@ -5,7 +5,7 @@ docs of config.yaml.
 """
 
 from hermes_cli.config_defaults_auxiliary import _aux
-from hermes_cli.config_defaults_browser import DEFAULT_BROWSER_CONFIG
+from hermes_cli.config_defaults_browser import default_browser_config
 from hermes_cli.config_defaults_vault import DEFAULT_VAULT_CONFIG
 from hermes_cli.config_defaults_runtime import (
     DEFAULT_CRON_MAX_PARALLEL_JOBS, DEFAULT_SANDBOX_IMAGE, DEFAULT_VERCEL_IMAGE,
@@ -417,7 +417,7 @@ DEFAULT_CONFIG = {
         "cache_exempt_hosts": [],
     },
 
-    "browser": DEFAULT_BROWSER_CONFIG,
+    "browser": default_browser_config(),
     # Heavy background deletes (dependency-install orphan collection, the periodic worktree
     # pruner) run only inside this local-time window, "HH:MM-HH:MM" (may wrap midnight). A daytime
     # mass delete on a nearly full APFS volume stalls every writer, state.db included. "" = any time.

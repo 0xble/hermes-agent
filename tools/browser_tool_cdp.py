@@ -116,6 +116,11 @@ def _get_cdp_override_raw() -> str:
     schema build with no error.
     """
     from tools import browser_tool_cloud as cloud
+    if cloud.pinned_browser_target_refuses():
+        # Fail closed: the live /browser connect endpoint, BROWSER_CDP_URL and browser.cdp_url are
+        # ignored on every lane. Only a non-Camofox pinned target is a CDP endpoint.
+        target = cloud.browser_target()
+        return target if target and not cloud.browser_target_is_camofox() else ""
     target = cloud.browser_target()
     if target and not cloud.browser_target_is_camofox():
         return target

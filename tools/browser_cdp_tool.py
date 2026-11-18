@@ -388,6 +388,36 @@ def _pinned_target_error(exc: BaseException) -> Optional[str]:
     return json.dumps(payload, ensure_ascii=False) if payload is not None else None
 
 
+def _pinned_cdp_unavailable() -> Optional[str]:
+    """Structured error when a refusing profile has no CDP target (raw CDP is only ever the pinned CDP
+    endpoint: a Camofox target is REST-only and an unset target is a misconfiguration), else ``None``."""
+    from tools import browser_tool_cloud as cloud
+    if not cloud.pinned_browser_target_refuses():
+        return None
+    pinned = cloud.browser_target()
+    if pinned and not cloud.browser_target_is_camofox():
+        return None
+    reason = "Camofox targets are REST-only and do not expose CDP" if pinned else "no pinned browser target configured"
+    return json.dumps(cloud.browser_target_error(
+        cloud.BrowserTargetUnavailable(pinned or "<unset>", reason)), ensure_ascii=False)
+
+
+def _cdp_endpoint_error(endpoint: str) -> Optional[str]:
+    """Error JSON when ``endpoint`` cannot be used for a raw CDP call (missing or not a WebSocket URL),
+    structured as ``browser_target_unavailable`` under a refusing profile; ``None`` when usable."""
+    if endpoint and endpoint.startswith(("ws://", "wss://")):
+        return None
+    if (target_error := _pinned_target_error(RuntimeError("CDP discovery failed"))):
+        return target_error
+    if not endpoint:
+        return tool_error("No CDP endpoint is available. Run '/browser connect' to attach to a running Chrome, "
+                          "Brave, Chromium, or Edge browser, or set 'browser.cdp_url' in config.yaml. The Camofox "
+                          "backend is REST-only and does not expose CDP.", cdp_docs=CDP_DOCS_URL)
+    return tool_error(f"CDP endpoint is not a WebSocket URL: {endpoint!r}. Expected ws://... or wss://... — "
+                      "the /browser connect resolver should have rewritten this. Check that a Chromium-family "
+                      "browser is actually listening on the debug port.")
+
+
 def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id: Optional[str] = None,
                 frame_id: Optional[str] = None, timeout: float = 30.0, task_id: Optional[str] = None) -> str:
     """Send a raw CDP command (see ``CDP_DOCS_URL``). ``target_id`` attaches a fresh stateless connection
@@ -396,6 +426,8 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
     hit signed-URL expiry (Browserbase). Both paths share the same private-page/SSRF guard. Returns JSON
     ``{"success": True, "method", "result"}`` or ``{"error": ...}``."""
     effective_task_id = task_id or "default"
+    if (refused := _pinned_cdp_unavailable()) is not None:  # before any lane, incl. frame_id/supervisor
+        return refused
     if method in {"Page.captureScreenshot", "Page.printToPDF", "HeadlessExperimental.beginFrame"}:
         from tools.browser_tool_vision import blocked_protected_date_pixels
         blocked = blocked_protected_date_pixels(effective_task_id)
@@ -425,16 +457,8 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
         return tool_error("The 'websockets' Python package is required but not installed. "
                           "Run: hermes pm repair")
     endpoint = _resolve_cdp_endpoint()
-    if not endpoint:
-        return tool_error("No CDP endpoint is available. Run '/browser connect' to attach to a running Chrome, "
-                          "Brave, Chromium, or Edge browser, or set 'browser.cdp_url' in config.yaml. The Camofox "
-                          "backend is REST-only and does not expose CDP.", cdp_docs=CDP_DOCS_URL)
-    if not endpoint.startswith(("ws://", "wss://")):
-        if (target_error := _pinned_target_error(RuntimeError("CDP discovery failed"))):
-            return target_error
-        return tool_error(f"CDP endpoint is not a WebSocket URL: {endpoint!r}. Expected ws://... or wss://... — "
-                          "the /browser connect resolver should have rewritten this. Check that a Chromium-family "
-                          "browser is actually listening on the debug port.")
+    if (endpoint_error := _cdp_endpoint_error(endpoint)) is not None:
+        return endpoint_error
     call_params: dict[str, Any] = params or {}
     if not isinstance(call_params, dict):
         return tool_error(f"'params' must be an object/dict, got {type(call_params).__name__}")
