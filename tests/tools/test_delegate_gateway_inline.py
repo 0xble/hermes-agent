@@ -4,8 +4,8 @@ The gateway builds a session's agent inside ``gateway_delegation_inline_scope`` 
 ``delegation.gateway_mode`` to inline (``auto`` + interim assistant messages off, or ``inline``). The tool build
 then carries the joined ``delegate_task`` variant (results return in the call, no live control), and dispatch
 follows the variant the model actually sees, so schema and behaviour cannot disagree. The variant rides the
-session's tools[] pin like every other schema byte: a config edit applies from the next session (``/new``),
-the rule ``delegation.backend`` already follows, and a cache eviction or restart never flips a live chat.
+session's tools[] pin like every other schema byte. An explicit ``gateway_mode`` change converges at the next
+prompt-refresh or compaction boundary, while an ordinary cache eviction or restart never flips a live chat.
 """
 
 from __future__ import annotations
@@ -40,7 +40,8 @@ def _built(inline: bool):
     from agent.agent_init import _load_tools
     from tools.delegate_tool_config import gateway_delegation_inline_scope
 
-    agent = SimpleNamespace(platform="whatsapp", quiet_mode=True)
+    agent = SimpleNamespace(platform="whatsapp", quiet_mode=True,
+                             _gateway_interim_messages_enabled=False)
     with gateway_delegation_inline_scope(inline):
         _load_tools(agent, ["hermes-cli"], None)
     return agent
@@ -129,7 +130,7 @@ def test_cache_break_rederives_gateway_mode_from_current_config(initial_inline, 
 
     agent = _built(inline=initial_inline)
     agent._notification_config = {"delegation": {"gateway_mode": current_mode}}
-    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda _path: agent._notification_config)
     assert refresh_gateway_delegation_mode(agent) is True
     refresh_agent_mcp_tools(agent, quiet_mode=True, content_aware=True)
     assert session_joins_delegation(agent) is (current_mode == "inline")
@@ -149,7 +150,19 @@ def test_cache_break_does_not_flip_non_gateway_agents(platform, monkeypatch):
     agent = _built(inline=False)
     agent.platform = platform
     agent._notification_config = {"delegation": {"gateway_mode": "inline"}}
-    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda _path: agent._notification_config)
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert not hasattr(agent, "_delegation_inline") or agent._delegation_inline is False
+
+
+def test_cache_break_does_not_flip_acp_agents(monkeypatch):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent.platform = "acp"
+    del agent._gateway_interim_messages_enabled
+    agent._notification_config = {"delegation": {"gateway_mode": "inline"}}
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda _path: agent._notification_config)
     assert refresh_gateway_delegation_mode(agent) is False
     assert not hasattr(agent, "_delegation_inline") or agent._delegation_inline is False
 
@@ -162,7 +175,7 @@ def test_cache_break_uses_session_interim_setting_for_heartbeat(monkeypatch):
     agent._gateway_interim_messages_enabled = False
     agent._session_interim_assistant_messages_enabled = True
     agent._notification_config = {"delegation": {"gateway_mode": "auto"}}
-    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    monkeypatch.setattr("hermes_cli.config_effective.load_user_config_effective", lambda _path: agent._notification_config)
     assert refresh_gateway_delegation_mode(agent) is False
     assert agent._delegation_inline is False
 

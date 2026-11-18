@@ -205,7 +205,7 @@ def refresh_agent_delegation_tool(agent) -> bool:
     delegation mode is re-derived first, then the one model-facing entry and
     its dispatch decision are persisted together.
     """
-    from agent.delegation_backends import refresh_gateway_delegation_mode
+    from agent.delegation_backends import adopt_built_backend, refresh_gateway_delegation_mode, saved_backend
 
     if not refresh_gateway_delegation_mode(agent):
         return False
@@ -241,6 +241,9 @@ def refresh_agent_delegation_tool(agent) -> bool:
                 break
         else:
             return False
+    # The refreshed schema was built from the current backend. Keep dispatch
+    # and the model-facing parameters on the same backend at this boundary.
+    adopt_built_backend(agent, fresh_defs, saved_backend())
     persist_agent_tool_names(agent)
     return True
 

@@ -6,7 +6,8 @@ warm, which also means SOUL.md, skills and project-context edits never reach it 
 (``hermes_state_prompt_refresh``). At the start of the session's next turn this module compares
 that epoch with the one stamped when the session's prompt was built (``model_config``) and, when
 the prompt is older, rebuilds it once through the normal builder: history, session id and the
-tools[] pin are kept, ``on_session_start`` does not fire, and the new bytes plus the epoch are
+the existing tools[] pin is kept, except that an explicit gateway delegation mode is converged at this
+cache-break boundary, ``on_session_start`` does not fire, and the new bytes plus the epoch are
 persisted so every later turn restores them verbatim. One prefix-cache break per request.
 
 No request recorded means the stored prompt is reused exactly as before: the only extra work is

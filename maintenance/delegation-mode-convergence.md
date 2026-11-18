@@ -7,12 +7,14 @@ Fork patch identity: `delegation-mode-convergence`.
 
 ## Contract
 
-`delegation.gateway_mode` is read from the current profile at a prompt-refresh
-or compaction cache break. An explicit mode replaces only the session's pinned
+`delegation.gateway_mode` is read from the current effective profile at a prompt-refresh
+or compaction cache break. Only agents wired by the gateway turn runner may
+converge. An explicit mode replaces only the session's pinned
 `delegate_task` schema, re-freezes the agent's dispatch decision, and persists
-the pair together. Ordinary turns keep the existing `tools[]` pin, and
-one-shot sessions keep their own joined behavior. Unrelated tool schemas and
-their pinned bytes are unchanged.
+the pair together, including the backend that built the refreshed schema.
+Malformed or unavailable config leaves the existing mode unchanged. Ordinary
+turns keep the existing `tools[]` pin, and one-shot sessions keep their own
+joined behavior. Unrelated tool schemas and their pinned bytes are unchanged.
 
 ## Verification
 

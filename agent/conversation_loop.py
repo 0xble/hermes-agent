@@ -861,8 +861,8 @@ def _restore_or_build_system_prompt(agent, system_message, conversation_history)
             return
         refresh_epoch = stored_prompt_refresh_epoch(agent, session_row)
         if refresh_epoch:
-            # `hermes sessions refresh-prompts` ran after this prompt was built. Pin tools[] first
-            # (the refresh is about instructions; the frozen tool array stays), then rebuild once.
+            # `hermes sessions refresh-prompts` ran after this prompt was built. Restore tools[] first,
+            # then rebuild once. Explicit gateway delegation mode is the cache-break exception.
             _restore_pinned_tools(agent, session_row)
             rebuild_for_refresh(agent, system_message, conversation_history, refresh_epoch)
             return

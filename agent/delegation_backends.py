@@ -100,31 +100,34 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
     if getattr(agent, "_oneshot_session", None) is True:
         return False
 
-    # Only messaging gateway sessions may change this mode at a cache-break
-    # boundary. CLI, TUI, desktop, cron, API, and subagent agents use their
-    # own delegation contract and must never be flipped by gateway config.
+    # Only agents wired by the gateway turn runner may change this mode at a
+    # cache-break boundary. ACP and other non-gateway agents can use a platform
+    # name that is not in the deny-list, so positive wiring evidence owns this
+    # guard.
+    if not hasattr(agent, "_gateway_interim_messages_enabled"):
+        return False
     from gateway.session_context import NON_MESSAGING_SESSION_SURFACES
     if str(getattr(agent, "platform", "") or "").strip().lower() in (
         NON_MESSAGING_SESSION_SURFACES | {"cron", "subagent"}
     ):
         return False
 
-    user_config = getattr(agent, "_notification_config", None)
-    from hermes_cli.config import get_config_path, read_user_config_raw
+    from hermes_cli.config import get_config_path
+    from hermes_cli.config_effective import load_user_config_effective
 
     try:
-        raw_config = read_user_config_raw(get_config_path())
-    except (OSError, ValueError, TypeError, RuntimeError, SystemExit):
+        user_config = load_user_config_effective(get_config_path())
+    except (Exception, SystemExit):
         return False
-    raw_delegation = raw_config.get("delegation") if isinstance(raw_config, dict) else None
+    raw_delegation = user_config.get("delegation") if isinstance(user_config, dict) else None
     # An absent key means the agent's original surface decision remains the
-    # contract. Check the raw file so a merged default ``auto`` does not look
-    # like an explicit operator change.
+    # contract. The effective loader preserves presence without injecting
+    # defaults, while also applying the managed overlay consistently.
     if not isinstance(raw_delegation, dict) or "gateway_mode" not in raw_delegation:
         return False
-    if not isinstance(user_config, dict):
-        user_config = raw_config
     delegation = user_config.get("delegation") if isinstance(user_config, dict) else None
+    if not isinstance(delegation, dict):
+        return False
     configured_mode = str(delegation.get("gateway_mode") or "").strip().lower()
     if configured_mode not in {"auto", "inline", "background", "async"}:
         return False
