@@ -75,7 +75,8 @@ def _agent(srv, home, session_id):
     db = SessionDB(db_path=home / "state.db")
     db.ensure_session(session_id, source="whatsapp")  # the gateway opens the row before the turn
     return AIAgent(provider="custom", base_url=srv.base_url, api_key="sk-fake-e2e", model="fake-model",
-                   session_db=db, session_id=session_id, quiet_mode=True, platform="whatsapp")
+                   session_db=db, session_id=session_id, quiet_mode=True, platform="whatsapp",
+                   gateway_session_key=f"agent:main:whatsapp:dm:{session_id}")
 
 
 def _system(request) -> str:
