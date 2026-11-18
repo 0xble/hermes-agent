@@ -179,13 +179,18 @@ async function owns(lockDir: string, token: string): Promise<boolean> {
 async function ownerPid(lockDir: string): Promise<number | null> {
   const raw = await fs.promises.readFile(ownerFile(lockDir), 'utf8').catch(() => '')
   const pid = Number.parseInt(raw.split('-', 1)[0] ?? '', 10)
+
   return Number.isInteger(pid) && pid > 0 ? pid : null
 }
 
 function pidIsAlive(pid: number | null): boolean {
-  if (pid === null) return false
+  if (pid === null) {
+    return false
+  }
+
   try {
     process.kill(pid, 0)
+
     return true
   } catch (error) {
     return (error as NodeJS.ErrnoException).code === 'EPERM'
@@ -194,21 +199,32 @@ function pidIsAlive(pid: number | null): boolean {
 
 async function breakIfStale(lockDir: string): Promise<void> {
   const pid = await ownerPid(lockDir)
-  if (pidIsAlive(pid)) return
+
+  if (pidIsAlive(pid)) {
+    return
+  }
 
   const mtime = await fs.promises.stat(lockDir).then(
     stat => stat.mtimeMs,
     () => null
   )
-  if (pid === null && (mtime === null || Date.now() - mtime <= LOCK_STALE_MS)) return
+
+  if (pid === null && (mtime === null || Date.now() - mtime <= LOCK_STALE_MS)) {
+    return
+  }
 
   const abandoned = `${lockDir}.stale-${process.pid}-${randomBytes(4).toString('hex')}`
+
   try {
     await fs.promises.rename(lockDir, abandoned)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') return
+    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
+      return
+    }
+
     return
   }
+
   await fs.promises.rm(abandoned, { force: true, recursive: true }).catch(() => undefined)
 }
 

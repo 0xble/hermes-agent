@@ -156,15 +156,11 @@ def _owner_pid(lock_dir: Path) -> Optional[int]:
 def _pid_is_alive(pid: Optional[int]) -> bool:
     if pid is None:
         return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+    # Keep process probing in the gateway's cross-platform helper: os.kill(pid, 0)
+    # sends CTRL_C_EVENT on Windows instead of being a harmless existence check.
+    from gateway.status import _pid_exists
+
+    return _pid_exists(pid)
 
 
 def _break_if_stale(lock_dir: Path) -> None:
