@@ -223,6 +223,11 @@ async def operation(authority, name, params, actor=None):
     if set(params) != {'session_id', 'admission_id'} or name not in {'status', 'cancel'}:
         raise RuntimeStoreError('invalid_params')
     ref = SessionRef(authority.profile_id, params['session_id'])
+    # Cron admissions are local sessions. Restore a cold local session through the async
+    # recovery path before authorization so a status/cancel poll never takes the store lock
+    # synchronously on the gateway event loop.
+    if ref.session_id not in authority.sessions:
+        await _restore_local_session_for_cron(authority, ref.session_id, admission_gate=False)
     authority.authorize(actor, ref, 'session:submit')
     row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=params['admission_id'])
     from gateway.owner_identity import same_owner
