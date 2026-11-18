@@ -75,10 +75,16 @@ def test_launchd_restart_routes_to_handover_before_service_manager(monkeypatch):
 
 
 def test_stopped_gateway_falls_back_to_normal_launchd_start(monkeypatch):
+    calls = []
     monkeypatch.setattr(handover, "planned_handover", lambda: False)
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
-    monkeypatch.setattr(launchd, "_launchd_restart_locked", lambda: "started")
+    monkeypatch.setattr(
+        launchd,
+        "_launchd_restart_locked",
+        lambda **kwargs: calls.append(kwargs) or "started",
+    )
     assert launchd.launchd_restart() == "started"
+    assert calls == [{"use_planned_handover": False}]
 
 
 def test_stopped_gateway_start_uses_lifetime_lock(monkeypatch):
@@ -95,13 +101,49 @@ def test_stopped_gateway_start_uses_lifetime_lock(monkeypatch):
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
     monkeypatch.setattr(launchd, "configured_launchd_domain", lambda: "gui/501")
     monkeypatch.setattr(launchd, "_gw", lambda: SimpleNamespace(get_hermes_home=lambda: "home"))
-    monkeypatch.setattr(launchd, "_launchd_restart_locked", lambda: events.append("restart") or "started")
+    monkeypatch.setattr(
+        launchd,
+        "_launchd_restart_locked",
+        lambda **kwargs: events.append(("restart", kwargs)) or "started",
+    )
     monkeypatch.setattr(
         "hermes_cli.gateway_launchd_lifetime.lifetime_lock",
         lambda *args, **kwargs: Lock(),
     )
     assert launchd.launchd_restart() == "started"
-    assert events == ["enter", "restart", "exit"]
+    assert events == ["enter", ("restart", {"use_planned_handover": False}), "exit"]
+
+
+def test_stopped_gateway_refresh_reloads_the_written_definition_directly(monkeypatch, tmp_path):
+    plist = tmp_path / "gateway.plist"
+    plist.write_text("old", encoding="utf-8")
+    calls = []
+    fake_gateway = SimpleNamespace(
+        get_launchd_plist_path=lambda: plist,
+        launchd_plist_is_current=lambda: False,
+        generate_launchd_plist=lambda: "new",
+        get_hermes_home=lambda: tmp_path,
+        _prepare_service_launcher=lambda: None,
+    )
+    monkeypatch.setattr(launchd, "_gw", lambda: fake_gateway)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.gateway_service_owner.definition_belongs_to_home",
+        lambda *args: True,
+    )
+    monkeypatch.setattr(
+        "hermes_cli.gateway_service_owner.refuse_temp_home_service_write",
+        lambda *args: False,
+    )
+    monkeypatch.setattr(
+        launchd,
+        "_reload_installed_launchd_plist",
+        lambda path, **kwargs: calls.append((path, kwargs)) or True,
+    )
+
+    assert launchd.refresh_launchd_plist_if_needed(use_planned_handover=False) is True
+    assert calls == [(plist, {"use_planned_handover": False})]
+    assert plist.read_text(encoding="utf-8") == "new"
 
 
 def test_live_gateway_handover_refusal_does_not_fall_back(monkeypatch):
