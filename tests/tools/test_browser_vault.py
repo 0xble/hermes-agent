@@ -826,3 +826,7 @@ class TestTwoFactor:
         assert "biometric sensor read" in out["error"]
         assert "phone-only tap/approval" in out["error"]
         assert "passkey not stored in 1Password" in out["error"]
+        assert "1Password passkey" in out["error"]
+        assert "intended identity" in out["error"]
+        assert "issuer's web or desktop path" in out["error"]
+        assert "Never use iPhone Mirroring" in out["error"]

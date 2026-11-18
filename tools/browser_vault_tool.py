@@ -695,7 +695,10 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, re
         return json.dumps({"success": False, "error_type": "no_code_field",
                            "error": ("No one-time-code field was found. If the page offers 'Try another way' or a "
                                      "list of methods, choose an authenticator/TOTP, SMS, or email code option, then "
-                                     "retry enter_code or read the code from the matching 1Password item. Only a "
+                                     "retry enter_code or read the code from the matching 1Password item. If the site "
+                                     "wants a passkey, use a stored 1Password passkey through the canonical-origin "
+                                     "browser/system prompt for the intended identity. For an approval, try the issuer's web or "
+                                     "desktop path first. Never use iPhone Mirroring. Only a "
                                      "hardware key, biometric sensor read, phone-only tap/approval, or a passkey not "
                                      "stored in 1Password is a human handoff.")})
 
@@ -1243,7 +1246,9 @@ BROWSER_VAULT_SCHEMA = {
         "authenticator key when available; otherwise fetch the newest matching code from the intended 1Password item, "
         "mailbox, or phone and type it with the browser input tool, calling enter_code only when no such source exists; "
         "if the page offers 'Try another way' or a list of methods, choose an authenticator/TOTP, SMS, or email code "
-        "option, then retry enter_code or read the code from the matching 1Password item; only a hardware key, "
+        "option, then retry enter_code or read the code from the matching 1Password item; use a stored 1Password "
+        "passkey through the canonical-origin browser/system prompt for the intended identity; try the issuer's "
+        "web/desktop approval first; never use iPhone Mirroring; only a hardware key, "
         "biometric sensor read, phone-only tap/approval, or a passkey not stored in 1Password is a human handoff; "
         "unlock (backend: ask the user to unlock 1Password/Bitwarden). "
         "Passwords and one-time codes fetched from an authorized source for this service may be typed with the "
