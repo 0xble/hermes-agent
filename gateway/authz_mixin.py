@@ -500,7 +500,17 @@ class GatewayAuthorizationMixin:
         if source is None:
             return None
         from gateway.session_identity import identity_of, restore_identity
-        restore_identity(source, runner=self, transport_profile=getattr(entry, "transport_profile", None))
+        transport_profile = getattr(entry, "transport_profile", None)
+        # Rows written before multiplex transport ownership was persisted have no
+        # transport_profile.  The historical agent:main namespace unambiguously
+        # belongs to the default profile, so recover that one legacy route.  A
+        # named namespace may have used a shared bot, so leave it unknown and
+        # preserve the existing fail-closed satellite fallback.
+        if transport_profile is None and getattr(getattr(self, "config", None), "multiplex_profiles", False):
+            from hermes_state_keys import profile_from_session_key
+            if profile_from_session_key(getattr(entry, "session_key", None)) == "default":
+                transport_profile = "default"
+        restore_identity(source, runner=self, transport_profile=transport_profile)
         # Standalone has one bot and one home, so restore does not pin a
         # RoutingIdentity. Automation still needs affirmative proof this source
         # was restored here; a wire rebuild has no stamp and stays unproven.
