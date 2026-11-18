@@ -6,6 +6,7 @@ from typing import Optional
 from gateway.platforms.base import OUTBOUND_PROGRESS, utf16_len
 
 _BACKTICK_RUN_RE = re.compile(r'`+')
+TELEGRAM_PROGRESS_PAUSE_NOTICE = "*Live updates paused · daily limit*"
 
 
 def _progress_code_span(text: str) -> str:
@@ -28,7 +29,7 @@ class TelegramProgressMixin:
     def format_progress_text(self, chat_id: str, text: str) -> str:
         """Explain a frozen first bubble without spending another Telegram call."""
         if self.progress_edit_pause_reason(chat_id):
-            notice = "\nLive updates paused (daily Telegram limit)"
+            notice = f"\n{TELEGRAM_PROGRESS_PAUSE_NOTICE}"
             # The policy sheds split tails too, so reserve the notice inside the first bubble.
             text = self.truncate_message(
                 text, self.MAX_MESSAGE_LENGTH - utf16_len(self.format_message(notice)),
