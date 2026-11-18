@@ -712,7 +712,8 @@ def refresh_launchd_plist_if_needed(*, use_planned_handover: bool = True) -> boo
 
     A stopped gateway has no owner to hand over.  In that state, a planned
     handover refusal must not be allowed to turn a freshly written plist into
-    a kickstart of launchd's stale in-memory definition.
+    a kickstart of launchd's stale in-memory definition.  Callers can pass
+    ``False`` to force the direct single-label reload path.
     """
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists() or _gw().launchd_plist_is_current():
@@ -976,7 +977,8 @@ def _launchd_start_locked():
             _launchd_ok("✓ Service started")
         return
 
-    _gw().refresh_launchd_plist_if_needed()
+    from gateway.status import get_running_pid
+    _gw().refresh_launchd_plist_if_needed(use_planned_handover=get_running_pid() is not None)
     try:
         _launchctl_kickstart_current(label)
     except subprocess.CalledProcessError as e:

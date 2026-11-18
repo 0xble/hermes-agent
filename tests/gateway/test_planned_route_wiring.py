@@ -146,6 +146,61 @@ def test_stopped_gateway_refresh_reloads_the_written_definition_directly(monkeyp
     assert plist.read_text(encoding="utf-8") == "new"
 
 
+def test_stopped_gateway_start_refreshes_without_handover(monkeypatch, tmp_path):
+    plist = tmp_path / "gateway.plist"
+    plist.write_text("current", encoding="utf-8")
+    calls = []
+    fake_gateway = SimpleNamespace(
+        get_hermes_home=lambda: tmp_path,
+        get_launchd_plist_path=lambda: plist,
+        get_launchd_label=lambda: "ai.hermes.gateway",
+        refresh_launchd_plist_if_needed=lambda **kwargs: calls.append(kwargs) or False,
+        _clear_launchd_unsupported_marker=lambda: None,
+    )
+    monkeypatch.setattr(launchd, "_gw", lambda: fake_gateway)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.gateway_service_owner.refuse_foreign_launchd_plist",
+        lambda *_: None,
+    )
+    monkeypatch.setattr("hermes_cli.gateway_guardian.set_intent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launchd, "_launchctl_kickstart_current", lambda *_: None)
+    monkeypatch.setattr(launchd, "_launchd_ok", lambda *_: None)
+
+    launchd._launchd_start_locked()
+
+    assert calls == [{"use_planned_handover": False}]
+
+
+def test_stopped_restart_forwards_direct_reload_to_the_locked_route(monkeypatch, tmp_path):
+    plist = tmp_path / "gateway.plist"
+    plist.write_text("current", encoding="utf-8")
+    calls = []
+    fake_gateway = SimpleNamespace(
+        get_hermes_home=lambda: tmp_path,
+        get_launchd_plist_path=lambda: plist,
+        get_launchd_label=lambda: "ai.hermes.gateway",
+        _launchd_domain=lambda: "gui/501",
+        refresh_launchd_plist_if_needed=lambda **kwargs: calls.append(kwargs) or True,
+        _wait_for_api_server_port_free=lambda: None,
+        _CAPTURE_TEXT={},
+        _clear_launchd_unsupported_marker=lambda: None,
+    )
+    monkeypatch.setattr(launchd, "_gw", lambda: fake_gateway)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.gateway_service_owner.refuse_foreign_launchd_plist",
+        lambda *_: None,
+    )
+    monkeypatch.setattr("hermes_cli.gateway_guardian.set_intent", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(launchd.subprocess, "run", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launchd, "_launchd_ok", lambda *_: None)
+
+    launchd._launchd_restart_locked(use_planned_handover=False)
+
+    assert calls == [{"use_planned_handover": False}]
+
+
 def test_live_gateway_handover_refusal_does_not_fall_back(monkeypatch):
     monkeypatch.setattr(handover, "planned_handover", lambda: False)
     monkeypatch.setattr("gateway.status.get_running_pid", lambda: 1234)
