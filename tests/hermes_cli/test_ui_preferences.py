@@ -18,6 +18,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from hermes_cli import ui_preferences, web_server
+from tests.waiting import wait_until
 
 
 def test_a_profile_home_and_the_root_home_resolve_the_same_store(monkeypatch, tmp_path):
@@ -98,9 +99,11 @@ def test_lock_waits_for_a_live_holder_and_keeps_the_lock_unchanged_until_release
     lock_dir.mkdir()
     owner.write_text(str(os.getpid()), encoding="utf-8")
     seen_existing = threading.Event()
+    polls = []
     original_break_if_stale = ui_preferences._break_if_stale
 
     def observe_break(existing_lock_dir):
+        polls.append(existing_lock_dir)
         seen_existing.set()
         return original_break_if_stale(existing_lock_dir)
 
@@ -116,7 +119,8 @@ def test_lock_waits_for_a_live_holder_and_keeps_the_lock_unchanged_until_release
     waiter = threading.Thread(target=wait_write)
     waiter.start()
     assert seen_existing.wait(10)
-    time.sleep(0.1)  # Several unchanged polls, without patching the stdlib clock globally.
+    # Several unchanged polls: the waiter has looked at the live lock 3 times and kept waiting.
+    wait_until(lambda: len(polls) >= 3, timeout=10, what="3 polls of the live lock")
     assert waiter.is_alive()
     assert lock_dir.is_dir()
     assert owner.read_text(encoding="utf-8-sig") == str(os.getpid())
