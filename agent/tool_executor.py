@@ -1329,6 +1329,12 @@ class _WorkerStartOnce:
             raise _BatchAbandoned(self._tool_name)
 
 
+def _invoke_with_search_batch(batch_size: int, invoke: Callable[[], Any]) -> Any:
+    from tools.web_search_attribution import search_call_context
+    with search_call_context("assistant_tool_call", batch_size):
+        return invoke()
+
+
 class _ConcurrentBatch:
     """Shared state of one concurrent tool batch: per-slot results, the start-order and
     authorization gates, and the deadline bookkeeping the wait loop needs."""
@@ -1362,13 +1368,16 @@ class _ConcurrentBatch:
             managed = _run_agent_tool_execution_middleware(
                 agent,
                 **ref.middleware_kwargs(),
-                execute=lambda next_args: agent._invoke_tool(
-                    ref.name, next_args, ref.task_id, ref.call_id,
-                    messages=self.messages,
-                    pre_tool_block_checked=True,
-                    skip_tool_request_middleware=True,
-                    skip_tool_execution_middleware=True,
-                    tool_request_middleware_trace=list(ref.trace),
+                execute=lambda next_args: _invoke_with_search_batch(
+                    len(self.parsed_calls),
+                    lambda: agent._invoke_tool(
+                        ref.name, next_args, ref.task_id, ref.call_id,
+                        messages=self.messages,
+                        pre_tool_block_checked=True,
+                        skip_tool_request_middleware=True,
+                        skip_tool_execution_middleware=True,
+                        tool_request_middleware_trace=list(ref.trace),
+                    ),
                 ),
                 scope_block=scope_block,
                 display_index=index + 1,
