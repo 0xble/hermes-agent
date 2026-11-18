@@ -972,9 +972,8 @@ class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BaseP
             if not chat:
                 return
             chat = str(chat)
-            # A live route includes absent fields; never mix older restored fields in.
-            if fill_only and chat in self._platform_by_chat:
-                return
+            # A restored route may have only some discriminators cached. Fill each
+            # missing field independently, never treating platform alone as complete.
             put = dict.setdefault if fill_only else dict.__setitem__
             # Underlying platform's string VALUE, skipping the generic RELAY
             # fallback (the connector's session default handles egress then).
@@ -987,6 +986,10 @@ class RelayAdapter(RelayDiscordInteractionMixin, RelayDraftLifecycleMixin, BaseP
                 ("chat_type", self._chat_type_by_chat),
                 ("profile", self.__dict__.setdefault("_profile_by_chat", {})),
             ):
+                if (fill_only and attr == "profile" and
+                        any(cache.get(chat) for cache in (
+                            self._dm_user_by_chat, self._scope_by_chat, self._chat_type_by_chat))):
+                    continue
                 value = getattr(src, attr, None)
                 if value:
                     put(cache, chat, str(value))

@@ -135,7 +135,9 @@ def run_prune_write(attempt, *, shrink=None, minimum_seconds=None, defer=None, l
             return attempt()
         except PruneWriteContended:
             budget.warn_contention(unit_label)
-            pacer.pause(0)
+            # A held foreground writer must not turn --now into a hot spin. Use
+            # the pacer's minimum fairness delay before retrying the transaction.
+            pacer.pause(pacer.MIN_PAUSE_S)
             continue
         except PruneBudgetExpired:
             budget.check()

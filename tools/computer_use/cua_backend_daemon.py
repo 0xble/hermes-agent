@@ -239,7 +239,8 @@ class _EmbeddedCuaDaemon:
             return
         try:
             from tools.computer_use.cua_driver_lifetime import arm_owner
-            self._lifetime = arm_owner(self.socket_path, self._command)
+            executable = self._command[0] if isinstance(self._command, (list, tuple)) else self._command
+            self._lifetime = arm_owner(self.socket_path, executable)
         except Exception:
             logger.debug("embedded cua-driver lifetime watch failed", exc_info=True)
             self._lifetime = None
@@ -250,7 +251,8 @@ class _EmbeddedCuaDaemon:
             return
         try:
             from tools.computer_use.cua_driver_lifetime import terminate_embedded_driver
-            terminate_embedded_driver(self.socket_path, self._command)
+            executable = self._command[0] if isinstance(self._command, (list, tuple)) else self._command
+            terminate_embedded_driver(self.socket_path, executable)
         except Exception:
             logger.debug("embedded cua-driver process-group reap failed", exc_info=True)
 
