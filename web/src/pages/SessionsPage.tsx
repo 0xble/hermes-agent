@@ -932,7 +932,7 @@ export default function SessionsPage() {
     };
   }, [loading, setAfterTitle, total]);
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     setEnd(
       <Button
         outlined
@@ -1465,8 +1465,8 @@ export default function SessionsPage() {
       loadSessions(0);
       setPage(0);
       loadStats();
-    } catch {
-      showToast("Failed to prune sessions", "error");
+    } catch (error) {
+      showToast(`Failed to prune sessions: ${errorMessage(error)}`, "error");
     } finally {
       setPruning(false);
     }

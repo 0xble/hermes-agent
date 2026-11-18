@@ -10,6 +10,9 @@ Plugin owners may pass `eager=True` through `PluginContext.register_tool` to kee
 
 Classification, scoped deferrable names, schema description, and bridge invocation use the same predicate. An eager tool is not cataloged, and `tool_call` rejects it with the existing direct-invocation error.
 
+`PluginContext.register_tool` forwards the flag to the scoped registry while
+retaining upstream override admission and unload restoration.
+
 The first consumers are the agents-repository goal and loop lifecycle plugins. Those plugins feature-detect the registration signature to stay loadable on older cores. No tool names are special-cased in Hermes core.
 
 ## Verification and retirement

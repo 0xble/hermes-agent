@@ -1,13 +1,14 @@
+import type { InputDetectDropResponse, PromptSubmitResponse, SessionActivateResponse } from '@hermes/shared/gateway-types'
 import { isUndeliveredCorrectionRefusal } from '@hermes/shared/json-rpc-channel'
 
 import type { GatewayClient } from '../gatewayClient.js'
-import type { InputDetectDropResponse, PromptSubmitResponse, SessionActivateResponse } from '../gatewayTypes.js'
 import type { QueueItem } from '../hooks/useQueue.js'
 import { t } from '../i18n/runtime.js'
 import { stageImagePath } from '../lib/imageAttachments.js'
 import { pendingInputOwner, savePendingInput } from '../lib/pendingInputs.js'
 import type { Msg } from '../types.js'
 
+import { takePastes } from './pasteStore.js'
 import { markBubbleShown } from './pendingBubbles.js'
 import { retireCanonicalControls } from './slash/canonicalSessionControls.js'
 import { captureDestination, isCurrentDestination, type SubmissionDestination } from './submissionDestination.js'
@@ -75,18 +76,31 @@ interface SubmitPromptOpts {
 
 type PendingOwner = ReturnType<typeof pendingInputOwner>
 
+let userImageTurns = 0
+
 function beginOwnedTurn(
   deps: SubmitPromptDeps,
   text: string,
   displayOverride: string | undefined,
   displayText: string,
-  show: boolean
+  show: boolean,
+  images: string[] = []
 ): void {
   turnController.clearStatusTimer()
   deps.setLastUserMsg(text)
 
   if (show) {
-    deps.appendMessage({ role: 'user', text: displayOverride || displayText })
+    const shown = displayOverride || displayText
+    const pastes = takePastes(text)
+
+    deps.appendMessage({
+      role: 'user',
+      text: shown,
+      ...(pastes?.display === shown && { pastes: pastes.pastes }),
+      // Each sent turn is its own revision: the legacy attach path keeps the user's own file path,
+      // so a re-attached, overwritten file must not reuse the previous turn's render.
+      ...(images.length && { imageRevision: `turn-${++userImageTurns}`, images })
+    })
   }
 
   patchUiState({ busy: true, status: 'running…' })
@@ -127,7 +141,8 @@ function submitParams(
   item: QueueItem | undefined,
   submitText: string,
   attachments: SubmitPromptOpts['attachments'],
-  voice: boolean
+  voice: boolean,
+  clarifyBatch: boolean
 ) {
   return {
     session_id: sid,
@@ -137,7 +152,9 @@ function submitParams(
     ...(item?.controlMethod ? { execution_generation: item.executionGeneration } : {}),
     ...(item && !item.controlMethod ? { submission_id: item.submissionId, queued: item.queued !== false } : {}),
     // A busy correction (steer/redirect) is not a turn: it never claims the voice route.
-    ...(!item?.controlMethod && voice && { voice_turn: true })
+    ...(!item?.controlMethod && voice && { voice_turn: true }),
+    // Ink renders a whole question set as one form; undeclared, the owner asks one card per question.
+    ...(!item?.controlMethod && clarifyBatch && { clarify_batch: true })
   }
 }
 
@@ -382,7 +399,9 @@ export function submitPrompt(
 
   const startSubmit = (displayText: string, submitText: string, show = true): Promise<boolean> => {
     if (ownsTurn()) {
-      beginOwnedTurn(deps, text, displayOverride, displayText, show)
+      const images = (opts.queueItem?.attachments ?? opts.attachments ?? []).map(attachment => attachment.path)
+
+      beginOwnedTurn(deps, text, displayOverride, displayText, show, images)
     }
 
     const item = opts.queueItem
@@ -405,7 +424,14 @@ export function submitPrompt(
     return deps.gw
       .request<PromptSubmitResponse>(
         item?.controlMethod ?? 'prompt.submit',
-        { ...submitParams(sid, item, submitText, opts.attachments, voiceTranscript === submitText.trim()),
+        { ...submitParams(
+          sid,
+          item,
+          submitText,
+          opts.attachments,
+          voiceTranscript === submitText.trim(),
+          deps.gw.clarifyBatch === true
+        ),
           ...(opts.moaToken ? { moa_token: opts.moaToken } : {}) }
       )
       .then(r => {

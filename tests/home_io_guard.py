@@ -66,7 +66,7 @@ def _contains(path: str, prefix: str) -> bool:
 
 
 class HomeIOGuard:
-    def __init__(self, roots, protected_writes=lambda: {}):
+    def __init__(self, roots, protected_writes=dict):
         self.roots = roots
         # Captured host installation paths, grouped by their diagnostic description.
         # Probes stay allowed, but tests may never publish or remove host tools/services.
@@ -159,7 +159,7 @@ class HomeIOGuard:
             for path in paths:
                 prefix = _normcase(os.fspath(path))
                 if _within(absolute, prefix) or _within(resolved, prefix):
-                    import pytest  # noqa: PLC0415
+                    import pytest
                     # pytest.fail, not AssertionError: removal helpers catch Exception and would log
                     # the refusal as a warning while the test passed.
                     pytest.fail(f"TEST BUG: changing the REAL {description}: {value}\n"

@@ -8,7 +8,7 @@ child persists through the ordinary ``worker.persist`` path under its own claim.
 import secrets
 from functools import partial
 
-from agent.runtime_session_store import RuntimeSessionStore, call_off_event_loop
+from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError, call_off_event_loop
 
 _REFUSALS = {
     'delegation_capacity': 'the gateway owner refused another subagent: this execution already runs '
@@ -23,6 +23,14 @@ class ChildSessionStore(RuntimeSessionStore):
     @property
     def reserved_session_id(self):
         return self.scope['session_id']
+
+    def _persist_entry(self, entry):
+        try:
+            return super()._persist_entry(entry)
+        except WorkerPersistenceError as exc:
+            if str(exc) == 'stale_generation':
+                raise WorkerPersistenceError('child execution retired or superseded (stale_generation)') from exc
+            raise
 
     def create_session(self, session_id, source, **fields):
         # The owner created this row at reservation with its source, lineage and profile; only

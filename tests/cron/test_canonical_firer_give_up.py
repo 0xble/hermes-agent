@@ -18,7 +18,7 @@ def test_given_up_fire_leaves_its_attempt_recoverable_not_running(tmp_path, monk
         def run_job(job, **kwargs):
             journal.parent.mkdir(parents=True, exist_ok=True)
             journal.write_text(json.dumps({'params': {'job_id': job['id'], 'request_id': fire,
-                                                      'extra_prompt': None}, 'receipt': None}))
+                                                      'extra_prompt': None}, 'job': job, 'receipt': None}))
             raise scheduler_authority.CronExecutionUnknown('Cron execution unverified: owner lost')
         monkeypatch.setattr(scheduler, 'run_job', run_job)
         assert scheduler._run_one_job_body(dict(jobs.get_job(job['id']), execution_id=fire)) is False
@@ -36,4 +36,5 @@ def test_given_up_fire_leaves_its_attempt_recoverable_not_running(tmp_path, monk
         monkeypatch.setattr(gateway_client, 'connect_gateway', connected)
         scheduler_authority.reconcile_pending()
         assert executions.get_execution(fire)['status'] == 'completed'
+        assert jobs.get_job(job['id'])['state'] == 'scheduled'
         assert not journal.exists()

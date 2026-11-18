@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import uuid
 import json
+import asyncio
 import subprocess
 import sys
 import time
@@ -19,7 +20,8 @@ from gateway.platforms.event import MessageEvent, MessageType
 from hermes_cli import goals
 from hermes_cli.goals import GoalManager
 from tests.gateway.test_goal_continuation_silence import _runner_with_goal
-from tests.gateway.test_goal_continuation_drain import hermes_home as hermes_home
+from tests.gateway.test_goal_continuation_drain import hermes_home as _hermes_home_fixture
+hermes_home = _hermes_home_fixture
 
 REASON = "The release still needs live validation"
 
@@ -114,7 +116,7 @@ async def test_same_reason_after_wait_lift_and_reload_is_not_reposted(hermes_hom
             assert mgr.clear_lifted_wait(mgr.state.waiting_since)
             _restart_db()
             # A new interpreter must retain the same identity after restart.
-            subprocess.run(
+            await asyncio.to_thread(subprocess.run,
                 [sys.executable, "-c",
                  "import sys; from hermes_cli.goals import GoalManager; "
                  "m=GoalManager(sys.argv[1]); assert not m.is_parked(); "
@@ -218,7 +220,7 @@ async def test_silent_continue_repark_keeps_notice_identity_after_db_reload(herm
         assert mgr.state.turns_used == original_turns + 2
         assert mgr.state.backoff_level == original_level + 2  # each silent re-park climbs the ladder
         # Prove the durable identity in an actual fresh interpreter too.
-        subprocess.run(
+        await asyncio.to_thread(subprocess.run,
             [sys.executable, "-c",
              "import sys; from hermes_cli.goals import GoalManager; "
              "m=GoalManager(sys.argv[1]); assert m.is_parked(); "

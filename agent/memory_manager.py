@@ -13,14 +13,15 @@ import math
 import re
 import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from typing import Any, Callable, Dict, List, Optional
 
-from agent.redact import redact_for_egress
+from agent.redact import redact_for_egress, redaction_generation
 
 from agent.memory_caller_scope import bound_scope, caller_scope, claim_instance, in_owner_home, refused_tool_message
 # Moved to agent.memory_context / agent.memory_manager_tools; still importable here because agent.memory_manager is a public
-# module for plugins (hermes_cli/plugin_validate_private_imports.py).
+# module for plugins (hermes_cli/data/plugin_api.json).
 from agent.memory_context import StreamingContextScrubber, build_memory_context_block, sanitize_context
 from agent.memory_manager_tools import (inject_memory_provider_tools, memory_provider_tools_enabled,
                                         memory_provider_tools_exposed, normalize_tool_schema)
@@ -112,14 +113,91 @@ def _accepts_require_checkpoint(fn: Callable[..., Any]) -> bool:
 
 # -- Provider egress scrubbing -----------------------------------------------
 
+_SCRUB_CACHE_MAX_ENTRIES = 4096
+_SCRUB_CACHE_MAX_BYTES = 32 * 1024 * 1024
+_SCRUB_CACHE: OrderedDict[tuple[str, int, str], str] = OrderedDict()
+_SCRUB_CACHE_BYTES = 0
+_SCRUB_CACHE_LOCK = threading.Lock()
+
+
 def _scrub(text: str) -> str:
     """The shared egress scrub. Like chat-platform and cron delivery it holds even when
     ``security.redact_secrets`` is off (that setting governs local logs, not what leaves the agent)
     and fails closed."""
-    return redact_for_egress(text)
+    global _SCRUB_CACHE_BYTES
+
+    try:
+        key = (hermes_home_key(), redaction_generation(), text)
+        with _SCRUB_CACHE_LOCK:
+            cached = _SCRUB_CACHE.get(key)
+            if cached is not None:
+                _SCRUB_CACHE.move_to_end(key)
+                return cached
+    except Exception:  # health: allow BLE001 -- cache is best-effort and must never block provider egress
+        return redact_for_egress(text)
+
+    scrubbed = redact_for_egress(text)
+    try:
+        # Character accounting is deliberately independent of text encoding. Transcripts can contain
+        # surrogateescape values and lone surrogates that strict UTF-8 rejects.
+        size = len(text) + len(scrubbed)
+        if size > _SCRUB_CACHE_MAX_BYTES:
+            return scrubbed
+        with _SCRUB_CACHE_LOCK:
+            previous = _SCRUB_CACHE.pop(key, None)
+            if previous is not None:
+                _SCRUB_CACHE_BYTES -= len(text) + len(previous)
+            _SCRUB_CACHE[key] = scrubbed
+            _SCRUB_CACHE_BYTES += size
+            while (len(_SCRUB_CACHE) > _SCRUB_CACHE_MAX_ENTRIES
+                   or _SCRUB_CACHE_BYTES > _SCRUB_CACHE_MAX_BYTES):
+                old_key, old_value = _SCRUB_CACHE.popitem(last=False)
+                _SCRUB_CACHE_BYTES -= len(old_key[2]) + len(old_value)
+    except Exception:  # health: allow BLE001 -- cache is best-effort and must never block provider egress
+        return redact_for_egress(text)
+    return scrubbed
 
 
 _TOKEN_RE = re.compile(r"[A-Za-z0-9_\-./+]{16,}")
+_LEARNED_PATTERN_CACHE: OrderedDict[frozenset[str], re.Pattern[str]] = OrderedDict()
+_LEARNED_PATTERN_CACHE_MAX_ENTRIES = 64
+_LEARNED_PATTERN_CACHE_LOCK = threading.Lock()
+
+
+def _learned_pattern(learned: frozenset[str]) -> re.Pattern[str]:
+    with _LEARNED_PATTERN_CACHE_LOCK:
+        pattern = _LEARNED_PATTERN_CACHE.get(learned)
+        if pattern is not None:
+            _LEARNED_PATTERN_CACHE.move_to_end(learned)
+            return pattern
+    pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
+    with _LEARNED_PATTERN_CACHE_LOCK:
+        _LEARNED_PATTERN_CACHE[learned] = pattern
+        _LEARNED_PATTERN_CACHE.move_to_end(learned)
+        while len(_LEARNED_PATTERN_CACHE) > _LEARNED_PATTERN_CACHE_MAX_ENTRIES:
+            _LEARNED_PATTERN_CACHE.popitem(last=False)
+    return pattern
+
+
+def _has_embedded_learned_token(text: str, learned: frozenset[str]) -> bool:
+    token_chars = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-.+/")
+    for token in learned:
+        start = text.find(token)
+        while start >= 0:
+            end = start + len(token)
+            if ((start and text[start - 1] in token_chars)
+                    or (end < len(text) and text[end] in token_chars)):
+                return True
+            start = text.find(token, start + 1)
+    return False
+
+
+def _apply_learned_tokens(text: str, learned: frozenset[str]) -> str:
+    if not learned or not any(token in text for token in learned):
+        return text
+    if not _has_embedded_learned_token(text, learned):
+        return _TOKEN_RE.sub(lambda match: "[redacted]" if match.group(0) in learned else match.group(0), text)
+    return _learned_pattern(learned).sub("[redacted]", text)
 
 
 def _redact_for_provider(*values: Any) -> Any:
@@ -156,13 +234,16 @@ def _redact_for_provider(*values: Any) -> Any:
 
     scrubbed = [walk(v, scrub) for v in values]
     if learned:
-        pattern = re.compile("|".join(re.escape(t) for t in sorted(learned, key=len, reverse=True)))
-        scrubbed = [walk(v, lambda t: pattern.sub("[redacted]", t) if pattern.search(t) else t) for v in scrubbed]
+        learned_tokens = frozenset(learned)
+        scrubbed = [walk(v, lambda t: _apply_learned_tokens(t, learned_tokens)) for v in scrubbed]
     return scrubbed[0] if len(scrubbed) == 1 else tuple(scrubbed)
 
 
 def _redact_messages_for_egress(messages: Optional[list[Any]]) -> Optional[list[Any]]:
-    return None if messages is None else list(_redact_for_provider(messages))
+    """Scrubbed copies of whole transcript rows for a provider; a ``pre_llm_call`` veto's typed text
+    (display-only metadata) never leaves the host."""
+    from agent.message_metadata import without_withheld_prompts
+    return None if messages is None else list(_redact_for_provider(without_withheld_prompts(messages)))
 
 
 class _StuckCallGate:
@@ -298,6 +379,10 @@ class MemoryManager:
         }
         # The profile ``initialize_all`` bound the providers to; tool calls must come from it (#140058).
         self._bound_scope: Optional[dict[str, Any]] = None
+        # Captured at initialize_all(). A fork ("subagent") holds a provider only for the checkpoint gate; its
+        # turn writes and recall must not reach the user's memory. "primary" until initialized, so the legacy
+        # construction path keeps writing.
+        self._agent_context = "primary"
         self._tool_call_keywords_cache: dict[int, Optional[frozenset[str]]] = {}
 
     # Bounds how long entering incognito waits for already-queued public memory writes.
@@ -353,6 +438,13 @@ class MemoryManager:
         """Whether a lifecycle hook may reach the providers: only from the profile they were initialized
         for (#140058; see ``agent/memory_caller_scope.py``). Nothing to reach, nothing to refuse."""
         return not self._providers or caller_scope(self._bound_scope, f"hook {hook}") is not None
+
+    def _fork_turn_hooks_suppressed(self) -> bool:
+        """A fork's writes and recall (on_turn_start, sync, prefetch, session-end extraction, delegation notes)
+        stay off on the host, independent of whether each provider honours ``agent_context``: before the
+        checkpoint gate armed them, forks ran with no provider at all. ``initialize``, ``on_session_switch``
+        and ``on_pre_compress`` (the checkpoint) are not gated."""
+        return self._agent_context == "subagent"
 
     def _tool_call_keywords(self, provider: MemoryProvider) -> Optional[frozenset[str]]:
         """The keywords ``provider.handle_tool_call`` declares; None when it takes any (``**kwargs``, or
@@ -449,6 +541,8 @@ class MemoryManager:
 
     def prefetch_all(self, query: str, *, session_id: str = "") -> str:
         """Merge non-empty prefetch context from all providers (failures are non-fatal)."""
+        if self._fork_turn_hooks_suppressed():
+            return ""
         clean_query = self._strip_skill_scaffolding(query)
         if not clean_query or not self._owner_allows("prefetch"):
             return ""
@@ -552,6 +646,8 @@ class MemoryManager:
 
     def queue_prefetch_all(self, query: str, *, session_id: str = "") -> None:
         """Queue background prefetch on all providers for the next turn (see ``sync_all``)."""
+        if self._fork_turn_hooks_suppressed():
+            return
         providers = list(self._providers)
         clean_query = self._strip_skill_scaffolding(query) if providers else None
         if not clean_query or not self._owner_allows("queue_prefetch"):
@@ -600,8 +696,12 @@ class MemoryManager:
         open after the user saw the response. The single worker also serializes writes (turn N before N+1).
         ``turn_author`` and the turn's provenance (``display_kind``, ``platform``) reach only providers
         whose ``sync_turn`` accepts them.
-"""
-        if self.read_only:
+
+        Everything forwarded is provider egress: turn strings AND the ``messages`` transcript slice
+        (tool outputs included) go through ``_redact_for_provider`` so secrets are never archived
+        verbatim in a provider's store (#115104).
+        """
+        if self.read_only or self._fork_turn_hooks_suppressed():
             return
         providers = list(self._providers)
         clean_user_content = self._strip_skill_scaffolding(user_content) if providers else None
@@ -778,11 +878,15 @@ class MemoryManager:
             return result
 
     def on_turn_start(self, turn_number: int, message: str, **kwargs) -> None:
-        if self.read_only:
+        if self.read_only or self._fork_turn_hooks_suppressed() or not self._owner_allows("on_turn_start"):
             return
-        if not self._owner_allows("on_turn_start"):
-            return
-        message = _redact_for_provider(message)
+        # previous_message is earlier user text, so it is scrubbed with the message (one learned-token set). The rest
+        # are identity/runtime values, raw as in sync_all: masking a phone-number author_id merges two senders.
+        if "previous_message" in kwargs:
+            message, previous = _redact_for_provider(message, kwargs["previous_message"])
+            kwargs = {**kwargs, "previous_message": previous}
+        else:
+            message = _redact_for_provider(message)
 
         def _tick(p: MemoryProvider) -> None:
             # A provider written before the author kwargs declares (turn_number, message) only; it still gets its tick.
@@ -793,7 +897,7 @@ class MemoryManager:
         self._each_provider("on_turn_start failed", _tick)
 
     def on_session_end(self, messages: list[dict[str, Any]]) -> None:
-        if self.read_only:
+        if self.read_only or self._fork_turn_hooks_suppressed():
             return
         if not self._owner_allows("on_session_end"):
             return
@@ -890,7 +994,9 @@ class MemoryManager:
 
         ``messages`` is the raw v1 transcript; ``evidence_messages`` is the host-normalized list handed
         only to checkpoint (v2+) providers. With ``require_checkpoint`` at least one checkpoint provider
-        must succeed — its exception propagates so the caller keeps the uncompressed transcript.
+        must succeed — its exception propagates so the caller keeps the uncompressed transcript. Not gated
+        for forks (``_fork_turn_hooks_suppressed``): the checkpoint is why a fork holds a provider, so a v2
+        provider must save here whatever its non-primary write scope.
         """
         if self.read_only:
             return ""
@@ -900,7 +1006,9 @@ class MemoryManager:
             return ""
         parts = []
         checkpoint_succeeded = False
-        messages, evidence_messages = _redact_for_provider(messages or [], evidence_messages)
+        from agent.message_metadata import without_withheld_prompts
+        messages, evidence_messages = _redact_for_provider(
+            without_withheld_prompts(messages or []), without_withheld_prompts(evidence_messages))
         for provider in self._providers:
             version = self._checkpoint_api_version(provider)
             if version is None:
@@ -1024,9 +1132,7 @@ class MemoryManager:
                 logger.debug("notify_memory_tool_write failed for op %s: %s", action, e)
 
     def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
-        if self.read_only:
-            return
-        if not self._owner_allows("on_delegation"):
+        if self.read_only or self._fork_turn_hooks_suppressed() or not self._owner_allows("on_delegation"):
             return
         task, result = _redact_for_provider(task, result)
         self._each_provider(
@@ -1132,6 +1238,8 @@ class MemoryManager:
 
         self._prefetch_generation.discard(_record_session)
         self._bound_scope = bound_scope(kwargs["hermes_home"], kwargs.get("agent_identity"))
+        _context = kwargs.get("agent_context")
+        self._agent_context = _context if isinstance(_context, str) and _context.strip() else "primary"
         # One instance, one profile: never rebind an instance another profile's manager bound (#140058).
         for provider in [p for p in self._providers if p.name != "builtin"]:
             if not claim_instance(provider, kwargs["hermes_home"]):

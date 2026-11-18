@@ -10,7 +10,8 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource
 from hermes_cli.goals import CONTINUATION_PROMPT_TEMPLATE
-from tests.gateway.test_goal_continuation_drain import hermes_home as hermes_home
+from tests.gateway.test_goal_continuation_drain import hermes_home as _hermes_home_fixture
+hermes_home = _hermes_home_fixture
 
 
 class FakeAdapter:

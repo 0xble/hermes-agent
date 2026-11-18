@@ -31,7 +31,7 @@ _LOCK_STALL_SECONDS = 2.0
 _LOCK_CEILING_SECONDS = 30.0
 
 
-def _tracked_stamp() -> Optional[Tuple[int, int, int]]:
+def _tracked_stamp() -> Optional[tuple[int, int, int]]:
     try:
         st = _state_file("tracked.json").stat()
     except OSError:
@@ -342,7 +342,7 @@ def quick() -> dict[str, Any]:
     """Safe deterministic cleanup — no prompts. Returns ``{deleted, empty_dirs, freed, errors}``."""
     deleted = freed = 0
     new_tracked: list[dict] = []
-    deleted_items: List[Dict] = []
+    deleted_items: list[dict] = []
     errors: list[str] = []
     with _tracking_lock():
         snapshot = load_tracked()

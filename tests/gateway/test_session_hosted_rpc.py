@@ -23,8 +23,8 @@ def test_local_hosted_member_revoked_during_preparation_is_not_admitted(hosted_o
 
     authority, loop, _, _ = hosted_owner
     service = CanonicalHostedRoomService(authority, loop)
-    # The component fixture uses a synthetic profile identifier, not a daemon home.
-    monkeypatch.setattr(service, 'profile_homes', lambda: {'default': Path(authority.profile_id)})
+    # The authority identity is synthetic, while its profile home is the temporary DB parent.
+    monkeypatch.setattr(service, 'profile_homes', lambda: {'default': Path(authority.db.db_path).parent})
     service.authorize_room('alice', 'room', create=True)
     gateway = local_authority_gateway_id()
     members = [

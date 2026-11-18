@@ -53,7 +53,7 @@ def test_gateway_reply_and_trigger_wrappers_do_not_hide_attachment_caption(
     assert auto_recall_query(prompt, platform=platform) == expected
     assert human_prompt_text(prompt) == prompt
     agent = _turn_agent()
-    _memory_turn_start_and_prefetch(agent, prompt)
+    _memory_turn_start_and_prefetch(agent, prompt, turn_author=None, previous_message="")
     if expected:
         assert agent._memory_manager.prefetch_all.call_args.args[0] == expected
     else:
@@ -84,7 +84,7 @@ def test_reply_context_delimiter_collision_preserves_the_quote_and_caption(enric
     pointer = prompt.split('[Replying to: ', 1)[1].split(']\n\n', 1)[0]
     assert json.loads(pointer) == quoted
     immediate = _turn_agent(platform=platform)
-    _memory_turn_start_and_prefetch(immediate, prompt)
+    _memory_turn_start_and_prefetch(immediate, prompt, turn_author=None, previous_message="")
     immediate._memory_manager.prefetch_all.assert_called_once_with(REQUEST, session_id=immediate.session_id)
     queued = _post_turn_agent(display_kind=None, platform=platform)
     queued._sync_external_memory_for_turn(
@@ -153,7 +153,7 @@ def test_untranscribed_voice_fallback_note_is_not_the_recall_query(monkeypatch):
     monkeypatch.setattr(builtins, "__import__", _no_stt)
     mixin = object.__new__(GatewayInboundMixin)
     mixin.config = SimpleNamespace(stt_enabled=True)
-    enrich = getattr(mixin, "_enrich_message_with_transcription")
+    enrich = mixin._enrich_message_with_transcription
     prompt, _ = asyncio.run(enrich(REQUEST, ["/cache/audio/voice.ogg"]))
     assert prompt.startswith("[voice message could not be transcribed]")
     assert auto_recall_query(prompt) == REQUEST
@@ -181,6 +181,27 @@ def test_attachment_noise_cannot_force_recall_for_a_trivial_caption(enrich, capt
 
 def test_image_only_turn_keeps_a_meaningful_description_not_path_advice(enrich):
     assert auto_recall_query(enrich("")) == DESCRIPTION.strip()
+
+
+@pytest.mark.parametrize("caption", ["[Brian]", "[Brian | Slack user <@U123>]", "[Check my records]"])
+def test_bracket_only_suffix_does_not_hide_image_description_or_discard_caption(enrich, caption):
+    prompt = enrich(caption)
+    assert auto_recall_query(prompt) == DESCRIPTION.strip() + "\n\n" + caption
+    assert human_prompt_text(prompt) == prompt
+    assert auto_recall_query(caption) == caption
+
+
+@pytest.mark.parametrize("caption", [
+    "[Brian] which plan should I pick [A or B]",
+    "[Brian | Slack user <@U1>] see [urgent]",
+])
+@pytest.mark.parametrize("include_synthetic", [False, True])
+def test_shared_caption_ending_in_brackets_stays_ahead_of_image_description(
+    enrich, caption, include_synthetic,
+):
+    prompt = enrich(caption)
+    assert auto_recall_query(prompt, include_synthetic=include_synthetic) == caption
+    assert human_prompt_text(prompt) == prompt
 
 
 def test_multiple_images_do_not_swallow_the_caption(enrich):
@@ -335,11 +356,11 @@ def test_native_multimodal_turn_recalls_the_complete_caption(monkeypatch, captio
         return_value=json.dumps({"analysis": DESCRIPTION})))
     turn = _multimodal_turn(caption, images)
     runner = VisionMessagePrepMixin()
-    setattr(runner, "_anthropic_image_fallback_cache", {})
+    runner._anthropic_image_fallback_cache = {}
     api_copy = runner._preprocess_anthropic_content(json.loads(json.dumps(turn)), "user")
     assert api_copy.index(caption) > 800
     agent = _turn_agent()
-    _memory_turn_start_and_prefetch(agent, turn)
+    _memory_turn_start_and_prefetch(agent, turn, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_called_once_with(caption, session_id="s-1")
     agent = _post_turn_agent(display_kind=None)
     agent._sync_external_memory_for_turn(original_user_message=turn, final_response="Answer.", interrupted=False)
@@ -348,7 +369,7 @@ def test_native_multimodal_turn_recalls_the_complete_caption(monkeypatch, captio
 
 def test_native_image_only_turn_has_no_recall_query():
     agent = _turn_agent()
-    _memory_turn_start_and_prefetch(agent, _multimodal_turn("", images=2))
+    _memory_turn_start_and_prefetch(agent, _multimodal_turn("", images=2), turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_not_called()
 
 
@@ -359,7 +380,12 @@ def test_unpaired_description_note_is_never_stripped_as_attachment_metadata():
     assert auto_recall_query(prompt) == prompt
 
 
-def test_hindsight_receives_the_request_with_its_existing_input_cap(enrich):
+@pytest.mark.parametrize("caption", [
+    REQUEST,
+    "[Brian] which plan should I pick [A or B]",
+    "[Brian | Slack user <@U1>] see [urgent]",
+])
+def test_hindsight_receives_the_request_with_its_existing_input_cap(enrich, caption):
     from plugins.memory.hindsight import HindsightMemoryProvider
     from unittest.mock import Mock
 
@@ -367,8 +393,8 @@ def test_hindsight_receives_the_request_with_its_existing_input_cap(enrich):
     provider._recall_max_input_chars = 800
     provider._prefetch_method = "recall"
     provider._recall = Mock(return_value=[])
-    provider._do_recall(auto_recall_query(enrich(REQUEST)))
-    provider._recall.assert_called_once_with(REQUEST)
+    provider._do_recall(auto_recall_query(enrich(caption)))
+    provider._recall.assert_called_once_with(caption)
 
 
 def test_inline_document_body_and_transcribed_speech_are_not_discarded():
@@ -390,7 +416,7 @@ def test_unknown_or_incomplete_attachment_lookalike_is_preserved():
 def test_both_real_memory_call_sites_use_the_caption(enrich):
     prompt = enrich(REQUEST)
     agent = _turn_agent()
-    _memory_turn_start_and_prefetch(agent, prompt)
+    _memory_turn_start_and_prefetch(agent, prompt, turn_author=None, previous_message="")
     agent._memory_manager.prefetch_all.assert_called_once_with(REQUEST, session_id="s-1")
     agent = _post_turn_agent(display_kind=None)
     agent._sync_external_memory_for_turn(original_user_message=prompt, final_response="Answer.", interrupted=False)

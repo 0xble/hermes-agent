@@ -51,6 +51,15 @@ def _load_installed_package(name):
         return None
 
 
+class _StreamExpiredError(Exception):
+    """slack_sdk.SlackApiError's shape (``exc.response["error"]``) without importing the SDK,
+    which CI stubs as a bare module. The adapter only reads the response mapping."""
+
+    def __init__(self, message, response):
+        super().__init__(message)
+        self.response = response
+
+
 def _ensure_slack_mock():
     """Install mocks only for Slack dependencies that are actually unavailable."""
     if _load_installed_package("slack_bolt") is None:
@@ -72,10 +81,12 @@ def _ensure_slack_mock():
     if _load_installed_package("slack_sdk") is None:
         slack_sdk = MagicMock()
         slack_sdk.web.async_client.AsyncWebClient = MagicMock
+        slack_sdk.errors.SlackApiError = _StreamExpiredError
         for name, mod in [
-            ("slack_sdk", slack_sdk),
+            ("slack_sdk", slack_sdk), ("slack_sdk.errors", slack_sdk.errors),
             ("slack_sdk.web", slack_sdk.web),
             ("slack_sdk.web.async_client", slack_sdk.web.async_client),
+            ("slack_sdk.web.async_slack_response", slack_sdk.web.async_slack_response),
         ]:
             sys.modules.setdefault(name, mod)
 
@@ -91,15 +102,6 @@ import plugins.platforms.slack.adapter as _slack_mod
 _slack_mod.SLACK_AVAILABLE = True
 
 from plugins.platforms.slack.adapter import SlackAdapter
-
-
-class _StreamExpiredError(Exception):
-    """slack_sdk.SlackApiError's shape (``exc.response["error"]``) without importing the SDK,
-    which CI stubs as a bare module. The adapter only reads the response mapping."""
-
-    def __init__(self, message, response):
-        super().__init__(message)
-        self.response = response
 
 
 @pytest.fixture(autouse=True)
@@ -4078,7 +4080,7 @@ class TestThreadContextUnverifiedTagging:
         adapter._thread_context_cache.clear()
         adapter._app.client.conversations_replies = self._make_replies(self._thread_messages())
         adapter.set_authorization_check(
-            lambda user_id, chat_type=None, chat_id=None: user_id == "U_BOB"
+            lambda user_id, chat_type=None, chat_id=None, **_: user_id == "U_BOB"
         )
 
         with patch.object(
@@ -4098,18 +4100,18 @@ class TestThreadContextUnverifiedTagging:
 
     @pytest.mark.asyncio
     async def test_auth_check_chat_type_and_id_passed(self, adapter):
-        """The adapter forwards chat_type='thread' and the channel_id so the
-        gateway-side check can resolve group-allowlist rules correctly."""
+        """The adapter forwards the inbound chat type ('group' for a channel), channel_id and
+        thread root, so the gateway check reads the allowlist the live message used."""
         adapter._thread_context_cache.clear()
         adapter._app.client.conversations_replies = self._make_replies(
             [{"ts": "100.0", "user": "U_X", "text": "hello"}]
         )
 
         captured = {}
-        def check(user_id, chat_type=None, chat_id=None):
+        def check(user_id, chat_type=None, chat_id=None, thread_id=None):
             captured["user_id"] = user_id
             captured["chat_type"] = chat_type
-            captured["chat_id"] = chat_id
+            captured.update(chat_id=chat_id, thread_id=thread_id)
             return True
         adapter.set_authorization_check(check)
 
@@ -4121,7 +4123,7 @@ class TestThreadContextUnverifiedTagging:
                 channel_id="C_CHAN", thread_ts="100.0", current_ts="999.0",
             )
 
-        assert captured == {"user_id": "U_X", "chat_type": "thread", "chat_id": "C_CHAN"}
+        assert captured == {"user_id": "U_X", "chat_type": "group", "chat_id": "C_CHAN", "thread_id": "100.0"}
 
 
     @pytest.mark.asyncio
@@ -5697,75 +5699,6 @@ class TestSlackAuthoredTextDeduplication:
         assert "Deploy failed" in payload
         assert "rollback" in payload
         assert "Roll back" in payload
-
-
-class TestAgentSessionsApiRouting:
-    """slack-sdk 3.44.0 Agent Sessions API (assistant_view deprecation Feb 2027).
-
-    When the installed slack-sdk ships agents.sessions.* typed methods, TITLE
-    calls route through agents.sessions.rename; older SDKs keep using the legacy
-    assistant.threads.* methods (compat bridge on Slack's side). Status always
-    stays on assistant.threads.setStatus — the Agent Sessions status API takes a
-    closed enum and rejects Hermes' free-text phrases and empty clear (#110374).
-    """
-
-    def _adapter(self):
-        config = PlatformConfig(enabled=True, token="xoxb-fake-token")
-        a = SlackAdapter(config)
-        a._app = MagicMock()
-        a._app.client = AsyncMock()
-        return a
-
-    @pytest.mark.asyncio
-    async def test_typing_stays_on_legacy_even_with_sdk_support(self):
-        """#110374: agents.sessions.setStatus takes a closed enum, so free-text
-        status phrases must keep going to assistant.threads.setStatus."""
-        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
-        a = self._adapter()
-        a._app.client.agents_sessions_setStatus = AsyncMock()
-        a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
-            thread_ts="parent_ts",
-            status="is thinking...",
-        )
-        a._app.client.agents_sessions_setStatus.assert_not_called()
-
-
-    @pytest.mark.asyncio
-    async def test_stop_typing_clears_via_legacy_empty_status(self):
-        """The empty-string clear is rejected by the enum API (#110374), so the
-        clear path stays on assistant.threads.setStatus too."""
-        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
-        a = self._adapter()
-        a._app.client.agents_sessions_setStatus = AsyncMock()
-        a._app.client.assistant_threads_setStatus = AsyncMock()
-        await a.send_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.assistant_threads_setStatus.reset_mock()
-        await a.stop_typing("C123", metadata={"thread_id": "parent_ts"})
-        a._app.client.assistant_threads_setStatus.assert_called_once_with(
-            channel_id="C123",
-            thread_ts="parent_ts",
-            status="",
-        )
-        a._app.client.agents_sessions_setStatus.assert_not_called()
-
-    @pytest.mark.asyncio
-    async def test_thread_title_uses_agents_sessions_rename(self):
-        _slack_mod._AGENT_SESSIONS_SUPPORTED = True
-        a = self._adapter()
-        a.config.extra["assistant_thread_titles"] = True
-        a._app.client.agents_sessions_rename = AsyncMock()
-        a._app.client.assistant_threads_setTitle = AsyncMock()
-        await a._set_assistant_thread_title("D123", "171234.0001", "Summarize the incident")
-        a._app.client.agents_sessions_rename.assert_called_once_with(
-            channel_id="D123",
-            thread_ts="171234.0001",
-            title="Summarize the incident",
-        )
-        a._app.client.assistant_threads_setTitle.assert_not_called()
-
 
 
 # ---------------------------------------------------------------------------

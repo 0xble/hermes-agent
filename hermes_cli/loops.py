@@ -107,7 +107,7 @@ _SILENCE_CONTRACT_WAKEUP_REPLY_RULES = (
 )
 
 
-def _evidence_wakeup_templates(reply_rules: str) -> Tuple[str, str]:
+def _evidence_wakeup_templates(reply_rules: str) -> tuple[str, str]:
     return (
         f"{WAKEUP_PROMPT_PREFIX}{{tick}}{{cadence}}]\n"
         "Recurring task: {prompt}\n\n"
@@ -366,7 +366,7 @@ class LoopState:
     # idle watcher can inject ticks into the right chat. Empty for CLI/TUI (own schedulers).
     route: dict[str, str] = field(default_factory=dict)
     # Versioned agent-authored changes; old rows omit this field and load as an empty list.
-    revisions: List[Dict[str, Any]] = field(default_factory=list)
+    revisions: list[dict[str, Any]] = field(default_factory=list)
     mutation_id: str = ""  # durable-write token, including same-value lifecycle changes
     tick_id: str = ""  # survives revisions, changes on every new claim
 
@@ -420,14 +420,14 @@ class LoopState:
 _META_PREFIX = "loop:"
 # Keyed by (store home, session) so multiplexed profiles never share a fence. Retired loops drop
 # out; the stored row stays authoritative for them and the sync fence treats absence as stale.
-_CONTROL_GENERATIONS: Dict[Tuple[str, str], int] = {}
+_CONTROL_GENERATIONS: dict[tuple[str, str], int] = {}
 
 
 def _meta_key(session_id: str) -> str:
     return f"{_META_PREFIX}{session_id}"
 
 
-def _control_generation_key(session_id: str) -> Tuple[str, str]:
+def _control_generation_key(session_id: str) -> tuple[str, str]:
     from hermes_constants import hermes_home_key
 
     return hermes_home_key(), session_id
@@ -1113,13 +1113,13 @@ class LoopManager(LoopRevisionsMixin):
         self.session_id = successor
         return True
 
-    def _superseded_result(self) -> Dict[str, Any]:
+    def _superseded_result(self) -> dict[str, Any]:
         s = self._state
         return {"status": s.status if s else None, "stopped": False,
                 "reason": "loop changed during the tick", "message": ""}
 
     @snapshot_control
-    def abandon_tick(self, *, tick: Optional[Tuple[Any, Any]] = None, owns_turn=None) -> bool:
+    def abandon_tick(self, *, tick: Optional[tuple[Any, Any]] = None, owns_turn=None) -> bool:
         """Release a pre-start claim, or skip a started tick without replaying it.
 
         ``fire_tick`` normally claims and starts in one CAS, so admission failures after that
@@ -1162,7 +1162,7 @@ class LoopManager(LoopRevisionsMixin):
 
         return self._save_tick_outcome(fired, settle, expected_phase=phase, owns_turn=owns_turn)
 
-    def _tick_execution_current(self, tick: Tuple[Any, Any], *, control_generation: int,
+    def _tick_execution_current(self, tick: tuple[Any, Any], *, control_generation: int,
                                 run_generation: int) -> bool:
         """Read the stored admission fence off-loop before each effect producer."""
         s = load_loop(self.session_id)
@@ -1217,7 +1217,7 @@ class LoopManager(LoopRevisionsMixin):
         s = self._state
         superseded = False
 
-        cap: Optional[Tuple[str, str, str]] = None
+        cap: Optional[tuple[str, str, str]] = None
 
         def settle(state: LoopState) -> None:
             nonlocal superseded, cap
@@ -1292,7 +1292,7 @@ class LoopManager(LoopRevisionsMixin):
         state.backoff_level = min(level + 1, len(_NO_PROGRESS_BACKOFF_S) - 1)
         state.next_due_at = now + delay
 
-    def complete_tick(self, last_response: str, *, tick: Optional[Tuple[Any, Any]] = None) -> Dict[str, Any]:
+    def complete_tick(self, last_response: str, *, tick: Optional[tuple[Any, Any]] = None) -> dict[str, Any]:
         """Settle the finished wakeup turn through the durable snapshot/CAS boundary.
 
         A superseded verdict cannot overwrite a newer durable state; see ``_complete_tick``.
@@ -1355,7 +1355,7 @@ class LoopManager(LoopRevisionsMixin):
                 # An unachievable stop condition is no-progress evidence, not a terminal loop
                 # failure. Keep the loop active and use the shared quiet ladder before retrying.
                 why = f"stop condition judged unachievable: {reason}"
-                cap: Optional[Tuple[str, str, str]] = None
+                cap: Optional[tuple[str, str, str]] = None
 
                 def settle_blocked(state: LoopState) -> None:
                     nonlocal cap
@@ -1375,7 +1375,7 @@ class LoopManager(LoopRevisionsMixin):
 
         # 3-4. --times user cap (done) and config backstop budget (paused, recoverable), judged at
         # settle time against the stored definition so a revise mid-tick cannot lift either.
-        cap: Optional[Tuple[str, str, str]] = None
+        cap: Optional[tuple[str, str, str]] = None
 
         def settle(state: LoopState) -> None:
             nonlocal cap
@@ -1394,7 +1394,7 @@ class LoopManager(LoopRevisionsMixin):
         return {"status": "active", "stopped": False, "reason": "loop continues", "message": ""}
 
 
-def enforce_loop_run_cap(state: LoopState) -> Optional[Dict[str, Any]]:
+def enforce_loop_run_cap(state: LoopState) -> Optional[dict[str, Any]]:
     """Apply deterministic budgets without judging an obsolete or absent reply."""
     if state.status != "active":
         return None
@@ -1539,10 +1539,25 @@ def dispatch_loop_command(
 
 
 __all__ = [
-    "LoopState", "LoopManager", "parse_loop_args", "parse_interval_token", "format_interval",
-    "response_signals_complete", "goal_blocks_loop_tick", "wake_loop_for_external_event", "load_loop", "save_loop", "clear_loop",
-    "list_active_loops", "migrate_loop_to_session", "dispatch_loop_command", "loop_control_generation",
+    "DEFAULT_MAX_TICKS",
+    "DEFAULT_MIN_INTERVAL_SECONDS",
     "LOOP_COMPLETE_MARKER",
-    "WAKEUP_PROMPT_TEMPLATE", "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE", "DEFAULT_MIN_INTERVAL_SECONDS",
-    "DEFAULT_MAX_TICKS", "is_quiet_wakeup_prompt",
+    "WAKEUP_PROMPT_TEMPLATE",
+    "WAKEUP_PROMPT_WITH_UNTIL_TEMPLATE",
+    "LoopManager",
+    "LoopState",
+    "clear_loop",
+    "dispatch_loop_command",
+    "format_interval",
+    "goal_blocks_loop_tick",
+    "is_quiet_wakeup_prompt",
+    "list_active_loops",
+    "load_loop",
+    "loop_control_generation",
+    "migrate_loop_to_session",
+    "parse_interval_token",
+    "parse_loop_args",
+    "response_signals_complete",
+    "save_loop",
+    "wake_loop_for_external_event",
 ]

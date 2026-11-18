@@ -71,7 +71,7 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
             time.sleep(.2)
         return False
     def loaded():
-        return subprocess.run(["launchctl", "print", gw_target], capture_output=True, timeout=5).returncode == 0
+        return subprocess.run(["launchctl", "print", gw_target], capture_output=True, timeout=5, check=False).returncode == 0
     try:
         subprocess.run(["launchctl", "bootstrap", domain, str(gw_plist)], check=True, timeout=15)
         assert wait_for(lambda: (home / "gateway_state.json").exists())
@@ -117,7 +117,7 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
                    for p in (home / "logs/guardian").glob("*.json")))
     finally:
         for target in (gw_target, agent_target):
-            subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
-            assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=5).returncode != 0
-        output = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=10).stdout
+            subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15, check=False)
+            assert subprocess.run(["launchctl", "print", target], capture_output=True, timeout=5, check=False).returncode != 0
+        output = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=10, check=False).stdout
         assert label not in output and guardian_label not in output

@@ -41,7 +41,7 @@ class StubProvider:
         stub = self
 
         class Handler(BaseHTTPRequestHandler):
-            def log_message(self, format, *args):  # noqa: A002 - BaseHTTPRequestHandler signature
+            def log_message(self, format, *args):
                 pass
 
             def do_GET(self):
@@ -104,7 +104,7 @@ class StubProvider:
     def primary_requests(self) -> list[dict]:
         return [r for r in self.requests if r["model"] == PRIMARY_MODEL]
 
-    def __enter__(self) -> "StubProvider":
+    def __enter__(self) -> StubProvider:
         self.thread.start()
         return self
 
@@ -161,7 +161,7 @@ def run_turn(hermes_home: Path, url: str, mode: str = "stream") -> dict:
     completed = subprocess.run(
         [sys.executable, "-c", CHILD, url, mode],
         cwd=ROOT, env=env, capture_output=True, text=True, timeout=180,
-    )
+     check=False)
     if completed.returncode != 0:
         raise AssertionError(f"child failed ({completed.returncode}):\n{completed.stdout}\n{completed.stderr}")
     return json.loads(completed.stdout.strip().splitlines()[-1])

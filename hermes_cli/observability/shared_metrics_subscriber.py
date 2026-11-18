@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 import platform
 import threading
-from typing import Any
+from typing import Any, Callable
 
 from agent.relay_runtime import RUNTIME_INSTANCE_KEY
 from hermes_constants import get_hermes_home
@@ -74,6 +74,7 @@ class SharedMetricsSubscriber:
         hermes_version: str,
         *,
         runtime_id: str | None = None,
+        consent_check: Callable[[], bool] | None = None,
     ) -> None:
         self.store = store
         self._client_resource = client_resource(
@@ -84,6 +85,7 @@ class SharedMetricsSubscriber:
         )
         self._runtime_id = runtime_id
         self._active = True
+        self._consent_check = consent_check
         self._lock = threading.RLock()
         self._milestones_done: set[str] = set(store.recorded_milestones())
         self._features_done: set[str] = set(store.recorded_features())
@@ -95,6 +97,11 @@ class SharedMetricsSubscriber:
         """Stop accepting events before telemetry is disabled or torn down."""
         with self._lock:
             self._active = False
+
+    def _collecting(self) -> bool:
+        # Relay delivery is asynchronous: the hook's opt-in may have been revoked while
+        # this event waited in the queue. Check the owning profile at persistence time.
+        return self._active and (self._consent_check is None or self._consent_check())
 
     @staticmethod
     def _classify(event: Any) -> list[tuple[str, dict, int]]:
@@ -120,7 +127,7 @@ class SharedMetricsSubscriber:
         if surface is None and route is None:
             return
         with self._lock:
-            if not self._active:
+            if not self._collecting():
                 return
             try:
                 engagement.record(self.store, self._client_resource, surface=surface, route=route)
@@ -173,7 +180,7 @@ class SharedMetricsSubscriber:
         self._record_engagement(event, classified)
         for metric_name, dimensions, amount in classified:
             with self._lock:
-                if not self._active:
+                if not self._collecting():
                     return
                 try:
                     self._persist(metric_name, dimensions, amount)

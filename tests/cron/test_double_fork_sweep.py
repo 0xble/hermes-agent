@@ -10,6 +10,8 @@ import threading
 import psutil
 import pytest
 
+from tests.waiting import process_alive
+
 
 @pytest.mark.platforms("macos")
 @pytest.mark.live_system_guard_bypass
@@ -40,9 +42,9 @@ def test_hard_wall_sweeps_double_forked_orphan(tmp_path):
         assert _terminate_owned_descendants(
             os.getpid(), _process_start_time(os.getpid()), execution_id)
         deadline = time.monotonic() + 5
-        while psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE and time.monotonic() < deadline:
+        while process_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(pid)
     finally:
         if psutil.pid_exists(pid):
             try:
@@ -82,9 +84,9 @@ def test_script_timeout_spares_unrelated_worker_child(monkeypatch, tmp_path):
         assert orphan_pid_file.exists()
         orphan = int(orphan_pid_file.read_text())
         deadline = time.monotonic() + 5
-        while psutil.pid_exists(orphan) and psutil.Process(orphan).status() != psutil.STATUS_ZOMBIE and time.monotonic() < deadline:
+        while process_alive(orphan) and time.monotonic() < deadline:
             time.sleep(0.02)
-        assert not psutil.pid_exists(orphan) or psutil.Process(orphan).status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(orphan)
         assert unrelated.poll() is None
     finally:
         unrelated.terminate()
@@ -135,10 +137,10 @@ def test_script_cancel_sweeps_reparented_child(monkeypatch, tmp_path):
         assert pid_file.exists()
         pid = int(pid_file.read_text())
         deadline = time.monotonic() + 5
-        while (psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
+        while (process_alive(pid)
                and time.monotonic() < deadline):
             time.sleep(0.02)
-        assert not psutil.pid_exists(pid) or psutil.Process(pid).status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(pid)
     finally:
         trigger.join(timeout=2)
         if pid_file.exists():

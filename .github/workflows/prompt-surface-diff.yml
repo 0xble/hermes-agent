@@ -11,8 +11,9 @@ name: Prompt surface diff
 #     per-tool description/param changes) into the unified CI review comment;
 #   * the prompt-surface-review ruleset requires one hermes-agent-core approval for that directory.
 #
-# Never blocking: the staleness test is the gate and the ruleset is the review requirement.
-# Reads only the two committed snapshots (no PR code runs), so it needs no secrets.
+# Blocking: gate.yml's qualification needs this job, so a failed or cancelled summary fails the
+# PR gate. The summary only reports; the staleness test owns snapshot freshness and the ruleset
+# owns approval. It runs with read-only contents permission and no secrets.
 
 on:
   workflow_call:

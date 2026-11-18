@@ -6,6 +6,7 @@ import { type TodoItem, type TodoStatus, todoTree } from '@/lib/todos'
 
 import { $gateway } from './gateway'
 import { $goalsBySession, type GoalStatus } from './goals'
+import { $liveWorkRoster, noteEventFed, rosterLiveIds, rosterSaysIdle } from './live-work-roster'
 import { dispatchNativeNotification } from './native-notifications'
 import { notifyError } from './notifications'
 import { isSessionGone, isSessionGoneForBackgroundPolling, markSessionGone, noteRuntimeAlive } from './runtime-gone'
@@ -23,7 +24,7 @@ export {
 } from './runtime-gone'
 
 /** Composer status stack feed — merged todos, subagents, background per session. */
-export type StatusItemState = 'done' | 'failed' | 'running'
+export type StatusItemState = 'done' | 'failed' | 'running' | 'unknown'
 export type StatusItemType = 'background' | 'goal' | 'subagent' | 'todo'
 
 export interface ComposerStatusItem {
@@ -51,6 +52,10 @@ export interface ComposerStatusItem {
 // Writable source for background work, synced from the gateway's process
 // registry (`terminal(background=true)` spawns) via `process.list`.
 export const $backgroundStatusBySession = atom<Record<string, ComposerStatusItem[]>>({})
+// When the backend snapshot behind each list arrived: the freshness the
+// live-work roster compares against. Local removals (dismiss, auto-clear) carry
+// the snapshot's stamp forward; they are not new backend data.
+const backgroundWrittenAt = new WeakMap<readonly ComposerStatusItem[], number>()
 
 // Stored session ids that have at least one RUNNING background process. The
 // sidebar row reads this for a hollow dot — distinct from the filled dot of an
@@ -66,20 +71,32 @@ export const $backgroundStatusBySession = atom<Record<string, ComposerStatusItem
 // reference when unchanged so rows reading this don't re-render per token.
 let backgroundRunningIds: readonly string[] = []
 export const $backgroundRunningSessionIds = computed(
-  [$backgroundStatusBySession, $sessionStates, $sessions],
-  (bg, states, sessions) => {
+  [$backgroundStatusBySession, $sessionStates, $sessions, $liveWorkRoster],
+  (bg, states, sessions, roster) => {
     const ids = new Set<string>()
+    const eventFedAt = new Map<string, number>()
 
     for (const [runtimeId, items] of Object.entries(bg)) {
-      if (!items.some(i => i.state === 'running')) {
+      if (items.length === 0) {
         continue
       }
 
       // Same fresh-chat fallback as the working/attention projections: before a
       // conversation is persisted its runtime id is the id surfaces key on.
-      for (const alias of lineageAliases(states[runtimeId]?.storedSessionId ?? runtimeId, sessions)) {
-        ids.add(alias)
+      const aliases = lineageAliases(states[runtimeId]?.storedSessionId ?? runtimeId, sessions)
+      const writtenAt = backgroundWrittenAt.get(items) ?? -Infinity
+      noteEventFed(eventFedAt, aliases, writtenAt)
+
+      if (items.some(i => i.state === 'running') && !rosterSaysIdle(roster, 'background', aliases, writtenAt)) {
+        for (const alias of aliases) {
+          ids.add(alias)
+        }
       }
+    }
+
+    // Rows no current event feed speaks for (off screen, every row after a reload).
+    for (const alias of rosterLiveIds(roster, 'background', eventFedAt, sessions)) {
+      ids.add(alias)
     }
 
     return (backgroundRunningIds = stableArray(backgroundRunningIds, [...ids]))
@@ -274,12 +291,16 @@ export function groupStatusItems(items: readonly ComposerStatusItem[]): StatusGr
   return TYPE_ORDER.filter(type => byType.has(type)).map(type => ({ items: byType.get(type)!, type }))
 }
 
-const writeBackground = (sid: string, items: ComposerStatusItem[]) => {
+const writeBackground = (sid: string, items: ComposerStatusItem[], snapshotAt: number | undefined) => {
   const current = $backgroundStatusBySession.get()
   const next = { ...current }
 
   if (items.length > 0) {
     next[sid] = items
+
+    if (snapshotAt !== undefined) {
+      backgroundWrittenAt.set(items, snapshotAt)
+    }
   } else {
     delete next[sid]
   }
@@ -290,7 +311,9 @@ const writeBackground = (sid: string, items: ComposerStatusItem[]) => {
 // `tui_gateway` process.list entry (tools/process_registry.list_sessions + output_tail).
 interface GatewayProcessEntry {
   command?: string
-  exit_code?: number
+  exit_code?: null | number
+  completion_reason?: string
+  termination_source?: string
   output_tail?: string
   session_id?: string
   status?: string
@@ -300,12 +323,21 @@ const toBackgroundItem = (proc: GatewayProcessEntry): ComposerStatusItem => {
   const exited = proc.status === 'exited'
   const exitCode = typeof proc.exit_code === 'number' ? proc.exit_code : undefined
 
+  const unknown =
+    exited &&
+    (exitCode === undefined ||
+      proc.completion_reason === 'lost' ||
+      proc.termination_source === 'checkpoint.exit_uncollected' ||
+      proc.termination_source === 'survivor_lost')
+
+  const command = (proc.command ?? '').split('\n')[0]!.trim() || 'background process'
+
   return {
-    exitCode,
+    exitCode: unknown ? undefined : exitCode,
     id: proc.session_id ?? '',
     output: proc.output_tail || undefined,
-    state: exited ? (exitCode ? 'failed' : 'done') : 'running',
-    title: (proc.command ?? '').split('\n')[0]!.trim() || 'background process',
+    state: !exited ? 'running' : unknown ? 'unknown' : exitCode !== 0 ? 'failed' : 'done',
+    title: unknown ? `${command} — finished, exit status unknown` : command,
     type: 'background'
   }
 }
@@ -353,11 +385,14 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
         body,
         kind: 'backgroundDone',
         sessionId: sid,
-        title: translateNow(
-          item.state === 'failed'
-            ? 'notifications.native.backgroundFailedTitle'
-            : 'notifications.native.backgroundDoneTitle'
-        )
+        title:
+          item.state === 'unknown'
+            ? 'Background task finished, exit status unknown'
+            : translateNow(
+                item.state === 'failed'
+                  ? 'notifications.native.backgroundFailedTitle'
+                  : 'notifications.native.backgroundDoneTitle'
+              )
       })
     }
   }
@@ -387,7 +422,10 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
   const finishedDelay = new Map(
     next
       .filter(item => item.state !== 'running')
-      .map(item => [item.id, item.state === 'failed' ? FAILURE_LINGER_MS : SUCCESS_LINGER_MS])
+      .map(item => [
+        item.id,
+        item.state === 'failed' || item.state === 'unknown' ? FAILURE_LINGER_MS : SUCCESS_LINGER_MS
+      ])
   )
 
   for (const [id, delay] of finishedDelay) {
@@ -404,7 +442,7 @@ export function reconcileBackgroundProcesses(sid: string, procs: GatewayProcessE
     return
   }
 
-  writeBackground(sid, next)
+  writeBackground(sid, next, Date.now())
 }
 
 /** Pull the session's live process snapshot from the gateway. */
@@ -452,7 +490,8 @@ export function dismissBackgroundProcess(sid: string, id: string) {
 
   writeBackground(
     sid,
-    list.filter(item => item.id !== id)
+    list.filter(item => item.id !== id),
+    backgroundWrittenAt.get(list)
   )
 }
 
@@ -529,5 +568,5 @@ export function resetSessionBackground(sid: string) {
   }
 
   dismissedBySession.set(sid, dismissed)
-  writeBackground(sid, [])
+  writeBackground(sid, [], undefined)
 }

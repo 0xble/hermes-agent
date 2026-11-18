@@ -99,6 +99,65 @@ def _validated_runtime_venv(env: dict) -> Path | None:
         return None
 
 
+def _trusted_installs_root() -> Path | None:
+    from pm.environments import installs_root
+
+    try:
+        return Path(installs_root()).resolve(strict=True)
+    except (OSError, RuntimeError, ValueError):
+        return None
+
+
+def _resolves_within(path: Path, root: Path) -> bool:
+    try:
+        resolved = path.resolve(strict=True)
+        anchor = root.resolve()
+    except OSError:
+        return False
+    return resolved == anchor or resolved.is_relative_to(anchor)
+
+
+def _hermes_generation_site_packages() -> list[Path]:
+    """Site-packages of every trusted PM generation, read on each call.
+
+    A daytime sync can commit a new generation while this process still holds
+    the previous one. Ownership is the whole trusted tree, not the selection
+    cached at first call. A venv symlink that resolves outside the installs
+    root is not Hermes-owned.
+    """
+    from pm.environments import site_packages
+
+    owned: list[Path] = []
+
+    def add(site: Path) -> None:
+        if site.is_dir() and not any(_same_path(site, existing) for existing in owned):
+            owned.append(site)
+
+    trusted_root = _trusted_installs_root()
+    if trusted_root is not None:
+        try:
+            candidates = list(trusted_root.glob("*/environments/*/venv"))
+        except OSError:
+            candidates = ()
+        for candidate in candidates:
+            try:
+                if not _resolves_within(candidate, trusted_root):
+                    continue
+                venv = candidate.resolve(strict=True)
+                if not (venv / "pyvenv.cfg").is_file():
+                    continue
+                site = site_packages(venv)
+                if _resolves_within(site, trusted_root):
+                    add(site)
+            except (OSError, RuntimeError, ValueError):
+                continue
+    return owned
+
+
+def _pythonpath_entry_is_owned(entry: str, owned: list[Path]) -> bool:
+    return any(_same_path(Path(entry), owned_path) for owned_path in owned)
+
+
 def _get_hermes_site_packages(env: dict) -> list[Path]:
     """Exact site-packages dirs owned by the Hermes runtime (cached):
     ``site.getsitepackages()`` with a ``sys.prefix`` fallback, plus a validated
@@ -149,9 +208,10 @@ def _strip_hermes_owned_pythonpath(env: dict) -> None:
     pp = env.get("PYTHONPATH")
     if not pp:
         return
-    owned_paths = [*_get_hermes_site_packages(env), *_state()._hermes_repo_root_aliases]
+    owned_paths = [*_get_hermes_site_packages(env), *_hermes_generation_site_packages(),
+                   *_state()._hermes_repo_root_aliases]
     entries = pp.split(os.pathsep)
-    stripped = [e for e in entries if e and any(_same_path(Path(e), p) for p in owned_paths)]
+    stripped = [e for e in entries if _pythonpath_entry_is_owned(e, owned_paths)]
     kept = [e for e in entries if e not in stripped]
     if kept:
         env["PYTHONPATH"] = os.pathsep.join(kept)

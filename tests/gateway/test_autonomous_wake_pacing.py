@@ -589,7 +589,7 @@ async def test_watcher_holds_routine_delegation_results_and_delivers_one_turn(he
         # Hang guard only: the success path is ordered by the events above and never waits on it.
         try:
             return await asyncio.wait_for(awaitable, timeout=10)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise AssertionError(f"watcher never reached: {what}") from None
 
     task = asyncio.create_task(runner._async_delegation_watcher(interval=0.05))
@@ -651,7 +651,7 @@ async def test_shutdown_requeues_held_delegations(hermes_home, monkeypatch):
 
     q = queue.Queue()
     monkeypatch.setattr(pr_module.process_registry, "completion_queue", q)
-    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    runner, _adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
     runner._deliver_async_delegation_group = AsyncMock(return_value=False)
     assert await runner._enqueue_async_delegation_group([_delegation("deleg_held")]) is True
 
@@ -665,7 +665,7 @@ async def test_shutdown_requeues_held_delegations(hermes_home, monkeypatch):
 async def test_task_failure_notice_releases_held_delegation_results_now(hermes_home):
     """The diagnostic failure lane keeps its own turn (and mute policy) but never leaves held
     sibling results waiting out the window."""
-    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    runner, _adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
     delivered: list = []
 
     async def _deliver(group):
@@ -860,7 +860,7 @@ async def test_duplicate_arriving_during_batch_delivery_is_not_delivered_twice(h
 @pytest.mark.asyncio
 async def test_raw_api_server_completion_is_never_held(hermes_home):
     """Raw API-server routes have no drain-spool form, so holding one could lose it at shutdown."""
-    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    runner, _adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
     evt = {**_completion("proc_api"), "platform": "", "chat_id": "", "chat_type": ""}
     runner._build_process_event_source = lambda e: None
     assert await runner._completion_hold_seconds(evt, session_busy=True) == 0.0
@@ -868,7 +868,7 @@ async def test_raw_api_server_completion_is_never_held(hermes_home):
 
 @pytest.mark.asyncio
 async def test_unspoolable_completion_after_teardown_starts_is_delivered_directly(hermes_home):
-    runner, adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
+    runner, _adapter = _fan_in_runner(window=3600, last_turn_age=0.0)
     runner._completion_notification_batches_stopping = True
     runner._spool_completion_for_restart = lambda text, evt: False
     runner._deliver_completion_notification = AsyncMock(return_value=True)

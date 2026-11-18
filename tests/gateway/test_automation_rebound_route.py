@@ -4,7 +4,8 @@ import json
 
 import pytest
 
-from tests.gateway.test_synthetic_native_admission import native_chat as native_chat  # noqa: F401
+from tests.gateway.test_synthetic_native_admission import native_chat as _native_chat_fixture
+native_chat = _native_chat_fixture
 
 
 def _rebind(runner, source):
@@ -37,10 +38,10 @@ def _wake(runner, entry, source, text="delegation done"):
 
 
 @pytest.mark.asyncio
-async def test_loop_wake_after_rebind_rides_the_current_route(native_chat):  # noqa: F811
+async def test_loop_wake_after_rebind_rides_the_current_route(native_chat):
     from gateway.session_automation import admit_route_wake, committed_route_envelope, route_rebound
-    runner, adapter, authority, source, sent, turns = native_chat
-    key, entry, moved = _rebind(runner, source)
+    runner, adapter, authority, source, _sent, _turns = native_chat
+    key, entry, _moved = _rebind(runner, source)
     stale = committed_route_envelope(authority, entry)
     assert stale["source"]["chat_id"] == source.chat_id and route_rebound(entry, stale)
 
@@ -52,9 +53,9 @@ async def test_loop_wake_after_rebind_rides_the_current_route(native_chat):  # n
 
 
 @pytest.mark.asyncio
-async def test_completion_after_rebind_is_admitted_on_the_current_route(native_chat):  # noqa: F811
-    runner, adapter, authority, source, sent, turns = native_chat
-    key, entry, moved = _rebind(runner, source)
+async def test_completion_after_rebind_is_admitted_on_the_current_route(native_chat):
+    runner, adapter, authority, source, _sent, _turns = native_chat
+    key, entry, _moved = _rebind(runner, source)
     receipt = await authority.admit_automation(adapter, _wake(runner, entry, runner._restored_source(entry)),
                                                "deleg-rebound")
     assert receipt.status in {"queued", "started", "terminal"}
@@ -64,21 +65,21 @@ async def test_completion_after_rebind_is_admitted_on_the_current_route(native_c
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("change", [{"user_id": "43"}, {"thread_id": "7002"}, {"chat_id": "100"}])
-async def test_rebound_route_still_refuses_another_sender_or_route(native_chat, change):  # noqa: F811
+async def test_rebound_route_still_refuses_another_sender_or_route(native_chat, change):
     from hermes_state_runtime import RuntimeStoreError
-    runner, adapter, authority, source, sent, turns = native_chat
-    key, entry, moved = _rebind(runner, source)
+    runner, adapter, authority, source, _sent, _turns = native_chat
+    _key, entry, _moved = _rebind(runner, source)
     foreign = dataclasses.replace(runner._restored_source(entry), **change)
     with pytest.raises(RuntimeStoreError, match="admission_conflict"):
         await authority.admit_automation(adapter, _wake(runner, entry, foreign), "deleg-foreign")
 
 
 @pytest.mark.asyncio
-async def test_rebound_relay_origin_is_refused_without_borrowing_the_old_proof(native_chat, monkeypatch):  # noqa: F811
+async def test_rebound_relay_origin_is_refused_without_borrowing_the_old_proof(native_chat, monkeypatch):
     """A rebound route revalidates its own origin; it never lends the old route's committed proof."""
     from hermes_state_runtime import RuntimeStoreError
-    runner, adapter, authority, source, sent, turns = native_chat
-    key, entry, moved = _rebind(runner, source)
+    runner, adapter, authority, source, _sent, _turns = native_chat
+    _key, entry, _moved = _rebind(runner, source)
     restored = runner._restored_source
 
     def relay_origin(entry_):

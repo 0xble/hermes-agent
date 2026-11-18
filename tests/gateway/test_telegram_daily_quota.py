@@ -15,8 +15,9 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from gateway.config import PlatformConfig
-from gateway.platforms.base import OUTBOUND_NOTICE, OUTBOUND_PROGRESS, SendResult, outbound_class
+from gateway.platforms.base import OUTBOUND_NOTICE, OUTBOUND_PROGRESS, SendResult, outbound_class, utf16_len
 from plugins.platforms.telegram import daily_quota as dq
+from plugins.platforms.telegram import progress as telegram_progress
 from plugins.platforms.telegram.chat_budget import ChatBudgetRateLimiter, ChatOutboundBudget
 from plugins.platforms.telegram.daily_quota import DailyQuota
 
@@ -32,7 +33,7 @@ class Wall:
 
 
 def _utc(s: str) -> float:
-    return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp()
+    return dt.datetime.strptime(s, "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.UTC).timestamp()
 
 
 def test_counts_every_endpoint_and_each_created_message(tmp_path):
@@ -204,12 +205,35 @@ def _adapter(tmp_path, ceiling=10):
 
 
 def _spend(adapter, n):
+    quota = adapter._daily_quota()
+    before = quota.messages(CHAT)
     for _ in range(n):
-        adapter._daily_quota().record(CHAT, "sendMessage")
+        quota.record(CHAT, "sendMessage")
+    assert quota.messages(CHAT) == before + n, "daily message pressure must survive test setup"
 
 
 def test_ceiling_comes_from_platform_extra(tmp_path):
     assert _adapter(tmp_path, ceiling=1234)._daily_quota().soft_ceiling == 1234
+
+
+def test_daily_pause_notice_is_italic_and_long_progress_fits_limit(tmp_path):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), 10)
+    token = bind_trigger(SimpleNamespace(text="show the verbose tool arguments"))
+    try:
+        raw = adapter.format_progress_text(CHAT, "Reading " + "x" * 10000)
+    finally:
+        reset_trigger(token)
+    rendered = adapter.format_message(raw)
+    formatted_notice = adapter.format_message(f"\n{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE}")
+
+    assert formatted_notice == f"\n_{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE.strip('*')}_"
+    assert raw.endswith(f"\n{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE}")
+    assert rendered.endswith(formatted_notice)
+    assert utf16_len(rendered) <= adapter.MAX_MESSAGE_LENGTH
 
 
 def _voice_runner_and_event(adapter):
@@ -465,12 +489,28 @@ async def test_post_delivery_cleanup_keeps_the_registering_turns_trigger(tmp_pat
         reset_trigger(token)
 
 
+@pytest.mark.asyncio
+async def test_post_delivery_registration_reports_success_and_honours_first(tmp_path):
+    """Deferred goal bookkeeping only waits for delivery when registration says True; a ``first``
+    signal must run ahead of the bubble cleanup chained before it."""
+    adapter = _adapter(tmp_path)
+    order = []
+    assert adapter.register_post_delivery_callback("sk", lambda: order.append("cleanup"), generation=1) is True
+    assert adapter.register_post_delivery_callback(
+        "sk", lambda: order.append("delivered"), generation=1, first=True) is True
+    assert adapter.register_post_delivery_callback("sk", lambda: None, generation=0) is False
+    await adapter._fire_post_delivery_callback("sk", 1)
+    assert order == ["delivered", "cleanup"]
+
+
 # --- Daily call budget (2026-10-24: 36261s ban at 19875 calls, 10116 of them from typed turns) ---
 
 
 def _spend_calls(quota, n, endpoint="editMessageText"):
+    before = sum(quota.calls(CHAT).values())
     for _ in range(n):
         quota.record(CHAT, endpoint)
+    assert sum(quota.calls(CHAT).values()) == before + n, "daily call pressure must survive test setup"
 
 
 @pytest.mark.parametrize("calls, background, typed", [(0, False, False), (49, False, False), (50, True, False),
@@ -660,10 +700,70 @@ async def test_tool_progress_edits_follow_daily_budget_without_restoring_typing(
         assert edited.success
         assert bool((edited.raw_response or {}).get("skipped")) is bool(used)
         adapter._bot.send_message.assert_awaited_once()
+        first_text = adapter._bot.send_message.call_args.kwargs["text"]
+        assert (telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE.strip("*") in first_text) is bool(used)
+        if used:
+            assert first_text.endswith(adapter.format_message(f"\n{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE}"))
+        assert getattr(state, "skipped_edits", 0) == (1 if used else 0)
         assert adapter._bot.edit_message_text.await_count == (0 if used else 1)
         if used:
             await adapter.send_typing(CHAT)
             adapter._bot.send_chat_action.assert_not_awaited()
+    finally:
+        reset_trigger(token)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("daily_pressure", [False, True])
+@pytest.mark.parametrize("path", ["edit", "overflow"])
+async def test_progress_skips_preserve_pending_state_and_log_daily_pause_once_per_turn(
+    tmp_path, caplog, daily_pressure, path,
+):
+    from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
+
+    adapter = _adapter(tmp_path)
+    adapter._telegram_daily_quota = DailyQuota(call_soft_ceiling=10, profile_dir=tmp_path)
+    _spend_calls(adapter._daily_quota(), 10 if daily_pressure else 0)
+    clock = Wall(100)
+    adapter._telegram_chat_outbound_slot_secs = 0.01
+    adapter._telegram_chat_budget = ChatOutboundBudget(clock=clock)
+    if not daily_pressure:
+        # Rich finalize deliberately bypasses the short-term slot. Exercise an interim skip.
+        adapter.REQUIRES_EDIT_FINALIZE = False
+    caplog.set_level(logging.INFO, logger="gateway.run")
+    token = bind_trigger(SimpleNamespace(text="run the checks"))
+    try:
+        for turn in range(2):
+            clock.t += 20  # The next turn starts beyond the previous turn's edit floor.
+            runner, state = _progress_runner(adapter)
+            await runner._progress_send_or_edit(state, _tool_line(runner, state))
+            state.reanchored = True
+            adapter._chat_budget().note_interim(CHAT)
+            assert adapter._chat_budget().interim_blocked(CHAT)
+            if path == "overflow":
+                state._PROGRESS_TEXT_LIMIT = len(state.progress_lines[0])
+            for i in range(3):
+                line = _tool_line(runner, state, f"Checking step {i}")
+                pending = list(state.progress_lines)
+                if path == "overflow":
+                    assert await runner._roll_progress_overflow_if_needed(state)
+                else:
+                    assert await runner._progress_send_or_edit(state, line)
+                pauses = [r for r in caplog.records if r.getMessage() ==
+                          f"progress edits paused for {CHAT}: daily budget"]
+                assert len(pauses) == (turn + 1 if daily_pressure else 0)
+                assert state.progress_lines == pending
+                assert state.reanchored  # A skipped edit did not repair the bubble.
+                assert getattr(state, "skipped_edits", 0) == i + 1
+            await runner._flush_progress_edit(state)
+            assert state.skipped_edits == 4
+            pauses = [r for r in caplog.records if r.getMessage() ==
+                      f"progress edits paused for {CHAT}: daily budget"]
+            assert len(pauses) == (turn + 1 if daily_pressure else 0)
+            assert all(r.levelno == logging.INFO for r in pauses)
+        adapter._bot.send_message.assert_awaited()
+        assert adapter._bot.send_message.await_count == 2
+        adapter._bot.edit_message_text.assert_not_awaited()
     finally:
         reset_trigger(token)
 
@@ -763,6 +863,9 @@ async def test_initial_tool_bubble_does_not_exempt_adapter_split_continuations(t
         assert state.progress_msg_id
         assert (adapter._bot.send_message.await_count == 1) is bool(used)
         assert not used or state.tool_progress_sent
+        if used:
+            first_text = adapter._bot.send_message.call_args_list[0].kwargs["text"]
+            assert first_text.endswith(adapter.format_message(f"\n{telegram_progress.TELEGRAM_PROGRESS_PAUSE_NOTICE}"))
     finally:
         reset_trigger(token)
 
@@ -818,7 +921,7 @@ async def test_failed_initial_tool_send_can_retry_but_only_accepts_one_bubble(tm
 
 @pytest.mark.asyncio
 async def test_deferred_initial_tool_send_spends_slot_and_preserves_native_replay_class(tmp_path, monkeypatch):
-    import gateway.outbox as outbox
+    from gateway import outbox
     from gateway.platforms.base import OUTBOUND_TOOL_PROGRESS
     from plugins.platforms.telegram.chat_budget import bind_trigger, reset_trigger
 

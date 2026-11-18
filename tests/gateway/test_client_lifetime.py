@@ -6,7 +6,7 @@ import sys
 
 import pytest
 
-from tests.waiting import wait_until
+from tests.waiting import wait_until, process_alive, kill_if_alive
 
 
 @pytest.mark.parametrize("argv,expected", [
@@ -38,7 +38,7 @@ def test_client_owned_cli_requires_a_lifetime_pipe(tmp_path, stdin_kind):
         proc = subprocess.run([sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--client-owned"],
                               env={**os.environ, "HOME": str(tmp_path), "HERMES_HOME": str(tmp_path), "PYTHONPATH": str(Path.cwd())},
                               stdin=slave if slave is not None else subprocess.DEVNULL,
-                              capture_output=True, text=True, encoding="utf-8", timeout=15)
+                              capture_output=True, text=True, encoding="utf-8", timeout=15, check=False)
         assert proc.returncode != 0
         assert "--client-owned requires stdin to be a pipe" in proc.stderr, (proc.stdout, proc.stderr)
         assert not (tmp_path / "gateway.pid").exists()
@@ -79,16 +79,12 @@ threading.Event().wait(30)
         # 74 distinguishes forced lifetime teardown from a graceful client exit.
         assert child.wait(timeout=6) == 74
         if with_tool:
-            import psutil
             tool_pid = int(ready.with_suffix('.tool').read_text())
-            assert wait_until(lambda: not psutil.pid_exists(tool_pid) or
-                              psutil.Process(tool_pid).status() == psutil.STATUS_ZOMBIE, timeout=3)
+            assert wait_until(lambda: not process_alive(tool_pid), timeout=3)
     finally:
         if child.poll() is None:
             child.kill()
         child.wait(timeout=5)
         if ready.with_suffix('.tool').exists():
-            import psutil
             tool_pid = int(ready.with_suffix('.tool').read_text())
-            if psutil.pid_exists(tool_pid):
-                psutil.Process(tool_pid).kill()  # only the exact tool spawned by this test
+            kill_if_alive(tool_pid)  # only the exact tool spawned by this test

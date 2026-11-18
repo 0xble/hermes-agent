@@ -347,7 +347,7 @@ def test_removed_job_journal_prunes_entries_older_than_seven_days(tmp_cron_dir, 
     import json
     from cron import jobs
 
-    fixed_now = datetime(2026, 1, 10, tzinfo=timezone.utc)
+    fixed_now = datetime(2026, 1, 10, tzinfo=UTC)
     jobs.ensure_dirs()
     removed_file = jobs._removed_jobs_file()
     removed_file.write_text(json.dumps({
@@ -379,7 +379,7 @@ def test_removed_job_journal_salvages_valid_records_around_corruption(tmp_cron_d
     removed_file = jobs._removed_jobs_file()
     valid = json.dumps({
         "id": "already-deleted",
-        "removed_at": datetime.now(timezone.utc).isoformat(),
+        "removed_at": datetime.now(UTC).isoformat(),
     }).encode()
     removed_file.write_bytes(valid + b"\n{\xff\n")
 
@@ -1467,7 +1467,7 @@ class TestPerJobScanContainment:
         import cron.jobs as jobs_mod
         real_grace = jobs_mod._compute_grace_seconds
 
-        def selective_grace(schedule):
+        def selective_grace(schedule, grace_minutes=None):
             if schedule.get("minutes") == 7:
                 raise RuntimeError("simulated unforeseen malformed field")
             return real_grace(schedule)

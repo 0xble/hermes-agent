@@ -68,9 +68,7 @@ def first_link(text: str) -> Optional[str]:
     # a balanced pair that is part of the URL (``https://en.wikipedia.org/wiki/Foo_(bar)``).
     while url:
         last = url[-1]
-        if last in _TRAILING_PUNCT:
-            url = url[:-1]
-        elif last in ")]}" and url.count(last) > url.count({")": "(", "]": "[", "}": "{"}[last]):
+        if last in _TRAILING_PUNCT or last in ")]}" and url.count(last) > url.count({")": "(", "]": "[", "}": "{"}[last]):
             url = url[:-1]
         else:
             break
@@ -173,7 +171,7 @@ def _text_metadata(body: str) -> Optional[str]:
     return f"Text: {_clean(first, MAX_LINK_CONTEXT_CHARS - 6)}" if first else None
 
 
-def _parser_metadata(parser: "_MetaParser") -> Optional[str]:
+def _parser_metadata(parser: _MetaParser) -> Optional[str]:
     """Bounded ``Title:``/``Description:`` lines; None when the head carried nothing useful."""
     meta = parser.meta
     title = _clean(meta.get("og:title") or meta.get("twitter:title") or "".join(parser.title_parts), 200)

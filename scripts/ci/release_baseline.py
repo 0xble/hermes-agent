@@ -30,7 +30,7 @@ def accepted_release_baseline(root: Path, revision: str | None = None) -> str | 
     else:
         shown = subprocess.run(
             ["git", "show", f"{revision}:MAINTENANCE.md"], cwd=root, capture_output=True,
-        )
+         check=False)
         if shown.returncode != 0:
             return None
         text = shown.stdout.decode("utf-8", errors="replace")
@@ -40,5 +40,5 @@ def accepted_release_baseline(root: Path, revision: str | None = None) -> str | 
     sha = match.group(1)
     ancestor = subprocess.run(
         ["git", "merge-base", "--is-ancestor", sha, revision or "HEAD"], cwd=root, capture_output=True,
-    )
+     check=False)
     return sha if ancestor.returncode == 0 else None

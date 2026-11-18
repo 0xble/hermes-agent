@@ -25,7 +25,12 @@ more newlines collapse to the same single spacer, and normalization is
 idempotent. A pipe table also gets a blank line, not a hard break, on any side
 where a single newline separates it from other content: Telegram cannot open a
 table inside a caption's open paragraph, and GFM continues a table through prose
-directly below it as one more row.
+directly below it as one more row. HTML `<blockquote>` boundaries, including
+literal copy previews and quotes with an opening newline, retain their blank
+line rather than becoming an NBSP spacer: GFM otherwise keeps the following
+bold labels, links, lists, headings, fences and tables inside a raw HTML block.
+Regression: `tests/gateway/test_telegram_rich_copy_quotes.py` exercises real
+send/draft/edit payloads and parses the surrounding Markdown, including details.
 
 Rich Message prose treats a pair of literal `$` on one line as inline LaTeX, so
 two currency amounts in a sentence render as an unwrapped italic formula with
@@ -137,7 +142,16 @@ so neither satisfies this delivery contract. The selected correction reuses the
 native policy and payload, not a new flag or renderer. No new upstream PR was
 opened; this is an upstreamable, fork-first consumer fix.
 
-**Retirement:** remove the adaptation when a released upstream standalone sender
+**v0.23.1 adoption:** upstream now owns standalone dispatch through the platform registry and
+`plugins/platforms/telegram/standalone.py`, with `telegram_outbound.py` sharing its rich and
+album policy. The duplicate core sender and adapter-to-core wrapper are retired. The fork
+keeps only uncovered behavior at that plugin owner: short bounded rich flood retries,
+stale-topic removal across fallback, rich text with attachments, accepted-text receipts after
+attachment failure, plain/intact copy blocks, durable metering and the MarkdownV2 indicator
+reserve. Upstream's notification, invisible-text, proxy/server, HTML and album behavior stays
+in place. Direct tests patch the plugin owner and pass rich options through `extra`.
+
+**Retirement:** remove the remaining adaptation when a released upstream standalone sender
 passes the same mode, routing, no-duplicate, and budget regressions.
 **Rollback:** revert this patch; no config or data migration is required.
 

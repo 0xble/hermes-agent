@@ -307,4 +307,3 @@ def test_real_private_agent_title_prologue_and_finalizer_are_inert(tmp_path, mon
         agent.close()
         register_session(agent.session_id, False)
         db.close()
-

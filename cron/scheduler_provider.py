@@ -73,7 +73,7 @@ def _profile_entry(entry) -> tuple:
     return entry if isinstance(entry, tuple) else (None, entry)
 
 
-def _existing_profile_homes(profile_homes: list) -> list:
+def _existing_profile_homes(profile_homes: list, *, strict=False) -> list:
     """Drop homes no longer on disk: ticking/heartbeating a deleted home would recreate its
     ``cron/`` workspace and silently resurrect the profile.
 
@@ -89,6 +89,8 @@ def _existing_profile_homes(profile_homes: list) -> list:
         try:
             profile_homes = list(profile_homes())
         except Exception:
+            if strict:
+                raise
             logger.warning("cron profile enumeration failed; skipping this cycle", exc_info=True)
             return []
     return [entry for entry in profile_homes if Path(_profile_entry(entry)[1]).is_dir()]
@@ -320,8 +322,8 @@ def fire_overdue_jobs(
         return 0
 
     from cron.jobs import (
-        ONESHOT_GRACE_SECONDS, _elapsed_seconds, _ensure_aware, _hermes_now,
-        is_job_runnable, load_jobs,
+        _elapsed_seconds, _ensure_aware, _hermes_now, is_job_runnable, load_jobs,
+        oneshot_grace_seconds,
     )
 
     if now is None:
@@ -342,12 +344,12 @@ def fire_overdue_jobs(
         if overdue_seconds < grace_minutes * 60:
             continue
         job_id = str(job.get("id") or "")
-        # One-shots past ONESHOT_GRACE_SECONDS "will never fire"; don't resurrect them hours late.
-        # One-shot jobs share the module-wide policy: more than ONESHOT_GRACE_SECONDS past their run time
-        # means "will never fire" (create/update/resume/recovery and, since #89571, the due-scan all enforce
-        # it). The misfire backstop must not resurrect them hours late after downtime — that's #93526.
+        # One-shots past their effective allowance "will never fire"; don't resurrect them hours late.
+        # Create/update/resume still use the fixed 120-second scheduling guard, while this recovery
+        # path honors a widened per-job catch-up allowance.
         schedule = job.get("schedule") or {}
-        if str(schedule.get("kind") or "") == "once" and overdue_seconds > ONESHOT_GRACE_SECONDS:
+        allowance = oneshot_grace_seconds(job) if schedule.get("kind") == "once" else None
+        if allowance is not None and overdue_seconds > allowance:
             logger.warning(
                 "Misfire catch-up: one-shot job %s (%s) was due %s "
                 "(%.0f min overdue) — outside the %ss one-shot grace "
@@ -356,7 +358,7 @@ def fire_overdue_jobs(
                 job.get("name") or "unnamed",
                 next_run_at,
                 overdue_seconds / 60,
-                ONESHOT_GRACE_SECONDS,
+                allowance,
             )
             continue
         logger.warning(
@@ -440,6 +442,23 @@ class InProcessCronScheduler(CronScheduler):
     def start(
         self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None,
         profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
+        profile_bot_platforms=None,
+    ):
+        from cron.scheduler_store import ExecutionStoreOwners
+
+        with ExecutionStoreOwners() as stores:
+            self._start(
+                stop_event, adapters=adapters, loop=loop, interval=interval,
+                can_dispatch=can_dispatch, profile_homes=profile_homes,
+                profile_adapters=profile_adapters, default_profile=default_profile,
+                profile_gate=profile_gate, profile_bot_platforms=profile_bot_platforms,
+                stores=stores,
+            )
+
+    def _start(
+        self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None,
+        profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
+        profile_bot_platforms=None, stores,
     ):
         from cron.scheduler import CronTickYielded
         from cron.scheduler import tick as cron_tick
@@ -448,6 +467,7 @@ class InProcessCronScheduler(CronScheduler):
         from hermes_constants import get_process_hermes_home
 
         from cron.oneshot_retirement import record_ticker_start
+        from cron.dispatch_hold import note_dispatching, note_held
 
         logger.info("In-process cron scheduler started (interval=%ds)", interval)
 
@@ -462,6 +482,7 @@ class InProcessCronScheduler(CronScheduler):
                 stop_event, profile_homes=profile_homes, adapters=adapters, loop=loop,
                 interval=interval, can_dispatch=can_dispatch, profile_adapters=profile_adapters,
                 default_profile=default_profile, profile_gate=profile_gate,
+                profile_bot_platforms=profile_bot_platforms, stores=stores,
             )
             return
 
@@ -474,6 +495,7 @@ class InProcessCronScheduler(CronScheduler):
         try:
             record_ticker_start()
             recovered = self.recover_interrupted()
+            stores.retain(get_process_hermes_home())
             if recovered:
                 logger.warning(
                     "Marked %d interrupted cron execution(s) unknown after restart", recovered
@@ -496,8 +518,10 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                    note_held()
                 else:
-                    cron_tick(
+                    note_dispatching()
+                    stores.run(get_process_hermes_home(), cron_tick,
                         verbose=False, adapters=adapters, loop=loop, sync=False,
                         can_dispatch=can_dispatch,
                     )
@@ -547,6 +571,7 @@ class InProcessCronScheduler(CronScheduler):
     def _start_multiplex(
         self, stop_event, *, profile_homes, adapters=None, loop=None, interval=60,
         can_dispatch=None, profile_adapters=None, default_profile=None, profile_gate=None,
+        profile_bot_platforms=None, stores,
     ):
         """Tick every profile's store, each scoped via ``_profile_cron_scope``. ``profile_gate(name,
         home)``, when given, is consulted every cycle; a rejected profile is neither ticked nor
@@ -554,10 +579,11 @@ class InProcessCronScheduler(CronScheduler):
         from cron.scheduler import tick as cron_tick
         from cron.scheduler import CronTickYielded, _is_fd_exhaustion
         from cron.scheduler_preflight import (
-            SharedRouteAdapters, _primary_profile_routes_for_current_home,
+            SharedRouteAdapters, _primary_profile_routes_for_current_home, has_credential_platform,
         )
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat
         from cron.scheduler_ownership import register_ticked_homes
+        from cron.dispatch_hold import note_dispatching, note_held_profiles
 
         initial_homes = _existing_profile_homes(profile_homes)
         register_ticked_homes([_profile_entry(entry)[1] for entry in initial_homes])
@@ -575,7 +601,8 @@ class InProcessCronScheduler(CronScheduler):
             if profile_name is None or profile_name == default_profile:
                 return adapters
             tick_adapters = (profile_adapters or {}).get(profile_name) or {}
-            if not tick_adapters and adapters:
+            owned = (profile_bot_platforms or {}).get(profile_name)
+            if not has_credential_platform(tick_adapters, owned) and adapters:
                 return SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
             return tick_adapters
 
@@ -583,12 +610,13 @@ class InProcessCronScheduler(CronScheduler):
         # A profile may have been deleted since this snapshot was taken; never recreate a deleted home's
         # cron workspace via the heartbeat below (#47368).
         for entry in initial_homes:
-            _, home = _profile_entry(entry)
+            profile_name, home = _profile_entry(entry)
             try:
                 with _profile_cron_scope(home):
                     from cron.oneshot_retirement import record_ticker_start
                     record_ticker_start()
                     recovered = self.recover_interrupted()
+                    stores.retain(home, gate=profile_gate, profile_name=profile_name)
                     if recovered:
                         logger.warning(
                             "Marked %d interrupted cron execution(s) for profile at %s",
@@ -617,7 +645,7 @@ class InProcessCronScheduler(CronScheduler):
             # tick the ungated set — the exact stand-down the Desktop gate exists for (#100489).
             cycle_homes: list = []
             try:
-                enumerated = [_profile_entry(e) for e in _existing_profile_homes(profile_homes)]
+                enumerated = [_profile_entry(e) for e in _existing_profile_homes(profile_homes, strict=True)]
                 if profile_gate is not None:
                     enumerated = [(name, home) for name, home in enumerated if profile_gate(name, home)]
                 cycle_homes = enumerated
@@ -625,6 +653,7 @@ class InProcessCronScheduler(CronScheduler):
                 # "do I own cron for this home?" and a profile added or gated out this cycle
                 # must be reflected in that answer, not one cycle late.
                 register_ticked_homes([home for _name, home in cycle_homes])
+                stores.discard_except(home for _name, home in cycle_homes)
             except BaseException as e:
                 logger.error("Cron profile enumeration error: %s", e, exc_info=True)
                 _tick_error = f"{type(e).__name__}: {e}"
@@ -632,11 +661,13 @@ class InProcessCronScheduler(CronScheduler):
             try:
                 if can_dispatch is not None and not can_dispatch():
                     logger.debug("Cron dispatch paused while gateway drains existing work")
+                    note_held_profiles(cycle_homes)
                 else:
                     for _pname, home in cycle_homes:
                         try:
                             with _profile_cron_scope(home):
-                                cron_tick(
+                                note_dispatching()
+                                stores.run(home, cron_tick,
                                     verbose=False, adapters=tick_adapters_for(_pname), loop=loop,
                                     sync=False, can_dispatch=can_dispatch,
                                 )

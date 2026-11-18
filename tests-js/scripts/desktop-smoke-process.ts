@@ -63,6 +63,34 @@ export function readInstallationCommit(root: string, origin: 'source' | 'bundled
   return z.string().regex(/^[0-9a-f]{40}$/).parse(commit)
 }
 
+/** The file the HEAD -> NEXT legs' synthetic commit adds (installer-common.sh::resolve_update_ref,
+ * windows-e2e.ps1::New-NextCommit). */
+const SYNTHETIC_NEXT_MARKER = '.hermes-e2e-next'
+
+/** The commit a reused packaged app may still report for an installed source checkout.
+ *
+ * `hermes update` keeps the packaged app when no desktop build input changed, and that app keeps
+ * naming the commit it was built from (hermes_cli/desktop_build_reuse.py). The harness can prove
+ * that case only for the synthetic NEXT commit, whose sole change is one marker file: there the
+ * parent is the commit the app may report. Any other installed commit, and any bundled install,
+ * returns undefined. */
+export function reusedDesktopBuildCommit(root: string, origin: 'source' | 'bundled', installed: string): string | undefined {
+  if (origin !== 'source') {
+    return undefined
+  }
+
+  const git: string = process.env.HERMES_E2E_REAL_GIT || 'git'
+  const parents = nativeText(git, ['-C', root, 'rev-list', '--parents', '-n', '1', installed]).split(/\s+/).slice(1)
+
+  if (parents.length !== 1) {
+    return undefined
+  }
+
+  const changed = nativeText(git, ['-C', root, 'diff', '--name-only', parents[0], installed])
+
+  return changed === SYNTHETIC_NEXT_MARKER ? parents[0] : undefined
+}
+
 const bundleEnvSchema = z.record(z.string(), z.string().nullable())
 
 /** The baked runtime defaults/clears of a bundled artifact, recorded in the
@@ -163,10 +191,13 @@ export function macosListeningPids(port: number, candidatePids: number[], query 
   try {
     output = query('/usr/sbin/lsof', ['-nP', '-a', '-p', candidatePids.join(','), `-iTCP:${port}`, '-sTCP:LISTEN', '-Fp'])
   } catch (error) {
-    // lsof reports an empty intersection with exit 1, without a diagnostic.
+    // lsof exits 1 for an empty intersection, but inaccessible mounts can still
+    // emit these non-fatal warnings. Do not swallow any other diagnostic.
+    const mountWarnings = /^(?:lsof: WARNING: can't stat\(\)[^\r\n]*\r?\n\s*Output information may be incomplete\.\s*\r?\n\s*assuming "dev=[^"\r\n]+" from mount table\s*)*$/
+
     if (error instanceof Error && 'status' in error && error.status === 1
       && 'stdout' in error && String(error.stdout).trim() === ''
-      && 'stderr' in error && String(error.stderr).trim() === '') {
+      && 'stderr' in error && mountWarnings.test(String(error.stderr).trim())) {
       return []
     }
 

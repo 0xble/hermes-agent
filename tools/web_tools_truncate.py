@@ -124,7 +124,7 @@ def _truncate_with_footer(content: str, url: str, char_limit: int) -> tuple[str,
     else:
         footer_lines.append(
             "Full text could not be stored; re-run web_extract on a more "
-            "specific URL or use browser_navigate for the complete page."
+            "specific URL or open it in the browser for the complete page."
         )
     footer_lines.append("─" * 29)
     model_text = head + "\n\n[... middle omitted — see footer ...]\n\n" + tail
@@ -159,7 +159,12 @@ def _truncate_results(results: list[dict], char_limit: int, debug_call_data: dic
     for result in results:
         url = result.get("url", "")
         raw_content = result.get("raw_content", "") or result.get("content", "")
-        if result.get("error") or not raw_content:
+        if result.get("error"):
+            # An origin error page keeps its body (a 404 page can help) but stays in the budget.
+            if body := result.get("content"):
+                result["content"], _ = _truncate_with_footer(convert_base64_images_to_links(body), url, char_limit)
+            continue
+        if not raw_content:
             continue
         binary_kind = _binary_payload_kind(raw_content)
         if binary_kind:
@@ -191,7 +196,7 @@ def _trim_results(results: list[dict]) -> list[dict]:
             "url": r.get("url", ""), "title": r.get("title", ""), "content": r.get("content", ""),
             "error": r.get("error"),
             **({"blocked_by_policy": r["blocked_by_policy"]} if "blocked_by_policy" in r else {}),
-            **{key: r[key] for key in ("extract_backend", "fallback_from", "direct_fetch_error") if key in r},
+            **{key: r[key] for key in ("extract_backend", "fallback_from", "direct_fetch_error", "cached", "requested_url") if key in r},
             **({"metadata": {key: r["metadata"][key] for key in ("rescued_from", "backend_error")
                              if key in r["metadata"]}}
                if isinstance(r.get("metadata"), dict) and r["metadata"].get("rescued_from") else {}),

@@ -145,7 +145,9 @@ def isolated_python(tmp_path_factory):
     root = tmp_path_factory.mktemp("pm-python")
     uv = shutil.which("uv")
     assert uv, "the worker contract requires real uv"
-    python = stage_runtime(Path(uv), Path(sys.executable), root)
+    python = stage_runtime(Path(uv), Path(sys.executable), root,
+                           wheelhouse=Path(__file__).parent / "fixtures" / "runtime-wheelhouse",
+                           offline=True)
     _run([str(python), "-I", "-c", "import importlib.util; assert importlib.util.find_spec('yaml') is None"],
          cwd=root, env=dict(os.environ))
     return python
@@ -195,3 +197,27 @@ def build_worker(client, isolated_python, monkeypatch):
         for name in names:
             monkeypatch.setattr(importlib.import_module(module), name, caller_engine)
     return client
+
+
+@pytest.fixture
+def offline_build_worker(build_worker, monkeypatch, isolated_python):
+    """Offline engine tests own both the worker's and caller's toolchain.
+
+    build_worker pins the isolated worker. managed_environment also runs in the
+    caller, where acquiring pinned tools would otherwise escape the wheelhouse.
+    """
+    uv = shutil.which("uv")
+    assert uv, "offline environment tests require uv on PATH"
+    monkeypatch.setattr("pm._uv._toolchain", lambda **kwargs: (Path(uv), Path(sys.executable)))
+    worker_toolchain(build_worker, monkeypatch, isolated_python, injection=(
+        "from pm.store import Store\n"
+        "def refuse(*args, **kwargs):\n"
+        "    raise RuntimeError('offline environment test attempted to acquire a PM tool')\n"
+        "Store.fetch_many = refuse\n"
+    ))
+
+    def refuse(*args, **kwargs):
+        pytest.fail("offline environment test attempted to acquire a PM tool")
+
+    monkeypatch.setattr("pm.store.Store.fetch_many", refuse)
+    return build_worker

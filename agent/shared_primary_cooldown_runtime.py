@@ -9,7 +9,7 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
     """Start a fresh agent on the configured fallback when another process armed the primary route."""
     if not getattr(agent, "_fallback_chain", None):
         return False  # nothing to adopt onto; skip the state-file lock on every turn
-    from agent.shared_primary_cooldown import is_active, read_cooldown, route_from_agent
+    from agent.shared_primary_cooldown import is_active, read_cooldown, route_from_agent, _probe_token_value
     try:
         record = read_cooldown(route_from_agent(agent))
     except OSError:
@@ -24,12 +24,52 @@ def _adopt_shared_primary_cooldown(agent) -> bool:
         # refuse the turn if no fallback can be bound, rather than use the primary.
         raise
     try:
-        if not is_active(record):
-            # Keep an expired record as a recovery probe: the first successful primary request
-            # clears it atomically and owns the sole recovery notice. None drops a record that
-            # was cleared elsewhere (another process recovered, or `hermes fallback cooldowns clear`).
+        if (isinstance(record, dict) and is_active(record)
+                and str(record.get("probe_owner") or "")
+                and str(record.get("probe_owner") or "") == _probe_token_value(getattr(agent, "_shared_primary_probe_token", ""))):
             agent._shared_primary_cooldown_record = record
             return False
+        agent._shared_primary_probe_token = None
+        if record is None:
+            agent._shared_primary_cooldown_record = None
+            return False
+        if not is_active(record):
+            agent._shared_primary_cooldown_record = record
+            from agent.shared_primary_cooldown import ProbeClaimKind, ProbeClaimOutcome, claim_probe, route_from_record
+            from agent.shared_primary_probe_runtime import primary_probe_lease_seconds
+            outcome = claim_probe(
+                route_from_record(record), str(record.get("outage_id") or ""),
+                lease_seconds=primary_probe_lease_seconds(agent),
+            )
+            if not isinstance(outcome, ProbeClaimOutcome):
+                logger.warning("Primary cooldown probe returned an invalid outcome; adopting fallback")
+                outcome = ProbeClaimOutcome(ProbeClaimKind.UNAVAILABLE)
+            if outcome.kind == ProbeClaimKind.CLAIMED:
+                agent._shared_primary_probe_token = outcome.token
+                return False
+            if outcome.kind in (ProbeClaimKind.OWNED_ELSEWHERE, ProbeClaimKind.STILL_COOLING,
+                                ProbeClaimKind.UNAVAILABLE):
+                from agent.error_classifier import FailoverReason
+                from agent.chat_completion_helpers import try_activate_fallback
+                try:
+                    reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))
+                except ValueError:
+                    reason = FailoverReason.rate_limit
+                return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=record))
+            if outcome.kind == ProbeClaimKind.CLEARED:
+                agent._shared_primary_cooldown_record = None
+                return False
+            if outcome.kind == ProbeClaimKind.REPLACED and isinstance(outcome.record, dict):
+                record = outcome.record
+                agent._shared_primary_cooldown_record = record
+                from agent.error_classifier import FailoverReason
+                from agent.chat_completion_helpers import try_activate_fallback
+                try:
+                    reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))
+                except ValueError:
+                    reason = FailoverReason.rate_limit
+                return bool(try_activate_fallback(agent, reason, _shared_cooldown_record=record))
+            raise AssertionError(f"unhandled probe claim outcome: {outcome.kind!r}")
         from agent.error_classifier import FailoverReason
         try:
             reason = FailoverReason(str(record.get("reason") or FailoverReason.rate_limit.value))

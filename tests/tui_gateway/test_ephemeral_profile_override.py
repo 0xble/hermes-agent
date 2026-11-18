@@ -20,6 +20,7 @@ from ``tui_gateway.server._methods`` with ``threading.Thread`` patched to run th
 target inline, then asserts on the recorded override set/reset calls and the agent.
 """
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -50,7 +51,7 @@ def fake_session():
     return {"agent": agent, "session_key": "sess_k", "profile_home": PROFILE_HOME}
 
 @pytest.fixture
-def override_calls():
+def override_calls(monkeypatch):
     """Patch set/reset override + AIAgent + emit/context helpers; record calls.
 
     Returns a dict with the mocks so each test can assert on set/reset ordering
@@ -60,8 +61,8 @@ def override_calls():
     # run_conversation returns a plain dict like the real agent does.
     agent_instance.run_conversation.return_value = {"final_response": "done"}
 
-    with patch("tui_gateway.server.threading.Thread", _InlineThread), \
-        patch("tui_gateway.server.set_hermes_home_override", return_value="TOK") as m_set, \
+    patch_server_threads(monkeypatch, srv, _InlineThread)
+    with patch("tui_gateway.server.set_hermes_home_override", return_value="TOK") as m_set, \
         patch("tui_gateway.server.reset_hermes_home_override") as m_reset, \
         patch("tui_gateway.server._background_agent_kwargs", return_value={}), \
         patch("tui_gateway.server._ephemeral_preview_agent_kwargs", return_value={}), \

@@ -66,7 +66,7 @@ Each provider dispatch is also bounded by a wall-clock timeout (`web.extract_tim
 
 ### When truncation gets in the way
 
-If you specifically need the live DOM rather than extracted markdown — for example, a JS-heavy page where extraction returns little content — use `browser_navigate` + `browser_snapshot` instead. The browser tool returns the live accessibility tree (subject to its own snapshot cap on huge pages).
+If you specifically need the live DOM rather than extracted markdown — for example, a JS-heavy page where extraction returns little content — use `browser_exec` instead: open the page with `new_tab(url)` + `wait_for_load()`, then read it with `page_info()` or a `js()` DOM extraction. It works on the live, rendered page.
 
 ---
 
@@ -452,6 +452,8 @@ If no shared backend has **ever** been selected (no `web.backend` written by you
 
 **One-shot keyless rescue for keyed backends:** when your chosen/keyed backend — including the Nous Tool Gateway route (`web.backend: nous`) — fails a call (bad key, outage, unreachable gateway, upstream 5xx), that single call automatically retries on the keyless free-tier ring instead of erroring — the result notes which vendor served it and why (`rescued_from` / `backend_error`). The failover is never sticky: the very next `web_search`/`web_extract` call attempts your chosen backend again. Disable with `web.keyless_rescue: false` (also off whenever `keyless_fallback` is off).
 
+**Exa Lite pause:** `web.exa_lite_paused` defaults to `true` and sends every Exa search to Auto. `hermes config set web.exa_lite_paused false` restores guarded Lite.
+
 xAI Web Search is **not** in the auto-detection chain — having `XAI_API_KEY` set (or being signed in via xAI Grok OAuth) does not automatically route web traffic through xAI, since those credentials are also used for inference / TTS / image gen and the user may want a different backend for web. Opt in explicitly with `web.backend: "xai"`.
 
 ---
@@ -515,19 +517,3 @@ Switch to a self-hosted instance (see [Option A](#option-a--self-host-with-docke
 ### `web_extract` returns truncated content with a `[TRUNCATED]` footer
 
 That's expected for pages over the character budget. The footer names the on-disk file holding the full clean text and the exact `read_file` call to page through the omitted middle. To see more inline, raise `web.extract_char_limit` in `config.yaml` or pass a larger `char_limit` on the call.
-
----
-
-## Optional skill: `searxng-search`
-
-For agents that need to use SearXNG via `curl` directly (e.g. as a fallback when the web toolset isn't available), install the `searxng-search` optional skill:
-
-```bash
-hermes skills install official/research/searxng-search
-```
-
-This adds a skill that teaches the agent how to:
-- Call the SearXNG JSON API via `curl` or Python
-- Filter by category (`general`, `news`, `science`, etc.)
-- Handle pagination and error cases
-- Fall back gracefully when SearXNG is unreachable

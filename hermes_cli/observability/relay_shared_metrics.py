@@ -11,9 +11,10 @@ import uuid
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from time import monotonic_ns
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from agent import relay_runtime
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from agent.portal_tags import get_conversation_context
 from hermes_cli.version_info import get_version_info
 
@@ -258,11 +259,15 @@ class _Runtime:
         # coalescing concurrent finish hooks into one worker.
         self._flush_lock = threading.RLock()
         self._flush_pending = False
+        self._flush_shutdown = False
+        self._flush_shutdown_pending = False
+        self._flush_shutdown_complete = threading.Event()
         self._flush_thread: threading.Thread | None = None
         self._snapshot_checked_ns: int | None = None
         self._subscriber_name = f"{SUBSCRIBER_NAME}.{self.host.runtime_id}"
         self.subscriber = SharedMetricsSubscriber(
-            SharedMetricsStore(), get_version_info().base_version, runtime_id=self.host.runtime_id
+            SharedMetricsStore(), get_version_info().base_version, runtime_id=self.host.runtime_id,
+            consent_check=self._collection_consented,
         )
         self.relay.subscribers.register(self._subscriber_name, self.subscriber)
         self.host.retain_managed_execution(self._subscriber_name)
@@ -629,6 +634,24 @@ class _Runtime:
             _forget(self._sessions, session.session_id, session)
 
     def shutdown(self) -> None:
+        # Callers (the atexit hook, an os._exit flush, a multiplex host's teardown) hold the launch
+        # profile's scope: this profile's own collection gate and send consent decide its exit.
+        with self._owner_scope():
+            if not enabled():  # revoked since its last turn: drop the data, never export it
+                if self._registered:
+                    self.deactivate()
+                return
+            self._close_and_export()
+
+    def _close_and_export(self) -> None:
+        from .shared_metrics_process import EXIT_FLUSH_TIMEOUT_S
+
+        with self._flush_lock:
+            closing = self._flush_shutdown
+            self._flush_shutdown = True
+        if closing:
+            self._flush_shutdown_complete.wait(EXIT_FLUSH_TIMEOUT_S)
+            return
         with self._sessions_lock:
             self._active = False
             session_ids = list(self._sessions)
@@ -639,10 +662,44 @@ class _Runtime:
         for session_id in unseen:
             self._safe(self._close_unseen_segment, session_id)
         if not self._registered:
+            self._flush_shutdown_complete.set()
             return
+        with self._flush_lock:
+            thread = self._flush_thread
+        if thread is not None:
+            if thread is not threading.current_thread():
+                try:
+                    thread.join(EXIT_FLUSH_TIMEOUT_S)
+                except RuntimeError:
+                    # Python can refuse daemon joins during late interpreter finalization.
+                    logger.debug("Shared-metrics export thread join failed", exc_info=True)
+            with self._flush_lock:
+                if self._flush_thread is thread and thread.is_alive():
+                    # A native barrier cannot be interrupted. Let its owner do the final
+                    # flush and cleanup rather than race a second export or discard rows.
+                    self._flush_pending = self._flush_shutdown_pending = True
+                    logger.warning("Shared-metrics export still running at shutdown; final flush remains queued")
+                    return
         self._flush_and_export("Hermes shared-metrics shutdown flush failed")
+        self._finish_export_shutdown()
+
+    def _finish_export_shutdown(self) -> None:
         self._deregister()
         self._release()
+        self._flush_shutdown_complete.set()
+
+    @contextlib.contextmanager
+    def _owner_scope(self) -> Iterator[None]:
+        """Bind this runtime's profile home for work that can run outside its own turns."""
+        token = set_hermes_home_override(self.host.profile_key)
+        try:
+            yield
+        finally:
+            reset_hermes_home_override(token)
+
+    def _collection_consented(self) -> bool:
+        with self._owner_scope():
+            return _collection_enabled()
 
     def _deregister(self) -> None:
         self._safe(self.relay.subscribers.deregister, self._subscriber_name)
@@ -729,6 +786,8 @@ class _Runtime:
         from agent.memory_provider import spawn_context_thread
 
         with self._flush_lock:
+            if self._flush_shutdown:
+                return
             self._flush_pending = True
             if self._flush_thread is not None:
                 return
@@ -747,18 +806,23 @@ class _Runtime:
                     # Cleared under the lock that schedulers check: a trigger can never land on a
                     # worker that has already decided to exit.
                     self._flush_thread = None
-                    return
+                    shutdown = self._flush_shutdown_pending
+                    break
                 self._flush_pending = False
             self._flush_and_export(failure_message)
+        if shutdown:
+            self._finish_export_shutdown()
 
     def _flush_and_export(self, failure_message: str) -> None:
-        """Flush the Relay subscriber, then export; a failed flush skips the export."""
+        """Flush the Relay subscriber, then export under this profile's scope (its send consent,
+        whoever triggered the flush); a failed flush skips the export."""
         try:
             self.relay.subscribers.flush()
         except Exception:
             logger.warning(failure_message, exc_info=True)
         else:
-            self._export()
+            with self._owner_scope():
+                self._export()
 
     def _abort_session(self, session: _MetricsSession, base_event: dict[str, Any]) -> bool:
         """Mark the session closing and system-abort its open tasks; False if already closing."""
@@ -1273,9 +1337,11 @@ class _Runtime:
         with self._send_lock:
             # One in-flight pass per process; the next hook fire picks up what is pending.
             if self._send_thread is None or not self._send_thread.is_alive():
-                self._send_thread = threading.Thread(
-                    target=self._run_send_pass, args=(resolved.endpoint,),
-                    name="hermes-shared-metrics-send", daemon=True,
+                from agent.memory_provider import spawn_context_thread
+
+                # Context copy: the pass re-checks consent (still_consented) in THIS profile's scope.
+                self._send_thread = spawn_context_thread(
+                    self._run_send_pass, name="hermes-shared-metrics-send", args=(resolved.endpoint,)
                 )
                 self._send_thread.start()
 
@@ -1338,12 +1404,11 @@ def _reconcile_store_consent(store: SharedMetricsStore, send_enabled: bool) -> N
             reconcile_send_consent(connection, send_enabled)
 
 
-def enabled() -> bool:
-    """Return the shared-metrics policy for the active Hermes profile."""
+def _collection_enabled() -> bool:
+    """Read consent without runtime teardown, including on the Relay subscriber thread."""
     from agent.incognito import is_incognito
     if is_incognito():
         return False
-    profile_key = relay_runtime.current_profile_key()
     try:
         config: Any = _raw_config()
     except Exception:
@@ -1351,7 +1416,16 @@ def enabled() -> bool:
         config = None
     for key in ("telemetry", "shared_metrics"):
         config = config.get(key) if isinstance(config, dict) else None
-    if isinstance(config, dict) and config.get("enabled") is True:
+    return isinstance(config, dict) and config.get("enabled") is True
+
+
+def enabled() -> bool:
+    """Return the shared-metrics policy for the active Hermes profile."""
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return False
+    profile_key = relay_runtime.current_profile_key()
+    if _collection_enabled():
         return True
     if profile_key not in _RUNTIMES:  # the opted-out hot path: nothing to tear down, no lock
         return False
@@ -1377,6 +1451,9 @@ def _reconcile_send_consent_once() -> None:
     AND consent is off: nothing to protect, and creating ``~/.hermes/telemetry`` for every
     fully-disabled user would be the wrong behaviour change.
     """
+    from agent.incognito import is_incognito
+    if is_incognito():
+        return
     global _consent_reconcile_done
     if _consent_reconcile_done:
         return
@@ -1397,10 +1474,30 @@ def _reconcile_send_consent_once() -> None:
         logger.warning("Unable to reconcile shared-metrics send consent", exc_info=True)
 
 
+# Hooks whose only effect is a process mark (no task, no scope): gated like record_process_mark.
+_PROCESS_MARK_HOOKS = frozenset({"post_auxiliary_call"})
+
+
+def _process_marks_admitted() -> bool:
+    """Whether the inherited turn lets a process-level mark through.
+
+    A process mark has no owning task and opens no scope, so a turn that has CLOSED does not gate
+    it: background work spawned under the turn (a turn-end compaction pass, title generation)
+    inherits that turn through its copied context and still reports after it ends. A turn Relay
+    skipped (a concurrent turn on the session) keeps gating, open or closed."""
+    turn = relay_runtime.current_turn()
+    return turn is None or turn.relay_enabled
+
+
 def observe_lifecycle(hook_name: str, **kwargs: Any) -> None:
     """Project one Hermes lifecycle event into the core Relay integration."""
     _reconcile_send_consent_once()
-    if not handles_hook(hook_name) or not relay_runtime.relay_instrumentation_enabled():
+    if not handles_hook(hook_name):
+        return
+    if not (
+        _process_marks_admitted() if hook_name in _PROCESS_MARK_HOOKS
+        else relay_runtime.relay_instrumentation_enabled()
+    ):
         return
     runtime = _get_runtime()
     if runtime is None:
@@ -1470,7 +1567,7 @@ def start_task_run(
 def shutdown_runtimes() -> None:
     """Run each live runtime's exit flush now, for a process that leaves through ``os._exit`` (the
     ``hermes -z`` exit) and so never reaches the atexit hook that closes sessions and writes
-    ``task_run.finished`` / ``session.count``."""
+    ``task_run.finished`` / ``session.count``. Each runtime binds its own profile while it does."""
     with _RUNTIME_LOCK:
         runtimes = [runtime for runtime in _RUNTIMES.values() if isinstance(runtime, _Runtime)]
     for runtime in runtimes:
@@ -1510,7 +1607,7 @@ def finish_task_run(
 
 def record_process_mark(mark: str, data: dict[str, Any]) -> None:
     """Emit one process-level decision mark when shared metrics are on (never raises)."""
-    if not enabled() or not relay_runtime.relay_instrumentation_enabled():
+    if not enabled() or not _process_marks_admitted():
         return
     runtime = _get_runtime(retry_failed=True)
     if runtime is not None:
@@ -1521,7 +1618,7 @@ def record_process_marks_saved(marks: list[tuple[str, dict[str, Any]]]) -> int:
     """``record_process_mark`` for facts recovered from a file the caller deletes only once they are
     saved (a busy store would otherwise lose them for good). How many rows are settled: saved, rejected
     by the contract, or nothing to record because collection is off."""
-    if not enabled() or not relay_runtime.relay_instrumentation_enabled():
+    if not enabled() or not _process_marks_admitted():
         return len(marks)
     runtime = _get_runtime(retry_failed=True)
     return (runtime._safe(runtime.record_process_marks_saved, marks) or 0) if runtime is not None else 0

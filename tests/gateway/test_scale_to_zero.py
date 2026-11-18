@@ -196,9 +196,7 @@ def test_idle_exactly_at_threshold():
 
 
 import os
-import shutil
 import socket as _socket
-import tempfile
 import threading
 from pathlib import Path
 
@@ -211,36 +209,6 @@ from gateway.scale_to_zero import (
 )
 
 _FLY_ENV = {FLY_APP_NAME_ENV: "hermes-agent-stg-test", FLY_MACHINE_ID_ENV: "d891234f"}
-
-# sockaddr_un.sun_path is 104 bytes on macOS/BSD and 108 on Linux (incl. NUL).
-_SUN_PATH_MAX = 100
-
-
-@pytest.fixture()
-def short_sock_dir():
-    """A directory short enough that ``<dir>/fly-api.sock`` fits in sun_path.
-
-    pytest's ``tmp_path`` nests deep enough on macOS and on CI runners that a
-    socket bound under it fails with ``OSError: AF_UNIX path too long``. The
-    production path is the fixed ``/.fly/api`` so the length limit never
-    applies there; only the fake flaps server needs a short home.
-    """
-    candidates = [tempfile.gettempdir(), "/tmp"]
-    for base in candidates:
-        try:
-            path = Path(tempfile.mkdtemp(prefix="s2z-", dir=base))
-        except OSError:
-            continue
-        if len(str(path / "fly-api.sock").encode()) <= _SUN_PATH_MAX:
-            break
-        shutil.rmtree(path, ignore_errors=True)
-    else:
-        pytest.skip(f"no temp dir short enough for an AF_UNIX socket (tried {candidates})")
-    try:
-        yield path
-    finally:
-        shutil.rmtree(path, ignore_errors=True)
-
 
 def _fake_flaps(sock_dir, status_line, capture):
     """One-shot unix-socket HTTP server standing in for flaps."""

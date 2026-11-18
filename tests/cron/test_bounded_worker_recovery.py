@@ -9,6 +9,8 @@ from pathlib import Path
 
 import pytest
 
+from tests.waiting import process_alive
+
 from cron import delivery_queue, executions, scheduler
 from hermes_constants import get_hermes_home, reset_hermes_home_override, set_hermes_home_override
 
@@ -228,7 +230,7 @@ class AbandonedAgent:
         pass
 
 run_agent.AIAgent = AbandonedAgent
-scheduler._prepare_job_prompt = lambda *args: (None, 'test prompt')
+scheduler._prepare_job_prompt = lambda *args: (None, 'test prompt', None)
 scheduler._load_cron_job_config = lambda *args: SimpleNamespace(cfg={}, model='test')
 scheduler._resolve_cron_agent_setup = lambda *args: scheduler._CronAgentSetup(model='test')
 scheduler._open_cron_session_db = lambda *args: SimpleNamespace()
@@ -300,8 +302,7 @@ time.sleep(60)
         assert process.wait(timeout=15) == 124
         execution_id = idfile.read_text()
         grandchild_pid = int(pidfile.read_text())
-        import psutil
-        assert not psutil.pid_exists(grandchild_pid) or psutil.Process(grandchild_pid).status() == psutil.STATUS_ZOMBIE
+        assert not process_alive(grandchild_pid)
         token = _home(home)
         try:
             row = executions.get_execution(execution_id)

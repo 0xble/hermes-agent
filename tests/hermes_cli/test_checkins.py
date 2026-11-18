@@ -77,7 +77,7 @@ def test_config_validates_duration_and_floor(monkeypatch, value, expected):
     assert CheckinConfig.load().first_after_seconds == expected
 
 
-def test_prompt_is_generated_but_its_reply_is_not_suppressible():
+def test_prompt_is_generated_and_successful_quiet_is_permitted():
     from agent.synthetic_prompt import human_prompt_text, is_runtime_prompt
     from gateway.response_filters import is_machinery_display_kind, silence_allowed
     prompt = checkin_prompt([{"id": "child", "name": "test", "status": "running", "started_at": 100}],
@@ -86,10 +86,9 @@ def test_prompt_is_generated_but_its_reply_is_not_suppressible():
     assert human_prompt_text(prompt) is None
     assert human_prompt_text(prompt + "\nActual human follow-up") == "Actual human follow-up"
     assert is_machinery_display_kind("supervisor_checkin")
-    assert not silence_allowed("supervisor_checkin", False)
+    assert silence_allowed("supervisor_checkin", False)
     assert silence_allowed("internal_notification")
     assert "unknown" in prompt and "age_seconds" in prompt
-    assert "reaction alone is NOT valid" in prompt
 
 
 def test_lineage_does_not_share_state_with_reset(db, monkeypatch):

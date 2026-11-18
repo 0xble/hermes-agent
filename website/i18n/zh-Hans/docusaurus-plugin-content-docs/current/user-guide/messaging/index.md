@@ -32,7 +32,7 @@ description: "通过 Telegram、Discord、Slack、WhatsApp、Signal、SMS、Emai
 | Weixin | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
 | BlueBubbles | — | ✅ | ✅ | — | ✅ | ✅ | — |
 | QQ | ✅ | ✅ | ✅ | — | — | ✅ | — |
-| Yuanbao | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
+| Yuanbao（Labs 插件） | ✅ | ✅ | ✅ | — | — | ✅ | ✅ |
 | Microsoft Teams | — | ✅ | — | ✅ | — | ✅ | — |
 | LINE | — | ✅ | ✅ | — | — | ✅ | — |
 | ntfy | — | — | — | — | — | — | — |
@@ -63,7 +63,7 @@ flowchart TB
     wx[Weixin]
     bb[BlueBubbles]
     qq[QQ]
-    yb[Yuanbao]
+    yb["Yuanbao (plugin)"]
     ms[Microsoft Teams]
     api["API Server<br/>(OpenAI-compatible)"]
     wh[Webhooks]
@@ -347,7 +347,7 @@ display:
 | `all` | 运行输出更新**以及**最终原始输出消息 |
 | `result` | 仅最终原始输出完成消息（无论退出码） |
 | `error` | 仅在退出码非零时的最终原始输出消息 |
-| `off` | 不接收任何进程监控消息 |
+| `off` | 不接收任何进程回执（包括运行/最终输出、忙碌时状态和回退通知）。网关上显式设置 `notify_on_complete=true` 的完成事件仍会唤醒 agent；CLI、TUI 和 Desktop 仍不唤醒，也不会自动开启通知 |
 
 也可通过环境变量设置：
 
@@ -444,7 +444,7 @@ launchd plist 是静态的——如果你在配置网关后安装了新工具（
 | Weixin | `hermes-weixin` | 完整工具，包括终端 |
 | BlueBubbles | `hermes-bluebubbles` | 完整工具，包括终端 |
 | QQBot | `hermes-qqbot` | 完整工具，包括终端 |
-| Yuanbao | `hermes-yuanbao` | 完整工具，包括终端 |
+| Yuanbao（Labs 插件） | `hermes-yuanbao` | 完整工具，外加 `yuanbao` Hermes Labs 插件提供的 `yb_*` 群组/私聊/贴纸工具 |
 | Microsoft Teams | `hermes-teams` | 完整工具，包括终端 |
 | API Server | `hermes-api-server` | 完整工具（去除 `clarify`、`send_message`、`text_to_speech`——程序化访问没有交互用户） |
 | Webhooks | `hermes-webhook` | 完整工具，包括终端 |
@@ -562,7 +562,7 @@ display:
 - [Weixin 配置（微信）](weixin.md)
 - [BlueBubbles 配置（iMessage）](bluebubbles.md)
 - [QQBot 配置](qqbot.md)
-- [Yuanbao 配置](yuanbao.md)
+- [Yuanbao](yuanbao.md)（Hermes Labs 插件）
 - [Microsoft Teams 配置](teams.md)
 - [Teams 会议流水线](teams-meetings.md)
 - [Open WebUI + API Server](open-webui.md)

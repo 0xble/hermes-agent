@@ -70,7 +70,7 @@ def test_private_review_response_preserves_explicit_empty_raw_model_response():
 
 @pytest.mark.asyncio
 async def test_busy_subject_is_refused_before_injection(monkeypatch):
-    import gateway.cron_review as cron_review
+    from gateway import cron_review
     monkeypatch.setattr(cron_review, "_IDLE_POLL_SECONDS", 0.01)
     monkeypatch.setattr(cron_review, "_MIN_REVIEW_SECONDS", 0.02)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
@@ -90,7 +90,7 @@ async def test_busy_subject_is_refused_before_injection(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_review_waits_for_a_busy_subject_to_go_idle(monkeypatch):
-    import gateway.cron_review as cron_review
+    from gateway import cron_review
     monkeypatch.setattr(cron_review, "_IDLE_POLL_SECONDS", 0.01)
     monkeypatch.setattr(cron_review, "_MIN_REVIEW_SECONDS", 0.02)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")
@@ -183,7 +183,7 @@ def test_bare_human_interrupt_is_rebuilt_as_a_reply_expected_human_event():
 
 @pytest.mark.asyncio
 async def test_waited_review_is_refused_once_the_gateway_starts_draining(monkeypatch):
-    import gateway.cron_review as cron_review
+    from gateway import cron_review
     monkeypatch.setattr(cron_review, "_IDLE_POLL_SECONDS", 0.01)
     monkeypatch.setattr(cron_review, "_MIN_REVIEW_SECONDS", 0.02)
     source = SessionSource(platform=Platform.TELEGRAM, chat_id="chat")

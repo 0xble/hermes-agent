@@ -70,17 +70,41 @@ def _statuses(authority):
 
 
 @pytest.mark.asyncio
-async def test_busy_follow_up_returns_after_commit_and_is_answered_once(monkeypatch):
+@pytest.mark.parametrize('delay_first_delivery', [False, True], ids=['normal', 'delayed-first-delivery'])
+async def test_busy_follow_up_returns_after_commit_and_is_answered_once(monkeypatch, delay_first_delivery):
     first_gate, second_gate = asyncio.Event(), asyncio.Event()
+    execution_order = []
 
     async def first():
+        execution_order.append('one started')
         await first_gate.wait()
+        execution_order.append('one finished')
         return 'FIRST_REPLY'
 
     async def second():
+        execution_order.append('two started')
         await second_gate.wait()
+        execution_order.append('two finished')
         return 'SECOND_REPLY'
     authority, adapter, source = await _busy_owner(monkeypatch, {'one': first, 'two': second})
+    if delay_first_delivery:
+        second_sent = asyncio.Event()
+        record = adapter._record_delivery_obligation
+        send = adapter.send
+
+        async def delayed_record(event, session_key, text_content, *args, **kwargs):
+            if text_content == 'FIRST_REPLY':
+                await second_sent.wait()
+            return await record(event, session_key, text_content, *args, **kwargs)
+
+        async def observed_send(chat_id, content, reply_to=None, metadata=None):
+            result = await send(chat_id, content, reply_to=reply_to, metadata=metadata)
+            if content == 'SECOND_REPLY':
+                second_sent.set()
+            return result
+
+        monkeypatch.setattr(adapter, '_record_delivery_obligation', delayed_record)
+        monkeypatch.setattr(adapter, 'send', observed_send)
     await adapter.handle_message(MessageEvent(text='one', source=source, message_id='m1'))
     await asyncio.wait_for(adapter.turn_started['one'].wait(), 5)
     # The receive loop hands over the follow-up while the first turn is still running.
@@ -94,7 +118,10 @@ async def test_busy_follow_up_returns_after_commit_and_is_answered_once(monkeypa
     await asyncio.wait_for(adapter.turn_started['two'].wait(), 5)
     second_gate.set()
     await async_wait_until(lambda: 'SECOND_REPLY' in adapter.sent and not adapter._background_tasks, timeout=5)
-    assert adapter.sent == ['FIRST_REPLY', 'SECOND_REPLY']
+    assert sorted(adapter.sent) == ['FIRST_REPLY', 'SECOND_REPLY']
+    assert execution_order == ['one started', 'one finished', 'two started', 'two finished']
+    if delay_first_delivery:
+        assert adapter.sent[0] == 'SECOND_REPLY'
     assert _statuses(authority) == {'one': 'terminal', 'two': 'terminal'}
 
 

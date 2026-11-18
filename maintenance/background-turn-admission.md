@@ -49,6 +49,10 @@ retries, process or delegation completions, or restart auto-resumes start turns,
   resume is still queued (not spooled internal events or declined follow-ups).
 - Once the gateway drains, queued resumes are dropped, never started, and release their
   preclaims (markers stay durable for the next boot), so the drain does not wait on them.
+- A wake receipted before drain began must run. Every inbound drain fence, including the
+  running-session, command and final dispatch fences, honors `_admitted_before_drain`.
+  Unadmitted work still spools or refuses normally. Preserve the receipt and pending-FIFO
+  invariants in `tests/gateway/test_wake_admitted_before_drain.py`.
 - `gateway.restart_replay_concurrency` keeps bounding replay dispatch (turn openings); it is a
   separate knob from this turn cap.
 

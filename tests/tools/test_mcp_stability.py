@@ -18,7 +18,7 @@ def _track_fake_incarnation(pid, monkeypatch, pgid=None):
     proc.children.return_value = []
     proc.send_signal.side_effect = lambda sig: os.kill(pid, sig)
     _mcp_lifecycle._stdio_processes[pid] = {pid: proc}
-    monkeypatch.setattr("psutil.process_iter", lambda: [])
+    monkeypatch.setattr("psutil.process_iter", list)
     monkeypatch.setattr("psutil.wait_procs", lambda procs, **kwargs: ([], procs))
     if pgid is not None:
         existing = getattr(os, "getpgid", lambda _: None)
@@ -162,8 +162,6 @@ class TestStdioPidTracking:
                  patch("tools.mcp_tool_config._resolve_stdio_command",
                        return_value=("echo", {})), \
                  patch("tools.mcp_tool_config._write_stderr_log_header"), \
-                 patch("tools.mcp_tool._get_mcp_stderr_log",
-                       return_value=None), \
                  patch("tools.mcp_tool.check_package_for_malware",
                        return_value=None, create=True), \
                  patch("tools.osv_check.check_package_for_malware",
@@ -457,7 +455,9 @@ class TestStdioPgroupReaping:
                             ("_orphan_stdio_pids", set()), ("_orphan_stdio_pid_servers", {})):
             monkeypatch.setattr(_mcp_lifecycle, name, value)
             monkeypatch.setattr(transport, name, value)
-        monkeypatch.setattr(core, "_update_death_supervisor", lambda *args: None)
+        monkeypatch.setattr(transport, "own_process_groups", lambda *args: None)
+        monkeypatch.setattr(transport, "release_process_groups", lambda *args: None)
+        monkeypatch.setattr(_mcp_lifecycle, "release_process_groups", lambda *args: None)
         monkeypatch.setattr("hermes_cli.process_identity.register_child", lambda *args: None)
         monkeypatch.setattr("hermes_cli.process_identity.attach_self_to_kill_on_close_job", lambda: False)
         monkeypatch.setattr(core, "_ensure_mcp_sdk", lambda: True)
@@ -502,7 +502,7 @@ class TestStdioPgroupReaping:
         @asynccontextmanager
         async def sdk_stdio(*args, **kwargs):
             nonlocal parent, captured_before_eof
-            parent = subprocess.Popen(
+            parent = await asyncio.to_thread(subprocess.Popen,
                 [sys.executable, str(parent_script)], stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE, text=True, start_new_session=True,
             )

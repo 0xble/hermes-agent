@@ -82,7 +82,9 @@ async def test_paused_receipt_rearms_on_resume_without_polling_rpc(bot, monkeypa
 
 @pytest.mark.asyncio
 async def test_receipt_read_straddling_the_settlement_commit_projects_the_reply(bot, monkeypatch):
-    """A settlement between the admission and result reads must publish the completed reply."""
+    """The drain settles from a worker thread while a receipt refresh reads the admission on the
+    loop: a commit landing between the row read and the result read is still a settled reply,
+    never a terminal ``failed`` receipt that no later wake re-reads."""
     from gateway import session_bot, session_results
     from gateway.session_contract import SessionRef
     from hermes_state_runtime import claim_session_input, settle_session_input

@@ -2,6 +2,84 @@
 
 Patch identity: `seamless-restart-s2`.
 
+### PM worker deadlines and offline validation
+
+`pm/client_process.py` bounds the isolated worker's active request time to the
+larger of 3,600 seconds and the sum of its sequential command budgets plus a
+180-second protocol margin. `pm/worker_budget.py` owns the named constants also
+used by the command runners: create 120 seconds, uv step 1,800 seconds, dependency
+check 60 seconds, workspace interpreter probe 60 seconds and repair validation
+60 seconds. Explicit operation timeouts replace the uv step budget, not the
+whole request budget. Existing step deadlines are unchanged.
+
+- `build_environment`: create + optional lock + sync + bytecode retry + check.
+  A resolving build is 120 + 3T + 60 + 180, or 5,760 seconds with default T.
+  A frozen build is 120 + 2T + 60 + 180, or 3,960 seconds.
+- `ensure_environment` and `ensure_python_tool`: the resolving build sum.
+  `ensure_project_environment`: the frozen build sum.
+- `sync_venv` and `ensure(venv)`: resolving build + workspace probe + repair
+  validation + margin, or 5,880 seconds. This conservatively covers both repair
+  and plugin resolution. Plugin eviction reserves up to 2N + 4 complete builds,
+  using the actual kept and due member counts discovered under the install lock.
+  Each extra build adds create + lock + sync + retry + check + workspace probe.
+- `build_requirements_environment`: create + install + check + margin, or 2,160
+  seconds before applying the 3,600-second floor.
+- `lock_project`, `check_project_lock`, `export_requirements` and `prune_cache`:
+  1 uv step + margin, or 1,980 seconds before the floor. Currency probes and
+  tool-only operations retain the protocol floor.
+
+The offline fixture fixes the original `Download._probe` hang by supplying local
+tools at both process boundaries. Worker deadlines cover other failures in the
+bounded command/protocol phases, not that tool-acquisition hang.
+
+Tool acquisition is deliberately not finitely bounded: downloads renew their network retry
+budget on durable progress, and explicit install locks intentionally wait
+patiently. The worker explicitly suspends the active-time clock while acquiring
+its toolchain, downloading/unpacking/staging artifacts, preparing native build
+tools or waiting for a patient lock. It resumes the remaining budget afterwards,
+including nested acquisition. Deadline reports require the request's
+`accepts: ["deadline"]` capability, so clients already loaded before a source
+update continue to receive only callback/result messages. A stdlib ContextVar hook keeps generic install-state
+locking independent of worker modules, so minimal pre-import launchers retain
+their existing import closure. Tool-only requests use the same suspension contract.
+A worker that never sends a complete protocol message still expires. This avoids
+inventing a tool-fetch ceiling that kills valid progressing downloads.
+
+At this base, npm sidecars do **not** run inside `sync_venv`: plugin install and
+transaction callers run `install_node_sidecar` before the PM sync. Each sidecar's
+900-second subprocess budget therefore lies outside this worker's clock, as do
+its prerequisite tool fetches. There is no npm-install count to estimate in the
+sync worker. If sidecar installation moves into this worker, its actual member
+count must add 900 seconds per install to the operation budget.
+
+The worker stays in the caller's process group and session so updater and Desktop
+group cleanup retain custody. Deadline cleanup snapshots descendants with psutil,
+kills children before the worker, then reaps it. Bare recovery without psutil uses
+a stdlib process-table snapshot on POSIX (`/proc/*/stat` when `ps` fails), or
+bounded taskkill on Windows. If neither POSIX snapshot is available, group cleanup
+is allowed only when the worker owns its group. During sync, control-pipe EOF
+kills the worker tree only before a result is ready. Normal result shutdown exits
+through atexit and releases its runtime lease. `ensure` retains its resumable
+pause-on-EOF behavior. A complete result is authoritative even if the timer fires
+before cancellation, so expiry cannot replace that result with a timeout.
+
+Contract tests: `tests/pm/test_worker_deadline.py`, `tests/pm/test_worker_lifetime.py`, `tests/pm/test_worker_budgets.py`, `tests/pm/test_worker_protocol.py`, `tests/pm/test_client_process.py`, `tests/pm/test_pip_check.py`.
+
+The pip-check integration fixture uses the existing real isolated worker with
+local uv and Python on both sides of the process boundary. Its runtime is built
+from the vendored PM wheelhouse. Both caller and worker reject tool acquisition.
+`UV_OFFLINE=1` alone only governed uv's fixture lock command: PM's public build
+facade acquired its own tools before dispatch, and stripped ambient UV settings.
+Linux CPython 3.14.7 stacks on the base revision show that acquisition waiting
+in `Download._probe`'s HTTPS read, without a uv child. The original hosted run
+finished items 1–14, locating its unfinished item at the requirements-build
+test, item 15. The exact hosted stack was not captured.
+
+Retire this adaptation when upstream tests supply their offline toolchain at
+both boundaries and the worker protocol has equivalent bounded failure and
+process cleanup. Revert the focused commit to roll back these changes without
+altering the existing uv runner or override validation.
+
 ## Contract and current gate
 
 Detached cron dispatch freezes both the physical tree and immutable-release module
@@ -24,6 +102,21 @@ This is the fork's core update/launchd/cron release boundary, not a plugin: atom
 **NOT ACTIVATION-READY while PR #192 is draft or any S2 acceptance item/required exact-SHA check is open.** Publishing or merging the source never authorizes running `hermes update` on the personal install or restarting its live gateway. Only the parent owner may authorize activation separately.
 
 ## Qualification evidence (disposable only)
+
+The transaction fixture explicitly disables `gateway.guardian.admission_canary`
+through its disposable `config.yaml`. Its probe gateway only reports a code root;
+it does not implement native ingress. After `post-install-admission-canary` added
+update-side observation, each real migration retry otherwise spent the production
+180-second window qualifying that probe. The file passed 71 native tests in
+48.2 seconds (nightly 39583566600) and 54.1 seconds (39762130206) before that
+addition, then exceeded 300 seconds (41834945580). Local verbose reproduction
+stacks identify `test_disposable_launchd_first_migration_and_rollback[migration-plist]`
+in `admission_canary.observe`, followed by `[migration-loaded]` at the file cap.
+Keep the real launchd acknowledgement, crash matrix and pointer assertions;
+`tests/hermes_cli/test_admission_canary.py` separately covers enabled, disabled,
+quiet-window and rollback behavior. Production defaults and runner budgets stay
+unchanged. Retire this fixture adaptation if probes implement native ingress and
+can meaningfully qualify the admission window.
 
 The crash-injection matrix in `test_immutable_release_transactions.py` hard-exits a real child after every durable rename, unlink, plist install, reload marker and transaction deletion for promote, rollback, first migration and first-migration rollback. The ordinary entry point uses the **recorded intended target**; it does not re-derive rollback A from a partially changed `previous` pointer. First migration and its reversal include UUID-named disposable launchd labels and check the bytes loaded by launchd, not only the plist file. These tests predate the review-11 supervised-process acknowledgement; a simulated loaded marker or successful `launchctl` call alone does not prove that the running gateway imported the intended release.
 

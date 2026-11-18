@@ -39,8 +39,19 @@ def _local_session(name="stuck-session"):
     return {"session_name": name, "bb_session_id": None, "cdp_url": None}
 
 
+def _pipe_output(payload=b""):
+    """Readable Popen-style pipe, including EOF, for the real memory collector."""
+    read_fd, write_fd = os.pipe()
+    with os.fdopen(write_fd, "wb") as writer:
+        writer.write(payload)
+    return os.fdopen(read_fd, "rb", buffering=0)
+
+
 def _install_command_stubs(monkeypatch, tmp_path, process):
     """Common _run_browser_command environment with a fake daemon layer."""
+    if process is not None:
+        process.stdout = _pipe_output()
+        process.stderr = _pipe_output()
     monkeypatch.setattr(bt_install, "_find_agent_browser", lambda: "agent-browser")
     monkeypatch.setattr("tools.browser_tool_install._chromium_installed", lambda: True)
     monkeypatch.setattr("tools.browser_tool_lifecycle._start_browser_cleanup_thread", lambda: None)
@@ -49,6 +60,8 @@ def _install_command_stubs(monkeypatch, tmp_path, process):
     monkeypatch.setattr(bt, "_socket_safe_tmpdir", lambda: str(tmp_path))
     monkeypatch.setattr("tools.browser_tool_lifecycle._write_owner_pid", lambda *_args: None)
     monkeypatch.setattr(bt, "_build_browser_env", dict)
+    monkeypatch.setattr(bt_session, "_agent_browser_command_env", lambda _socket_dir: {})
+    monkeypatch.setattr(bt_session, "_sandbox_wrap", lambda argv, env, _path: (argv, env))
     monkeypatch.setattr("tools.browser_tool_install._merge_browser_path", lambda value: value)
     monkeypatch.setattr("tools.browser_tool_cloud._get_browser_engine", lambda: "auto")
     monkeypatch.setattr("tools.browser_tool_cloud._is_headed_mode", lambda: False)
@@ -155,7 +168,9 @@ class TestSuccessfulCallNeverRecycles:
             returncode = 0
 
             def __init__(self, *_args, **kwargs):
-                os.write(kwargs["stdout"], payload)
+                assert kwargs["stdout"] == kwargs["stderr"] == subprocess.PIPE
+                self.stdout = _pipe_output(payload)
+                self.stderr = _pipe_output()
 
             def wait(self, timeout=None):
                 return 0
@@ -284,7 +299,9 @@ class TestBackendLevelFailureRecycles:
                 rc, out = outputs[len(spawns)]
                 spawns.append(list(argv))
                 self.returncode = rc
-                os.write(kwargs["stdout"], out)
+                assert kwargs["stdout"] == kwargs["stderr"] == subprocess.PIPE
+                self.stdout = _pipe_output(out)
+                self.stderr = _pipe_output()
 
             def wait(self, timeout=None):
                 return self.returncode

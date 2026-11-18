@@ -24,7 +24,7 @@ def _paused_by_contract_verdict(state) -> bool:
     return state.last_verdict == "blocked" and reason.startswith((_BLOCKED_PAUSE_PREFIX, _LEGACY_BLOCKED_PAUSE_PREFIX))
 
 
-def revise_goal_snapshot(manager: Any, **kwargs: Any) -> Dict[str, Any]:
+def revise_goal_snapshot(manager: Any, **kwargs: Any) -> dict[str, Any]:
     from hermes_cli.goals import GoalState, _get_session_db
     from hermes_cli.goals_evaluation import (
         GoalEvaluationConflict, GoalEvaluationPersistenceError, _reload_if_readable,
@@ -100,7 +100,7 @@ _STATE_CHANGED = {"ok": False, "error_code": "state_changed",
                   "error": "goal changed; retry against the current version"}
 
 
-def _replace_from_durable_row(manager: Any, **kwargs: Any) -> Dict[str, Any]:
+def _replace_from_durable_row(manager: Any, **kwargs: Any) -> dict[str, Any]:
     """Apply an explicit user replacement to the CURRENT durable row through the CAS commit.
 
     The user command targets whatever goal is live, so a stale manager (the gateway loads it and
@@ -194,9 +194,9 @@ def stop_condition_only(state: Any, *, goal: str, contract: Any,
 
 class GoalRevisionsMixin:
     def revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
-               contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
+               contract: Optional[dict[str, str]] = None, subgoals: Optional[list[str]] = None,
                evidence: str = "", user_quote: str = "",
-               user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+               user_messages: Optional[list[str]] = None) -> dict[str, Any]:
         """Apply an additive revision through the durable snapshot/CAS boundary.
 
         Default mode is additive-only and quotes do not grant removal authority. Opt-in autonomy
@@ -211,15 +211,15 @@ class GoalRevisionsMixin:
 
     def replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
                 contract: Optional[Any] = None, actor: str = "agent", user_quote: str = "",
-                user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+                user_messages: Optional[list[str]] = None) -> dict[str, Any]:
         """Replace through the durable snapshot/CAS boundary."""
         return revise_goal_snapshot(self, reason=reason, goal=goal, max_turns=max_turns,
                                     contract=contract, actor=actor, user_quote=user_quote,
                                     user_messages=user_messages, _replace=True)
 
     def _revise(self, *, reason: str, actor: str = "agent", goal: Optional[str] = None,
-                contract: Optional[Dict[str, str]] = None, subgoals: Optional[List[str]] = None,
-                evidence: str = "", user_quote: str = "") -> Dict[str, Any]:
+                contract: Optional[dict[str, str]] = None, subgoals: Optional[list[str]] = None,
+                evidence: str = "", user_quote: str = "") -> dict[str, Any]:
         """Validate and apply an additive revision to this manager's (staged) state."""
         from hermes_cli.goals_autonomy import autonomous_edit, goal_autonomy_enabled
         if goal_autonomy_enabled() and actor == "agent":
@@ -240,7 +240,7 @@ class GoalRevisionsMixin:
 
     def _replace(self, *, reason: str, goal: str, max_turns: Optional[int] = None,
                  contract: Optional[Any] = None, actor: str = "agent", user_quote: str = "",
-                 user_messages: Optional[List[str]] = None) -> Dict[str, Any]:
+                 user_messages: Optional[list[str]] = None) -> dict[str, Any]:
         """Replace the objective in place, keeping lifecycle status and turn accounting.
 
         Only an explicit user command or approved session control (``actor="user"``) may
@@ -279,7 +279,7 @@ class GoalRevisionsMixin:
             authority = {}
         approved = authority.get("via") in {"quote", "button", "session"}
 
-        def snapshot() -> Dict[str, Any]:
+        def snapshot() -> dict[str, Any]:
             return {"goal": state.goal, "max_turns": state.max_turns, "contract": state.contract.to_dict(),
                     "status": state.status, "turns_used": state.turns_used, "subgoals": list(state.subgoals)}
 

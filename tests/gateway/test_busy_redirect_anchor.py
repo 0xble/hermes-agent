@@ -126,7 +126,7 @@ async def test_accepted_relay_steer_keeps_a_relay_turn_unaddressed_and_sends_no_
 async def test_addressed_relay_steer_keeps_its_expectation_and_ack():
     runner = GatewayRunner(config=GatewayConfig())
     receiver = Receiver()
-    opening, ctx, incoming, source = _running_turn(runner, "key", receiver)
+    _opening, ctx, incoming, source = _running_turn(runner, "key", receiver)
     incoming.text = "/steer [relay from=agent@example.com receipt=receipt-3]\nplease answer me"
     incoming.reply_expected = True
 

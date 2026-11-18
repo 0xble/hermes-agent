@@ -1,12 +1,15 @@
 """Standalone ``serve`` (no session authority) must not run a legacy turn past the gateway's
 durable ledger: an ``unknown`` admission is never replayed, queued input runs in FIFO order."""
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import pytest
 
 from hermes_state import SessionDB
 from hermes_state_runtime import admit_session_input, claim_session_input, list_session_admissions, recover_session_inputs, resolve_unknown_session_input
 from tests.fakes.runtime_owner import begin_runtime_epoch
 from tui_gateway import server
+
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
 
 
 class _InlineThread:
@@ -26,8 +29,8 @@ def test_legacy_submit_refuses_while_canonical_ledger_holds_work(monkeypatch, tm
         monkeypatch.setattr(server, name, lambda *_a, **_k: None)
     monkeypatch.setattr(server, "_restart_completed_failed_agent_build", lambda *_a: False)
     turns = []
-    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a: turns.append(a[1]))
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    monkeypatch.setattr(server, "_run_after_agent_ready", lambda *a, **kw: turns.append(a[1]))
+    patch_server_threads(monkeypatch, server, _InlineThread)
     created = server.handle_request({"id": "c", "method": "session.create", "params": {"source": "desktop"}})
     sid, key = created["result"]["session_id"], created["result"]["stored_session_id"]
     db.create_session(key, "cli")

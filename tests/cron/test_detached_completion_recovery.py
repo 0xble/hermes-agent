@@ -60,7 +60,7 @@ def test_terminal_execution_reconciles_canonical_result_without_status_poll(tmp_
 
 
 def test_unsettled_terminal_execution_keeps_journal_without_owner(tmp_path, monkeypatch):
-    owner, db = _owner(tmp_path, monkeypatch)
+    _unused_owner, db = _owner(tmp_path, monkeypatch)
     try:
         with jobs.use_cron_store(tmp_path):
             job = jobs.create_job(prompt='inert', schedule='every 1h', deliver='local')

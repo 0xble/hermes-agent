@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 from types import SimpleNamespace
 
@@ -486,7 +487,7 @@ def test_prompt_row_id_rewind_preserves_scaffold_before_regeneration(
             self._target()
 
     session["agent"] = _Agent()
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     monkeypatch.setattr(server, "_get_usage", lambda _agent: {})
     monkeypatch.setattr(server, "render_message", lambda *_args: "")
     monkeypatch.setattr(server, "_emit", lambda *_args: None)

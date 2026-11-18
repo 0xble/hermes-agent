@@ -5,7 +5,7 @@ Users map env-var names to ``op://vault/item/field`` references in
 per-reference ``op read`` fallback using whatever auth the user's ``op`` already has (``OP_SERVICE_ACCOUNT_TOKEN``
 headless, ``OP_SESSION_*`` interactive) — Hermes never authenticates on the
 user's behalf, and failures never block startup. Complete pulls are cached
-in-process and under ``<hermes_home>/cache/op_cache.json`` (values only; auth
+in-process and under ``<hermes_home>/op_cache.json`` (values only; auth
 material is fingerprinted, never stored).
 """
 
@@ -54,7 +54,7 @@ _OP_ENV_ALLOWLIST = (
 
 # L1 key folds in str(home_path) so a HERMES_HOME switch inside one long-lived
 # process (the gateway) can't return another profile's secrets. The disk key
-# omits home because the file already lives under <home>/cache/.
+# omits home because the file already lives in that home.
 _CacheKey = tuple[str, str, str, str]  # (auth_fp, account, home, refs_fp)
 _DISK_CACHE_BASENAME = "op_cache.json"
 
@@ -149,7 +149,7 @@ def _cooldown_path(home_path: Optional[Path] = None) -> Path:
     return resolve_cache_home(home_path) / "cache" / _COOLDOWN_BASENAME
 
 
-def _read_cooldowns(home_path: Optional[Path]) -> Dict[str, float]:
+def _read_cooldowns(home_path: Optional[Path]) -> dict[str, float]:
     try:
         payload = json.loads(_cooldown_path(home_path).read_text(encoding="utf-8-sig"))
     except (OSError, ValueError):
@@ -208,8 +208,8 @@ def _batch_safe_reference(reference: str) -> bool:
     return reference == reference.strip() and not any(c in reference for c in "\n\r$#\"'\\")
 
 
-def _run_op_batch(op: Path, references: Dict[str, str], *, account: str = "",
-                  token_value: str = "") -> Dict[str, str]:
+def _run_op_batch(op: Path, references: dict[str, str], *, account: str = "",
+                  token_value: str = "") -> dict[str, str]:
     """Resolve unique refs in one op invocation, never putting values on stdout.
 
     The temporary directory is private; both files are 0600 and removed on every
@@ -312,7 +312,7 @@ def fetch_onepassword_secrets(
 
     # Values carried over from a fresh-but-incomplete cache entry, and the fetch time
     # they were recorded under (reused so carried-over values never get a fresh lease).
-    prefetched: Dict[str, str] = {}
+    prefetched: dict[str, str] = {}
     prefetched_at: Optional[float] = None
     if use_cache:
         cached = _STORE.lookup(cache_key, cache_ttl_seconds, home_path)
@@ -328,8 +328,8 @@ def fetch_onepassword_secrets(
                            "(https://developer.1password.com/docs/cli/get-started/) or set "
                            "secrets.onepassword.binary_path to its absolute location.")
 
-    secrets: Dict[str, str] = dict(prefetched)
-    failure_kinds: List[ErrorKind] = []
+    secrets: dict[str, str] = dict(prefetched)
+    failure_kinds: list[ErrorKind] = []
     cooldown_key = _cooldown_key(cache_key[0], cache_key[1])
     if use_cache and _rate_limit_cooldown_active(cooldown_key, home_path):
         # Another process was refused within the cooldown: every read now would be refused
@@ -354,7 +354,7 @@ def fetch_onepassword_secrets(
             if ErrorKind.RATE_LIMITED not in failure_kinds:
                 # Isolate failed batches and parser-sensitive refs through the
                 # existing exact read path, preserving successful partial results.
-                resolved_refs: Dict[str, str] = {}
+                resolved_refs: dict[str, str] = {}
                 for name, ref in pending.items():
                     if name in secrets:
                         continue
@@ -399,7 +399,7 @@ def fetch_onepassword_secrets(
             _STORE.disk.clear(home_path)
         return secrets, warnings
 
-    stale_used: List[str] = []
+    stale_used: list[str] = []
     if use_cache and cache_ttl_seconds > 0 and failure_kinds and all(k in _STALE_OK_KINDS for k in failure_kinds):
         # Every failure was transient, so the last good value for a ref is still the
         # best answer. Served for this process only: the stale entry is never re-stored

@@ -20,6 +20,7 @@ import logging
 import time
 
 from gateway.platforms.event import MessageEvent, MessageType
+from hermes_cli.observability.shared_metrics_busy import note_busy_merged, settle_busy_arrival, stamp_busy_arrival
 
 logger = logging.getLogger(__name__)
 
@@ -62,8 +63,12 @@ def _authorized(runner, event, session_key):
         )
         return False
     if not getattr(event, '_bot_loop_admitted', False):
-        if not runner._admit_bot_message_for_source(event.source):
+        charge = object() if event.source.is_bot else None
+        if not runner._admit_bot_message_for_source(event.source, **({'charge': charge} if charge is not None else {})):
             return False
+        if charge is not None:
+            event._busy_bot_loop_charge = (
+                runner._bot_loop_guard_instance(), runner._bot_loop_guard_conversation(event.source), charge)
         event._bot_loop_admitted = True
     return True
 
@@ -125,12 +130,14 @@ async def _dispatch_busy_burst(adapter, runner, event, session_key):
             home = runner._resolve_profile_home_for_source(event.source)
             return runner._async_scope_or_null(_async_profile_runtime_scope, home)
         schedule(event, event.source, session_key, profile_scope=profile_scope)
+    stamp_busy_arrival(adapter, event)
     kind, bursts = _kind(adapter, event), _state(adapter, '_shared_bursts')
     while (burst := bursts.get(session_key)) is not None:
         if kind is not None and kind == _kind(adapter, burst.head) and adapter._can_merge_text_debounce_events(
                 burst.head, event):
             merge_pending_message_event({session_key: burst.head}, session_key, event, merge_text=kind == 'text')
             burst.absorbed.append(event)
+            note_busy_merged(burst.head, event)
             burst.last_ts = time.monotonic()
             _arm(adapter, session_key, burst)
             return await _accepted(adapter, burst, event)
@@ -257,4 +264,11 @@ def discard_busy_burst(adapter, session_key):
     burst = adapter.__dict__.get('_shared_bursts', {}).pop(session_key, None)
     if burst is not None:
         burst.timer.cancel()
+        for event in (burst.head, *burst.absorbed):
+            receipt = event.__dict__.pop('_busy_bot_loop_charge', None)
+            if receipt is not None:
+                guard, conversation, charge = receipt
+                guard.refund(conversation, charge)
+                event._bot_loop_admitted = False
+        settle_busy_arrival(burst.head, discarded=True)
         burst.done.done() or burst.done.set_result(None)

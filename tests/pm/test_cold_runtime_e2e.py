@@ -22,6 +22,8 @@ import tomllib
 
 import pytest
 
+from tests.pm._cold_snapshot import copy_cold_source
+
 # Spawns children with a home it builds itself; the parent's must stay real.
 pytestmark = pytest.mark.real_machine_home
 
@@ -98,21 +100,17 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
 
     source = Path(__file__).resolve().parents[2]
     repo = tmp_path / "source"
-    repo.mkdir()
-    for name in ("pm", "hermes_cli"):
-        shutil.copytree(source / name, repo / name,
-                        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    for name in ("utils.py", "hermes_constants.py", "hermes_yaml.py",
-                 "hermes_bootstrap.py"):
-        shutil.copy2(source / name, repo / name)
+    copy_cold_source(source, repo)
     # No production application lock or metadata enters this source snapshot.
     recipe = tomllib.loads((repo / "pm" / "pyproject.toml").read_text())
     yaml_requirement = next(dep for dep in recipe["project"]["dependencies"]
                             if dep.startswith("ruamel.yaml"))
+    # The legacy launch completes config migration, whose dotenv reader is real.
+    app_requirements = [yaml_requirement, "python-dotenv>=1.2.1,<2"]
     (repo / "pyproject.toml").write_text(
         '[project]\nname="cold-pm-app"\nversion="0.0.0"\n'
         'requires-python=">=3.14,<3.15"\n'
-        f'dependencies=[{json.dumps(yaml_requirement)}]\n'
+        f'dependencies={json.dumps(app_requirements)}\n'
         '[project.optional-dependencies]\nall=[]\n'
         '[tool.uv]\npackage=false\n', encoding="utf-8",
     )

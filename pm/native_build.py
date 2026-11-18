@@ -17,6 +17,7 @@ import subprocess
 import tempfile
 
 from pm.progress import run_contained
+from pm.worker_budget import unbounded
 
 _PROVIDER = Path("scripts/build/windows-deps.ps1")
 
@@ -44,6 +45,7 @@ def prepare_windows_environment(*, source: Path, state: Path, env: Mapping[str, 
     return prepared
 
 
+@unbounded()
 def source_build_environment(source: Path) -> dict[str, str] | None:
     """The environment a dependency build of ``source`` needs on this host.
 

@@ -25,6 +25,8 @@ Run standalone for manual probes: ``python -m tests.fakes.fake_llm_provider 8765
 from __future__ import annotations
 
 import json
+import select
+import socket
 import threading
 import time
 from dataclasses import dataclass, field
@@ -91,6 +93,8 @@ class DropMidStream:
 
     text: str = "partial answer that never finishes"
     after_chars: int = 12
+    # Keep the SSE reader active while a test observes the in-flight request.
+    before_drop: Callable[[Callable[[], None]], None] | None = None
 
 
 @dataclass
@@ -319,11 +323,22 @@ def _handler_for(server: FakeLLMServer) -> type[BaseHTTPRequestHandler]:
                 self.close_connection = True
                 return
             if isinstance(resp, DropMidStream):
+                if record is not None:
+                    record["drop_served"] = False
                 self._start_sse()
                 self._sse(_chunk({"role": "assistant", "content": ""}))
                 self._sse(_chunk({"content": resp.text[: resp.after_chars]}))
+                if resp.before_drop is not None:
+                    resp.before_drop(lambda: self._sse(_chunk({"content": ""})))
                 self.wfile.flush()
                 self.close_connection = True
+                # A successful buffered write alone does not prove the client stayed
+                # connected: TCP may accept it after a stale-killed reader sent FIN.
+                readable, _, _ = select.select([self.connection], [], [], 0)
+                if readable and not self.connection.recv(1, socket.MSG_PEEK):
+                    return
+                if record is not None:
+                    record["drop_served"] = True
                 return
             message, finish, usage = _message_for(resp, server, prompt_tokens)
             # What the provider billed for this request, so usage/cost accounting can be checked

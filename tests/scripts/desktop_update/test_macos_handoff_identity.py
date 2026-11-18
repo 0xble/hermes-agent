@@ -80,7 +80,7 @@ sys.exit(0 if ok else 2)
            "TMPDIR": str(tmp_path), "HERMES_UPDATE_SHIM_GRACE_SECONDS": "0"}
     result = subprocess.run(["/bin/bash", str(POSIX), "--daemonized", "--no-ui",
                              "--install-root", str(install)], env=env, cwd=tmp_path,
-                            text=True, capture_output=True, timeout=60)
+                            text=True, capture_output=True, timeout=60, check=False)
     assert witness.exists(), result.stdout + result.stderr
     observed = json.loads(witness.read_text())
     assert observed["ok"], observed

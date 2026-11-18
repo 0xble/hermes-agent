@@ -264,24 +264,31 @@ def test_notice_held_after_stop_does_not_pin_session(server, registry, detached)
 
 
 def test_recovered_process_whose_pid_died_releases_session(server, registry, detached, monkeypatch):
-    """A checkpoint-recovered process has no reader thread to observe its exit; a dead PID must not pin its owner."""
+    """A dead recovered PID is retained as one unknown-status notice, which pins only until taken."""
     sid, session, _ = detached
-    _spawn(registry, session["session_key"], notify_on_complete=True, detached=True, pid=12345)
+    proc = _spawn(registry, session["session_key"], notify_on_complete=True, detached=True, pid=12345)
     monkeypatch.setattr(registry, "_detached_host_fate", lambda *_: "gone")
 
+    assert not server._session_is_reapable(sid, session)
+    event = registry.completion_queue.get_nowait()
+    assert event["exit_code"] is None
+    assert proc.exited and proc.exit_code is None
     assert server._session_is_reapable(sid, session)
 
 
 @pytest.mark.parametrize("unit", ["", "hermes-proc.scope"])
-def test_uncollected_recovered_exit_never_pins_session(server, registry, detached, unit):
-    """A recovered entry closed without a collected exit (exited_at stays 0, a scope keeps it retained) queues no
-    completion, so it must not hold its owner however long ago it ended."""
+def test_uncollected_recovered_exit_pins_only_until_notice_taken(server, registry, detached, unit):
+    """An uncollected recovered exit is one explicit unknown-status completion, not an immortal pin."""
     sid, session, _ = detached
     proc = _spawn(registry, session["session_key"], notify_on_complete=True, detached=True, pid=12345,
                   systemd_unit=unit)
     registry._prune_uncollected_detached(proc)
 
-    assert proc.exited and not proc.exited_at
+    assert proc.exited and proc.exit_code is None and proc.exited_at
+    assert not server._session_is_reapable(sid, session)
+    event = registry.completion_queue.get_nowait()
+    assert event["exit_code"] is None
+    assert registry.completion_queue.empty()
     assert server._session_is_reapable(sid, session)
 
 

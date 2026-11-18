@@ -436,7 +436,7 @@ class TestFullBackupReportsWhyThereIsNoArchive:
         import hermes_cli.update_cmd_maint as maint
 
         monkeypatch.setattr("hermes_cli.backup.get_default_hermes_root", lambda: home)
-        monkeypatch.setattr(maint, "_load_updates_cfg", lambda: {})
+        monkeypatch.setattr(maint, "_load_updates_cfg", dict)
         ur.begin_update_receipt()
         maint._run_full_backup()
         data = ur._current.get().data
@@ -458,7 +458,7 @@ class TestFullBackupReportsWhyThereIsNoArchive:
         assert "BackupInProgressError" in steps[0]["detail"]
 
     def test_failed_archive_write_reads_as_a_failure(self, receipt_home, monkeypatch, capsys):
-        import hermes_cli.backup as backup
+        from hermes_cli import backup
 
         def _disk_full(*_a, **_kw):
             raise OSError("disk full")
@@ -476,7 +476,7 @@ class TestFullBackupReportsWhyThereIsNoArchive:
     def test_unloadable_backup_module_reads_as_a_failure(self, receipt_home, monkeypatch, capsys):
         import sys
 
-        import hermes_cli.backup  # noqa: F401 — imported so _run can still patch it
+        import hermes_cli.backup
 
         (receipt_home / "config.yaml").write_text("model: x\n")
         monkeypatch.setitem(sys.modules, "hermes_cli.backup", None)

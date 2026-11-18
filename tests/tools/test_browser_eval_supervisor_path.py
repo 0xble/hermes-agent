@@ -14,6 +14,31 @@ import pytest
 from tools import browser_tool_session as bt_session
 
 
+def _start_running_loop():
+    """Start an event loop on a daemon thread and return once it is running.
+
+    ``Thread.start()`` returns before ``run_forever()`` begins, and the
+    supervisor refuses work while ``loop.is_running()`` is false. The first
+    callback runs only inside ``run_forever()``, so waiting for it proves the
+    loop is live.
+    """
+    import asyncio
+    import threading
+
+    loop = asyncio.new_event_loop()
+    running = threading.Event()
+
+    def _runner():
+        asyncio.set_event_loop(loop)
+        loop.call_soon(running.set)
+        loop.run_forever()
+
+    thread = threading.Thread(target=_runner, daemon=True)
+    thread.start()
+    assert running.wait(10), "supervisor test loop did not start"
+    return loop, thread
+
+
 # ---------------------------------------------------------------------------
 # Fast-path dispatch: tools.browser_tool._browser_eval
 # ---------------------------------------------------------------------------
@@ -136,14 +161,7 @@ def _make_supervisor_with_cdp(cdp_response):
 
     # Build a real running event loop on a background thread so
     # asyncio.run_coroutine_threadsafe has somewhere to dispatch.
-    loop = asyncio.new_event_loop()
-
-    def _runner():
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
-
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
+    loop, thread = _start_running_loop()
 
     async def _fake_cdp(method, params=None, *, session_id=None, timeout=10.0):
         return cdp_response
@@ -202,12 +220,7 @@ class TestEvaluateRuntimeResponseShaping:
         sup._active = True
         sup._page_session_id = None  # ← attach hasn't happened yet
 
-        loop = asyncio.new_event_loop()
-        thread = threading.Thread(
-            target=lambda: (asyncio.set_event_loop(loop), loop.run_forever()),
-            daemon=True,
-        )
-        thread.start()
+        loop, thread = _start_running_loop()
         sup._loop = loop
         try:
             out = sup.evaluate_runtime("1+1")
@@ -232,14 +245,7 @@ def _make_supervisor_with_cdp_fn(cdp_fn):
     sup._active = True
     sup._page_session_id = "test-session-id"
 
-    loop = asyncio.new_event_loop()
-
-    def _runner():
-        asyncio.set_event_loop(loop)
-        loop.run_forever()
-
-    thread = threading.Thread(target=_runner, daemon=True)
-    thread.start()
+    loop, thread = _start_running_loop()
 
     sup._cdp = cdp_fn  # type: ignore[method-assign]
     sup._loop = loop

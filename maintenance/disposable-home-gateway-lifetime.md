@@ -20,6 +20,34 @@ reusable idle-exit behavior. The classic `HermesCLI` route forwards its existing
 `chat -q`/`-Q` uses the same lease as `-z`; no new configuration or lifecycle
 manager is introduced. Injected connection factories are unchanged.
 
+Update pause must not acquire a finite client's lease: `pause-for-update` refuses
+with `{"pausing": false, "client_owned": true}`. The shared
+`hermes_cli/gateway_client_ownership.py` predicate proves ownership with a
+PID-matched control identity or exact `--client-owned` argv flag. POSIX bare
+pause, the same update's manual/profile restart arming, unmapped SIGTERM sweep,
+stale-fleet drain and final force-kill all exclude those owners. Windows pause
+filters them before planned-stop markers, pause debt and argv replay; its
+leftover tree-kill selection also excludes them. One notice per excluded PID
+explains that it remains on its lease. Such owners are never drained, SIGTERMed,
+SIGKILLed, replayed with detached stdin, or added to update resume debt; they
+keep running old code until their creating client's lease ends. Ordinary
+persistent gateway pause/replay and restart behavior is unchanged.
+
+Contract tests: `tests/gateway/test_client_owned_update_pause.py`,
+  `tests/hermes_cli/test_update_client_owned_pause.py`,
+  `tests/hermes_cli/test_update_client_owned_fleet.py`.
+The Windows marker/leftover selections have host-independent fake-process
+coverage; its full only-a-lease pause regression is marked for native Windows.
+
+Fleet-review preflight: root/CLI/tests guidance and CONTRIBUTING rechecked at
+upstream `e76fbd80be65ea5c1b89831f8d7aaedb713f5cac`. Independent proposal:
+extend the existing identify/argv decision into one neutral predicate and use
+it at every updater stop/replay selection, not a second lifecycle manager.
+Open/closed PR and issue searches for client-owned gateways and finite update
+leases found no equivalent; neighboring fleet restart fixes address process
+identity and supervised relaunch, not finite ownership. This remains an
+intentional fork ownership fence with no added dependency.
+
 The finite-client owner serves local sessions only. It must not dispatch cron,
 restore heartbeat/loop/recovered work, connect messaging adapters, or start
 long-lived daemon housekeeping. A disposable home is not a daemon enrollment.
@@ -355,6 +383,16 @@ is effectively level and total median is slower, so do not claim that magnitude
 from this run. Fresh-receipt identity suppression remains independently GREEN.
 Head again leaves **zero** live children; base leaves **27**, all exact recorded
 fixture children cleaned afterward. Final-output-to-exit medians are 0.127/0.404 s.
+
+A named-profile ensure must also observe the root multiplexer reservation before
+reporting its own startup child's exit as a terminal failure. Desktop cron fires
+profiles concurrently, and a losing launch can exit before the winning root
+publishes that profile's control-channel roster. While the root remains reserved,
+the client waits within its existing deadline, then returns ready or pending,
+without spawning another child. An exited child with neither a profile owner nor
+a root reservation still fails promptly. The behavior contract in
+`tests/hermes_cli/test_gateway_runtime_ensure.py` uses a real root reservation and
+an exited child to cover both ready and pending outcomes.
 
 Retire when released upstream bounds finite-client auto-starts including killed
 clients and prevents those owners from running unrelated daemon services.

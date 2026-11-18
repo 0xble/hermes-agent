@@ -70,7 +70,8 @@ with a fresh outage id, an unclaimed notice, and backoff starting again at 60 s.
 Readers prune these stale records, along with malformed ones.
 
 `hermes fallback status` and `hermes fallback cooldowns` list active records.
-`hermes fallback cooldowns clear --all` clears every record. If the file itself cannot be
+`hermes fallback cooldowns clear --all` clears cooldown and probe records, but keeps
+recovery tombstones so late in-flight failures cannot resurrect a recovered outage. If the file itself cannot be
 read or parsed, this explicit operator action renames it to a `.corrupt-<time_ns>` backup
 under the same writer lock, preserving the bytes for diagnosis. The CLI reports the
 backup path. Lock or rename failures still exit nonzero; targeted clears do not quarantine.
@@ -84,6 +85,22 @@ expired record as authoritative over the agent's cached deadline. A provider res
 shorten an outage below a deadline cached earlier, so a cached fallback agent probes the
 primary once the shared window passes. The expired record stays until that probe succeeds
 and clears it with one recovery notice.
+
+Half-open probes carry one durable owner token. A local token stops suppressing cooldown
+arming as soon as it loses durable ownership (expiry, takeover, operator clear, or
+replacement), and every primary exit consumes its local token even if settlement fails.
+An older claimant must not overwrite another process's live probe. Runtime claims size
+the lease to the primary request timeout plus a 120 s margin (SDK default: 600 s),
+rather than scheduling renewal. A valid live lease survives expired-record pruning.
+Probe failure reasons derive from `_SHARED_COOLDOWN_REASONS`, so billing failures,
+like rate limits and overload, re-arm the existing outage and double its backoff instead
+of releasing the lease for an immediate retry. `server_error` and `timeout` are explicit
+probe-only additions: they do not arm a fresh shared breaker, but a failed half-open
+probe is evidence that an already-recorded outage persists. When the request leaves the
+primary for either reason, re-arm that outage with the same exponential backoff. Same-primary
+retries retain the lease; interrupt/cancel exits release it without escalation.
+Custom URL ownership is cached per profile/config revision and snapshotted before taking
+the cross-process state lock; alias merging cannot parse config while holding that lock.
 
 ## Source surfaces and proof
 
@@ -102,6 +119,11 @@ and clears it with one recovery notice.
   clearing that reaches a cached agent at its next turn. Overload cases cover 529 with
   Retry-After and 503 without it through `run_conversation`, in-flight versus lapsed
   overload backoff, non-arming 500 and timeout, and non-finite record pruning.
+- `tests/agent/test_shared_primary_probe_review.py`: all shared arming reasons (including billing)
+  re-arm and double probe backoff for enum/string inputs; server errors and timeouts escalate only
+  an existing probe outage, never arm a fresh breaker. Also covers lost-lease rearming, operator clear,
+  takeover recovery, preserved tombstones, profile/revision-scoped config caching, and
+  long-request lease coverage through both runtime claim entry points.
 - `tests/hermes_cli/test_fallback_cmd.py`: the `cooldowns` list and clear surface, plus `clear`
   keeping its chain meaning, and `status` on a non-finite record.
 - `tests/agent/_shared_cooldown_stub.py`: loopback OpenAI-compatible stub and child runner;

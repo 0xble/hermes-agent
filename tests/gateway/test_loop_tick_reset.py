@@ -1,5 +1,8 @@
 """Strict loop ticks cannot cross a fresh-session reset or block later human input.
 
+Compression exhaustion retains the session, so a queued tick stays on that owner
+instead of being cancelled by an implicit reset. Explicit /new still cancels.
+
 Use real authority admission, drains, reset callers and transcript-pin checks. Only model
 execution and platform sends are stand-ins. Events below reproduce the producer race: the
 scheduler claims an idle tick, then a human turn starts before its route wake is admitted.
@@ -115,10 +118,13 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
         finish.set()
         await _drains_idle(authority, adapter)
         new = runner.session_store.peek_session_id(key)
-        assert new != old
+        if reset == "exhaustion":
+            assert new == old
+        else:
+            assert new != old
         await adapter.handle_message(MessageEvent(text="B", source=source, message_id="B"))
         await _drains_idle(authority, adapter)
-        rows = [row for sid in (old, new) for row in list_session_admissions(
+        rows = [row for sid in dict.fromkeys((old, new)) for row in list_session_admissions(
             authority.db, session_id=sid, pending_only=False)]
         actual = next(row for row in rows if row["admission_id"] == wake["admission_id"])
         from hermes_cli.loops import load_loop
@@ -129,10 +135,15 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
                         admissions=[(row["payload"].get("text"), row["status"], row["outcome"]) for row in rows],
                         awaiting=state.awaiting_response, log=caplog.text)
         print("RESET_OBSERVED", observed)
-        assert ("B", new) in executed, observed
-        assert not any(text == "WAKE" for text, _ in executed), observed
-        assert (actual["status"], actual["outcome"]) == ("terminal", "cancelled"), observed
-        assert state.awaiting_response is superseded, observed
+        if reset == "exhaustion":
+            assert ("B", old) in executed, observed
+            assert (actual["status"], actual["outcome"]) == ("terminal", "completed"), observed
+            assert state.awaiting_response is True, observed
+        else:
+            assert ("B", new) in executed, observed
+            assert not any(text == "WAKE" for text, _ in executed), observed
+            assert (actual["status"], actual["outcome"]) == ("terminal", "cancelled"), observed
+            assert state.awaiting_response is superseded, observed
         assert len([row for row in rows if row["request_id"] == wake["request_id"]]) == 1, rows
         assert "admission_conflict" not in caplog.text, observed
         # A repeated reset-move observation is idempotent and cannot settle a replacement tick.
@@ -151,7 +162,7 @@ async def test_native_reset_cancels_strict_tick_and_unblocks_human(monkeypatch, 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("superseded", [False, True])
-async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatch, tmp_path, caplog, superseded):
+async def test_local_exhaustion_keeps_session_and_tick_claim(monkeypatch, tmp_path, caplog, superseded):
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
     from tests.fakes.runtime_owner import initialize_session_authority
@@ -214,7 +225,7 @@ async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatc
         finish.set()
         await _drains_idle(authority)
         new = runner.session_store.peek_session_id(key)
-        assert new != ref.session_id
+        assert new == ref.session_id
         await authority.submit(connection.actor, Submission("B", ref, {"text": "B"}, "queue"))
         await _drains_idle(authority)
         rows = list_session_admissions(authority.db, session_id=ref.session_id, pending_only=False)
@@ -226,10 +237,9 @@ async def test_local_exhaustion_cancels_strict_tick_and_settles_claim(monkeypatc
                         wake=(actual["status"], actual["outcome"]),
                         awaiting=state.awaiting_response, log=caplog.text)
         print("LOCAL_RESET_OBSERVED", observed)
-        assert ("B", new) in executed, observed
-        assert not any(text == "WAKE" for text, _ in executed), observed
-        assert (actual["status"], actual["outcome"]) == ("terminal", "cancelled"), observed
-        assert state.awaiting_response is superseded, observed
+        assert ("B", ref.session_id) in executed, observed
+        assert (actual["status"], actual["outcome"]) == ("terminal", "completed"), observed
+        assert state.awaiting_response is True, observed
         assert "admission_conflict" not in caplog.text, observed
     finally:
         finish.set()

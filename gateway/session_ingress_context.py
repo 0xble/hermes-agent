@@ -1,4 +1,5 @@
 """Process-local callback provenance; private snapshots are revalidated, not grants."""
+import asyncio
 from contextlib import contextmanager
 from copy import copy
 from contextvars import ContextVar
@@ -7,8 +8,11 @@ import weakref
 import hashlib
 import hmac
 import json
+import logging
 
 from hermes_state_runtime import RuntimeStoreError
+
+logger = logging.getLogger(__name__)
 
 _callback: ContextVar[tuple | None] = ContextVar('native_ingress_callback', default=None)
 _relay_callback: ContextVar[tuple | None] = ContextVar('relay_ingress_callback', default=None)
@@ -58,6 +62,15 @@ def _relay_seal(transport, source, provenance):
                     hashlib.sha256).hexdigest()
 
 
+def reseal_relay(adapter, source, provenance):
+    """*provenance* bound to the stored *source* dict instead; only for a seal the caller verified."""
+    from gateway.session import SessionSource
+    stored = SessionSource.from_dict(source)
+    stored.is_bot = source['is_bot']
+    base = {key: value for key, value in provenance.items() if key != 'relay'}
+    return {**base, 'relay': _relay_seal(adapter._transport, stored, base)}
+
+
 def register_transport_home(runner, profile, home):
     """Called when the server creates a callback, never from event home fields."""
     homes = getattr(runner, '_native_transport_homes', None)
@@ -96,13 +109,81 @@ def carry_callback(event, rewritten):
 _PREFIX_PRODUCERS = ('webhook', 'api_server', 'msgraph_webhook')
 
 
-def _binding(runner, source, profile):
+def _runtime_profile(runner, source, profile, owner_name, homes, relay):
+    """The multiplexed runtime profile *source* routes to; ``_binding`` checks it is served."""
+    # Same matcher as ingress stamping, ``user_id`` included: a ``user_id`` route stamps the
+    # source upstream, so it must resolve here too. A route applies only to its bot_profile's
+    # bot (#104933), so the receiving adapter's owner is part of the match.
+    matches = [route for route in runner.config.profile_routes if route.matches(
+        source.platform.value, guild_id=source.scope_id, chat_id=source.chat_id,
+        thread_id=source.thread_id, parent_chat_id=source.parent_chat_id,
+        adapter_profile=profile, user_id=source.user_id)]
+    if source.profile and source.platform.value in _PREFIX_PRODUCERS:
+        # ``/p/<profile>/`` producers address a profile explicitly on the HOST's listener; that
+        # URL prefix names the profile and wins over ``profile_routes`` (webhook.py /
+        # api_server.py stamp it; a bare producer source carries the routed name itself).
+        return source.profile
+    if matches:
+        rank = max(route.specificity for route in matches)
+        best = [route for route in matches if route.specificity == rank]
+        if len(best) != 1:
+            raise RuntimeStoreError('admission_conflict')
+        return best[0].profile
+    if relay and profile is None and source.profile in homes:
+        # The instance's one authenticated connector (relay is process-level) routes scopes to
+        # served profiles (Team Gateway); the relay seal covers ``source.profile``.
+        return source.profile
+    return owner_name
+
+
+def _registry_candidates(runner, platform):
     registries = [(None, runner.adapters), *getattr(runner, '_profile_adapters', {}).items()]
+    return [(owner, mapping.get(platform)) for owner, mapping in registries]
+
+
+def _slot_adapter(candidates, profile):
+    return next((adapter for owner, adapter in candidates if owner == profile), None)
+
+
+# A platform adapter leaves its registry slot when it goes fatal and returns when the reconnect
+# watcher installs the replacement: the first retry is immediate and the watcher ticks every 10s,
+# so a reconnect that succeeds lands well inside this bound (the next retry backs off 30s).
+ADAPTER_RECONNECT_WAIT_S = 30.0
+_ADAPTER_RECONNECT_POLL_S = 0.25
+
+
+async def await_reconnecting_adapter(runner, envelope, stopping):
+    """Wait, bounded, for a restored turn's adapter slot to refill after a reconnect.
+
+    Only an EMPTY slot waits: ``_binding`` still decides every identity check (an ambiguous
+    registration, a profile or connector mismatch) once this returns, and a slot still empty at
+    the bound fails there as ``not_found`` exactly as before."""
+    provenance = envelope.get('provenance')
+    if not isinstance(provenance, dict):
+        return
+    from gateway.config import Platform
+    platform = Platform.RELAY if 'relay' in provenance else Platform(envelope['source']['platform'])
+    profile = provenance.get('transport_profile')
+    if _slot_adapter(_registry_candidates(runner, platform), profile) is not None:
+        return
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + ADAPTER_RECONNECT_WAIT_S
+    logger.info('Admitted turn waiting up to %.0fs for the %s adapter (profile %s) to reconnect',
+                ADAPTER_RECONNECT_WAIT_S, platform.value, profile or 'primary')
+    while _slot_adapter(_registry_candidates(runner, platform), profile) is None:
+        if stopping() or loop.time() >= deadline:
+            logger.warning('%s adapter (profile %s) still absent; the admitted turn fails',
+                           platform.value, profile or 'primary')
+            return
+        await asyncio.sleep(_ADAPTER_RECONNECT_POLL_S)
+
+
+def _binding(runner, source, profile):
     from gateway.config import Platform
     relay = source.delivered_via_upstream_relay is True
     platform = Platform.RELAY if relay else source.platform
-    candidates = [(owner, mapping.get(platform)) for owner, mapping in registries]
-    adapter = next((adapter for owner, adapter in candidates if owner == profile), None)
+    candidates = _registry_candidates(runner, platform)
+    adapter = _slot_adapter(candidates, profile)
     if adapter is None or sum(item is adapter for _, item in candidates) != 1:
         raise RuntimeStoreError('not_found')
     home = getattr(runner, '_native_transport_homes', {}).get(profile)
@@ -134,26 +215,7 @@ def _binding(runner, source, profile):
         owner_name = profile or primary
         if homes.get(owner_name) != home:
             raise RuntimeStoreError('profile_mismatch')
-        # Same matcher as ingress stamping, ``user_id`` included: a ``user_id`` route stamps the
-        # source upstream, so it must resolve here too. A route applies only to its bot_profile's
-        # bot (#104933), so the receiving adapter's owner is part of the match.
-        matches = [route for route in runner.config.profile_routes if route.matches(
-            source.platform.value, guild_id=source.scope_id, chat_id=source.chat_id,
-            thread_id=source.thread_id, parent_chat_id=source.parent_chat_id,
-            adapter_profile=profile, user_id=source.user_id)]
-        if source.profile and source.platform.value in _PREFIX_PRODUCERS:
-            # ``/p/<profile>/`` producers address a profile explicitly on the HOST's listener; that
-            # URL prefix names the profile and wins over ``profile_routes`` (webhook.py /
-            # api_server.py stamp it; a bare producer source carries the routed name itself).
-            runtime_profile = source.profile
-        elif matches:
-            rank = max(route.specificity for route in matches)
-            best = [route for route in matches if route.specificity == rank]
-            if len(best) != 1:
-                raise RuntimeStoreError('admission_conflict')
-            runtime_profile = best[0].profile
-        else:
-            runtime_profile = owner_name
+        runtime_profile = _runtime_profile(runner, source, profile, owner_name, homes, relay)
         if (source.profile or primary) != runtime_profile or runtime_profile not in homes:
             raise RuntimeStoreError('profile_mismatch')
         runtime_home = homes[runtime_profile]
@@ -214,6 +276,10 @@ def restore_provenance(runner, source, provenance):
         raise RuntimeStoreError('profile_mismatch')
     source.delivered_via_upstream_relay = candidate.delivered_via_upstream_relay
     source._transport_adapter_ref = weakref.ref(adapter)
+    # Re-pin the identity ingress resolved: the drained turn's route records the receiving bot from it
+    # (``SessionEntry.transport_profile``), so after a restart its session still answers through that bot.
+    from gateway.session_identity import canonical_identity
+    canonical_identity(source, runner=runner, adapter=adapter, transport_profile=provenance.get('transport_profile'))
     source._authorization_profile_home = home
     return runtime_home
 

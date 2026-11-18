@@ -27,6 +27,33 @@ from tools.delegate_tool_results import (
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
+def _reserve_child_transcript(child: Any) -> None:
+    """Make a queued child readable without completing its first-turn persistence."""
+    from agent.runtime_session_store import RuntimeSessionStore
+
+    db = child._session_db
+    if db is None or child._persist_disabled or isinstance(db, RuntimeSessionStore):
+        # Managed workers already have an owner-reserved row. Persistence-disabled
+        # children retain their existing no-transcript behavior.
+        return
+    try:
+        # Only the lineage marker: every marker-keyed reader (pickers, resume tip
+        # walk, FTS, cascade delete) must see a subagent, not a continuation, from
+        # the moment its id is published. The first turn merges the rest of the
+        # constructor config in (``AIAgent._ensure_db_session``); the prompt stays unset.
+        parent_sid = child._parent_session_id
+        db.create_session(
+            session_id=child.session_id, source="subagent",
+            parent_session_id=parent_sid,
+            model_config={"_delegate_from": parent_sid} if parent_sid else None,
+        )
+        child._session_db_reserved = True
+    except BaseException:
+        # Ownership has transferred, but the child is not attached or published yet.
+        child.close()
+        raise
+
+
 def _num(value: Any, default: int = 0) -> int:
     """int() for counters that may be mocks/None on test doubles."""
     return int(value) if isinstance(value, (int, float)) else default
@@ -957,9 +984,18 @@ class _ChildRun:
                 parent_session_id=str(getattr(child, "_parent_session_id", "") or ""),
                 root_session_id=getattr(child, "_delegation_root_session_id", None),
             ):
-                return child.run_conversation(
-                    user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
-                )
+                try:
+                    return child.run_conversation(
+                        user_message=user_message, task_id=self.child_task_id, stream_callback=self.relay_text,
+                    )
+                finally:
+                    # Release when the child actually exits; the parent may have already
+                    # returned a timeout while this worker is still unwinding.
+                    try:
+                        from agent.spare_guards import release_fallback_route
+                        release_fallback_route(child)
+                    except Exception:
+                        logger.debug("Failed to release spare fallback lease in child worker", exc_info=True)
 
         future = self.conversation_future = executor.submit(contextvars.copy_context().run, _run_with_thread_capture)
         # One wait covers both ways out: the worker finishing, or the heartbeat's stale verdict.

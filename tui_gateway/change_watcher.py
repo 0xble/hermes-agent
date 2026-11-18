@@ -187,19 +187,11 @@ def _pet_changed_payload() -> dict:
     return {"enabled": False}
 
 
-# last_activity_at / _description are left out on purpose: the session activity heartbeat restamps
-# them mid-turn and on idle ticks, so hashing them re-fired sessions.changed every heartbeat window
-# (#98005). Liveness comes from session.active_list, and a real turn still moves message_count.
-_SESSION_SIGNATURE_FIELDS = (
-    "id", "source", "session_key", "display_name", "model", "parent_session_id",
-    "started_at", "ended_at", "end_reason", "message_count", "tool_call_count",
-    "cwd", "git_branch", "git_repo_root", "title", "title_source", "profile_name",
-    "archived", "pinned", "hidden", "last_read_at", "handoff_state",
-)
-# path -> (database/WAL mtime, session-table digest). The mtime guard keeps the
-# normal 0.5 s watch pass stat-only; SQLite is read only after another process
+# path -> (database/WAL mtime, session-table digest, incremental projection).
+# Journal-backed stores read only changed session rows after the first scan.
+# The mtime guard keeps the normal 0.5 s watch pass stat-only. SQLite is read only after another process
 # actually commits (and for ``utils.RACY_MTIME_WINDOW_NS`` after it, see _settled_mtime).
-_sessions_db_sig_cache: dict[str, tuple[object, tuple | None]] = {}
+_sessions_db_sig_cache: dict[str, tuple[object, tuple | None, object]] = {}
 
 
 def _session_db_content_sig(db_path: Path):
@@ -218,38 +210,24 @@ def _session_db_content_sig(db_path: Path):
     if cached is not None and cached[0] == mtime:
         return cached[1]
     if not db_path.exists():
-        _sessions_db_sig_cache[cache_key] = (mtime, None)
+        _sessions_db_sig_cache[cache_key] = (mtime, None, None)
 
         return None
 
     conn = None
+    revision = None
     try:
-        import hashlib
-        import marshal
         from hermes_state import _connect_tracked_db
         from hermes_state_holders import read_only_db_uri
+        from hermes_state_session_signature import session_content_signature
 
         conn = _connect_tracked_db(read_only_db_uri(db_path), tracking_path=db_path,
                                    uri=True, timeout=0.05)
-        available = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
-        fields = tuple(field for field in _SESSION_SIGNATURE_FIELDS if field in available)
-        if not fields:
-            # A state.db without a readable sessions table (foreign schema, legacy
-            # or transient file): keep the old mtime contract so any move still
-            # wakes the sidebar instead of silently never broadcasting.
+        # Journal bounds, changed rows and the digest must share one snapshot.
+        conn.execute("BEGIN")
+        signature, revision = session_content_signature(conn, db_path, cached[2] if cached else None)
+        if signature is None:
             signature = ("mtime-fallback", mtime)
-        else:
-            order = " ORDER BY id" if "id" in available else ""
-            rows = conn.execute(f"SELECT {', '.join(fields)} FROM sessions{order}")
-            digest = hashlib.blake2b(digest_size=16)
-            for row in rows:
-                # SQLite rows contain only primitive scalar values. Version 2 has no
-                # object-reference memoization, so equal rows hash identically across
-                # connections; binary doubles avoid float-to-decimal work every tick.
-                # This is an in-process signature only; never unmarshal stored input.
-                digest.update(marshal.dumps(tuple(row), 2))
-                digest.update(b"\0")
-            signature = (fields, digest.digest())
     except Exception:
         # A busy/locked read after a good one keeps the last digest and leaves the cached mtime
         # stale so the next pass re-reads: digest -> mtime -> digest would broadcast twice.
@@ -260,7 +238,7 @@ def _session_db_content_sig(db_path: Path):
         if conn is not None:
             conn.close()
 
-    _sessions_db_sig_cache[cache_key] = (_settled_mtime(mtime), signature)
+    _sessions_db_sig_cache[cache_key] = (_settled_mtime(mtime), signature, revision)
 
     return signature
 

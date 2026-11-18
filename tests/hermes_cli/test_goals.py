@@ -165,6 +165,24 @@ class TestGoalManager:
         headline, contract = parse_contract(goal)
         assert goal_authoring_findings(headline, contract) == []
 
+    @pytest.mark.parametrize("goal", [
+        "Track task id 95b8eda2 until the worker completes.",
+        "Track session UUID: 95b8eda2 until the worker completes.",
+    ])
+    def test_goal_authoring_allows_labeled_task_or_session_prefix(self, goal):
+        from hermes_cli.goals import goal_authoring_findings
+        assert goal_authoring_findings(goal) == []
+
+    def test_goal_authoring_checklist_finding_names_span_and_remedy(self):
+        from hermes_cli.goals import goal_authoring_findings
+        finding = goal_authoring_findings(
+            "Ship the release",
+            {"verification": "Wiki main, agents main, LPG release, Io skill, and authority page are verified."},
+        )[0]
+        assert finding.code == "verification_checklist"
+        assert "Wiki main, agents main" in finding.message
+        assert "one observable end state" in finding.fix
+
     def test_goal_authoring_revision_cap_preserves_legacy_small_fix(self):
         from hermes_cli.goals import goal_authoring_findings
         current = len("Keep the service healthy") + len("The service is healthy.")

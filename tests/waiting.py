@@ -18,8 +18,9 @@ Prefer an Event the code under test sets (``threading.Event`` / ``asyncio.Event`
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from typing import TypeVar
 
@@ -27,6 +28,79 @@ T = TypeVar("T")
 
 DEFAULT_TIMEOUT = 10.0  # a deadline, not a delay: only a hang ever waits this long
 DEFAULT_INTERVAL = 0.01
+
+
+def process_alive(process_or_pid, *, created: float | None = None) -> bool:
+    """A live non-zombie, or False if reaped at any point during the probe.
+
+    Accept an existing Process to retain its PID-reuse protection. ``created`` also
+    checks an identity recorded by another process. Access/guard errors still fail
+    the test: they are not evidence that a process exited.
+    """
+    import psutil
+
+    try:
+        process = psutil.Process(process_or_pid) if isinstance(process_or_pid, int) else process_or_pid
+        return (process.is_running() and process.status() != psutil.STATUS_ZOMBIE
+                and (created is None or process.create_time() == created))
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return False
+
+
+def kill_if_alive(process_or_pid, *, created: float | None = None, timeout: float | None = None) -> None:
+    """Clean up an owned test process, tolerating a reap before/during kill."""
+    import psutil
+
+    try:
+        process = psutil.Process(process_or_pid) if isinstance(process_or_pid, int) else process_or_pid
+        if process_alive(process, created=created):
+            process.kill()
+            if timeout is not None:
+                process.wait(timeout=timeout)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        pass
+
+
+def terminate_if_alive(process) -> None:
+    """Gracefully stop an owned Process, tolerating a reap before/during TERM."""
+    import psutil
+
+    try:
+        if process_alive(process):
+            process.terminate()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        pass
+
+
+def process_children(process_or_pid) -> list:
+    """Snapshot children of a test process; an already-reaped parent has none."""
+    import psutil
+
+    try:
+        process = psutil.Process(process_or_pid) if isinstance(process_or_pid, int) else process_or_pid
+        return process.children(recursive=True)
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return []
+
+
+def process_name(process) -> str | None:
+    """Read a matching process name, or None if the child was reaped."""
+    import psutil
+
+    try:
+        return process.name()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return None
+
+
+def process_cmdline(process) -> list[str] | None:
+    """Read a diagnostic/matching command line without racing a child's reap."""
+    import psutil
+
+    try:
+        return process.cmdline()
+    except (psutil.NoSuchProcess, psutil.ZombieProcess):
+        return None
 
 
 def _timed_out(what: str | None, timeout: float) -> AssertionError:
@@ -63,12 +137,15 @@ def wait_for_ctime_tick(directory: Path, after_ns: int, timeout: float = DEFAULT
     wait_until(_ticked, timeout=timeout, what="filesystem ctime clock to advance")
 
 
-async def async_wait_until(predicate: Callable[[], T], timeout: float = DEFAULT_TIMEOUT,
+async def async_wait_until(predicate: Callable[[], T | Awaitable[T]], timeout: float = DEFAULT_TIMEOUT,
                            interval: float = DEFAULT_INTERVAL, what: str | None = None) -> T:
-    """``wait_until`` for a coroutine: yields to the event loop between polls."""
+    """``wait_until`` for a coroutine: yields to the event loop between polls. ``predicate`` may be
+    async (e.g. an RPC asking the code under test for its own view of the condition)."""
     deadline = time.monotonic() + timeout
     while True:
         value = predicate()
+        if inspect.isawaitable(value):
+            value = await value
         if value:
             return value
         if time.monotonic() >= deadline:

@@ -8,7 +8,6 @@ import pytest
 from agent.message_metadata import DB_ROW_SNAPSHOT
 from agent.transcript_repair import transcript_row_snapshot
 from hermes_state import SessionDB
-from tests.hermes_state.test_fts_cjk_bigram import cjk_so
 
 
 class _InsertObserver:
@@ -27,12 +26,9 @@ class _InsertObserver:
 
 @pytest.mark.parametrize("named", [False, True])
 @pytest.mark.parametrize("variables", [999, 32766])
-@pytest.mark.parametrize("native_cjk", [False, True])
 def test_compaction_insert_steps_are_bounded_and_search_is_atomic(
-    tmp_path, monkeypatch, request, named, variables, native_cjk,
+    tmp_path, monkeypatch, named, variables,
 ):
-    if native_cjk:
-        monkeypatch.setenv("HERMES_FTS5_CJK_SO", str(request.getfixturevalue("cjk_so")))
     db = SessionDB(tmp_path / "state.db")
     try:
         db.create_session("topic", source="test")
@@ -64,7 +60,7 @@ def test_compaction_insert_steps_are_bounded_and_search_is_atomic(
         for row, msg in zip(rows, compacted):
             assert msg["_row_id"] == row["id"] > history[-1]["_row_id"] + 1000
             assert msg[DB_ROW_SNAPSHOT] == transcript_row_snapshot(row)
-        tables = ("messages_fts", "messages_fts_trigram", *(("messages_fts_cjk",) if native_cjk else ()))
+        tables = ("messages_fts", "messages_fts_trigram")
         for table in tables:
             assert db._read_one(f"SELECT COUNT(*) FROM {table} WHERE {table} MATCH 'newsummarytoken'")[0] == 1
             db._write_sql(f"INSERT INTO {table}({table}, rank) VALUES('integrity-check', 1)")

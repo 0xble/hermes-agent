@@ -16,21 +16,6 @@ import pytest
 from tools.environments.local import _find_bash, _find_shell
 
 
-def _pid_alive(pid: int) -> bool:
-    try:
-        import psutil
-        try:
-            return psutil.pid_exists(pid) and psutil.Process(pid).status() != psutil.STATUS_ZOMBIE
-        except psutil.NoSuchProcess:
-            return False
-    except ImportError:
-        try:
-            os.kill(pid, 0)  # windows-footgun: ok — psutil fallback only on POSIX hosts without it
-        except OSError:
-            return False
-        return True
-
-
 class TestFindShellPrefersUserShell:
     """_find_shell should prefer $SHELL over bash on POSIX."""
 

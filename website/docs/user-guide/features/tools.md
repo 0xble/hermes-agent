@@ -27,7 +27,7 @@ High-level categories:
 | **Web** | `web_search`, `web_extract` | Search the web and extract page content. |
 | **X Search** | `x_search` | Search X (Twitter) posts and threads via xAI's built-in `x_search` Responses tool — gated on xAI credentials (SuperGrok OAuth or `XAI_API_KEY`); off by default, opt in via `hermes tools` → 🐦 X (Twitter) Search. |
 | **Terminal & Files** | `terminal`, `process`, `read_file`, `patch` | Execute commands and manipulate files. |
-| **Browser** | `browser_navigate`, `browser_snapshot`, `browser_vision` | Interactive browser automation with text and vision support. |
+| **Browser** | `browser_exec`, `browser_cdp`, `browser_dialog`, `browser_vault` | Browser automation: `browser_exec` drives Chromium with Python over CDP (screenshots included). The Camofox browser is a separate catalog plugin (`hermes plugins install camofox`). |
 | **Media** | `vision_analyze`, `image_generate`, `text_to_speech` | Multimodal analysis and generation. |
 | **Agent orchestration** | `todo`, `clarify`, `execute_code`, `delegate_task` | Planning, clarification, code execution, and subagent delegation. |
 | **Memory & recall** | `memory`, `session_search` | Persistent memory and session search. |
@@ -74,16 +74,52 @@ The terminal tool can execute commands in different environments:
 | `docker` | Isolated containers | Security, reproducibility |
 | `ssh` | Remote server | Sandboxing, keep agent away from its own code |
 | `singularity` (plugin) | HPC containers | Cluster computing, rootless |
+| `sprites` (plugin) | Stateful Fly.io cloud sandbox | Persistent cloud environments with checkpoint & restore |
 | `modal` | Cloud execution | Serverless, scale |
 | `daytona` | Cloud sandbox workspace | Persistent remote dev environments |
 | `vercel_sandbox` | Vercel Sandbox cloud microVM | Cloud execution with snapshot-backed filesystem persistence |
+
+### Named Execution Nodes
+
+`terminal`, `read_file`, `write_file`, `patch` and `search_files` accept `node` from the shared root `nodes` registry. `process` accepts it as an optional identity check on an existing handle or a filter for `list`.
+
+```yaml
+nodes:
+  default: macstudio
+  hosts:
+    macstudio:
+      ssh: macstudio
+      platform: macos
+    macbook:
+      ssh: macbook
+      platform: macos
+```
+
+The `ssh` values are existing SSH aliases. Named terminal/file execution uses the existing SSH backend with profile-file synchronization disabled. It does not copy the controller's profile to either Mac, create a remote service, or change the profile's terminal backend. Targets need Bash and Python 3, with remote search tools such as `rg` available for the operations that use them.
+
+Example tool arguments:
+
+```json
+{"command": "pwd", "node": "macbook"}
+{"path": "~/notes.txt", "node": "macbook"}
+{"path": "~/notes.txt", "content": "Revised notes\n", "node": "macbook"}
+{"action": "poll", "session_id": "<returned handle>", "node": "macbook"}
+```
+
+Omitting `node` uses `nodes.default`. With no configured default or explicit selection, the existing terminal/file behavior is unchanged. Unknown nodes, denied scopes, conflicting sandbox overrides and connection failures refuse rather than run locally or on a sibling. Results identify the node and SSH alias.
+
+Cwd, exports, shell snapshots, file caches and read-before-overwrite authorization are isolated by profile, caller session and node. A full read of a MacBook file does not authorize overwriting the same path on the Studio or controller. Metadata, hashes, path resolution and write verification run on the selected target as well as content access. Partial reads do not authorize full overwrites.
+
+A background process handle retains its original node, SSH alias and unique remote run identity, including through controller checkpoint recovery. `process` without `node` follows that handle, not the current default. An explicit conflicting node refuses before probing the backend. Disconnected polling reports `remote_status: unavailable`, preserving the last known process state instead of claiming an exit. Killing uses the original command's target-side supervisor, never a controller PID or a fresh bare-PID signal. If launch acknowledgement is lost, the returned handle is for reconciliation, not permission to replay the command.
+
+Current limits: named execution supports macOS/Linux SSH targets, not remote PTY or stdin interaction. ACP named-node edits refuse before preparing a controller-local diff. Rich document/image extraction is not routed through the controller for named paths. Foreground transport failures have an unknown outcome and must be inspected before retrying. This selector does not route browser tools, `execute_code`, connectors or messaging.
 
 ### Configuration
 
 ```yaml
 # In ~/.hermes/config.yaml
 terminal:
-  backend: local    # or: docker, ssh, modal, daytona, vercel_sandbox, or a plugin backend (singularity)
+  backend: local    # or: docker, ssh, modal, daytona, vercel_sandbox, or a plugin backend (singularity, sprites)
   cwd: "."          # Working directory
   timeout: 180      # Command timeout in seconds
 ```
@@ -154,6 +190,16 @@ apptainer build ~/python.sif docker://python:3.11-slim
 # Configure
 hermes config set terminal.backend singularity
 hermes config set terminal.singularity_image ~/python.sif
+```
+
+### Sprites
+
+A plugin ([`sprites`](https://github.com/NousResearch/hermes-plugin-sprites)) that runs commands in a stateful [Sprite](https://fly.io/sprites) on Fly.io. See [Sprites Backend](../configuration.md#sprites-backend).
+
+```bash
+hermes plugins install NousResearch/hermes-plugin-sprites --enable
+hermes config set terminal.backend sprites
+# Add SPRITES_TOKEN to ~/.hermes/.env
 ```
 
 ### Modal (Serverless Cloud)
@@ -262,7 +308,9 @@ This applies where a completion can reach the agent: the interactive CLI (includ
 `hermes chat -q`), the TUI and desktop app, and messaging chats. Non-interactive `hermes chat -q`,
 one-shot `hermes -z`, cron jobs, Kanban workers, stateless API requests and delegated subagents keep the
 previous behaviour because they cannot receive a later completion, as does any profile with
-`display.background_process_notifications: off` (completions never start an agent turn there). Checking
+`display.background_process_notifications: off` (automatic wait-promotion stays disabled there).
+An explicitly requested `notify_on_complete=true` still wakes the messaging gateway agent under
+`off`, without a separate chat receipt; CLI, TUI and Desktop keep plain polling under `off`. Checking
 a process whose completion goes to someone else (another session's process, or a subagent's process
 that was not handed off) also stays plain polling. Admin-managed settings and `${VAR}` values count.
 To keep plain polling everywhere, set:

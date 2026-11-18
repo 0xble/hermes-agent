@@ -8,9 +8,9 @@ import json
 import pytest
 
 from agent import redact
+from agent.redact_json import redact_sensitive_json
 from agent.redact import (
     clear_vault_redaction_values,
-    redact_sensitive_json,
     register_vault_date_component,
     register_vault_redaction_value,
     register_vault_card_component,
@@ -22,7 +22,8 @@ SENTINEL = "«redacted-vault-secret»"
 @pytest.fixture(autouse=True)
 def _isolated_redaction(monkeypatch):
     monkeypatch.setattr(redact, "_REDACT_ENABLED", True)
-    monkeypatch.setattr(redact, "_REDACT_ENABLED_BY_HOME", {})
+    monkeypatch.setattr(redact, "_ENV_POLICY_BY_HOME", {})
+    monkeypatch.setattr(redact, "_CONFIG_POLICY_BY_HOME", {})
     clear_vault_redaction_values()
     yield
     clear_vault_redaction_values()
@@ -97,6 +98,65 @@ def test_structural_redaction_preserves_vault_tab_and_origin_scope(flags):
     assert other_tab == payload
 
 
+@pytest.mark.parametrize("value,month,year", [
+    ("12/29", 12, "29"), ("07/2034", 7, "2034"),
+    ("7 / 2034", 7, "2034"), ("0734", 7, "34"), ("072034", 7, "2034"),
+])
+@pytest.mark.parametrize("origin", ["https://pay.example", ""])
+def test_registered_expiry_representations_keep_scope_boundaries_and_cleanup(tmp_path, value, month, year, origin):
+    from agent.redact import clear_vault_date_components
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    representations = sorted({value} | {
+        f"{m}{separator}{y}"
+        for m in (str(month), f"{month:02d}")
+        for y in (year, year[-2:])
+        for separator in ("", "/", " /", "/ ", " / ")
+    })
+    compact = {v for v in representations if v.isdigit()}
+    # Matching an expiry must not consume it inside a ref, order ID, or word.
+    controls = [f"e{v} order=9{v}8 x{v}x _{v} {v}_" for v in sorted(compact)]
+    controls += ["date=2035-06-14 count=42", 42, True]
+    if len(year) == 2:
+        controls += [f"{m}20{year}" for m in (str(month), f"{month:02d}")]
+        controls += [int(f"{month}20{year}"), float(f"{month}20{year}")]
+    payload = {"ordinary": [{"echoes": [f"echo={v};" for v in representations],
+                             "numeric": sorted({int(v) for v in compact}),
+                             "numeric_float": sorted({float(v) for v in compact}),
+                             "controls": controls}]}
+    # Use the task named default to distinguish explicit ownership from an
+    # omitted browser context, which must never enable short-number masking.
+    scope = {"vault_tab": "default", "vault_origin": origin}
+    register_vault_card_component("expiry", value, tab="default", origin=origin)
+    register_vault_card_component("expiry", value, tab="other", origin=origin)
+    assert redact_sensitive_json(payload) == payload
+    assert redact_sensitive_json(payload, vault_tab="unrelated", vault_origin=origin) == payload
+    if origin:
+        assert redact_sensitive_json(payload, vault_tab="default", vault_origin="https://other.example") == payload
+
+    other_profile = set_hermes_home_override(tmp_path / "other-profile")
+    try:
+        assert redact_sensitive_json(payload, **scope) == payload
+        clear_vault_date_components("default")
+    finally:
+        reset_hermes_home_override(other_profile)
+
+    # Both known and unavailable read origins retain protection on the owner.
+    for read_origin in (origin or "https://pay.example", ""):
+        actual = redact_sensitive_json(payload, vault_tab="default", vault_origin=read_origin)["ordinary"][0]
+        for representation, echo in zip(representations, actual["echoes"]):
+            assert f"echo={representation};" not in echo
+            assert SENTINEL in echo
+        assert actual["numeric"] == [SENTINEL] * len(payload["ordinary"][0]["numeric"])
+        assert actual["numeric_float"] == actual["numeric"]
+        assert actual["controls"] == controls
+    clear_vault_date_components("default")
+    assert redact_sensitive_json(payload, **scope) == payload
+    assert SENTINEL in json.dumps(redact_sensitive_json(payload, vault_tab="other", vault_origin=origin), ensure_ascii=False)
+    clear_vault_redaction_values()
+    assert redact_sensitive_json(payload, vault_tab="other", vault_origin=origin) == payload
+
+
 def test_env_lookup_expression_without_registered_secret_is_preserved():
     expression = "os.getenv('PASSWORD')"
     assert redact_sensitive_json({"password": expression}, force=True) == {"password": expression}
@@ -142,6 +202,7 @@ def test_default_api_honors_routed_profile_opt_out(tmp_path, monkeypatch):
     routed = tmp_path / "routed-opt-out"
     routed.mkdir()
     (routed / ".env").write_text("HERMES_REDACT_SECRETS=false\n", encoding="utf-8")
+    redact.resolve_profile_policy(routed)
     token = set_hermes_home_override(routed)
     try:
         register_vault_redaction_value("9876")

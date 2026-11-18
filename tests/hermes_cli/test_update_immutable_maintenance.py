@@ -21,7 +21,7 @@ def homes(tmp_path, monkeypatch):
 def test_required_maintenance_seeds_catalog_skills_and_migrates_each_home(homes, monkeypatch):
     from hermes_cli import config, model_catalog
 
-    root, sibling = homes
+    root, _sibling = homes
     for home in homes:
         (home / "config.yaml").write_text("model:\n  default: test-model\n", encoding="utf-8")
     assert update_cmd_maint.strict_immutable_maintenance(
@@ -88,7 +88,7 @@ def test_required_maintenance_blocks_real_filesystem_failures(homes, tmp_path, m
 def test_required_maintenance_propagates_failure(homes, monkeypatch, failure):
     from hermes_cli import config, model_catalog, profiles
 
-    root, sibling = homes
+    root, _sibling = homes
     original = "model: [invalid\n" if failure == "config" else "model:\n  default: test-model\n"
     for home in homes:
         (home / "config.yaml").write_text(original, encoding="utf-8")

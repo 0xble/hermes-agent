@@ -140,7 +140,7 @@ def test_cli_stop_command_scopes_durable_cancellation_to_its_session(monkeypatch
     from hermes_cli.cli_commands_session_tools import CLICommandsSessionToolsMixin
 
     calls = []
-    monkeypatch.setattr(process_registry, "list_sessions", lambda: [])
+    monkeypatch.setattr(process_registry, "list_sessions", list)
     monkeypatch.setattr(ad, "active_count", lambda: 1)
     monkeypatch.setattr(ad, "interrupt_all", lambda **kwargs: calls.append(kwargs) or 1)
     cli = type("CLI", (CLICommandsSessionToolsMixin,), {"session_id": "sess-cli"})()

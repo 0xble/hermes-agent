@@ -467,7 +467,7 @@ def test_boot_recovery_runs_before_resume_turns_and_queued_inbound(monkeypatch):
 
     runner = SimpleNamespace(
         _start_post_connect_services=noop, _await_startup_boot_sends=noop, _await_mcp_discovery=noop,
-        _claim_pending_obligations=no_candidates, _resume_pending_candidates=lambda: [],
+        _claim_pending_obligations=no_candidates, _resume_pending_candidates=list,
         _resume_pending_candidates_async=no_candidates, _startup_interrupted_note_candidates=lambda _c: [],
         _queue_startup_restore_event=lambda *_a, **_k: None,
         _schedule_resume_pending_sessions=lambda **_kwargs: order.append("resume"),

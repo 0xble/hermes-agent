@@ -18,7 +18,7 @@ def test_overlong_shebang_shell_fallback_fails_closed(tmp_path):
     wrapper.chmod(0o755)
 
     # Nothing restarts: the child only emits a sentinel proving /bin/sh ran the body.
-    result = subprocess.run(["/bin/sh", "-c", shlex.quote(str(wrapper))], capture_output=True, text=True, timeout=10)
+    result = subprocess.run(["/bin/sh", "-c", shlex.quote(str(wrapper))], capture_output=True, text=True, timeout=10, check=False)
     assert result.returncode == 0, result.stderr
     assert result.stdout == "child-ran\n"
     unsafe, refusal = scan_gateway_lifecycle(str(wrapper))
@@ -68,7 +68,7 @@ def test_ambiguous_shebangs_keep_the_strict_walk(tmp_path_factory, case):
     wrapper.write_bytes(shebang + f"{shlex.quote(str(child))}\n".encode())
     wrapper.chmod(0o755)
 
-    result = subprocess.run(["/bin/sh", "-c", shlex.quote(str(wrapper))], capture_output=True, text=True, timeout=10)
+    result = subprocess.run(["/bin/sh", "-c", shlex.quote(str(wrapper))], capture_output=True, text=True, timeout=10, check=False)
     if case in {"nested", "env-nested", "shebangless-interpreter", "shell-symlink"}:
         # Linux can recurse into a script interpreter; kernels that reject it can fall back to
         # shell. Either way this allowlisted basename actually executes the shell-only child.

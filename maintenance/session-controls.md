@@ -130,7 +130,26 @@ subject-specific successor only when needed. This wake is pinned to the source
 session ID, routing key and retirement generation, including at strict-pin
 admission. A cancelled or superseded wake cannot re-arm
 retirement. Active claims are a quiet wait, not a failed retirement. No standing
-commitment is cancelled merely because its owner is unclear. A merge hands off
+commitment is cancelled merely because its owner is unclear. Once an explicit retirement
+selects deletion (a reason, no merge target), the first preparation pass still lists
+active source goals/loops as open items without clearing them. The generation-fenced
+preparation decision acknowledges the offered control definitions: `owners` preserves
+them by handoff, while leaving them unowned clears them only at finalization. A changed
+definition needs another owner choice. A queued preparation alone never authorizes
+clearing. Preparation fingerprints include the authored definition digest, so an in-place
+change with the same title re-wakes the owner choice; execution counters do not.
+Independently confirmed topic absence also allows finalization without a
+preparation wake. Source goals/loops without a chosen owner or saved handoff are cleared only
+after every other inventory obligation settles. External inventories cannot share the session
+DB transaction; both source control rows are rechecked in that transaction before either is
+cleared through `GoalManager.clear()` or `LoopManager.clear()`. Receipts are keyed by kind and
+control mutation identity (a snapshot digest for legacy controls), preserving earlier clears
+under the same retirement generation. The durable control row is read
+back before inventory continues. A cancelled goal is terminal for inventory. Running
+session, rebound-key, and current-generation/phase fences run before absent-topic
+control clearing, so a declined finalization pass leaves controls unchanged. Running
+processes, delegation, cron, task claims and destination-topic controls are never
+cleared by this reconciliation. A merge hands off
 the source context summary (the tool's existing `message` field) even with no
 executable items. This context-only settlement is a verified FYI, not a fabricated
 task. Actual obligations retain their task-linked handoffs. The merge records
@@ -176,7 +195,7 @@ Recovery reads that exact receipt and validates its identity, target and deliver
 status. Missing or ambiguous saved destinations hold retirement without resending.
 
 An unaccepted goal/loop may replace a terminal successor control (`cleared`,
-`done`, `completed` or `stopped`), but never an active, paused or unknown control.
+`done`, `completed`, `stopped` or `cancelled`), but never an active, paused or unknown control.
 Inventory, preparation and the atomic transfer share this eligibility rule.
 Moving a loop redirects its persisted wake route to the successor topic in the
 same transaction as source clearance and recovery proof. Accepted destination

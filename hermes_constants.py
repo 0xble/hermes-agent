@@ -22,6 +22,12 @@ _HERMES_HOME_OVERRIDE: ContextVar[str | object] = ContextVar("_HERMES_HOME_OVERR
 INDICATOR_STYLES: tuple[str, ...] = ("ascii", "emoji", "kaomoji", "unicode")
 DEFAULT_INDICATOR_STYLE: str = "kaomoji"
 
+# Browser-hosted attachments are staged on the Hermes host and then read back
+# as a base64 data URL for the normal remote attachment RPC. Keep the upload
+# and read-back boundaries identical so a successful picker/drop can always be
+# attached afterward.
+WEBAPP_ATTACHMENT_MAX_BYTES: int = 16 * 1024 * 1024
+
 
 def set_hermes_home_override(path: str | Path | None) -> Token:
     """Set a context-local Hermes home override and return its reset token.
@@ -614,22 +620,6 @@ def with_hermes_node_path(env: dict[str, str] | None = None) -> dict[str, str]:
     return env_for("npm", base_env=env)
 
 
-def agent_browser_runnable(path: str | None) -> bool:
-    """True when *path* is an agent-browser CLI that runs (``--version`` exits 0).
-
-    Dead/wrong-arch/hung binaries are rejected so callers try the next candidate.
-
-    A bare presence check (``shutil.which`` / ``Path.exists``) is not enough: agent-browser's npm
-    ``postinstall`` re-points a *global* install symlink (e.g. ``/opt/homebrew/bin/agent-browser``) at our
-    local ``node_modules/agent-browser/bin/...`` binary, which then disappears on the next ``hermes update``
-    — leaving a **dangling symlink** that ``which`` still reports but exec fails on with exit 127 (issue
-    #48521). Callers that trust such a path silently break every browser tool.
-    """
-    if not path:
-        return False
-    return _is_executable_file(path) and _version_probe_ok(path)
-
-
 def _legacy_path_has_content(path: Path) -> bool:
     """True iff *path* is a non-directory file or a populated directory.
 
@@ -976,6 +966,10 @@ def get_scratch_dir(home: str | Path | None = None, *, prune: bool = True) -> Pa
     :func:`export_scratch_tmp_env`), so ``tempfile`` defaults land here without call sites
     knowing. Entries idle for ``SCRATCH_MAX_IDLE_HOURS`` are pruned at most once per process
     and once per hour across processes (stamp file), so a fan-out of children stays cheap.
+    The pass itself runs in a detached child process (``hermes_constants_scratch_detach``): the
+    directory is created and permissioned before this returns, no caller (the boot hook
+    included) waits on the idle scan or the ``rmtree`` of a multi-GB entry, and the pass still
+    finishes when the caller is a ``hermes`` command that exits a moment later.
 
     Permissions follow :func:`apply_secure_dir_policy`, so an explicit ``HERMES_HOME_MODE`` or
     a managed/shared home is honored instead of a blanket ``0700`` (#117347).
@@ -1025,7 +1019,9 @@ def _prune_scratch_dir_once(scratch: Path) -> None:
         pass
     with contextlib.suppress(Exception):
         stamp.touch()
-        prune_scratch_dir(scratch)
+        from hermes_constants_scratch_detach import spawn_prune
+
+        spawn_prune(scratch)
 
 
 def scratch_dir_usage_bytes(scratch: Path | None = None) -> int:
@@ -1211,42 +1207,11 @@ def resolve_reasoning_config(cfg: dict | None, model: str = "") -> dict | None:
     cfg = cfg if isinstance(cfg, dict) else {}
     agent_cfg = cfg.get("agent") if isinstance(cfg.get("agent"), dict) else {}
 
-    default_model = ""
-    preset_effort = None
-    from hermes_cli.model_presets import ModelPresetError, preset_ref_name
-    try:
-        from hermes_cli.model_preset_runtime import resolve_default_route
-        route = resolve_default_route(cfg)
-        default_model = str(route.model or "").strip()
-        if route.reasoning_effort:
-            preset_effort = parse_reasoning_effort(route.reasoning_effort)
-    except ModelPresetError:
-        raise
-    except Exception:
-        pass
-
     if not model:
         model_cfg = cfg.get("model")
         if isinstance(model_cfg, dict):
             model_cfg = model_cfg.get("default") or model_cfg.get("model") or ""
         model = model_cfg.strip() if isinstance(model_cfg, str) else ""
-    # Empty, a bare @ref, or the resolved default model all mean the default
-    # route. A switched or fallback model keeps the per-model override, then
-    # the global effort. A preset that declares no effort defers.
-    default_model_ref = ""
-    model_cfg = cfg.get("model")
-    if isinstance(model_cfg, str):
-        default_model_ref = model_cfg
-    elif isinstance(model_cfg, dict):
-        raw_default = model_cfg.get("model_preset") or model_cfg.get("default") or model_cfg.get("model") or ""
-        if isinstance(raw_default, str):
-            default_model_ref = raw_default
-    on_default = not model or model == default_model or (
-        preset_ref_name(model) is not None and preset_ref_name(model) == preset_ref_name(default_model_ref)
-    )
-    if preset_effort is not None and on_default:
-        return preset_effort
-
     per_model = resolve_per_model_reasoning_effort(model, agent_cfg.get("reasoning_overrides") or {})
     if per_model is not None:
         return per_model

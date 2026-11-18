@@ -127,6 +127,11 @@ def isolated_env(
         XDG_CONFIG_HOME=str(home / ".config"),
         XDG_DATA_HOME=str(home / ".local" / "share"),
         XDG_CACHE_HOME=str(home / ".cache"),
+        # Host-gateway rendezvous is cross-profile, not keyed by HERMES_HOME.
+        # Give every sandbox an explicit namespace so neither host defaults nor
+        # a sibling test's gateway can claim this sandbox's 'default' profile.
+        XDG_STATE_HOME=str(root / "state"),
+        HERMES_GATEWAY_LOCK_DIR=str(root / "state" / "hermes-gateway-locks"),
         DBUS_SESSION_BUS_ADDRESS="unix:path=/nonexistent/hermes-test-bus",
         NO_COLOR="1",
         TERM="dumb",
@@ -142,6 +147,7 @@ def isolated_env(
         GIT_COMMITTER_NAME="e2e", GIT_COMMITTER_EMAIL="e2e@example.invalid",
     )
     (root / "run").mkdir(parents=True, exist_ok=True)
+    (root / "state" / "hermes-gateway-locks").mkdir(parents=True, exist_ok=True)
     # Reuse the host uv cache (read/write, uv is concurrency-safe) so dependency syncs are
     # warm; never the real ~/.hermes.
     real_uv_cache = Path(os.environ.get("UV_CACHE_DIR") or REAL_HOME / ".cache" / "uv")

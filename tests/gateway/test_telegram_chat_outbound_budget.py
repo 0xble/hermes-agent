@@ -15,6 +15,7 @@ import pytest
 
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
+import itertools
 
 
 class _Clock:
@@ -211,7 +212,7 @@ async def test_concurrent_deliveries_share_the_slot_and_are_never_dropped():
     await asyncio.gather(*(limiter.process_request(callback, (), {}, "sendMessage", {"chat_id": 5}, None)
                            for _ in range(6)))
     assert len(fired) == 6
-    gaps = [b - a for a, b in zip(fired, fired[1:])]
+    gaps = [b - a for a, b in itertools.pairwise(fired)]
     assert min(gaps) >= 0.05 - 0.01
 
 
@@ -317,7 +318,7 @@ async def test_standalone_lane_refuses_inside_a_recorded_penalty(tmp_path, monke
 
     from plugins.platforms.telegram import flood_state
     from plugins.platforms.telegram.chat_budget import MeteredBot
-    from tools import send_message_senders as senders
+    from plugins.platforms.telegram import standalone as senders
 
     monkeypatch.setattr("hermes_constants.get_hermes_home", lambda: tmp_path)
     flood_state.record_deadline(tmp_path, "2027045491", 24237.0)
@@ -334,16 +335,16 @@ async def test_standalone_lane_refuses_inside_a_recorded_penalty(tmp_path, monke
 @pytest.mark.parametrize("chat_id", [123, -100123])
 async def test_standalone_rich_send_spends_chat_budget_and_honors_flood_penalty(tmp_path, monkeypatch, chat_id):
     from plugins.platforms.telegram.chat_budget import ChatBudgetRateLimiter, ChatOutboundBudget, MeteredBot
-    from tools import send_message_senders as senders
+    from plugins.platforms.telegram import standalone as senders
 
     inner = SimpleNamespace(do_api_request=AsyncMock(return_value={"message_id": 9}), send_message=AsyncMock())
     budget = ChatOutboundBudget(clock=lambda: 0.0)
     counter = SimpleNamespace(record=MagicMock())
     limiter = ChatBudgetRateLimiter(budget, counter=counter)
     bot = MeteredBot(inner, limiter)
-    monkeypatch.setattr(senders, "_telegram_bot", lambda _token: bot)
+    monkeypatch.setattr(senders, "_telegram_bot", lambda _token, extra=None: bot)
 
-    result = await senders._send_telegram("test-token", str(chat_id), "**rich**", rich_messages="always")
+    result = await senders._send_telegram("test-token", str(chat_id), "**rich**", extra={"rich_messages": "always"})
     assert result["success"] is True
     assert budget.remaining(chat_id) == pytest.approx(budget.gap(chat_id))
     counter.record.assert_called_once_with(str(chat_id), "sendRichMessage")
@@ -351,7 +352,7 @@ async def test_standalone_rich_send_spends_chat_budget_and_honors_flood_penalty(
     inner.send_message.assert_not_awaited()
 
     limiter._penalty_remaining = lambda _key: 900.0
-    result = await senders._send_telegram("test-token", str(chat_id), "**rich**", rich_messages="always")
+    result = await senders._send_telegram("test-token", str(chat_id), "**rich**", extra={"rich_messages": "always"})
     assert "error" in result
     assert inner.do_api_request.await_count == 1
     inner.send_message.assert_not_awaited()

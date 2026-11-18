@@ -1444,6 +1444,11 @@ def _session_id(event: dict[str, Any]) -> str:
 
 def _reset_for_tests() -> None:
     """Reset all profile-scoped Relay hosts for isolated tests."""
+    # The turn context is process-local even after its host registry is torn down.
+    # Clear it here so a test that leaves a skipped or closed turn cannot suppress
+    # process-level metrics in the next test running on the same shard thread.
+    _CURRENT_TURN.set(None)
+    _MANAGED_CALLBACK_DEPTH.set(0)
     with SESSION_COORDINATOR._active_turns_lock:
         SESSION_COORDINATOR._active_turns.clear()
     HOST_REGISTRY.shutdown_all()

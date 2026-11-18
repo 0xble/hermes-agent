@@ -209,7 +209,7 @@ DESTRUCTIVE = {
     "credentials-pool-delete": lambda c, p, t: c.delete(f"/api/credentials/pool/anthropic/0{_q(p)}"),
     "curator-run": lambda c, p, t: c.post(f"/api/curator/run{_q(p)}"),
     "sessions-prune": lambda c, p, t: c.post(
-        "/api/sessions/prune", json={"dry_run": False, **_body_profile(p)}),
+        "/api/sessions/prune", json={"dry_run": False, "now": True, **_body_profile(p)}),
     "sessions-empty": lambda c, p, t: c.delete(f"/api/sessions/empty{_q(p)}"),
     "sessions-bulk-delete": lambda c, p, t: c.post(
         "/api/sessions/bulk-delete", json={"ids": ["abc"], **_body_profile(p)}),

@@ -233,7 +233,7 @@ def test_receipt_waits_without_an_open_send_window_and_is_recorded_at_once_when_
 @pytest.mark.parametrize("wall_offset_days", [-3650, 3650], ids=["past", "future"])
 def test_receipt_age_uses_the_store_clock_when_wall_time_disagrees(marks, monkeypatch, wall_offset_days):
     """A pending receipt ages with the same clock as consent and recording, not the host clock."""
-    t0 = datetime.now(timezone.utc) + timedelta(days=wall_offset_days)
+    t0 = datetime.now(UTC) + timedelta(days=wall_offset_days)
     clock = {"now": t0}
     monkeypatch.setattr(store_module, "_utc_now", lambda: clock["now"])
     marks.store["saves"] = False  # a busy store leaves a fresh receipt pending

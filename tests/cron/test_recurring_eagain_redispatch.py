@@ -27,7 +27,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from unittest import mock
 
@@ -62,7 +62,7 @@ def wedge_env(tmp_path, monkeypatch):
         script="probe.py",
     )
     # Force it due now.
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     jobs_mod.update_job(job["id"], {"next_run_at": (now - timedelta(minutes=1)).isoformat()})
 
     script = hermes_home / "scripts" / "probe.py"
@@ -111,7 +111,7 @@ class TestEAGAINRecurringRedispatches:
         state = self._make_script_eagain(env, monkeypatch)
 
         # Tick 1: EAGAIN failure.
-        n1 = S.tick(verbose=False, sync=True)
+        _n1 = S.tick(verbose=False, sync=True)
         # Assert the failure was recorded.
         latest = E.latest_execution(env["job_id"])
         assert latest is not None, "tick 1 must create an execution"
@@ -125,11 +125,11 @@ class TestEAGAINRecurringRedispatches:
         assert job["next_run_at"] is not None
 
         # Force next_run_at due again (simulate the substrate recovery tick).
-        now = datetime.now(timezone.utc)
+        now = datetime.now(UTC)
         J.update_job(env["job_id"], {"next_run_at": (now - timedelta(minutes=1)).isoformat()})
 
         # Tick 2: script passes -> job must fire (completed execution).
-        n2 = S.tick(verbose=False, sync=True)
+        _n2 = S.tick(verbose=False, sync=True)
         latest2 = E.latest_execution(env["job_id"])
         assert latest2 is not None
         assert latest2["status"] == "completed", (
@@ -150,19 +150,19 @@ class TestEAGAINRecurringRedispatches:
         monkeypatch.setattr(S, "_hermes_home", env["home"])
 
         self._make_script_eagain(env, monkeypatch)
-        n1 = S.tick(verbose=False, sync=True)
+        _n1 = S.tick(verbose=False, sync=True)
 
         # Simulate the persisted non-dispatch state: next_run_at far in the
         # future (job not due) but still enabled/scheduled — the observed
         # wedge where get_due_jobs never returns it.
         from datetime import timezone as tz
-        far = datetime.now(tz.utc) + timedelta(days=1)
+        far = datetime.now(UTC) + timedelta(days=1)
         update_job(env["job_id"], {"next_run_at": far.isoformat()})
-        n2 = S.tick(verbose=False, sync=True)  # not due -> no dispatch
+        _n2 = S.tick(verbose=False, sync=True)  # not due -> no dispatch
 
         # Force-run (trigger_job) sets next_run_at = now -> due again.
         triggered = trigger_job(env["job_id"])
         assert triggered is not None
-        n3 = S.tick(verbose=False, sync=True)
+        _n3 = S.tick(verbose=False, sync=True)
         latest = E.latest_execution(env["job_id"])
         assert latest["status"] == "completed", "force-run must clear the wedge"

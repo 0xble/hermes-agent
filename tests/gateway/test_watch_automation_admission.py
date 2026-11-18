@@ -21,7 +21,7 @@ def _rows(authority, sid):
 async def test_registry_producers_cross_real_admission(tmp_path, monkeypatch, kind):
     from tools import async_delegation as ad
     from tools import process_registry as pr
-    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    runner, authority, _adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
     registry = pr.ProcessRegistry()
     monkeypatch.setattr(pr, 'process_registry', registry)
     process = pr.ProcessSession(id='proc-test', command='verify', task_id='task',
@@ -68,7 +68,7 @@ async def test_registry_producers_cross_real_admission(tmp_path, monkeypatch, ki
 async def test_retry_producer_commits_claim_and_cancel_fence_survives_restore(tmp_path, monkeypatch):
     from tools import async_delegation as ad, delegation_resume as dr
     from hermes_cli.session_controls import RETRY_WAKE_METADATA_KEY, internal_wake_is_current
-    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    runner, authority, _adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
     monkeypatch.setattr(ad, '_db_path', lambda: tmp_path / 'delegations.db')
     _failed_row('deleg-retry', 'rate_limit')
     with ad._DB_LOCK, ad._transaction() as conn:
@@ -96,7 +96,7 @@ async def test_retry_producer_commits_claim_and_cancel_fence_survives_restore(tm
 @pytest.mark.asyncio
 async def test_boot_notice_producer_has_its_own_replay_identity(tmp_path, monkeypatch):
     from tools import delegation_resume as dr, process_registry as pr
-    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    runner, authority, _adapter, _source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
     registry = pr.ProcessRegistry()
     monkeypatch.setattr(pr, 'process_registry', registry)
     record = dict(delegation_id='deleg-boot', session_key=metadata['gateway_session_key'],
@@ -120,7 +120,7 @@ async def test_boot_notice_producer_has_its_own_replay_identity(tmp_path, monkey
     {'delegation_id': 'd', 'claim': ''}, {'delegation_id': [], 'claim': 'c'},
     {'delegation_id': 'd', 'claim': 'c', 'foreign': True}])
 async def test_retry_stamp_is_closed_and_validated(tmp_path, monkeypatch, stamp):
-    runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
+    _runner, authority, adapter, source, metadata = await _native_owner(tmp_path, monkeypatch, 'seed')
     event = MessageEvent(text='retry', source=source, internal=True,
                          metadata={**metadata, 'delegation_retry_notice': stamp})
     try:
@@ -151,13 +151,13 @@ async def test_real_process_metadata_still_rejects_unknown_key(tmp_path, monkeyp
 async def test_valid_retry_stamp_crosses_snapshot_and_restore(tmp_path, monkeypatch, local):
     from gateway.session_automation import restore_local_automation
     from tests.gateway.test_automation_notification_category import _authority
-    from gateway.session_contract import Principal
+    from gateway.session_contract import SessionActor
     from gateway.session_local import create_local_session
     from gateway.session_local_title import title_new_session
     stamp = {'delegation_id': 'deleg-retry', 'claim': 'retry:fixture'}
     if local:
         runner, authority = await _authority(tmp_path, monkeypatch)
-        actor = Principal('owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'fixture')
+        actor = SessionActor('owner', 'default', frozenset({'session:create', 'session:submit', 'session:read'}), 'fixture')
         ref = create_local_session(authority, actor, dict(request_id='local', source='gui', model='fixture', toolsets=[]))
         live = authority.sessions[ref.session_id]
         title_new_session(authority, ref, 'local')

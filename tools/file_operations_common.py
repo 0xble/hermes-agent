@@ -7,7 +7,7 @@ the model.
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, ClassVar, Dict, List, Optional, Tuple
+from typing import Any, ClassVar, Dict, Optional, Tuple
 
 
 @dataclass
@@ -74,7 +74,7 @@ class PatchResult:
     lsp_diagnostics: Optional[str] = None  # see WriteResult.lsp_diagnostics
     error: Optional[str] = None
     match_count: Optional[int] = None
-    match_lines: List[int] = field(default_factory=list)
+    match_lines: list[int] = field(default_factory=list)
     match_lines_truncated: bool = False
     # Success-shaped no-op: the edit was already present, nothing written; ``note`` says why.
     no_change: bool = False
@@ -124,7 +124,11 @@ class SearchResult:
     limit_reason: Optional[str] = None
     warning: Optional[str] = None
     error: Optional[str] = None
-
+    # Unreadable paths behind the "Skipped N unreadable path(s)" sentence in ``warning``,
+    # plus the diagnostics dropped past the runner's cap: a multi-root merge recomposes
+    # one sentence from this data instead of parsing the text. Never serialized.
+    skipped_paths: list[str] = field(default_factory=list)
+    skipped_omitted: int = 0
     resolved_path: Optional[str] = None
     resolved_cwd: Optional[str] = None
     nearest_existing_parent: Optional[str] = None
@@ -205,6 +209,8 @@ class ExecuteResult:
     # the command never ran, so the verdict is about the working directory, not
     # the requested path (callers must neither cache it nor blame the path).
     cwd_error: str = ""
+    # Separate, bounded diagnostics for filename searches. Never parsed as paths.
+    stderr: str = ""
 
 
 # ---------------------------------------------------------------------------

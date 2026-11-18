@@ -5,6 +5,18 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def real_detached_body_gate(tmp_path, monkeypatch):
+    from cron import executions
+
+    monkeypatch.setattr(executions, 'EXECUTIONS_FILE', tmp_path / 'executions.db')
+    row = executions.create_execution('inert', source='test')
+    with executions._transaction() as conn:
+        conn.execute("UPDATE executions SET id='inert' WHERE id=?", (row['id'],))
+    assert executions.mark_execution_handoff_pending('inert')
+    assert executions.adopt_claimed_execution('inert')
+
+
 @pytest.fixture
 def detached_worker(tmp_path, monkeypatch):
     from agent import runtime_session_store as worker
@@ -106,6 +118,24 @@ def test_detached_persistence_survives_multiple_owner_retry_deadlines(detached_w
     assert len(writes) == 1 and writes[0]['sequence'] == 1 and writes[0]['epoch'] == 2
     assert writes[0]['payload']['messages'] == [{'role': 'assistant', 'content': 'computed once'}]
     assert [r['method'] for r in clock.sent].count('worker.adopt') == 2
+
+
+def test_timeout_after_body_gate_is_not_prebody_deferral(detached_worker, tmp_path, monkeypatch):
+    from cron import detached_authority, executions, scheduler
+
+    _clock, _run = detached_worker
+
+    def timeout(*_args, **_kwargs):
+        row = executions.get_execution('inert')
+        assert row is not None and row['body_phase'] == 'started'
+        raise TimeoutError('worker_receipt_timeout')
+
+    monkeypatch.setattr(scheduler, 'run_job', timeout)
+    with pytest.raises(TimeoutError) as caught:
+        detached_authority.run_detached(
+            {'id': 'inert'}, {'session_id': 's'}, {'profile_id': str(tmp_path), 'generation': 0},
+            {}, lambda: None, execution_id='inert', extra_prompt=None, cancel_event=None)
+    assert not isinstance(caught.value, detached_authority.DetachedHandshakeTimeout)
 
 
 @pytest.mark.parametrize('fault', ['lost_reply', 'double_entry_close', 'chained_write', 'receipt_timeout', 'register_timeout'])

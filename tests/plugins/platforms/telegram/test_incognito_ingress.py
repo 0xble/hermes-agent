@@ -162,7 +162,7 @@ async def test_clarify_callbacks_keep_answers_functional_without_private_logs(
     key = key_for(adapter, msg)
     clarify_id = f"privacy-{choice}-{private}"
     clarify.register(clarify_id, key, "PRIVATE_QUESTION", ["PRIVATE_CHOICE"])
-    adapter._clarify_state[clarify_id] = key
+    adapter._clarify_state[clarify_id] = telegram.ClarifyPrompt.from_sent(key, msg)
     query = SimpleNamespace(
         data=f"cl:{clarify_id}:{choice}", message=msg, from_user=msg.from_user,
         answer=AsyncMock(), edit_message_text=AsyncMock(),
@@ -583,4 +583,3 @@ async def test_picker_without_a_real_message_id_is_unattributed_and_cannot_selec
     query.answer.assert_awaited_once()
     assert getattr(adapter, f"_{kind}_picker_state")["100"] is state
     assert not is_incognito()
-

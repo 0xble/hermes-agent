@@ -55,17 +55,15 @@ async def _start_gateway_replace_existing_instance(existing_pid: int, replace: b
             "to this profile's gateway (HERMES_HOME %s). Remove the "
             "stale PID record or stop the owning profile explicitly.",
             existing_pid, _get_process_hermes_home())
-        # The stamp must be ON DISK before this process exits: every CLI exit path funnels
-        # through _exit_after_graceful_shutdown(), whose os._exit() never flushes the queued
-        # runtime-status writer. A fire-and-forget stamp can die in the queue, the supervisor
-        # retries into the same stale record, and the loop this refusal exists to break keeps
-        # going (#135392). Bounded wait: a stalled disk delays the exit by at most 5 s, it
-        # never hangs the start.
+        # This is a recovery checkpoint, not a best-effort heartbeat. A bounded
+        # write_runtime_status wait may return False with the stamp still queued,
+        # and the CLI's os._exit then kills the writer with the stale running
+        # record intact (#135392). Use the synchronous completion contract before
+        # allowing startup to return to the hard-exit path.
         try:
             write_runtime_status(
                 gateway_state="startup_failed",
                 exit_reason="gateway_replace_ownership_unproven",
-                wait_timeout=5.0,
             )
         except Exception:
             # Persistence must never abort the start; the traceback (DEBUG) keeps the
@@ -187,6 +185,11 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             from gateway.status import consume_planned_stop_marker_for_self
             return consume_planned_stop_marker_for_self()
 
+        # Planned reload: launchd bootout issued only to re-read the service definition.
+        def _planned_restart() -> bool:
+            from gateway.restart_loop_guard import consume_planned_restart_signal
+            return consume_planned_restart_signal()
+
         # Fast (<10ms) sync snapshot: stdlib + /proc, no subprocesses (`ps aux` here once blocked ~3s).
         def _snapshot():
             from gateway.shutdown_forensics import snapshot_shutdown_context
@@ -201,6 +204,8 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             planned_stop_seen[0] = True
         elif planned_stop_seen[0] and not planned_takeover:
             planned_stop = True
+        planned_restart = not (planned_takeover or planned_stop) and bool(
+            _best_effort(_planned_restart, "Planned restart marker check failed: %s"))
         _shutdown_ctx = _best_effort(_snapshot, "snapshot_shutdown_context failed: %s")
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
@@ -208,6 +213,9 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
         elif planned_stop:
             logger.info("Received %s as a planned gateway stop — exiting cleanly", sig_name or "SIGTERM/SIGINT")
+        elif planned_restart:
+            logger.info("Received %s with planned-restart marker — taking the bounded restart path",
+                        sig_name or "SIGTERM")
         else:
             # Mirrored onto the runner so _stop_impl suppresses the gateway_state=stopped persist for
             # unexpected signals; operator stops take the `planned_stop` branch and leave it False (DO persist).
@@ -235,7 +243,11 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
             # here, and a sibling-driven --replace takeover is not launchd-timed either, so both
             # keep the configured drain. _stop_impl uses this to cap the drain to the live budget.
             runner._stop_requested_by_signal = True
-        asyncio.create_task(runner.stop())
+        if planned_restart:
+            # Match the SIGUSR1 restart, without its after-turn wait: launchd times this shutdown.
+            asyncio.create_task(runner.stop(restart=True, service_restart=True))
+        else:
+            asyncio.create_task(runner.stop())
     return shutdown_signal_handler
 
 
@@ -287,6 +299,7 @@ async def _start_gateway_start_control_socket(runner):
         )
         from gateway.run_plugin_rewire import reload_plugins_verb
         from gateway.run_active_work_verb import active_work_verb
+        from gateway.relay.link import relay_link_verb
         from gateway.drain_control import RESTART_WAIT_REASON
         descriptor = runner.session_runtime_descriptor
 
@@ -317,27 +330,8 @@ async def _start_gateway_start_control_socket(runner):
         # manager) relaunches after the code swap.
         _main_loop = asyncio.get_running_loop()
 
-        def _pause_for_update_handler() -> dict:
-            try:
-                from hermes_cli.gateway import _get_restart_drain_timeout
-                _drain = float(_get_restart_drain_timeout())
-            except Exception:
-                _drain = 30.0
-            accepted_box: list[bool] = []
-            _done = threading.Event()
-
-            def _request() -> None:
-                try:
-                    accepted_box.append(runner.request_restart(detached=False, via_service=True))
-                finally:
-                    _done.set()
-
-            _main_loop.call_soon_threadsafe(_request)
-            _done.wait(timeout=5.0)
-            accepted = bool(accepted_box and accepted_box[0])
-            return {
-                "pausing": accepted, "already_stopping": not accepted,
-                "pid": os.getpid(), "drain_timeout": _drain}
+        from gateway.run_control_pause import make_update_pause_handler
+        _pause_for_update_handler = make_update_pause_handler(runner, _main_loop)
 
         def _rescan_profiles_handler() -> dict:
             """``hermes profile create/delete`` asks the multiplexer to reconcile ``profiles/`` now
@@ -365,8 +359,19 @@ async def _start_gateway_start_control_socket(runner):
                            "active-work": active_work_verb(runner, _main_loop),
                            # A plugin installed/enabled by another process loads now and re-wires the
                            # live adapters' handlers (#87770); tools/prompt still wait for the next session.
-                           "reload-plugins": reload_plugins_verb(runner, _main_loop)})
+                           "reload-plugins": reload_plugins_verb(runner, _main_loop),
+                           # The per-gateway relay secret exists only in this process: the dashboard
+                           # mints Team Gateway link codes through it.
+                           "relay-link": relay_link_verb})
         _control_server.ticket_store = runner.session_ticket_store
+        # The public client lookup answers from the same descriptor ``identify`` does.
+        from gateway.control_resolve import resolve_profile_handler
+        _control_server.resolve_handler = resolve_profile_handler(_identify_runtime)
+        # The Webapp's verbs answer from the socket's first moment ("starting" until the listener
+        # settles): a client polling a restarting gateway must never read "unknown verb" as a failure.
+        from gateway.webapp_listener import register_control_verbs
+        from hermes_constants import get_hermes_home
+        register_control_verbs(runner, get_hermes_home(), server=_control_server)
         from gateway.session_worker_discovery import worker_discovery_handler
         _control_server.private_handlers['worker-identify'] = worker_discovery_handler(runner, _identify_runtime)
         if not await _control_server.start():
@@ -414,6 +419,8 @@ def _start_gateway_start_cron_and_housekeeping(runner):
         # default's. Absent (no multiplexed adapters), delivery for a secondary profile falls
         # back to the primary's routed adapters or fails closed — the job still FIRES.
         cron_start_kwargs["profile_adapters"] = getattr(runner, "_profile_adapters", None)
+        # A secondary bot that dropped is still that profile's own: never borrow meanwhile.
+        cron_start_kwargs["profile_bot_platforms"] = getattr(runner, "_profile_bot_platforms", None)
         # runner.adapters belongs to the LAUNCH profile (``default``, or the ``--profile``
         # name); naming it keeps the ticker from routing a secondary's cron through that bot
         # and lets a named multiplexer's own jobs reuse its live adapters.
@@ -537,6 +544,10 @@ def _launch_home_may_multiplex(config=None) -> bool:
             f"profile {name!r} launched the gateway, and only the default profile runs the multiplexer "
             "(start it with `hermes gateway run` from the default profile to serve every profile)")
         config.multiplex_profiles = False
+        # The first load armed fail-closed secret reads for a multiplexer; boot work before the
+        # runner (the left-core install) reads this profile's own env, unscoped.
+        from agent.secret_scope import set_multiplex_active
+        set_multiplex_active(False)
         log_multiplex_decision(decision)
         return True
     from gateway.restart import GATEWAY_FATAL_CONFIG_EXIT_CODE
@@ -547,6 +558,27 @@ def _launch_home_may_multiplex(config=None) -> bool:
         "default profile (`hermes gateway run`), which serves this profile too.", name)
     _write_runtime_status_quiet(gateway_state="startup_failed", exit_reason="multiplex_requires_default_profile")
     raise SystemExit(GATEWAY_FATAL_CONFIG_EXIT_CODE)
+
+
+def _reload_config_keeping_multiplex_verdict(first: GatewayConfig) -> GatewayConfig:
+    """Re-read platform config after the left-core migration installed a platform plugin (the first
+    load predates it) without deciding multiplex again: the boot already settled it, including the
+    named-launch downgrade ``_launch_home_may_multiplex`` applied in place, and reserved homes to
+    match. A second ``resolve_multiplex_mode`` would re-enable an implicit default and serve
+    profiles this process never reserved."""
+    from gateway.config import load_gateway_config
+    if getattr(first, "multiplex_profiles", False):
+        from gateway.run import _profile_runtime_scope
+        from hermes_constants import get_default_hermes_root
+        with _profile_runtime_scope(Path(get_default_hermes_root())):
+            reloaded = load_gateway_config()
+    else:
+        reloaded = load_gateway_config()
+    reloaded.multiplex_profiles = first.multiplex_profiles
+    reserved = getattr(first, "_runtime_profile_homes", None)
+    if reserved:
+        reloaded._runtime_profile_homes = reserved
+    return reloaded
 
 
 def _start_gateway_resolve_terminal_cwd() -> None:
@@ -579,52 +611,13 @@ def _browse_reconcile_reserve_wait_s() -> float:
     return BROWSE_RECONCILE_BUDGET_S + 2.0
 
 
-def _conflicting_homes(homes):
-    """The homes whose gateway.lock another holder has right now: each probed alone with its own open
-    file description and released at once (the all-or-nothing reserve does not say which failed).
-    A home freed meanwhile is simply not listed; the next reserve attempt takes it."""
-    from gateway.runtime_ownership import OwnershipConflict, ProfileOwnership
-    conflicting = []
-    for home in homes:
-        probe = ProfileOwnership()
-        try:
-            probe.reserve([home])
-        except OwnershipConflict:
-            conflicting.append(home)
-        finally:
-            probe.close()
-    return conflicting
-
-
 def _reserve_waiting_out_browse_reconcile(ownership, homes, *, wait_s: float | None = None):
-    """Reserve *homes*, waiting (bounded) while a contender is a browse reconcile or has not yet
-    published its lock record (flock taken, record unwritten). Only a positively identified holder
-    that is not browse maintenance refuses at once; the flock exclusion itself is never weakened."""
-    from gateway.runtime_ownership import OwnershipConflict, lock_record_unpublished, maintenance_holder
-    from hermes_state_reconcile import BROWSE_RECONCILE_PURPOSE
+    """Boot's all-or-nothing reserve of every served home, waiting out transient holders (a browse
+    reconcile, an unpublished record, a client's lock probe) for up to the browse window."""
+    from gateway.runtime_ownership import reserve_waiting_out_transient_holders
     if wait_s is None:
         wait_s = _browse_reconcile_reserve_wait_s()
-    deadline = time.monotonic() + wait_s
-    logged = False
-    while True:
-        try:
-            return ownership.reserve(homes)
-        except OwnershipConflict:
-            # Only the homes that actually conflict decide: a real owner on any of them refuses at
-            # once, even while another home is mid-browse (multiplexer boot, all-or-nothing).
-            conflicting = _conflicting_homes(homes)
-            # The holder may release between the failed reserve and these probes.
-            if not conflicting and time.monotonic() < deadline:
-                continue
-            holders = [h for h in conflicting
-                       if maintenance_holder(h, BROWSE_RECONCILE_PURPOSE) or lock_record_unpublished(h)]
-            if not holders or len(holders) < len(conflicting) or time.monotonic() >= deadline:
-                raise
-            if not logged:
-                logger.info("Profile %s is held by a short session-store schema catch-up; waiting up to %.0fs",
-                            holders[0], wait_s)
-                logged = True
-            time.sleep(0.1)
+    return reserve_waiting_out_transient_holders(ownership, homes, wait_s=wait_s)
 
 
 def _start_gateway_reserve_profiles(profile_homes) -> bool:
@@ -729,9 +722,50 @@ def _start_gateway_early_environment_probe() -> None:
         logger.debug("early environment probe did not start", exc_info=True)
 
 
+def _record_process_exit_state(runner) -> None:
+    from gateway.run_process_exit import current_process_exit_state
+    process_exit_state = current_process_exit_state()
+    if process_exit_state is None:
+        return
+    from gateway.run_shutdown_deadlines import bounded_stop_requested
+    restart_requested = bool(getattr(runner, "_restart_requested", False))
+    signal_shutdown = bool(getattr(runner, "_signal_initiated_shutdown", False))
+    planned_signal_stop = bool(runner is not None and bounded_stop_requested(runner)) and not signal_shutdown
+    # stop() sets _shutdown_event even for exception cleanup, so it is not stop intent.
+    explicit_stop = bool(getattr(runner, "_exit_cleanly", False)) and not signal_shutdown
+    process_exit_state.update(
+        shutdown_requested=restart_requested or planned_signal_stop or explicit_stop,
+        exit_code=(getattr(runner, "exit_code", None) if runner is not None else None),
+    )
+    if restart_requested and process_exit_state["exit_code"] is None:
+        from gateway.restart import GATEWAY_SERVICE_RESTART_EXIT_CODE
+        process_exit_state["exit_code"] = (
+            GATEWAY_SERVICE_RESTART_EXIT_CODE if getattr(runner, "_restart_via_service", False) else 0
+        )
+
+
 async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = False,
                         verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
                         client_owned: bool = False) -> bool:
+    from pm.extras import suppress_interactive_install_prompts
+    with suppress_interactive_install_prompts():
+        return await _start_gateway_runtime(config, replace, verbosity, force, idle_exit, client_owned)
+
+
+async def _recover_gateway_start_config(resolved_config, config):
+    """Recover the interrupted core before constructing the runtime and its stores."""
+    from gateway.run import asyncio
+    from gateway.run_startup import recover_left_core_at_gateway_start
+    from gateway.zero_cut_standby import is_standby
+    if not is_standby():
+        if await asyncio.to_thread(recover_left_core_at_gateway_start) and config is None:
+            return _reload_config_keeping_multiplex_verdict(resolved_config)
+    return resolved_config
+
+
+async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace: bool = False,
+                                 verbosity: Optional[int] = 0, force: bool = False, idle_exit: bool = False,
+                                 client_owned: bool = False) -> bool:
     """Start the gateway and run until interrupted; False if it failed to start (non-zero exit so
     systemd can auto-restart). ``replace`` kills any existing instance first (avoids restart-loop
     deadlocks); ``force`` starts without consulting the host owner at all; ``idle_exit`` arms the
@@ -762,6 +796,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     )
     # Set here (not at import) so incidental gateway.run imports from CLI code don't poison it.
     os.environ["HERMES_EXEC_ASK"] = "1"
+    from hermes_cli.update_proxy_env import restore_user_proxy_env
+    restore_user_proxy_env()  # a gateway an update restarted keeps the user's proxy env, not the update's
     _start_gateway_resolve_terminal_cwd()
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit
@@ -790,6 +826,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
     if profile_homes and not getattr(resolved_config, 'multiplex_profiles', False):
         profile_homes = []  # implicit default downgraded: this named launch serves only itself
+        if config is None:  # the first load read the default root's platforms under its scope
+            resolved_config = _reload_config_keeping_multiplex_verdict(resolved_config)
 
     # Multiplex-only: the ONE host gateway decides first. Attach to it, make it serve this profile,
     # replace it (--replace) or refuse — before anything below binds a port or claims a PID file.
@@ -832,22 +870,15 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     try:
         _facade_configure_logging(verbosity)
 
-        from gateway.run_startup import recover_left_core_at_gateway_start
-        if not is_standby():
-            await asyncio.to_thread(recover_left_core_at_gateway_start)  # before the runner loads platform config
+        resolved_config = await _recover_gateway_start_config(resolved_config, config)
 
-        # Some runner doubles construct SessionDB in __init__. Guard registration belongs to the
-        # running runner, not the bootstrap constructor, so do not let a prior test/runtime's guard
-        # reject construction before the new runner can establish its own lifecycle.
-        import hermes_loop_guard as _loop_guard
-        _previous_loop_thread = _loop_guard._loop_thread
-        _loop_guard.set_loop_thread(None)
+        from gateway.run_runtime import initialize_gateway_runtime, pin_launch_store, unpin_launch_store
+        _launch_store_pin = await asyncio.to_thread(pin_launch_store)
         try:
             runner = GatewayRunner(resolved_config)
             runner._client_owned = client_owned
         finally:
-            _loop_guard.set_loop_thread(_previous_loop_thread)
-        from gateway.run_runtime import initialize_gateway_runtime
+            unpin_launch_store(_launch_store_pin)
         await initialize_gateway_runtime(runner)
         # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
         # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
@@ -907,6 +938,8 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         _log_standalone_profiles_at_boot(runner)
         from gateway.run_runtime import start_gateway_runtime_api
         await start_gateway_runtime_api(runner)
+        from gateway.run_api import await_session_socket_preload, preload_session_socket
+        ws_preload = preload_session_socket() if idle_exit else None  # overlaps the adapter/cron start
 
         # After the PID claim: a losing replacement must not clobber crash evidence.
         from gateway.run_client_owned import start_daemon_lifecycle
@@ -915,6 +948,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
 
         _early_verdict = await _start_gateway_run_runner(runner, _signal_initiated_shutdown)
         if _early_verdict is not None:
+            await await_session_socket_preload(ws_preload)  # never left unawaited on the way out
             return _early_verdict
         if _unclean_exit is not None:
             _start_deferred_state_db_integrity_check(_unclean_exit)
@@ -925,6 +959,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         # which stops the cron ticker and housekeeping before the adapters they deliver through close.
         from gateway.run_runtime import publish_gateway_runtime_ready, wait_gateway_runtime
         try:
+            await await_session_socket_preload(ws_preload)
             # READY only once adapters, cron and housekeeping run; missing systemd state just disables watchdog.
             if hasattr(runner, "session_runtime_descriptor"):
                 publish_gateway_runtime_ready(runner)
@@ -943,6 +978,7 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return verdict
 
     finally:
+        _record_process_exit_state(runner)
         try:
             if runner is not None:
                 from gateway.run_runtime import drain_gateway_runtime

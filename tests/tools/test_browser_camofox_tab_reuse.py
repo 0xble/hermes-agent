@@ -154,6 +154,8 @@ def camofox(tmp_path, monkeypatch):
             leases.release(server_url, user_id, tab_id)
         with cf._sessions_lock:
             cf._sessions.clear()
+            cf._task_release_epochs.clear()
+            cf._active_identity_lookups.clear()
             getattr(cf, "_stale_tab_ids", {}).clear()
             getattr(cf, "_owned_tabs", {}).clear()
             cf._closing_tabs.clear()
@@ -1220,6 +1222,70 @@ def test_identity_lookup_refuses_a_concurrently_changed_binding(camofox, change)
     assert camofox.server.calls == before, "stale lookup must not navigate or create a replacement"
     if old is not None:
         assert old["tab_id"] in cf._protected_tabs_on_disk()
+
+
+def test_cleanup_during_initial_identity_lookup_invalidates_the_lookup(camofox):
+    """Cleanup that lands while a task's first registry lookup is in flight must not be undone.
+
+    With no prior binding the post-lookup snapshot is ``None`` again after cleanup, so only the
+    release epoch tells the stale lookup apart from a lookup nobody cleaned up.
+    """
+    from agent.memory_provider import spawn_context_thread
+
+    cf = camofox.cf
+    started, finish, released = threading.Event(), threading.Event(), threading.Event()
+    results = []
+    original_lookup = cf.get_camofox_account_identity
+
+    def lookup(account, task_id):
+        started.set()
+        assert finish.wait(15), "identity lookup was not released"
+        return original_lookup(account, task_id)
+
+    def named_tool():
+        results.append(_dispatch("browser_navigate", {"url": "https://stale.test/", "account": "brianle"}, "target"))
+
+    def cleanup():
+        cf.release_task_bindings({"target"}, close_created_tabs=True)
+        released.set()
+
+    with patch.object(cf, "get_camofox_account_identity", side_effect=lookup):
+        named = spawn_context_thread(named_tool, name="initial-identity-lookup")
+        closer = spawn_context_thread(cleanup, name="initial-lookup-cleanup")
+        named.start()
+        try:
+            assert started.wait(2)
+            assert "target" not in cf._sessions
+            closer.start()
+            assert released.wait(2), "cleanup blocked on the identity registry"
+            assert "target" not in cf._sessions
+            before = list(camofox.server.calls)
+        finally:
+            finish.set()
+            for thread in (named, closer):
+                if thread.ident is not None:
+                    thread.join(5)
+        assert not named.is_alive() and not closer.is_alive()
+        assert results[0]["success"] is False
+        assert "binding changed" in results[0]["error"]
+        assert "target" not in cf._sessions, "stale lookup recreated a binding after cleanup"
+        assert not cf._owned_tabs
+        assert camofox.server.calls != before
+        assert all(method == "GET" and path == "/browser/identities" for method, path, _ in camofox.server.calls)
+        assert camofox.server.tab_posts() == []
+    # The next operation is a fresh lookup and binds normally.
+    assert _dispatch("browser_navigate", {"url": "https://fresh.test/", "account": "brianle"}, "target")["success"]
+    assert cf._sessions["target"]["tab_id"]
+    cf.release_task_bindings({"target"}, close_created_tabs=True)
+    assert "target" not in cf._task_release_epochs
+
+
+def test_cleanup_without_an_inflight_lookup_does_not_retain_release_epochs(camofox):
+    cf = camofox.cf
+    for index in range(1000):
+        cf.release_task_bindings({f"unused-{index}"}, close_created_tabs=True)
+    assert not cf._task_release_epochs
+    assert not cf._active_identity_lookups
 
 
 def test_slow_owned_tab_delete_does_not_block_sibling_tool(camofox):

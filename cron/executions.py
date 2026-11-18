@@ -3,6 +3,43 @@
 The ledger records what is known about each attempt; it is not a retry queue. Interrupted attempts
 become ``unknown`` only after their owner process is proved gone — a start-time reading that fails
 to match the claim-time fingerprint is not proof of death. Terminal states are immutable.
+
+Read contract (SQLite ``mode=ro``; read metadata and attempts in ONE read transaction):
+``execution_coverage`` has one row (``singleton=1``): ``epoch_id`` is a random database
+incarnation ID, ``started_at`` is the UTC coverage epoch, and ``origin`` is ``fresh`` or
+``migration``. The epoch is never backdated to surviving rows: ALL earlier history is
+unproven, even on migration from a populated ledger. Recreating the DB starts a new ID
+and epoch; readers must not carry a certificate across IDs or a restored older snapshot.
+``execution_prune_watermarks`` has exactly two rows, reasons ``age`` and ``cap``:
+``pruned_count`` is cumulative, ``max_pruned_claimed_jd`` is the greatest SQLite
+``julianday(claimed_at)`` ever deleted for that reason (NULL before any valid deletion),
+``unparseable_claimed_at_count`` counts deleted rows with an unreadable claim time,
+and ``last_pruned_at`` is the UTC time of the latest nonempty prune. All sources count,
+conservatively including never-started misses. Deletion and watermark commit together.
+
+For a valid ISO window start bound as ``:window_start``, the exact proof query is::
+
+    SELECT EXISTS (
+        SELECT 1 FROM execution_coverage
+        WHERE singleton=1 AND julianday(started_at) < julianday(:window_start)
+          AND (SELECT COUNT(*) FROM execution_prune_watermarks) = 2
+          AND NOT EXISTS (
+              SELECT 1 FROM execution_prune_watermarks
+              WHERE unparseable_claimed_at_count > 0
+                 OR max_pruned_claimed_jd >= julianday(:window_start)
+          )
+    ) AS complete
+
+A result of 1 proves no ledger-admitted attempt with claim time >= the window start
+has been pruned since coverage began, for this DB snapshot. Window the attempts using
+``julianday(claimed_at)`` too (numeric instants, not offset-sensitive ISO text). The
+strict epoch comparison and prune comparison conservatively refuse proof on boundary
+collisions at SQLite's millisecond precision.
+Missing tables, a missing epoch, or 0 mean unproven, NOT zero attempts. This certifies
+retention, not scheduler uptime, expected occurrences, terminality, or success. It
+assumes ledger writes use this implementation: older writers, manual SQL, file loss,
+clock rollback and backup restoration are not independently detectable by an in-DB
+certificate and must invalidate external continuity evidence.
 """
 
 from __future__ import annotations
@@ -10,15 +47,16 @@ from __future__ import annotations
 import logging
 import math
 import os
+import re
 import subprocess
 import sqlite3
 import threading
 import time
 import uuid
-from contextlib import contextmanager
-from datetime import datetime
+from contextlib import closing, contextmanager
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Optional
+from typing import Any, Iterable, Iterator, List, Optional
 
 from hermes_constants import get_hermes_home
 from hermes_time import now as _hermes_now
@@ -31,11 +69,22 @@ logger = logging.getLogger(__name__)
 # that temporarily enter another profile cannot leak that profile's records into the import-time
 # home.
 EXECUTIONS_FILE: Optional[Path] = None
-MAX_TERMINAL_EXECUTIONS = 1000
+# A full week plus one audit period, independent of normal fleet throughput.
+TERMINAL_RETENTION_DAYS = 8
+# Runaway-write backstop, not the normal history window (see the maintenance unit).
+MAX_TERMINAL_EXECUTIONS = 100_000
+# Every terminal transition contributes one short cleanup batch, including recovery.
+TERMINAL_PRUNE_BATCH_SIZE = 500
 HANDOFF_ADOPTION_GRACE_SECONDS = 30.0
 # Floor for the live-owner stale-claim bound (#115692); see _live_owner_stale_after_seconds.
 LIVE_OWNER_STALE_CLAIM_FLOOR_SECONDS = 7200.0
-_TERMINAL_STATES = ("completed", "failed", "unknown")
+# ``cancelled``: an operator stopped the run (``hermes cron cancel``, removing the job mid-run).
+# ``missed``: never started — one row books every occurrence the scheduler skipped past.
+_TERMINAL_STATES = ("completed", "failed", "unknown", "cancelled", "missed")
+_STATUS_CHECK = "('claimed','running','completed','failed','unknown','cancelled','missed')"
+# Outcomes the attempt's own firer booked: receipt recovery, the external-worker waiter and the
+# dead-owner sweep must treat these as final, never replay or re-book them.
+FIRER_FINISHED_STATES = frozenset({"completed", "failed", "cancelled"})
 _lock = threading.RLock()
 _PROCESS_ID = uuid.uuid4().hex
 
@@ -57,8 +106,11 @@ def _connect() -> sqlite3.Connection:
 def _initialize_schema(conn: sqlite3.Connection) -> None:
     from hermes_cli.sqlite_util import add_column_if_missing
 
+    existing_ledger = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='executions'"
+    ).fetchone() is not None
     conn.execute(
-        """CREATE TABLE IF NOT EXISTS executions (
+        f"""CREATE TABLE IF NOT EXISTS executions (
              id TEXT PRIMARY KEY,
              job_id TEXT NOT NULL,
              source TEXT NOT NULL,
@@ -66,7 +118,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              pid INTEGER NOT NULL,
              process_started_at INTEGER,
              status TEXT NOT NULL CHECK(status IN
-               ('claimed','running','completed','failed','unknown')),
+               {_STATUS_CHECK}),
              handoff_pending INTEGER NOT NULL DEFAULT 0,
              handoff_started_at REAL,
              claimed_at TEXT NOT NULL,
@@ -75,6 +127,7 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
              error TEXT
            )"""
     )
+    _widen_status_check(conn)
     add_column_if_missing(
         conn, "executions", "handoff_pending",
         "handoff_pending INTEGER NOT NULL DEFAULT 0",
@@ -97,6 +150,10 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     add_column_if_missing(conn, "executions", "code_sha", "code_sha TEXT")
     add_column_if_missing(conn, "executions", "execution_identity", "execution_identity TEXT")
     add_column_if_missing(conn, "executions", "owner_kind", "owner_kind TEXT")
+    # NULL is legacy/ambiguous, never proof of an unstarted body. Only the new
+    # detached runner writes attaching, and must win attaching->started before
+    # any pre-script or agent effect. Terminalization makes that CAS impossible.
+    add_column_if_missing(conn, "executions", "body_phase", "body_phase TEXT")
     add_column_if_missing(conn, "executions", "delivery_status", "delivery_status TEXT")
     # 0 means an unknown status is a terminal queue projection; 1 is the
     # detached finish-before-enqueue provisional marker.  Additive so older
@@ -110,6 +167,102 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_executions_occurrence "
         "ON executions(job_id, scheduled_instant) WHERE status='completed'"
     )
+    # Numeric instants handle timezone/DST changes. The partial index keeps age
+    # selection and oldest-first trimming off the output-bearing table pages.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_terminal_age "
+        "ON executions(COALESCE(julianday(finished_at), julianday(claimed_at)), id) "
+        "WHERE status IN ('completed','failed','unknown','cancelled','missed')"
+    )
+    # Retention must preserve the same latest attempt the history/list readers select,
+    # including when a profile's UTC offset has changed.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_executions_job_instant "
+        "ON executions(job_id, julianday(claimed_at) DESC, claimed_at DESC, id DESC)"
+    )
+    _initialize_coverage(conn, existing_ledger=existing_ledger)
+
+
+_STATUS_CHECK_RE = re.compile(r"(CHECK\s*\(\s*status\s+IN\s*)\(([^)]*)\)", re.IGNORECASE)
+
+
+def _widened_table_sql(old_sql: str) -> Optional[str]:
+    """Return ``old_sql`` with its status CHECK widened to the union of the statuses it already
+    allows and :data:`_STATUS_CHECK`, or ``None`` when it has no status CHECK to widen.
+
+    Keeping the old values matters: a fork ledger may allow statuses this build no longer writes
+    (``deferred``), and narrowing would make the copy fail. The result always names ``missed``,
+    so a rebuild happens once rather than on every open."""
+    match = _STATUS_CHECK_RE.search(old_sql)
+    if match is None:
+        return None
+    statuses = list(dict.fromkeys(
+        re.findall(r"'([^']*)'", match.group(2)) + re.findall(r"'([^']*)'", _STATUS_CHECK)))
+    widened = ",".join(f"'{status}'" for status in statuses)
+    return old_sql[:match.start()] + f"{match.group(1)}({widened})" + old_sql[match.end():]
+
+
+def _widen_status_check(conn: sqlite3.Connection) -> None:
+    """Rebuild a ledger created before ``cancelled``/``missed`` existed: SQLite cannot alter a
+    CHECK constraint in place. Copies every column the old table has; runs once per file, and
+    re-reads the schema under the write lock so two processes opening it together rebuild once."""
+    def current_sql() -> Optional[str]:
+        row = conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='executions'").fetchone()
+        return row[0] if row is not None else None
+
+    if "'missed'" in (current_sql() or "'missed'"):
+        return
+    if _widened_table_sql(current_sql() or "") is None:
+        return
+    conn.commit()
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        old_sql = current_sql() or "'missed'"
+        new_sql = None if "'missed'" in old_sql else _widened_table_sql(old_sql)
+        if new_sql is not None:
+            columns = ", ".join(r[1] for r in conn.execute("PRAGMA table_info(executions)"))
+            conn.execute("ALTER TABLE executions RENAME TO executions_pre_widen")
+            conn.execute(new_sql)
+            conn.execute(
+                f"INSERT INTO executions ({columns}) SELECT {columns} FROM executions_pre_widen")
+            conn.execute("DROP TABLE executions_pre_widen")
+        conn.commit()
+    except BaseException:
+        conn.rollback()
+        raise
+
+
+def _initialize_coverage(conn: sqlite3.Connection, *, existing_ledger: bool) -> None:
+    conn.execute("""CREATE TABLE IF NOT EXISTS execution_coverage (
+        singleton INTEGER PRIMARY KEY CHECK(singleton=1),
+        epoch_id TEXT NOT NULL,
+        started_at TEXT NOT NULL,
+        origin TEXT NOT NULL CHECK(origin IN ('fresh','migration'))
+    )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS execution_prune_watermarks (
+        reason TEXT PRIMARY KEY CHECK(reason IN ('age','cap')),
+        pruned_count INTEGER NOT NULL DEFAULT 0 CHECK(pruned_count >= 0),
+        max_pruned_claimed_jd REAL,
+        unparseable_claimed_at_count INTEGER NOT NULL DEFAULT 0
+            CHECK(unparseable_claimed_at_count >= 0),
+        last_pruned_at TEXT
+    )""")
+    if conn.execute("SELECT 1 FROM execution_coverage WHERE singleton=1").fetchone() is not None:
+        return
+    # Separate schema initialization from callers' explicit BEGIN IMMEDIATE. INSERT OR IGNORE
+    # elects one epoch across processes; its empty watermarks must commit with that epoch.
+    with conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO execution_coverage (singleton, epoch_id, started_at, origin) "
+            "VALUES (1, ?, ?, ?)",
+            (uuid.uuid4().hex, _hermes_now().astimezone(UTC).isoformat(),
+             "migration" if existing_ledger else "fresh"),
+        )
+        conn.executemany(
+            "INSERT OR IGNORE INTO execution_prune_watermarks (reason) VALUES (?)",
+            (("age",), ("cap",)),
+        )
 
 
 @contextmanager
@@ -245,16 +398,110 @@ def touch_execution_progress(execution_id: str) -> bool:
         return cur.rowcount == 1
 
 
-def _prune_unlocked(conn: sqlite3.Connection) -> None:
-    conn.execute(
-        """DELETE FROM executions WHERE id IN (
-             SELECT id FROM executions
-             WHERE status IN ('completed','failed','unknown')
-             ORDER BY julianday(finished_at) DESC, finished_at DESC,
-                      julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT -1 OFFSET ?
-           )""",
-        (max(0, int(MAX_TERMINAL_EXECUTIONS)),),
+def _delete_prunable(
+    conn: sqlite3.Connection, limit: int, *, keep_ids: set[str], cutoff: Optional[str] = None,
+) -> int:
+    from cron.scheduler_authority import journal_path
+
+    age_clause = (
+        " AND COALESCE(julianday(e.finished_at), julianday(e.claimed_at)) < julianday(?)"
+        if cutoff is not None else ""
     )
+    ids = []
+    with closing(conn.execute(
+        """SELECT e.id, e.job_id FROM executions AS e INDEXED BY idx_executions_terminal_age
+           WHERE e.status IN ('completed','failed','unknown','cancelled','missed')
+             AND COALESCE(e.delivery_outcome, '') != 'queued'
+             AND COALESCE(e.delivery_status, '') NOT IN ('pending','delivering')
+             AND e.delivery_status_provisional=0
+             AND e.id != (
+                 SELECT newest.id FROM executions AS newest
+                 WHERE newest.job_id=e.job_id
+                 ORDER BY julianday(newest.claimed_at) DESC, newest.claimed_at DESC,
+                          newest.id DESC LIMIT 1
+             )""" + age_clause + """
+           ORDER BY COALESCE(julianday(e.finished_at), julianday(e.claimed_at)), e.id""",
+        (cutoff,) if cutoff is not None else (),
+    )) as rows:
+        for row in rows:
+            if row["id"] in keep_ids:
+                continue
+            # A terminal worker can still owe canonical admission settlement. Keep
+            # its recovery link until the journal's owner removes it, even if old.
+            if journal_path(row["job_id"], row["id"]).exists():
+                continue
+            ids.append((row["id"],))
+            if len(ids) == limit:
+                break
+    if ids:
+        _record_prune_watermark(conn, ids, reason="age" if cutoff is not None else "cap")
+    return conn.executemany("DELETE FROM executions WHERE id=?", ids).rowcount
+
+
+def _record_prune_watermark(
+    conn: sqlite3.Connection, ids: list[tuple[str]], *, reason: str,
+) -> None:
+    # The selection is already bounded by the shared prune budget; aggregate by primary key,
+    # not by finish time or lexical ISO order. The caller owns the delete's write transaction.
+    stats = conn.execute(
+        "SELECT COUNT(*), MAX(julianday(claimed_at)), "
+        "SUM(julianday(claimed_at) IS NULL) FROM executions WHERE id IN ("
+        + ",".join("?" for _ in ids) + ")",
+        tuple(item[0] for item in ids),
+    ).fetchone()
+    count, maximum, unparseable = stats
+    updated = conn.execute(
+        """UPDATE execution_prune_watermarks
+           SET pruned_count=pruned_count+?,
+               max_pruned_claimed_jd=COALESCE(MAX(max_pruned_claimed_jd, ?),
+                                            max_pruned_claimed_jd, ?),
+               unparseable_claimed_at_count=unparseable_claimed_at_count+?,
+               last_pruned_at=?
+           WHERE reason=?""",
+        (count, maximum, maximum, unparseable, _hermes_now().astimezone(UTC).isoformat(), reason),
+    )
+    if updated.rowcount != 1:
+        raise RuntimeError(f"Missing cron execution prune watermark: {reason}")
+
+
+def _prune_unlocked(conn: sqlite3.Connection, *, keep_ids: Iterable[str] = ()) -> None:
+    """Age out terminal history, with a bounded runaway-write backstop.
+
+    Share one deletion budget between both policies so an upgrade or recovery
+    backlog cannot monopolize the caller's write transaction. Later transitions
+    drain any remaining excess. In-flight attempts never enter either policy.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    value = (load_config_readonly().get("cron") or {}).get(
+        "execution_retention_days", TERMINAL_RETENTION_DAYS)
+    try:
+        days = float(value)
+        if not math.isfinite(days) or days < 0:
+            raise ValueError("expected a non-negative finite duration")
+    except (TypeError, ValueError):
+        logger.warning("Invalid cron.execution_retention_days=%r, using %s", value, TERMINAL_RETENTION_DAYS)
+        days = TERMINAL_RETENTION_DAYS
+    budget = TERMINAL_PRUNE_BATCH_SIZE
+    keep_ids = set(keep_ids)
+    if days > 0:
+        cutoff = (_hermes_now().astimezone(UTC) - timedelta(days=days)).isoformat()
+        budget -= _delete_prunable(conn, budget, keep_ids=keep_ids, cutoff=cutoff)
+    if budget <= 0:
+        return
+    cap = max(0, int(MAX_TERMINAL_EXECUTIONS))
+    # Only count enough indexed entries to fill this batch. Neither a table
+    # scan nor sorting the entire history belongs inside a terminal write.
+    remaining = conn.execute(
+        """SELECT COUNT(*) FROM (
+             SELECT 1 FROM executions INDEXED BY idx_executions_terminal_age
+             WHERE status IN ('completed','failed','unknown','cancelled','missed') LIMIT ?
+           )""",
+        (cap + budget,),
+    ).fetchone()[0]
+    excess = min(budget, remaining - cap)
+    if excess > 0:
+        _delete_prunable(conn, excess, keep_ids=keep_ids)
 
 
 def create_execution(
@@ -279,6 +526,41 @@ def create_execution(
         )
         record = _fetch(conn, execution_id)
     _emit_execution_state(record)
+    return record  # type: ignore[return-value]
+
+
+def record_missed_execution(job_id: str, *, scheduled_instant: str, error: str) -> dict[str, Any]:
+    """Atomically persist a never-started miss once per occurrence, including save retries."""
+    from cron.occurrences import scheduled_instant as canonical_instant
+
+    instant = canonical_instant(scheduled_instant)
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _transaction() as conn:
+        # Serialize the occurrence lookup with insertion across processes too. A
+        # miss is born terminal: no crash or failed terminal write can strand a claim.
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT * FROM executions WHERE job_id=? AND source='scheduler-missed' "
+            "AND scheduled_instant=? AND status='failed' ORDER BY claimed_at, id LIMIT 1",
+            (str(job_id), instant),
+        ).fetchone()
+        if existing is not None:
+            return dict(existing)
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, process_started_at, status,
+                claimed_at, finished_at, scheduled_instant, error, code_sha,
+                execution_identity, owner_kind)
+               VALUES (?, ?, 'scheduler-missed', ?, ?, ?, 'failed', ?, ?, ?, ?, ?, ?, 'gateway')""",
+            (execution_id, str(job_id), _PROCESS_ID, pid, _process_start_time(pid),
+             now, now, instant, str(error), running_code_sha(), execution_id),
+        )
+        _prune_unlocked(conn, keep_ids=(execution_id,))
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record)
+    record_cron_finish(record, None)
     return record  # type: ignore[return-value]
 
 
@@ -341,6 +623,31 @@ def adopt_claimed_execution(execution_id: str) -> Optional[dict[str, Any]]:
     return record
 
 
+def _advance_detached_body_phase(execution_id: str, expected: str | None, phase: str) -> bool:
+    with _transaction() as conn:
+        cur = conn.execute(
+            "UPDATE executions SET body_phase=? WHERE id=? AND status='running' "
+            "AND owner_kind='detached' AND process_id=? AND pid=? AND body_phase IS ?",
+            (phase, execution_id, _PROCESS_ID, os.getpid(), expected),
+        )
+        return cur.rowcount == 1
+
+
+def mark_detached_attaching(execution_id: str) -> bool:
+    """Opt this worker into the durable body gate; old workers remain NULL/ambiguous."""
+    return _advance_detached_body_phase(execution_id, None, 'attaching')
+
+
+def mark_detached_attach_lost(execution_id: str) -> bool:
+    """Record the positive marker for a transient loss before the body gate."""
+    return _advance_detached_body_phase(execution_id, 'attaching', 'attach_lost')
+
+
+def start_detached_body(execution_id: str) -> bool:
+    """Win before ANY pre-script/agent effect; an unknown/deferred attempt cannot start."""
+    return _advance_detached_body_phase(execution_id, 'attaching', 'started')
+
+
 def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
     """Transition one claimed attempt to running exactly once."""
     now = _hermes_now().isoformat()
@@ -363,7 +670,7 @@ def mark_execution_running(execution_id: str) -> Optional[dict[str, Any]]:
 def finish_execution(
     execution_id: str, *, success: bool, error: Optional[str] = None,
     delivery_outcome: Optional[str] = None, require_running: bool = False,
-    output: Optional[str] = None,
+    output: Optional[str] = None, cancelled: bool = False,
 ) -> Optional[dict[str, Any]]:
     """Write a terminal result once; terminal attempts cannot be rewritten.
 
@@ -371,7 +678,7 @@ def finish_execution(
     settles through ``recover_receipted_execution``.
     """
     now = _hermes_now().isoformat()
-    status = "completed" if success else "failed"
+    status = "cancelled" if cancelled else ("completed" if success else "failed")
     detail = None if success else (str(error) if error else "unknown failure")
     with _transaction() as conn:
         owner = (_PROCESS_ID, os.getpid())
@@ -392,10 +699,38 @@ def finish_execution(
         )
         if cur.rowcount != 1:
             return None
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
+    return record
+
+
+def record_missed_occurrences(
+    job_id: str, *, count: int, first_instant: Optional[str], detail: str,
+) -> Optional[dict[str, Any]]:
+    """Book occurrences the scheduler passed over without running as ONE terminal ``missed`` row
+    (``missed ×N``), so run history shows the gap instead of nothing. Never started, so no
+    owner fencing applies; ``first_instant`` is the earliest skipped slot."""
+    from cron.occurrences import scheduled_instant as canonical_instant
+
+    if count < 1:
+        return None
+    now = _hermes_now().isoformat()
+    execution_id = uuid.uuid4().hex
+    pid = os.getpid()
+    with _transaction() as conn:
+        conn.execute(
+            """INSERT INTO executions
+               (id, job_id, source, process_id, pid, process_started_at,
+                status, claimed_at, finished_at, error, scheduled_instant)
+               VALUES (?, ?, 'scheduler', ?, ?, ?, 'missed', ?, ?, ?, ?)""",
+            (execution_id, str(job_id), _PROCESS_ID, pid, _process_start_time(pid), now, now,
+             f"missed \u00d7{count} ({detail})", canonical_instant(first_instant)),
+        )
+        _prune_unlocked(conn)
+        record = _fetch(conn, execution_id)
+    _emit_execution_state(record)
     return record
 
 
@@ -415,7 +750,7 @@ def recover_receipted_execution(execution_id, job_id, *, success, error=None, de
                handoff_started_at=NULL, delivery_outcome=? WHERE id=?""",
             ('completed' if success else 'failed', now, None if success else (str(error) if error else 'unknown failure'),
              delivery_outcome, execution_id))
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
         record = _fetch(conn, execution_id)
     _emit_execution_state(record, delivery_outcome=delivery_outcome)
     record_cron_finish(record, delivery_outcome)
@@ -445,6 +780,18 @@ def execution_owner_live(execution_id: str, job_id: str) -> bool:
     return row is not None and _row_owner_live(row)
 
 
+def mark_deferred_execution(execution_id: str) -> bool:
+    """Mark an attach-lost attempt settled by occurrence deferral, without booking a run result."""
+    with _transaction() as conn:
+        cur = conn.execute(
+            """UPDATE executions SET delivery_outcome='deferred'
+               WHERE id=? AND body_phase='attach_lost' AND status IN ('failed','unknown')
+                 AND (delivery_outcome IS NULL OR delivery_outcome='deferred')""",
+            (str(execution_id),),
+        )
+    return cur.rowcount == 1
+
+
 def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
     """Replace a terminal attempt's ``queued`` delivery outcome with the drain's real one.
 
@@ -455,7 +802,7 @@ def settle_delivery_outcome(execution_id: str, outcome: str) -> bool:
         cur = conn.execute(
             """UPDATE executions SET delivery_outcome=?
                WHERE id=? AND delivery_outcome='queued'
-                 AND status IN ('completed','failed','unknown')""",
+                 AND status IN ('completed','failed','unknown','cancelled','missed')""",
             (outcome, execution_id),
         )
     return cur.rowcount == 1
@@ -496,7 +843,8 @@ def recover_interrupted_executions() -> int:
     with _transaction() as conn:
         rows = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at, claimed_at, progress_at, owner_kind
+                      handoff_pending, handoff_started_at, claimed_at, progress_at, owner_kind,
+                      body_phase, error
                FROM executions
                WHERE status IN ('claimed','running')"""
         ).fetchall()
@@ -544,15 +892,19 @@ def recover_interrupted_executions() -> int:
                 continue
             # The SELECT ran outside a write transaction and the liveness probe takes time: the
             # owner may have stamped progress since, so act only on the snapshot that was judged.
+            attach_lost = (row["owner_kind"] == "detached"
+                           and row["body_phase"] == "attaching"
+                           and not row["error"])
             cur = conn.execute(
                 """UPDATE executions
                    SET status='unknown', finished_at=?, error=?,
+                       body_phase=CASE WHEN ? THEN 'attach_lost' ELSE body_phase END,
                        handoff_pending=0, handoff_started_at=NULL
                    WHERE id=? AND status=? AND process_id=? AND pid=?
                      AND handoff_pending=?
                      AND handoff_started_at IS ?
                      AND claimed_at=? AND progress_at IS ?""",
-                (now, reason, row["id"], row["status"], row["process_id"], row["pid"],
+                (now, reason, int(attach_lost), row["id"], row["status"], row["process_id"], row["pid"],
                  row["handoff_pending"], row["handoff_started_at"],
                  row["claimed_at"], row["progress_at"]),
             )
@@ -562,7 +914,7 @@ def recover_interrupted_executions() -> int:
                 if record is not None:
                     recovered.append(record)
         if changed:
-            _prune_unlocked(conn)
+            _prune_unlocked(conn, keep_ids=(record["id"] for record in recovered))
     for record in recovered:
         _emit_execution_state(record)
     return changed
@@ -591,7 +943,7 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
     with _transaction() as conn:
         row = conn.execute(
             """SELECT id, status, process_id, pid, process_started_at,
-                      handoff_pending, handoff_started_at
+                      handoff_pending, handoff_started_at, owner_kind, body_phase, error
                FROM executions WHERE id=?""",
             (execution_id,),
         ).fetchone()
@@ -608,17 +960,21 @@ def terminalize_dead_owner(execution_id: str, *, reason: str) -> bool:
             and time.time() - float(handoff_started_at) < HANDOFF_ADOPTION_GRACE_SECONDS
         ):
             return False
+        attach_lost = (row["owner_kind"] == "detached"
+                       and row["body_phase"] == "attaching"
+                       and not row["error"])
         cur = conn.execute(
             """UPDATE executions
                SET status='unknown', finished_at=?, error=?,
+                   body_phase=CASE WHEN ? THEN 'attach_lost' ELSE body_phase END,
                    handoff_pending=0, handoff_started_at=NULL
                WHERE id=? AND status=? AND process_id=? AND pid=?""",
-            (now, reason, row["id"], row["status"], row["process_id"], row["pid"]),
+            (now, reason, int(attach_lost), row["id"], row["status"], row["process_id"], row["pid"]),
         )
         if cur.rowcount != 1:
             return False
         record = _fetch(conn, execution_id)
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
     _emit_execution_state(record)
     return True
 
@@ -638,7 +994,7 @@ def give_up_execution(execution_id: str, *, reason: str) -> bool:
         if cur.rowcount != 1:
             return False
         record = _fetch(conn, str(execution_id))
-        _prune_unlocked(conn)
+        _prune_unlocked(conn, keep_ids=(execution_id,))
     _emit_execution_state(record)
     return True
 
@@ -707,7 +1063,7 @@ def _project_delivery_statuses(conn: sqlite3.Connection, rows: Iterable[tuple[st
 
 def record_delivery_outcome(
     execution_id: str, outcome: str, *, resolve_provisional_status: Optional[str] = None,
-) -> Optional[Dict[str, Any]]:
+) -> Optional[dict[str, Any]]:
     """Classify an already committed detached result once, without reopening its result fence.
 
     The same process/PID that committed the result owns this write; a replacement
@@ -785,12 +1141,51 @@ def live_inflight_execution(job_id: str) -> Optional[dict[str, Any]]:
     heartbeat yet stays owned, while a run whose process died (watchdog kill, crash) does not.
     Read-only — unlike ``recover_interrupted_executions`` it never rewrites a row.
     """
-    record = latest_execution(job_id)
+    # A ``missed`` row is the due scan's note about skipped slots, not an attempt: one booked while
+    # a long run is still live (machine slept through its next slots) must not hide that run.
+    with _transaction() as conn:
+        row = conn.execute(
+            """SELECT * FROM executions WHERE job_id=? AND status != 'missed'
+               ORDER BY julianday(claimed_at) DESC, claimed_at DESC, id DESC LIMIT 1""",
+            (job_id,),
+        ).fetchone()
+    record = dict(row) if row is not None else None
     if not record or record.get("status") not in ("claimed", "running"):
         return None
     if not _owner_is_live(int(record["pid"]), record.get("process_started_at")):
         return None
     return record
+
+
+def cancellable_execution(job_id: str) -> Optional[dict[str, Any]]:
+    """The job's newest claimed/running attempt under a LIVE owner, even when it is not the latest row.
+
+    A Run-now refused while a run is live books its own newer ``failed`` row ("Fire claim was not
+    acquired"), so ``live_inflight_execution`` (latest row only) would call the live run idle and a
+    cancel would never reach it.
+    """
+    return live_executions([job_id]).get(str(job_id))
+
+
+def live_executions(job_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Each job's newest claimed/running attempt under a live owner, in one query (see
+    ``cancellable_execution``). The job list carries it as ``live_execution`` so a Stop button
+    still finds a run that a refused Run-now's newer row hides from ``latest_execution``."""
+    clean = [str(job_id) for job_id in dict.fromkeys(job_ids) if job_id]
+    if not clean:
+        return {}
+    placeholders = ",".join("?" for _ in clean)
+    with _transaction() as conn:
+        rows = conn.execute(
+            f"""SELECT * FROM executions WHERE job_id IN ({placeholders}) AND status IN ('claimed', 'running')
+               ORDER BY julianday(claimed_at) DESC, claimed_at DESC, id DESC""",
+            clean,
+        ).fetchall()
+    live: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        if row["job_id"] not in live and _row_owner_live(row):
+            live[row["job_id"]] = dict(row)
+    return live
 
 
 def latest_executions(job_ids: list[str]) -> dict[str, dict[str, Any]]:

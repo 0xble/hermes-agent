@@ -30,7 +30,7 @@ HTTPX_AVAILABLE = httpx is not None
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import MessageDeduplicator, bounded_put, send_chunks
 from gateway.platforms.access_policy_mixin import OwnAccessPolicyMixin
-from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult
+from gateway.platforms.base import gateway_trust_env, BasePlatformAdapter, SendResult, describe_proxy_error, env_proxy_for_redaction
 from gateway.platforms.event import MessageEvent, MessageType
 from utils import env_float
 
@@ -170,16 +170,16 @@ class WeComAdapter(WeComStreamMixin, WeComMediaMixin, ChatSendQueueMixin, OwnAcc
             # Tighter keepalive so idle CLOSE_WAIT drains promptly.
             # See #18451.
             from gateway.platforms.helpers import platform_http_client
-            self._http_client = platform_http_client()
+            self._http_client = platform_http_client(trust_env=gateway_trust_env())  # must match the redaction below
             await self._open_connection()
             self._mark_connected()
             self._listen_task, self._heartbeat_task = asyncio.create_task(self._listen_loop()), asyncio.create_task(self._heartbeat_loop())
             logger.info("[%s] Connected to %s", self.name, self._ws_url)
             self._wire_plugin_handlers(None)  # ctx.register_platform_handler hooks
             return True
-        except Exception as exc:
-            self._set_fatal_error("wecom_connect_error", f"WeCom startup failed: {exc}", retryable=True)
-            logger.error("[%s] Failed to connect: %s", self.name, exc, exc_info=True)
+        except Exception as exc:  # the raw text may echo an env proxy's secret
+            self._set_fatal_error("wecom_connect_error", f"WeCom startup failed: {(shown := describe_proxy_error(exc, env_proxy_for_redaction(self._ws_url, trust_env=gateway_trust_env()))) or exc}", retryable=True)
+            logger.error("[%s] Failed to connect: %s", self.name, shown or exc, exc_info=not shown)
             await self._teardown()
             return False
 
@@ -710,7 +710,7 @@ async def _send_via(adapter, chat_id, message, *, live: bool):
     try:
         result = await adapter.send(chat_id, message)
     except Exception as e:
-        return send_error(f"WeCom live adapter send failed: {e}" if live else f"WeCom send failed: {e}")
+        return send_error(f"WeCom{' live adapter' if live else ''} send failed: {describe_proxy_error(e, env_proxy_for_redaction(adapter._ws_url, trust_env=gateway_trust_env())) or e}")
     if result.success:
         return {"success": True, "platform": "wecom", "chat_id": chat_id, "message_id": result.message_id}
     return send_error(f"WeCom send failed: {result.error}")
@@ -739,7 +739,7 @@ async def _standalone_send(pconfig, chat_id, message, *, thread_id=None, media_f
         finally:
             await adapter.disconnect()
     except Exception as e:
-        return send_error(f"WeCom send failed: {e}")
+        return send_error(f"WeCom send failed: {describe_proxy_error(e, env_proxy_for_redaction(getattr(adapter, '_ws_url', DEFAULT_WS_URL), trust_env=gateway_trust_env())) or e}")
 
 
 _MANUAL_SETUP_STEPS = (
@@ -865,9 +865,12 @@ def register(ctx) -> None:
         env_overrides=gateway_env.ENV_OVERRIDES,
         env_enable_credentials=gateway_env.ENV_ENABLE_CREDENTIALS, **gateway_env.AUTHZ,
     )
-    from plugins.platforms.wecom.callback_adapter import check_wecom_callback_requirements, ensure_wecom_callback_requirements
+    from plugins.platforms.wecom.callback_adapter import (
+        WecomCallbackAdapter, check_wecom_callback_requirements, ensure_wecom_callback_requirements,
+    )
     ctx.register_platform(
         name="wecom_callback", label="WeCom Callback (self-built apps)", adapter_factory=_build_callback_adapter,
+        adapter_class=WecomCallbackAdapter,
         dashboard_label="WeCom (app)",
         dashboard_description="Two-way WeCom integration via callback app.",
         docs_url="https://developer.work.weixin.qq.com/document/path/90930",

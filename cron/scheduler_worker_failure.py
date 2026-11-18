@@ -5,6 +5,37 @@ import logging
 logger = logging.getLogger("cron.scheduler")
 
 
+def defer_proven_unstarted_worker(
+    job: dict, execution: dict, *, pause: dict | None = None,
+) -> bool:
+    """Reclaim only a terminal worker whose durable body gate was never won.
+
+    The positive attach_lost marker proves the body gate was never won; neither an
+    empty transcript nor started_at is proof. Reconnect refusals and hard-wall
+    failures stay on the visible failure lane. NULL/legacy and started rows fail closed.
+    """
+    from cron.scheduler_control import defer_unstarted_fire
+
+    if (execution.get('job_id') != job['id'] or execution.get('body_phase') != 'attach_lost'
+            or execution.get('status') not in {'failed', 'unknown'}
+            or not (job.get('_scheduled_instant') or execution.get('scheduled_instant'))):
+        return False
+    deferred = dict(job, _scheduled_instant=(
+        job.get('_scheduled_instant') or execution['scheduled_instant']))
+    outcome = defer_unstarted_fire(
+        deferred, execution.get('error') or 'Detached worker died before body start', pause=pause)
+    if outcome is None:
+        # No occurrence restored (busy fence, lost claim): stay on the base failure lane.
+        return False
+    # "deferred" or "superseded" by an operator edit: the claim is released either way.
+    from cron.executions import mark_deferred_execution
+    mark_deferred_execution(execution['id'])
+    # The settlement retires this admission through the same guarded path as completion.
+    from cron.scheduler_authority import retire_completed_journal
+    retire_completed_journal(job['id'], execution['id'])
+    return True
+
+
 def record_external_worker_outcome(
     job: dict, *, error=None, adapters=None, loop=None, worker_exited: bool = False,
     worker_terminated: bool = False, worker_exit_code: int | None = None,
@@ -29,6 +60,8 @@ def record_external_worker_outcome(
         return False
     execution = scheduler.get_execution(str(execution_key))
     status = execution.get("status") if execution else None
+    if status == "cancelled":
+        return worker_exited  # the firer already booked the operator stop and job state
     if not execution or status not in ("completed", "failed", "unknown"):
         return False
     if status in ("completed", "failed") and not worker_exited:
@@ -43,6 +76,8 @@ def record_external_worker_outcome(
         return False
     with scheduler.fire_claim_fence(job["id"], expected_owner=owner) as owns_claim:
         if not owns_claim:
+            return True
+        if defer_proven_unstarted_worker(job, execution):
             return True
         nonzero_worker_exit = worker_exit_code not in (None, 0)
         failed = status != "completed" or worker_terminated or nonzero_worker_exit

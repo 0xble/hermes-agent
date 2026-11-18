@@ -27,7 +27,7 @@ def test_runner_bounds_compilation_and_forwards_default_to_clean_env(tmp_path, w
     if workers is not None:
         env["HERMES_TEST_WORKERS"] = workers
     result = subprocess.run(["bash", str(ROOT / "scripts/run_tests.sh"), "tests/example.py"],
-                            env=env, capture_output=True, text=True, timeout=30)
+                            env=env, capture_output=True, text=True, timeout=30, check=False)
     assert result.returncode == 0, result.stderr
     compilation, runner = [json.loads(line) for line in log.read_text().splitlines()]
     assert compilation["args"][:5] == ["-m", "compileall", "-q", "-j", expected]

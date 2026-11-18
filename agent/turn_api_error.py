@@ -9,6 +9,7 @@ fallback → terminal result) and the interruptible backoff. Nothing here import
 from __future__ import annotations
 
 from dataclasses import dataclass
+import contextlib
 import json
 import logging
 import ssl
@@ -17,6 +18,7 @@ from typing import Any, Dict, Optional
 
 from agent.api_error_summary import is_provider_stream_parse_error
 from agent.error_classifier import RETRYABLE_CLIENT_REASONS, FailoverReason, classify_api_error
+from agent.route_verdicts import route_visit
 from agent.turn_overflow import recover_from_overflow
 from agent.turn_recovery import (
     _NONRETRYABLE_LABELS, abort_turn_on_interrupt, compute_error_backoff, free_tier_cooldown_ends_turn,
@@ -84,6 +86,15 @@ def handle_api_error(
         active_system_prompt=active_system_prompt,
     )
     if _recovered:
+        # Pre-classification recovery still means the physical provider request failed.
+        # Record it here because the classified hook below is intentionally bypassed.
+        agent._invoke_api_request_error_hook(
+            task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
+            api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,
+            error_type=type(api_error).__name__, error_message=str(api_error),
+            status_code=getattr(api_error, "status_code", None), retry_count=retry_count,
+            max_retries=max_retries, retryable=True, reason="pre_classification_recovery",
+        )
         return _verdict("continue")
 
     status_code = getattr(api_error, "status_code", None)
@@ -112,6 +123,9 @@ def handle_api_error(
             "during API call #%d (%s)",
             agent.log_prefix, api_call_count, api_error,
         )
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(agent, reason="shutdown", reset_at=None)
         _shutdown_summary = "Turn abandoned: the process was shutting down before the model call could complete."
         return _verdict("return", {
             "final_response": _shutdown_summary, "messages": messages, "api_calls": api_call_count,
@@ -165,8 +179,14 @@ def handle_api_error(
         # Preserve a pending redirect: the user is steering, not stopping — rebuild the
         # turn from the correction instead of aborting.
         if agent.clear_interrupt(preserve_redirect=True):
+            with contextlib.suppress(Exception):
+                from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+                settle_primary_probe_on_exit(agent, reason="interrupt")
             _retry.restart_with_redirected_messages = True
             return _verdict("break")
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(agent, reason="interrupt")
         return _verdict("return", abort_turn_on_interrupt(
             agent, messages, conversation_history, api_call_count,
             abort_message="Interrupt detected during error handling, aborting retries.",
@@ -284,19 +304,26 @@ def settle_unrecovered_error(
     current_turn_user_idx: Any = None,
 ) -> UnrecoveredErrorVerdict:
     """Decide the fate of an API error that every recovery chain declined: local validation /
-    non-retryable client errors (Copilot stale-credential self-heal first, then fallback, then a
+    non-retryable client errors (provider stale-credential self-heal first, then fallback, then a
     terminal result), max-retries exhaustion (primary transport recovery -> fallback -> terminal
     result), else the interruptible error backoff. ``FailoverReason.billing`` (402) is deliberately
     treated as non-retryable (#31273)."""
-    from agent.conversation_loop import (
-        _arm_fallback_restart, _is_copilot_provider, _is_stale_copilot_credential_error
-    )
+    from agent.conversation_loop import _arm_fallback_restart, _credential_refresh_profile
+    from agent.provider_route_hooks import ask_on_error_path
 
     def _verdict(action: str, result: Optional[dict[str, Any]] = None) -> UnrecoveredErrorVerdict:
         return UnrecoveredErrorVerdict(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
             compression_attempts=compression_attempts, result=result,
         )
+
+    def _settle_primary_exit() -> None:
+        with contextlib.suppress(Exception):
+            from agent.shared_primary_cooldown import settle_primary_probe_on_exit
+            settle_primary_probe_on_exit(
+                agent, reason=classified.reason,
+                reset_at=error_context.get("reset_at") if isinstance(error_context, dict) else None,
+            )
 
     # ``FailoverReason.billing`` (402) is deliberately NOT excluded: pool rotation and
     # eager fallback already gave up, so retrying only burns paid requests on a depleted
@@ -314,8 +341,9 @@ def settle_unrecovered_error(
     # so a second reasoning-field rejection means the route refuses the configured reasoning
     # controls themselves — nothing left to drop, so take the fallback chain now instead of
     # replaying the identical request ``max_retries`` times (#114460).
-    reasoning_spent = classified.reason == FailoverReason.reasoning_mandatory and bool(
-        getattr(_retry, "reasoning_mandatory_retry_attempted", False)
+    reasoning_spent = (
+        classified.reason == FailoverReason.reasoning_mandatory
+        and getattr(_retry, "reasoning_mandatory_retry_visit", None) == route_visit(agent)
     )
     is_client_error = (
         is_local_validation_error
@@ -333,22 +361,22 @@ def settle_unrecovered_error(
         # slug is dead for this account, so record it before the fallback walk runs (#106475).
         from agent.fallback_cooldown import _mark_entitlement_rejected_model
         _mark_entitlement_rejected_model(agent, api_error)
-        # Copilot self-heal BEFORE fallback: a stale credential yields a 400
-        # ``model_not_available_for_integrator`` / ``model_not_supported``, not a 401.
-        # Fresh token + client rebuild, one retry, SAME provider.
+        # Provider self-heal BEFORE fallback: some providers surface a stale credential as a
+        # non-auth error (the profile's ``is_stale_credential_error``), not a 401. Fresh
+        # credential + client rebuild, one retry, SAME provider.
         if (
-            _is_copilot_provider(agent)
-            and not _retry.copilot_stale_cred_retry_attempted
-            and _is_stale_copilot_credential_error(
-                status_code, str(getattr(api_error, "message", "") or api_error)
+            not _retry.provider_stale_refresh_attempted
+            and (profile := _credential_refresh_profile(agent)) is not None
+            and ask_on_error_path(
+                profile, "is_stale_credential_error", False,
+                status_code=status_code, message=str(getattr(api_error, "message", "") or api_error),
             )
         ):
-            _retry.copilot_stale_cred_retry_attempted = True
-            if agent._try_recover_stale_copilot_credential():
-                agent._buffer_vprint(
-                    "🔐 Copilot credential re-exchanged after "
-                    "model_not_available 400. Retrying request..."
-                )
+            _retry.provider_stale_refresh_attempted = True
+            if agent._try_refresh_provider_runtime_credentials(reason="stale"):
+                agent._buffer_vprint("🔐 " + (ask_on_error_path(profile, "credential_refresh_notice", "", reason="stale") or (
+                    f"{profile.display_name or profile.name} credential renewed after a "
+                    "stale-credential error. Retrying request...")))
                 retry_count = 0
                 return _verdict("continue")
         # ``should_fallback=False`` marks a deterministic failure no other provider can fix (the
@@ -373,12 +401,13 @@ def settle_unrecovered_error(
                 retry_count = compression_attempts = 0
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
+        _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", nonretryable_client_error_result(
             agent, api_error, classified, status_code=status_code, api_kwargs=api_kwargs,
             api_messages=api_messages, messages=messages, conversation_history=conversation_history,
             api_call_count=api_call_count, approx_tokens=approx_tokens, provider=_provider,
-            base_url=_base, model=_model, delivered=_delivered,
+            base_url=_base, model=_model, delivered=_delivered, current_turn_user_idx=current_turn_user_idx,
         ))
 
     over_wait_cap = exceeds_retry_wait_cap(agent, api_error)
@@ -435,7 +464,10 @@ def settle_unrecovered_error(
         if _ladder is not None:
             if _ladder["action"] == "continue":
                 retry_count = 0
+            elif _ladder["action"] == "return":
+                _settle_primary_exit()
             return _verdict(_ladder["action"], _ladder.get("result"))
+        _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", max_retries_exhausted_result(
             agent, api_error, classified, attempts=attempts_made, is_rate_limited=is_rate_limited,

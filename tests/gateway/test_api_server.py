@@ -3220,7 +3220,7 @@ class TestCreateAgentModelRecovery:
 @pytest.mark.asyncio
 async def test_api_admission_waits_for_mcp_discovery(monkeypatch):
     """Authenticated API turns cannot enter a handler before startup tool discovery completes."""
-    import gateway.platforms.api_server as api_server
+    from gateway.platforms import api_server
 
     ready = asyncio.Event()
     calls = []
@@ -3232,7 +3232,6 @@ async def test_api_admission_waits_for_mcp_discovery(monkeypatch):
         @staticmethod
         def _check_auth(request):
             del request
-            return None
 
         @staticmethod
         def _draining_response():

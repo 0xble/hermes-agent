@@ -154,9 +154,9 @@ def test_repeated_native_checkpoints_allow_one_skill_reread_each(served, monkeyp
     monkeypatch.setattr("agent.model_metadata._fetch_codex_oauth_context_lengths_with_source", lambda _t, **_kw: ({}, False))
     agent = AIAgent(model="gpt-5.6", base_url="https://chatgpt.com/backend-api/codex", api_key="codex-token",
                     quiet_mode=True, skip_context_files=True, skip_memory=True, max_iterations=12)
-    setattr(agent, "codex_responses_native_compaction", True)
-    setattr(agent, "runtime_capabilities", {"native_compaction": True})
-    setattr(agent, "_tool_guardrails", ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True)))
+    agent.codex_responses_native_compaction = True
+    agent.runtime_capabilities = {"native_compaction": True}
+    agent._tool_guardrails = ToolCallGuardrailController(ToolCallGuardrailConfig(hard_stop_enabled=True))
     usage = SimpleNamespace(input_tokens=9, output_tokens=1, total_tokens=10)
     rounds = 7
     responses = [
@@ -180,4 +180,4 @@ def test_repeated_native_checkpoints_allow_one_skill_reread_each(served, monkeyp
     ]
     assert len(re_views) == rounds
     assert all("Do the demo steps." in body and "Blocked" not in body for body in re_views)
-    assert getattr(agent, "_tool_guardrails").halt_decision is None
+    assert agent._tool_guardrails.halt_decision is None

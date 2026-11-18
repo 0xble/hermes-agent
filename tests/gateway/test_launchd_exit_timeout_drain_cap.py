@@ -17,6 +17,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.run_bootstrap import _start_gateway_make_shutdown_signal_handler
+
 from gateway.restart import (
     LAUNCHD_LABEL_ENV,
     LAUNCHD_STOP_CLEANUP_RESERVE_S,
@@ -119,6 +121,6 @@ def test_sigterm_handler_marks_stop_as_signal_driven_unless_planned_takeover(mon
     monkeypatch.setattr(run_mod.asyncio, "create_task", lambda coro: coro.close())
     runner = _runner(drain=180.0, launchd=60.0, by_signal=False)
     runner.stop = lambda: asyncio.sleep(0)
-    run_mod._start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
+    _start_gateway_make_shutdown_signal_handler(runner, [False])(signal.SIGTERM)
     assert runner._stop_requested_by_signal is (not takeover)
     assert effective_stop_drain_timeout(runner) == (180.0 if takeover else 50.0)

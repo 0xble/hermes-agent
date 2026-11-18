@@ -8,6 +8,11 @@ Status-less provider overload responses, including overload messages from custom
 
 An HTTP 503 whose body names `auth_unavailable` or "no auth available" is a relay-wrapped credential or quota failure, not an overload. It falls back as `auth unavailable`. A timeout-flavoured 408 keeps its timeout label. HTTP 500 bodies containing TLS handshake failures or `: EOF` are wrapped connection failures and use the existing 60-second connection quarantine, not the 600-second provider-unavailable quarantine. Other 408 or 5xx failures that survive the same-provider transient retry fall back as `provider unavailable`.
 
+The v0.23.1 integration expresses these labels in `agent/auxiliary_error_policy.py`,
+after the shared classifier supplies a structured verdict. A relay 503 can carry
+a nested rate-limit verdict, so its `auth_unavailable` evidence is checked before
+generic reason labels. The retired facade predicates are not a second classifier.
+
 ## Provenance and patches
 
 Fork patch identity: `auxiliary-overload-fallback`.

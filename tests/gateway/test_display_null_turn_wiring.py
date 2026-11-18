@@ -15,7 +15,7 @@ import pytest
 from gateway.run_turn_runner import TurnRunner
 
 
-def _wire(user_config, *, voice_turn=False, agent=None):
+def _wire(user_config, *, voice_turn=False, agent=None, **runner_attrs):
     """Run `_wire_turn_agent_callbacks` over minimal fakes; return the agent."""
     if agent is None:
         agent = types.SimpleNamespace()
@@ -50,6 +50,7 @@ def _wire(user_config, *, voice_turn=False, agent=None):
             _service_tier=None,
             _session_reasoning_override=lambda key: None,
             _consume_pending_turn_sidecar_notes=lambda key: [],
+            **runner_attrs,
         ),
         _make_bg_review_callbacks=lambda: (lambda message: None, lambda: None),
         _merge_turn_request_overrides=TurnRunner._merge_turn_request_overrides,
@@ -78,3 +79,8 @@ def test_voice_route_flag_is_rebound_per_turn(voice_turn):
     agent = types.SimpleNamespace(_voice_turn_pending=not voice_turn)
     assert _wire({}, voice_turn=voice_turn, agent=agent) is agent
     assert agent._voice_turn_pending is voice_turn
+def test_owner_surface_is_recorded_apart_from_the_daybreak_switch():
+    """Daybreak delegation routes read the chat's owner verdict, which holds with the switch off."""
+    agent = _wire({}, _load_daybreak=lambda source: False, _daybreak_surface=lambda source: True)
+    assert (agent.daybreak, agent.daybreak_surface) == (False, True)
+    assert _wire({}).daybreak_surface is False

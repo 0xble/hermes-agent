@@ -145,7 +145,7 @@ class TestLocateRealGitLayouts:
 
         program_files = tmp_path / "Program Files" / "Git"
         monkeypatch.setattr(update_cmd_git, "_GIT_FOR_WINDOWS_ROOTS", (program_files,))
-        monkeypatch.setattr(update_cmd_git, "_portable_git_candidates", lambda: [])
+        monkeypatch.setattr(update_cmd_git, "_portable_git_candidates", list)
         return program_files
 
     @pytest.mark.parametrize("env", ["ucrt64", "mingw64", "clangarm64"])

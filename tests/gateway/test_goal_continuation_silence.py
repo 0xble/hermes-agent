@@ -20,7 +20,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.response_filters import silence_allowed
 from gateway.session import SessionEntry, build_session_key
 
-from tests.gateway.test_goal_continuation_drain import (  # noqa: F401  (fixture)
+from tests.gateway.test_goal_continuation_drain import (
     _DrainProbeAdapter,
     _slack_thread_source,
     hermes_home,

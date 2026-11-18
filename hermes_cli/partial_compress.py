@@ -21,13 +21,13 @@ MAX_KEEP_LAST = 100
 MAX_COMPRESS_LEVEL = 3
 
 
-def extract_compress_level(raw_args: str) -> Tuple[str, int]:
+def extract_compress_level(raw_args: str) -> tuple[str, int]:
     """Strip ``--level N`` / ``--level=N`` (anywhere in the string) and return ``(remaining_args, level)``.
 
     A missing or unparseable value means level 1; out-of-range values clamp to ``[1, MAX_COMPRESS_LEVEL]``.
     """
     tokens = (raw_args or "").split()
-    kept: List[str] = []
+    kept: list[str] = []
     level = 1
     i = 0
     while i < len(tokens):

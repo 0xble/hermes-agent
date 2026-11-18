@@ -1,7 +1,6 @@
 """Received Telegram work survives handover through the real adapter/runner gates."""
 
 import asyncio
-import threading
 import weakref
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -353,7 +352,7 @@ async def test_received_batches_execute_once_across_handover(kind, secondary, ph
     fetched, dispatch = asyncio.Event(), asyncio.Event()
     popped, before_admission, admit = asyncio.Event(), asyncio.Event(), asyncio.Event()
     released, executed, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
-    recover = threading.Event()
+    recover = asyncio.Event()
     calls, responses = [], []
     handled, transport_settle = asyncio.Event(), asyncio.Event()
     release_observations = []
@@ -382,12 +381,15 @@ async def test_received_batches_execute_once_across_handover(kind, secondary, ph
 
     app.add_handler(TypeHandler(MessageEvent, fetched_update))
 
-    def recover_topic(received):
-        loop.call_soon_threadsafe(popped.set)
-        assert recover.wait(5), "test did not release topic recovery"
+    handle_message = adapter.handle_message
 
-    adapter._apply_topic_recovery = recover_topic
-    adapter._topic_recovery_fn = lambda source: None
+    async def dispatch_popped(received):
+        # The real flush has left its pending map and owns this pre-admission dispatch.
+        popped.set()
+        await asyncio.wait_for(recover.wait(), 5)
+        return await handle_message(received)
+
+    adapter.handle_message = dispatch_popped
 
     async def processing_hook(name, received, *args):
         if name == "on_processing_start":
@@ -728,6 +730,9 @@ async def test_pending_ptb_stop_owns_token_until_reconnect_can_start(failure, se
         await adapter._probe_pending_updates(SimpleNamespace(), 1)
         finish_cleanup.set()
         await asyncio.wait_for(adapter._handover_polling_stop_task, 5)
+        # PTB stop completion only starts the remaining disconnect steps. Wait for
+        # the credential owner, not a 50ms race between retirement and the retry.
+        await asyncio.wait_for(asyncio.shield(adapter._platform_lock_retirement_task), 5)
         if not secondary:
             # The retained queue remains eligible after the bounded attempt, no manual re-enqueue.
             await asyncio.wait_for(runner._reconnect_failed_platform(Platform.TELEGRAM, time.monotonic() + 3600), 5)

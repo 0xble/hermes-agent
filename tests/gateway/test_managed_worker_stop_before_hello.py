@@ -5,11 +5,10 @@ import subprocess
 import sys
 from types import SimpleNamespace
 
-import psutil
 import pytest
 
-from gateway.session_contract import Principal, SessionRef
-from tests.waiting import async_wait_until
+from gateway.session_contract import SessionActor, SessionRef
+from tests.waiting import async_wait_until, process_alive
 
 
 @pytest.mark.platforms("linux")
@@ -31,7 +30,7 @@ def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch)
         authorize=lambda actor, ref, cap: checks.append(cap),
         check_approval_generation=lambda session_id, generation: checks.append(generation))
     row = {'admission_id': 'adm', 'principal_id': 'owner', 'generation': 3, 'payload': {'text': 'go'}}
-    actor = Principal('owner', 'profile', frozenset({'session:control'}), 'transport')
+    actor = SessionActor('owner', 'profile', frozenset({'session:control'}), 'transport')
 
     async def scenario():
         turn = asyncio.create_task(managed.execute_managed(authority, ref, row, policy=None))
@@ -45,15 +44,16 @@ def test_stop_before_hello_terminates_child_and_settles_interrupted(monkeypatch)
     assert authority.pending_results['adm']['result']['interrupted'] is True
     assert ref.session_id not in authority._managed_workers
     child = spawned[0]
-    assert child.poll() is not None and not psutil.pid_exists(child.pid) or psutil.Process(child.pid).status() == psutil.STATUS_ZOMBIE
+    assert child.poll() is not None and not process_alive(child.pid)
 
 
 CHILD = """import json, os, sys, psutil
+from hermes_cli.process_identity import worker_birth
 me = psutil.Process()
 out = os.fdopen(os.dup(sys.stdout.fileno()), 'wb', buffering=0)
 def send(frame):
     out.write((json.dumps(frame) + '\\n').encode())
-send({'type': 'hello', 'pid': me.pid, 'birth': me.create_time(), 'ancestors': [p.pid for p in me.parents()[:3]]})
+send({'type': 'hello', 'pid': me.pid, 'birth': worker_birth(me), 'ancestors': [p.pid for p in me.parents()[:3]]})
 for line in sys.stdin.buffer:
     frame = json.loads(line)
     with open(sys.argv[1], 'a') as log:
@@ -89,7 +89,7 @@ def test_stop_acknowledged_during_spawn_never_bootstraps_the_worker(tmp_path, mo
     authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='i'))
     authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
-    actor = Principal('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
+    actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     ref = SessionRef('owned', 's')
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
     received = tmp_path / 'received.jsonl'

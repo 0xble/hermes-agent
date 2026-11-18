@@ -9,6 +9,7 @@ from __future__ import annotations
 import codecs
 import json
 import os
+import runpy
 import signal
 from pathlib import Path
 import subprocess
@@ -24,6 +25,79 @@ def _write_json(path: Path, data: dict) -> None:
 
 def _exit_status(code: int) -> int:
     return code if code >= 0 else 128 - code
+
+
+# POSIX completion child is a new session, so a SIGKILL of `hermes update` does not
+# take it with the parent's process group. Windows puts the same child in a
+# kill-on-close job. Without this watch the orphan keeps the checkout lock, the
+# next launch refuses ("an update is still running"), and the gateway the update
+# paused stays draining. EOF on the pipe (parent death) SIGKILLs the child; a
+# dismiss byte means the parent is still here and will reap it itself.
+_OWNER_DEATH_WATCH = (
+    "import os, signal, sys\n"
+    "data = b''\n"
+    "while b'\\n' not in data:\n"
+    "    chunk = os.read(0, 64)\n"
+    "    if not chunk:\n"
+    "        sys.exit()\n"
+    "    data += chunk\n"
+    "pid, done = data.split(b'\\n', 1)\n"
+    "if not done and not os.read(0, 1):\n"
+    "    try:\n"
+    "        os.killpg(int(pid), signal.SIGKILL)\n"  # windows-footgun: ok — POSIX completion child is a session leader
+    "    except OSError:\n"
+    "        pass\n"
+)
+
+
+def _owner_death_watch():
+    """Watch the next POSIX child; return ``(announce, dismiss)``.
+
+    ``announce`` is the child's ``preexec_fn``. ``dismiss`` tells the watcher the
+    parent is still alive. Parent death closes the pipe and the watcher kills the
+    child's session, which is what releases the checkout lock it inherited.
+    """
+    read_end, write_end = os.pipe()
+    os.set_inheritable(read_end, False)
+    os.set_inheritable(write_end, False)
+    try:
+        watcher = subprocess.Popen(
+            [sys.executable, "-I", "-S", "-c", _OWNER_DEATH_WATCH],
+            stdin=read_end, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            # detached-spawn: ok — pipe EOF on parent death must let this stdlib watcher kill the completion session
+            start_new_session=True)
+    except OSError:
+        os.close(write_end)
+        # Never launch an unfenced completion. The caller records the committed
+        # update's tail as owed, so a subsequent launch can recover safely.
+        raise
+    finally:
+        os.close(read_end)
+    parent = os.getpid()
+
+    def announce() -> None:
+        try:
+            os.write(write_end, b"%d\n" % os.getpid())
+        except OSError:
+            pass
+        if os.getppid() != parent:
+            os._exit(137)
+
+    def dismiss() -> None:
+        try:
+            os.write(write_end, b"x")
+        except OSError:
+            pass
+        try:
+            os.close(write_end)
+        except OSError:
+            pass
+        try:
+            watcher.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            pass
+
+    return announce, dismiss
 
 
 def _write_bootstrap_result(request: dict, result_path: Path, code: int, receipt: dict | None) -> int:
@@ -88,11 +162,24 @@ def run_completion(request: dict) -> dict:
 
         # The child joins the update tree's checkout lock: it inherits the locked fd (POSIX)
         # or dies with us (Windows job: created suspended, bound, then resumed, so nothing it
-        # starts runs outside the job), so the lock is never free while it runs.
-        proc = subprocess.Popen(
-            command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            **({"start_new_session": True, "pass_fds": checkout_lock_fds(root)} if os.name == "posix" else
-               {"creationflags": subprocess.CREATE_NO_WINDOW | CREATE_SUSPENDED}))
+        # starts runs outside the job), so the lock is never free while it runs. POSIX
+        # start_new_session would otherwise outlive a SIGKILL of this parent; the death
+        # watch kills that session when we die, matching the Windows job.
+        watch = _owner_death_watch() if os.name == "posix" else None
+        # detached-spawn: ok — the announced child session is killed by the pipe owner-death watcher above
+        popen_kwargs = ({"start_new_session": True, "pass_fds": checkout_lock_fds(root)}
+                        if os.name == "posix" else
+                        {"creationflags": subprocess.CREATE_NO_WINDOW | CREATE_SUSPENDED})
+        if watch is not None:
+            popen_kwargs["preexec_fn"] = watch[0]
+        try:
+            proc = subprocess.Popen(
+                command, cwd=root, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                **popen_kwargs)
+        except BaseException:
+            if watch is not None:
+                watch[1]()
+            raise
         decoder = codecs.getincrementaldecoder("utf-8")("replace")
         try:
             # A failure here unwinds through the cleanup below, never orphans the child.
@@ -132,6 +219,8 @@ def run_completion(request: dict) -> dict:
             raise
         finally:
             proc.stdout.close()
+            if watch is not None:
+                watch[1]()
         code = _exit_status(code)
         try:
             result = json.loads(result_path.read_text(encoding="utf-8-sig"))
@@ -322,6 +411,7 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
     from pm import receipt
     from pm.client import ensure_tools_for_sync
     from pm.environments import activation_environment, project_python
+    from pm.extras import first_generation_selection
 
     root = Path(request["source"])
     update_id = request["receipt"]["update_id"]
@@ -349,8 +439,10 @@ def _prepare(request: dict, request_path: Path, result_path: Path) -> int:
             # This file runs from the new tree, so its lockfile carries the new
             # pins; tools (incl. bumped uv/python) land before the sync uses them.
             ensure_tools_for_sync()
-            # An update never fails because of a plugin: misfits are disabled and reported.
-            pm.sync_venv(explicit=True, project_root=root, evict_incompatible_plugins=True)
+            # An update never fails because of a plugin: misfits are disabled and reported. A
+            # pre-PM tree that reached this code with no recorded selection carries its old venv.
+            pm.sync_venv(first_generation_selection(root), explicit=True, project_root=root,
+                         evict_incompatible_plugins=True)
             collect_superseded_generations(root)
         finally:
             request["pm_receipt"] = receipt.last_for_update(update_id)
@@ -386,6 +478,7 @@ def _complete_selected(request: dict) -> bool:
     from hermes_cli import main, update_cmd, update_cmd_config
     from hermes_cli.source_completion import complete_source_checkout
     from hermes_cli.update_inventory import RuntimeRecord, UpdatePlan
+    from hermes_cli.update_launch_files import refresh_launch_files
     from hermes_cli.update_receipt import (
         TAIL_FOLLOWUPS, record_build_stage, record_followup, record_skip, record_stage)
 
@@ -405,6 +498,13 @@ def _complete_selected(request: dict) -> bool:
     # verification still needs the real verdict so it never auto-migrates the gateway topology
     # on a runtime that can corrupt sessions. Unknown (the tail raised) is not proven safe.
     runtime_safe = False
+    prepared: list[bool] = []
+
+    def prepare_gateways() -> None:
+        prepared.append(True)
+        refresh_launch_files()
+        _resume_paused_before_build(request)
+
     try:
         runtime_safe = complete_source_checkout(
             root, desktop=request["desktop"], assume_yes=request["assume_yes"],
@@ -412,13 +512,15 @@ def _complete_selected(request: dict) -> bool:
             pre_update_version=request["pre_update_version"],
             completion_message=request.get("completion_message"),
             announce=None if request.get("completion_message") else "\n✓ Code updated!",
-            followups=followups, before_build=lambda: _resume_paused_before_build(request))
+            followups=followups, after_dependencies=prepare_gateways)
     except (Exception, SystemExit) as exc:  # health: allow BLE001 -- e.g. the shared update lock refused the tail
         reason = str(exc) or type(exc).__name__
         # The tail's steps catch their own failures, so a raise here means the build never ran.
         _report_desktop_build_owed(request, None, "the source-update tail did not run")
         record_followup("completion", reason)
         followups.append(("completion", reason))
+    if not prepared:  # the tail ended before its dependency step
+        prepare_gateways()
     tail_owed = any(step in TAIL_FOLLOWUPS for step, _ in followups)
     record_build_stage(followups)
     if not tail_owed:
@@ -455,9 +557,10 @@ def _complete_selected(request: dict) -> bool:
 
 
 def _resume_paused_before_build(request: dict) -> None:
-    """Restart the gateways the POSIX pause stopped: the dependencies are synced and the launchers
-    published, the product builds (minutes) have not started. A gateway needs nothing later to
-    boot. A failure stays owed: the post-build resume retries it and records the outcome.
+    """Restart the gateways the POSIX pause stopped: the dependencies are prepared, the launchers
+    published and the launch files rewritten; the product builds (minutes) have not started. A
+    gateway needs nothing later to boot. A failure stays owed: the post-build resume retries it
+    and records the outcome.
 
     POSIX only: the fleet restart skips what this restarted (``already_restarted``). A Windows set
     keeps resuming after the fleet restart, which would otherwise drain it a second time."""
@@ -550,7 +653,8 @@ def main() -> int:
     request = json.loads(request_path.read_text(encoding="utf-8-sig"))
     if request["schema"] != 1:
         raise ValueError("unsupported source completion request")
-    root = Path(__file__).resolve().parents[1]
+    # -I -S keeps the checkout off sys.path, so the install-root owner is run from its file.
+    root = Path(runpy.run_path(str(Path(__file__).with_name("_startup_fast.py")))["project_root_str"]())
     if root != Path(request["source"]).resolve():
         raise ValueError("completion checkout does not match request")
     # -I deliberately ignores inherited PYTHONPATH during PM preparation.

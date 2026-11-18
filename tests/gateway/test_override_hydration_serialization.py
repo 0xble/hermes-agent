@@ -21,7 +21,9 @@ async def test_model_hydration_waits_for_pending_resume_clear(monkeypatch, tmp_p
     runner.session_store.get_or_create_session(source)
     runner.session_store.set_model_override(key, {"model": "stale-model"})
     runner._session_model_overrides[key] = {"model": "stale-model"}
-    runner._session_db = SimpleNamespace(get_session_title=AsyncMock(return_value="target"))
+    runner._session_db = SimpleNamespace(
+        _db=runner.session_store._db, get_session_title=AsyncMock(return_value="target")
+    )
     monkeypatch.setattr(runner, "_resolve_resume_target", AsyncMock(return_value=("target", "target")))
     monkeypatch.setattr(runner, "_resume_access_denied_reply", AsyncMock(return_value=None))
     monkeypatch.setattr(runner, "_normalize_source_for_session_key", lambda value: value)
@@ -177,7 +179,7 @@ async def test_reasoning_hydration_cannot_overwrite_newer_picker(monkeypatch, tm
         await runner._handle_reasoning_command(MessageEvent(text="/reasoning", source=source))
         await asyncio.wait_for(asyncio.to_thread(picker_applied.wait, 10), 12)
         persisted = read(key)
-        live = runner._session_reasoning_overrides[key]
+        live = runner._session_state(key).conversation.reasoning_override
         assert live == persisted == {"enabled": True, "effort": "high"}, (
             f"reasoning hydration overwrote picker: persisted={persisted!r}, live={live!r}"
         )

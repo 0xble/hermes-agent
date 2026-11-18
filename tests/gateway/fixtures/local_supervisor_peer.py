@@ -1,4 +1,4 @@
-"""Real LOCAL admission recovery, interrupted model and durable status replay."""
+"""Real LOCAL admission recovery, interrupted model and durable quiet-result replay."""
 import asyncio
 from http.server import ThreadingHTTPServer
 import json
@@ -15,12 +15,13 @@ from local_recovery_probe import child_env, daemon, rpc, websocket
 from tests.waiting import async_wait_until
 
 
-def probe(base):
+def probe(base, quiet):
     root = Path(__file__).resolve().parents[3]
     home, user = base / 'state', base / 'user'
     home.mkdir(); user.mkdir()
     model = ThreadingHTTPServer(('127.0.0.1', 0), Model)
     model.requests, model.checkin_turns, model.checkin = [], 0, True
+    model.checkin_silent = quiet
     model.checkin_blocked, model.checkin_release = threading.Event(), threading.Event()
     model.blocked, model.release = threading.Event(), threading.Event()
     model.gate = home / 'unused-terminal-gate'
@@ -128,21 +129,32 @@ def probe(base):
         async with websocket(home, desc) as ws:
             reply = await rpc(ws, 'session.resume', session_id=sid)
             assert 'result' in reply, reply
+            requests_before = len(model.requests)
             advance(next_attempt_at=time.time() - 1)
             await wait(lambda: len(ticks()) == 2 and ticks()[-1]['status'] == 'terminal')
-            await wait(lambda: state()['due_at'] > time.time() + 1700)
+            if quiet:
+                assert state()['due_at'] == before_crash['due_at'], state()
+                assert state()['last_visible_at'] == before_crash['last_visible_at'], state()
+                assert state()['next_attempt_at'] > time.time() + 1700, state()
+            else:
+                await wait(lambda: state()['due_at'] > time.time() + 1700)
             reply = await rpc(ws, 'session.resume', session_id=sid)
             assert 'result' in reply, reply
             history = reply['result']['messages']
-            assert 'SUPERVISOR_STATUS' in json.dumps(history), history
+            with sqlite3.connect(home / 'state.db') as db:
+                saved = json.loads(db.execute('SELECT value FROM state_meta WHERE key=?',
+                    ('gateway.admission.result.v1.' + ticks()[-1]['admission_id'],)).fetchone()[0])
+            if quiet:
+                assert 'SUPERVISOR_STATUS' not in json.dumps(history), history
+                assert saved['result']['intentional_silence'] is True, saved
+                assert saved['result']['final_response'] == '', saved
+            else:
+                assert 'SUPERVISOR_STATUS' in json.dumps(history), history
+                assert 'SUPERVISOR_STATUS' in saved['result']['final_response'], saved
             cards = [m for m in history if m.get('display_kind') == 'supervisor_checkin']
             assert cards and all(m.get('role') == 'user' for m in cards), cards
             assert model.checkin_turns == 2, model.requests
-            retries = [request for request in model.requests
-                       if any('required supervisor status' in str(message.get('content', ''))
-                              for message in request['messages']
-                              if message['role'] in ('system', 'developer'))]
-            assert len(retries) == 1, retries
+            assert len(model.requests) == requests_before + 1, model.requests
             return state(), history
 
     async def replay(desc, delivered, history):
@@ -176,7 +188,7 @@ def probe(base):
         assert len(set(pids)) == 4 and epochs == sorted(set(epochs)), (pids, epochs)
         print(json.dumps({'pids': pids, 'epochs': epochs, 'ledger': ticks(),
                           'queued_restore_executed_once': True, 'started_crash_not_replayed': True,
-                          'visible_due_preserved_until_delivery': True, 'durable_status_replayed': True,
+                          'quiet': quiet, 'durable_result_replayed': True,
                           'model_checkin_turns': model.checkin_turns, 'local_source': 'gui'}))
     except BaseException:
         for path in (home / 'first.log', home / 'restart.log'):
@@ -189,4 +201,4 @@ def probe(base):
 
 
 if __name__ == '__main__':
-    probe(Path(sys.argv[1]))
+    probe(Path(sys.argv[1]), quiet=sys.argv[2] == 'quiet')

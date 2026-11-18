@@ -82,7 +82,7 @@ def _outcomes(caplog):
 
 @pytest.mark.asyncio
 async def test_resume_bounced_by_startup_preclaim_is_logged_resumed_after_its_real_turn(monkeypatch, caplog):
-    runner, adapter, entry, turns, tasks = _wire(monkeypatch, succeeded=True)
+    runner, _adapter, entry, turns, tasks = _wire(monkeypatch, succeeded=True)
     with caplog.at_level("INFO", logger="gateway.run"):
         assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 1
         # A reconnect scan while the resume runs must not admit a second resume turn.
@@ -98,7 +98,7 @@ async def test_resume_bounced_by_startup_preclaim_is_logged_resumed_after_its_re
 
 @pytest.mark.asyncio
 async def test_resume_bounced_by_startup_preclaim_reports_a_failed_real_turn(monkeypatch, caplog):
-    runner, adapter, entry, turns, tasks = _wire(monkeypatch, succeeded=False)
+    runner, _adapter, entry, turns, tasks = _wire(monkeypatch, succeeded=False)
     with caplog.at_level("INFO", logger="gateway.run"):
         assert runner._schedule_resume_pending_sessions(candidates=[entry]) == 1
         await asyncio.wait_for(asyncio.gather(*tasks), 5)

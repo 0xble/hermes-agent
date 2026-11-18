@@ -44,6 +44,9 @@ def _lightpanda_vision_preroute(
     (it has no graphical renderer). Returns ``(prerouted, fallback_warning, path)``;
     on fallback failure ``prerouted`` is False and the caller takes the normal
     screenshot path (forcing Chrome) so the standard fallback metadata still applies."""
+    from tools.browser_task_cdp import task_browser_url
+    if task_browser_url(effective_task_id):
+        return False, None, screenshot_path
     engine = _cloud._get_browser_engine()
     if engine != "lightpanda" or not _cloud._should_inject_engine(engine):
         return False, None, screenshot_path

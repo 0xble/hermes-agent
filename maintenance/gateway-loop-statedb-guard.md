@@ -23,6 +23,12 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   (retained results open state.db), the startup-restore drain's session-key resolution (Telegram
   topic recovery), the boot resume-candidate snapshot, and the first open of each served secondary
   profile's handles (primed off the loop at startup and on hot-add).
+- Detached process-result routing (`gateway/session_detached.py::follow_detached_pin`) resolves
+  store entries, logical owners, session rows and cold mounts through `asyncio.to_thread`.
+  The live route is checked after the worker returns. This preserves completion delivery after
+  a chat moves to another conversation without blocking the gateway loop or bypassing its guard.
+  The real headless completion contract is in `tests/tools/test_completed_process_results.py`,
+  with detached-conversation lifecycle and result coverage in `tests/gateway/`.
 - 2026-10-25 sweep of the sites the guard named on the live gateway (about 120 active agents,
   writer-lock holds of 3-13 s, two exit-75 kills): attended route resolution takes the durable
   activity stamp and `get_attended_route_active` from the off-loop resolution snapshot; turn
@@ -44,6 +50,18 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   only a live session's in-memory view, never get-or-creates one from a worker thread. A role hold
   with attended routing off takes the same off-loop resolution snapshot. The Slack DM seed (`_seed_dm_session`, and the `_adopt_legacy_slack_entry`
   and compression-tip reads under it) belongs to PR #814 (`slack-seed-off-loop`).
+- 2026-11-11 sweep (three exit-75 liveness kills, 03:30–03:48 PT; in every dump the loop thread was
+  waiting on the session-store lock, holder not captured because faulthandler stops at 100
+  threads): the native FIFO claim's route check (`check_native_route` /
+  `check_automation_route` / `_owner`), the native snapshot (`_snapshot_native_async`), cron
+  `recover`/delivery local restores (`restore_local_session_async`), session-title lookups and
+  the model-override rehydrate now run on a dedicated bounded `session-store` executor
+  (`gateway/session_store_async.py`, 4 workers) so a long holder parks those workers instead of
+  the default executor or the loop. Results are immutable; the claim still re-reads the exact
+  head after the await. The liveness and shutdown watchdog dumps print each served store's
+  `SessionStore._lock.owner_snapshot()` (thread, held age, count, callsites) without taking the
+  lock, so the next stall names its holder. Moving DB and file I/O out of store-locked sections
+  (`session_persistence._ensure_loaded_locked`, whole-index saves) is the follow-up.
 - The pre-open deleted-WAL holder scan (host-wide libproc on macOS, already bounded at 5 s
   fail-open by upstream `233434b41447`; a cold scan took 77 s on the loaded host) reuses a
   clean verdict for 10 s while both sidecars keep their identity, never while one is missing,
@@ -95,6 +113,13 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
 - The turn-liveness watchdog does not count time the turn's execution thread spends inside a
   SessionDB write (writer-lock queue, busy retries, commit) as no progress; a finished write
   counts as activity. Nothing else (lease refresh included) feeds the activity clock.
+- A loop stall can fail the Telegram heartbeat probe, so the adapter goes fatal and leaves
+  `runner.adapters` until the reconnect watcher installs its replacement (2026-11-12 15:27 PT:
+  back about 2 s later). An admitted native turn whose claim already passed preflight and whose
+  adapter slot is empty at execution awaits (`await_reconnecting_adapter`, `asyncio.sleep` in 0.25 s
+  steps) up to `ADAPTER_RECONNECT_WAIT_S` (30 s) for the slot to refill, then restores and runs.
+  Only an empty slot waits, and draining or retirement stops the wait. `_binding` still decides
+  every identity check, and a slot still empty at the bound fails `not_found` as before.
 
 ## Active replay access path
 
@@ -215,7 +240,9 @@ tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, 
 `cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound), and the 2026-10-25 sweep
 in `gateway/run_turn.py`, `gateway/run_config_loaders.py`, `gateway/slash_commands_status.py`,
 `gateway/delivery.py`, `gateway/telegram_retire*.py`, `gateway/telegram_topic_sessions.py` and
-the Telegram and Slack adapters. Proof surface:
+the Telegram and Slack adapters, and `gateway/session_ingress.py` with
+`gateway/session_ingress_context.py` (admitted-turn adapter reconnect wait). Proof surface:
+`tests/gateway/test_admission_adapter_reconnect_wait.py`,
 `tests/gateway/test_startup_resume_admission.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_max_parallel_is_bounded_unless_explicitly_unbounded` in `tests/cron/test_scheduler.py`, and

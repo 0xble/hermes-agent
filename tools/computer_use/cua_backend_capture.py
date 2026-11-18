@@ -62,7 +62,7 @@ def _is_cua_driver_self_window(w: dict[str, Any]) -> bool:
 
 
 def _select_capture_target(windows: list[dict[str, Any]], *, app_requested: bool,
-                           exact_target: bool = False) -> dict[str, Any]:
+                           exact_target: bool = False, target_platform: Optional[str] = None) -> dict[str, Any]:
     """Best window from z-sorted (frontmost-first) list_windows output. Unqualified default captures on
     Linux (no app filter, no exact target) skip desktop/shell helper windows first — targetable but capture
     as empty — and when every remaining candidate shares one ``z_index`` (the common X11 case)
@@ -80,7 +80,7 @@ def _select_capture_target(windows: list[dict[str, Any]], *, app_requested: bool
         external = [w for w in pool if not _is_cua_driver_self_window(w)]
         if external:
             pool = external
-    if not exact_target and not app_requested and sys.platform == "linux":
+    if not exact_target and not app_requested and (target_platform or sys.platform) == "linux":
         pool = [w for w in pool if _is_real_app_window(w)] or pool
         if pool and _z_index_uninformative(pool):
             active_id = _linux_x11_active_window_id()
@@ -210,6 +210,10 @@ class _CaptureMixin:
                  [w for w in windows if not _name(w).strip() and app_lower in str(w.get("title", "")).lower()])
         return next((matched for matched in tiers if matched), [])
 
+    def _empty_discovery_reason(self) -> str:
+        from tools.computer_use import cua_backend as _cb
+        return _cb._empty_discovery_reason()
+
     def _resolve_capture_windows(self, mode: str, app: Optional[str], pid: Optional[int],
                                  window_id: Optional[int]) -> list[dict[str, Any]] | CaptureResult:
         """Candidate windows for capture(), or a failed CaptureResult."""
@@ -227,7 +231,7 @@ class _CaptureMixin:
         if not windows:
             # Diagnose instead of a bare 0x0: the dominant real-world cause on Linux is a locked desktop session.
             from tools.computer_use import cua_backend as _cb
-            return self._failed_capture(mode, _cb._empty_discovery_reason())
+            return self._failed_capture(mode, self._empty_discovery_reason())
         if not app:
             return windows
         if app.strip().lower() in _DESKTOP_SHELL_SENTINELS:
@@ -317,7 +321,9 @@ class _CaptureMixin:
         windows = self._resolve_capture_windows(mode, app, pid, window_id)
         if isinstance(windows, CaptureResult):
             return windows
-        self._set_active_target(target := _select_capture_target(windows, app_requested=bool(app), exact_target=exact_target))
+        self._set_active_target(target := _select_capture_target(
+            windows, app_requested=bool(app), exact_target=exact_target,
+            target_platform=getattr(getattr(self, "node", None), "platform", None)))
         app_name = target["app_name"]
         # Record the resolved app so capture_after= follow-ups re-target the same app rather than falling back
         # to the frontmost window.

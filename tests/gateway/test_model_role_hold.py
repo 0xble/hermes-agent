@@ -1,9 +1,8 @@
-"""@role holds: persistence, reset, concrete-pick precedence, and cards."""
+"""role holds: persistence, reset, concrete-pick precedence, and cards."""
 
 from __future__ import annotations
 
 import asyncio
-import logging
 import time
 from datetime import UTC, datetime, timedelta
 from types import SimpleNamespace
@@ -44,7 +43,8 @@ def _attended_cfg(**attended):
             "provider": "nous",
             "attended": {"model": "claude-opus-5-5", "provider": "custom:claude", **attended},
         },
-        "model_presets": {
+        "model_aliases": {
+            "attended": {"model": "claude-opus-5-5", "provider": "custom:claude", **attended},
             "fast": {"provider": "openrouter", "model": "fast-model", "reasoning_effort": "minimal"},
         },
     }
@@ -76,12 +76,12 @@ def _runner(store, *, config=None, states=None):
 
 
 
-def test_role_preset_reasoning_applies_when_attended_is_unconfigured(tmp_path, monkeypatch):
+def test_role_alias_reasoning_applies_when_attended_is_unconfigured(tmp_path, monkeypatch):
     import gateway.run as gateway_run
 
     cfg = {
         "model": {"default": "gpt-6.1-sol", "provider": "nous"},
-        "model_presets": {
+        "model_aliases": {
             "fast": {"provider": "openrouter", "model": "fast-model", "reasoning_effort": "minimal"},
         },
     }
@@ -166,27 +166,24 @@ def test_attended_role_follows_a_config_edit_between_resolves():
     assert second.model == "claude-sonnet-next"
 
 
-def test_custom_preset_role_follows_a_preset_edit():
+def test_custom_alias_role_follows_an_alias_edit():
     state = {"default_model": "gpt-6.1-sol", "model_role": "fast"}
     first = resolve_attended_model(state, time.time(), _attended_cfg())
     edited = _attended_cfg()
-    edited["model_presets"]["fast"]["model"] = "faster-model"
+    edited["model_aliases"]["fast"]["model"] = "faster-model"
     second = resolve_attended_model(state, time.time(), edited)
     assert first.model == "fast-model"
     assert second.model == "faster-model"
     assert second.reason == "role"
 
 
-def test_unknown_role_falls_back_to_default_with_a_warning(caplog):
-    with caplog.at_level(logging.WARNING, logger="gateway.attended_model"):
-        result = resolve_attended_model(
+def test_unknown_role_refuses_the_request():
+    with pytest.raises(ValueError, match="Stored model alias 'missing' is unavailable; request refused"):
+        resolve_attended_model(
             {"default_model": "gpt-6.1-sol", "default_provider": "nous", "model_role": "missing"},
             time.time(),
             _attended_cfg(),
         )
-    assert result.reason == "default"
-    assert result.model == "gpt-6.1-sol"
-    assert "fallback=default" in caplog.text
 
 
 def test_explicit_model_beats_role_for_its_scope_and_leaves_the_role_stored():
@@ -235,7 +232,7 @@ async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch, per
     result = SimpleNamespace(
         new_model="gpt-5.5", target_provider="openrouter", api_key="sk", base_url="https://example.invalid",
         api_mode="chat_completions", request_overrides={}, runtime_capabilities={},
-        provider_label="OpenRouter",
+        provider_label="OpenRouter", alias_endpoint_applied=False,
     )
 
     await runner._record_model_switch_locked(result, ctx, source=_source(), one_turn=True, picker=False)
@@ -250,17 +247,34 @@ async def test_concrete_model_clears_role_except_once(tmp_path, monkeypatch, per
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("flag", ["--global", "--once", "--session", "--provider openrouter", "--reasoning high"])
+@pytest.mark.parametrize("flag", ["--global", "--once", "--session", "--reasoning high"])
 async def test_model_role_rejects_flags(tmp_path, monkeypatch, flag):
     store = _store(tmp_path, monkeypatch)
     entry = store.get_or_create_session(_source())
     runner, _states = _runner(store)
     monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
 
-    reply = await runner._handle_model_command_locked(_event(f"/model @fast {flag}"))
+    reply = await runner._handle_model_command_locked(_event(f"/model fast {flag}"))
 
     assert reply.startswith("❌")
-    assert "@role" in reply
+    assert "role" in reply
+    assert store.get_model_role(entry.session_key) is None
+
+
+@pytest.mark.asyncio
+async def test_explicit_provider_uses_upstream_concrete_model_selection(tmp_path, monkeypatch):
+    store = _store(tmp_path, monkeypatch)
+    entry = store.get_or_create_session(_source())
+    runner, _states = _runner(store)
+    monkeypatch.setattr("gateway.run._load_gateway_config", _attended_cfg)
+    result = SimpleNamespace()
+    runner._perform_model_switch = AsyncMock(return_value=(result, None))
+    runner._model_selection_guard_reply = AsyncMock(return_value=(False, None))
+    runner._commit_model_switch_locked = AsyncMock(return_value="native switch")
+
+    assert await runner._handle_model_command_locked(_event("/model fast --provider openrouter")) == "native switch"
+    assert runner._perform_model_switch.await_args.args[1:3] == ("fast", "openrouter")
+    runner._commit_model_switch_locked.assert_awaited_once()
     assert store.get_model_role(entry.session_key) is None
 
 
@@ -275,9 +289,9 @@ async def test_model_role_alone_sets_hold(tmp_path, monkeypatch):
         new_model="fast-model", target_provider="openrouter", model_info=None, api_key="", base_url="",
     ), None))
     runner._model_selection_warning = AsyncMock(return_value=None)
-    reply = await runner._handle_model_command_locked(_event("/model @fast"))
+    reply = await runner._handle_model_command_locked(_event("/model fast"))
 
-    assert "@fast" in reply and reply.startswith("✓")
+    assert "fast" in reply and reply.startswith("✓")
     assert store.get_model_role(entry.session_key) == "fast"
 
 
@@ -456,7 +470,7 @@ def test_status_card_shows_role_marker():
 
     card = asyncio.run(runner._handle_status_command(_event("/status")))
 
-    assert "(@attended)" in card
+    assert "(attended)" in card
 
 
 def test_held_wakeup_posts_no_switch_card(monkeypatch):

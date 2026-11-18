@@ -5,6 +5,7 @@ generation's first getUpdates was an idle 10s long poll. Only the first request 
 generation may skip the long-poll wait; steady-state polls and stale generations keep it.
 """
 
+import json
 import asyncio
 
 import pytest
@@ -68,10 +69,9 @@ class _RecordingPollRequest(BaseRequest):
             self.long_poll_started.set()
             await self.release.wait()
         batch, self.pending = self.pending, []
-        body = ",".join(
-            '{"update_id":%d,"message":{"message_id":%d,"date":0,'
-            '"chat":{"id":1,"type":"private"},"text":"hi"}}' % (uid, uid) for uid in batch)
-        return 200, ('{"ok":true,"result":[%s]}' % body).encode()
+        body = ",".join(json.dumps({"update_id": uid, "message": {"message_id": uid, "date": 0,
+            "chat": {"id": 1, "type": "private"}, "text": "hi"}}) for uid in batch)
+        return 200, (f'{{"ok":true,"result":[{body}]}}').encode()
 
 
 def _polls(request, generation):

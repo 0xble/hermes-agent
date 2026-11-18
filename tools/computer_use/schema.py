@@ -15,6 +15,10 @@ from typing import Any, Dict
 # window_id) / targeting (element, coordinate, button, modifiers) / drag / scroll /
 # set_value / type-key-wait / focus_app / delivery ladder / return shape.
 _PROPERTIES: dict[str, Any] = {
+    "node": {
+        "type": "string",
+        "description": "Optional configured node name. Omitted uses nodes.default, or the local desktop when unset. No fallback.",
+    },
     "action": {
         "type": "string",
         "enum": [
@@ -188,7 +192,7 @@ _PROPERTIES: dict[str, Any] = {
 COMPUTER_USE_SCHEMA: dict[str, Any] = {
     "name": "computer_use",
     "description": (
-        "Drive the desktop via cua-driver — screenshots, mouse, keyboard, scroll, drag — on macOS, "
+        "Drive the desktop via cua-driver: screenshots, mouse, keyboard, scroll, drag. macOS, "
         "Windows, and Linux. Input is background-FIRST, not background-only: the default delivery "
         "routes to the target window without stealing the user's cursor or focus (works even on "
         "hidden/minimized windows), and when a result's `verdict` says to escalate you climb — "

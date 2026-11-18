@@ -159,31 +159,31 @@ def _run_chrome_fallback_command(task_id: str, command: str, args: list[str], ti
     browser_env = _session.windows_headless_browser_options(browser_env)
 
     def _run_tmp(cmd: str, cmd_args: list[str]) -> dict[str, Any]:
-        proc = _session._popen_agent_browser(base_args + [cmd] + cmd_args, browser_env, task_socket_dir, cmd)
-        stdout_path = os.path.join(task_socket_dir, f"_stdout_{cmd}")
-        stderr_path = os.path.join(task_socket_dir, f"_stderr_{cmd}")
+        from tools.browser_tool_capture import wait_for_cli
+        spawn_cmd, spawn_args, payload = _session._shim_safe_args(base_args[0], cmd, cmd_args)
+        proc = _session._popen_agent_browser(base_args + [spawn_cmd] + spawn_args, browser_env,
+                                              task_socket_dir, cmd, payload)
         try:
-            proc.wait(timeout=timeout)
+            wait_for_cli(proc, timeout, payload)
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+            _session._read_command_output(proc)
             return {"success": False, "error": f"Chrome fallback '{cmd}' timed out"}
         try:
-            with open(stdout_path, encoding="utf-8-sig") as f:
-                stdout = f.read().strip()
+            stdout, _ = _session._read_command_output(proc)
             if stdout:
-                return json.loads(stdout.split("\n")[-1])
+                result = json.loads(stdout.split("\n")[-1])
+                return _session._unwrap_batch_result(result, cmd) if payload is not None else result
         except Exception as exc:
-            _bt.logger.debug("Chrome fallback tmp cmd '%s' error: %s", cmd, exc)
-        finally:
-            _session._unlink_command_output_files(stdout_path, stderr_path)
+            _bt.logger.debug("Chrome fallback tmp cmd '%s' error: %s", cmd, type(exc).__name__)
         return {"success": False, "error": f"Chrome fallback '{cmd}' failed"}
 
     try:
         # 3. Navigate Chrome to the same URL, then 4. run the requested command.
         nav = _run_tmp("open", [current_url])
         if not nav.get("success"):
-            _bt.logger.warning("Chrome fallback: navigate failed: %s", nav.get("error"))
+            _bt.logger.warning("Chrome fallback: navigate failed")
             return {"success": False, "error": f"Chrome fallback navigate failed: {nav.get('error')}"}
         return _run_tmp(command, args)
     finally:

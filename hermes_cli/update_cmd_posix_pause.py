@@ -5,8 +5,8 @@ files. On POSIX nothing is locked, but a gateway that keeps running while git re
 loads new-tree modules into an old process on its next lazy import. So every gateway running
 from this install is stopped at the commit point, immediately before the first checkout move
 (``update_cmd_commit.arm_commit_point``), and the same set is restarted once the dependencies
-are synced and the launchers published, before the product builds
-(``source_completion.complete_source_checkout``'s ``before_build``).
+are prepared and the launch files rewritten, before the product builds
+(``source_build.build_update_products``'s ``after_dependencies``).
 
 The set rides the Windows pause contract: one token in ``update_pause_record`` (identity = pid
 + start time; supervisor unit, or argv + home for bare processes), written before the first stop,
@@ -48,6 +48,9 @@ _RUN: dict | None = None
 #: Runtimes the early resume already restarted on the new code: the late fleet restart in the
 #: same completion process must not restart them a second time.
 _RESTARTED: dict = {"units": set(), "labels": set(), "pids": set()}
+#: The replay environment of each paused bare gateway's home, built at the commit point: built after
+#: the move, it would import the new tree's modules into this process.
+_REPLAY_ENVS: dict[str, dict] = {}
 
 _STOP_TIMEOUT_S = 120.0
 _READY_TIMEOUT_S = 30.0
@@ -69,6 +72,7 @@ def arm_pause(*, no_gateway_restart: bool) -> dict | None:
     gateways, nothing is stopped). An adopted orphan set is recorded under this process now, so
     even an update that never moves the checkout restarts it at exit."""
     global _RUN
+    _REPLAY_ENVS.clear()
     if sys.platform == "win32" or no_gateway_restart:
         return None
     from hermes_cli import update_pause_record as pause_record
@@ -225,6 +229,8 @@ def _respawning_service(pid: int) -> str | None:
 def _discover_bare(service_pids: set[int]) -> tuple[list[dict], list[str]]:
     """``(bare gateways, notices)``: this install's ``gateway run`` processes outside any unit."""
     from gateway.status import get_process_start_time
+    from gateway.control_socket import identify_gateway
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
     from hermes_cli.gateway import _capture_gateway_argv, _get_service_pids, find_gateway_pids
     from hermes_cli.update_cmd_fleet import _scoped_manual_gateway_pids
     from hermes_cli.update_fleet_scope import gateway_pid_home
@@ -235,6 +241,10 @@ def _discover_bare(service_pids: set[int]) -> tuple[list[dict], list[str]]:
         pid = int(pid)
         marker = _supervisor_markers(pid)
         argv, home = _capture_gateway_argv(pid), gateway_pid_home(pid)
+        identity = identify_gateway(Path(home)) if home else None
+        # Finite owners end with the client's lease, never updater stop/replay.
+        if leave_client_owned_gateway(pid, identity, home=home, argv=argv):
+            continue
         if marker or not argv or not home:
             why = f"supervised by {marker}" if marker else "its command line could not be read" if not argv \
                 else "its Hermes home could not be proved"
@@ -323,12 +333,25 @@ def _manage_cmd(scope: str) -> list | None:
     return cmd
 
 
+def _scope_cmd(unit: dict) -> list:
+    return ["systemctl", "--user"] if unit["scope"] == "user" else ["systemctl"]
+
+
 def _stop_unit(unit: dict) -> None:
-    from hermes_cli.update_cmd_fleet import _systemctl
+    """Stop *unit* through systemd. A stop job systemd is still running holds the pause unless
+    the gateway is provably still up: its job outlives our client timeout (a cgroup child that
+    ignores SIGTERM keeps it in ``deactivating`` for up to twice TimeoutStopSec), it keeps the
+    supervisor from respawning the gateway, and a rollback ``start`` would only queue behind it
+    and boot the gateway seconds before the checkout moves."""
+    from hermes_cli.update_cmd_fleet import _unit_main_pid
+    from hermes_cli.update_cmd_fleet_unit_budget import UNIT_JOB_STILL_RUNNING, run_unit_job
     cmd = _manage_cmd(unit["scope"])
     if cmd is None:
         raise PauseRefused(f"no privilege to stop system unit {unit['unit']}")
-    result = _systemctl(cmd + ["stop", unit["unit"]], timeout=_STOP_TIMEOUT_S)
+    result = run_unit_job(cmd, _scope_cmd(unit), "stop", unit["unit"], timeout=_STOP_TIMEOUT_S)
+    if result.returncode == UNIT_JOB_STILL_RUNNING and not _alive(unit["pid"], unit.get("ct")) \
+            and _unit_main_pid(_scope_cmd(unit), unit["unit"]) <= 0:
+        return
     if result.returncode != 0:
         raise PauseRefused(f"systemctl stop {unit['unit']} failed: {(result.stderr or '').strip()}")
 
@@ -339,13 +362,14 @@ def _start_unit(unit: dict) -> int:
     from hermes_cli.update_cmd_fleet import (
         _repair_unit_without_fatal_exit_park, _systemctl, _unit_main_pid, _wait_for_service_active,
     )
+    from hermes_cli.update_cmd_fleet_unit_budget import run_unit_job
     cmd = _manage_cmd(unit["scope"])
     if cmd is None:
         raise RuntimeError(f"no privilege to start system unit {unit['unit']}")
     _repair_unit_without_fatal_exit_park(unit["unit"], unit["scope"])
     _systemctl(cmd + ["reset-failed", unit["unit"]], timeout=10)
-    result = _systemctl(cmd + ["start", unit["unit"]], timeout=_STOP_TIMEOUT_S)
-    scope_cmd = ["systemctl", "--user"] if unit["scope"] == "user" else ["systemctl"]
+    scope_cmd = _scope_cmd(unit)
+    result = run_unit_job(cmd, scope_cmd, "start", unit["unit"], timeout=_STOP_TIMEOUT_S)
     if result.returncode != 0 or not _wait_for_service_active(scope_cmd, unit["unit"], timeout=15.0):
         raise RuntimeError(f"{unit['unit']} did not start: {(result.stderr or '').strip() or 'not active'}")
     return _unit_main_pid(scope_cmd, unit["unit"])
@@ -509,6 +533,8 @@ def _replay_env(home: str) -> dict:
     under that same profile, inherits the launcher's environment (an exported bot token may be its
     only credential). The multiplexing root, and any home other than the launcher's, get that home's
     own secrets and none of the launcher's (``served_profile_child_env``)."""
+    if (prepared := _REPLAY_ENVS.get(home)) is not None:
+        return dict(prepared)
     from hermes_constants import get_default_hermes_root, get_routing_process_hermes_home
     from tools.environments.local import build_subprocess_env, served_profile_child_env
     target = Path(home).resolve()
@@ -529,6 +555,7 @@ def _relaunch_bare(entry: dict) -> int:
         env.pop(leaked, None)
     with open(logs / "gateway-update-resume.log", "ab") as log:
         proc = subprocess.Popen(list(entry["argv"]), env=env, stdin=subprocess.DEVNULL, stdout=log,
+                                # detached-spawn: ok — resumes the paused gateway after an update; it must outlive the updater
                                 stderr=subprocess.STDOUT, start_new_session=True, close_fds=True)
     deadline = time.monotonic() + _READY_TIMEOUT_S
     while time.monotonic() < deadline:
@@ -561,6 +588,12 @@ def pause_at_commit_point() -> str | None:
         return None
     if "posix_pause_verdict" not in token:
         token["posix_pause_verdict"] = _pause(token)
+    for entry in token.get("unmapped") or []:
+        if entry.get("argv") and entry["home"] not in _REPLAY_ENVS:
+            try:
+                _REPLAY_ENVS[entry["home"]] = _replay_env(entry["home"])
+            except Exception as exc:  # health: allow BLE001 -- the replay builds it again when it runs
+                print(f"  ⚠ Could not prepare the restart environment for {entry['home']}: {exc}")
     return token["posix_pause_verdict"]
 
 

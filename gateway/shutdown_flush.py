@@ -298,6 +298,11 @@ def _serialise_value(value: Any) -> Optional[dict]:
         metadata = getattr(value, "metadata", None)
         if isinstance(metadata, dict) and metadata and _json_safe(metadata):
             result["metadata"] = metadata
+            if metadata.get("goal_continuation") is True:
+                from gateway.shutdown_goal_wakes import goal_continuation_only, goal_wake_identities
+                result["goal_continuation_only"] = goal_continuation_only(value)
+                if result["goal_continuation_only"]:
+                    result["goal_continuation_wakes"] = goal_wake_identities(value)
         source = getattr(value, "source", None)
         if source is not None:
             for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):
@@ -609,9 +614,11 @@ def _recover_one_payload(session_db, path: Path, payload: dict[str, Any], *,
     data = _upgrade_shutdown_follow_up(payload, data)
     data = {**data, "_recovery_spool_ts": payload.get("ts")}
     text = data.get("text", "")
-    if data.get("drain_deferred") is True and _drop_drain_deferred(
-            path, text, data,
-            keep_expired=data.get("shutdown_follow_up") is True and deferred_followup is not None):
+    from gateway.shutdown_goal_wakes import retire_regenerable_goal_continuation
+    if retire_regenerable_goal_continuation(session_key, data) or (
+            data.get("drain_deferred") is True and _drop_drain_deferred(
+                path, text, data,
+                keep_expired=data.get("shutdown_follow_up") is True and deferred_followup is not None)):
         return DROP_PENDING
     if not session_key or not has_user_content(data):
         logger.warning("Cannot recover structurally invalid pending message from %s; "

@@ -7,14 +7,15 @@ import json
 import logging
 import sqlite3
 import threading
+import time
 import uuid
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone, UTC
 from pathlib import Path
 from typing import Any
 
-from hermes_cli.sqlite_util import add_column_if_missing, write_txn
+from hermes_cli.sqlite_util import add_column_if_missing, open_db, write_txn
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 
@@ -154,6 +155,25 @@ _SEND_COLUMNS = (
 )
 
 logger = logging.getLogger(__name__)
+
+# Every store in this process that ever deferred a write, the per-profile runtimes' stores and the
+# ones no runtime owns alike (the root profile's host-level active-profiles accumulator, the Desktop
+# store). ``os._exit`` skips each store's atexit drain, so a hard exit drains this set instead.
+_DEFERRING_STORES: list[SharedMetricsStore] = []
+_DEFERRING_STORES_LOCK = threading.Lock()
+
+
+def drain_deferring_stores(deadline: float) -> None:
+    """Write every store's deferred rows before an ``os._exit``, waiting on a busy store no later
+    than ``deadline`` (``time.monotonic``). Each deferred write runs against the store that deferred
+    it, so one profile's rows never land in another's database."""
+    with _DEFERRING_STORES_LOCK:
+        stores = list(_DEFERRING_STORES)
+    for store in stores:
+        remaining_ms = int((deadline - time.monotonic()) * 1000)
+        if remaining_ms <= 0:
+            return
+        store.drain_deferred(busy_timeout_ms=remaining_ms)
 
 
 def _utc_now() -> datetime:
@@ -429,6 +449,8 @@ class SharedMetricsStore:
                 register, self._drain_at_exit = not self._drain_at_exit, True
             if register:
                 atexit.register(self.drain_deferred)
+                with _DEFERRING_STORES_LOCK:
+                    _DEFERRING_STORES.append(self)
             if not busy:
                 raise
 
@@ -442,7 +464,11 @@ class SharedMetricsStore:
             with self._write(busy_timeout_ms=busy_timeout_ms) as connection:
                 for item in pending:
                     item(connection)
-        except Exception:
+        except Exception as exc:
+            if isinstance(exc, sqlite3.OperationalError) and ("locked" in str(exc) or "busy" in str(exc)):
+                with self._deferred_lock:  # still contended: keep them for the next write or exit drain
+                    self._deferred = [*pending, *self._deferred][-_DEFERRED_WRITES_MAX:]
+                return
             logger.warning("Unable to write %d deferred shared-metrics updates", len(pending), exc_info=True)
 
     def create_and_export_package_if_due(self) -> list[Path]:
@@ -536,6 +562,29 @@ class SharedMetricsStore:
                 " ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 (_STORE_SCHEMA_VERSION,),
             )
+        # WAL is a property of the store, not the schema transaction. Enabling it
+        # after the transaction preserves the normal busy wait for an existing
+        # writer while making subsequent short writes multi-process safe.
+        try:
+            with closing(
+                open_db(
+                    self.database_path,
+                    db_label="shared-metrics",
+                    busy_timeout_ms=_SCHEMA_BUSY_TIMEOUT_MS,
+                    wal=True,
+                    wal_lock_retries=3,
+                    row_factory=sqlite3.Row,
+                )
+            ):
+                pass
+        except sqlite3.OperationalError as exc:
+            if str(exc).lower() != "database is locked":
+                raise
+            logger.info(
+                "Unable to switch shared-metrics store to WAL while it is busy; "
+                "leaving its current journal mode for a later construction"
+            )
+
 
     def _install_id(self, connection: sqlite3.Connection) -> str:
         query = "SELECT value FROM telemetry_state WHERE key = 'install_id'"

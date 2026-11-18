@@ -10,8 +10,17 @@ PLATFORM_HINT = (
     "You can send files natively: write MEDIA:/absolute/path/to/file in your response. "
     # Telegram is in gateway.copy_blocks.PLAIN_COPY_PLATFORMS, so only its hint promises separate sends.
     "For text the user should copy exactly, wrap it in [[copy]] and [[/copy]] on separate lines; "
-    "each copy block is sent as its own plain-text message. "
+    "each copy block stays inline as a literal blockquote (expandable above 6 lines) and is also sent "
+    "as its own byte-exact plain-text message. "
     "Images (.png, .jpg, .webp) send as photos, videos (.mp4) play inline; image URLs via ![alt](url) send as "
     "photos. Audio: add [[audio_as_voice]] on its own line to send ANY audio file as a native voice bubble "
     "(non-Opus transcodes automatically); without it, .mp3/.m4a arrive as audio files, other formats as documents."
 )
+
+# Appended only when the session's toolset has ``clarify`` (cron and clarify-disabled profiles do not).
+PLATFORM_HINT_TOOL_NOTES = {
+    "clarify": (
+        "To offer a small fixed set of choices, call `clarify`: its choices render as tappable buttons that send the "
+        "answer back to you. Never fake controls with numbered lists or copy-to-clipboard text; those return nothing."
+    ),
+}

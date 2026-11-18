@@ -230,7 +230,7 @@ def test_inherit_branch_deep_copies_parent_overrides():
         "provider": "",
         "request_overrides": {"extra_body": {"provider": {"sort": "throughput"}}},
     }
-    creds, merged = _child_overrides(cfg, parent)
+    _creds, merged = _child_overrides(cfg, parent)
     assert merged is not None
     merged["extra_body"]["thinking"]["type"] = "mutated"
     assert parent_overrides == {"extra_body": {"thinking": {"type": "disabled"}}}

@@ -49,6 +49,11 @@ def set_loop_thread(ident: Optional[int]) -> None:
     _loop_thread = ident
 
 
+def on_loop_thread() -> bool:
+    """True when the caller runs on the registered gateway event-loop thread."""
+    return _loop_thread is not None and threading.get_ident() == _loop_thread
+
+
 def check(what: str) -> None:
     """Report *what* when it is about to block the registered loop thread."""
     if _loop_thread is None or threading.get_ident() != _loop_thread:
@@ -138,4 +143,4 @@ def _reset_for_tests() -> None:
         _reported.clear()
 
 
-__all__ = ["LoopGuardedLock", "LoopThreadBlockingError", "check", "set_loop_thread"]
+__all__ = ["LoopGuardedLock", "LoopThreadBlockingError", "check", "on_loop_thread", "set_loop_thread"]

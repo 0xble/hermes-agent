@@ -11,12 +11,13 @@ import pytest
 
 from gateway.update_notifications import expected_revision, final_outcome
 from tests.gateway.update_fixtures import RELEASE, SOURCE, _release, finalize_update
+from datetime import UTC
 
 
 def _pending():
     from datetime import datetime, timezone
     return {"platform": "telegram", "chat_id": "42", "notification_version": 2,
-            "timestamp": datetime(2000, 1, 1, tzinfo=timezone.utc).isoformat()}
+            "timestamp": datetime(2000, 1, 1, tzinfo=UTC).isoformat()}
 
 
 def _receipt(home, *, fleet_sha, transition=None, restart=True):

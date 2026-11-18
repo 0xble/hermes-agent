@@ -180,7 +180,7 @@ def test_restart_wait_status_reports_only_remaining_budgets(monkeypatch, caplog)
         runner._restart_delegation_timeout = 25
         runner._running_agents["stuck-chat"] = object()
         monkeypatch.setattr(async_delegation, "active_count", lambda: 1)
-        monkeypatch.setattr(async_delegation, "active_records", lambda: [])
+        monkeypatch.setattr(async_delegation, "active_records", list)
         clock = SimpleNamespace(now=0.0)
 
         async def tick(_delay):

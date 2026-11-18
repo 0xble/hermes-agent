@@ -70,7 +70,7 @@ async def scan(runner, sid):
 
 @pytest.mark.asyncio
 async def test_refused_adapter_admission_consumes_tick_until_recovery(control_home):
-    runner, adapter, source, entry = native_runner(control_home)
+    runner, _adapter, source, entry = native_runner(control_home)
     create_loop(entry, source)
     # Real BasePlatformAdapter: with no message handler admission is refused.
     await scan(runner, entry.session_id)
@@ -236,7 +236,7 @@ async def test_recovery_write_boundary_rechecks_live_owner(control_home):
 @pytest.mark.parametrize("phase", ["started", "claimed", "executing", "legacy"])
 @pytest.mark.parametrize("response", ["Answer to an unrelated user question", "LOOP_COMPLETE", ""])
 async def test_post_turn_requires_exact_loop_wake_identity(control_home, phase, response):
-    runner, adapter, source, entry = native_runner(control_home)
+    runner, _adapter, source, entry = native_runner(control_home)
     try:
         mgr = create_loop(entry, source)
         assert mgr.fire_tick()

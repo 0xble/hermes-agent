@@ -40,39 +40,50 @@ class GatewayPluginInjectionMixin:
         self, *, content: str, plugin_id: str, session_key: Optional[str] = None,
         origin: Optional[Mapping[str, Any]] = None, plugin_home: Optional[Path] = None,
         keyless: bool = False, calling_session_key: str = "",
-    ) -> bool:
+        await_dispatch: bool = False, correlation_id: Optional[str] = None,
+    ):
         """Schedule a plugin-triggered turn on the live gateway loop (thread-safe).
 
         With ``origin`` the profile, origin and adapter checks run here, synchronously, so the plugin
         gets ``False`` for a chat it may not start; authorization is rechecked at dispatch. ``keyless``
         (neither given) picks the target here too (``gateway/plugin_keyless_inject.py``)."""
         from gateway.run import safe_schedule_threadsafe
+        from hermes_cli.plugin_injection import GatewayInjectionHandle, InjectionDelivery
+        delivery = InjectionDelivery(session_key, correlation_id) if await_dispatch else None
+
+        def refused(reason):
+            return GatewayInjectionHandle.resolved(delivery.result(False, reason)) if delivery else False
+
         loop = getattr(self, "_gateway_loop", None)
         if not getattr(self, "_running", False) or loop is None or loop.is_closed():
-            return False
+            return refused("gateway_unavailable")
 
         if keyless:
             from gateway import plugin_keyless_inject
             resolved = plugin_keyless_inject.resolve(self, plugin_home=plugin_home, plugin_id=plugin_id,
                                                      calling_session_key=calling_session_key)
             if resolved is None:
-                return False
+                return refused("not_routed")
             target = f"session={resolved[1].route} (no key given)"
             coro = plugin_keyless_inject.admit(self, *resolved, content=content, plugin_id=plugin_id)
         elif origin is not None:
             source = self._plugin_origin_source(origin, plugin_home=plugin_home, plugin_id=plugin_id)
-            if source is None or not self._plugin_origin_admissible(source, plugin_home=plugin_home,
-                                                                    plugin_id=plugin_id):
-                return False
+            if source is None:
+                return refused("not_routed")
+            if not self._plugin_origin_admissible(source, plugin_home=plugin_home, plugin_id=plugin_id):
+                return refused("not_authorized")
             target = f"origin={source.platform.value}/{source.chat_id}"
             coro = self._dispatch_plugin_origin_injection(source=source, content=content, plugin_id=plugin_id)
         else:
             if not self._plugin_session_key_admissible(session_key, plugin_home=plugin_home, plugin_id=plugin_id):
-                return False
+                return refused("not_authorized")
             target = f"session={session_key}"
             coro = self._dispatch_plugin_message_injection(
                 session_key=session_key, content=content, plugin_id=plugin_id, plugin_home=plugin_home,
             )
+        dispatch_coro = coro
+        if delivery is not None:
+            coro = delivery.observe(dispatch_coro)
         try:
             current_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -83,8 +94,10 @@ class GatewayPluginInjectionMixin:
                 future = loop.create_task(coro)
             except Exception:
                 coro.close()
+                if delivery is not None:
+                    dispatch_coro.close()
                 logger.warning("Plugin message injection scheduling failed", exc_info=True)
-                return False
+                return refused("schedule_failed")
             self._background_tasks.add(future)
             future.add_done_callback(self._background_tasks.discard)
         else:
@@ -93,7 +106,9 @@ class GatewayPluginInjectionMixin:
                 log_level=logging.WARNING,
             )
             if future is None:
-                return False
+                if delivery is not None:
+                    dispatch_coro.close()
+                return refused("schedule_failed")
 
         def _log_result(completed) -> None:
             try:
@@ -107,6 +122,8 @@ class GatewayPluginInjectionMixin:
             logger.warning("Plugin message injection was not routed: plugin=%s %s", plugin_id, target)
 
         future.add_done_callback(_log_result)
+        if delivery is not None:
+            return GatewayInjectionHandle.track(future, delivery, loop, dispatch_coro)
         return True
 
     def _plugin_injection_accepting(self) -> bool:
@@ -246,14 +263,28 @@ class GatewayPluginInjectionMixin:
             allow_gateway_control=False, message_id=identity,
             metadata={"gateway_session_key": session_key, "gateway_session_id": session_id},
         )
+        from hermes_cli.plugin_injection import active_delivery
+        delivery = active_delivery()
+        if delivery is not None:
+            delivery.started = True
+            delivery.session_key = session_key
+            delivery.session_id = session_id
         try:
-            await authority.admit_automation(adapter, event, identity)
+            receipt = await authority.admit_automation(adapter, event, identity)
+            if delivery is not None:
+                delivery.finish(True, "adopted", admission_id=receipt.admission_id)
         except RuntimeStoreError as exc:
-            logger.warning("Plugin message injection refused by the session authority: plugin=%s session=%s (%s)",
-                           plugin_id, session_key, exc.reason)
+            # This error is raised before INSERT; other failures may follow a
+            # shielded commit and must remain ambiguous rather than replayable.
+            if delivery is not None and exc.reason == "queue_full":
+                delivery.finish(False, "queue_full")
+            logger.warning("Plugin message injection refused by the session authority: plugin=%s session=%s "
+                           "correlation=%s (%s)", plugin_id, session_key,
+                           delivery.correlation_id if delivery else None, exc.reason)
             return False
-        logger.info("Plugin message injection admitted: plugin=%s session=%s session_id=%s",
-                    plugin_id, session_key, session_id)
+        logger.info("Plugin message injection admitted: plugin=%s session=%s session_id=%s correlation=%s admission=%s",
+                    plugin_id, session_key, session_id, delivery.correlation_id if delivery else None,
+                    getattr(receipt, "admission_id", None))
         return True
 
     async def _dispatch_plugin_message_injection(
@@ -262,6 +293,9 @@ class GatewayPluginInjectionMixin:
     ) -> bool:
         """Route a plugin-triggered turn through the session's live adapter."""
         if not self._plugin_injection_accepting():
+            from hermes_cli.plugin_injection import active_delivery
+            if delivery := active_delivery():
+                delivery.finish(False, "gateway_draining")
             return False
         entry = await self.async_session_store.lookup_by_session_key(session_key)
         if entry is None or entry.origin is None or not self._plugin_injection_accepting():
@@ -311,6 +345,9 @@ class GatewayPluginInjectionMixin:
                     return admitted
                 # True only on the adapter's admission receipt: a busy queue can refuse the event
                 # without raising, and callers treat True as a durable delivery acknowledgement.
+                from hermes_cli.plugin_injection import active_delivery
+                if delivery := active_delivery():
+                    delivery.started = True
                 await admit_internal_event(adapter, event)
         except WakeNotAccepted:
             logger.info(
@@ -387,6 +424,9 @@ class GatewayPluginInjectionMixin:
         message path: ``get_or_create_session`` creates it, the reply goes back to that chat."""
         target = f"origin={source.platform.value}/{source.chat_id}"
         if not self._plugin_injection_accepting():
+            from hermes_cli.plugin_injection import active_delivery
+            if delivery := active_delivery():
+                delivery.finish(False, "gateway_draining")
             return False
         adapter = self._delivery_adapter_for(source)
         if adapter is None:
@@ -409,6 +449,9 @@ class GatewayPluginInjectionMixin:
                 return await self._admit_plugin_injection(
                     adapter, source, session_key=session_key, session_id=entry.session_id,
                     content=content, plugin_id=plugin_id)
+            from hermes_cli.plugin_injection import active_delivery
+            if delivery := active_delivery():
+                delivery.started = True
             await adapter.handle_message(MessageEvent(
                 text=content, message_type=MessageType.TEXT, source=source, internal=True,
                 allow_gateway_control=False,

@@ -50,17 +50,12 @@ def _real_profile_daemon_env() -> tuple:
 
 
 def _capture_agent_browser_cli(argv: list, timeout: float, tag: str) -> subprocess.CompletedProcess:
-    """Run an agent-browser CLI argv once, capturing output through temp files (not pipes).
+    """Capture in memory, waiting for the CLI rather than inherited daemon EOF.
 
-    The CLI forks a resident daemon that inherits its stdio and outlives the CLI, so with
-    pipe capture the CLI can exit while its output never reaches EOF: POSIX burns the whole
-    timeout draining pipes on every call, and Windows' ``TimeoutExpired`` cleanup re-drains
-    with no timeout, blocking past the outer tool deadline (#96731). Same pattern as
-    ``_popen_agent_browser``: wait for the CLI alone — a grandchild holding the inherited
-    file handles is harmless. Raises ``TimeoutExpired`` after killing the CLI."""
+    The shared collector drains daemon handles independently and never stages raw
+    page output. Raises ``TimeoutExpired`` after killing the CLI.
+    """
     env, socket_dir = _real_profile_daemon_env()
-    stdout_path = os.path.join(socket_dir, f"_stdout_{tag}")
-    stderr_path = os.path.join(socket_dir, f"_stderr_{tag}")
     proc = _session._popen_agent_browser(argv, env, socket_dir, tag)
     timed_out = False
     try:
@@ -69,8 +64,7 @@ def _capture_agent_browser_cli(argv: list, timeout: float, tag: str) -> subproce
         timed_out = True
         proc.kill()
         proc.wait()
-    stdout, stderr = _session._read_command_output_files(stdout_path, stderr_path)
-    _session._unlink_command_output_files(stdout_path, stderr_path)
+    stdout, stderr = _session._read_command_output(proc)
     if timed_out:
         raise subprocess.TimeoutExpired(argv, timeout)
     return subprocess.CompletedProcess(argv, proc.returncode, stdout=stdout, stderr=stderr)
@@ -208,8 +202,10 @@ def _launch_real_profile_chrome(real_binary: str, copy_dir: str) -> tuple[Option
     if not (_cloud._is_headed_mode() and (_has_display or not sys.platform.startswith("linux"))):
         chrome_argv.append("--headless=new")
     try:
-        chrome_proc = subprocess.Popen(chrome_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                                       stdin=subprocess.DEVNULL, start_new_session=True, env=browser_env)
+        chrome_proc = subprocess.Popen(
+            chrome_argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL,
+            # detached-spawn: ok — tracked in _real_profile_chrome_procs and terminated by _terminate_real_profile_chrome on close and exit
+            start_new_session=True, env=browser_env)
     except (subprocess.SubprocessError, OSError) as e:
         return None, f"{_RP}the launch failed: {e}"
     _bt._real_profile_chrome_procs.append(chrome_proc)

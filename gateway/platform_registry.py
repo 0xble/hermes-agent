@@ -7,7 +7,9 @@ registry first, then the legacy built-in path. Plugin side: ``platform_registry
 .register(PlatformEntry(...))``; gateway side: ``create_adapter("irc", platform_config)``.
 """
 
+import contextlib
 import contextvars
+import inspect
 import logging
 import sys
 import threading
@@ -17,6 +19,9 @@ from typing import Any, Awaitable, Callable, Optional
 from hermes_constants import hermes_home_key
 
 logger = logging.getLogger(__name__)
+# The verdict of an ``ensure_deps`` an async gateway caller already ran in an executor (#125607).
+_OFF_LOOP_DEPS_RESULT: contextvars.ContextVar[Optional[bool]] = contextvars.ContextVar(
+    "platform_off_loop_deps_result", default=None)
 
 _LoadKey = tuple[Optional[str], str]
 _Loader = Callable[[], None]
@@ -49,6 +54,10 @@ class PlatformEntry:
     # PASSIVE dependency probe (deps importable RIGHT NOW); must be side-effect free since it
     # runs from status displays and the config enablement pass, which may never pip-install.
     check_fn: Callable[[], bool]
+    # Optional adapter class for capability inspection when the factory is a wrapper (for example,
+    # a factory that applies post-construction configuration). This is metadata only: callers must
+    # never instantiate the adapter to inspect capabilities.
+    adapter_class: Optional[type] = None
 
     # Optional: given a PlatformConfig, is it properly configured?
     # If None, the registry skips config validation and lets the adapter
@@ -86,6 +95,9 @@ class PlatformEntry:
     emoji: str = "🔌"  # CLI/gateway display
     allow_update_command: bool = True  # /update may be issued from this platform
     platform_hint: str = ""  # injected into the system prompt; empty = none
+    # ``{tool_name: sentence}`` appended to ``platform_hint`` only when the session's toolset (fixed at
+    # prompt build) has that tool, so the hint never recommends a tool cron or the profile disabled.
+    platform_hint_tool_notes: dict = field(default_factory=dict)
     # ``() -> Optional[dict]`` of ``extra`` fields to seed when auto-enabled from env; runs in
     # ``_apply_env_overrides`` BEFORE adapter construction so ``gateway status`` sees it.
     env_enablement_fn: Optional[Callable[[], Optional[dict]]] = None
@@ -106,7 +118,7 @@ class PlatformEntry:
     send_message_handler: Optional[Callable[[dict, str, str, Any], Any]] = None
     # Out-of-process sender for cron without a co-resident gateway:
     # ``async (pconfig, chat_id, message, *, thread_id=None, media_files=None, force_document=False)
-    # -> {"success": True, "message_id": ...} | {"error": str}``.
+    # -> {"success": True, "message_id": ...} | {"error": str}``; ``notify`` only if declared/**kwargs.
     standalone_sender_fn: Optional[Callable[..., Awaitable[dict]]] = None
     # Every inbound event is produced by the service the adapter authenticated to with its own
     # credential (an event bus, not a person), so user allowlists and pairing do not apply. Never
@@ -481,6 +493,38 @@ class PlatformRegistry:
             return {n for e in (*self._entries.values(), *entries.values())
                     for n in e.required_env if isinstance(n, str)}
 
+    def adapter_class(self, name: str) -> Optional[type]:
+        """Return a loaded adapter class for *name* without resolving deferred plugins.
+
+        Tool selection must not discover manifests (notably in safe mode), so an unresolved
+        entry intentionally returns ``None`` and callers should fail open.
+        """
+        with self._lock:
+            scope = self.current_scope_key()
+            entries, _deferred = self._scope_maps(scope)
+            entry = entries.get(name) or self._entries.get(name)
+            if entry is None:
+                return None
+            adapter_class = entry.adapter_class
+            if adapter_class is None and inspect.isclass(entry.adapter_factory):
+                adapter_class = entry.adapter_factory
+            return adapter_class if inspect.isclass(adapter_class) else None
+
+    def reactions_supported(self, name: str) -> Optional[bool]:
+        """Return whether a loaded adapter supports reactions, or ``None`` when unknown.
+
+        This is deliberately a passive registry read: constructing an adapter can import SDKs or
+        perform setup work, and resolving deferred manifests from tool selection is forbidden.
+        """
+        adapter_class = self.adapter_class(name)
+        if adapter_class is None:
+            return None
+        declared = getattr(adapter_class, "SUPPORTS_REACTIONS", None)
+        if declared is not None:
+            return bool(declared)
+        from gateway.platforms.base import BasePlatformAdapter
+        return getattr(adapter_class, "add_reaction", None) is not BasePlatformAdapter.add_reaction
+
     def is_registered(self, name: str) -> bool:
         # A deferred (not-yet-imported) platform still counts as registered so cheap membership
         # checks (toolset resolution, webhook deliver-target checks) never trigger a heavy import.
@@ -489,12 +533,27 @@ class PlatformRegistry:
             entries, _deferred = self._scope_maps(scope)
             return name in entries or name in self._entries or self._load_pending(scope, name)
 
-    def create_adapter(self, name: str, config: Any) -> Optional[Any]:
-        """Create an adapter instance for *name*; None when no entry exists, deps are missing
-        and cannot be installed, ``validate_config`` fails, or the factory raises."""
+    @staticmethod
+    @contextlib.contextmanager
+    def deps_resolved_off_loop(deps_ok: Optional[bool]):
+        """Scope in which ``create_adapter`` reuses *deps_ok* from an ``ensure_deps`` the caller already
+        ran in an executor, so neither the probe nor a failed install re-runs on the event loop."""
+        token = _OFF_LOOP_DEPS_RESULT.set(deps_ok)
+        try:
+            yield
+        finally:
+            _OFF_LOOP_DEPS_RESULT.reset(token)
+
+    def ensure_deps(self, name: str) -> Optional[bool]:
+        """Passive probe, then the ACTIVE installer when deps are missing; None when *name* has no
+        entry. Blocking (``ensure_deps_fn`` may run a pm install for minutes): the gateway calls it
+        through an executor before ``create_adapter`` so the install never stalls its event loop."""
         entry = self.get(name)
         if entry is None:
             return None
+        resolved = _OFF_LOOP_DEPS_RESULT.get()
+        if resolved is not None:
+            return resolved
         def _probe(fn: Callable[[], Any], failure_msg: str) -> bool:
             try:
                 return bool(fn())
@@ -510,6 +569,13 @@ class PlatformRegistry:
         if not deps_ok:
             hint = f" ({entry.install_hint})" if entry.install_hint else ""
             logger.warning("Platform '%s' requirements not met%s", entry.label, hint)
+        return deps_ok
+
+    def create_adapter(self, name: str, config: Any) -> Optional[Any]:
+        """Create an adapter instance for *name*; None when no entry exists, deps are missing
+        and cannot be installed, ``validate_config`` fails, or the factory raises."""
+        entry = self.get(name)
+        if entry is None or not self.ensure_deps(name):
             return None
         if entry.validate_config is not None:
             try:

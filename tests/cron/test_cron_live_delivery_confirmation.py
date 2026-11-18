@@ -426,7 +426,7 @@ class TestShortFloodWaitStaysOnTheLiveLane:
             future = Future()
             try:
                 future.set_result(asyncio.run(coro))
-            except BaseException as e:  # noqa: BLE001
+            except BaseException as e:
                 future.set_exception(e)
             return future
 
@@ -495,3 +495,11 @@ class TestShortFloodWaitStaysOnTheLiveLane:
         assert len(router_calls) == 1
         assert sleeps == []
         assert len(standalone_calls) == 1
+@pytest.mark.parametrize("cron_cfg,expected", [(None, True), ({"delivery": {"notify": False}}, False)])
+def test_standalone_fallback_carries_the_cron_notify_choice(cron_cfg, expected):
+    """The live lane sends ``metadata["notify"] = cron.delivery.notify``; the standalone fallback
+    must pass the same choice, or a brief that buzzes in-process lands silently out of process."""
+    _, _, standalone_calls = _run(_job(), "Nightly report.", {"success": True, "filtered": "x", "delivered": False},
+                                  cron_cfg=cron_cfg)
+
+    assert [call["kwargs"]["notify"] for call in standalone_calls] == [expected]

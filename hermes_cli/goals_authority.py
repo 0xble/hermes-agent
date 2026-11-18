@@ -8,6 +8,7 @@ from __future__ import annotations
 import logging
 import re
 import unicodedata
+from itertools import pairwise
 from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("hermes_cli.goals")
@@ -18,7 +19,7 @@ def _facade():
     return goals
 
 
-def _is_user_typed(row: Dict[str, Any]) -> bool:
+def _is_user_typed(row: dict[str, Any]) -> bool:
     """Whether a user-role row is input the person typed, judged by provenance first."""
     content = row.get("content")
     if not isinstance(content, str) or row.get("compressed_summary"):
@@ -87,15 +88,15 @@ def _normalize_authority_text(text: Any) -> str:
     return " ".join("".join(chars).split())
 
 
-def _split_text_units(text: str) -> List[str]:
+def _split_text_units(text: str) -> list[str]:
     """Split sentence/clause-sized text without treating punctuation inside tokens as a boundary."""
     return [part.strip() for part in re.split(r"(?<=[.!?;])(?=\s|$)", text or "") if part.strip()]
 
 
-def _authority_unit_records(text: str) -> List[Tuple[str, List[str], str]]:
+def _authority_unit_records(text: str) -> list[tuple[str, list[str], str]]:
     """Mask before splitting, retaining original offsets and quoted data (never quoted authority)."""
     masked = _mask_non_authoritative_spans(text or "")
-    records: List[Tuple[str, List[str], str]] = []
+    records: list[tuple[str, list[str], str]] = []
     cursor = 0
     boundaries = [match.start() for match in re.finditer(r"(?<=[.!?;])(?=\s|$)", masked)]
     boundaries.append(len(masked))
@@ -113,7 +114,7 @@ def _authority_unit_records(text: str) -> List[Tuple[str, List[str], str]]:
     return records
 
 
-def _authority_units(text: str) -> List[str]:
+def _authority_units(text: str) -> list[str]:
     """Return sentence/clause units after masking the complete source first."""
     return [unit for unit, _quotes, _original in _authority_unit_records(text)]
 
@@ -209,7 +210,7 @@ def _replacement_action_is_authorized(source: str, goal: str) -> bool:
     return False
 
 
-def _removal_instruction_units(source: str, goal: str = "") -> List[Tuple[str, str, List[str]]]:
+def _removal_instruction_units(source: str, goal: str = "") -> list[tuple[str, str, list[str]]]:
     """Return explicit removal verbs and their targets from independent imperative clauses.
 
     Mask replacement-objective text before examining directives. A work task may itself
@@ -247,7 +248,67 @@ def _removal_instruction_units(source: str, goal: str = "") -> List[Tuple[str, s
     return instructions
 
 
-def _explicit_restriction_removals(source: str, goal: str) -> Tuple[bool, bool]:
+def _bound_removal_instruction_units(source: str, requirements: list[str]) -> list[tuple[str, str, list[str]]]:
+    """Parse removal directives with exact existing requirement names as inert data.
+
+    Binding precedes sentence splitting and authority checks: a name can itself
+    contain negation, conditions or punctuation. Only a name immediately following
+    a removal verb (and optional noun wrapper) can be bound. The remaining entire
+    instruction must still be an unconditional removal, never an example, question,
+    alternative or quoted/code command. Inclusive scope text grants no extra target.
+    """
+    from hermes_cli.session_controls import _message_grants_authority
+
+    source = unicodedata.normalize("NFKC", source).translate(str.maketrans({
+        "\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'"})).casefold()
+    marker = "__goal_removal_target_"
+    if marker in source:
+        return []
+    direct = _mask_non_authoritative_spans(source)
+    noun = r"(?:constraint|requirement|criterion|rule)"
+    head = rf"\b{_REMOVAL_VERBS}\s+(?:(?:the\s+)?{noun}\s+)?"
+    spans = {}
+    for value in dict.fromkeys(_normalize_authority_value(item) for item in requirements):
+        if not value:
+            continue
+        name = r"\s+".join(re.escape(part) for part in value.split())
+        target = rf'''(?:"{name}[.!?;]*"|'{name}[.!?;]*'|{name})(?=$|[\s.!;?,])'''
+        for match in re.finditer(rf"{head}(?P<target>{target})", source, re.IGNORECASE):
+            start, end = match.span("target")
+            # Commands in examples/quotes/code never bind names, even if their
+            # target spelling is an exact existing requirement.
+            if direct[match.start():start] == source[match.start():start]:
+                spans[(start, end)] = value
+    ordered = sorted(spans)
+    if not ordered or any(left[1] > right[0] for left, right in pairwise(ordered)):
+        return []  # Overlapping interpretations are ambiguous, not a longest-name guess.
+    bound = {f"{marker}{index}__": spans[span] for index, span in enumerate(ordered)}
+    for index in reversed(range(len(ordered))):
+        start, end = ordered[index]
+        source = source[:start] + f"{marker}{index}__" + source[end:]
+    # Inclusive scope is a closed allowlist: free text after the target could
+    # carry conditional, temporary or future-effective qualifiers a blocklist misses.
+    scope = (r"(?:anywhere\s+(?:(?:that|it)(?:'s|\s+is)\s+)?mentioned|everywhere"
+             r"(?:\s+(?:(?:that|it)(?:'s|\s+is)\s+)?mentioned)?|(?:in\s+)?memory|memories)")
+    grammar = (rf"\s*(?:please\s+)?(?P<verb>{_REMOVAL_VERBS})\s+"
+               rf"(?:(?:the\s+)?{noun}\s+)?(?P<target>{marker}\d+__)"
+               rf"(?:\s+{noun})?(?:,\s*including\s+{scope}(?:\s*,?\s*including\s+{scope})*"
+               rf"(?:\s*\(invalidate\))?)?[.!;\s]*")
+    if _NON_AUTHORITATIVE_SPANS_RE.search(source):
+        return []  # Only bound target data can be quoted/coded, never leftover context.
+    units = []
+    for authority, quoted, _original in _authority_unit_records(source):
+        match = re.fullmatch(grammar, authority, re.IGNORECASE)
+        if (not match or quoted or _unit_is_non_directive(authority) or not _message_grants_authority(authority)
+                or re.search(r"\b(?:and|or|but|except|excluding|keep|retain|preserve|leave|nothing|none|contingent|conditional|"
+                             r"example|actually|instead|rather|cancel|disregard|ignore|scratch)\b"
+                             r"|\b(?:subject to|as long as|in case|on condition)\b", authority, re.IGNORECASE)):
+            return []
+        units.append((match["verb"], bound[match["target"]], []))
+    return units
+
+
+def _explicit_restriction_removals(source: str, goal: str) -> tuple[bool, bool]:
     """Require complete restriction targets in independent, un-negated removal directives."""
     remove_gates = remove_budget = False
     for verb, targets, _quoted_targets in _removal_instruction_units(source, goal):
@@ -277,7 +338,7 @@ def _bounded_authority_match(needle: str, source: str) -> Optional[re.Match[str]
     return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", source) if needle else None
 
 
-def _requirement_diff(field_name: str, before: Any, after: Any) -> Tuple[List[str], List[str], List[str]]:
+def _requirement_diff(field_name: str, before: Any, after: Any) -> tuple[list[str], list[str], list[str]]:
     """Return retained, removed, and added canonical items."""
     before_items = {_normalize_authority_value(item): item
                     for item in _facade().contract_items(field_name, before)}
@@ -312,7 +373,7 @@ def _evidence_is_negated(content: str, evidence: str, *, include_no: bool = Fals
     return False
 
 def _typed_user_message_records_since(session_id: Optional[str], since: float = 0.0,
-                                      limit: int = 500) -> List[Dict[str, Any]]:
+                                      limit: int = 500) -> list[dict[str, Any]]:
     """Newest-first active typed user rows; withdrawn and summarized-away rows cannot authorize."""
     db = _facade()._get_session_db()
     reader = getattr(db, "get_messages", None) if db is not None else None
@@ -330,13 +391,13 @@ def _typed_user_message_records_since(session_id: Optional[str], since: float = 
             and float(row.get("timestamp") or 0.0) >= float(since or 0.0)][:limit]
 
 
-def _typed_user_message_text(row: Dict[str, Any]) -> str:
+def _typed_user_message_text(row: dict[str, Any]) -> str:
     """Return only the user's text, excluding a client-provided assistant quote header."""
     content = row.get("content")
     return _REPLY_QUOTE_RE.sub("", content, count=1) if isinstance(content, str) else ""
 
 
-def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> List[str]:
+def user_messages_since(session_id: Optional[str], since: float = 0.0, limit: int = 500) -> list[str]:
     """Text the user actually wrote since ``since``: synthetic runtime prompts are dropped and a
     reply's quoted header (which repeats the assistant's words) is stripped. Fail-safe: ``[]``."""
     return [_typed_user_message_text(row)

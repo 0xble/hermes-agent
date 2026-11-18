@@ -101,7 +101,7 @@ def test_release_in_another_process_is_broadcast_and_local_transition_not_duplic
 
 
 def test_watched_lease_homes_deduplicates_profile_aliases(tmp_path, monkeypatch):
-    import tui_gateway.server as server
+    from tui_gateway import server
     from hermes_constants import hermes_home_key
 
     home = tmp_path / "home"

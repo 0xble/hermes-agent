@@ -382,7 +382,7 @@ class TestTickLifecycle:
             assert "say so in the same one or two short lines, then put LOOP_COMPLETE on its own line" in template
 
     def test_every_stored_wakeup_wording_is_still_a_quiet_wakeup(self, hermes_home):
-        import hermes_cli.loops as loops
+        from hermes_cli import loops
 
         fields = {"tick": 3, "cadence": ", every 5m", "prompt": "check CI", "until": "CI is green"}
         for name in ("_ORIGINAL_WAKEUP_PROMPT_TEMPLATE", "_PREVIOUS_WAKEUP_PROMPT_TEMPLATE",
@@ -984,7 +984,7 @@ class TestSelfPacedBackoff:
 
         mgr = LoopManager(session_id="sp-silent")
         state = mgr.set("watch the queue")
-        floor = state.current_delay
+        _floor = state.current_delay
 
         for _ in range(2):
             mgr.state.next_due_at = time.time() - 1
@@ -999,7 +999,7 @@ class TestSelfPacedBackoff:
 
         mgr = LoopManager(session_id="sp-silent-forms")
         state = mgr.set("watch the queue")
-        floor = state.current_delay
+        _floor = state.current_delay
 
         for reply in ("[SILENT]", "NO_REPLY", "[SILENT].", " no reply ", "NO_REPLY"):
             mgr.state.next_due_at = time.time() - 1
@@ -1013,7 +1013,7 @@ class TestSelfPacedBackoff:
 
         mgr = LoopManager(session_id="sp2")
         state = mgr.set("watch")
-        floor = state.current_delay
+        _floor = state.current_delay
         state.next_due_at = time.time() - 1
         mgr.fire_tick()
         mgr.complete_tick("Still building. Checked at 14:02:33")

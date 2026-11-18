@@ -412,7 +412,7 @@ def test_signal_guard_rechecks_group_members(request, monkeypatch, state, leader
     leader.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
     leader.children.return_value = [member]
     owner = Mock()
-    owner.children.return_value = []
+    owner.children.return_value = [leader, member]
     processes = {os.getpid(): owner, leader_pid: leader, member.pid: member}
 
     def lookup(pid):
@@ -445,6 +445,54 @@ def test_signal_guard_rechecks_group_members(request, monkeypatch, state, leader
             with pytest.raises(RuntimeError, match="live-system guard"):
                 os.killpg(leader_pid, signal.SIGKILL)
             killpg.assert_not_called()
+
+
+@pytest.mark.platforms("posix")
+@pytest.mark.parametrize("state", ["owned", "recycled", "foreign"])
+def test_signal_guard_keeps_siblings_when_bottom_up_term_reaps_the_leader(request, monkeypatch, state):
+    """A signal to 1 helper can make its parent exit before its sibling is signalled."""
+    import psutil
+
+    leader_pid = 987654321
+    processes = {}
+    owner = Mock()
+    owner.children.side_effect = lambda recursive=True: list(processes.values())
+
+    def lookup(pid):
+        if pid == os.getpid():
+            return owner
+        if pid not in processes:
+            raise psutil.NoSuchProcess(pid)
+        return processes[pid]
+
+    monkeypatch.setattr(psutil, "Process", lookup)
+    with _record_signal_delivery(request) as (kill, _):
+        leader, sibling, member = (Mock(pid=leader_pid + i) for i in range(3))
+        for process in (leader, sibling, member):
+            process.create_time.return_value = float(process.pid)
+            process.parents.return_value = [types.SimpleNamespace(pid=os.getpid())]
+            process.children.return_value = []
+            processes[process.pid] = process
+        if state == "foreign":
+            member.parents.return_value = []
+
+        def reap_leader(pid, sig):
+            if pid == sibling.pid:
+                del processes[leader.pid]
+                member.parents.return_value = []
+
+        kill.side_effect = reap_leader
+        os.kill(sibling.pid, signal.SIGTERM)
+        if state == "recycled":
+            member.create_time.return_value += 100.0
+        kill.reset_mock()
+        if state == "owned":
+            os.kill(member.pid, signal.SIGKILL)
+            kill.assert_called_once_with(member.pid, signal.SIGKILL)
+        else:
+            with pytest.raises(RuntimeError, match="live-system guard"):
+                os.kill(member.pid, signal.SIGKILL)
+            kill.assert_not_called()
 
 
 @pytest.mark.platforms("posix")
@@ -710,24 +758,30 @@ def test_updater_guard_is_at_least_as_blocking_as_pre_pr_base():
     print(f"pre-PR base implication: {matched} updater shapes blocked")
 
 
-def test_npm_refresh_allowance_is_only_the_direct_temporary_fixture(tmp_path, monkeypatch):
+@pytest.mark.parametrize("tool", ["npm", "pnpm"])
+def test_dependency_refresh_allowance_is_only_the_direct_temporary_fixture(tmp_path, monkeypatch, tool):
     import tempfile
 
     temp = tmp_path / "hermes-ci-home"
     root = temp / "pm-deps-fixture"
     repo = root / "repo"
     repo.mkdir(parents=True)
-    binary = root / "store" / "npm-fixture"
-    binary = binary / "npm.cmd" if os.name == "nt" else binary / "bin" / "npm"
+    binary = root / "store" / f"{tool}-fixture"
+    if tool == "npm":
+        binary = binary / "npm.cmd" if os.name == "nt" else binary / "bin" / "npm"
+        arguments = ["update"]
+    else:
+        binary = binary / ("pnpm.exe" if os.name == "nt" else "pnpm")
+        arguments = ["update", "--recursive", "--lockfile-only", "--no-save"]
     binary.parent.mkdir(parents=True)
     binary.write_text("fixture, never executed")
     monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
-    command = [str(binary), "update"]
+    command = [str(binary), *arguments]
     kwargs = {"cwd": str(repo)}
     _check_update_command_without_spawning(command, kwargs)
     _check_update_command_without_spawning(tuple(command), kwargs)
 
-    # The exception is not an npm basename allowlist or a shell-string exemption.
+    # Neither exact allowance grants a basename allowlist or shell-string exemption.
     denied = [
         (command, None), (command, {"cwd": str(temp)}),
         (command, {**kwargs, "shell": True}),
@@ -736,14 +790,69 @@ def test_npm_refresh_allowance_is_only_the_direct_temporary_fixture(tmp_path, mo
         (" ".join(command), kwargs),
         (["bash", "-c", " ".join(command)], kwargs),
         (["cmd.exe", "/c", " ".join(command)], kwargs),
-        ([str(root / "store" / "npm-fixture" / "hermes.exe"), "update"], kwargs),
+        ([str(root / "store" / f"{tool}-fixture" / "hermes.exe"), "update"], kwargs),
         ([str(root / ".venv" / "bin" / "hermes"), "update"], kwargs),
         (["python", str(root / "hermes_cli" / "main.py"), "update"], kwargs),
         (["bash", "-c", 'exec hermes "$@"', "--", "update"], kwargs),
     ]
+    if tool == "pnpm":
+        denied.extend([
+            ([str(binary), "update"], kwargs),
+            ([str(binary), "update", "--recursive", "--lockfile-only"], kwargs),
+            ([str(binary), "update", "--no-save", "--lockfile-only", "--recursive"], kwargs),
+        ])
     for candidate, options in denied:
         with pytest.raises(RuntimeError, match="would run.*hermes update"):
             _check_update_command_without_spawning(candidate, options)
+    binary.unlink()
+    with pytest.raises(RuntimeError, match="would run.*hermes update"):
+        _check_update_command_without_spawning(command, kwargs)
+
+
+def test_pnpm_release_age_diagnostic_allowance_requires_its_owned_copy(tmp_path, monkeypatch):
+    import tempfile
+
+    temp = tmp_path / "hermes-ci-home"
+    root = temp / "pm-deps-fixture"
+    binary = root / "store" / "pnpm-fixture" / ("pnpm.exe" if os.name == "nt" else "pnpm")
+    binary.parent.mkdir(parents=True)
+    binary.write_text("fixture, never executed")
+    scratch = temp / "pm-pnpm-release-age-fixture"
+    scratch.mkdir()
+    for name in ("package.json", "pnpm-workspace.yaml"):
+        (scratch / name).write_text("fixture")
+    monkeypatch.setattr(tempfile, "gettempdir", lambda: str(temp))
+    command = [str(binary), "update", "--recursive", "--lockfile-only", "--reporter=ndjson"]
+    env = {"HERMES_HOME": str(root / "home"), "HERMES_RUNTIME_DIR": str(root / "store")}
+    kwargs = {"cwd": str(scratch), "env": env, "stdin": subprocess.DEVNULL}
+    _check_update_command_without_spawning(command, kwargs)
+    _check_update_command_without_spawning(tuple(command), kwargs)
+
+    denied = [
+        (command, None),
+        (command, {**kwargs, "cwd": str(root / "repo")}),
+        (command, {**kwargs, "cwd": str(temp)}),
+        (command, {**kwargs, "env": {**env, "HERMES_HOME": str(temp)}}),
+        (command, {**kwargs, "env": {**env, "HERMES_RUNTIME_DIR": str(temp)}}),
+        (command, {**kwargs, "env": None}),
+        (command, {**kwargs, "stdin": None}),
+        (command, {**kwargs, "shell": True}),
+        (command, {**kwargs, "executable": "hermes"}),
+        ([*command, "--gateway"], kwargs),
+        ([str(binary), "update", "--recursive", "--lockfile-only"], kwargs),
+        (" ".join(command), kwargs),
+        (["bash", "-c", " ".join(command)], kwargs),
+        ([str(binary.with_name("hermes")), "update"], kwargs),
+    ]
+    for candidate, options in denied:
+        with pytest.raises(RuntimeError, match="would run.*hermes update"):
+            _check_update_command_without_spawning(candidate, options)
+    for required in (scratch / "package.json", scratch / "pnpm-workspace.yaml", binary):
+        contents = required.read_text()
+        required.unlink()
+        with pytest.raises(RuntimeError, match="would run.*hermes update"):
+            _check_update_command_without_spawning(command, kwargs)
+        required.write_text(contents)
 
 
 def test_subprocess_run_full_path_systemctl_blocked():

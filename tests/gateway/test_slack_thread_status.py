@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, call
 import pytest
 
 # test_slack's autouse pins (legacy status API, temporary document cache) apply here too.
-from tests.gateway.test_slack import (  # noqa: F401 - pytest fixtures
+from tests.gateway.test_slack import (
     _pin_legacy_assistant_threads_api, _redirect_cache,
 )
 from tests.gateway.test_slack import adapter as slack_fixture

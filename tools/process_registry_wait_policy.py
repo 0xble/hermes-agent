@@ -72,20 +72,29 @@ def _count_unchanged(session) -> int:
 
 
 def _can_deliver_completion() -> bool:
+    """Automatic wait-promotion remains disabled under notifications-off."""
+    return _completion_delivery_supported()
+
+
+def _completion_delivery_supported(*, explicit_notify: bool = False) -> bool:
     """Whether a completion notice for this session can reach the agent that is waiting.
 
     Finite turns (non-interactive ``hermes chat -q`` / ``-z``, as ``delegate_task`` decides inline execution) end
     the run when the turn ends, so a promised notice would never arrive."""
     from agent.delegation_context import is_delegated_child_context
-    from gateway.session_context import async_delivery_supported, get_session_env
+    from gateway.session_context import NON_MESSAGING_SESSION_SURFACES, async_delivery_supported, get_session_env
     from gateway.session_finite import finite_turn_required
     finite = finite_turn_required()
     if finite is True or (finite is None and get_session_env("HERMES_SINGLE_QUERY_SESSION") == "1"):
         return False
     if not async_delivery_supported() or is_delegated_child_context():
         return False
-    # ``off`` drains the completion but never starts the agent turn (CLI, TUI and gateway alike). The
-    # gateway also honours the HERMES_BACKGROUND_NOTIFICATIONS override; either one saying off is off.
+    # Only the messaging gateway preserves an explicitly requested wake under
+    # ``off``. CLI/TUI/Desktop still drain silently; automatic wait promotion
+    # remains disabled under ``off`` on every surface.
+    if explicit_notify and get_session_env("HERMES_SESSION_PLATFORM", "") not in NON_MESSAGING_SESSION_SURFACES:
+        return True
+    # Honour the owning profile and its environment override for other callers.
     from hermes_cli.config import cfg_get
     try:
         from gateway.platforms._shared import platform_gate_env

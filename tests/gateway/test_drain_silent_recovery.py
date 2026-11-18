@@ -139,7 +139,7 @@ async def test_queued_interrupt_placeholder_does_not_send_before_followup():
     source = make_restart_source()
     ctx = SimpleNamespace(
         session_key="agent:main:telegram:dm:123456", stream_consumer_holder=[None],
-        mute_notification_reply=False, persist_user_display_kind=None, source=source,
+        mute_notification_reply=False, persist_user_display_kind=None, reply_expected=None, source=source,
         _status_thread_metadata=None, event_message_id=None, inbound_message_id="101",
     )
     result = {"final_response": "Operation interrupted: waiting for model response (1.3s elapsed).",
@@ -173,7 +173,7 @@ async def test_queued_model_echo_of_interrupt_diagnostic_never_sends_before_foll
     runner._refresh_agent_cache_message_count = AsyncMock()
     ctx = SimpleNamespace(
         session_key=key, session_id="sid", source=source, stream_consumer_holder=[None],
-        mute_notification_reply=False, persist_user_display_kind=None,
+        mute_notification_reply=False, persist_user_display_kind=None, reply_expected=None,
         _status_thread_metadata=None, event_message_id=None, inbound_message_id="101",
         run_generation=1, _interrupt_depth=0, history=[], context_prompt=None,
         result_holder=[None], _post_delivery_adapter=None,
@@ -315,7 +315,6 @@ async def test_adapter_drain_preserves_one_turn_without_reentering_handler(
         async def active_handler(first):
             entered.set()
             await active.wait()
-            return None
 
         adapter.set_message_handler(active_handler)
         await adapter.handle_message(MessageEvent(text="existing turn", source=source, user_id="u1"))
@@ -629,7 +628,7 @@ def test_ordinary_queued_head_precedes_later_drain_spool(tmp_path, monkeypatch):
 
 def test_failed_drain_authorization_keeps_spool_for_next_pass(tmp_path, monkeypatch, caplog):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    runner, adapter = make_restart_runner()
+    runner, _adapter = make_restart_runner()
     source = make_restart_source()
     key = runner._session_key_for_source(source)
     event = MessageEvent(text="keep", source=source, user_id="u1")
@@ -658,7 +657,7 @@ def test_failed_drain_authorization_keeps_spool_for_next_pass(tmp_path, monkeypa
 @pytest.mark.asyncio
 async def test_reconnect_during_drain_does_not_claim_arrival(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    runner, adapter = make_restart_runner()
+    runner, _adapter = make_restart_runner()
     source = make_restart_source()
     key = runner._session_key_for_source(source)
     event = MessageEvent(text="later", source=source, user_id="u1")

@@ -39,6 +39,31 @@ fallback_providers:
 
 Each entry requires both `provider` and `model`. Entries missing either field are ignored.
 
+### Spare fallback guards
+
+Delegated children use a shared, cross-process lease cap for spare upstreams so a fan-out does not
+move every child onto the same backup at once. The defaults are two active delegated children per
+spare family, with Meta/Muse and xAI/Grok treated as spares:
+
+```yaml
+fallback_budgets:
+  meta: 30000000   # input + cache-read + output tokens per local day
+  xai: 30000000
+
+delegation:
+  spare_upstreams: [meta, xai]
+  max_concurrent_on_spare: 2
+```
+
+`fallback_budgets` is tunable per upstream family; omit a family to use the 30M default, or set it
+to `0` to disable that family's budget. A fallback entry may explicitly set `upstream: meta` (or
+another family) when provider/model naming is ambiguous. The budget is charged only while the route
+is a fallback. A spare used as the primary route is not capped or budgeted, which preserves deliberate
+quota-burn cron jobs. Over-budget routes are skipped and the chain continues; active lease slots are
+released on child exit and expire after a crash. Lease heartbeats run with fallback usage accounting,
+and the one-hour TTL covers a child blocked in a long tool call. Guard-state lock or write failures
+fail open so a damaged local guard cannot create a new terminal provider error.
+
 When a rate-limit response names its reset time, the primary is benched until exactly then (a provider that says nothing gets the exponential 60 s → 4 h backoff). Optionally, skip the switch when the primary reopens soon:
 
 ```yaml
@@ -95,8 +120,6 @@ OpenAI-compatible base URL continues to use the compatible client instead.
 | OpenRouter | `openrouter` | `OPENROUTER_API_KEY` |
 | Nous Portal | `nous` | `hermes setup --portal` (fresh) or `hermes auth add nous` (OAuth) |
 | OpenAI Codex | `openai-codex` | `hermes model` → **ChatGPT or Codex Subscription** (ChatGPT OAuth) |
-| GitHub Copilot | `copilot` | `COPILOT_GITHUB_TOKEN`, `GH_TOKEN`, or `GITHUB_TOKEN` |
-| GitHub Copilot ACP | `copilot-acp` | External process (editor integration) |
 | Anthropic | `anthropic` | `ANTHROPIC_API_KEY` or Claude Code credentials |
 | z.ai / GLM | `zai` | `GLM_API_KEY` |
 | Kimi / Moonshot | `kimi-coding` | `KIMI_API_KEY` |
@@ -249,7 +272,6 @@ Hermes uses separate lightweight models for side tasks. Each task has its own pr
 |------|-------------|-----------|
 | Vision | Image analysis, browser screenshots | `auxiliary.vision` |
 | Compression | Context compression summaries | `auxiliary.compression` |
-| Skills Hub | Skill search and discovery | `auxiliary.skills_hub` |
 | MCP | MCP helper operations | `auxiliary.mcp` |
 | Approval | Smart command-approval classification | `auxiliary.approval` |
 | Title Generation | Session title summaries | `auxiliary.title_generation` |
@@ -269,7 +291,7 @@ A billing or quota failure quarantines only the failed custom endpoint for the a
 
 The task-specific chain is most precise and wins when present. The top-level `fallback_providers` chain is the same policy the main agent uses, so free-only or same-provider fallback rules apply to auxiliary tasks on `auto` as well.
 
-**Built-in text discovery chain (compression, web extract, title generation, etc.):**
+**Built-in text discovery chain (compression, title generation, etc.):**
 
 ```text
 OpenRouter → Nous Portal → Custom endpoint → Codex OAuth →
@@ -303,10 +325,6 @@ auxiliary:
     fallback_chain:              # optional, task-specific fallback policy
       - provider: openrouter
         model: inclusionai/ring-2.6-1t:free
-
-  skills_hub:
-    provider: "auto"
-    model: ""
 
   mcp:
     provider: "auto"
@@ -482,7 +500,6 @@ To keep fallback for a job, leave it unpinned and choose its model with `cron.mo
 | Auxiliary tasks (any) — explicit provider | `fallback_chain` (if set) → main agent model → warn + raise, on capacity errors; auth errors (401) walk `fallback_chain` only | `auxiliary.<task>.fallback_chain` |
 | Vision | Layered (see above) + internal OpenRouter retry | `auxiliary.vision` |
 | Context compression | Layered (see above); degrades to no-summary if all layers unavailable | `auxiliary.compression` |
-| Skills hub | Layered (see above) | `auxiliary.skills_hub` |
 | MCP helpers | Layered (see above) | `auxiliary.mcp` |
 | Approval classification | Layered (see above) | `auxiliary.approval` |
 | Title generation | Layered (see above) | `auxiliary.title_generation` |

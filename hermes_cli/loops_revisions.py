@@ -15,8 +15,8 @@ if TYPE_CHECKING:
 
 class LoopRevisionsMixin:
     @staticmethod
-    def _revision_result(*, ok: bool, revision: Optional[Dict[str, Any]], version: int,
-                         error_code: str = "", error: str = "") -> Dict[str, Any]:
+    def _revision_result(*, ok: bool, revision: Optional[dict[str, Any]], version: int,
+                         error_code: str = "", error: str = "") -> dict[str, Any]:
         return {
             "ok": ok,
             "error_code": error_code,
@@ -26,7 +26,7 @@ class LoopRevisionsMixin:
         }
 
     def _revision_quote(self, state: LoopState, user_quote: str,
-                        user_messages: Optional[List[str]], *, required: bool) -> Tuple[Optional[str], Optional[str], Optional[Dict[str, Any]]]:
+                        user_messages: Optional[list[str]], *, required: bool) -> tuple[Optional[str], Optional[str], Optional[dict[str, Any]]]:
         """Validate a verbatim user quote using the goal lifecycle's shared source rules."""
         from hermes_cli.goals import (
             _REVISION_QUOTE_MIN_CHARS,
@@ -78,8 +78,8 @@ class LoopRevisionsMixin:
         times: Optional[int] = None,
         until: Optional[str] = None,
         user_quote: str = "",
-        user_messages: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        user_messages: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
         """Apply a versioned, authority-checked edit to the existing loop.
 
         Commit only against the durable snapshot this revision read.
@@ -98,8 +98,8 @@ class LoopRevisionsMixin:
         times: Optional[int] = None,
         until: Optional[str] = None,
         user_quote: str = "",
-        user_messages: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        user_messages: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
         """Apply a versioned, authority-checked edit to the existing loop."""
         from hermes_cli.goals_autonomy import loop_autonomy_enabled
         from hermes_cli.loops import min_interval_seconds, self_paced_floor_seconds
@@ -238,11 +238,11 @@ class LoopRevisionsMixin:
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
-        route: Optional[Dict[str, str]] = None,
+        route: Optional[dict[str, str]] = None,
         reason: str,
         user_quote: str,
-        user_messages: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        user_messages: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
         """Replace the loop definition while preserving its revision history and route.
 
         Commit only against the durable snapshot this replacement read.
@@ -257,11 +257,11 @@ class LoopRevisionsMixin:
         interval_seconds: Optional[int] = None,
         times: int = 0,
         until: str = "",
-        route: Optional[Dict[str, str]] = None,
+        route: Optional[dict[str, str]] = None,
         reason: str,
         user_quote: str,
-        user_messages: Optional[List[str]] = None,
-    ) -> Dict[str, Any]:
+        user_messages: Optional[list[str]] = None,
+    ) -> dict[str, Any]:
         """Replace the loop definition while preserving its revision history and route."""
         from hermes_cli.goals_autonomy import loop_autonomy_enabled
         from hermes_cli.loops import max_ticks_default, min_interval_seconds, self_paced_floor_seconds

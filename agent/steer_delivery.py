@@ -9,23 +9,19 @@ logger = logging.getLogger(__name__)
 
 def _requeue_pending_steer(agent, steer_text: str) -> None:
     """Put drained steer text back so the caller's fallback delivers it as a next-turn user message."""
-    # Under the lock the slot is read directly: an initialized agent always has both attributes, so a
-    # missing ``_pending_steer`` there is a real bug and must fail loud. The lock-less branch only
-    # exists for test stubs built via ``object.__new__`` that skipped ``__init__``.
-    _lock = getattr(agent, "_pending_steer_lock", None)
-    if _lock is not None:
-        with _lock:
-            if agent._pending_steer:
-                agent._pending_steer = agent._pending_steer + "\n" + steer_text
-            else:
-                agent._pending_steer = steer_text
-    else:
-        existing = getattr(agent, "_pending_steer", None)
-        agent._pending_steer = (existing + "\n" + steer_text) if existing else steer_text
+    from agent.interrupt_control import requeue_drained_steer
+    requeue_drained_steer(agent, steer_text)
 
 
 def report_steer_delivered(agent, text: str) -> None:
     """Report a completed row insertion once; observer failures cannot undo delivery."""
+    from agent.interrupt_control import _ic_lock
+    with _ic_lock(agent, "_pending_steer_lock"):
+        drained, parts = vars(agent).pop("_steer_last_drain", (None, []))
+    if drained == text:
+        for part in parts:
+            if part.on_delivered is not None:
+                part.on_delivered()
     ordinal = getattr(agent, "_steer_delivery_ordinal", 0) + 1
     agent._steer_delivery_ordinal = ordinal
     delivery_id = str(uuid.uuid4())

@@ -95,7 +95,7 @@ def _spooled_runner(tmp_path, monkeypatch, *, pending=True, session_id="sid"):
 
 @pytest.mark.asyncio
 async def test_reconnect_restore_gate_is_set_before_interrupted_note_delivery(tmp_path, monkeypatch):
-    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch)
+    runner, adapter, source, key, _db = _spooled_runner(tmp_path, monkeypatch)
     runner._startup_restore_in_progress = False
     entry = runner.session_store._entries[key]
     entry.resume_turn_id = "resume-reconnect"
@@ -244,7 +244,7 @@ async def test_reconnect_restore_gate_is_released_when_note_delivery_is_cancelle
 
 @pytest.mark.asyncio
 async def test_reconnect_during_drain_retains_arrival_for_boot(tmp_path, monkeypatch):
-    runner, adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch, pending=False)
+    runner, _adapter, source, key, db = _spooled_runner(tmp_path, monkeypatch, pending=False)
     runner._startup_restore_in_progress = False
     runner._draining = True
     event = MessageEvent(text="after drain", source=source, user_id="u1")
@@ -302,7 +302,7 @@ async def test_shutdown_preserves_unclaimed_restore_queue_and_reuses_claimed_spo
     fresh = MessageEvent(text="fresh", source=source, user_id="u1")
     assert flush_pending_to_file({key: claimed}) == 1
     path, = (tmp_path / "pending_messages").glob("*.json")
-    setattr(claimed, "_hermes_recovery_spool", path)
+    claimed._hermes_recovery_spool = path
     runner._startup_restore_queue = [claimed, fresh]
     ctx = MagicMock()
     ctx.elapsed.return_value = 0
@@ -445,7 +445,7 @@ async def test_offline_followup_retried_on_primary_reconnect(tmp_path, monkeypat
 
 
 def test_direct_session_id_spool_skips_resolver_and_queues(tmp_path, monkeypatch):
-    runner, _, source, key, _ = _spooled_runner(tmp_path, monkeypatch)
+    runner, _, _source, key, _ = _spooled_runner(tmp_path, monkeypatch)
     path = tmp_path / "pending_messages" / "direct.json"
     path.parent.mkdir(exist_ok=True)
     path.write_text(json.dumps({"session_key": key, "ts": int(datetime.now().timestamp()),
@@ -739,7 +739,7 @@ async def test_startup_release_does_not_overtake_other_session_deferred_followup
 
     older_a = MessageEvent(text="human:A-older", source=source, user_id="u1")
     older_b = MessageEvent(text="human:B-older", source=other, user_id="u1")
-    setattr(older_b, "_hermes_recovered_followup", True)
+    older_b._hermes_recovered_followup = True
     live_b = MessageEvent(text="human:B-live", source=other, user_id="u1")
     runner._queue_startup_restore_event(older_a, session_key=key)
     runner._queue_startup_restore_event(older_b, session_key=other_key)
@@ -775,7 +775,7 @@ async def test_failed_deferred_followup_keeps_older_input_ahead_of_live(tmp_path
     resume = asyncio.get_running_loop().create_future()
     runner._replay_resume_tasks = {key: resume}
     older = MessageEvent(text="older-followup", source=source, user_id="u1")
-    setattr(older, "_hermes_recovered_followup", True)
+    older._hermes_recovered_followup = True
     runner._queue_startup_restore_event(older, session_key=key)
     runner._queue_startup_restore_event(
         MessageEvent(text="newer-live", source=source, user_id="u1"), session_key=key,
@@ -843,7 +843,7 @@ async def test_shutdown_spools_restore_items_dropped_behind_replay_cap(tmp_path,
         MessageEvent(text="newer", source=source, user_id="u1"),
         MessageEvent(text="other", source=replace(source, chat_id="other"), user_id="u1"),
     ]
-    setattr(events[1], "_hermes_recovered_followup", True)
+    events[1]._hermes_recovered_followup = True
     for event in reversed(events) if front else events:
         runner._queue_startup_restore_event(event, front=front)
 
@@ -1086,7 +1086,7 @@ async def test_inbound_without_restore_gate_does_not_derive_restore_key(tmp_path
 
 @pytest.mark.asyncio
 async def test_reconnect_keeps_other_platforms_followup_until_its_resume(tmp_path, monkeypatch):
-    runner, adapter, source, key, _ = _spooled_runner(tmp_path, monkeypatch, pending=False)
+    runner, adapter, source, _key, _ = _spooled_runner(tmp_path, monkeypatch, pending=False)
     runner._startup_restore_in_progress = False
     other = replace(source, platform=Platform.DISCORD, chat_id="discord-room")
     other_key = runner._session_key_for_source(other)

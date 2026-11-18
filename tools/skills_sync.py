@@ -267,7 +267,7 @@ class _SyncState:
     manifest: dict[str, str]
     quiet: bool
     skipped: int = 0
-    failed: List[str] = field(default_factory=list)
+    failed: list[str] = field(default_factory=list)
     copied: list[str] = field(default_factory=list)
     updated: list[str] = field(default_factory=list)
     user_modified: list[str] = field(default_factory=list)

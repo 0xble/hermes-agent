@@ -16,7 +16,6 @@ import hermes_cli.left_core_migration as lcm
 @pytest.fixture(autouse=True)
 def _fresh(monkeypatch):
     monkeypatch.setattr(lcm, "_attempted", set())
-    monkeypatch.setattr(lcm, "_undelivered", {})
     monkeypatch.delenv("HASS_TOKEN", raising=False)
     # A catalog that lists every left-core plugin; never the network.
     import hermes_cli.memory_provider_migration as mpm
@@ -251,6 +250,33 @@ def test_gateway_start_outcome_waits_for_the_first_agent(tmp_path, monkeypatch):
     assert lcm.recover_at_startup(say=said.append) == [] and len(said) == 1
 
 
+@pytest.mark.parametrize("gateway_start", [False, True])
+def test_an_agent_start_install_of_a_platform_keeps_the_restart_hint(tmp_path, monkeypatch, gateway_start):
+    """An agent start keeps its outcome for the next turn someone sees, with the hint to restart the gateway
+    serving the home; the gateway's own start loads the platform right after, so it needs none."""
+    home = _home(tmp_path, env="HASS_TOKEN=abc\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import pm.install
+    monkeypatch.setattr(pm.install, "lazy_installs_allowed", lambda: True)
+    monkeypatch.setattr(lcm, "_install_into", lambda h, consent=None: lambda name: {"ok": True})
+    monkeypatch.setattr(lcm, "_gateway_serves", lambda h: True)
+    assert lcm.recover_at_startup(gateway_start=gateway_start) == ["homeassistant"]
+    kept = lcm._claim_notices(home)
+    assert kept[0].startswith("✓ Home Assistant moved out of core")
+    assert any("hermes gateway restart" in message for message in kept) is not gateway_start
+
+
+
+def test_a_malformed_route_url_does_not_abort_the_home_migration(tmp_path, monkeypatch):
+    """`urlparse` raises on an unclosed IPv6 bracket: that one slot is at no host, and the home's other
+    features (Home Assistant here) still migrate."""
+    home = _home(tmp_path, env="HASS_TOKEN=abc\n", config="model:\n  provider: custom\n  base_url: http://[fe80::1/v1\n")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    import pm.install
+    monkeypatch.setattr(pm.install, "lazy_installs_allowed", lambda: True)
+    monkeypatch.setattr(lcm, "_install_into", lambda h, consent=None: lambda name: {"ok": True})
+    assert lcm.recover_at_startup() == ["homeassistant"]
+
 
 def test_the_migration_installs_once_so_a_removal_sticks(tmp_path, monkeypatch):
     """At most one automatic install per home: after `hermes plugins remove`, neither `hermes update`
@@ -433,7 +459,7 @@ def test_old_langfuse_plugin_key_keeps_naming_the_catalog_plugin(tmp_path, monke
     """`observability/langfuse` (every pre-move doc, an administrator's pinned list) names the install
     while the plugin is absent, and selects/resolves the installed plugin once it is there."""
     from hermes_cli.plugins_cmd import _find_plugin_entry, _unknown_plugin_message
-    from hermes_cli.plugins_discovery import gate_manifest
+    from hermes_cli.plugins_discovery import IN_BOTH_LISTS, gate_manifest
     from hermes_cli.plugins_manifest import PluginManifest
     home = _home(tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -450,4 +476,41 @@ def test_old_langfuse_plugin_key_keeps_naming_the_catalog_plugin(tmp_path, monke
     assert _find_plugin_entry("observability/langfuse")[5] == "langfuse"
     manifest = PluginManifest(name="langfuse", source="user", path=str(plugin_dir), key="langfuse")
     assert gate_manifest(manifest, set(), {"observability/langfuse"}).action == "load"
-    assert gate_manifest(manifest, {"observability/langfuse"}, {"langfuse"}).error == "disabled via config"
+    # The old key in plugins.disabled still names the plugin, so with the new key enabled both lists do.
+    assert gate_manifest(manifest, {"observability/langfuse"}, {"langfuse"}).error == IN_BOTH_LISTS
+    assert gate_manifest(manifest, {"observability/langfuse"}, None).error == "disabled via config"
+
+
+@pytest.mark.parametrize(("delegation", "expected"), [
+    ("backend: model_map", True),
+    ("backend: profile_routes", True),
+    ("model_preset: delegation-sol", True),
+    ("by_parent: {'@uncensored': inherit}", True),
+    ("subagents: {research: {model: old-role}}", True),
+    ("backend: default", False),
+    ("max_concurrent_children: 4", False),
+])
+def test_advanced_delegation_install_detection_covers_both_migration_orders(tmp_path, delegation, expected):
+    home = _home(tmp_path, config="delegation:\n  " + delegation + "\n")
+    assert lcm.advanced_delegation_in_use(home) is expected
+
+
+def test_migrated_delegation_gets_its_plugin_once_and_honours_later_removal(tmp_path):
+    import shutil
+
+    home = _home(tmp_path, config="delegation:\n  backend: model_map\n")
+    calls, notices = [], []
+    plugin = home / "plugins" / "advanced-delegation"
+
+    def install(name):
+        calls.append(name)
+        (home / "plugins" / name).mkdir(parents=True)
+        return {"ok": True}
+
+    assert lcm.migrate_home(home, install=install, say=notices.append) == ["advanced-delegation"]
+    assert plugin.is_dir() and calls == ["advanced-delegation"]
+    assert any("Advanced Delegation" in notice for notice in notices)
+    assert lcm.migrate_home(home, install=install, say=notices.append) == []
+    shutil.rmtree(plugin)
+    assert lcm.migrate_home(home, install=install, say=notices.append) == []
+    assert calls == ["advanced-delegation"] and not plugin.exists()

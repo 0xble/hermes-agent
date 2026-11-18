@@ -14,6 +14,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli import immutable_releases as releases
+from tests.hermes_cli.immutable_test_helpers import _fake_release_generation
 
 
 def _await_ready(process: subprocess.Popen, expected: str) -> None:
@@ -73,7 +74,7 @@ def test_release_plist_executes_selected_release_with_managed_source_launcher(tm
     runtime = store_root(source)
     tool = runtime / "python-test" / "bin" / "python3"
     tool.parent.mkdir(parents=True)
-    tool.symlink_to(sys.executable)
+    tool.symlink_to(getattr(sys, "_base_executable", sys.executable))
     (runtime / "facts.json").write_text(json.dumps({"packages": {"python": {"entry": "python-test"}}}), encoding="utf-8")
     assert resolve_store_python(source) == tool
     launcher = source / ".hermes" / "bin" / "hermes"
@@ -141,6 +142,7 @@ def _copy_pm_builder(candidate: Path) -> None:
     package.mkdir(exist_ok=True)
     (package / "__init__.py").touch()
     shutil.copyfile(root / "hermes_cli" / "runtime_state.py", package / "runtime_state.py")
+    shutil.copyfile(root / "hermes_cli" / "macos_signing.py", package / "macos_signing.py")
 
 
 def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, monkeypatch):
@@ -191,7 +193,7 @@ def test_git_staging_with_home_nested_in_checkout_reads_real_identity(tmp_path, 
     argv = gateway_run._resolve_update_hermes_bin(home)
     assert argv is not None and argv[0] == sys.executable
     launched = subprocess.run([*argv, "probe"], cwd=release,
-                              capture_output=True, text=True)
+                              capture_output=True, text=True, check=False)
     assert launched.returncode == 0, launched.stderr
     assert launched.stdout.strip() == str(release / "hermes_cli" / "main.py")
 
@@ -415,7 +417,7 @@ def test_active_locked_extra_is_passed_to_frozen_pm_build(tmp_path, monkeypatch)
         encoding="utf-8")
     (project / "uv.lock").write_text(
         '[[package]]\nname = "python-telegram-bot"\nversion = "22.8"\n', encoding="utf-8")
-    monkeypatch.setattr(releases, "_active_distributions", lambda _: {"python-telegram-bot": "22.8"})
+    monkeypatch.setattr(releases, "_active_distributions", lambda _, **kwargs: {"python-telegram-bot": "22.8"})
     extras = releases._active_locked_extras(Path(sys.executable), project)
     assert extras == ["messaging"]
     calls = []
@@ -441,7 +443,7 @@ def test_orphan_transitive_package_does_not_enable_another_feature(tmp_path, mon
         'dependencies=[{name="old-transitive"}]\n'
         '[[package]]\nname="old-transitive"\nversion="1.0"\n', encoding="utf-8")
     monkeypatch.setattr(releases, "_active_distributions",
-                        lambda _: {"sdk-client": "1.0", "old-transitive": "1.0"})
+                        lambda _, **kwargs: {"sdk-client": "1.0", "old-transitive": "1.0"})
     assert releases._active_locked_extras(Path(sys.executable), project) == ["sdk"]
 
 
@@ -498,7 +500,7 @@ def test_normal_update_without_layout_opt_in_does_not_touch_release_or_plist(tmp
     plist = tmp_path / "service.plist"
     plist.write_bytes(b"original")
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {})
+    monkeypatch.setattr(update_cmd, "_updates_config", dict)
     monkeypatch.setattr(gateway, "refresh_launchd_plist_if_needed", lambda: pytest.fail("launchd touched"))
     monkeypatch.setattr(releases, "stage_release", lambda *a, **kw: pytest.fail("release staged"))
     assert update_cmd._activate_immutable_release()
@@ -537,7 +539,7 @@ def test_outstanding_release_is_promoted_before_catchup_restart(tmp_path, monkey
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
-    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", list)
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
     attempted = []
     def stage(*args, **kwargs):
@@ -574,7 +576,7 @@ def test_noop_update_promotes_before_pending_restart(tmp_path, monkeypatch):
     monkeypatch.setattr(update_cmd._m(), "PROJECT_ROOT", tmp_path)
     monkeypatch.setattr(releases, "release_sha", lambda _: "B")
     monkeypatch.setattr(releases, "stage_release", lambda *args, **kw: (b, "existing"))
-    monkeypatch.setattr(update_cmd, "_update_node_dependencies", lambda: [])
+    monkeypatch.setattr(update_cmd, "_update_node_dependencies", list)
     monkeypatch.setattr(update_cmd._m(), "_build_web_ui", lambda _: True)
     monkeypatch.setattr(update_cmd, "_resume_windows_gateways_and_merge_outcome", lambda *a: None)
     def restart(*, defer, checkout_complete):
@@ -766,7 +768,7 @@ def test_nonready_current_refuses_legacy_update_before_build(tmp_path, monkeypat
     releases.promote(home, broken)
     (broken / ".release-ready").unlink()
     monkeypatch.setattr(update_cmd, "get_hermes_home", lambda: home)
-    monkeypatch.setattr(update_cmd, "_updates_config", lambda: {})
+    monkeypatch.setattr(update_cmd, "_updates_config", dict)
     with pytest.raises(RuntimeError, match="current release is not ready"):
         update_cmd._immutable_release_enabled()
 
@@ -1038,8 +1040,35 @@ def test_prepare_venv_identical_lock_still_builds_in_place(tmp_path, monkeypatch
     assert called == [new]
 
 
+@pytest.fixture
+def release_child_stderr(monkeypatch):
+    """Keep captured child diagnostics on the original, still-fatal exception."""
+    run = subprocess.run
+
+    def run_with_stderr(*args, **kwargs):
+        try:
+            return run(*args, **kwargs)
+        except subprocess.CalledProcessError as exc:
+            exc.add_note(f"child stderr:\n{exc.stderr}")
+            raise
+
+    monkeypatch.setattr(releases.subprocess, "run", run_with_stderr)
+
+
+def test_release_child_failure_includes_stderr(release_child_stderr):
+    with pytest.raises(subprocess.CalledProcessError) as caught:
+        subprocess.run(
+            [sys.executable, "-c", "import sys; sys.stderr.write('child diagnostic'); sys.exit(7)"],
+            check=True, capture_output=True, text=True,
+        )
+    assert caught.value.returncode == 7
+    assert caught.value.stderr == "child diagnostic"
+    assert caught.value.__notes__ == ["child stderr:\nchild diagnostic"]
+
+
 @pytest.mark.parametrize("carrier", ["previous", "source"])
-def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path, monkeypatch, carrier):
+def test_prepare_venv_carries_extras_from_previous_release_environment(
+        tmp_path, monkeypatch, carrier, release_child_stderr):
     """An extra installed into the active release survives the next release build.
 
     The migration-bound source interpreter never sees `hermes pm install --extra` or a lazy
@@ -1047,8 +1076,6 @@ def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path,
     interpreter alone dropped Slack on every update. At first migration nothing is active yet,
     so the source checkout's own committed environment carries instead.
     """
-    from pm.environments import install_state_dir, runtime_facts_path
-
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     pyproject = ("[project]\nname='hermes-agent'\nversion='0.1.0'\n[project.optional-dependencies]\n"
                  "slack=['slack-bolt==1.30.0']\ntelegram=['python-telegram-bot==22.8']\n")
@@ -1058,15 +1085,9 @@ def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path,
         release.mkdir(parents=True)
         (release / "pyproject.toml").write_text(pyproject, encoding="utf-8")
     carried = previous if carrier == "previous" else source
-    environment = install_state_dir(carried) / "environments" / "generation" / "venv"
-    (environment / "bin").mkdir(parents=True)
-    (environment / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (environment / "bin" / "python").symlink_to(sys.executable)
-    facts = runtime_facts_path(carried)
-    facts.write_text(json.dumps({"schema": 1, "packages": {"venv": {
-        "environment": str(environment), "extras": ["slack", "telegram"]}}}), encoding="utf-8")
+    environment = _fake_release_generation(carried, ["slack", "telegram"])
 
-    def distributions(python):
+    def distributions(python, **kwargs):
         installed = {"python-telegram-bot": "22.8"}
         if Path(python).parent.parent == environment.resolve():
             installed["slack-bolt"] = "1.30.0"
@@ -1084,17 +1105,10 @@ def test_prepare_venv_carries_extras_from_previous_release_environment(tmp_path,
 
 def test_smoke_runs_the_interpreter_the_candidate_boots(tmp_path, monkeypatch):
     """After a carry commits a PM generation, staging smokes that generation, not `.venv`."""
-    from pm.environments import install_state_dir, runtime_facts_path
-
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     release = tmp_path / "releases" / "B"
     _fake_release(release, "B")
-    generation = install_state_dir(release) / "environments" / "generation" / "venv"
-    (generation / "bin").mkdir(parents=True)
-    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (generation / "bin" / "python").symlink_to(sys.executable)
-    runtime_facts_path(release).write_text(json.dumps({"schema": 1, "packages": {"venv": {
-        "environment": str(generation), "extras": ["slack"]}}}), encoding="utf-8")
+    generation = _fake_release_generation(release, ["slack"])
     ran = []
     monkeypatch.setattr(releases.subprocess, "run",
                         lambda argv, **kwargs: ran.append(argv[0]) or subprocess.CompletedProcess(argv, 0, "", ""))
@@ -1102,7 +1116,8 @@ def test_smoke_runs_the_interpreter_the_candidate_boots(tmp_path, monkeypatch):
     assert ran == [str(generation.resolve() / "bin" / "python")]
 
 
-def test_ready_candidate_from_older_builder_commits_active_extras_before_activation(tmp_path, monkeypatch):
+def test_ready_candidate_from_older_builder_commits_active_extras_before_activation(
+        tmp_path, monkeypatch, release_child_stderr):
     """A release staged by the frozen source checkout gets the active release's extras.
 
     `hermes update` re-enters the source checkout, whose older `prepare_venv` built B without
@@ -1111,8 +1126,6 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
     PM's record supplies `documents`, which inference from installed packages cannot see.
     A recorded extra that is platform-gated off here is never re-synced.
     """
-    from pm.environments import install_state_dir, runtime_facts_path
-
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
     home = tmp_path / "profile"
     a, b = home / "releases" / "A", home / "releases" / "B"
@@ -1124,17 +1137,11 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
             "documents=['docx-pkg==1.0']\ngated=['gated-pkg==1.0; sys_platform == \"none\"']\n",
             encoding="utf-8")
         (release / ".venv" / "bin" / "python").unlink()
-        (release / ".venv" / "bin" / "python").symlink_to(sys.executable)
+        (release / ".venv" / "bin" / "python").symlink_to(getattr(sys, "_base_executable", sys.executable))
     releases.promote(home, a)
-    generation = install_state_dir(a) / "environments" / "generation" / "venv"
-    (generation / "bin").mkdir(parents=True)
-    (generation / "pyvenv.cfg").write_text("", encoding="utf-8")
-    (generation / "bin" / "python").symlink_to(sys.executable)
-    runtime_facts_path(a).write_text(json.dumps({"schema": 1, "packages": {"venv": {
-        "environment": str(generation), "extras": ["documents", "gated", "slack", "telegram"]}}}),
-        encoding="utf-8")
+    generation = _fake_release_generation(a, ["documents", "gated", "slack", "telegram"])
 
-    def distributions(python):
+    def distributions(python, **kwargs):
         installed = {"python-telegram-bot": "22.8"}
         if Path(python).parent.parent == generation.resolve():
             installed["slack-bolt"] = "1.30.0"
@@ -1152,9 +1159,9 @@ def test_ready_candidate_from_older_builder_commits_active_extras_before_activat
     # Post-swap: B's own code commits the missing extra before activate_release runs.
     monkeypatch.setattr("pm.paths.repo_root", lambda: b.resolve())
     assert releases.stage_release(tmp_path / "source", home, sha="B") == (b, "existing")
-    assert synced == [(["documents", "slack"],
+    assert synced == [(["documents", "slack", "telegram"],
                        {"explicit": True, "project_root": b, "evict_incompatible_plugins": True})]
-    assert steps == [("immutable_extras_carry", True, f"carried documents, slack from {a.resolve()}")]
+    assert steps == [("immutable_extras_carry", True, f"carried documents, slack, telegram from {a.resolve()}")]
 
 
 @pytest.fixture
@@ -1358,6 +1365,8 @@ def test_real_staging_rejects_incompatible_plugin_and_keeps_pointer_and_receipt(
 
 def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "broken-model"
     plugin.mkdir(parents=True)
@@ -1372,6 +1381,8 @@ def test_candidate_import_smoke_rejects_model_provider_import_failure(tmp_path, 
 
 def test_candidate_smoke_cannot_pass_via_inherited_stale_pythonpath(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "broken"
     plugin.mkdir(parents=True)
@@ -1659,6 +1670,8 @@ def test_pre_s2_revision_fails_with_clear_message(tmp_path):
 
 def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profile(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "candidate-test"
     plugin.mkdir(parents=True)
@@ -1678,6 +1691,8 @@ def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profil
 
 def test_candidate_import_smoke_accepts_enabled_portable_plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "portable-test"
     plugin.mkdir(parents=True)
@@ -1693,6 +1708,8 @@ def test_candidate_import_smoke_accepts_enabled_portable_plugin(tmp_path, monkey
 
 def test_candidate_import_smoke_accepts_enabled_manifest_only_language_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "language-pack"
     (plugin / "locales").mkdir(parents=True)
@@ -1708,6 +1725,8 @@ def test_candidate_import_smoke_accepts_enabled_manifest_only_language_pack(tmp_
 
 def test_candidate_import_smoke_rejects_enabled_portable_plugin_load_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "portable-test"
     plugin.mkdir(parents=True)
@@ -1725,6 +1744,8 @@ def test_candidate_import_smoke_rejects_enabled_portable_plugin_load_failure(tmp
 
 def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "portable-test"
     plugin.mkdir(parents=True)
@@ -1737,12 +1758,14 @@ def test_candidate_import_smoke_rejects_disabled_enabled_portable_plugin(tmp_pat
     }), encoding="utf-8")
     source = Path(__file__).resolve().parents[2]
 
-    with pytest.raises(RuntimeError, match="disabled via config"):
+    with pytest.raises(RuntimeError, match="listed in both plugins.enabled and plugins.disabled"):
         releases.smoke_plugins(source, home)
 
 
 def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(releases, "_release_python", lambda _release: Path(sys.executable))
+    # smoke_plugins resolves the candidate through PM (#784), not _release_python.
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
     home = tmp_path / "profile"
     plugin = home / "plugins" / "language-pack"
     (plugin / "locales").mkdir(parents=True)
@@ -1755,5 +1778,5 @@ def test_candidate_import_smoke_rejects_disabled_enabled_manifest_only_language_
     (plugin / "locales" / "pl.yaml").write_text("name: Polski\n", encoding="utf-8")
     source = Path(__file__).resolve().parents[2]
 
-    with pytest.raises(RuntimeError, match="disabled via config"):
+    with pytest.raises(RuntimeError, match="listed in both plugins.enabled and plugins.disabled"):
         releases.smoke_plugins(source, home)

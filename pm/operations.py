@@ -15,6 +15,7 @@ import shutil
 import sys
 import uuid
 
+from pm.worker_budget import UV_STEP_TIMEOUT
 from pm.package import InstallError
 
 
@@ -31,7 +32,7 @@ def build_environment(
     extras: Sequence[str] = (), groups: Sequence[str] = (),
     all_extras: bool = False, no_install_project: bool = False,
     frozen: bool = True, sealed: bool = False, offline: bool = False,
-    explicit: bool = False, timeout: int = 1800,
+    explicit: bool = False, timeout: int = UV_STEP_TIMEOUT,
 ) -> Path:
     """Build and validate a fresh destination; never overwrite an existing tree.
 
@@ -184,7 +185,7 @@ def _requirements(requirements: Sequence[str]) -> list[str]:
 
 def ensure_environment(
     name: str, requirements: Sequence[str], *, root: Path | None = None,
-    explicit: bool = False, timeout: int = 1800,
+    explicit: bool = False, timeout: int = UV_STEP_TIMEOUT,
     executable: str | None = None,
 ) -> Path:
     """Make an isolated dependency set current, then atomically select it.
@@ -217,7 +218,7 @@ def ensure_environment(
 
 def ensure_project_environment(
     name: str, project: Path, *, extras: Sequence[str] = (), groups: Sequence[str] = (),
-    root: Path | None = None, explicit: bool = False, timeout: int = 1800,
+    root: Path | None = None, explicit: bool = False, timeout: int = UV_STEP_TIMEOUT,
 ) -> Path:
     """Make an isolated environment of a project's LOCKED dependencies current.
 
@@ -320,7 +321,7 @@ def _ensure_generation(
 
 def ensure_python_tool(
     name: str, requirements: Sequence[str], executable: str, *,
-    root: Path | None = None, explicit: bool = False, timeout: int = 1800,
+    root: Path | None = None, explicit: bool = False, timeout: int = UV_STEP_TIMEOUT,
 ) -> Path:
     python = ensure_environment(name, requirements, root=root, explicit=explicit,
                                 timeout=timeout, executable=executable)

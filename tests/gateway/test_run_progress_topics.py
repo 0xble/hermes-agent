@@ -514,7 +514,6 @@ def _make_runner(adapter):
     runner._fallback_model = None
     runner._session_db = None
     runner._running_agents = {}
-    runner._session_run_generation = {}
     runner.session_store = SimpleNamespace(
         _entries={}, _save=lambda: None, get_model_role=lambda _key: None,
         get_model_override=lambda _key: None, get_model_override_scope=lambda _key: "session",
@@ -1954,7 +1953,7 @@ async def test_run_agent_drops_tool_progress_after_generation_invalidation(monke
         thread_id=None,
     )
     session_key = "agent:main:discord:dm:dm-1"
-    runner._session_run_generation[session_key] = 1
+    runner._session_state(session_key).persistent.run_generation = 1
 
     original_send = adapter.send
     invalidated = {"done": False}
@@ -2015,7 +2014,7 @@ async def test_run_agent_drops_interim_commentary_after_generation_invalidation(
         thread_id=None,
     )
     session_key = "agent:main:discord:dm:dm-2"
-    runner._session_run_generation[session_key] = 1
+    runner._session_state(session_key).persistent.run_generation = 1
 
     original_send = adapter.send
     invalidated = {"done": False}

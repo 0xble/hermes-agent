@@ -7,7 +7,7 @@ import pytest
 
 # User-message persistence reaches the runtime bootstrap. Load it before the
 # per-test real-home guard, as the application entry point does.
-import hermes_bootstrap  # noqa: F401
+import hermes_bootstrap
 
 from hermes_cli import goals, session_controls
 from hermes_cli.goal_command import dispatch_goal_command
@@ -38,6 +38,21 @@ def proof(db):
     db.append_message("autonomy", "tool", "suite: 12 passed; release readback matches abc1234",
                       tool_name="terminal", tool_call_id="proof")
     return {"tests pass": "12 passed", "release readback matches": "release readback matches abc1234"}
+
+
+def test_replace_reports_each_missing_requirement(home):
+    from hermes_cli.goals import GoalContract, GoalManager
+
+    mgr = GoalManager("autonomy")
+    limits = "Never restart the gateway\nNever weaken the canary"
+    mgr.set("Ship the repair", contract=GoalContract(
+        verification="The repair is live", constraints=limits))
+    result = mgr.replace(reason="trim the contract", goal="Ship the repair",
+                         contract={"constraints": "Never restart the gateway"})
+    assert result["ok"] is False
+    assert result["error_code"] == "constraint_quote_required"
+    assert result["missing_requirements"] == ["Never weaken the canary"]
+    assert "Never weaken the canary" in result["error"]
 
 
 def test_completion_preserves_unproven_goal_and_records_each_gap(home):

@@ -150,7 +150,7 @@ def test_committed_goal_and_loop_plugin_receipts_reach_context(monkeypatch, name
     from agent import inline_tool_executors as ite
     from types import SimpleNamespace
     turn, _, adapter = _turn(monkeypatch)
-    monkeypatch.setattr("hermes_cli.config.load_config_readonly", lambda: {})
+    monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
     monkeypatch.setattr("model_tools._emit_post_tool_call_hook", lambda **kw: None)
     agent = SimpleNamespace(notice_callback=turn._notice_callback_sync, _emit_notice=turn._notice_callback_sync)
     ite.emit_terminal_post_tool_call(agent, function_name=name, function_args={},
@@ -259,7 +259,7 @@ async def test_personality_success_is_context_but_failed_save_is_full(monkeypatc
     from gateway.platforms.event import MessageEvent
     from gateway.session import SessionSource
     from gateway.config import Platform
-    monkeypatch.setattr("gateway.run._load_gateway_config", lambda: {})
+    monkeypatch.setattr("gateway.run._load_gateway_config", dict)
     monkeypatch.setattr("hermes_cli.personality.persist_personality", lambda name: True)
     runner = object.__new__(GatewayRunner)
     event = MessageEvent(text="/personality none", source=SessionSource(platform=Platform.SLACK, chat_id="C1"))

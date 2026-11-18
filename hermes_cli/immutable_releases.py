@@ -10,6 +10,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import logging
 import os
 import tempfile
 import shutil
@@ -26,6 +27,8 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timezone
 from pathlib import Path
 from typing import Callable, Iterable, Sequence, Any
+
+logger = logging.getLogger(__name__)
 
 # Freeze the package's physical code tree before `current` can change. This is
 # the installation owning the process, not any individual cron profile home.
@@ -44,7 +47,7 @@ class ReleasePaths:
     previous: Path
 
     @classmethod
-    def for_home(cls, home: str | Path) -> "ReleasePaths":
+    def for_home(cls, home: str | Path) -> ReleasePaths:
         home = Path(home).expanduser().resolve()
         return cls(home, home / "releases", home / "current", home / "previous")
 
@@ -287,7 +290,7 @@ def _leaf_requirements(project: Path) -> dict[str, set[str]]:
     return declared
 
 
-def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
+def _active_locked_extras(source_python: Path, project: Path, *, deadline: float | None = None) -> list[str]:
     """Infer selected leaf extras from installed direct requirements.
 
     Wheel metadata lists *available*, not selected, extras. A uniquely named
@@ -297,7 +300,7 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
     declared = _leaf_requirements(project)
     if not declared:
         return []
-    installed = set(_active_distributions(source_python))
+    installed = set(_active_distributions(source_python, deadline=deadline))
     unique = {name for extra, names in declared.items() for name in names
               if sum(name in other for other in declared.values()) == 1}
     selected = {extra for extra, names in declared.items()
@@ -311,8 +314,10 @@ def _active_locked_extras(source_python: Path, project: Path) -> list[str]:
                        "for text in [d.read_text('direct_url.json') or ''] "
                        "for group in re.findall(r'hermes-agent\\[([^]]+)\\]', text) "
                        "for x in group.split(',')))))")
+    from hermes_cli.immutable_release_preflight import probe_timeout
     metadata_result = subprocess.run([str(source_python), "-c", metadata_script], check=True,
-                                     capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env())
+                                     capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env(),
+                                     timeout=probe_timeout(deadline))
     selected.update(extra for extra in json.loads(metadata_result.stdout) if extra in declared)
 
     # Old transitive packages are not evidence of an enabled feature. In particular,
@@ -339,12 +344,14 @@ def _build_venv(release: Path, *, uv: str = "uv", extras: Sequence[str] = (),
         raise RuntimeError(f"candidate dependency build failed: {detail}")
 
 
-def _active_distributions(python: Path) -> dict[str, str]:
+def _active_distributions(python: Path, *, deadline: float | None = None) -> dict[str, str]:
+    from hermes_cli.immutable_release_preflight import probe_timeout
     script = ("import importlib.metadata as m,json; "
               "import re; print(json.dumps({re.sub(r'[-_.]+','-',d.metadata['Name']).lower(): d.version "
               "for d in m.distributions() if d.metadata.get('Name')}))")
     result = subprocess.run([str(python), "-c", script], check=True,
-                            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env())
+                            capture_output=True, text=True, encoding="utf-8", errors="replace", env=_release_subprocess_env(),
+                            timeout=probe_timeout(deadline))
     return json.loads(result.stdout)
 
 
@@ -426,7 +433,7 @@ def prepare_venv(release: Path, previous: Path | None = None, *, uv: str = "uv",
     return release / ".venv", "built"
 
 
-def _committed_extras(release: Path | None, project: Path) -> set[str]:
+def _committed_extras(release: Path | None, project: Path, *, deadline: float | None = None) -> set[str]:
     """Extras `project` declares that `release`'s committed PM environment carries.
 
     The source interpreter is frozen at first migration. Extras added since
@@ -437,7 +444,7 @@ def _committed_extras(release: Path | None, project: Path) -> set[str]:
         return set()
     from pm.environments import project_python
     python = project_python(release)
-    inferred = set(_active_locked_extras(python, project)) if python.is_file() else set()
+    inferred = set(_active_locked_extras(python, project, deadline=deadline)) if python.is_file() else set()
     return (_recorded_extras(release) & set(_optional_dependencies(project))) | inferred
 
 
@@ -466,12 +473,11 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
     if previous is None or previous == candidate or repo_root() != candidate.resolve():
         return []
     from pm.environments import project_python
-    # Missing means the candidate's boot environment lacks an applicable requirement, so a
-    # recorded extra that is platform-gated off, or already installed, never re-syncs.
+    # A satisfied candidate needs no sync, and platform-gated extras are excluded.
     leaves = _leaf_requirements(candidate)
+    applicable = sorted(_committed_extras(previous, candidate) & leaves.keys())
     installed = set(_active_distributions(project_python(candidate)))
-    missing = sorted(extra for extra in _committed_extras(previous, candidate)
-                     if extra in leaves and not leaves[extra] <= installed)
+    missing = [extra for extra in applicable if not leaves[extra] <= installed]
     if missing:
         import pm
         from hermes_cli.update_receipt import record_fact, record_step
@@ -479,10 +485,12 @@ def carry_active_extras(candidate: Path, previous: Path | None) -> list[str]:
         # recover earlier publications outside the candidate. Mark the boundary before entering
         # PM, even if it fails or its worker never returns mutation evidence.
         record_fact("staging_runtime_mutation_started", True)
-        # An update never fails because of a plugin: evict one that keeps the candidate's
-        # environment from building, as every other update-path sync does.
-        pm.sync_venv(missing, explicit=True, project_root=candidate, evict_incompatible_plugins=True)
-        record_step("immutable_extras_carry", True, f"carried {', '.join(missing)} from {previous}")
+        # Sync replaces the selected environment. Carry the complete applicable set:
+        # an extra present only in the payload .venv may not be inferred by PM's
+        # first-generation selection, even though it was not missing before sync.
+        # Evict incompatible plugins as every other update-path sync does.
+        pm.sync_venv(applicable, explicit=True, project_root=candidate, evict_incompatible_plugins=True)
+        record_step("immutable_extras_carry", True, f"carried {', '.join(applicable)} from {previous}")
     return missing
 
 
@@ -512,7 +520,7 @@ def smoke_plugins(release: Path, home: Path, *, plugin_dir: Path | None = None) 
         result = subprocess.run(
             [str(python), "-m", "hermes_cli.immutable_releases", "--smoke-imports"],
             cwd=release, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=90,
-        )
+         check=False)
         if result.returncode:
             detail = (result.stderr or result.stdout).strip()
             raise RuntimeError(f"candidate plugin smoke failed: {detail}")
@@ -627,20 +635,18 @@ def _build_candidate_web(staging: Path) -> None:
     web = staging / "web"
     if not (web / "package.json").is_file():
         return
+    from hermes_cli.source_build import build_source_web, prepare_source_dependencies
     from pm import prepare_tools
     from pm.build_operations import verified_tools
     from pm.store import current_target
     target = current_target()
-    store = prepare_tools(["node", "npm"], out=staging.parent / ".build-tools", target=target)
-    tools = verified_tools(["node", "npm"], source_store=store, target=target)
-    npm = str(tools.entries["npm"].binary)
+    names = ["node", "pnpm"]
+    store = prepare_tools(names, out=staging.parent / ".build-tools", target=target)
+    tools = verified_tools(names, source_store=store, target=target)
     env = tools.environment(_release_subprocess_env())
-    workspaces = ["--workspace", "web", "--include-workspace-root"]
-    if (staging / "ui-tui" / "package.json").is_file():
-        workspaces[:0] = ["--workspace", "ui-tui"]
-    subprocess.run([npm, "ci", "--no-audit", "--no-fund", *workspaces],
-                   cwd=staging, env=env, check=True)
-    subprocess.run([npm, "run", "build", "--workspace", "web"], cwd=staging, env=env, check=True)
+    workspaces = ("ui-tui", "web") if (staging / "ui-tui" / "package.json").is_file() else ("web",)
+    prepare_source_dependencies(staging, workspaces, env=env, explicit=True)
+    build_source_web(staging, env=env)
     if not (staging / "hermes_cli" / "web_dist" / "index.html").is_file():
         raise RuntimeError("candidate web build did not produce hermes_cli/web_dist/index.html")
 
@@ -984,8 +990,43 @@ def wait_for_release_acknowledgement(home: Path, *, timeout_seconds: float = 180
     return True
 
 
+def _preflight_transaction(paths: ReleasePaths, record: dict[str, Any], target: Path, *,
+                           deadline: float | None) -> None:
+    from hermes_cli.immutable_release_preflight import ReleaseActivationRefused, activation_preflight
+    origin = record.get("current_original") or record.get("source")
+    try:
+        activation_preflight(target, origin, paths.home, operation=record["operation"], deadline=deadline)
+    except ReleaseActivationRefused as exc:
+        unapplied = (not record.get("reload_issued") and
+                     _pointer_value(paths.current) == record["current_original"] and
+                     _pointer_value(paths.previous) == record["previous_original"])
+        if not unapplied:
+            logger.warning("RELEASE %s: transaction intent already applied. Preflight is advisory, "
+                           "completing recorded switch despite regression: %s", record["operation"], exc)
+            return
+        # Nothing has been switched or reloaded. A refused intent must not be
+        # replayed by rollback or the next update. Keep the last completed txn.
+        _txn_path(paths).unlink()
+        _sync_dir(paths.home)
+        if record.get("plist"):
+            Path(record["plist"]["backup"]).unlink(missing_ok=True)
+            _sync_dir(paths.home)
+        raise
+
+
+def _prepare_transaction_candidate(paths: ReleasePaths, record: dict[str, Any], *,
+                                   deadline: float | None, preflight_done: bool) -> Path:
+    candidate = Path(record["candidate"])
+    if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
+        raise RuntimeError(f"transaction candidate no longer ready: {candidate}")
+    if not preflight_done:
+        _preflight_transaction(paths, record, candidate, deadline=deadline)
+    return candidate
+
+
 def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
-                     reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
+                     reload_callback: Callable[[], Any] | None = None, *,
+                     deadline: float | None = None, preflight_done: bool = False) -> dict[str, str | None]:
     operation = record["operation"]
     if (record.get("requires_reload") and reload_callback is None
             and not record.get("reload_done") and not record.get("reload_issued")
@@ -1024,10 +1065,14 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         _set_pointer(paths.previous, record["previous_intended"])
         return {"current": None, "previous": record["previous_intended"]}
 
+    from hermes_cli.immutable_release_preflight import activation_preflight
+    origin = record.get("current_original") or record.get("source")
+
     if operation == "first-migration-rollback":
         source = Path(record["source"])
         if not source.is_dir() or release_sha(source) != record["source_sha"]:
             raise RuntimeError("source checkout changed since migration; refusing unsafe rollback")
+        activation_preflight(source, origin, paths.home, operation=operation, deadline=deadline)
         _set_pointer(paths.current, None)
         _set_pointer(paths.previous, None)
         if record.get("journal_intended") is not None:
@@ -1037,9 +1082,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
         result = {"current": record["source"], "previous": record["current_original"],
                   "source_sha": record["source_sha"]}
     else:
-        candidate = Path(record["candidate"])
-        if not _release_is_ready(candidate, candidate.name) or candidate.parent != paths.releases.resolve():
-            raise RuntimeError(f"transaction candidate no longer ready: {candidate}")
+        candidate = _prepare_transaction_candidate(paths, record, deadline=deadline, preflight_done=preflight_done)
         if record.get("journal_intended") is not None:
             _atomic_json(paths.home / "release-layout.json", record["journal_intended"])
         _set_pointer(paths.previous, record["previous_intended"])
@@ -1059,7 +1102,7 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
             # service; ordinary recovery is strictly observation-only.
             assert plist is not None and "intended_sha256" in plist
             record["reload_issued"] = {
-                "at": datetime.now(timezone.utc).isoformat(),
+                "at": datetime.now(UTC).isoformat(),
                 "plist_sha256": plist["intended_sha256"],
                 "attempt": 1,
             }
@@ -1076,7 +1119,8 @@ def _run_transaction(paths: ReleasePaths, record: dict[str, Any],
     return result
 
 
-def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] | None = None
+def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] | None = None, *,
+                                deadline: float | None = None
                                 ) -> dict[str, str | None] | None:
     """Converge the recorded intent, never infer an inverse from partial pointers."""
     paths = ReleasePaths.for_home(home)
@@ -1095,8 +1139,8 @@ def recover_pending_transaction(home: Path, reload_callback: Callable[[], Any] |
             return _transaction_result(record)
         if reload_callback is None and not record.get("reload_issued"):
             raise RuntimeError("release reload pending: restart-authorized update required")
-        return _run_transaction(paths, record, reload_callback)
-    return _run_transaction(paths, record, reload_callback)
+        return _run_transaction(paths, record, reload_callback, deadline=deadline)
+    return _run_transaction(paths, record, reload_callback, deadline=deadline)
 
 
 def _transaction_result(record: dict[str, Any]) -> dict[str, str | None]:
@@ -1114,7 +1158,8 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
                      plist_path: Path | None = None, plist_body: bytes | None = None,
                      reload_callback: Callable[[], Any] | None = None,
                      before_flip: Callable[[], Any] | None = None,
-                     operation: str = "promote", force_reload: bool = False) -> dict[str, str | None]:
+                     operation: str = "promote", force_reload: bool = False,
+                     deadline: float | None = None) -> dict[str, str | None]:
     """Persist the exact pointers, layout and plist bytes before any live mutation.
 
     plist_body is the fully rendered *target* definition. The core writes those
@@ -1142,15 +1187,21 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
             if pending.get("plist") and plist_body is not None:
                 pending["plist"]["intended_body"] = base64.b64encode(plist_body).decode("ascii")
                 pending["plist"]["intended_sha256"] = hashlib.sha256(plist_body).hexdigest()
-            _write_txn(paths, pending)
         else:
-            result = recover_pending_transaction(paths.home, reload_callback)
+            result = recover_pending_transaction(paths.home, reload_callback, deadline=deadline)
             if result and result.get("current") == str(candidate):
                 return result
             pending = None
     old = _pointer_value(paths.current)
     if old == str(candidate) and not force_reload:
         return {"current": old, "previous": _pointer_value(paths.previous)}
+    from hermes_cli.immutable_release_preflight import activation_preflight
+    # A rejected candidate must never become replayable transaction intent.
+    origin = old or (pending.get("source") if pending else source)
+    if pending is not None:
+        _preflight_transaction(paths, pending, candidate, deadline=deadline)
+    else:
+        activation_preflight(candidate, origin, paths.home, operation=operation, deadline=deadline)
     if pending is None:
         if source is not None and old is None:
             pending = _migration_record(paths, source, plist_path, candidate=candidate,
@@ -1164,12 +1215,12 @@ def activate_release(home: Path, candidate: Path, *, source: Path | None = None,
                        "candidate": str(candidate), "previous_intended": previous if old == str(candidate) else old or previous,
                        "journal_original": None, "journal_intended": None,
                        "requires_reload": reload_callback is not None, "plist": plist}
-        _write_txn(paths, pending)
+    _write_txn(paths, pending)
     if before_flip is not None:
         # Compatibility hook: call after previous is recorded but before current.
         _set_pointer(paths.previous, pending["previous_intended"])
         before_flip()
-    return _run_transaction(paths, pending, reload_callback)
+    return _run_transaction(paths, pending, reload_callback, deadline=deadline, preflight_done=True)
 
 
 def promote(home: Path, candidate: Path, *, before_flip=None) -> dict[str, str | None]:
@@ -1278,7 +1329,7 @@ def _source_python_valid(python: Path, source: Path) -> bool:
     try:
         return subprocess.run([str(python), "-c", probe, str(source)],
                               capture_output=True, timeout=15,
-                              env=_release_subprocess_env()).returncode == 0
+                              env=_release_subprocess_env(), check=False).returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         return False
 
@@ -1343,14 +1394,15 @@ def _migration_record(paths: ReleasePaths, source: Path, plist_path: Path | None
 
 
 def restore_source_layout(home: Path, *, plist_path: Path | None = None,
-                          reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
+                          reload_callback: Callable[[], Any] | None = None,
+                          deadline: float | None = None) -> dict[str, str | None]:
     """Finish a first-migration rollback, including after interrupted unlinks."""
     paths = ReleasePaths.for_home(home)
     pending = _read_txn(paths)
     if pending is not None:
         if pending["operation"] == "first-migration-rollback":
-            return _run_transaction(paths, pending, reload_callback)
-        recover_pending_transaction(paths.home, reload_callback)
+            return _run_transaction(paths, pending, reload_callback, deadline=deadline)
+        recover_pending_transaction(paths.home, reload_callback, deadline=deadline)
     journal = paths.home / "release-layout.json"
     data = json.loads(journal.read_text(encoding="utf-8-sig"))
     source = Path(data["source"]).resolve(strict=True)
@@ -1379,7 +1431,7 @@ def restore_source_layout(home: Path, *, plist_path: Path | None = None,
               "journal_original": data, "journal_intended": intended, "plist": plist,
               "requires_reload": reload_callback is not None}
     _write_txn(paths, record)
-    return _run_transaction(paths, record, reload_callback)
+    return _run_transaction(paths, record, reload_callback, deadline=deadline)
 
 
 def migration_plist(home: Path) -> tuple[Path, bytes] | None:
@@ -1419,12 +1471,13 @@ def abandon_failed_switch(home: Path, *, candidate: Path, previous: Path) -> Non
 
 
 def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | None = None,
-             reload_callback: Callable[[], Any] | None = None) -> dict[str, str | None]:
+             reload_callback: Callable[[], Any] | None = None,
+             deadline: float | None = None) -> dict[str, str | None]:
     paths = ReleasePaths.for_home(home)
     pending = _read_txn(paths)
     if pending is not None:
         operation = pending["operation"]
-        result = recover_pending_transaction(paths.home, reload_callback)
+        result = recover_pending_transaction(paths.home, reload_callback, deadline=deadline)
         if operation in {"rollback", "first-migration-rollback"}:
             assert result is not None
             return result
@@ -1448,9 +1501,9 @@ def rollback(home: Path, *, plist_path: Path | None = None, plist_body: bytes | 
     if previous is None:
         raise RuntimeError("no previous release is available")
     if previous.parent != paths.releases.resolve():
-        return restore_source_layout(home, plist_path=plist_path, reload_callback=reload_callback)
+        return restore_source_layout(home, plist_path=plist_path, reload_callback=reload_callback, deadline=deadline)
     return activate_release(paths.home, previous, plist_path=plist_path, plist_body=plist_body,
-                            reload_callback=reload_callback, operation="rollback")
+                            reload_callback=reload_callback, operation="rollback", deadline=deadline)
 
 
 def resolved_release(home: Path) -> Path | None:

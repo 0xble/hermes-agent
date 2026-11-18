@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
-from gateway.session_contract import Principal, SessionRef, Submission
+from gateway.session_contract import SessionActor, SessionRef, Submission
 from hermes_state import SessionDB
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
 from tests.fakes.runtime_owner import begin_runtime_epoch
@@ -32,7 +32,7 @@ def _staged(tmp_path, name, size):
 
 
 def _submit(authority, request_id, attachments):
-    actor = Principal('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
+    actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     return authority.submit(actor, Submission(request_id=request_id, ref=SessionRef('owned', 's'),
                                               payload={'text': 'hi', 'attachments': attachments}, intent='queue'))
 
@@ -56,7 +56,7 @@ async def test_attachment_cap_is_per_admission_not_per_file(tmp_path, monkeypatc
 async def test_retained_bytes_are_released_after_cancel_and_settlement(tmp_path, monkeypatch):
     from gateway.session_ingress_media import _media_root, admission_media_references
     db, authority = _authority(tmp_path, monkeypatch)
-    actor = Principal('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
+    actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     ref = SessionRef('owned', 's')
     with db:
         shared = _staged(tmp_path, 'shared.png', 64)
@@ -82,6 +82,8 @@ async def test_retained_bytes_are_released_after_cancel_and_settlement(tmp_path,
         # Released by the owner's queued cleanup, off the FIFO path, once the drain settled it.
         from gateway.session_ingress_media import media_releases_idle
         await media_releases_idle(authority)
+        from gateway.session_runtime_workers import join_authority_work
+        await join_authority_work(authority, timeout=5)
         assert not Path(retained).exists()
         assert not Path(retained).parent.exists()
         assert list(_media_root().iterdir()) == []

@@ -32,6 +32,12 @@ class RuntimeStoreError(ValueError):
         super().__init__(reason)
 
 
+#: The one ``admission_conflict`` that proves the request was already admitted: this principal's
+#: request id on this target holds an admission with another payload. Every other conflict (route,
+#: binding, lineage) carries no such proof, so a client tells them apart by this field.
+ADMITTED_REQUEST_CONFLICT = {'field': 'request_id', 'detail': 'this request id was already admitted with another payload'}
+
+
 def _one_line(value, limit):
     """A refusal's ``field``/``detail`` as the log line and the client frame carry it: either may hold
     client text, so whitespace collapses to single spaces, other non-printables drop (no forged log
@@ -169,7 +175,7 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             WHERE principal_id=? AND target_session_id=? AND request_id=?''', (principal_id, session_id, request_id)).fetchone()
         if old is not None:
             if old['payload_digest'] != digest:
-                raise RuntimeStoreError('admission_conflict')
+                raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
             if _replay_guard is not None:
                 _replay_guard(conn)
             return _row(old)
@@ -785,13 +791,21 @@ def _worker_assignment(conn, execution_id, session_id, generation):
 
 
 def _linked_worker_admission(conn, session_id, generation, owner_epoch, statuses):
-    placeholders = ','.join('?' for _ in statuses)
+    statuses = tuple(statuses)
+    if statuses == ('started', 'unknown'):
+        # Keep the non-terminal set literal so SQLite can prove the partial-index predicate at prepare time.
+        status_clause = "status IN ('started','unknown')"
+        status_params = ()
+    else:
+        placeholders = ','.join('?' for _ in statuses)
+        status_clause = f"status IN ({placeholders})"
+        status_params = statuses
     rows = conn.execute(f"""SELECT * FROM session_admissions
-        WHERE generation=? AND owner_epoch=? AND status IN ({placeholders})
+        WHERE generation=? AND owner_epoch=? AND {status_clause}
           AND (target_session_id=? OR EXISTS (
               SELECT 1 FROM json_each(session_admissions.lineage_json) WHERE value=?
           )) ORDER BY seq""",
-        (generation, owner_epoch, *statuses, session_id, session_id)).fetchall()
+        (generation, owner_epoch, *status_params, session_id, session_id)).fetchall()
     if len(rows) > 1:
         raise RuntimeStoreError('admission_conflict')
     return rows[0] if rows else None
@@ -1005,6 +1019,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
                                              worker_tail_role, worker_tool_names)
     from hermes_state_worker_compression import WORKER_COMPRESSION_HANDLERS
     from hermes_state_worker_lifecycle import WORKER_LIFECYCLE_HANDLERS
+    from hermes_state_worker_messages import worker_append_message
     handlers = {
         **WORKER_LIFECYCLE_HANDLERS,
         **WORKER_COMPRESSION_HANDLERS,
@@ -1015,6 +1030,7 @@ def mutate_worker_execution(db, *, epoch, execution_id, session_id, generation,
         'session.tail_role': worker_tail_role,
         'session.row_role': worker_row_role,
         'transcript.append': _worker_append,
+        'transcript.append_one': worker_append_message,
         'execution.finish': _worker_finish,
         'usage.main': _worker_usage,
         'usage.auxiliary': lambda db, conn, sid, p: _worker_usage(db, conn, sid, p, auxiliary=True),
@@ -1044,10 +1060,8 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
     digest = admission_fingerprint(canonical_target=session_id,
                                   payload={'operation': operation, 'payload': json.loads(encoded)})
     def write(conn):
-        _epoch(conn, epoch)
         row = worker_receipt_assignment(conn, execution_id, session_id, generation, sequence, digest)
-        if row['owner_epoch'] != epoch:
-            raise RuntimeStoreError('stale_epoch')
+        terminal = row['status'] == 'terminal'
         old = conn.execute('SELECT * FROM worker_receipts WHERE execution_id=? AND sequence=?',
                            (execution_id, sequence)).fetchone()
         if old is not None:
@@ -1056,7 +1070,19 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             from hermes_state_runtime_workers import retired_receipt
             if retired_receipt(old['result_json']):
                 raise RuntimeStoreError('stale_generation')  # a terminal execution's read copy
-            return json.loads(old['result_json'])
+        elif terminal:
+            # Retirement is final, not an invitation to reconnect to a new epoch.
+            raise RuntimeStoreError('stale_generation')
+        try:
+            _epoch(conn, epoch)
+        except RuntimeStoreError:
+            if terminal:
+                raise RuntimeStoreError('stale_generation') from None
+            raise
+        if row['owner_epoch'] != epoch:
+            raise RuntimeStoreError('stale_generation' if terminal else 'stale_epoch')
+        if old is not None:
+            return json.loads(old['result_json'])  # retain exact mutation acknowledgements
         if row['status'] not in ('registered', 'running'):
             raise RuntimeStoreError('stale_generation')
         if sequence != row['last_sequence'] + 1:
@@ -1078,4 +1104,5 @@ def apply_worker_receipt(db, *, epoch, execution_id, session_id, generation, seq
             from hermes_state_runtime_workers import compact_terminal_receipts
             compact_terminal_receipts(conn, execution_id)
         return result
+    write._state_operation = operation
     return db._execute_write(write, patience_s=db._TRANSCRIPT_WRITE_PATIENCE_S, session_ids=(session_id, payload,), skip_result={})

@@ -910,15 +910,15 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             file_size=file_size, file_ends_with_newline=file_ends_with_newline)
 
     def _native_read_enabled(self) -> bool:
-        """Whether ``read_file`` and ``search_files`` may bypass the shell: only POSIX + ``LocalEnvironment``
-        (file is on this host, path already native; Windows keeps the shell path since
-        file_operations holds Git-Bash-style paths there). ``HERMES_NATIVE_FILE_READ=0``
-        turns the fast path off."""
+        """Whether ``read_file`` and ``search_files`` may bypass the shell: only POSIX + a backend whose
+        files are the host's (``uses_host_filesystem``: the file is on this host, path already native;
+        Windows keeps the shell path since file_operations holds Git-Bash-style paths there).
+        ``HERMES_NATIVE_FILE_READ=0`` turns the fast path off."""
         flag = os.environ.get("HERMES_NATIVE_FILE_READ", "1").strip().lower()
         if flag in ("0", "false", "no", "off"):
             return False
-        # Same "is this env the local host" test the LSP path uses; isinstance is
-        # microseconds and self.env is never rebound, so nothing to memoize.
+        # Same "are these the host's files" test the LSP path uses; an attribute read
+        # and self.env is never rebound, so nothing to memoize.
         return sys.platform != "win32" and self._lsp_local_only()
 
     def _native_path(self, path: str) -> str:
@@ -1505,6 +1505,18 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             hash_result = None if disk_sha else self._exec(f"sha256sum {self._escape_shell_arg(path)} 2>/dev/null")
             if hash_result is not None and hash_result.exit_code == 0 and hash_result.stdout.strip():
                 disk_sha = hash_result.stdout.strip().split()[0]
+            if not disk_sha:
+                # Minimal macOS peers have Python but no GNU coreutils. Hash on
+                # the same backend without depending on a platform-specific CLI.
+                hash_result = self._exec_python_snippet(
+                    "import hashlib\n"
+                    "digest=hashlib.sha256()\n"
+                    f"with open({path!r},'rb') as stream:\n"
+                    "    for block in iter(lambda:stream.read(1048576),b''):\n"
+                    "        digest.update(block)\n"
+                    "print(digest.hexdigest())\n")
+                if hash_result.exit_code == 0:
+                    disk_sha = hash_result.stdout.strip()
             if disk_sha:
                 if disk_sha != hashlib.sha256(content_bytes).hexdigest():
                     return False, WriteResult(error=(
@@ -1569,6 +1581,11 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         content_verified, verify_error = self._verify_written_hash(path, content_bytes)
         if verify_error is not None:
             return verify_error
+        from tools.nodes import Node
+        if isinstance(getattr(self.env, "_hermes_node", None), Node) and content_verified is not True:
+            return WriteResult(error=(
+                f"Write outcome is unverified on selected node for {path}. "
+                "The write may have taken effect. Re-read this node/path before retrying."))
 
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
         # LSP diagnostics are a separate channel, fired only when the syntax tier is
@@ -1721,6 +1738,5 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
                 "Skipped macOS protected folders during broad search to avoid "
                 f"an unattended privacy prompt: {skipped}. Search a protected "
                 "folder directly when access is intentional.")
-            # Append: earlier disclosures (e.g. a literal-search retry) must survive.
             result.warning = f"{result.warning} {protected}" if result.warning else protected
         return result

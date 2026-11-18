@@ -89,7 +89,7 @@ def test_check_receipt_reads_the_native_structure(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     head = "b" * 40
     monkeypatch.setattr(mod, "_git", lambda *args: head)
-    monkeypatch.setattr(mod, "_live_fleet", lambda: {})  # nothing running
+    monkeypatch.setattr(mod, "_live_fleet", dict)  # nothing running
     _receipt(tmp_path)
     assert mod.check_receipt(tmp_path) == []
     _receipt(tmp_path, outcome="partial", steps=[{"name": "reinstall", "ok": False}])
@@ -108,7 +108,7 @@ def test_check_receipt_ignores_pm_latest_for_the_newest_update(tmp_path, monkeyp
     mod = _load("check_fork_patches")
     head = "b" * 40
     monkeypatch.setattr(mod, "_git", lambda *args: head)
-    monkeypatch.setattr(mod, "_live_fleet", lambda: {})  # nothing running
+    monkeypatch.setattr(mod, "_live_fleet", dict)  # nothing running
     _receipt(tmp_path)
     directory = tmp_path / "logs" / "update_receipts"
     native = directory / "update_20261005_045152_65780_a276f85a563a4f74983a41e34995844a.json"
@@ -121,7 +121,7 @@ def test_check_receipt_ignores_pm_latest_for_the_newest_update(tmp_path, monkeyp
 def test_check_receipt_treats_lone_pm_latest_as_no_update(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     monkeypatch.setattr(mod, "_git", lambda *args: "b" * 40)
-    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    monkeypatch.setattr(mod, "_live_fleet", dict)
     directory = tmp_path / "logs" / "update_receipts"
     directory.mkdir(parents=True)
     (directory / "latest.json").write_text(json.dumps({"kind": "sync", "outcome": "ok", "steps": []}), encoding="utf-8")
@@ -263,7 +263,7 @@ def test_check_receipt_only_excuses_partial_when_a_row_was_verified_live(tmp_pat
     down_row = {"profile": "default", "pid": 7, "code_sha": None, "state": "down"}
     _receipt(tmp_path, outcome="partial", fleet=[down_row])
     assert mod.check_receipt(tmp_path) == []
-    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    monkeypatch.setattr(mod, "_live_fleet", dict)
     problems = mod.check_receipt(tmp_path)
     assert any("state down" in p for p in problems) and any("outcome is 'partial'" in p for p in problems)
 
@@ -324,7 +324,7 @@ def test_rollback_reinstall_failure_reaches_recovery(tmp_path):
     script.write_text(
         "#!/usr/bin/env bash\nset -euo pipefail\nreinstall() { echo boom >&2; return 7; }\n"
         "if reinstall 2>&1 | tail -3; then :; else echo RECOVERED; exit 1; fi\necho UNREACHABLE\n")
-    run = subprocess.run(["bash", str(script)], capture_output=True, text=True)
+    run = subprocess.run(["bash", str(script)], capture_output=True, text=True, check=False)
     assert run.returncode == 1 and "RECOVERED" in run.stdout and "UNREACHABLE" not in run.stdout
     real = (SCRIPTS / "rollback_fork_runtime.sh").read_text()
     assert "if reinstall 2>&1 | tail -3; then" in real and "PIPESTATUS" not in real
@@ -363,7 +363,7 @@ def test_check_receipt_ignores_gateways_on_a_separate_checkout(tmp_path, monkeyp
     mod = _load("check_fork_patches")
     head = "b" * 40
     monkeypatch.setattr(mod, "_git", lambda *args: head)
-    monkeypatch.setattr(mod, "_live_fleet", lambda: {})
+    monkeypatch.setattr(mod, "_live_fleet", dict)
     _receipt(tmp_path, fleet=[
         {"profile": "default", "pid": 9, "code_sha": head, "state": "current"},
         {"profile": "lpg", "pid": 11, "code_sha": "e" * 40, "state": "external", "code_root": "/srv/other"},
@@ -388,6 +388,90 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     assert mod.check_config(tmp_path) == []
     values["memory.write_approval"] = "true"
     assert mod.check_config(tmp_path) == ["config memory.write_approval = 'true', expected 'false'"]
+
+
+def test_check_config_accepts_legacy_delegation_model(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "auxiliary.review.model": "m",
+              "delegation.model": "worker", "delegation.backend": "default",
+              "delegation.backends.model_map.default": ""}
+
+    def fake_run(cmd, **_kwargs):
+        return subprocess.CompletedProcess(cmd, 0, stdout=values.get(cmd[-1], "") + "\n", stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+
+
+def test_check_config_accepts_advanced_delegation_model_map(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "auxiliary.review.model": "m",
+              "delegation.model": "", "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker",
+              "delegation.backends.model_map.options": [{"name": "worker", "model": "worker-model"}]}
+
+    def fake_run(cmd, **_kwargs):
+        key = cmd[-2] if cmd[-1] == "--json" else cmd[-1]
+        stdout = json.dumps(values.get(key)) if cmd[-1] == "--json" else str(values.get(key, "")) + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == []
+
+
+def test_check_config_rejects_model_map_default_missing_option(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "auxiliary.review.model": "m",
+              "delegation.model": "", "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker",
+              "delegation.backends.model_map.options": [{"name": "coder", "model": "coder-model"}]}
+
+    def fake_run(cmd, **_kwargs):
+        key = cmd[-2] if cmd[-1] == "--json" else cmd[-1]
+        stdout = json.dumps(values.get(key)) if cmd[-1] == "--json" else str(values.get(key, "")) + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == [
+        "config delegation route is not resolvable: default 'worker' is not declared in "
+        "delegation.backends.model_map.options"
+    ]
+
+
+def test_check_config_rejects_model_map_option_without_model(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "auxiliary.review.model": "m",
+              "delegation.model": "", "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker",
+              "delegation.backends.model_map.options": [{"name": "worker"}]}
+
+    def fake_run(cmd, **_kwargs):
+        key = cmd[-2] if cmd[-1] == "--json" else cmd[-1]
+        stdout = json.dumps(values.get(key)) if cmd[-1] == "--json" else str(values.get(key, "")) + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == [
+        "config delegation route is not resolvable: default 'worker' names an option without a non-empty model or profile"
+    ]
+
+
+def test_check_config_rejects_missing_delegation_routes(tmp_path, monkeypatch):
+    mod = _load("check_fork_patches")
+    values = {"memory.write_approval": "false", "auxiliary.review.model": "m",
+              "delegation.model": "", "delegation.backend": "default",
+              "delegation.backends.model_map.default": ""}
+
+    def fake_run(cmd, **_kwargs):
+        key = cmd[-2] if cmd[-1] == "--json" else cmd[-1]
+        stdout = json.dumps(values.get(key)) if cmd[-1] == "--json" else values.get(key, "") + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=stdout, stderr="")
+
+    monkeypatch.setattr(mod.subprocess, "run", fake_run)
+    assert mod.check_config(tmp_path) == [
+        "config delegation route is not resolvable: set delegation.model or "
+        "delegation.backend='model_map' with a non-empty default and declared options"
+    ]
 
 
 def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch):

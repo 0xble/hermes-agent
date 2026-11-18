@@ -191,7 +191,7 @@ def test_fifo_burst_and_cap_are_left_to_existing_queue(tmp_path):
     events = [MessageEvent(str(i), source=_source(), message_id=f"m-{i}") for i in range(3)]
     for event in events:
         assert runner._queue_or_replace_pending_event(entry.session_key, event)
-    assert list(adapter._pending_messages.values())[0].message_id == "m-0"
+    assert next(iter(adapter._pending_messages.values())).message_id == "m-0"
     assert len(adapter._pending_messages) == 1
     assert [event.message_id for event in events] == ["m-0", "m-1", "m-2"]
 

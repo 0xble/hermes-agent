@@ -182,6 +182,16 @@ def maybe_require_edit_approval(tool_name: str, arguments: dict[str, Any]) -> st
     requester = _EDIT_APPROVAL_REQUESTER.get()
     if requester is None:
         return None
+    if tool_name in {"write_file", "patch"}:
+        # ACP proposals read controller files and carry no filesystem identity.
+        # Refuse before preparing a diff rather than open a selected-node path here.
+        from tools.nodes import NodeError, resolve_node
+        try:
+            node = resolve_node(arguments.get("node"))
+        except NodeError as exc:
+            return _denied(f"Edit approval denied: {exc}")
+        if node is not None:
+            return _denied(f"Edit approval denied on node {node.name}: named-node ACP edit proposals are unsupported")
     try:
         proposal = build_edit_proposal(tool_name, arguments)
     except Exception as exc:
@@ -200,9 +210,12 @@ def maybe_require_edit_approval(tool_name: str, arguments: dict[str, Any]) -> st
 def build_acp_edit_tool_call(proposal: EditProposal):
     """Build the ToolCallUpdate payload for ACP request_permission."""
     import acp
+    from agent.redact import redact_approval_display
 
+    # The title is display text; the diff keeps the raw path the client opens.
     return acp.update_tool_call(
-        f"edit-approval-{next(_PERMISSION_REQUEST_IDS)}", title=f"Approve edit: {proposal.path}", kind="edit",
+        f"edit-approval-{next(_PERMISSION_REQUEST_IDS)}", title=f"Approve edit: {redact_approval_display(proposal.path)}",
+        kind="edit",
         status="pending",
         content=[acp.tool_diff_content(path=proposal.path, old_text=proposal.old_text, new_text=proposal.new_text)],
         raw_input={"tool": proposal.tool_name, "arguments": proposal.arguments},

@@ -15,6 +15,34 @@ if TYPE_CHECKING:
 _ARCHIVE_ACTIVE_SQL = "UPDATE messages SET active = 0, compacted = 1 WHERE session_id = ? AND active = 1"
 
 
+def prepare_carried_tail(db, conn, tail_ids: list[int], messages: list[dict[str, Any]]):
+    """Keep UID deduplication from mistaking a stale version for the current tail.
+
+    A rewritten fragment that cannot prove the current stored version is a separate
+    compaction occurrence. Its old UID cannot suppress the concurrent current row.
+    Proven carries retain their UID and consume the existing row exactly once.
+    """
+    from agent.message_metadata import DB_ROW_SNAPSHOT, MESSAGE_UID, stamp_message_uid
+
+    carried, weak = db._carried_tail_ids(conn, tail_ids, messages)
+    unclaimed = [row_id for row_id in tail_ids if row_id not in carried]
+    rows = conn.execute(
+        f"SELECT id, message_uid FROM messages WHERE id IN ({_placeholders(unclaimed)})", unclaimed,
+    ).fetchall() if unclaimed else []
+    uids = {row[1] for row in rows if row[1]}
+    claimed_slots = set(carried.values())
+    claimed_uids = {messages[index].get(MESSAGE_UID) for index in claimed_slots}
+    # A superseded physical version is display history, never a second active occurrence.
+    weak.update(row[0] for row in rows if row[1] in claimed_uids)
+    for index, message in enumerate(messages):
+        if index not in claimed_slots and message.get(MESSAGE_UID) in uids:
+            for key in (MESSAGE_UID, "_row_id", DB_ROW_SNAPSHOT):
+                message.pop(key, None)
+            stamp_message_uid(message)
+    return carried, weak
+
+
+
 def archive_message_rows(conn, session_id: str, rewind_ids: list[int], *, exclude_rewound: bool = False) -> None:
     """Keep rewound rows out of display history and archive the remaining active generation."""
     with write_phase("archive_mark_inactive"):

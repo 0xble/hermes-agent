@@ -50,7 +50,7 @@ def test_quiet_success_acknowledges_before_fresh_successor(tmp_path, monkeypatch
             return {{'final_response': 'received'}}
         result = continue_quiet_notify_completions('session', run_turn, linger_budget=0)
         assert result == {{'final_response': 'received'}} and len(turns) == 1
-    """)], capture_output=True, text=True, timeout=20)
+    """)], capture_output=True, text=True, timeout=20, check=False)
     assert child.returncode == 0, child.stderr
     successor = ProcessRegistry()
     successor.recover_from_checkpoint()

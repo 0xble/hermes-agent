@@ -461,7 +461,7 @@ def test_launch_external_worker_uses_restart_safe_scope_and_acknowledges(
 
 def test_degraded_worker_reaps_before_projecting_terminal_row(tmp_path, monkeypatch):
     """A degraded worker's terminal row does not return until its process exits."""
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from tools.process_registry import GatewayChildDispatch
 
     job = {"id": "job-degraded", "execution_id": "exec-1", "prompt": "work"}
@@ -471,7 +471,7 @@ def test_degraded_worker_reaps_before_projecting_terminal_row(tmp_path, monkeypa
         "tools.process_registry.restart_safe_gateway_child_argv",
         lambda command, **_kw: GatewayChildDispatch("degraded", command),
     )
-    spawned, _payloads, _handoff, get = _stub_external_worker_launch(scheduler, monkeypatch)
+    spawned, _payloads, _handoff, _get = _stub_external_worker_launch(scheduler, monkeypatch)
     import cron.scheduler_detached_worker as detached_worker
     monkeypatch.setattr(detached_worker, "reap_terminal_worker_in_background", lambda _process: None)
     prior_worker_pids = dict(scheduler._running_worker_pids)
@@ -607,7 +607,7 @@ def test_external_worker_exit_rechecks_exact_execution_before_failure(monkeypatc
 
 
 def test_detached_worker_exit_releases_its_in_process_claim(monkeypatch, tmp_path):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     job_id = "job-detached"
@@ -647,7 +647,7 @@ def test_detached_worker_exit_releases_its_in_process_claim(monkeypatch, tmp_pat
 
 @pytest.mark.parametrize("mode", ["scoped", "degraded"])
 def test_live_external_worker_keeps_claim_until_process_exit(monkeypatch, tmp_path, mode):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     job_id = "job-live-detached"
@@ -706,7 +706,7 @@ def test_live_external_worker_keeps_claim_until_process_exit(monkeypatch, tmp_pa
 
 
 def test_post_handoff_waiter_error_keeps_claim_until_worker_exit(monkeypatch, tmp_path):
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from concurrent.futures import Future
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
@@ -782,7 +782,7 @@ def test_post_handoff_waiter_error_keeps_claim_until_worker_exit(monkeypatch, tm
 def test_stale_sweep_keeps_live_detached_worker_claim_after_waiter_error(
     monkeypatch, tmp_path, execution_ledger
 ):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     job_id = "job-live-detached-terminal"
@@ -849,7 +849,7 @@ def test_stale_sweep_keeps_live_detached_worker_claim_after_waiter_error(
 
 def test_stale_sweep_of_exited_worker_does_not_wedge_successor(monkeypatch, tmp_path):
     """Sweep wins the race with the reaper: the dead claim must not block a successor's release."""
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     job_id = "job-exited-detached-swept"
@@ -869,7 +869,7 @@ def test_stale_sweep_of_exited_worker_does_not_wedge_successor(monkeypatch, tmp_
         scheduler._running_since[key] = time.time() - 10_000
         scheduler._running_allowance_s[key] = 1.0
 
-    monkeypatch.setattr(scheduler, "_latest_executions_for_releasable_claims", lambda: {})
+    monkeypatch.setattr(scheduler, "_latest_executions_for_releasable_claims", dict)
     successor = object()
     try:
         assert scheduler.sweep_stale_inflight([job]) == [job_id]
@@ -898,7 +898,7 @@ def test_stale_sweep_of_exited_worker_does_not_wedge_successor(monkeypatch, tmp_
 
 
 def test_stale_waiter_cleanup_does_not_erase_successor_metadata(monkeypatch, tmp_path):
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     monkeypatch.setattr(scheduler, "_get_hermes_home", lambda: tmp_path)
     job_id = "job-successor-metadata"
@@ -1113,7 +1113,7 @@ def test_launch_external_worker_pins_the_gateways_tree_on_pythonpath(
 
 
 def test_external_worker_keeps_loaded_tree_after_current_moves(tmp_path, monkeypatch):
-    import cron.scheduler as scheduler
+    from cron import scheduler
     from tools.process_registry import GatewayChildDispatch
     loaded = scheduler._LOADED_CODE_ROOT
     moved = tmp_path / "new-release" / "cron" / "scheduler.py"

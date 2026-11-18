@@ -10,7 +10,7 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.run import GatewayRunner
-import gateway.run_startup as run_startup
+from gateway import run_startup
 
 
 @pytest.mark.asyncio

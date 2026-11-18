@@ -66,10 +66,11 @@ class SSHEnvironment(BaseEnvironment):
         # Short, deterministic socket name: the path must stay under macOS's 104-byte sun_path
         # limit (raw user@host:port + SSH's 16-byte suffix under a deep $TMPDIR exceeds it), and
         # stability across reconnects keeps ControlMaster reuse working. A probe gets its own
-        # per-instance socket so its cleanup() can never close the agent's shared master.
+        # per-instance socket so its cleanup() cannot close another caller's master.
+        # Physical-node (no file sync) scopes are isolated for the same reason.
         socket_key = f"{user}@{host}:{port}"
-        if probe_only:
-            socket_key = f"{socket_key}:probe:{self._session_id}"
+        if probe_only or not sync_files:
+            socket_key = f"{socket_key}:scope:{self._session_id}"
         _socket_id = hashlib.sha256(socket_key.encode()).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
         _ensure_ssh_available()
@@ -123,7 +124,7 @@ class SSHEnvironment(BaseEnvironment):
         cmd.extend(arg for name in send_env for arg in ("-o", f"SendEnv={name}"))
         cmd.extend(self._target_flags("-p"))
         cmd.extend(extra_args or [])
-        cmd.append(f"{self.user}@{self.host}")
+        cmd.append(f"{self.user}@{self.host}" if self.user else self.host)
         return cmd
 
     def _run_ssh(self, remote_cmd: str, timeout: float) -> subprocess.CompletedProcess:
@@ -296,7 +297,7 @@ class SSHEnvironment(BaseEnvironment):
             if not socket.exists():
                 continue
             with contextlib.suppress(OSError, subprocess.SubprocessError):
-                cmd = ["ssh", "-o", f"ControlPath={socket}", "-O", "exit", f"{self.user}@{self.host}"]
+                cmd = ["ssh", "-o", f"ControlPath={socket}", "-O", "exit", f"{self.user}@{self.host}" if self.user else self.host]
                 subprocess.run(cmd, capture_output=True, timeout=5, stdin=subprocess.DEVNULL, check=False)
             with contextlib.suppress(OSError):
                 socket.unlink()

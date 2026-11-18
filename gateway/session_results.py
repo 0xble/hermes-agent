@@ -7,14 +7,45 @@ execution_result: ContextVar[dict | None] = ContextVar("execution_result", defau
 from hermes_state_terminal import RESULT_PREFIX as _RESULT_PREFIX, load_result
 
 
-def record_unexecuted_failure(reply):
+def record_compression_deferral(session_key):
+    """Record an unexecuted outcome for the current durable native claim.
+
+    The executor waits and re-enters the handler, rather than manufacturing an
+    empty completed result or transferring ownership to an adapter RAM queue.
+    False leaves genuinely non-authority inputs with their adapter retry path.
+    """
+    from gateway.session_ingress import executing_admission
+    captured = execution_result.get()
+    if not executing_admission.get() or captured is None:
+        return False
+    captured['compression_deferred'] = session_key
+    return True
+
+
+def validate_unexecuted_claim(db, epoch, row):
+    """A compression wait may outlive this runtime's lease; never resume a fenced claim."""
+    with db._read_ctx() as conn:
+        _epoch(conn, epoch)
+        current = _admission(conn, row['admission_id'])
+        if (current['status'] != 'started' or current['owner_epoch'] != epoch
+                or current['generation'] != row['generation']):
+            raise RuntimeStoreError('stale_generation')
+
+
+def record_unexecuted_failure(reply, reason=None, error=None):
     """The admitted turn never ran because it failed (agent initialization raised, history
     unreadable): commit a failed result for the executing admission, so no surface settles it
-    ``completed`` with the apology as the turn's output. Returns ``reply`` unchanged."""
+    ``completed`` with the apology as the turn's output. A *reason* is stamped as the turn's
+    non-retryable failure code, so clients render that code's card. *error* replaces the reply
+    as the result's ``error`` (the raw cause a local client shows as its details line).
+    Returns ``reply`` unchanged."""
     captured = execution_result.get()
     if captured is not None and 'result' not in captured:
         captured['result'] = {'final_response': '', 'messages': [], 'failed': True, 'completed': False,
-                              'error': str(reply or 'The admitted turn failed.')}
+                              'error': str(error or reply or 'The admitted turn failed.')}
+        if reason:
+            from agent.turn_failure_copy import stamp_failure
+            stamp_failure(captured['result'], reason, False)
     return reply
 
 

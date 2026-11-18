@@ -44,6 +44,7 @@ from agent.vault_backends.base import (
 )
 from agent.vault_backends import unlock as _unlock
 from agent.vault_store import VaultItemMeta, normalize_origin, normalize_otp_secret, totp_now
+from datetime import UTC
 
 logger = logging.getLogger(__name__)
 
@@ -56,11 +57,11 @@ _CATEGORIES = "Login,Credit Card"  # one listing feeds both metadata and the vau
 # Display listings (browser_vault_list) reuse an answer for 15 minutes.
 _LISTING_TTL_SECONDS = 900.0
 _FILL_METADATA_TTL_SECONDS = FILL_METADATA_TTL_SECONDS
-_LISTING_CACHE: Dict[Tuple[str, str, str], Tuple[float, str]] = {}
+_LISTING_CACHE: dict[tuple[str, str, str], tuple[float, str]] = {}
 # Single flight: concurrent callers wanting the same listing or item metadata wait on one
 # `op` call. Fill authorization does not use the display cache as authority.
-_LISTING_INFLIGHT: Dict[Tuple[str, Tuple[str, str, str]], Future] = {}
-_ITEM_META_INFLIGHT: Dict[Tuple[Tuple[str, str, str], str], Future] = {}
+_LISTING_INFLIGHT: dict[tuple[str, tuple[str, str, str]], Future] = {}
+_ITEM_META_INFLIGHT: dict[tuple[tuple[str, str, str], str], Future] = {}
 _LISTING_LOCK = threading.Lock()
 _LISTING_GENERATION = [0]  # bumped on invalidation so a fetch already in flight is not stored
 
@@ -85,9 +86,9 @@ _BARE_HOST_RE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9-]*[A-Za-z0-9])?(?:\.[A-Za-
 _CARD_FIELD_IDS = {"ccnum": "card_number", "cardholder": "cardholder_name", "cvv": "cvc"}
 
 
-def _card_secret(fields) -> Dict[str, str]:
+def _card_secret(fields) -> dict[str, str]:
     """Map a Credit Card item's fields onto the PAYMENT_FIELDS shape; digits only for the number."""
-    out: Dict[str, str] = {}
+    out: dict[str, str] = {}
     for field in fields if isinstance(fields, list) else []:
         if not isinstance(field, dict):
             continue
@@ -141,7 +142,7 @@ class OnePasswordLoginBackend(LoginBackend):
     needs_unlock = True
     binds_cards_to_page = True
 
-    def __init__(self, cfg: Optional[Dict] = None, *, alias: str = ""):
+    def __init__(self, cfg: Optional[dict] = None, *, alias: str = ""):
         self.cfg = cfg or {}
         self.alias = alias
         if alias:
@@ -160,7 +161,7 @@ class OnePasswordLoginBackend(LoginBackend):
         self._fill_metadata = threading.local()
 
     @classmethod
-    def additional_accounts(cls, cfg: Dict) -> List["OnePasswordLoginBackend"]:
+    def additional_accounts(cls, cfg: dict) -> list[OnePasswordLoginBackend]:
         """One backend per valid ``accounts`` entry. An entry must name a unique alias, its
         account, and its OWN token env (never the primary's), so no two accounts can share a
         credential. Invalid entries are skipped with a warning: fail closed, never widen."""
@@ -170,7 +171,7 @@ class OnePasswordLoginBackend(LoginBackend):
             return []
         aliases: set = set()
         token_envs = {str(cfg.get("service_account_token_env") or _DEFAULT_TOKEN_ENV)}
-        out: List[OnePasswordLoginBackend] = []
+        out: list[OnePasswordLoginBackend] = []
         for entry in entries:
             entry = entry if isinstance(entry, dict) else {}
             alias = str(entry.get("alias") or "").strip().lower()
@@ -352,7 +353,7 @@ class OnePasswordLoginBackend(LoginBackend):
             raise RuntimeError(f"op failed: {err[:200]}")
         return proc.stdout or ""
 
-    def _listing_key(self) -> Tuple[str, str, str]:
+    def _listing_key(self) -> tuple[str, str, str]:
         # The credential's fingerprint, so another account, token or session never sees a listing.
         credential = self._service_token or _unlock.get_session_token(self.name) or ""
         return (self.name, str(self.cfg.get("account") or ""), _fingerprint(credential))
@@ -621,7 +622,7 @@ class OnePasswordLoginBackend(LoginBackend):
         return self._cli_meta(handle, item)
 
     # ── backend contract ───────────────────────────────────────────────────
-    def list_items(self, *, fresh: bool = False) -> List[VaultItemMeta]:
+    def list_items(self, *, fresh: bool = False) -> list[VaultItemMeta]:
         self._connect_credentials()  # Misconfigured Connect must never fall back to another route.
         if self.alias and not self._service_token:
             raise MissingCredential(self._missing_token_error())  # surfaced, not an empty account
@@ -639,7 +640,7 @@ class OnePasswordLoginBackend(LoginBackend):
                             out.append(meta)
             return out + self.list_protected_fields()
         raw = json.loads((self._list_json_fresh() if fresh else self._item_list_json()) or "[]")
-        out: List[VaultItemMeta] = []
+        out: list[VaultItemMeta] = []
         for item in raw if isinstance(raw, list) else []:
             handle = f"{self.prefix}{item.get('id')}"
             created = str(item.get("created_at") or "")
@@ -659,14 +660,14 @@ class OnePasswordLoginBackend(LoginBackend):
                 allowed_origins=_web_origins(origins)))
         return out + self.list_protected_fields()
 
-    def list_protected_fields(self) -> List[VaultItemMeta]:
+    def list_protected_fields(self) -> list[VaultItemMeta]:
         """Configured origin-bound fields as opaque model-facing handles."""
         # Connect cannot resolve arbitrary ``op://`` secret references. Do not
         # advertise handles whose values this backend cannot consume.
         if self._connect_credentials()[1]:
             return []
         configured = self.cfg.get("protected_fields") or []
-        out: List[VaultItemMeta] = []
+        out: list[VaultItemMeta] = []
         for entry in configured if isinstance(configured, list) else []:
             normalized = _normalize_protected_field_entry(entry)
             if normalized is None:
@@ -731,7 +732,7 @@ class OnePasswordLoginBackend(LoginBackend):
             self._remember_fill_metadata(handle, item)
         return meta
 
-    def _item_selector(self, handle: str, categories=("LOGIN",)) -> List[str]:
+    def _item_selector(self, handle: str, categories=("LOGIN",)) -> list[str]:
         return self._locate(handle, categories)[0]
 
     def _locate(self, handle: str, categories) -> tuple:
@@ -756,7 +757,7 @@ class OnePasswordLoginBackend(LoginBackend):
             return _login_password(self._connect_item(handle).get("fields"))
         return self._read_password(self._item_selector(handle))
 
-    def _read_password(self, selector: List[str]) -> str:
+    def _read_password(self, selector: list[str]) -> str:
         # The documented --fields projection cannot select by purpose. Read only the
         # exact authorized item transiently, never retain its revealed fields in metadata.
         raw = self._run("item", "get", *selector, "--format", "json", "--reveal")
@@ -786,7 +787,7 @@ class OnePasswordLoginBackend(LoginBackend):
             return None
         return code if code.isdigit() else None
 
-    def resolve_secret(self, handle: str) -> Dict[str, str]:
+    def resolve_secret(self, handle: str) -> dict[str, str]:
         """Full payload for a Credit Card item or configured protected field."""
         if handle.startswith(f"{self.prefix}field:"):
             if self._connect_credentials()[1]:
@@ -839,7 +840,7 @@ def _normalize_protected_field_entry(entry):
             or parsed_reference.fragment or semantic != "bday" or value_type != "date"
             or not label or not isinstance(raw_origins, list)):
         return None
-    origins: List[str] = []
+    origins: list[str] = []
     for raw in raw_origins:
         try:
             origin = normalize_origin(str(raw))
@@ -852,7 +853,7 @@ def _normalize_protected_field_entry(entry):
 
 
 def _protected_field_handle(prefix: str, reference: str, semantic: str, value_type: str,
-                            origins: List[str]) -> str:
+                            origins: list[str]) -> str:
     """Account-scoped handle (``op:field:`` / ``op@<alias>:field:``) so routing by
     prefix reaches the backend, and account binding, that advertised it."""
     digest = hashlib.sha256(
@@ -876,8 +877,8 @@ def _normalize_protected_date(value: str) -> str:
     digits = value.lstrip("-")
     if digits.isdigit() and digits and len(digits) != 8 and value.count("-") <= 1:
         try:
-            result = datetime.fromtimestamp(int(value), tz=timezone.utc).date().isoformat()
-            if 1900 <= int(result[:4]) <= datetime.now(timezone.utc).year:
+            result = datetime.fromtimestamp(int(value), tz=UTC).date().isoformat()
+            if 1900 <= int(result[:4]) <= datetime.now(UTC).year:
                 return result
         except (OverflowError, OSError, ValueError):
             pass

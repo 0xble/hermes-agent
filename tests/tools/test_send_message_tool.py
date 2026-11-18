@@ -14,6 +14,7 @@ import pytest
 # or call _send_telegram need it; tests for other platforms don't but
 # keeping the whole file consistent is simpler.
 _HAS_TELEGRAM = pytest.importorskip("telegram", reason="python-telegram-bot not installed") is not None
+from telegram.error import NetworkError
 
 
 @pytest.fixture(autouse=True)
@@ -29,10 +30,10 @@ from gateway.config import Platform
 from tools.send_message_tool import (
     _resolve_slack_user_target,
     _send_matrix_via_adapter,
-    _send_telegram,
     _send_to_platform,
     send_message_tool,
 )
+from plugins.platforms.telegram.standalone import _send_telegram
 from tools.send_message_targets import _parse_target_ref
 from plugins.platforms.signal.standalone import _send_signal
 # Discord helpers moved to the plugin in #24325.  Import from the new path
@@ -244,7 +245,11 @@ def _install_telegram_mock(monkeypatch, bot):
     # MessageEntity needed by #27865 mention-detection path; tests don't
     # inspect it but the import must succeed.
     _MessageEntity = lambda **_kw: SimpleNamespace(**_kw)
-    telegram_mod = SimpleNamespace(Bot=lambda token: bot, MessageEntity=_MessageEntity, constants=constants_mod)
+    # The standalone sender now passes the gateway-built request transports to PTB's Bot.
+    # Keep this seam compatible with that production constructor while still returning the
+    # controlled test double.
+    telegram_mod = SimpleNamespace(Bot=lambda token, **_kwargs: bot, MessageEntity=_MessageEntity,
+                                   constants=constants_mod)
     monkeypatch.setitem(sys.modules, "telegram", telegram_mod)
     monkeypatch.setitem(sys.modules, "telegram.constants", constants_mod)
 
@@ -765,13 +770,21 @@ class TestSendTelegramHtmlDetection:
         bot = self._make_bot()
         bot.send_message = AsyncMock(
             side_effect=[
-                Exception("502 Bad Gateway"),
+                NetworkError("Bad Gateway"),  # what PTB raises for Telegram's JSON 502
                 SimpleNamespace(message_id=2),
             ]
         )
         _install_telegram_mock(monkeypatch, bot)
 
-        with patch("asyncio.sleep", new=AsyncMock()) as sleep_mock:
+        from plugins.platforms.telegram import chat_budget
+        fake_time = [0.0]
+        monkeypatch.setattr(chat_budget.time, "monotonic", lambda: fake_time[0])
+
+        async def fake_sleep(seconds):
+            fake_time[0] += seconds
+
+        sleep_mock = AsyncMock(side_effect=fake_sleep)
+        with patch("asyncio.sleep", new=sleep_mock):
             result = asyncio.run(_send_telegram("tok", "123", "hello"))
 
         assert result["success"] is True
@@ -793,8 +806,16 @@ class TestStandaloneTelegramRichMessages:
         bot.do_api_request = AsyncMock(return_value={"message_id": 123})
         bot.send_message = AsyncMock(return_value=SimpleNamespace(message_id=1))
         bot.send_document = AsyncMock(return_value=SimpleNamespace(message_id=2))
+        # Rich payload assertions use audible delivery; notification modes have their own parity proof.
+        monkeypatch.setenv("HERMES_TELEGRAM_NOTIFICATIONS", "all")
         # Drive the standalone sender without touching real credentials, quotas, or chats.
-        monkeypatch.setattr("tools.send_message_senders._telegram_bot", lambda _token: bot)
+        monkeypatch.setattr("plugins.platforms.telegram.standalone._telegram_bot", lambda _token, extra=None: bot)
+        # Discovery loads a profile-owned module namespace. Patch the registered sender's
+        # actual bot seam as well as the canonical module used by direct helper tests.
+        from tools.send_message_senders import _plugin_standalone_sender
+        sender, error = _plugin_standalone_sender("telegram")
+        assert error is None
+        monkeypatch.setitem(sender.__globals__, "_telegram_bot", lambda _token, extra=None: bot)
         return bot
 
     def test_always_sends_one_rich_message_from_resolved_platform_config(self, bot):
@@ -823,7 +844,7 @@ class TestStandaloneTelegramRichMessages:
 
     @pytest.mark.parametrize("mode", ["never", False, None])
     def test_never_keeps_markdownv2_path(self, bot, mode):
-        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages=mode))
+        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", extra={"rich_messages": mode}))
         assert result["success"] is True
         bot.do_api_request.assert_not_awaited()
         bot.send_message.assert_awaited_once()
@@ -838,7 +859,7 @@ class TestStandaloneTelegramRichMessages:
         ("$$x^2$$", True),
     ])
     def test_auto_mirrors_adapter_construct_selection(self, bot, mode, message, rich):
-        result = asyncio.run(_send_telegram("test-token", "123", message, rich_messages=mode))
+        result = asyncio.run(_send_telegram("test-token", "123", message, extra={"rich_messages": mode}))
         assert result["success"] is True
         assert bot.do_api_request.await_count == int(rich)
         assert bot.send_message.await_count == int(not rich)
@@ -850,7 +871,7 @@ class TestStandaloneTelegramRichMessages:
     ])
     def test_permanent_rejection_falls_back(self, bot, error):
         bot.do_api_request.side_effect = error
-        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages="always"))
+        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", extra={"rich_messages": "always"}))
         assert result["success"] is True
         bot.do_api_request.assert_awaited_once()
         bot.send_message.assert_awaited_once()
@@ -861,7 +882,7 @@ class TestStandaloneTelegramRichMessages:
     ])
     def test_transient_or_unknown_error_never_legacy_resends(self, bot, error):
         bot.do_api_request.side_effect = error
-        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", rich_messages="always"))
+        result = asyncio.run(_send_telegram("test-token", "123", "**hello**", extra={"rich_messages": "always"}))
         assert "error" in result
         bot.do_api_request.assert_awaited_once()
         bot.send_message.assert_not_awaited()
@@ -869,7 +890,7 @@ class TestStandaloneTelegramRichMessages:
     @pytest.mark.parametrize("message", ["x" * 32769, "line\n" * 5000])
     def test_oversized_raw_or_normalized_payload_uses_legacy_chunks(self, bot, message):
         from gateway.platforms.base import utf16_len
-        result = asyncio.run(_send_telegram("test-token", "123", message, rich_messages="always"))
+        result = asyncio.run(_send_telegram("test-token", "123", message, extra={"rich_messages": "always"}))
         assert result["success"] is True
         bot.do_api_request.assert_not_awaited()
         assert bot.send_message.await_count > 1
@@ -879,7 +900,7 @@ class TestStandaloneTelegramRichMessages:
 
     @pytest.mark.parametrize("message", ["中文", "<details>\n$$x^2$$\n</details>"])
     def test_desktop_safety_guards_match_adapter(self, bot, message):
-        result = asyncio.run(_send_telegram("test-token", "123", message, rich_messages="always"))
+        result = asyncio.run(_send_telegram("test-token", "123", message, extra={"rich_messages": "always"}))
         assert result["success"] is True
         bot.do_api_request.assert_not_awaited()
         bot.send_message.assert_awaited_once()
@@ -895,7 +916,7 @@ class TestStandaloneTelegramRichMessages:
         bot.send_message.assert_not_awaited()
 
     def test_general_topic_omitted_and_preview_default_unchanged(self, bot):
-        result = asyncio.run(_send_telegram("test-token", "123", "hello", thread_id="1", rich_messages="always"))
+        result = asyncio.run(_send_telegram("test-token", "123", "hello", thread_id="1", extra={"rich_messages": "always"}))
         assert result["success"] is True
         payload = bot.do_api_request.await_args.kwargs["api_kwargs"]
         assert "message_thread_id" not in payload
@@ -912,7 +933,7 @@ class TestStandaloneTelegramRichMessages:
                 raise second_error
             return {"message_id": 456}
         bot.do_api_request.side_effect = send
-        result = asyncio.run(_send_telegram("test-token", "123", "hello", thread_id="234", rich_messages="always"))
+        result = asyncio.run(_send_telegram("test-token", "123", "hello", thread_id="234", extra={"rich_messages": "always"}))
         assert len(seen) == 2
         assert seen[0]["message_thread_id"] == 234
         assert "message_thread_id" not in seen[1]
@@ -929,7 +950,7 @@ class TestStandaloneTelegramRichMessages:
 
     @pytest.mark.parametrize("copy_block,message", [(True, "**copy exactly**"), (True, "x" * 5000)])
     def test_copy_block_remains_plain_or_document(self, bot, copy_block, message):
-        result = asyncio.run(_send_telegram("test-token", "123", message, copy_block=copy_block, rich_messages="always"))
+        result = asyncio.run(_send_telegram("test-token", "123", message, copy_block=copy_block, extra={"rich_messages": "always"}))
         assert result["success"] is True
         bot.do_api_request.assert_not_awaited()
         if len(message) > 4096:
@@ -946,7 +967,7 @@ class TestStandaloneTelegramRichMessages:
         path.write_text("attachment")
         result = asyncio.run(_send_telegram(
             "test-token", "123", "**caption**", media_files=[(str(path), False)],
-            thread_id="234", rich_messages=rich_messages))
+            thread_id="234", extra={"rich_messages": rich_messages}))
         assert result["success"] is True
         bot.send_document.assert_awaited_once()
         upload = bot.send_document.await_args.kwargs
@@ -987,7 +1008,7 @@ class TestStandaloneTelegramRichMessages:
             path.write_text("attachment")
             bot.send_document.side_effect = RuntimeError("upload failed")
         result = asyncio.run(_send_telegram(
-            "test-token", "123", "**report**", media_files=[(str(path), False)], rich_messages="always"))
+            "test-token", "123", "**report**", media_files=[(str(path), False)], extra={"rich_messages": "always"}))
         assert result["success"] is True and result["message_id"] == "123"
         assert len(result["warnings"]) == 1
         bot.do_api_request.assert_awaited_once()
@@ -998,7 +1019,7 @@ class TestStandaloneTelegramRichMessages:
         path.write_text("attachment")
         bot.do_api_request.side_effect = TimeoutError("timed out")
         result = asyncio.run(_send_telegram(
-            "test-token", "123", "**report**", media_files=[(str(path), False)], rich_messages="always"))
+            "test-token", "123", "**report**", media_files=[(str(path), False)], extra={"rich_messages": "always"}))
         assert "error" in result
         bot.do_api_request.assert_awaited_once()
         bot.send_document.assert_not_awaited()
@@ -1009,7 +1030,7 @@ class TestStandaloneTelegramRichMessages:
         path.write_text("attachment")
         bot.do_api_request.side_effect = type("BadRequest", (Exception,), {})("rejected")
         result = asyncio.run(_send_telegram(
-            "test-token", "123", "**report**", media_files=[(str(path), False)], rich_messages="always"))
+            "test-token", "123", "**report**", media_files=[(str(path), False)], extra={"rich_messages": "always"}))
         assert result["success"] is True
         bot.do_api_request.assert_awaited_once()
         bot.send_document.assert_awaited_once()

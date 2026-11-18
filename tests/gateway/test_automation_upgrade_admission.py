@@ -75,7 +75,7 @@ async def upgraded_chat(tmp_path, monkeypatch, request):
 
 @pytest.mark.asyncio
 async def test_queued_watch_after_upgrade_needs_no_fresh_human_envelope(upgraded_chat):
-    runner, adapter, authority, entry, queued, turns, sent = upgraded_chat
+    runner, _adapter, authority, entry, queued, turns, sent = upgraded_chat
     assert await runner._inject_watch_notification('Verifier READY', queued) is True
     await async_wait_until(lambda: len(turns) == 1, timeout=20, what='upgraded process watch')
     rows = list_session_admissions(authority.db, session_id=entry.session_id, pending_only=False)
@@ -109,7 +109,7 @@ async def test_suspended_route_is_refused_without_counting_live_work_outage(upgr
 async def test_missing_legacy_envelope_does_not_hide_invalid_live_automation(upgraded_chat):
     from gateway.platforms.event import MessageEvent
     from hermes_state_runtime import RuntimeStoreError
-    runner, adapter, authority, entry, _, turns, _ = upgraded_chat
+    _runner, adapter, authority, entry, _, turns, _ = upgraded_chat
     event = MessageEvent(text='notice', source=entry.origin, internal=True,
                          metadata={'gateway_session_key': entry.session_key,
                                    'gateway_session_id': entry.session_id, 'foreign': True})

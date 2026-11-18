@@ -10,10 +10,39 @@ from typing import Any, Dict, List
 
 from agent.memory_context import sanitize_context
 from agent.message_content import flatten_message_text
-from agent.history_commentary import visible_commentary
+from agent.history_commentary import COMMENTARY_WITHHELD, commentary_items, visible_commentary
 
 # Same logger name as the origin module so log records / caplog filters are unchanged.
 logger = logging.getLogger("run_agent")
+
+
+def withhold_held_row(agent: Any, assistant_msg: dict[str, Any]) -> dict[str, Any]:
+    """Type a held turn's model row ``display_kind="hidden"`` when it has visible text; returns it.
+
+    Every row ``_build_assistant_message`` makes passes here before its first flush, so commentary,
+    continuation fragments, codex incomplete partials and an answer a stop gate sent back never reach
+    a history load; ``finish_text_response`` publishes the one row the user gets
+    (``publish_held_final_row``). The key never reaches the wire: the model's context and its cached
+    prefix are unchanged."""
+    if (getattr(agent, "_hold_stream", False) is True and not assistant_msg.get("display_kind")
+            and agent._interim_assistant_visible_text(assistant_msg)):
+        assistant_msg["display_kind"] = "hidden"
+    return assistant_msg
+
+
+def publish_held_final_row(agent: Any, final_msg: dict[str, Any], final_response: Any, joined: bool) -> None:
+    """The held turn's final row shows what the user got: visible again, without the Codex
+    commentary the transform never saw, and carrying the whole stitched reply when
+    length-continuation fragments (hidden above) were joined into it."""
+    if getattr(agent, "_hold_stream", False) is not True:
+        return
+    if final_msg.get("display_kind") == "hidden":
+        del final_msg["display_kind"]
+    if commentary_items(final_msg):  # Codex commentary rides the row's items, for replay only
+        final_msg["display_metadata"] = {**(final_msg.get("display_metadata") or {}), COMMENTARY_WITHHELD: True}
+    if joined and final_msg.get("content") and final_msg["content"] != final_response:
+        final_msg.setdefault("api_content", final_msg["content"])  # the model keeps the piece it wrote
+        final_msg["content"] = final_response
 
 
 class StreamDeliveryMixin:
@@ -31,9 +60,20 @@ class StreamDeliveryMixin:
             return False
 
     def _deliver_to_stream_callbacks(self, text: str) -> bool:
-        """Send ``text`` to the display + TTS delta callbacks; True if at least one accepted it."""
-        results = [self._call_quietly(cb, text) for cb in (self.stream_delta_callback, self._stream_callback)]
-        return any(results)
+        """Send text to display and TTS; return whether display accepted it.
+
+        Keep the any-consumer record for content recovery and liveness, and the
+        display-only record for replay/dedup decisions.
+        """
+        if getattr(self, "_hold_stream", False):
+            return False
+        display_delivered = self._call_quietly(getattr(self, "stream_delta_callback", None), text)
+        tts_delivered = self._call_quietly(getattr(self, "_stream_callback", None), text)
+        if isinstance(text, str) and text and (display_delivered or tts_delivered):
+            self._record_streamed_assistant_text(text)
+            if display_delivered:
+                self._record_display_streamed_assistant_text(text)
+        return display_delivered
 
     def _enqueue_stream_hook(self, event: str, *, label: str | None = None, **fields: Any) -> None:
         """Best-effort plugin stream hook enqueue; never raises into the stream path."""
@@ -59,9 +99,10 @@ class StreamDeliveryMixin:
         self._stream_reasoning_hooks_enabled = None
 
         def deliver(tail: str) -> None:
+            # Recorded only once shown (as ``_fire_stream_delta``): a held tail must not become an
+            # interrupted turn's untransformed partial final.
             if tail:
                 self._deliver_to_stream_callbacks(tail)
-                self._record_streamed_assistant_text(tail)
 
         # Flush any benign partial-tag tail held by the think scrubber first (#17924): an innocent '<' at
         # the end of the stream that turned out not to be a tag prefix should reach the UI. Then flush the
@@ -78,6 +119,7 @@ class StreamDeliveryMixin:
         if ctx_scrubber is not None:
             deliver(ctx_scrubber.flush())
         self._current_streamed_assistant_text = ""
+        self._display_streamed_assistant_text = ""
 
     @property
     def _current_streamed_assistant_text(self) -> str:
@@ -90,13 +132,31 @@ class StreamDeliveryMixin:
     @_current_streamed_assistant_text.setter
     def _current_streamed_assistant_text(self, value: str) -> None:
         self._streamed_assistant_text_parts = [value] if value else []
+        self._display_streamed_assistant_text_parts = [value] if value else []
 
     def _record_streamed_assistant_text(self, text: str) -> None:
-        """Accumulate visible assistant text emitted through stream callbacks (superseded writers excluded)."""
+        """Accumulate text accepted by any consumer (display, TTS, or relay)."""
         if isinstance(text, str) and text and not self._stream_writer_superseded():
             parts = getattr(self, "_streamed_assistant_text_parts", None)
             if parts is None:
                 parts = self._streamed_assistant_text_parts = []
+            parts.append(text)
+
+    @property
+    def _display_streamed_assistant_text(self) -> str:
+        """Text accepted by the chat display only, for replay/dedup decisions."""
+        parts = getattr(self, "_display_streamed_assistant_text_parts", None)
+        return "".join(parts) if parts else ""
+
+    @_display_streamed_assistant_text.setter
+    def _display_streamed_assistant_text(self, value: str) -> None:
+        self._display_streamed_assistant_text_parts = [value] if value else []
+
+    def _record_display_streamed_assistant_text(self, text: str) -> None:
+        if isinstance(text, str) and text and not self._stream_writer_superseded():
+            parts = getattr(self, "_display_streamed_assistant_text_parts", None)
+            if parts is None:
+                parts = self._display_streamed_assistant_text_parts = []
             parts.append(text)
 
     @staticmethod
@@ -106,7 +166,7 @@ class StreamDeliveryMixin:
     def _interim_visible_and_streamed(self, content: str) -> tuple[str, str]:
         """(visible content, streamed text), both think-stripped and whitespace-normalized."""
         normalize = self._normalize_interim_visible_text
-        streamed = getattr(self, "_current_streamed_assistant_text", "") or ""
+        streamed = getattr(self, "_display_streamed_assistant_text", "") or ""
         return normalize(self._strip_think_blocks(content or "")), normalize(self._strip_think_blocks(streamed))
 
     def _interim_content_was_streamed(self, content: str) -> bool:
@@ -174,8 +234,9 @@ class StreamDeliveryMixin:
             self._delivered_interim_texts.add(normalized)
 
     def _deliver_interim(self, visible: str, *, already_streamed: bool, record: list[str]) -> None:
-        """Hand ``visible`` to ``interim_assistant_callback`` and mark ``record`` delivered; swallows callback errors."""
-        cb = getattr(self, "interim_assistant_callback", None)
+        """Hand ``visible`` to ``interim_assistant_callback`` and mark ``record`` delivered; swallows callback errors.
+        Commentary is model text ``transform_llm_output`` never sees, so a held turn drops it."""
+        cb = None if getattr(self, "_hold_stream", False) else getattr(self, "interim_assistant_callback", None)
         if cb is None:
             return
         # Interim text is display-only (loop detection reads the final response), so hide the
@@ -336,10 +397,9 @@ class StreamDeliveryMixin:
                 text = text.lstrip("\n")
         if not text:
             return
-        delivered = self._deliver_to_stream_callbacks(text)
+        self._deliver_to_stream_callbacks(text)
         self._enqueue_stream_hook("on_stream_delta", delta=text, kind="text")
-        if delivered:
-            self._record_streamed_assistant_text(text)
+
 
     def _fire_reasoning_delta(self, text: str, *, inline: bool = False) -> None:
         """Fire reasoning callback if registered; superseded writers are fenced like content deltas.

@@ -68,7 +68,7 @@ async def _run_until_abandoned(r, monkeypatch, *, interval=0.01, timeout=2.0):
         r._running = False
         try:
             await asyncio.wait_for(task, timeout=2)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await task

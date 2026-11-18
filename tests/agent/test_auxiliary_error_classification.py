@@ -10,6 +10,7 @@ import logging
 import pytest
 
 from agent import auxiliary_client as ac
+from agent import auxiliary_error_policy as aux_errors
 from agent.error_classifier import FailoverReason, classify_api_error
 
 
@@ -26,9 +27,10 @@ class _Err(Exception):
 def test_openrouter_limit_403_is_billing_for_main_loop_and_aux_ladder(body):
     exc = _Err(body, 403)
     assert classify_api_error(exc).reason is FailoverReason.billing
-    assert ac._is_payment_error(exc)
-    # Every main-classifier billing phrase is an aux payment phrase (one table, no drift).
-    assert all(p in ac._PAYMENT_KEYWORDS for p in classify_api_error.__globals__["_BILLING_PATTERNS"])
+    # The aux ladder decides from the same verdict (one classifier, no drift).
+    verdict = aux_errors.classify_attempt(exc, "openrouter")
+    assert aux_errors.benches_provider(verdict)
+    assert aux_errors.fallback_label(aux_errors.Failure(exc, verdict)) == aux_errors.PAYMENT_ERROR
 
 
 @pytest.mark.parametrize("body, reason, ttl", [
@@ -45,9 +47,8 @@ def test_wrapped_transport_500_uses_connection_quarantine(body, reason, ttl):
     from agent.auxiliary_health import fallback_candidate_quarantine_ttl
 
     exc = _Err(body, 500)
-    assert ac._is_connection_error(exc) is (reason == "connection error")
-    assert ac._is_server_error(exc) is (reason == "provider unavailable")
-    assert next(label for predicate, label in ac._FALLBACK_REASONS if predicate(exc)) == reason
+    failure = aux_errors.Failure(exc, aux_errors.classify_attempt(exc, "custom"))
+    assert aux_errors.fallback_label(failure) == reason
     assert fallback_candidate_quarantine_ttl(reason) == ttl
 
 
@@ -80,12 +81,11 @@ def test_vision_fallback_skips_text_only_main_model(monkeypatch):
 ])
 def test_upstream_capacity_429_is_not_a_credential_to_bench(monkeypatch, body, benches_pool):
     exc = _Err(body, 429)
-    assert ac._is_rate_limit_error(exc)
-    assert ac._is_overloaded_error(exc) is (not benches_pool)
     assert classify_api_error(exc).reason is (
         FailoverReason.rate_limit if benches_pool else FailoverReason.overloaded)
+    assert classify_api_error(exc).should_rotate_credential is benches_pool
 
-    # The predicate is only half the contract: _recover_provider_pool must not bench a credential
+    # The verdict is only half the contract: _recover_provider_pool must not bench a credential
     # for an upstream-capacity 429, while a real per-key rate limit still rotates the pool.
     class _StubPool:
         def __init__(self):

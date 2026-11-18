@@ -6,6 +6,17 @@ from collections import defaultdict
 from contextlib import suppress
 
 
+async def send_scoped_status(receipt, adapter, chat_id, event_type, content, metadata):
+    """Keep worker callbacks and owned status cards on the same confirmation scope."""
+    from gateway.run import _send_or_update_status_coro
+    from gateway.reply_latency import delivery_scope, record_first_reply
+
+    with delivery_scope(receipt, "progress_send"):
+        result = await _send_or_update_status_coro(adapter, chat_id, event_type, content, metadata)
+    record_first_reply(receipt, content, result, kind="progress_send")
+    return result
+
+
 class StatusDelivery:
     """Fence status updates to their originating turn, topic and transport."""
 
@@ -43,15 +54,14 @@ class StatusDelivery:
             await asyncio.wait_for(adapter.delete_message(self.ctx.source.chat_id, mid), 5)
 
     async def send(self, adapter, chat_id, event_type, content, metadata):
-        from gateway.run import _send_or_update_status_coro
-
         async with self.locks[event_type]:
             if not self.live(adapter):
                 return
             # The token prevents a later turn reusing an earlier turn's editable bubble.
             # Thread identity additionally partitions the adapter's status cache.
-            result = await _send_or_update_status_coro(
-                adapter, chat_id, f"{self.token}:{event_type}", content,
+            receipt = getattr(self.ctx, "_reply_latency_receipt", None)
+            result = await send_scoped_status(
+                receipt, adapter, chat_id, f"{self.token}:{event_type}", content,
                 dict(metadata) if metadata else None,
             )
             self.track(result, adapter)

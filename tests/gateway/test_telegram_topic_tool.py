@@ -63,7 +63,7 @@ def _model_result(model="gpt-test", provider="openai-codex"):
     return SimpleNamespace(success=True, new_model=model, target_provider=provider, api_key="sk-x",
                            base_url="https://example.invalid/v1", api_mode="chat_completions",
                            request_overrides={}, runtime_capabilities={}, provider_label=provider,
-                           warning_message="", model_info=None)
+                           warning_message="", model_info=None, alias_endpoint_applied=False)
 
 
 @pytest.fixture
@@ -179,7 +179,8 @@ async def test_named_role_create_and_edit_use_gateway_loader_not_runner(home, mo
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {
-        "model": {"default": "main", "attended": {"model": "attended-model", "provider": "openrouter"}},
+        "model": {"default": "main"},
+        "model_aliases": {"attended": {"model": "attended-model", "provider": "openrouter"}},
     })
     adapter = FakeTelegram()
     adapter.get_forum_topic_icon_options = AsyncMock(return_value=list(ICONS))
@@ -187,11 +188,11 @@ async def test_named_role_create_and_edit_use_gateway_loader_not_runner(home, mo
     await _seed_caller(runner, home)
     assert not hasattr(runner, "_load_gateway_config")
 
-    created = await create_topic_session(runner, _source(), TopicSpec(name="Held", icon="💡", model="@attended"))
+    created = await create_topic_session(runner, _source(), TopicSpec(name="Held", icon="💡", model="attended"))
     assert created["model"] == "attended-model"
     assert created["provider"] == "openrouter"
 
-    edited = await edit_topic_session(runner, _source(), created["thread_id"], TopicSpec(model="@attended"))
+    edited = await edit_topic_session(runner, _source(), created["thread_id"], TopicSpec(model="attended"))
     assert edited["model"] == "attended-model"
     assert edited["provider"] == "openrouter"
 
@@ -865,14 +866,15 @@ async def test_role_with_explicit_provider_is_rejected(home, monkeypatch):
     import gateway.run as gateway_run
 
     monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda *a: {
-        "model": {"default": "main", "attended": {"model": "attended-model", "provider": "openrouter"}},
+        "model": {"default": "main"},
+        "model_aliases": {"attended": {"model": "attended-model", "provider": "openrouter"}},
     })
     adapter = FakeTelegram()
     runner = _runner(home, adapter)
     await _seed_caller(runner, home)
     with pytest.raises(TopicRequestError, match="role"):
         await create_topic_session(runner, _source(), TopicSpec(
-            name="Held", icon="💡", model="@attended", provider="openai-codex"))
+            name="Held", icon="💡", model="attended", provider="openai-codex"))
     assert adapter.created == []
 
 
@@ -884,7 +886,8 @@ async def test_role_resolves_from_routed_profile_config_under_multiplex(home, mo
 
     def fake_load(path=None):
         seen.append(path)
-        return {"model": {"default": "main", "attended": {"model": "profile-model", "provider": "nous"}}}
+        return {"model": {"default": "main"},
+                "model_aliases": {"attended": {"model": "profile-model", "provider": "nous"}}}
 
     monkeypatch.setattr(gateway_run, "_load_gateway_config", fake_load)
     adapter = FakeTelegram()
@@ -894,7 +897,7 @@ async def test_role_resolves_from_routed_profile_config_under_multiplex(home, mo
     runner._resolve_profile_home_for_source = lambda source: home.path / "profiles" / "work"
     await _seed_caller(runner, home)
 
-    created = await create_topic_session(runner, _source(), TopicSpec(name="Held", icon="💡", model="@attended"))
+    created = await create_topic_session(runner, _source(), TopicSpec(name="Held", icon="💡", model="attended"))
     assert created["model"] == "profile-model"
     assert seen and all(p == home.path / "profiles" / "work" / "config.yaml" for p in seen)
     # The role branch's reasoning readback uses the same routed profile as the route.

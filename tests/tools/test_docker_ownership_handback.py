@@ -14,6 +14,16 @@ import pytest
 from tools.environments import docker as docker_env
 
 
+@pytest.fixture(autouse=True)
+def _teardowns_finish_under_the_fakes(monkeypatch):
+    """Every env a test drops tears down on a daemon worker (``__del__`` -> ``cleanup``). Join them
+    before monkeypatch unwinds: a worker left running reaches the real docker CLI and the real
+    sandbox dir, and one still printing its traceback at exit aborts the interpreter."""
+    yield
+    gc.collect()
+    assert docker_env.DockerEnvironment.wait_for_all_teardowns(timeout=10)
+
+
 _ROOT_OWNED = b"/root/.cache/x\0/workspace/out.txt\0"  # what a root walk of the sandbox finds
 _HOST_OWNED = b"/workspace/repo/HEAD\0"  # a no-symlink walk for host-owned entries finds only this
 

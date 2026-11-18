@@ -29,16 +29,19 @@ class TurnSessionTitlesMixin:
             runner = self._runner
             session_key = getattr(ctx, "session_key", None)
 
-            def session_current() -> bool:
+            async def session_current_async() -> bool:
                 # Fence on session identity, not run generation: a quick follow-up starts a new
                 # run but keeps the session, and the titler never fires again for it.
                 peek = getattr(getattr(runner, "session_store", None), "peek_session_id", None)
-                return bool(session_id) and callable(peek) and peek(session_key) == session_id
+                if not session_id or not callable(peek):
+                    return False
+                from gateway.session_store_async import run_store_lookup
+                return await run_store_lookup(runner.session_store, "peek_session_id", session_key) == session_id
 
             # A platform adapter may own its session-title lane (Slack DM thread upgrades).
             adapter = getattr(ctx, "_status_adapter", None)
             configure = getattr(type(adapter), "configure_session_titles", None)
-            if configure is not None and configure(adapter, agent, ctx, session_current):
+            if configure is not None and configure(adapter, agent, ctx, session_current_async):
                 return
             if local_viewer_turn(self):
                 # Main's CLI repainted its status-bar title when the auto-title landed.

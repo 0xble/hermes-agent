@@ -8,6 +8,8 @@ import sys
 
 import pytest
 
+from tests.waiting import kill_if_alive, process_children
+
 from cron import executions, jobs
 from cron.scheduler_detached_worker import hard_wall_timeout_seconds
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
@@ -27,7 +29,7 @@ def profile(tmp_path):
 def test_operator_deadline_round_trip_preserves_other_jobs_and_model_dispatch(profile, monkeypatch):
     from hermes_cli import cron as cli
     from hermes_cli.subcommands.cron import build_cron_parser
-    from tools import cronjob_tools  # noqa: F401 — register the real model-facing handler
+    from tools import cronjob_tools
     from tools.registry import registry
 
     monkeypatch.setenv("HERMES_CRON_SCHEDULER", "builtin")
@@ -101,9 +103,8 @@ def test_detached_script_uses_job_deadline_and_kills_owned_child(profile, tmp_pa
         out, err = proc.communicate(timeout=12)
     except subprocess.TimeoutExpired:
         # Only processes created by this test are eligible for fallback cleanup.
-        import psutil
-        for child in psutil.Process(proc.pid).children(recursive=True):
-            child.kill()
+        for child in process_children(proc.pid):
+            kill_if_alive(child)
         proc.kill()
         out, err = proc.communicate()
         pytest.fail(f"job deadline did not terminate worker: {out}\n{err}")

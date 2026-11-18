@@ -250,10 +250,11 @@ class TestCheckpointPersistence:
             "watch_patterns": ["PANIC", "OOM"],
         }]))
         monkeypatch.setattr(pr_mod, "CHECKPOINT_PATH", checkpoint)
-        # PID doesn't exist, so nothing will be recovered
         count = registry.recover_from_checkpoint()
-        # Won't recover since PID is fake, but verify the code path doesn't crash
-        assert count == 0
+        recovered = registry._finished["proc_recovered"]
+        assert count == 1
+        assert recovered.watch_patterns == ["PANIC", "OOM"]
+        assert recovered.exited and recovered.exit_code is None
 
 
 # =========================================================================

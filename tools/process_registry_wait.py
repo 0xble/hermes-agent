@@ -53,7 +53,7 @@ def completion_reaches_session(session) -> bool:
     return not parent_session_id and not session_key
 
 
-def plan_for(session, max_timeout: int) -> Tuple[int, str]:
+def plan_for(session, max_timeout: int) -> tuple[int, str]:
     """``wait_plan`` for a registry process session."""
     return wait_plan(bool(session.notify_on_complete), max_timeout,
                      completion_reaches_session=completion_reaches_session(session))
@@ -64,7 +64,7 @@ def wait_plan(
     max_timeout: int,
     *,
     completion_reaches_session: bool = True,
-) -> Tuple[int, str]:
+) -> tuple[int, str]:
     """The single decision for a wait: (default window, guidance after it elapses).
 
     Deferring is safe only when a completion notice will actually arrive: the
@@ -73,7 +73,9 @@ def wait_plan(
     Anywhere else, ending the turn or not waiting again loses the result, so the
     caller keeps the full window and must collect or kill the process itself.
     """
-    reachable = can_receive_later()
+    from tools.process_registry_wait_policy import _completion_delivery_supported
+
+    reachable = _completion_delivery_supported(explicit_notify=True)
     if notify_on_complete and completion_reaches_session and reachable:
         return (min(NOTIFIABLE_DEFAULT_TIMEOUT, max_timeout),
                 " You will be notified on completion; do not wait again. End the turn or do other work.")

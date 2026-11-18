@@ -128,6 +128,8 @@ def _run_prune(monkeypatch, capsys, argv_tail, candidates=None, skipped_open=0, 
         sys, "argv", ["hermes", "sessions", sub, *argv_tail]
     )
     monkeypatch.setattr("builtins.input", lambda _prompt="": "y")
+    # These cases test filter translation, not the wall-clock deletion window.
+    monkeypatch.setattr("hermes_cli.maintenance_window.deletion_window_open", lambda: True)
     main_mod.main()
     return seen, capsys.readouterr().out
 

@@ -13,19 +13,23 @@ from hermes_state import SessionDB
 import hermes_logging
 from run_agent import AIAgent
 from tests.agent.test_incognito_auxiliary_health import _files
-from tests.tools.test_delegate_by_parent import MEDIUM, PARENT_CHAIN, PINNED_CHAIN, VENICE, _authored, config_file
+from tests.tools.alias_route_fixtures import MEDIUM, PARENT_CHAIN, PINNED_CHAIN, VENICE, _authored, config_file
 from tools import delegate_tool as delegate
 
 
 @pytest.mark.parametrize("private_parent", [False, True])
 @pytest.mark.parametrize("caller_identity", [None, "unrelated-public-caller"])
 @pytest.mark.parametrize("plugin_launch", [False, True])
-@pytest.mark.parametrize("route", ["inherit", "@worker"])
+@pytest.mark.parametrize("route", ["inherit", "worker"])
 def test_live_parent_private_route_builds_real_private_child_and_grandchild(
     config_file, tmp_path, monkeypatch, private_parent, caller_identity, plugin_launch, route,
 ):
     raw: dict[str, Any] = _authored()
-    raw["delegation"]["by_parent"]["@uncensored"] = route
+    if route == "inherit":
+        raw["delegation"] = {"max_spawn_depth": 3}
+    else:
+        raw["delegation"].update(model="worker-model", provider="custom:worker",
+                                 base_url="https://worker.test/v1", reasoning_effort="low")
     raw["context_file_max_chars"] = 256
     config_file(raw)
     workspace = tmp_path / "workspace"

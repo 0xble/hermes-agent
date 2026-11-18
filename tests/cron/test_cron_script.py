@@ -193,7 +193,7 @@ class TestRunJobScript:
 
     def test_script_subprocess_env_drops_session_identity(self, cron_env, monkeypatch):
         """A sessionless cron worker must not pass its launcher's stale session mirror to a script."""
-        import gateway.session_context as session_context
+        from gateway import session_context
         from cron.scheduler_script import _run_job_script
 
         saved_context = {var: var.get() for var in session_context._VAR_MAP.values()}
@@ -451,6 +451,91 @@ class TestRunJobScript:
         assert pickled == "pickled True"  # __main__ outlives the body, as in a plain run
 
     @pytest.mark.platforms("posix")
+    @pytest.mark.parametrize("missing_interpreter", [False, True])
+    def test_posix_snapshot_uses_its_own_generation_environment(
+        self, cron_env, tmp_path, monkeypatch, missing_interpreter
+    ):
+        """Snapshot code belongs to the sibling venv, not workspace/venv or a newer selection.
+
+        Exercise real path resolution and a real child process. Only the unrelated managed-store
+        discovery is stubbed; mocking selected_venv would hide the original workspace/venv defect.
+        """
+        from cron import scheduler_script
+        from pm.environments import site_packages
+
+        generation = tmp_path / "installs" / "owner" / "environments" / "generation"
+        snapshot = generation / "workspace"
+        (snapshot / "cron").mkdir(parents=True)
+        (generation / ".lease-managed").touch()
+        monkeypatch.setattr(scheduler_script, "__file__", str(snapshot / "cron" / "scheduler_script.py"))
+        monkeypatch.setattr(
+            "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
+        )
+        monkeypatch.delenv("PYTHONPATH", raising=False)
+
+        venv = generation / "venv"
+        (venv / "bin").mkdir(parents=True)
+        base_executable = getattr(sys, "_base_executable", sys.executable)
+        if not missing_interpreter:
+            (venv / "bin" / "python").symlink_to(base_executable)
+        (venv / "pyvenv.cfg").write_text(
+            f"home = {Path(sys.base_prefix) / 'bin'}\ninclude-system-site-packages = false\n",
+            encoding="utf-8",
+        )
+        deps = site_packages(venv)
+        deps.mkdir(parents=True)
+        (deps / "generation_probe.py").write_text("VALUE = 'generation dependency'\n", encoding="utf-8")
+        script = cron_env / "scripts" / "generation-probe.py"
+        script.write_text(
+            "import os, sys, generation_probe\n"
+            "print(sys.prefix)\nprint(generation_probe.VALUE)\n"
+            "print(os.environ.get('HERMES_DISABLE_LAZY_INSTALLS'))\n"
+            "print('PYTHONPATH=' + (os.environ.get('PYTHONPATH') or ''))\n",
+            encoding="utf-8",
+        )
+        if missing_interpreter:
+            # Even a tempting workspace-local interpreter cannot hide a damaged generation.
+            fallback = snapshot / "venv" / "bin" / "python"
+            fallback.parent.mkdir(parents=True)
+            fallback.symlink_to(base_executable)
+
+        success, output = scheduler_script._run_job_script("generation-probe.py")
+
+        if missing_interpreter:
+            assert success is False
+            assert f"dependency environment interpreter is missing: {venv / 'bin' / 'python'}" in output
+        else:
+            assert success is True, output
+            prefix, dependency, lazy, pythonpath = output.splitlines()
+            assert Path(prefix).resolve() == venv.resolve()
+            assert dependency == "generation dependency"
+            assert lazy == "1"
+            assert pythonpath == "PYTHONPATH="
+
+    @pytest.mark.platforms("posix")
+    @pytest.mark.parametrize("managed_layout", [False, True])
+    def test_posix_workspace_name_alone_does_not_select_a_sibling_venv(
+        self, tmp_path, monkeypatch, managed_layout
+    ):
+        from cron import scheduler_script
+
+        parent = tmp_path / ("environments" if managed_layout else "ordinary") / "generation"
+        repo = parent / "workspace"
+        (repo / "cron").mkdir(parents=True)
+        if not managed_layout:
+            (parent / ".lease-managed").touch()
+        # Neither the generation marker alone nor the directory layout alone proves ownership.
+        python = repo / "venv" / "bin" / "python"
+        python.parent.mkdir(parents=True)
+        python.touch()
+        monkeypatch.setattr(scheduler_script, "__file__", str(repo / "cron" / "scheduler_script.py"))
+        monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda root: Path(sys.executable))
+
+        argv, _ = scheduler_script._posix_cron_script_argv(tmp_path / "probe.py")
+
+        assert argv[0] == str(python)
+
+    @pytest.mark.platforms("posix")
     @pytest.mark.parametrize("broken", ["selection_raises", "interpreter_missing"])
     def test_posix_unusable_store_selection_fails_the_run_not_the_tick(
         self, cron_env, tmp_path, monkeypatch, broken
@@ -537,6 +622,86 @@ class TestBuildJobPromptWithScript:
         prompt = _build_job_prompt(job)
         assert "## Script Output" not in prompt
         assert "Simple job." in prompt
+
+
+@pytest.mark.parametrize("log_store", ["writable", "unwritable", "no-job", "invalid-job"])
+def test_large_script_error_is_bounded_and_full_redacted_output_is_recoverable(
+    cron_env, monkeypatch, log_store
+):
+    """Build logs must not flood prompts, even when the diagnostic store is unavailable."""
+    from agent.redact import redact_sensitive_text
+    from cron.scheduler import _build_job_prompt
+
+    # Assert the owner-only policy itself, as tests/cron/test_file_permissions.py does: containerized
+    # CI runners otherwise take the shared policy's container branch, which deliberately skips chmod.
+    monkeypatch.setattr("hermes_constants._detect_container", lambda: False)
+    monkeypatch.setenv("HERMES_MANAGED", "false")
+    for name in ("HERMES_CONTAINER", "HERMES_SKIP_CHMOD", "HERMES_HOME_MODE", "HERMES_UID", "HERMES_GID"):
+        monkeypatch.delenv(name, raising=False)
+
+    secret = "sk-" + "synthetic" * 6
+    stderr = "BUILD START " + secret + "\n" + "compiling unit\n" * 70000 + "BUILD FAILED"
+    stdout = "OUT START\n" + "build progress\n" * 20000 + secret + "\nOUT END"
+    script = cron_env / "scripts" / "build.py"
+    script.write_text(
+        "import sys\n"
+        f"sys.stderr.write({stderr!r})\n"
+        f"sys.stdout.write({stdout!r})\n"
+        "sys.exit(3)\n",
+        encoding="utf-8",
+    )
+    if log_store == "unwritable":
+        def refuse_write(*args, **kwargs):
+            raise OSError("store unavailable")
+        monkeypatch.setattr("utils.atomic_write_text", refuse_write)
+    job_id = {"no-job": "", "invalid-job": "../escape"}.get(log_store, "build-check")
+    prompt = _build_job_prompt({"id": job_id, "prompt": "Report status.", "script": str(script)})
+
+    assert "## Script Error" in prompt
+    assert "Script exited with code 3" in prompt
+    assert "Report status." in prompt
+    assert len(prompt) < 12000
+    assert secret not in prompt
+    redacted = [(name, redact_sensitive_text(text)) for name, text in (
+        ("stderr", stderr), ("stdout", stdout)
+    )]
+    for name, text in redacted:
+        omitted = len(text) - 4000
+        assert f"{name}:\n{text[:1000]}\n[... {omitted} characters omitted ...]\n{text[-3000:]}" in prompt
+    log = cron_env / "cron" / "output" / "build-check" / "script-error.log"
+    if log_store == "writable":
+        full = "\n".join(["Script exited with code 3"] + [f"{name}:\n{text}" for name, text in redacted])
+        assert f"Full output ({len(full)} characters): {log}" in prompt
+        assert log.read_text(encoding="utf-8") == full + "\n"
+        assert secret not in log.read_text(encoding="utf-8")
+        if os.name == "posix":
+            assert log.stat().st_mode & 0o777 == 0o600
+            assert log.parent.stat().st_mode & 0o777 == 0o700
+        assert not list(log.parent.glob("*.md")), "diagnostics are not cron run outputs"
+        # A later failure replaces the single log instead of accumulating build logs.
+        log.write_text("old failure", encoding="utf-8")
+        _build_job_prompt({"id": job_id, "prompt": "Report status.", "script": str(script)})
+        assert log.read_text(encoding="utf-8") == full + "\n"
+    else:
+        assert "Full output (" in prompt and "was not saved." in prompt
+        assert not log.exists()
+
+
+@pytest.mark.parametrize("exit_code,size", [(0, 50000), (2, 10), (2, 4000)])
+def test_script_output_without_truncation_is_unchanged(cron_env, exit_code, size):
+    from cron.scheduler_script import _run_job_script
+
+    script = cron_env / "scripts" / "output.py"
+    script.write_text(
+        f"import sys\nprint('x' * {size})\nprint('bad input', file=sys.stderr)\nsys.exit({exit_code})\n",
+        encoding="utf-8",
+    )
+    success, output = _run_job_script(str(script), cron_job_id="unchanged")
+    expected = "x" * size
+    if exit_code:
+        expected = f"Script exited with code {exit_code}\nstderr:\nbad input\nstdout:\n{expected}"
+    assert (success, output) == (exit_code == 0, expected)
+    assert not (cron_env / "cron" / "output" / "unchanged").exists()
 
 
 class TestCronjobToolScript:

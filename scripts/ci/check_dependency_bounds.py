@@ -33,7 +33,7 @@ def selected_history(repo: Path, base: str, head: str) -> tuple[str, str]:
                 result = subprocess.run(
                     ['git', 'merge-base', '--is-ancestor', boundary, commit],
                     cwd=repo, capture_output=True, text=True, encoding='utf-8', errors='replace',
-                )
+                 check=False)
                 if result.returncode == 0:
                     raise ValueError(f'Full history is required for selected commits: reachable shallow boundary {boundary}.')
                 if result.returncode != 1:

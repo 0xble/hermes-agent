@@ -4,6 +4,7 @@ from contextlib import ExitStack, nullcontext
 from threading import Barrier
 import importlib.util
 import os
+import ntpath
 import re
 import shutil
 from pathlib import Path
@@ -25,6 +26,14 @@ def clean_git_env():
 
 
 class PortableGateTests(unittest.TestCase):
+    def test_every_nightly_selector_discovers_executable_coverage(self):
+        from scripts.run_tests_parallel import _discover_files
+
+        for relative in ci.NIGHTLY_ONLY_TESTS:
+            with self.subTest(selector=relative):
+                self.assertTrue(_discover_files([ci.ROOT / relative]),
+                                f'nightly selector has no executable tests: {relative}')
+
     def test_fork_history_email_scan_stays_on_first_parent(self):
         with patch.object(ci, 'git', return_value='fork@example.invalid\n') as git:
             self.assertEqual(ci.fork_commit_emails('base', 'release'), ['fork@example.invalid'])
@@ -112,6 +121,24 @@ class PortableGateTests(unittest.TestCase):
         self.assertNotIn('GITHUB_ACTIONS=true', profile['run'])
         self.assertIn('chown -R ci:ci "$GITHUB_WORKSPACE" "$HOME"', profile['run'])
 
+    def test_linux_desktop_builds_install_x11_headers(self):
+        """The HUD modifier monitor compiles in the node lane and desktop core E2E.
+        Without these headers the Linux helper is omitted and packaging continues."""
+        workflows = Path(__file__).resolve().parents[3] / '.github' / 'workflows'
+        for name in ('nightly.yml', 'gate.yml'):
+            text = (workflows / name).read_text(encoding='utf-8-sig')
+            # Python shards also install build-essential, and they install tmux.
+            # The linux job is the one that compiles the desktop native monitor.
+            installs = [line for line in text.splitlines()
+                        if 'apt-get install' in line and 'build-essential' in line and 'tmux' not in line]
+            self.assertEqual(len(installs), 1, name)
+            for package in ('libx11-dev', 'libxi-dev'):
+                self.assertIn(package, installs[0].split(), f'{name} linux job')
+        desktop = (workflows / 'e2e-desktop-core.yml').read_text(encoding='utf-8-sig')
+        install = desktop.split('apt-get install', 1)[1].split('- name:', 1)[0]
+        for package in ('libx11-dev', 'libxi-dev'):
+            self.assertIn(package, install.split(), 'e2e-desktop-core.yml')
+
     def test_local_toolchain_preserves_argv0_dispatching_node_shim(self):
         with tempfile.TemporaryDirectory() as directory:
             tools = Path(directory)
@@ -166,6 +193,43 @@ class PortableGateTests(unittest.TestCase):
                 subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], env=env, check=True)
                 with self.assertRaisesRegex(RuntimeError, 'Tracked checkout'):
                     ci.assert_exact_checkout(sha)
+
+    def test_git_commands_honor_the_current_module_root(self):
+        original = ci.ROOT.resolve()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            env = clean_git_env()
+            subprocess.run(['git', 'init', '-q', str(root)], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.email', 'ci@example.invalid'], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'config', 'user.name', 'CI'], env=env, check=True)
+            (root / 'tracked.txt').write_text('fixture', encoding='utf-8')
+            subprocess.run(['git', '-C', str(root), 'add', 'tracked.txt'], env=env, check=True)
+            subprocess.run(['git', '-C', str(root), 'commit', '-qm', 'fixture'], env=env, check=True)
+            expected = subprocess.check_output(
+                ['git', '-C', str(root), 'rev-parse', 'HEAD'], env=env, text=True).strip()
+            original_head = subprocess.check_output(
+                ['git', '-C', str(original), 'rev-parse', 'HEAD'], env=env, text=True).strip()
+            self.assertNotEqual(expected, original_head)
+            probe = root / 'cwd.txt'
+            with patch.object(ci, 'ROOT', root):
+                actual = ci.git('rev-parse', 'HEAD').strip()
+                self.assertEqual(
+                    actual, expected,
+                    f'git() ran against {actual}, the definition-time checkout {original_head}, not {expected}')
+                self.assertIn('tracked.txt', ci.source_files())
+                self.assertNotIn('scripts/ci/portable.py', ci.source_files())
+                ci.run([
+                    sys.executable, '-c',
+                    f'from pathlib import Path; Path(r"{probe}").write_text(str(Path.cwd().resolve()))',
+                ])
+                config = root / 'gitconfig'
+                bound = ci.git_environment(config_path=config)
+                unbound = ci.git_environment(root=None, config_path=root / 'unbound')
+            self.assertEqual(Path(probe.read_text(encoding='utf-8-sig')), root.resolve())
+            self.assertIn(f'directory = {root.resolve().as_posix()}', config.read_text(encoding='utf-8-sig'))
+            self.assertEqual(bound['GIT_CONFIG_GLOBAL'], config.resolve().as_posix())
+            self.assertEqual(unbound['GIT_CONFIG_GLOBAL'], os.devnull)
+            self.assertFalse((root / 'unbound').exists())
 
     def test_preflight_fixture_cannot_mutate_inherited_git_repository(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -243,6 +307,70 @@ class PortableGateTests(unittest.TestCase):
             })
             self.assertTrue(Path(result['LOCALAPPDATA']).is_dir())
             self.assertTrue(Path(result['APPDATA']).is_dir())
+
+    def test_windows_system_locations_survive_isolation_in_either_casing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            for casing in ('SystemDrive', 'SYSTEMDRIVE'):
+                with self.subTest(casing=casing):
+                    locations = {
+                        casing: 'D:',
+                        'SystemRoot' if casing[0].isupper() and casing[1].islower() else 'SYSTEMROOT': r'D:\Windows',
+                        'ProgramData' if casing == 'SystemDrive' else 'PROGRAMDATA': r'D:\ProgramData',
+                        'ALLUSERSPROFILE': r'D:\ProgramData',
+                        'PATH': os.defpath,
+                    }
+                    with patch.dict(os.environ, locations, clear=True), patch.object(ci, 'STATE', state):
+                        env = ci.environment(state / casing)
+                    for key, value in locations.items():
+                        if key == 'PATH':
+                            continue
+                        self.assertEqual(env.get(key.upper()), value, key)
+                    with patch.dict(os.environ, {'SYSTEMDRIVE': env['SYSTEMDRIVE']}, clear=False):
+                        expanded = ntpath.expandvars('%SYSTEMDRIVE%\\ProgramData')
+                    self.assertEqual(expanded, r'D:\ProgramData')
+                    self.assertNotIn('%SystemDrive%', expanded)
+                    self.assertNotIn('OPENAI_API_KEY', env)
+
+    def test_windows_location_variables_cross_the_test_runner_env_boundary(self):
+        locations = {
+            'SYSTEMDRIVE': r'D:',
+            'SystemDrive': r'D:',
+            'SYSTEMROOT': r'D:\Windows',
+            'SystemRoot': r'D:\Windows',
+            'PROGRAMDATA': r'D:\ProgramData',
+            'ProgramData': r'D:\ProgramData',
+            'ALLUSERSPROFILE': r'D:\ProgramData',
+            'PSModuleAnalysisCachePath': r'D:\cache\ModuleAnalysisCache',
+            'PSMODULEANALYSISCACHEPATH': r'D:\cache\ModuleAnalysisCache',
+        }
+        # Do not replace the real native Windows system paths when this
+        # portable contract itself runs there.
+        if os.name == 'nt':
+            locations = {
+                key: os.environ.get(key) or os.environ.get(key.upper()) or value
+                for key, value in locations.items()
+            }
+        probe = (
+            'import os, sys\n'
+            'expected = {\n'
+            + ''.join(f'    {key!r}: {value!r},\n' for key, value in locations.items())
+            + '}\n'
+            'missing = {key: os.environ.get(key) for key, value in expected.items() if os.environ.get(key) != value}\n'
+            'assert not missing, missing\n'
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            test_file = root / 'test_windows_location_boundary.py'
+            test_file.write_text('def test_locations_survive():\n' + ''.join(f'    {line}\n' for line in probe.splitlines()), encoding='utf-8')
+            env = dict(os.environ)
+            env.update(locations)
+            env['HERMES_PYTHON'] = sys.executable
+            env['HERMES_HOME'] = str(root / 'hermes-home')
+            subprocess.run(
+                ['bash', 'scripts/run_tests.sh', '-j', '1', '--file-retries', '0', str(test_file)],
+                cwd=ci.ROOT, env=env, check=True, timeout=300,
+            )
 
     def test_windows_appdata_seeds_only_the_isolated_analysis_cache(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -580,6 +708,7 @@ try {
             stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=ci.free_space_floor_bytes() + 1))
             stack.enter_context(patch.object(ci, 'require_tools'))
             stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'pm_setup_phase'))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
             run = stack.enter_context(patch.object(ci, 'run'))
@@ -644,7 +773,17 @@ try {
             stack.enter_context(patch.object(ci, 'volume_free_bytes', return_value=ci.free_space_floor_bytes() + 1))
             stack.enter_context(patch.object(ci, 'run', side_effect=install))
             stack.enter_context(patch.object(ci, 'provision_rg'))
-            ci.setup(env)
+            def managed_phase(phase, managed_env, *args):
+                if phase == 'install':
+                    # The bootstrap npm was selected before PM supplied its newer tools.
+                    ci.require_tools(('npm',), managed_env)
+                    write_executable(uv_bin / 'uv', 'uv ' + ci.PM_PINS['uv'])
+                    write_executable(node_bin / 'node', 'v' + ci.PM_PINS['node'])
+                    write_executable(toolchain / 'node_modules/.bin/npm', ci.PM_PINS['npm'])
+                    write_executable(node_bin / 'pnpm', ci.PM_PINS['pnpm'])
+
+            with patch.object(ci, 'pm_setup_phase', side_effect=managed_phase), patch.object(ci, 'python', return_value=sys.executable):
+                ci.setup(env)
 
             npm = toolchain / 'node_modules' / '.bin' / 'npm'
             self.assertEqual(ci.windows_command('npm', env), str(npm.resolve()))
@@ -653,6 +792,35 @@ try {
             self.assertEqual(Path(found or '').resolve(), npm.resolve())
             ci.require_tools(('npm',), env)
             self.assertEqual(commands[0][:2], ['npm', 'install'])
+
+    def test_pm_setup_exports_selected_environment_and_tool_precedence(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+            root = Path(directory)
+            state = root / 'state'
+            state.mkdir()
+            npm_dir, node_dir = root / 'npm', root / 'node'
+            npm_dir.mkdir()
+            node_dir.mkdir()
+            for path in (npm_dir / 'npm', node_dir / 'node'):
+                path.touch()
+                path.chmod(0o755)
+            env = {'PATH': str(root / 'host')}
+
+            def provision(argv, **kwargs):
+                exported = kwargs['env']
+                Path(exported['GITHUB_ENV']).write_text('HERMES_PYTHON=/isolated/test/bin/python\n', encoding='utf-8')
+                Path(exported['GITHUB_PATH']).write_text(str(node_dir) + '\n' + str(npm_dir) + '\n', encoding='utf-8')
+
+            stack.enter_context(patch.object(ci, 'STATE', state))
+            command = stack.enter_context(patch.object(ci, 'run', side_effect=provision))
+            ci.pm_setup_phase('dependencies', env, '--extras', '["all"]', '--test-environment')
+            self.assertEqual(env['HERMES_PYTHON'], '/isolated/test/bin/python')
+            self.assertEqual(env['PATH'].split(os.pathsep)[:2], [str(npm_dir), str(node_dir)])
+            self.assertEqual(env['HERMES_CI_PINNED_NODE'], str(node_dir / 'node'))
+            self.assertIn('--test-environment', command.call_args.args[0])
+            command.side_effect = subprocess.CalledProcessError(1, 'PM failed')
+            with self.assertRaises(subprocess.CalledProcessError):
+                ci.pm_setup_phase('install', env)
 
     def test_setup_provisions_pinned_npm_and_rg_ahead_of_host_tools(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
@@ -687,7 +855,9 @@ try {
     def test_default_invocation_sets_up_and_runs_all_lanes_after_failure(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
             stack.enter_context(patch.object(ci, 'STATE', Path(directory)))
+            stack.enter_context(patch.object(ci, 'require_case_sensitive_tmpdir'))
             stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
+            stack.enter_context(patch.object(ci, 'resolve_local_toolchain', side_effect=lambda env: env))
             stack.enter_context(patch.object(sys, 'argv', ['bin/ci']))
             seen = []
             stack.enter_context(patch.object(ci, 'setup', side_effect=lambda env: seen.append('setup')))
@@ -701,6 +871,24 @@ try {
             stack.enter_context(patch.object(ci, 'e2e_tests', side_effect=lambda env, workers: seen.append('e2e')))
             self.assertEqual(ci.main(), 1)
             self.assertEqual(seen, ['setup', 'static', ('tests',), 'e2e', 'node', 'docs', 'rust', 'container_lint'])
+
+    def test_exact_gate_runs_the_bounded_partition_locally_and_hosted(self):
+        for hosted in ('', 'true'):
+            with self.subTest(hosted=hosted), tempfile.TemporaryDirectory() as directory, ExitStack() as stack:
+                stack.enter_context(patch.dict(os.environ, {'GITHUB_ACTIONS': hosted}))
+                stack.enter_context(patch.object(ci, 'STATE', Path(directory)))
+                stack.enter_context(patch.object(ci, 'require_case_sensitive_tmpdir'))
+                stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
+                stack.enter_context(patch.object(ci, 'assert_exact_checkout'))
+                stack.enter_context(patch.object(ci, 'setup'))
+                stack.enter_context(patch.object(ci, 'environment', return_value={}))
+                stack.enter_context(patch.object(ci, 'resolve_local_toolchain', side_effect=lambda env: env))
+                stack.enter_context(patch.object(sys, 'argv', ['bin/ci', 'gate', 'a' * 40]))
+                seen = []
+                for name in ('static', 'node', 'node_gate', 'docs', 'rust', 'container_lint', 'python_tests', 'e2e_tests'):
+                    stack.enter_context(patch.object(ci, name, side_effect=lambda *args, name=name: seen.append(name)))
+                self.assertEqual(ci.main(), 0)
+                self.assertEqual(seen, ['static', 'node_gate'])
 
     def test_e2e_lane_bounds_only_the_upgrade_suite_higher_and_runs_both_parts(self):
         calls = []
@@ -805,7 +993,9 @@ try {
                 '    attempts.write_text(str(count), encoding="utf-8")\n'
                 '    assert count > 1, "first attempt fails"\n', encoding='utf-8')
             stack.enter_context(patch.object(ci, 'STATE', root / 'state'))
+            stack.enter_context(patch.object(ci, 'require_case_sensitive_tmpdir'))
             stack.enter_context(patch.object(ci, 'source_unchanged', return_value=nullcontext()))
+            stack.enter_context(patch.object(ci, 'resolve_local_toolchain', side_effect=lambda env: env))
             stack.enter_context(patch.object(sys, 'argv', ['bin/ci', 'check', '--lane', 'python', '--workers', '1']))
             # Keep the actual lane, shell harness and pytest subprocesses. Only
             # narrow discovery and bypass unrelated installed-tool qualification.
@@ -1055,6 +1245,8 @@ with ci.checkout_lock():
             stack.enter_context(patch.object(ci, 'volume_free_bytes', side_effect=lambda path: next(free)))
             stack.enter_context(patch.object(ci, 'require_tools'))
             stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'pm_setup_phase'))
+            stack.enter_context(patch.object(ci, 'python', return_value=sys.executable))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
             run = stack.enter_context(patch.object(ci, 'run'))
@@ -1173,6 +1365,8 @@ with patch.dict(reclaim.__globals__, {
                 ci, 'reclaim_finished_generated_dirs', side_effect=AssertionError('reclaim on a roomy volume')))
             stack.enter_context(patch.object(ci, 'require_tools'))
             stack.enter_context(patch.object(ci, 'provision_npm'))
+            stack.enter_context(patch.object(ci, 'pm_setup_phase'))
+            stack.enter_context(patch.object(ci, 'python', return_value=sys.executable))
             stack.enter_context(patch.object(ci, 'resolve_local_toolchain'))
             stack.enter_context(patch.object(ci, 'provision_rg'))
             run = stack.enter_context(patch.object(ci, 'run'))

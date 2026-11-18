@@ -15,10 +15,13 @@ def test_private_turn_cannot_create_relay_host_or_shared_metrics(monkeypatch):
 
     monkeypatch.setattr(relay_runtime, "current_profile_key", unexpected_profile_lookup)
     registry = relay_runtime.RelayHostRegistry()
+    monkeypatch.setattr(relay_shared_metrics, "_consent_reconcile_done", False)
     with incognito_scope():
         assert registry.for_profile() is None
         assert not relay_runtime.relay_instrumentation_enabled()
         assert not relay_shared_metrics.enabled()
+        relay_shared_metrics.observe_lifecycle("session:start")
+        assert not relay_shared_metrics._consent_reconcile_done
     assert not registry._hosts
 
 

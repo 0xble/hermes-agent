@@ -17,7 +17,7 @@ from gateway.session import SessionSource
 @pytest.mark.parametrize("reload", [False, True], ids=["cold-start", "forced-reload"])
 @pytest.mark.parametrize("action", ["skip", "rewrite"])
 async def test_first_ingress_enforces_policy_after_discovery(monkeypatch, reload, action):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
     if reload:
@@ -90,7 +90,7 @@ async def test_first_ingress_enforces_policy_after_discovery(monkeypatch, reload
 
 @pytest.mark.asyncio
 async def test_reload_starting_after_ready_probe_cannot_expose_empty_policy(monkeypatch):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
     manager._discovered = manager._discovery_complete = True
@@ -126,7 +126,7 @@ async def test_reload_starting_after_ready_probe_cannot_expose_empty_policy(monk
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["timeout", "load-error"])
 async def test_incomplete_discovery_does_not_authorize_ingress(monkeypatch, failure):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
 
@@ -150,8 +150,8 @@ async def test_incomplete_discovery_does_not_authorize_ingress(monkeypatch, fail
 
 
 def test_startup_refuses_worker_that_exits_incomplete(monkeypatch):
-    import hermes_cli.plugins as plugins
-    import gateway.relay as relay
+    from hermes_cli import plugins
+    from gateway import relay
 
     class FailedThread:
         alive = True
@@ -181,7 +181,7 @@ def test_startup_refuses_worker_that_exits_incomplete(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_ready_registry_waits_off_loop_for_contended_lock_without_busy_spin(monkeypatch):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
     manager._discovered = manager._discovery_complete = True
@@ -250,7 +250,7 @@ async def test_ready_registry_waits_off_loop_for_contended_lock_without_busy_spi
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["timeout", "lock-error"])
 async def test_ready_registry_contention_timeout_refuses_policy_without_repeated_hops(monkeypatch, failure):
-    import hermes_cli.plugins as plugins
+    from hermes_cli import plugins
 
     manager = plugins.PluginManager()
     manager._discovered = manager._discovery_complete = True

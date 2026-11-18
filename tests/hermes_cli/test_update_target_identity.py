@@ -130,7 +130,9 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
     local_work = local.read_bytes() + b'# local work\n'
     if case.startswith('fork-late'):
         local.write_bytes(local_work)
-    run = subprocess.run
+    from hermes_cli import update_custody
+
+    run, real_git = subprocess.run, update_custody.run_git
     pushes = []
 
     def _upstream_sha():
@@ -139,9 +141,10 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
                     capture_output=True, text=True, encoding='utf-8')
         return found.stdout.strip() or '<no upstream>'
 
-    def fault(command, *args, **kwargs):
+    def fault(git_cmd, git_args, **kwargs):
+        command = [*git_cmd, *git_args]
         assert Path(command[0]).name.lower() in {'git', 'git.exe'} or command[0] == sys.executable, command
-        assert Path(kwargs['cwd']).resolve() in {t.clone, t.origin}, command
+        assert Path(kwargs.get('cwd') or os.getcwd()).resolve() in {t.clone, t.origin}, command
         # The upstream sync's tree move (`pull upstream main` on older updaters, a local merge of
         # the commit resolved from `refs/remotes/upstream/main` now, m2) vs the origin fast-forward.
         upstream_move = ('pull' in command or 'merge' in command) and (
@@ -150,13 +153,13 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
         if 'merge' in command and '--ff-only' in command and not upstream_move:
             if case == 'no-move':
                 return subprocess.CompletedProcess(command, 0, stdout='', stderr='')
-            result = run(command, *args, **kwargs)
+            result = real_git(git_cmd, git_args, **kwargs)
             if case in {'wrong-branch', 'fork-upstream-wrong-branch'}:
                 run(['git', 'checkout', '-qb', 'wrong'], cwd=t.clone, check=True, capture_output=True)
             if case == 'fork-upstream-reverted':
                 run(['git', 'reset', '--hard', t.base], cwd=t.clone, check=True, capture_output=True)
             return result
-        result = run(command, *args, **kwargs)
+        result = real_git(git_cmd, git_args, **kwargs)
         if upstream_move and case.startswith('fork-late'):
             if case.endswith('wrong-branch'):
                 run(['git', 'checkout', '-qb', 'wrong'], cwd=t.clone, check=True, capture_output=True)
@@ -166,7 +169,7 @@ def test_branch_update_uses_real_refs_and_completion_request(update_tree, monkey
             pushes.append(result.returncode)
         return result
 
-    monkeypatch.setattr(subprocess, 'run', fault)
+    monkeypatch.setattr(update_custody, 'run_git', fault)
     fails = case in {'missing', 'check-missing', 'no-move', 'wrong-branch',
                      'fork-upstream-wrong-branch', 'fork-upstream-reverted',
                      'fork-late-wrong-branch', 'fork-late-reverted'}
@@ -229,11 +232,13 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
         git(t.origin, 'branch', 'retained-branch', t.newer)
         t.args.branch = 'retained-branch'
         expected = t.newer
-    run = subprocess.run
+    from hermes_cli import update_custody
+
+    real_git = update_custody.run_git
     calls = []
 
-    def guarded_run(command, *args, **kwargs):
-        command = list(map(str, command))
+    def guarded_run(git_cmd, git_args, **kwargs):
+        command = list(map(str, [*git_cmd, *git_args]))
         assert Path(command[0]).name.lower() in {'git', 'git.exe'}, command
         cwd = Path(kwargs.get('cwd', os.getcwd())).resolve()
         assert cwd in {t.clone, t.origin}, (command, cwd)
@@ -241,9 +246,9 @@ def test_stable_git_uses_remote_identity_without_moving_local_tags(update_tree, 
         calls.append(command)
         if 'fetch' in command and t.wanted in command and server == 'fetch-refused':
             return subprocess.CompletedProcess(command, 128, stdout='', stderr='fixture: raw SHA wants disabled')
-        return run(command, *args, **kwargs)
+        return real_git(git_cmd, git_args, **kwargs)
 
-    monkeypatch.setattr(subprocess, 'run', guarded_run)
+    monkeypatch.setattr(update_custody, 'run_git', guarded_run)
     if server == 'fetch-refused':
         with pytest.raises(SystemExit) as error:
             cli_main.cmd_update(t.args)
@@ -365,7 +370,7 @@ def test_stable_zip_consumes_the_same_commit_through_the_real_swap(update_tree, 
         (t.clone / 'content.txt').write_text('local work\n', encoding='utf-8')
     before = (t.clone / 'content.txt').read_bytes()
     monkeypatch.setattr(urllib.request, 'urlopen', local_open)
-    monkeypatch.setattr(subprocess, 'run', guarded_run)
+    monkeypatch.setattr(update_custody, 'run_git', guarded_run)
     monkeypatch.setattr(update_custody, 'run', guarded_custody_run)
     try:
         if transport == 'dirty':

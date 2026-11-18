@@ -11,7 +11,7 @@ import os
 import json
 import re
 import stat
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from typing import Any, Iterable
 
 
@@ -69,7 +69,7 @@ def _write_observations(args: Any, blocked: list[str]) -> None:
     home = get_hermes_home()
     home.mkdir(parents=True, exist_ok=True)
     operations = list(_operations(args))
-    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+    timestamp = datetime.now(UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
     home_fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY)
     try:
         try:

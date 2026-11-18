@@ -35,7 +35,7 @@ async def handover_stop_polling(adapter) -> dict[str, object]:
                 label="telegram handover updater.stop()")
         remaining = max(0.0, deadline - asyncio.get_running_loop().time())
         await asyncio.wait_for(_wait_for_dispatch_settle(adapter, app), timeout=remaining)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return {"settled": False, "reason": "telegram updates did not settle before updater stop deadline"}
     except Exception as exc:
         logger.warning("Telegram handover polling stop failed: %s", exc, exc_info=True)

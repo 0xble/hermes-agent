@@ -235,7 +235,7 @@ def cmd_fallback_clear(args) -> None:
     print("\n  Fallback chain cleared.\n")
 
 
-def cmd_fallback_status(args) -> None:  # noqa: ARG001
+def cmd_fallback_status(args) -> None:
     """Show active shared primary-model cooldowns (``hermes fallback status`` / ``cooldowns``)."""
     from datetime import datetime
     from agent.shared_primary_cooldown import list_cooldowns

@@ -14,7 +14,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 from hermes_cli.config import DEFAULT_CONFIG, cfg_get
-from tools import browser_tool_lifecycle as bt_lifecycle
+from tools import browser_session_lifecycle as bt_lifecycle
 
 def _make_runner():
     """Create a minimal GatewayRunner with just the cache infrastructure."""
@@ -176,7 +176,7 @@ class TestExtractCacheBustingConfig:
         """The MemoryManager reads these at agent build, so changing either must rebuild the agent."""
         from gateway.run import GatewayRunner
 
-        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)[f"memory.{key}"]  # noqa: E731
+        sig = lambda cfg: GatewayRunner._extract_cache_busting_config(cfg)[f"memory.{key}"]
         assert sig({}) == sig({"memory": {key: DEFAULT_CONFIG["memory"][key]}}) == DEFAULT_CONFIG["memory"][key]
         assert sig({"memory": {key: other}}) == other != sig({})
 

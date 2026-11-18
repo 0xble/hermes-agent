@@ -2,8 +2,7 @@
 
 A still-live host PID is re-attached and stays running. A confirmed start-time
 mismatch means the PID was reused: the old entry is closed and that PID is not
-signalled. A gone PID is pruned. A completion is queued only when a real exit
-status was collected.
+signalled. A gone PID is retained with an explicitly unknown exit status and completion.
 """
 
 import json
@@ -122,7 +121,7 @@ class TestCheckpointReadopt:
                 proc.kill()
                 proc.wait()
 
-    def test_gone_pid_is_pruned_without_a_false_completion(self, registry):
+    def test_gone_pid_is_retained_with_an_unknown_completion(self, registry):
         session = ProcessSession(
             id="proc_gone",
             command="already-dead",
@@ -140,9 +139,11 @@ class TestCheckpointReadopt:
         polled = registry.poll(session.id)
 
         assert session.id not in registry._running
-        assert all(row["session_id"] != session.id for row in listed)
-        assert polled["status"] == "not_found"
-        assert _completions(registry) == []
+        assert any(row["session_id"] == session.id for row in listed)
+        assert polled["status"] == "exited"
+        assert polled["exit_code"] is None
+        event, = _completions(registry)
+        assert event["termination_source"] == "checkpoint.exit_uncollected"
 
     def test_recover_reattaches_live_pid_when_start_probe_fails(
         self, registry, tmp_path, monkeypatch

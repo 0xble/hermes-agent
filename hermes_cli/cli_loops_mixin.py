@@ -84,6 +84,54 @@ _SELF_INJECTED_TURN_PREFIXES = (
 )
 
 
+def _is_explicit_synthetic_turn(text: Any) -> bool:
+    """Classify only runtime-marked CLI injections, never user-authored slash text.
+
+    ``_is_self_injected_turn`` intentionally also recognizes broad notification prose for goal
+    revival. Failure provenance needs the narrower contract: process/delegation rows carry the
+    ``TimelineNotification`` type, while autonomous goal/loop/heartbeat turns carry exact generated
+    prefixes.
+    """
+    try:
+        from tools.process_registry_notifications import TimelineNotification
+    except ImportError:
+        TimelineNotification = None
+    if TimelineNotification is not None and isinstance(text, TimelineNotification):
+        return True
+    if not isinstance(text, str):
+        return False
+    try:
+        from hermes_cli.goals import is_goal_continuation_text
+        from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX
+        from hermes_cli.loops import WAKEUP_PROMPT_PREFIX
+    except ImportError:
+        logging.getLogger(__name__).debug(
+            "synthetic-turn markers unavailable; treating turn as user-initiated", exc_info=True)
+        return False
+    if is_goal_continuation_text(text):
+        return True
+    return text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
+
+
+def _turn_origin_for_cli_message(text: Any) -> str:
+    """Match gateway provenance using the CLI's runtime markers, not message wording."""
+    try:
+        from tools.process_registry_notifications import TimelineNotification
+        if isinstance(text, TimelineNotification):
+            return "process"
+        from hermes_cli.goals import is_goal_continuation_text
+        from hermes_cli.heartbeat import HEARTBEAT_PROMPT_PREFIX
+        from hermes_cli.loops import WAKEUP_PROMPT_PREFIX
+        if isinstance(text, str) and (
+            is_goal_continuation_text(text)
+            or text.lstrip().startswith((HEARTBEAT_PROMPT_PREFIX, WAKEUP_PROMPT_PREFIX))
+        ):
+            return "goal_loop"
+    except ImportError:
+        logging.getLogger(__name__).debug("CLI turn-origin markers unavailable", exc_info=True)
+    return "user"
+
+
 def _is_self_injected_turn(text: Any) -> bool:
     # Standing-goal prompt forms are registered centrally; the remaining frames are
     # runtime-specific notifications that never represent user input.
@@ -269,9 +317,12 @@ class CLILoopsMixin:
             else t("cli.undo.removes_last_turns", count=_undo_n))
         if self._confirm_destructive_slash("undo", _undo_desc, cmd_original=cmd_original) is None:
             return True  # confirmation cancelled — command handled, keep REPL alive
+        before = list(self.conversation_history)
         turns_undone = self.undo_last(_undo_n)
         if turns_undone:  # None when nothing was rewound
             self._record_model_friction("undo", turns_undone)
+            from hermes_cli.cli_undo_hint import print_undo_rollback_hint
+            print_undo_rollback_hint(self, before, turns_undone)
 
     def _cmd_skills(self, cmd_original: str):
         with self._busy_command(self._slow_command_status(cmd_original)):
@@ -306,6 +357,13 @@ class CLILoopsMixin:
 
     def _cmd_plugins(self, cmd_original: str):
         from hermes_constants import display_hermes_home
+        parts = cmd_original.split()[1:]
+        if parts and parts[0] in ("update", "auto-update"):
+            from hermes_cli.plugins_auto_update import plugins_slash_action
+            with self._busy_command(self._slow_command_status(cmd_original)):
+                for line in plugins_slash_action(parts):
+                    print(line)
+            return
         try:
             # Discover from disk (bundled + user) like `hermes plugins list`, so
             # installed-but-not-enabled plugins show up; the plugin manager only knows
@@ -695,6 +753,7 @@ class CLILoopsMixin:
         if getattr(self, "_heartbeat_watchdog_started", False):
             return
         self._heartbeat_watchdog_started = True
+        from hermes_cli.gateway_automation import GatewayHeartbeatManager
         from hermes_cli.heartbeat import POLL_SECONDS
 
         def _loop():
@@ -703,6 +762,10 @@ class CLILoopsMixin:
                     time.sleep(POLL_SECONDS)
                     try:
                         mgr = self._get_heartbeat_manager()
+                        if isinstance(mgr, GatewayHeartbeatManager):
+                            # The gateway poller stands down while this watchdog runs, so a resume,
+                            # set or re-anchor from another viewer must reach this copy.
+                            mgr.refresh()
                         if mgr is None or not mgr.is_active():
                             continue
                         busy = (
@@ -933,8 +996,30 @@ class CLILoopsMixin:
 
         last_response, successful = self._post_turn_response()
         if not successful or getattr(self, "_last_turn_failed", False):
+            # A user turn starts a fresh retry budget; never let an earlier continuation's failure
+            # suppress the visible notice or consume this continuation's one retry.
+            if getattr(self, "_goal_turn_user_initiated", True):
+                self._goal_failed_retry_count = 0
+            # A failed goal continuation is an internal work item, not a user request. Preserve
+            # the active goal and retry its generated prompt once the current failure is settled;
+            # never print the generic resend boundary as the continuation's answer.
+            # Only a goal continuation is retried here. Process notifications and heartbeat/loop
+            # wakeups have their own gateway scheduling semantics; feeding them a fresh goal prompt
+            # would turn a failed notification into unrelated goal work.
+            if (
+                getattr(self, "_last_turn_origin", "user") == "goal_loop"
+                and getattr(self, "_last_turn_is_goal_continuation", False)
+                and not getattr(self, "_last_turn_interrupted", False)
+                and getattr(self, "_last_turn_failed", False)
+                and getattr(self, "_goal_failed_retry_count", 0) < 1
+            ):
+                self._goal_failed_retry_count = getattr(self, "_goal_failed_retry_count", 0) + 1
+                prompt = mgr.next_continuation_prompt()
+                if prompt:
+                    getattr(self, "_pending_input").put(prompt)
             return
         _active_deleg = 0
+        self._goal_failed_retry_count = 0
         try:
             from hermes_cli.goals import count_active_delegations, gather_background_processes as _gather_bg
             # Only THIS session's processes: subagents' pollers must not park the parent's goal.

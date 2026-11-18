@@ -48,7 +48,10 @@ def _build_rig(monkeypatch, tmp_path, request, surface_a, mode):
         home.mkdir(parents=True)
         (home / "config.yaml").write_text(
             f"delegation:\n  surface_child_process_notifications: {str(surface).lower()}\n"
-            f"display:\n  background_process_notifications: {mode}\n",
+            f"display:\n  background_process_notifications: {mode}\n"
+            # Every leg opens a fresh profile state.db; its schema DDL's fsyncs were most of this
+            # file's wall time and the 300s file budget on a loaded host. Durability is not under test.
+            "database:\n  synchronous: \"OFF\"\n",
         )
         homes[name] = home
 
@@ -192,7 +195,7 @@ async def test_process_watcher_follows_the_owning_profile(
             clock.setattr(asyncio, "sleep", tick)
             await rig.runner._run_process_watcher(leg.watcher)
         own_profile_surfaces = surface_a if leg.name == "a" else not surface_a
-        expected_admissions = int(leg.surfaced and path == "agent" and mode != "off")
+        expected_admissions = int(leg.surfaced and path == "agent")
         expected_sends = 0
         if leg.surfaced and path == "raw":
             if mode == "all":

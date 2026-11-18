@@ -9,7 +9,7 @@ import pytest
 from pm.environment import managed_environment
 from pm import plugins_state, workspace
 from plugins import memory
-from tests.pm.test_environment_build import locked_project as locked_project
+from tests.pm.test_environment_build import locked_project
 
 
 def _provider(root, name, dependency):

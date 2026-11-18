@@ -21,6 +21,7 @@ time is positive proof the turn never finished. Contract pinned here:
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import multiprocessing
 import os
 import subprocess
@@ -40,9 +41,24 @@ from tui_gateway.turn_marker import (
     record_turn_start,
 )
 
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
+
+
+_REAL_THREAD = threading.Thread
+
 
 class _InlineThread:
-    """Run threads synchronously so tests observe final state."""
+    """Run threads synchronously so tests observe final state.
+
+    ``server.threading`` is the global ``threading`` module, so this patch reaches every caller,
+    including the state.db write-stall watchdog's helper supervisor, which blocks on its child for the
+    process lifetime. That one thread stays real, as in production; inlining it deadlocks the first
+    state.db write on macOS."""
+
+    def __new__(cls, target=None, *args, **kwargs):
+        if getattr(target, "__module__", None) == "hermes_state_write_stalls":
+            return _REAL_THREAD(target=target, *args, **kwargs)
+        return super().__new__(cls)
 
     def __init__(self, target=None, daemon=None, args=(), kwargs=None, name=None):
         self._target = target
@@ -100,7 +116,7 @@ def marker_home(monkeypatch, tmp_path):
 @pytest.fixture()
 def turn_env(monkeypatch, tmp_path, marker_home):
     """Neutralize the turn pipeline's environment-heavy side paths."""
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)
     monkeypatch.setattr(server, "_session_cwd", lambda session: str(tmp_path))
@@ -396,7 +412,7 @@ def test_older_agent_still_gets_the_post_turn_stamp(emits, turn_env, marker_home
 
 @pytest.fixture()
 def schedule_env(monkeypatch, marker_home):
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_start_agent_build", lambda sid, session: None)
     monkeypatch.setattr(server, "_wait_agent", lambda session, rid, timeout=30.0: None)
     monkeypatch.setattr(server, "_load_cfg", dict)

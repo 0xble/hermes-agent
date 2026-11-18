@@ -103,7 +103,7 @@ def test_prune_under_the_live_owner_is_applied_by_the_owner_not_refused(owned_st
     monkeypatch.setattr(gateway_client, 'connect_gateway', owner_socket)
     monkeypatch.setattr(hermes_state, 'SessionDB', recording_db)
     args = Namespace(sessions_action='prune', dry_run=False, yes=True, force=False, never_active=False,
-                     include_archived=False, include_pinned=False,
+                     include_archived=False, include_pinned=False, now=True,
                      **{name: None for name in sessions_cmd._FILTER_ARGS})
     args.older_than = '90'
     try:

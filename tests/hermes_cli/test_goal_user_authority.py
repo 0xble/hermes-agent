@@ -76,7 +76,7 @@ def test_cross_session_approval_is_authoritative_and_keeps_reply_quote(hermes_ho
     target_db = _db(target)
     sender_db.set_session_title(sender, "Approval chat")
     mgr = GoalManager(target)
-    state = mgr.set("send one clearly marked test message only after Brian approves")
+    _state = mgr.set("send one clearly marked test message only after Brian approves")
     sender_db.append_message(
         sender, "user", '[Replying to: "Allow one clearly marked test message for the acknowledgement proof"]\n\nYes'
     )

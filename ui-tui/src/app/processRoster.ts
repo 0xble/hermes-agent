@@ -15,6 +15,7 @@ export interface ProcessEntry {
   exit_code?: number | null
   exited_at?: number | null
   completion_reason?: string | null
+  termination_source?: string | null
   output_preview?: string
 }
 
@@ -50,7 +51,21 @@ export const processStatus = (entry: ProcessEntry): ProcessRow['status'] => {
     return 'running'
   }
 
-  return REASON_STATUS[entry.completion_reason ?? ''] ?? (entry.exit_code ? 'failed' : 'done')
+  const knownReason = REASON_STATUS[entry.completion_reason ?? '']
+
+  if (knownReason) {
+    return knownReason
+  }
+
+  if (
+    entry.exit_code == null ||
+    entry.termination_source === 'checkpoint.exit_uncollected' ||
+    entry.termination_source === 'survivor_lost'
+  ) {
+    return 'lost'
+  }
+
+  return entry.exit_code === 0 ? 'done' : 'failed'
 }
 
 const lastOutputLine = (preview: string | undefined): string => {
@@ -70,7 +85,12 @@ export const processVerdict = (row: ProcessRow, exitCode: number | null | undefi
     return row.detail ? `last: ${row.detail}` : 'starting'
   }
 
-  const verdict = row.status === 'killed' || row.status === 'lost' ? row.status : `exit ${exitCode ?? '?'}`
+  const verdict =
+    row.status === 'lost'
+      ? 'finished, exit status unknown'
+      : row.status === 'killed'
+        ? row.status
+        : `exit ${exitCode ?? '?'}`
 
   return `${verdict} · ${row.sinceExitSeconds}s ago`
 }

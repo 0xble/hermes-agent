@@ -29,13 +29,13 @@ sys.modules.setdefault("telegram", _tg)
 sys.modules.setdefault("telegram.constants", _tg.constants)
 sys.modules.setdefault("telegram.ext", types.ModuleType("telegram.ext"))
 
-from gateway.platforms.base import Platform, SessionSource, build_session_key  # noqa: E402
-from gateway.platforms.event import (  # noqa: E402
+from gateway.platforms.base import Platform, SessionSource, build_session_key
+from gateway.platforms.event import (
     GOAL_CONTINUATION_METADATA_KEY,
     MessageEvent,
     MessageType,
 )
-from gateway.run import GatewayRunner  # noqa: E402
+from gateway.run import GatewayRunner
 
 _SOURCE = SessionSource(platform=Platform.TELEGRAM, chat_id="123", chat_type="dm", user_id="user1",
                         thread_id="311556")

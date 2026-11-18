@@ -695,6 +695,10 @@ class AnthropicStreamAccumulator:
                 block["input"] = partial
         return {**self._message, "content": blocks}
 
+    def argument_chars(self) -> int:
+        """Return the streamed JSON argument size for incomplete tool blocks."""
+        return sum(len(str(block.get("_partial_json") or "")) for block in self._blocks.values())
+
     def response(self, base: Any = None) -> Any:
         """Return the attribute-shaped response consumed by Hermes."""
         assembled = self.finalize()

@@ -52,6 +52,17 @@ class WorkerPersistenceError(RuntimeError):
     pass
 
 
+class GatewayHandshakeTimeout(TimeoutError):
+    """A timeout during the pre-send gateway handshake, with its phase typed."""
+
+    def __init__(self, phase, detail=None):
+        self.phase = phase
+        message = f"gateway handshake timed out ({phase})"
+        if detail:
+            message += f": {detail}"
+        super().__init__(message)
+
+
 def _caller_summary(limit=8):
     """module:function:line of the frames above this store (its own frames skipped), never
     locals or argument values: best-effort callers swallow the guard's raise (#139029)."""
@@ -137,6 +148,16 @@ def _owner_transition_error(exc):
     }
 
 
+def _handshake_call(phase, call):
+    """Name a pre-send gateway handshake timeout before owner retry classification."""
+    try:
+        return call()
+    except TimeoutError as exc:
+        if isinstance(exc, GatewayHandshakeTimeout):
+            raise
+        raise GatewayHandshakeTimeout(phase, str(exc)) from exc
+
+
 class WorkerRPC:
     """Bounded authenticated calls to an existing owner; never starts a daemon.
 
@@ -183,11 +204,18 @@ class WorkerRPC:
         from websockets.sync.client import connect
         # A served secondary has no socket; its multiplexer's descriptor names it.
         from hermes_cli.gateway_runtime import discover_gateway_endpoint
-        discovery = discover_gateway_endpoint(self.home, timeout=_connection_budget(deadline))
+        discovery = _handshake_call(
+            "discover",
+            lambda: discover_gateway_endpoint(self.home, timeout=_connection_budget(deadline)),
+        )
         if discovery.reason_code == 'client_owned':
             from hermes_cli.gateway_worker_discovery import discover_worker_gateway_endpoint
-            discovery = discover_worker_gateway_endpoint(self.home, self.worker_scope,
-                                                         timeout=_connection_budget(deadline))
+            discovery = _handshake_call(
+                "discover",
+                lambda: discover_worker_gateway_endpoint(
+                    self.home, self.worker_scope, timeout=_connection_budget(deadline)
+                ),
+            )
         if discovery.state == 'ready' and discovery.endpoint is not None:
             self.endpoint = discovery.endpoint
         elif discovery.state != 'draining' or self.endpoint is None:
@@ -202,16 +230,38 @@ class WorkerRPC:
             raise WorkerPersistenceError('owner_unavailable')
         from hermes_cli.gateway_runtime import control_home_for
         endpoint = self.endpoint
-        descriptor = query_identify(control_home_for(self.home, endpoint), timeout=_connection_budget(deadline))
+        descriptor = _handshake_call(
+            "identify",
+            lambda: query_identify(
+                control_home_for(self.home, endpoint), timeout=_connection_budget(deadline)
+            ),
+        )
         if descriptor.get('pid') == os.getpid():
             raise WorkerPersistenceError('synchronous_self_rpc')
-        ticket = _session_ticket(self.home, endpoint, purpose='worker-adoption', timeout=_connection_budget(deadline))
+        ticket = _handshake_call(
+            "ticket",
+            lambda: _session_ticket(
+                self.home, endpoint, purpose='worker-adoption', timeout=_connection_budget(deadline)
+            ),
+        )
         url, protocols = gateway_ws_target(endpoint, ticket)
         # The owner is loopback, like connect_gateway's peer: an inherited HTTPS_PROXY must not carry it.
         # No library keepalive: its pong deadline would run independently of (and could fail) a call
         # inside its receipt budget; that budget and the observed close are the liveness checks.
-        self.link = _OwnerLink(connect(url, subprotocols=protocols, open_timeout=_connection_budget(deadline), close_timeout=1,
-                                       max_size=8 * 1024 * 1024, proxy=None, ping_interval=None))
+        self.link = _OwnerLink(
+            _handshake_call(
+                "connect",
+                lambda: connect(
+                    url,
+                    subprotocols=protocols,
+                    open_timeout=_connection_budget(deadline),
+                    close_timeout=1,
+                    max_size=8 * 1024 * 1024,
+                    proxy=None,
+                    ping_interval=None,
+                ),
+            )
+        )
         return self.link
 
     def _drop(self):
@@ -314,9 +364,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             raise WorkerPersistenceError('outbox_in_use')
         try:
             if self.path.exists():
-                if self.path.stat().st_size > max_bytes:
-                    raise WorkerPersistenceError('outbox_full')
-                self.journal = json.loads(self.path.read_text(encoding="utf-8-sig"))
+                from agent.runtime_session_journal import read_journal
+                self.journal = read_journal(self.path, max_bytes)
                 reconciled = self.journal['scope'] != self.scope
                 if reconciled:
                     self._reconcile_adopted(adopted)
@@ -367,21 +416,14 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self.journal = candidate
 
     def _save(self, journal):
-        if self._outbox_owner.closed:
-            raise WorkerPersistenceError('outbox_closed')
-        encoded = json.dumps(journal, ensure_ascii=True, allow_nan=False, separators=(',', ':')).encode()
-        if len(encoded) > self.max_bytes:
-            self.failure = 'outbox_full'
-            raise WorkerPersistenceError(self.failure)
-        from utils import atomic_write_bytes
-        # Owner-only journal (the dir is 0700 too); the rename and its directory entry are durable.
-        atomic_write_bytes(self.path, encoded, tmp_prefix='.pending-', mode=0o600, fsync_dir=True)
+        from agent.runtime_session_journal import save_journal
+        save_journal(self, journal)
 
     def _session(self, session_id):
         if session_id != self.scope['session_id']:
             raise WorkerPersistenceError('permission_denied')
 
-    def _apply(self, operation, payload):
+    def _apply(self, operation, payload, *, best_effort=False):
         with self.lock:
             if self.failure:
                 raise WorkerPersistenceError(self.failure)
@@ -391,8 +433,16 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             candidate = json.loads(json.dumps(self.journal))
             candidate['pending'].append(json.loads(json.dumps(entry, allow_nan=False)))
             candidate['next_sequence'] += 1
+            from agent.runtime_session_journal import OutboxCapacityError, check_worker_frame
             try:
+                check_worker_frame(self.scope, candidate['pending'][-1])
                 self._save(candidate)
+            except OutboxCapacityError:
+                # Only explicitly optional archives may skip an unsent rejection. Mandatory
+                # append callers can swallow errors: retain the failure for flush/finish.
+                if not best_effort:
+                    self.failure = 'outbox_full'
+                raise
             except Exception as exc:
                 self.failure = str(exc)
                 raise
@@ -438,6 +488,15 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
             self.scope = candidate['scope']
             self.journal = candidate
             self.failure = None
+
+    def append_message(self, session_id, role, content=None, *, archived=False,
+                       compression_lock_holder=None, turn_lease_holder=None,
+                       turn_lease_ttl_seconds=300.0, **metadata):
+        self._session(session_id)
+        payload = dict(metadata, role=role, content=content, archived=archived,
+            compression_lock_holder=compression_lock_holder, turn_lease_holder=turn_lease_holder,
+            turn_lease_ttl_seconds=turn_lease_ttl_seconds)
+        return self._apply('transcript.append_one', payload)['row_id']
 
     def append_messages_batch(self, session_id, messages, compression_lock_holder=None,
                               turn_lease_holder=None, chunk_rows=None, turn_lease_ttl_seconds=300.0):
@@ -568,8 +627,8 @@ class RuntimeSessionStore(RuntimeSessionCompressionMixin, RuntimeSessionLifecycl
         self._apply('session.sidecars', {'patch': patch})
 
     def update_session_tool_names(self, session_id, pin):
-        # The tools[] freeze pin ({"version", "tools"}; None clears): without it every fresh worker
-        # re-probes check_fns and a config flip between turns silently forks the cached prefix.
+        # The tools[] freeze pin ({"version", "tools"[, "delegation_backend"]}; None clears): without it every
+        # fresh worker re-probes check_fns and a config flip between turns silently forks the cached prefix.
         self._session(session_id)
         self._apply('session.tools', {'tool_names': pin})
 

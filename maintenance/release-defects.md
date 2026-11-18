@@ -1,5 +1,7 @@
 # Upstream release defects
 
+**Patch identity:** `release-defects`.
+
 Load this unit before changing any file named in a section's guard or description
 below, when a sync review finds a defect in upstream or fork code, and when deciding
 whether a fix here can retire because upstream now carries an equivalent. Current
@@ -90,7 +92,7 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 ## Billing outage persistence and provider-wide classification
 
 - Fork patch identity: `billing-outage-recovery`.
-- A provider/account billing or rate-limit failure must retain the failed user turn, avoid the context-overflow auto-reset path, and classify provider-wide proxy `auth_unavailable` envelopes into the existing shared cooldown/fallback route. Explicit 5xx overload/529 signals arm the same breaker before local backoff. Generic server faults and request-specific validation/context failures do not create shared outages.
+- A provider/account billing or rate-limit failure must retain the failed user turn, avoid the context-overflow auto-reset path, and classify provider-wide proxy `auth_unavailable` envelopes into the existing shared cooldown/fallback route. The upstream suffix uses the shared rate-limit patterns, so CLIProxyAPI's `Rate limit exceeded` detail is a rate limit rather than generic 5xx overload; `usage_limit_reached` and other quota walls stay billing unless an explicit rate-limit phrase is present. A matched rate limit carries a reset when one is parseable. Explicit 5xx overload/529 signals arm the same breaker before local backoff. Generic server faults and request-specific validation/context failures do not create shared outages.
 - Both persistence layers share `is_context_overflow_reason`: known classifications are authoritative; only missing/unknown classifications may use the legacy large-400 growth guard. Proxy upstream text is considered only within a 5xx `auth_unavailable` envelope's `last upstream error:` suffix, before generic provider-profile status verdicts.
 - Guard: run `scripts/run_tests.sh` one file at a time for `tests/gateway/test_billing_failure_transcript.py`, `tests/agent/test_billing_proxy_error_classification.py`, and `tests/agent/test_billing_outage_shared_cooldown.py`. The latter drives two separate `AIAgent.run_conversation` processes against a loopback provider with the same `HERMES_HOME`; agent B makes no primary call after A records billing 400, proxy billing/rate-limit 503, or explicit overload. Also run the existing classifier, shared-primary-cooldown, fallback-exhaustion, and transient-transcript tests.
 - Retire only when the released upstream passes these regressions without this patch. Roll back the code and focused tests together; no state migration or alternate cooldown store is introduced.
@@ -687,9 +689,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   the owner enabled background review on 2026-09-24, so `verify-hermes-fork`
   failed every day on a correct config. The key is no longer pinned. The
   remaining expectations guard fork behavior (`memory.write_approval`) or
-  required routing (`delegation.model`, `auxiliary.review.model`).
+  required routing (`auxiliary.review.model`, and a resolvable delegation route:
+  either legacy `delegation.model` or Advanced Delegation's
+  `delegation.backend: model_map` with a non-empty
+  `delegation.backends.model_map.default`).
 - Guard: `tests/scripts/test_candidate_scripts.py`
-  (`test_check_config_does_not_pin_background_review`).
+  (`test_check_config_does_not_pin_background_review`,
+  `test_check_config_accepts_legacy_delegation_model`,
+  `test_check_config_accepts_advanced_delegation_model_map`,
+  `test_check_config_rejects_missing_delegation_routes`).
 
 ## Live vault regression launched the user's branded Chrome
 
@@ -907,7 +915,13 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 - The public replace seam now forwards to the extracted bootstrap implementation, restoring
   the durable ownership-refusal stamp while retaining process-slot PID isolation. Its scoped-lock
   release uses the canonical source module, not the removed status export.
+  The refusal is a synchronous persistence checkpoint: it must not return to the CLI hard exit
+  while a slow disk write remains queued. A bounded wait can return false just before
+  `os._exit` kills the daemon writer, leaving the stale `running` record intact.
   Guard: the complete replace-ownership suite, including stamp durability and no-signal refusal.
+  The subprocess durability regression holds the writer until its caller waits and advances the
+  wait clock past the former deadline, then checks the real stamp after hard exit. It neither
+  races equal-duration sleeps nor weakens the persisted-state assertions.
 - Fork patch identity: `v0225-merge-integration`.
 - The Windows gateway checks the legacy venv's Python major/minor before processing
   its site-packages or .pth files. Missing version metadata refuses the overlay,
@@ -1323,3 +1337,24 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   `test_model_not_found_notice_absent_for_a_normally_finished_task` and
   `test_model_not_found_notice_counts_only_rejected_tasks`; `tests/tools/test_async_delegation.py`
   model-rejection notices (a real rejection that exhausts iterations still raises it).
+
+## TUI Launcher Banner Prefetch Lifetime
+
+- Fork patch identity: `cli-banner-prefetch-lifetime`.
+- `cmd_chat` started classic-banner git/update daemon threads even for the TUI,
+  which never displays that Python banner. A fast attachment handoff or refusal
+  could exit while `git rev-parse --short=8 HEAD` was running, orphaning the
+  subprocess and violating process ownership at launcher cleanup.
+- Skip both banner prefetches for TUI launches. Preserve bundled-skills sync on
+  both paths and classic-banner warming on the classic CLI. Do not weaken the
+  attachment probe or its live-process guard.
+- Guards: `tests/hermes_cli/test_chat_banner_prefetch.py`,
+  `tests/hermes_cli/test_tui_first_run_routing.py`, and the real-process
+  `tests/e2e/core/security/test_attach_handshake.py`.
+- Upstream guidance checked at `780d5a3313d7e1f64c0a0f3ec6b644d50f156e90`.
+  Related merged [PR #97280](https://github.com/NousResearch/hermes-agent/pull/97280)
+  suppresses background probes inside pytest, not in real launcher subprocesses.
+  No equivalent TUI-launch lifetime fix was found. This is an upstream-origin
+  bug fix suitable for contribution, with publication outside this local change.
+- Retire when upstream skips unused launcher prefetch or reaps every prefetch
+  child before launcher exit. Roll back the commit carrying this patch identity.

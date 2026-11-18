@@ -15,6 +15,7 @@ from gateway.config import GatewayConfig, Platform, PlatformConfig
 from gateway.response_filters import display_kind_for_event
 from gateway.run import GatewayRunner
 from gateway.run_turn import GatewayTurnMixin
+from gateway.run_config_loaders import GatewayConfigLoadersMixin
 from gateway.platforms.event import MessageEvent
 from gateway.session import SessionSource
 
@@ -258,7 +259,7 @@ async def test_full_background_gate_deferral_is_logged_once_per_interval(
     assert fired is not None and fired.ticks_fired == 1
 
 
-class _ShapeRunner(GatewayTurnMixin):
+class _ShapeRunner(GatewayTurnMixin, GatewayConfigLoadersMixin):
     def __init__(self):
         self.async_session_store = SimpleNamespace(clear_resume_pending=self._noop)
 

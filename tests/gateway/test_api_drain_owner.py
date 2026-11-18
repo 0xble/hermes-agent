@@ -34,6 +34,6 @@ def test_unbound_drain_check_retains_global_runner_fallback(monkeypatch, flags, 
     adapter = object.__new__(APIServerAdapter)
     adapter.gateway_runner = None
     gateway = ModuleType("gateway.run")
-    setattr(gateway, "_gateway_runner_ref", lambda: SimpleNamespace(**flags))
+    gateway._gateway_runner_ref = lambda: SimpleNamespace(**flags)
     monkeypatch.setitem(sys.modules, "gateway.run", gateway)
     assert adapter._gateway_is_draining() is expected

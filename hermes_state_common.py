@@ -11,11 +11,17 @@ import time
 from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
-from hermes_state_keys import CRON_PRINCIPAL_ID
+from hermes_state_keys import CRON_PRINCIPAL_ID, POLICY_PREFIX
+from hermes_state_session_signature import SESSION_SIGNATURE_TABLE_SQL, SESSION_SIGNATURE_TRIGGER_SQL
 from hermes_state_pidns import persistent_record_pidns_checkable, pid_namespace_id
 from agent.skill_commands import AUTO_LOAD_SCAFFOLD_SQL_LIKE, SKILL_EXCERPT_JOINT, SKILL_SCAFFOLD_SQL_LIKE, describe_skill_invocation
 from agent.context_compressor import (LEGACY_SUMMARY_PREFIX, SUMMARY_PREFIX, _MERGED_PRIOR_CONTEXT_HEADER,
     _MERGED_SUMMARY_DELIMITER, _SUMMARY_END_MARKER)
+
+
+# The held-media query and its partial index must share this exact predicate: SQLite's partial-index
+# matcher is textual and a harmless-looking rewrite would make the writer scan all admissions.
+HELD_MEDIA_WHERE = "status!='terminal' OR json_type(payload_json, '$.api_turn_v1.media') IS NOT NULL"
 
 
 # Persisted title provenance: automatic display labels are not user-selected identities.
@@ -86,6 +92,11 @@ def _sql_literal(text: str) -> str:
 # is exactly what distinguishes a never-drained accept row from a dispatched-then-interrupted
 # turn's row (which #123532 deliberately keeps active).
 QUEUED_PROMPT_METADATA_KEY = "_queued_prompt"
+
+
+# ``display_metadata = <this>`` merges a JSON object parameter into the column (its keys win, a null value
+# removes a key): a row-addressed rewrite must not wipe a key another writer added meanwhile (a reaction).
+_MERGE_DISPLAY_META = "json_patch(CASE WHEN json_valid(display_metadata) THEN display_metadata ELSE '{}' END, COALESCE(?, '{}'))"
 
 
 def _sql_json_extract(expression: str, path: str) -> str:
@@ -293,7 +304,8 @@ def _sql_session_last_active_by_id(session_id_expr: str) -> str:
 # (schema_read_probe_statements), never by this number, and its catch-up is the declarative
 # executescript(SCHEMA_SQL) + _reconcile_columns() every writable open already runs (additive,
 # idempotent). The bump only records that the declared shape changed; a new table or column needs no bump.
-SCHEMA_VERSION = 32
+# v33: data-only — re-tag delegate subagent rows that lost ``_delegate_from`` (see _run_data_migrations).
+SCHEMA_VERSION = 33
 
 # Auto-maintenance VACUUMs only above this freelist fraction; below it a rewrite costs more I/O than it returns.
 # Auto-maintenance only VACUUMs when at least this fraction of the database file is reclaimable (``PRAGMA
@@ -614,6 +626,15 @@ CREATE TABLE IF NOT EXISTS session_admissions (
 );
 CREATE INDEX IF NOT EXISTS session_admissions_pending
     ON session_admissions(target_session_id, status, seq);
+CREATE INDEX IF NOT EXISTS idx_session_admissions_held
+    ON session_admissions(seq) WHERE """ + HELD_MEDIA_WHERE + """;
+-- Worker adoption searches by generation/epoch and only ever considers started or unknown admissions.
+-- Keep terminal and queued history out of that writer-transaction candidate scan; the literal predicate
+-- is intentional because SQLite can only prove a parameterized status list satisfies a partial index at
+-- prepare time when the values are written into the SQL.
+CREATE INDEX IF NOT EXISTS idx_session_admissions_worker_adoption
+    ON session_admissions(generation, owner_epoch, status, seq)
+    WHERE status IN ('started', 'unknown');
 -- Cron run history finds a job's unified-runtime runs by the scheduler principal's request ids
 -- (``cron:<job>:<execution>``); without this a lookup walked
 -- every cron admission of every job. Partial: interactive turns, the bulk of admissions, pay
@@ -648,6 +669,10 @@ CREATE TABLE IF NOT EXISTS state_meta (
     key TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE INDEX IF NOT EXISTS idx_state_meta_local_policy_route ON state_meta(
+    (CASE WHEN json_valid(value) THEN json_extract(value, '$.entry.session_id') END),
+    (CASE WHEN json_valid(value) THEN json_extract(value, '$.route') END), key)
+    WHERE key GLOB '""" + POLICY_PREFIX + """*';
 
 CREATE TABLE IF NOT EXISTS gateway_routing (
     scope TEXT NOT NULL DEFAULT '',
@@ -834,7 +859,7 @@ CREATE INDEX IF NOT EXISTS idx_session_model_usage_session ON session_model_usag
 CREATE INDEX IF NOT EXISTS idx_session_model_usage_model ON session_model_usage(model);
 CREATE INDEX IF NOT EXISTS idx_async_delegations_delivery
     ON async_delegations(delivery_state, completed_at);
-"""
+""" + SESSION_SIGNATURE_TABLE_SQL
 
 # Indexes on later-added columns must run AFTER _reconcile_columns(), or executescript fails on legacy DBs.
 # sessions_runtime_ledger_delete_guard: every delete path in this release retires a session's ledger rows
@@ -859,6 +884,15 @@ BEGIN
     -- An in-place rewrite (prompt expansion, multimodal context, a redaction) moves neither the
     -- active row count nor the highest id; this write-side revision is what a transcript-derived
     -- cache keys on (conversation_revision). Whoever wrote the row, old builds included.
+    UPDATE sessions SET transcript_revision = transcript_revision + 1 WHERE id = new.session_id;
+END;
+DROP TRIGGER IF EXISTS messages_display_revision_update;
+CREATE TRIGGER IF NOT EXISTS messages_display_revision_update
+AFTER UPDATE OF codex_reasoning_items, codex_message_items, display_kind, display_metadata ON messages
+BEGIN
+    -- A reaction, a display rewrite or checkpoint pruning: a transcript poller's cursor
+    -- (transcript_cursor_state) keys on these too. Its own name, so an older build's open, which
+    -- recreates the trigger above with that build's column list, leaves this one in place.
     UPDATE sessions SET transcript_revision = transcript_revision + 1 WHERE id = new.session_id;
 END;
 CREATE INDEX IF NOT EXISTS idx_messages_session_active
@@ -974,7 +1008,7 @@ CREATE INDEX IF NOT EXISTS idx_sessions_effective_activity
 CREATE INDEX IF NOT EXISTS idx_sessions_local_created_started
     ON sessions(created_source, started_at DESC)
     WHERE source = 'local';
-"""
+""" + SESSION_SIGNATURE_TRIGGER_SQL
 
 
 # ── Deferred FTS rebuild bookkeeping (schema v23) ──
@@ -1193,12 +1227,6 @@ BEGIN
                   WHERE id = new.session_id AND {FTS_TRIGRAM_SESSION_SQL});
 END;
 """
-
-_FTS_CJK_TRIGGERS = ("messages_fts_cjk_insert", "messages_fts_cjk_delete", "messages_fts_cjk_update")
-
-# Set when a tokenizer-less process dropped the cjk triggers to keep writes alive: the cjk index is missing rows
-# and must not serve reads until `hermes sessions optimize-storage` rebuilds it on a capable host.
-FTS_CJK_STALE_KEY = "fts_cjk_stale"
 
 # Set when a base/trigram FTS index was detached after runtime corruption; startup must rebuild the complete
 # index before reinstalling sync triggers (rows written while they were absent leave an unknown gap).

@@ -7,6 +7,7 @@ import pytest
 from agent.redact import (
     clear_vault_date_components, has_vault_date_components, mark_vault_protected_tab,
 )
+from agent.vault_backends.local import LocalLoginBackend
 from agent.vault_store import VaultItemMeta
 from tools import browser_tool, browser_vault_tool
 from tools.browser_cdp_tool import browser_cdp
@@ -38,7 +39,7 @@ def test_protected_fill_refuses_shared_browser_before_resolving_secret(kind, mon
                          origin="https://example.com", created_at="", field_token="bday",
                          allowed_origins=("https://example.com",))
     backend = Mock(needs_unlock=False)
-    backend.get_meta.return_value = meta
+    backend.get_meta = Mock(return_value=meta)
     with patch("agent.vault_backends.backend_for_handle", return_value=backend):
         result = json.loads(browser_vault_tool.browser_vault_fill("fixture", task_id=task))
     assert result["error_type"] == "private_browser_required"
@@ -57,11 +58,10 @@ def test_local_owned_session_permits_protected_fill(monkeypatch):
     meta = VaultItemMeta(id="fixture", kind="protected_field", label="Birth date",
                          origin="https://example.com", created_at="", field_token="bday",
                          allowed_origins=("https://example.com",))
-    backend = Mock(display_name="1Password", needs_unlock=False,
-                   binds_cards_to_page=False)
+    backend = LocalLoginBackend()
     backend.name = "onepassword"
-    backend.get_meta.return_value = meta
-    backend.resolve_secret.return_value = {"value": "1990-04-12"}
+    backend.get_meta = Mock(return_value=meta)
+    backend.resolve_secret = Mock(return_value={"value": "1990-04-12"})
     monkeypatch.setattr(browser_tool, "_active_sessions", {task: {
         **session, "features": {"cdp_override": True}, "cdp_url": "ws://127.0.0.1:9222",
     }})
@@ -122,10 +122,10 @@ def test_hybrid_task_fills_only_the_checked_local_browser(monkeypatch):
     meta = VaultItemMeta(id="fixture", kind="protected_field", label="Birth date",
                          origin="https://example.com", created_at="", field_token="bday",
                          allowed_origins=("https://example.com",))
-    backend = Mock(display_name="1Password", needs_unlock=False, binds_cards_to_page=False)
+    backend = LocalLoginBackend()
     backend.name = "onepassword"
-    backend.get_meta.return_value = meta
-    backend.resolve_secret.return_value = {"value": "1990-04-12"}
+    backend.get_meta = Mock(return_value=meta)
+    backend.resolve_secret = Mock(return_value={"value": "1990-04-12"})
     try:
         with patch("agent.vault_backends.backend_for_handle", return_value=backend):
             result = json.loads(browser_vault_tool.browser_vault_fill("fixture", task_id=task))
@@ -166,10 +166,10 @@ def test_protected_fill_refuses_when_selected_browser_changes_before_write(monke
     meta = VaultItemMeta(id="fixture", kind="protected_field", label="Birth date",
                          origin="https://example.com", created_at="", field_token="bday",
                          allowed_origins=("https://example.com",))
-    backend = Mock(display_name="1Password", needs_unlock=False, binds_cards_to_page=False)
+    backend = LocalLoginBackend()
     backend.name = "onepassword"
-    backend.get_meta.return_value = meta
-    backend.resolve_secret.return_value = {"value": "1990-04-12"}
+    backend.get_meta = Mock(return_value=meta)
+    backend.resolve_secret = Mock(return_value={"value": "1990-04-12"})
     try:
         with patch("agent.vault_backends.backend_for_handle", return_value=backend), \
              patch.object(browser_vault_tool, "_focus_bound_origin", return_value=meta.origin), \

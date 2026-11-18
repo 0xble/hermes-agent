@@ -5,6 +5,10 @@ thousands of files per pass. On a nearly full APFS volume a daytime burst of del
 the volume's own reclamation, stalled every process writing to it (state.db included) for minutes
 on 2026-10-11. Both run only inside ``maintenance.deletion_window`` (local time, ``HH:MM-HH:MM``,
 may wrap midnight). An empty value allows any time.
+
+An operator's `hermes sessions prune` is held to the same window: on 2026-11-07 a daytime manual
+prune of a 107 GB state.db kept the live gateway's writers waiting for seconds at a time for five
+hours. It refuses outside the window unless the operator explicitly asks to run it now.
 """
 from __future__ import annotations
 
@@ -33,14 +37,28 @@ def window_contains(spec: object, at: datetime) -> bool:
     return start <= minute < end if start <= end else (minute >= start or minute < end)
 
 
-def deletion_window_open(at: Optional[datetime] = None) -> bool:
-    """Whether the active profile's deletion window is open now (or at *at*)."""
+def deletion_window_spec() -> object:
+    """The active profile's configured ``maintenance.deletion_window`` (default when unreadable)."""
     try:
         from hermes_cli.config import load_config_readonly
 
-        spec = (load_config_readonly().get("maintenance") or {}).get("deletion_window", DEFAULT_DELETION_WINDOW)
-    except Exception:
-        spec = DEFAULT_DELETION_WINDOW
+        return (load_config_readonly().get("maintenance") or {}).get("deletion_window", DEFAULT_DELETION_WINDOW)
+    except Exception:  # health: allow BLE001 -- an unreadable config keeps the documented default window
+        return DEFAULT_DELETION_WINDOW
+
+
+def deletion_window_refusal(override_hint: str) -> Optional[str]:
+    """Why a manual session prune may not start now, naming the window and *override_hint*
+    (the caller's explicit run-now switch); None while the window is open."""
+    if deletion_window_open():
+        return None
+    return (f"Prune deletes only in maintenance.deletion_window ({deletion_window_spec()} local). "
+            f"Preview with a dry run, wait, or {override_hint} to run now.")
+
+
+def deletion_window_open(at: Optional[datetime] = None) -> bool:
+    """Whether the active profile's deletion window is open now (or at *at*)."""
+    spec = deletion_window_spec()
     if at is None:
         import hermes_time
 

@@ -7,6 +7,10 @@
         "description": "Changed replacement text; it must differ from old_string. Pass empty string '' to delete the matched text.",
         "type": "string"
       },
+      "node": {
+        "description": "Named execution node from nodes.hosts. Omit to use nodes.default, or the legacy backend when no default is configured. Unknown or unavailable nodes never fall back.",
+        "type": "string"
+      },
       "old_string": {
         "description": "Exact text to find and replace. Must be unique in the file unless replace_all=true. Include surrounding context lines to ensure uniqueness.",
         "type": "string"

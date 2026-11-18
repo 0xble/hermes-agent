@@ -163,6 +163,8 @@ def _render_list(
         if item is None:
             continue
         content = _render_blocks(item.get("blocks"), state, depth + 2)
+        while content and not content[0]:
+            content.pop(0)
         if not content:
             item_text = _inline(item.get("text"), state, depth + 2).strip()
             content = [item_text] if item_text else []
@@ -270,8 +272,8 @@ def _render_block(
         return [f"$${expression}$$"] if expression else []
 
     if block_type == "paragraph":
-        text = _inline(block.get("text"), state, depth + 1)
-        return text.splitlines() if text else []
+        # An empty paragraph is how Telegram carries a blank line between blocks; keep it.
+        return _inline(block.get("text"), state, depth + 1).splitlines() or [""]
 
     if block_type in {"blockquote", "expandable_blockquote"}:
         nested = _render_blocks(block.get("blocks"), state, depth + 1)

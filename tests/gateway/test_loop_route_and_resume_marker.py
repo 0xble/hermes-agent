@@ -9,7 +9,7 @@ import pytest
 
 from hermes_cli import loops
 from tests.gateway.test_loop_interruption_recovery import create_loop, native_runner, scan
-from tests.gateway.test_loop_interruption_recovery import control_home as loop_control_home  # noqa: F401 - registers the fixture
+from tests.gateway.test_loop_interruption_recovery import control_home as loop_control_home
 
 # The shared fixture points HERMES_HOME at tmp_path and owns the SessionDB cache lifecycle.
 pytestmark = pytest.mark.usefixtures("loop_control_home")

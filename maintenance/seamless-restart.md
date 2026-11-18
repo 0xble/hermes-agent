@@ -7,6 +7,36 @@ bounded priority scheduler. Its ordering, long-turn opening window, profile scop
 and shutdown-source durability contract live in
 [Shared Replay Admission](restart-continuation.md#shared-replay-admission).
 
+## Process shutdown exit boundary
+
+Signal stops use the same short cleanup/finalization deadlines as explicit
+restarts, independently of how the stop is classified. Preserve the configured
+drain (including zero), pending-input spool, transcript flush, session-DB
+quiesce, receipts and lifecycle writes before exit. The shutdown watchdog stays
+armed as a backstop; it is not the normal exit timer.
+
+Both process entrypoints call the existing flushed hard-exit path **inside**
+their main coroutine, after `start_gateway` completes all teardown/finally blocks.
+Calling it after `asyncio.run` is too late: `Runner.close` first cancels tasks
+and joins the default executor, whose abandoned network/cleanup jobs may never
+return. Embedded coroutine callers retain their existing lifecycle.
+
+A cancelled process exits successfully only for recorded stop intent, not merely
+because teardown set `_shutdown_event`. Stray runtime cancellation exits 1 so the
+service manager revives the gateway. A cancelled restart with no explicit exit
+code uses 75 only for a service restart; detached/in-place restarts retain code 0.
+The interrupted-cron mark and tool sweep share the existing shutdown bound;
+bounded stops reserve up to 0.5 seconds (half a smaller bound) for the sweep so a
+held cron fire fence cannot detach it immediately with a zero timeout.
+
+The stop task carries `tools.environments.local.process_exit_cleanup` into its
+workers. Local cleanup unlinks its known snapshot/cwd files without scanning
+the shared temp directory for orphan atomic snapshots; ordinary session teardown
+still removes those immediately. The managed default terminal cache is pruned by
+housekeeping, while an explicitly configured `TMPDIR` remains caller-owned.
+Verify `tests/gateway/test_process_exit_after_stop.py`, gateway process-exit,
+bounded-adapter and shutdown-kill tests, plus `tests/tools/test_local_temp_dir.py`.
+
 ## Shutdown Notice Routing
 
 Use upstream's `_delivery_target_key` for active chats, served home channels,
@@ -62,7 +92,7 @@ freshness window. Keep the existing DST invariants in
 
 This was written as a **fork plan** before implementation; [Shipped Status](#shipped-status) records what landed. The maintained fork `0xble/hermes-agent` `main` is the implementation base; the runtime installation and source checkout are distinct ([runtime ownership](runtime-ownership.md)). Before S1, `cron/scheduler.py::_launch_external_cron_worker` used `restart_safe_gateway_child_argv`; on non-Linux that resolver returns `in_process` (`tools/process_registry.py`), so a macOS launchd gateway does not get an external restart-safe cron worker. Linux's systemd transient-scope model cannot be copied to macOS: `launchctl bootout` terminates the job process group, but a `start_new_session` child and double-forked `setsid` grandchild can survive outside that group. Design the macOS worker boundary and explicit kill semantics around that topology, without claiming bootout alone reaps all descendants.
 
-The profile-local `cron/executions.py` ledger records attempt owner PID/start fingerprint and immutable terminal states; it is **not a retry queue**. The current cron inactivity watchdog is idle-based, not a hard wall-clock cap. Scheduler tick locking, `pending_slot`/`scheduled_instant` deduplication, profile scope, and delivery ownership remain authoritative ([cron contract](../cron/AGENTS.md)). Current restart/delegation policy can wait or offer explicit parent-driven recovery, but does not provide uninterrupted overlapping execution ([delegation restart](delegation-restart.md)). The gateway's control socket presently supports identity/status/pause-for-update; it is a candidate coordination seam, not yet a handoff protocol. Upstream's open [structured safe restart PR #71876](https://github.com/NousResearch/hermes-agent/pull/71876) addresses agent-request coordination, not evidence that release pinning or two-generation handoff already exists. Recheck upstream and fork source before each implementation slice.
+The profile-local `cron/executions.py` ledger records attempt owner PID/start fingerprint and immutable terminal states; it is **not a retry queue**. The current cron inactivity watchdog is idle-based, not a hard wall-clock cap. Scheduler tick locking, `pending_slot`/`scheduled_instant` deduplication, profile scope, and delivery ownership remain authoritative ([cron contract](../cron/AGENTS.md)). Current restart/delegation policy can wait or offer explicit parent-driven recovery, but does not provide uninterrupted overlapping execution ([delegation restart](delegation-restart.md)). The gateway's control socket presently supports identity/status/pause-for-update; it is a candidate coordination seam, not yet a handoff protocol. POSIX update pause/replay excludes finite client-owned gateways; their explicit refusal and lease boundary are maintained in [Disposable one-shot gateway lifetime](disposable-home-gateway-lifetime.md#contract). Upstream's open [structured safe restart PR #71876](https://github.com/NousResearch/hermes-agent/pull/71876) addresses agent-request coordination, not evidence that release pinning or two-generation handoff already exists. Recheck upstream and fork source before each implementation slice.
 
 **Global invariants:** Never automatically retry an interrupted execution, chat turn, or delegation. Preserve one admitted owner per event/occurrence and one active Telegram poller per token; require a receipt from the owning process before acknowledging forwarded input. Preserve both gateway busy-message guards, identity/authorization and per-profile secret scope, prompt-cache stability, turn alternation, and existing durable delivery semantics. Shared databases and `~/.hermes/plugins` must remain readable and writable by both `current` and `previous` during rollback; use additive/backward-compatible migrations and dual-version contract tests, never a destructive migration during promotion. Do not infer a live runtime revision from source `HEAD`.
 

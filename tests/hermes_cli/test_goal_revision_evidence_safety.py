@@ -3,7 +3,7 @@
 import pytest
 
 from hermes_cli.goals import GoalContract, GoalManager, load_goal
-from tests.hermes_cli.test_goal_adaptive import _db, _tool, hermes_home  # noqa: F401
+from tests.hermes_cli.test_goal_adaptive import _db, _tool, hermes_home
 
 
 pytestmark = pytest.mark.usefixtures("hermes_home")

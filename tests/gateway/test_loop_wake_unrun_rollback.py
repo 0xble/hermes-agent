@@ -139,9 +139,12 @@ async def test_unrun_rollback_only_undoes_the_tick_the_wake_carried(hermes_home,
     runner = _runner(monkeypatch, tmp_path)
     sid = runner.session_store.get_or_create_session.return_value.session_id
     event = _fired_loop_wake(runner, sid)
-    time.sleep(0.01)
+    previous_created_at = load_loop(sid).created_at
     newer = LoopManager(session_id=sid)
-    newer.set("a different loop", interval_seconds=300, route=_ROUTE)
+    # The instance fence must advance even when the wall clock is unchanged.
+    with patch("hermes_cli.loops.time.time", return_value=previous_created_at):
+        newer.set("a different loop", interval_seconds=300, route=_ROUTE)
+    assert newer.state.created_at > previous_created_at
     newer.state.next_due_at = 0
     newer._save()
     assert newer.fire_tick()

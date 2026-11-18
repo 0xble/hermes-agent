@@ -32,8 +32,10 @@ def signal_stale_fleet_survivors(fleet: list, restart, drain_budget: float) -> l
     Never raises: verification must still finalize the receipt (with an owed restart).
     """
     from hermes_cli.update_cmd_fleet import _drain_or_signal_gateway_for_update
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
 
-    pids = stale_fleet_survivor_pids(fleet, set(restart.killed_pids))
+    pids = [pid for pid in stale_fleet_survivor_pids(fleet, set(restart.killed_pids))
+            if not leave_client_owned_gateway(pid)]
     if not pids:
         return []
     try:

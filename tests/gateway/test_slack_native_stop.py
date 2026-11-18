@@ -9,7 +9,7 @@ import pytest
 from gateway.config import PlatformConfig
 from hermes_cli.slack_cli import _build_full_manifest
 from plugins.platforms.slack.adapter_native_stop import handle_agent_session_stopped
-from tests.gateway.test_slack import SlackAdapter
+from tests.gateway.test_slack import SlackAdapter, _slack_mod
 
 
 _EVENT = {"type": "agent_session_stopped", "channel": "C1", "user": "U1",
@@ -23,7 +23,8 @@ class _AgentSessionsClient:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("authorized", [True, False])
-async def test_native_stop_acts_as_stop_in_its_thread_for_authorized_users_only(authorized):
+async def test_native_stop_acts_as_stop_in_its_thread_for_authorized_users_only(authorized, monkeypatch):
+    monkeypatch.setattr(_slack_mod, "_AGENT_SESSIONS_SUPPORTED", True)
     adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-fake"))
     client = _AgentSessionsClient()
     client.agents_sessions_setStatus.reset_mock()

@@ -90,7 +90,7 @@ def _normalize_alias_origin(value: Any) -> str | None:
         return None
 
 
-def _configured_aliases() -> Dict[str, tuple[str, ...]]:
+def _configured_aliases() -> dict[str, tuple[str, ...]]:
     """Read and validate ``vault.origin_aliases`` from the active profile config."""
     from hermes_cli.config import load_config_readonly
 
@@ -104,7 +104,7 @@ def _configured_aliases() -> Dict[str, tuple[str, ...]]:
     if not isinstance(raw_aliases, dict):
         return {}
 
-    aliases: Dict[str, tuple[str, ...]] = {}
+    aliases: dict[str, tuple[str, ...]] = {}
     for raw_key, raw_origins in raw_aliases.items():
         key = raw_key.strip() if isinstance(raw_key, str) else ""
         if not key:
@@ -144,6 +144,32 @@ def alias_fill_confirmation_enabled() -> bool:
     return True
 
 
+def remember_logins_enabled(browser_account: str | None) -> bool:
+    """Whether login fills in this browser account tick a "Remember me"-style box.
+
+    ``vault.remember_logins`` maps browser account aliases to booleans, with ``default`` covering
+    accounts not listed; a bare boolean applies to every account. Unreadable or invalid config
+    falls back to remembering, the shipped default.
+    """
+    from hermes_cli.config import load_config_readonly
+
+    try:
+        config = load_config_readonly() or {}
+    except Exception as exc:
+        logger.warning("Using the default vault.remember_logins because config could not be read: %s", exc, exc_info=True)
+        return True
+    vault_config = config.get("vault") if isinstance(config, dict) else None
+    value = vault_config.get("remember_logins", True) if isinstance(vault_config, dict) else True
+    if isinstance(value, dict):
+        value = value.get(browser_account, value.get("default", True)) if browser_account else value.get("default", True)
+    if isinstance(value, bool):
+        return value
+    if ("remember_logins", repr(value)) not in _invalid_alias_warnings:
+        _invalid_alias_warnings.add(("remember_logins", repr(value)))
+        logger.warning("Ignoring invalid vault.remember_logins value %r; remembering logins", value)
+    return True
+
+
 def _alias_keys(meta: VaultItemMeta) -> tuple[str, ...]:
     """Return exact handle keys plus raw IDs supported by 1Password handles."""
     keys = [meta.id]
@@ -157,7 +183,7 @@ def _alias_keys(meta: VaultItemMeta) -> tuple[str, ...]:
 
 
 def _meta_with_origin_aliases(
-    meta: VaultItemMeta, configured: Dict[str, tuple[str, ...]]
+    meta: VaultItemMeta, configured: dict[str, tuple[str, ...]]
 ) -> VaultItemMeta:
     """Augment one login's exact allowed origins without changing its vault item."""
     if meta.kind != "login" or not meta.origin:

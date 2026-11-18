@@ -74,6 +74,11 @@ def _both_first_class(a: BackendIdentity, b: BackendIdentity) -> bool:
         return False
 
 
+def distinct_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
+    """Prove distinct first-class credentials; custom alias differences remain unproven."""
+    return _both_first_class(a, b)
+
+
 def same_credential_surface(a: BackendIdentity, b: BackendIdentity) -> bool:
     """Do two identities share the credential a 401/402 just invalidated?
 

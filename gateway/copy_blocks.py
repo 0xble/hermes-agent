@@ -6,6 +6,9 @@ import re
 
 _COPY_OPEN = "[[copy]]"
 _COPY_CLOSE = "[[/copy]]"
+# Display-only control lines survive chunking independently of literal code fences.
+_DISPLAY_COPY_OPEN = "\x00HERMES_COPY_OPEN\x00"
+_DISPLAY_COPY_CLOSE = "\x00HERMES_COPY_CLOSE\x00"
 _FENCE_RE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 _LIST_PREFIX_RE = re.compile(r"(?:[-*+•]|[0-9]+[.)])[ \t]+")
 _LIST_TOKEN_RE = re.compile(r"(?:[-*+•]|[0-9]+[.)]?)")
@@ -30,9 +33,17 @@ def _is_copy_marker(line: str) -> bool:
     return _line_marker(line, _COPY_OPEN) or _line_marker(line, _COPY_CLOSE)
 
 
+def _display_marker(line: str) -> bool:
+    return line.strip() in {_DISPLAY_COPY_OPEN, _DISPLAY_COPY_CLOSE}
+
+
+def _has_copy_markers(text: str) -> bool:
+    return any(marker in text for marker in (_COPY_OPEN, _COPY_CLOSE, _DISPLAY_COPY_OPEN, _DISPLAY_COPY_CLOSE))
+
+
 def _after_marker(line: str, in_copy: bool) -> bool:
     """Block state after a marker line: an open marker toggles, a close marker always closes."""
-    return _line_marker(line, _COPY_OPEN) and not in_copy
+    return line.strip() == _DISPLAY_COPY_OPEN or (_line_marker(line, _COPY_OPEN) and not in_copy)
 
 
 def _next_fence(fence: str | None, line: str) -> str | None:
@@ -120,15 +131,17 @@ class CopyMarkerStreamFilter:
     outside a fenced code block are control syntax, and CRLF is preserved for ordinary text.
     """
 
-    def __init__(self, *, drop_bodies: bool = False) -> None:
-        # drop_bodies=True removes whole blocks (markers and bodies) for surfaces whose
-        # copy blocks are delivered separately; False keeps bodies inline.
+    def __init__(self, *, drop_bodies: bool = False, keep_markers: bool = False) -> None:
+        # TTS drops entire blocks; ordinary surfaces keep bodies inline; Telegram
+        # retains marker lines so its formatter can render literal inline quotes.
         self._drop_bodies = drop_bodies
+        self._keep_markers = keep_markers
         self._in_copy = False
         self._pending = ""  # held line prefix that may still become a marker line
         self._boundary_text = ""  # ordinary held text, finished by a message boundary
         self._line = ""  # already-seen text of the current line, for fence tracking
         self._fence: str | None = None
+        self._display_prefix = ""
 
     @staticmethod
     def _could_be_marker_prefix(line: str) -> bool:
@@ -162,8 +175,8 @@ class CopyMarkerStreamFilter:
             return ""
         text = self._pending + delta
         self._pending = ""
-        output: list[str] = [self._boundary_text]
-        self._boundary_text = ""
+        output: list[str] = [self._boundary_text, self._display_prefix]
+        self._boundary_text = self._display_prefix = ""
         cursor = 0
         while cursor < len(text):
             match = re.search(r"\r\n|\n|\r", text[cursor:])
@@ -184,6 +197,9 @@ class CopyMarkerStreamFilter:
             segment = text[cursor:end]
             full_line = self._line + segment
             if not self._line and self._is_marker(segment):
+                if self._keep_markers:
+                    opening = _after_marker(segment, self._in_copy)
+                    output.append((_DISPLAY_COPY_OPEN if opening else _DISPLAY_COPY_CLOSE) + "\n")
                 self._on_marker(segment)  # a complete marker line is control syntax
             else:
                 if self._emit():
@@ -200,6 +216,7 @@ class CopyMarkerStreamFilter:
         self._boundary_text = ""
         self._line = ""
         self._fence = None
+        self._display_prefix = ""
 
     def message_boundary(self) -> None:
         """A new assistant message starts here, so it starts on a new line.
@@ -212,6 +229,9 @@ class CopyMarkerStreamFilter:
         joining it to a marker in the new message.
         """
         if self._pending and self._is_marker(self._pending):
+            if self._keep_markers:
+                opening = _after_marker(self._pending, self._in_copy)
+                self._boundary_text += (_DISPLAY_COPY_OPEN if opening else _DISPLAY_COPY_CLOSE) + "\n"
             self._on_marker(self._pending)
             self._pending = ""
         elif self._pending and (
@@ -221,12 +241,20 @@ class CopyMarkerStreamFilter:
                 self._boundary_text += self._pending
             self._pending = ""
         self._line = ""
+        if self._keep_markers and not self._boundary_text:
+            if self._in_copy:
+                self._display_prefix = _DISPLAY_COPY_OPEN + "\n"
+            elif self._fence:
+                self._display_prefix = self._fence + "\n"
 
     def flush(self) -> str:
         """Release a non-marker tail, or drop it when it is a complete marker line."""
         released, self._boundary_text = self._boundary_text, ""
         pending, self._pending = self._pending, ""
         self._line = ""
+        if self._keep_markers and pending and self._is_marker(pending):
+            opening = _after_marker(pending, self._in_copy)
+            return released + (_DISPLAY_COPY_OPEN if opening else _DISPLAY_COPY_CLOSE)
         if not pending or self._is_marker(pending) or not self._emit():
             return released
         return released + pending
@@ -245,10 +273,17 @@ def adapter_sends_copy_blocks(adapter) -> bool:
     return platform_sends_copy_blocks(getattr(adapter, "platform", None))
 
 
-def split_copy_blocks_for(adapter, text: str) -> tuple[str, list[str]]:
-    """Separate copy blocks where *adapter* can send them plain, else render them inline."""
+def split_copy_blocks_for(adapter, text: str, *, inline_quotes: bool = True) -> tuple[str, list[str]]:
+    """Split copy sends, retaining inline display except for legacy/raw ledger replay.
+
+    New main-reply rows carry display sentinels, while separate-copy rows retain
+    their original raw marker wrapper. Replay must never turn those into two sends.
+    """
     if adapter_sends_copy_blocks(adapter):
-        return extract_copy_blocks(text)
+        if not inline_quotes:
+            return (text, []) if _DISPLAY_COPY_OPEN in text else extract_copy_blocks(text)
+        protected, blocks, bodies = split_copy_blocks_protected(adapter, text)
+        return restore_inline_copy_bodies(protected, bodies), blocks
     return render_copy_blocks_inline(text), []
 
 
@@ -259,15 +294,21 @@ def split_copy_blocks_protected(adapter, text: str) -> tuple[str, list[str], dic
     tags, image links, and paths inside a body are never acted on.
     """
     if adapter_sends_copy_blocks(adapter):
-        remaining, blocks = extract_copy_blocks(text)
-        return remaining, blocks, {}
+        _, blocks = (text, []) if _DISPLAY_COPY_OPEN in text else extract_copy_blocks(text)
+        protected, bodies = protect_inline_copy_bodies(text, keep_markers=True)
+        return protected, blocks, bodies
     protected, bodies = protect_inline_copy_bodies(text)
     return protected, [], bodies
 
 
 def copy_free_text_for(adapter, text: str) -> str:
-    """The streamed body *adapter* shows: bodies removed where they go out separately."""
-    return strip_copy_blocks(text) if adapter_sends_copy_blocks(adapter) else render_copy_blocks_inline(text)
+    """The streamed display source; plain-copy adapters retain markers for literal quotes."""
+    if not adapter_sends_copy_blocks(adapter):
+        return render_copy_blocks_inline(text)
+    if _DISPLAY_COPY_OPEN in text or _DISPLAY_COPY_CLOSE in text:
+        return text
+    stream = CopyMarkerStreamFilter(keep_markers=True)
+    return stream.feed(text) + stream.flush()
 
 
 def wrap_copy_block(body: str) -> str:
@@ -289,7 +330,7 @@ def wrap_copy_block(body: str) -> str:
     return f"{_COPY_OPEN}\n{lead}{body}{trail}\n{_COPY_CLOSE}"
 
 
-def protect_inline_copy_bodies(text: str) -> tuple[str, dict[str, str]]:
+def protect_inline_copy_bodies(text: str, *, keep_markers: bool = False) -> tuple[str, dict[str, str]]:
     """Render blocks inline with each body swapped for an opaque token.
 
     Directive processing (MEDIA tags, image links, bare paths) then cannot see a body;
@@ -300,20 +341,25 @@ def protect_inline_copy_bodies(text: str) -> tuple[str, dict[str, str]]:
     def _token() -> str:
         return f"\x00COPYBODY{len(bodies)}\x00"
 
-    if not text or (_COPY_OPEN not in text and _COPY_CLOSE not in text):
+    if not text or not _has_copy_markers(text):
         return text, bodies
     out: list[str] = []
     body: list[str] = []
     fence: str | None = None
     in_copy = False
     for line in text.splitlines(keepends=True):
-        if fence is None and _is_copy_marker(line):
+        if _display_marker(line) or (fence is None and _is_copy_marker(line)):
             if in_copy and body:
                 token = _token()
                 bodies[token] = "".join(body)
                 out.append(token)
                 body = []
             in_copy = _after_marker(line, in_copy)
+            if keep_markers:
+                marker = _DISPLAY_COPY_OPEN if in_copy else _DISPLAY_COPY_CLOSE
+                out.append(marker + ("\n" if line.endswith(("\n", "\r")) else ""))
+            if line.strip() in {_DISPLAY_COPY_OPEN, _DISPLAY_COPY_CLOSE}:
+                fence = None
             continue
         (body if in_copy else out).append(line)
         fence = _next_fence(fence, line)
@@ -330,8 +376,29 @@ def restore_inline_copy_bodies(text: str, bodies: dict[str, str]) -> str:
     return text
 
 
+def copy_quote_continuation(text: str) -> str:
+    """Open a literal quote in a new stream chunk when the preceding source ends in one."""
+    return (_DISPLAY_COPY_OPEN + "\n" if text.rfind(_DISPLAY_COPY_OPEN) > text.rfind(_DISPLAY_COPY_CLOSE) else "")
+
+
+def balance_copy_quote_chunks(chunks: list[str]) -> list[str]:
+    """Carry quote state across display chunks without touching separate copy payloads."""
+    prefix = ""
+    result = []
+    for chunk in chunks:
+        chunk = prefix + chunk
+        result.append(chunk)
+        prefix = copy_quote_continuation(chunk)
+    return result
+
+
 def strip_copy_blocks(text: str) -> str:
     """Return *text* without copy blocks, for display surfaces that send them separately."""
+    if _DISPLAY_COPY_OPEN in (text or "") or _DISPLAY_COPY_CLOSE in (text or ""):
+        protected, bodies = protect_inline_copy_bodies(text)
+        for token in bodies:
+            protected = protected.replace(token, "")
+        return protected
     return extract_copy_blocks(text)[0]
 
 
@@ -343,7 +410,7 @@ def map_outside_copy_blocks(text: str, transform, *, keep_markers: bool = False)
     With ``keep_markers`` the marker lines stay, for callers that stream the result
     through :class:`CopyMarkerStreamFilter`.
     """
-    if not text or (_COPY_OPEN not in text and _COPY_CLOSE not in text):
+    if not text or not _has_copy_markers(text):
         return transform(text) if text else text
     out: list[str] = []
     ordinary: list[str] = []
@@ -356,11 +423,13 @@ def map_outside_copy_blocks(text: str, transform, *, keep_markers: bool = False)
             ordinary.clear()
 
     for line in text.splitlines(keepends=True):
-        if fence is None and _is_copy_marker(line):
+        if _display_marker(line) or (fence is None and _is_copy_marker(line)):
             _flush_ordinary()
             in_copy = _after_marker(line, in_copy)
             if keep_markers:
                 out.append(line)
+            if _display_marker(line):
+                fence = None
             continue
         (out if in_copy else ordinary).append(line)
         fence = _next_fence(fence, line)
@@ -376,8 +445,11 @@ def render_copy_blocks_inline(text: str) -> str:
     surface's streamed and final text match. Callers apply this only to their output,
     never to persisted transcript text.
     """
-    if not text or (_COPY_OPEN not in text and _COPY_CLOSE not in text):
+    if not text or not _has_copy_markers(text):
         return text
+    if _DISPLAY_COPY_OPEN in text or _DISPLAY_COPY_CLOSE in text:
+        protected, bodies = protect_inline_copy_bodies(text)
+        return restore_inline_copy_bodies(protected, bodies)
     stream = CopyMarkerStreamFilter()
     return stream.feed(text) + stream.flush()
 

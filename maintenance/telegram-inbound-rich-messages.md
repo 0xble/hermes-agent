@@ -42,6 +42,16 @@ and #98679 overlap. #98679 is the narrowest, but it flattens to plaintext and
 loses inline formatting and nested list structure, which matters for pasted
 prompts. None is released as of 2026-09-25.
 
+v0.23.1 (`3b421578`) ships upstream's own fix for #146067 (`ceeeec8374fd`,
+`b3daabee04ca`): `telegram_entities.rich_message_text` flattens the blocks to
+plain text and the text handler matches a text-less `rich_message`. It still
+drops inline formatting, so the sync keeps this unit: the text handler stays
+`filters.TEXT & ~filters.COMMAND` and the dedicated Rich Message handler owns
+projection, while upstream's `addressing_sources`/`addressing_text` serve
+mention and wake-word gating. Upstream's contract that an empty paragraph is a
+blank line holds here too, so `tests/e2e/core/platforms/test_telegram_rich_message_inbound.py`
+expects the Markdown projection (bold kept) with that blank line.
+
 ## Verification
 
 `scripts/run_tests.sh tests/gateway/test_telegram_rich_message_ingress.py`

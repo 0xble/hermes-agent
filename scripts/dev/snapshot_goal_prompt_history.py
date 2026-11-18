@@ -237,8 +237,8 @@ def _snapshot() -> dict[str, dict[str, list[str]]]:
 
 def _render(registry: dict[str, dict[str, list[str]]]) -> str:
     rows: list[dict[str, Any]] = []
-    for kind in registry:
-        entries = sorted(registry[kind].items(), key=lambda item: (len(item[0]), item[0]))
+    for kind, mapping in registry.items():
+        entries = sorted(mapping.items(), key=lambda item: (len(item[0]), item[0]))
         for template, commits in entries:
             rows.append({
                 "formatter": kind,

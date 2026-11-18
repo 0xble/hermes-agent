@@ -42,6 +42,12 @@ def record_ticker_start() -> None:
     _write_marker("ticker_start", f"{_hermes_now().isoformat()} {previous_at}", ".start_")
 
 
+def held_outcome(job: dict) -> str:
+    return ("Job not run. Payload kept. It will not fire on its own. "
+            f"Options: send now (`hermes cron resume {job['id']} --run-now`) "
+            f"or drop (`hermes cron remove {job['id']}`).")
+
+
 def queue_retirement_alert(job: dict, diagnostic: str, reason: str, *, now: datetime) -> None:
     from cron import delivery_queue
     from cron.jobs import _parse_aware, _read_marker_fields
@@ -55,12 +61,16 @@ def queue_retirement_alert(job: dict, diagnostic: str, reason: str, *, now: date
     if len(startup) > 1:
         context += f" Last heartbeat before startup: {startup[1]}; downtime onset is not known."
     interrupted = reason == "wedged-oneshot"
+    held = reason == "missed-oneshot-held"
     outcome = ("Dispatch was interrupted without a completion record; partial effects may have "
                "occurred. Not rerun; inspect effects before you recreate to run."
-               if interrupted else "Job not run; recreate to run.")
+               if interrupted else
+               held_outcome(job)
+               if held else "Job not run; recreate to run.")
     timing_label = "Elapsed since scheduled" if interrupted else "Late by"
+    label = "One-shot missed" if held else "One-shot retired"
     content = (
-        f"[CRON_FAILURE]\nOne-shot retired: {job.get('name') or job['id']}\n"
+        f"[CRON_FAILURE]\n{label}: {job.get('name') or job['id']}\n"
         f"Job id: {job['id']}\nScheduled time: {scheduled or 'unknown'}\n"
         f"{timing_label}: {lateness} at {now.isoformat()}\n{outcome}\n{context}\n\n{diagnostic}"
     )
@@ -73,6 +83,8 @@ def queue_retirement_alert(job: dict, diagnostic: str, reason: str, *, now: date
     if (not notice.get("failure_deliver")
             or _normalize_deliver_value(notice["failure_deliver"]).strip().lower() == "local"):
         notice.pop("failure_deliver", None)
+    if held and not notice.get("failure_deliver"):
+        notice["deliver"] = "origin"
     if _normalize_deliver_value(notice.get("deliver")).strip().lower() == "local":
         notice["deliver"] = "origin"
     # Retain the normal incident sink even on profiles with no configured chat.
@@ -83,6 +95,7 @@ def queue_retirement_alert(job: dict, diagnostic: str, reason: str, *, now: date
     notice["_failure_incident_id"] = incident_id
     # Keep the ordinary failure resolver's origin -> configured home fallback. No
     # inference run exists, so do not attach an execution terminality gate.
-    receipt = f"oneshot-retired:{job['id']}"
+    receipt = (f"oneshot-missed:{job['id']}:{job.get('next_run_at') or scheduled}"
+               if held else f"oneshot-retired:{job['id']}")
     notice["execution_id"] = receipt
     delivery_queue.enqueue(receipt, notice, content, for_failure=True, terminal_gate=False)

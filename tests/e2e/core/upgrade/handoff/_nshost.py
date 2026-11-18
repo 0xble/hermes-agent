@@ -116,7 +116,7 @@ class NamespaceHost:
         return bool(self.call({"op": "kill", "pid": pid, "sig": int(sig)}, timeout=60)["ok"])
 
     def alive(self, pid: int) -> bool:
-        return any(p["pid"] == pid and p["state"] not in ("Z", "X") for p in self.procs())
+        return bool(self.call({"op": "alive", "pid": pid}, timeout=60)["alive"])
 
     def ps_text(self) -> str:
         rows = [f"{p['pid']:>6} {p['ppid']:>6} {p['state']} {' '.join(p['cmdline'])[:220]}" for p in self.procs()]

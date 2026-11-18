@@ -17,6 +17,10 @@ from tests.cron.test_cron_recovery import _owner
 @pytest.mark.parametrize('commit_later', [True, False])
 async def test_ambiguous_submit_keeps_its_journal_until_verified(tmp_path, monkeypatch, caplog, commit_later):
     authority, db = _owner(tmp_path, monkeypatch)
+    if not commit_later:
+        # Never committed: the firer reads "missing" until the owner-side grace; past it, the
+        # bounded fresh-link ladder ends the wait as before.
+        monkeypatch.setattr(scheduler_authority, 'MISSING_SUBMIT_GRACE_SECONDS', 0)
     submitted, disconnected, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
     requests, commits = [], []
     real_rpc = gateway_client.GatewayClient.rpc

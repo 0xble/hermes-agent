@@ -18,8 +18,11 @@ classification.
   killed. When redirect declines (between a model response and its tool batch)
   the message is steered instead, so it reaches the model at the next tool
   boundary. Voice is transcribed and steered. Photos and documents still queue.
-- The turn then answers the typed message (reply anchor and reply expectation
-  move to it). The goal's post-turn continuation resumes the autonomous work.
+- The running turn answers incorporated typed input. Its reply expectation moves
+  only when a steer is inserted into model history. Input buffered after the last
+  boundary becomes a human successor without changing the predecessor's silence
+  contract. A prior incorporated human input still requires a predecessor reply.
+  The goal's post-turn continuation resumes the autonomous work.
 - Once the user has steered or redirected a turn (`_turn_user_intervened`), it
   is theirs and keeps queue semantics.
 - Relays and other agent-origin messages never preempt.
@@ -31,7 +34,11 @@ in `_handle_active_session_busy_message` and `_resolve_busy_steer_or_redirect`.
 
 ## Verification
 
-`scripts/run_tests.sh tests/gateway/test_busy_human_preempts_autonomous.py`
+`scripts/run_tests.sh tests/gateway/test_busy_human_preempts_autonomous.py tests/gateway/test_late_steer_reply_obligation.py`
+
+The late-steer regression covers declined redirects, buffered successor delivery
+exactly once, incorporated steering through busy/priority/slash/tool-redirect
+routes, and a prior human obligation surviving a later leftover.
 
 ## Provenance
 

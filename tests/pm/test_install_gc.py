@@ -386,7 +386,7 @@ def test_limit_bounds_removals_per_pass(monkeypatch, tmp_path):
 def test_interrupted_removal_is_finished_by_the_next_pass(monkeypatch, tmp_path):
     import time
 
-    import pm.install_gc as install_gc
+    from pm import install_gc
 
     home = _setup(monkeypatch, tmp_path)
     checkout = tmp_path / "checkout"

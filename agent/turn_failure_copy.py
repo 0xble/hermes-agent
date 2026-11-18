@@ -13,6 +13,7 @@ import time
 from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 from agent.error_classifier import FailoverReason
+from agent.stream_max_lifetime import StreamLifetimeExceeded
 from hermes_constants import display_hermes_home
 
 # Failure codes minted by loop sites that are not provider verdicts (see module docstring).
@@ -45,7 +46,7 @@ def retained_input_result(
     provider_calls_made: Optional[bool] = None,
     compression_enabled: bool = True,
     final_response: Optional[str] = None,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """Build the typed result for a preflight pause that retains the accepted input."""
     if provider_calls_made is None:
         provider_calls_made = api_call_count > 0
@@ -64,6 +65,22 @@ def retained_input_result(
         "failure_reason": "input_retained",
         "failure_retryable": True,
     }
+
+
+def launch_credentials_copy(error: Any) -> str:
+    """The refusal for a session whose own launch/route API key changed or is gone (``RuntimeStoreError``
+    or an RPC refusal carrying ``field``/``detail``). A session never sends a different key than it
+    started with, so /retry repeats the refusal: the copy names /new on every surface."""
+    from agent.i18n import t
+
+    data = getattr(error, "data", None)
+    data = data if isinstance(data, dict) else {}
+    field = getattr(error, "field", None) or data.get("field")
+    detail = getattr(error, "detail", None) or data.get("detail")
+    named = f" ({field}: {detail or 'unavailable'})" if field else ""
+    text = t("gateway.errors.launch_credentials_unavailable", detail=named)
+    # The raw code + field stay greppable for bug reports and log matching (untranslated, last line).
+    return f"{text}\n\nDetails: launch_credentials_unavailable{named}" if field else text
 
 
 def stamp_failure(result: dict[str, Any], reason: str, retryable: bool) -> dict[str, Any]:
@@ -100,6 +117,21 @@ OPEN_TURN_TAIL_ROLES = frozenset({"user", "tool"})
 # ``messages.display_kind`` of that row: display-only (stripped before every provider request),
 # so renderers show a Hermes notice and room pollers never read it as the model's reply.
 FAILED_TURN_DISPLAY_KIND = "failed_turn"
+
+
+# ---- safety-refused turn, retained for display only -------------------------------------------
+# A content-policy refusal is deterministic for the unchanged conversation (the filter judges the
+# whole thread), so the whole refused turn leaves the MODEL's context — otherwise every later
+# message re-trips the filter and the chat locks (the "stuck session" report). But the user keeps
+# SEEING their message: the user row is retained in the DISPLAY projection (never the model read)
+# and tagged with this display_kind, while the raw tool rounds + refusal detail collapse into
+# CONTENT_REFUSED_NOTICE. Rendered cross-surface (Desktop, CLI/TUI, ACP) as a greyed block.
+CONTENT_REFUSED_DISPLAY_KIND = "content_refused"
+CONTENT_REFUSED_NOTICE = (
+    "This message was refused by the model's safety filter — try a different query."
+)
+# messages.display_metadata key carrying the stored notice, so every surface renders one copy.
+CONTENT_REFUSED_METADATA_KEY = "content_refused"
 
 
 def untyped_failed_turn_display_kind(role: Any, content: Any) -> Optional[str]:
@@ -289,8 +321,10 @@ _AUTH_COPY: dict[str, str] = {
 }
 
 CONTENT_POLICY_NEXT_STEPS = (
-    "Try rewording your message or removing sensitive attachments, or switch to another "
-    "model with /model."
+    "That message has been left out of this conversation, so you're not stuck — just ask "
+    "something else and you can keep going. Rewording it, removing any sensitive attachments, "
+    "or switching models with /model can also help. If a later message is refused too, start a "
+    "new chat with /new (in a Bot Chat, Archive it from its tab menu)."
 )
 
 # ---- one reason → "what happened" gloss, shared by cron, subagent and chat notices ------------
@@ -415,8 +449,8 @@ _ONE_OFF_COPY: dict[str, str] = {
         "produce a summary. Send `continue` to keep going, or raise `max_iterations` in your config."
     ),
     "nous_rate_limit": (
-        "Wait for the reset and send /retry, or switch models with /model. To avoid waits, add "
-        "a backup provider with `hermes fallback add`."
+        "Wait for the reset and send /retry, or switch models with /model. To avoid waits, list "
+        "backup providers under `fallback_providers` in `{home}/config.yaml`."
     ),
 }
 _SITE_COPY: dict[str, str] = {**_FAILURE_CODE_COPY, **_ONE_OFF_COPY}
@@ -428,23 +462,42 @@ def site_copy(code: str, **fields: Any) -> str:
     return _SITE_COPY[code].format_map(_Defaults(fields))
 
 
-def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None) -> str:
+def exhausted_copy(reason: str, *, label: str, attempts: int, summary: str, reset_seconds: Optional[float] = None,
+                   earliest_route_seconds: Optional[float] = None, error: Any = None,
+                   chain_path: Optional[str] = None, exhausted_routes: Optional[list[str]] = None) -> str:
     """Chat copy once retries + fallback are exhausted (``max_retries_exhausted_result``). A rate
-    limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401)."""
+    limit whose reset window is known names it: an 8.6h plan quota is not "wait a minute" (#89401).
+    ``earliest_route_seconds`` must belong to a different configured route than the failing one.
+    ``chain_path`` names the backup list that feeds the failing agent (``turn_failure_routes``);
+    ``exhausted_routes`` are named only when the turn ran out of more than the one route.
+    A stream cut by ``agent.stream_max_lifetime`` names the setting: the provider was responding,
+    so neither waiting nor a backup provider helps."""
+    if isinstance(error, StreamLifetimeExceeded):
+        return (f"The response was still streaming when agent.stream_max_lifetime ({error.cap:g}s) cut it, "
+                f"on all {attempts} attempts. Raise agent.stream_max_lifetime, or set it to 0 to turn the "
+                "cap off, if this model legitimately streams this long.")
     first_attempt = attempts == 1 and reason in _EXHAUSTED_FIRST_ATTEMPT_LEADS
     lead = (_EXHAUSTED_FIRST_ATTEMPT_LEADS if first_attempt else _EXHAUSTED_LEADS).get(
         reason, _EXHAUSTED_DEFAULT_LEAD).format(label=label, attempts=attempts)
     # The free-tier cutoff (one attempt) fires on any cooldown over a minute, so it always names the reset.
-    if reset_seconds is not None and (reset_seconds >= 120 or first_attempt and reset_seconds > 0):
+    if (reset_seconds is not None and earliest_route_seconds is not None
+            and earliest_route_seconds < reset_seconds - 60):
+        # Another configured route recovers sooner than the failing one: do not tell the user to wait out the long reset.
+        from agent.retry_utils import format_reset_window
+        situation = (f"another configured model has an earlier recorded reset (in "
+                     f"{format_reset_window(max(0.0, earliest_route_seconds))})")
+        situation += f" (this one's limit resets in {format_reset_window(reset_seconds)}). Send /retry then, or switch models with /model."
+    elif reset_seconds is not None and (reset_seconds >= 120 or first_attempt and reset_seconds > 0):
         from agent.retry_utils import format_reset_window
         situation = (f"its usage limit resets in {format_reset_window(reset_seconds)}. "
                      "Send /retry after that, or switch models with /model.")
     else:
         situation = f"it looks temporarily unavailable. {_NEXT_STEPS_RETRY}"
-    return (
-        f"{lead} — {situation} To avoid this in future, "
-        f"add a backup provider with `hermes fallback add`.\n\nProvider said: {summary}"
-    )
+    where = chain_path or f"`fallback_providers` in `{display_hermes_home()}/config.yaml`"
+    hint = f"To avoid this in future, list backup providers under {where}."
+    if exhausted_routes and len(exhausted_routes) > 1:
+        hint += f" Routes that ran out this turn: {', '.join(exhausted_routes)}."
+    return f"{lead} — {situation} {hint}\n\nProvider said: {summary}"
 
 
 def limit_reset_copy(resets_at: float, now: Optional[float] = None) -> str:
@@ -470,7 +523,16 @@ def oauth_relogin_command(provider: Any) -> str:
     slug = str(provider or "").strip().lower()
     if slug == "nous":
         return f"hermes {profile_cli_selector()}portal"
+    if _login_owned_by_external_cli(slug):
+        # `auth add` refuses a plugin with no auth_handler; the model flow runs the vendor CLI's login.
+        return f"hermes {profile_cli_selector()}model"
     return f"hermes {profile_cli_selector()}auth add {slug} --type oauth"
+
+
+def _login_owned_by_external_cli(slug: str) -> bool:
+    from hermes_cli.auth_plugin_providers import plugin_auth_handler, plugin_profile
+
+    return getattr(plugin_profile(slug), "auth_type", "") == "external_process" and plugin_auth_handler(slug) is None
 
 
 def relogin_command_hint(provider: Any) -> str:
@@ -485,7 +547,7 @@ def relogin_command_hint(provider: Any) -> str:
         return f"hermes {profile_cli_selector()}auth add <provider>"
     from agent.error_surface import auth_kind
 
-    if auth_kind(slug) == "oauth":
+    if _login_owned_by_external_cli(slug) or auth_kind(slug) == "oauth":
         return oauth_relogin_command(slug)
     return f"hermes {profile_cli_selector()}auth add {slug}"
 

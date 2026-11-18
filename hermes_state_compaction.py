@@ -23,7 +23,7 @@ import os
 import shutil
 import threading
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Optional
 
@@ -46,7 +46,7 @@ def request_path(db_path) -> Path:
     return db_path.with_name(db_path.name + REQUEST_SUFFIX)
 
 
-def read_request(db_path) -> Optional[Dict[str, Any]]:
+def read_request(db_path) -> Optional[dict[str, Any]]:
     """The pending request, or None. An unreadable marker still counts as a request."""
     path = request_path(db_path)
     try:
@@ -65,7 +65,7 @@ def request_compaction(db_path, *, requested_by: str = "cli") -> Path:
     path = request_path(db_path)
     atomic_json_write(path, {
         "version": 1,
-        "requested_at": datetime.now(timezone.utc).isoformat(),
+        "requested_at": datetime.now(UTC).isoformat(),
         "requested_by": requested_by,
         "attempts": 0,
     })
@@ -81,11 +81,11 @@ def cancel_request(db_path) -> bool:
         return False
 
 
-def _write_attempts(db_path, request: Dict[str, Any], attempts: int) -> None:
+def _write_attempts(db_path, request: dict[str, Any], attempts: int) -> None:
     from utils import atomic_json_write
 
     atomic_json_write(request_path(db_path), {**request, "attempts": attempts,
-                                              "last_attempt_at": datetime.now(timezone.utc).isoformat()})
+                                              "last_attempt_at": datetime.now(UTC).isoformat()})
 
 
 def _sqlite_temp_dir() -> Path:
@@ -170,7 +170,7 @@ class _ProgressLease:
                 self.renew()
             last = current
 
-    def __enter__(self) -> "_ProgressLease":
+    def __enter__(self) -> _ProgressLease:
         self.renew()
         try:
             self._conn.set_progress_handler(self._on_progress, 10_000)
@@ -188,7 +188,7 @@ class _ProgressLease:
             pass
 
 
-def run_pending_compaction(db_path) -> Dict[str, Any]:
+def run_pending_compaction(db_path) -> dict[str, Any]:
     """Honor a pending request once. Never raises; returns ``{"status": ...}`` for logs and tests."""
     try:
         return _run_pending_compaction(Path(db_path))
@@ -197,7 +197,7 @@ def run_pending_compaction(db_path) -> Dict[str, Any]:
         return {"status": "error", "error": str(exc)}
 
 
-def _run_pending_compaction(db_path: Path) -> Dict[str, Any]:
+def _run_pending_compaction(db_path: Path) -> dict[str, Any]:
     request = read_request(db_path)
     if request is None:
         return {"status": "none"}

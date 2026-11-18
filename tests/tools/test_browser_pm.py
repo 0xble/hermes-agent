@@ -14,6 +14,16 @@ from tools import browser_tool_install as install
 from tools import browser_tool_session as session
 
 
+@pytest.fixture(autouse=True)
+def _isolated_pm_checkout(tmp_path, monkeypatch):
+    # Package resolution may inspect manifest/install metadata beside its source
+    # checkout; never let a checkout under the real Hermes home select host state.
+    from pm import paths
+    root = tmp_path / "pm-checkout"
+    root.mkdir()
+    monkeypatch.setattr(paths, "repo_root", lambda: root)
+
+
 @pytest.fixture
 def browser_store(tmp_path, monkeypatch):
     home = tmp_path / "home with spaces"
@@ -247,7 +257,7 @@ print(json.dumps({"argv": sys.argv, "env": dict(os.environ)}))
     env = session._agent_browser_command_env(str(socket_dir))
     proc = session._popen_agent_browser([command, "--json", "get", "url"], env, str(socket_dir), "probe")
     assert proc.wait(timeout=10) == 0
-    output, error = session._read_command_output_files(str(socket_dir / "_stdout_probe"), str(socket_dir / "_stderr_probe"))
+    output, error = session._read_command_output(proc)
     assert error == ""
     child = json.loads(output)
     assert Path(child["argv"][0]) == binary

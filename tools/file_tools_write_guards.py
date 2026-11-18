@@ -12,6 +12,7 @@ whole-file overwrite of content this task never saw or that changed since.
 
 import fnmatch
 import os
+from tools.node_execution import current_execution
 from pathlib import Path
 
 from agent.file_safety import get_nt_namespace_error
@@ -171,6 +172,9 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
             f"Refusing to write to Hermes config file: {filepath}\n"
             "Agent cannot modify security-sensitive configuration. "
             "Edit ~/.hermes/config.yaml directly or use 'hermes config' instead.")
+    from tools.skill_lock import path_refusal
+    if reason := path_refusal(candidates):
+        return f"Refusing to write to {filepath}: {reason}"
     return None
 
 
@@ -225,8 +229,11 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
 
     normalized = os.path.normpath(_expand_tilde(filepath))
     try:
-        resolved = os.path.realpath(str(_resolve_path_for_task(filepath, task_id)))
+        target = str(_resolve_path_for_task(filepath, task_id))
+        resolved = target if current_execution() else os.path.realpath(target)
     except (OSError, ValueError, RuntimeError):
+        if current_execution():
+            raise
         resolved = os.path.realpath(normalized)
 
     # ~/.hermes itself is governed by its own guards (config.yaml hard-block,
@@ -234,7 +241,7 @@ def _protected_instruction_reason(filepath: str, task_id: str = "default",
     # Must run before the ``.hermes`` component rule, which would match the home.
     # ``_hermes_exempt_homes`` also covers the ROOT when the active home is a named
     # profile, so ~/.hermes/<file> cannot read as project-local ``.hermes`` config.
-    for real_home in _hermes_exempt_homes():
+    for real_home in (() if current_execution() else _hermes_exempt_homes()):
         if resolved == real_home or resolved.startswith(real_home + os.sep):
             return None
 
@@ -500,7 +507,7 @@ def _check_binary_document_write(filepath: str, task_id: str = "default") -> str
             f"Refusing to write plain text to binary document '{filepath}' ({ext}). "
             "A text write cannot produce a valid document container and would "
             "corrupt the file (read_file showed you EXTRACTED text, not the real "
-            "bytes). Use the docx/xlsx/powerpoint skills or a library like "
+            "bytes). Use the microsoft-office skill or a library like "
             "python-docx/openpyxl/python-pptx via the terminal to create or edit "
             "this document.")
     # A -wal/-shm/-journal path is never a legitimate text target, even when
@@ -577,7 +584,8 @@ def _stale_overwrite_blocker(filepath: str, resolved: str | None, task_id: str) 
     if not resolved or _has_full_write_baseline(resolved, task_id):
         return None
     try:
-        exists = Path(resolved).exists()
+        from tools.file_backend_state import remote_state
+        exists = remote_state(resolved)["exists"] if current_execution() else Path(resolved).exists()
     except OSError:
         return None
     if not exists:

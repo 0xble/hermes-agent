@@ -91,12 +91,18 @@ def perform_api_call(
     _use_streaming = _should_stream(agent)
 
     def _perform_api_call(next_api_kwargs):
+        # This is the start of this physical transport attempt.  Retry attempts
+        # within one logical API call must not reuse the outer call timestamp
+        # when guarding a recovery tombstone.
+        agent._current_api_request_started_at = time.time()
         from agent import relay_llm
         from agent.turn_usage import log_response_service_tier
 
         if agent.api_mode == "codex_responses":
+            from agent.codex_responses_adapter import drops_replay_item_ids
+
             next_api_kwargs = agent._get_transport().preflight_kwargs(
-                next_api_kwargs, allow_stream=False, is_github_responses=agent._is_copilot_url(),
+                next_api_kwargs, allow_stream=False, drop_replay_item_ids=drops_replay_item_ids(agent.base_url),
                 sanitize_harmony_tokens=agent._is_codex_backend(),
             )
         with relay_llm.capture_provider_request(next_api_kwargs) as provider_kwargs:
@@ -187,6 +193,11 @@ def handle_api_interrupt(
     from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 
     thinking_spinner = stop_thinking_spinner(agent, thinking_spinner)
+    from agent.shared_primary_cooldown import _probe_token_value
+    token = _probe_token_value(getattr(agent, "_shared_primary_probe_token", None))
+    if token:
+        from agent.shared_primary_probe_runtime import release_primary_probe
+        release_primary_probe(agent, token)
     # redirect() cancelled only this request: keep the correction queued, clear the
     # cancellation bit, let the outer loop rebuild. Never materialize incomplete
     # signed/encrypted reasoning items.
@@ -235,6 +246,7 @@ class NousRateGuardVerdict:
 def nous_rate_limit_guard(
     agent: Any, *, _retry: Any, api_messages: Any, messages: Any, conversation_history: Any,
     active_system_prompt: Any, retry_count: Any, compression_attempts: Any, api_call_count: Any,
+    approx_tokens: Any = None,
 ) -> NousRateGuardVerdict:
     """Skip the call if another session recorded a Nous Portal rate limit: every attempt (incl.
     SDK retries) counts against RPH. Never lets the guard itself break the agent loop."""
@@ -245,6 +257,21 @@ def nous_rate_limit_guard(
             action=action, active_system_prompt=active_system_prompt, retry_count=retry_count,
             compression_attempts=compression_attempts, result=result,
         )
+
+    # A response header can tell us that the next request cannot fit in the current TPM
+    # bucket. Check before any SDK call; otherwise a large prompt predictably produces a
+    # second 429. With a fallback that can take the turn it restarts cleanly there. With none
+    # the request is sent anyway and no fallback state is touched: the estimate is approximate,
+    # and the provider's own 429 carries the real reset into the normal wait-and-retry path.
+    from agent.turn_api_call_admission import has_admissible_fallback, predicted_tpm_overage
+    overage = predicted_tpm_overage(agent, approx_tokens)
+    if overage and has_admissible_fallback(agent):
+        agent._buffer_diagnostic_status(f"⏳ {overage} Trying fallback.")
+        if agent._try_activate_fallback():
+            active_system_prompt = _arm_fallback_restart(agent, api_messages, active_system_prompt, _retry)
+            retry_count = 0
+            compression_attempts = 0
+            return _verdict("break")
 
     if agent.provider == "nous":
         # A gateway ``x-nous-model-switch`` recorded on the previous response moves this session
@@ -271,6 +298,7 @@ def nous_rate_limit_guard(
                 agent._buffer_vprint(f"⏳ {_nous_msg} Trying fallback...")
                 agent._buffer_diagnostic_status(f"⏳ {_nous_msg}")
                 if agent._try_activate_fallback():
+                    logger.warning("%sNous rate limit recorded (resets in %s) — switched to fallback", agent.log_prefix, reset)
                     active_system_prompt = _arm_fallback_restart(
                         agent, api_messages, active_system_prompt, _retry)
                     retry_count = 0

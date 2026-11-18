@@ -4,7 +4,7 @@ import time
 from unittest.mock import Mock
 
 import tools.process_registry as process_registry_module
-import tools.terminal_tool as terminal_tool
+from tools import terminal_tool
 from tools.process_registry import ProcessRegistry, ProcessSession
 from tools.terminal_tool_lifecycle import _cleanup_inactive_envs
 

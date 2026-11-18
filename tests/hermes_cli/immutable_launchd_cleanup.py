@@ -10,6 +10,8 @@ from pathlib import Path
 
 import psutil
 
+from tests.waiting import process_alive
+
 _PREFIXES = ("ai.hermes.s2spike.", "ai.hermes.s2migration.", "ai.hermes.s2crash.")
 _REGISTRY = "immutable-launchd-labels.jsonl"
 
@@ -34,7 +36,7 @@ def _sweep(registry: Path) -> None:
         if not label.startswith(_PREFIXES) or not path.name == f"{label}.plist":
             continue
         target = f"gui/{os.getuid()}/{label}"
-        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15)
+        subprocess.run(["launchctl", "bootout", target], capture_output=True, timeout=15, check=False)
 
 
 def register_disposable_label(request, label: str, plist: Path) -> None:
@@ -55,7 +57,7 @@ def register_disposable_label(request, label: str, plist: Path) -> None:
 def _sweep_missing_plists(base: Path) -> None:
     """Recover disposable jobs after pytest has removed their registry and plist."""
     domain = f"gui/{os.getuid()}"
-    listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=15)
+    listing = subprocess.run(["launchctl", "list"], capture_output=True, text=True, timeout=15, check=False)
     if listing.returncode:
         return
     for row in listing.stdout.splitlines():
@@ -64,7 +66,7 @@ def _sweep_missing_plists(base: Path) -> None:
             continue
         label = columns[2]
         detail = subprocess.run(["launchctl", "print", f"{domain}/{label}"],
-                                capture_output=True, text=True, timeout=15)
+                                capture_output=True, text=True, timeout=15, check=False)
         if detail.returncode:
             continue
         paths = [line.strip().removeprefix("path = ") for line in detail.stdout.splitlines()
@@ -83,7 +85,7 @@ def _sweep_missing_plists(base: Path) -> None:
                 or not relative.parts[2].startswith("pytest-")):
             continue
         subprocess.run(["launchctl", "bootout", f"{domain}/{label}"],
-                       capture_output=True, timeout=15)
+                       capture_output=True, timeout=15, check=False)
 
 
 def sweep_prior_sessions(request) -> None:
@@ -100,8 +102,7 @@ def sweep_prior_sessions(request) -> None:
             entries = [json.loads(line) for line in registry.read_text().splitlines()]
         except (OSError, ValueError):
             continue
-        if entries and all(not psutil.pid_exists(item["pid"]) or
-                           psutil.Process(item["pid"]).create_time() != item["created"]
+        if entries and all(not process_alive(item["pid"], created=item["created"])
                            for item in entries):
             _sweep(registry)
             registry.unlink(missing_ok=True)

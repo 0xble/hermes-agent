@@ -59,11 +59,6 @@ def _make_runner_with_cached_agent(close_fn):
     runner._background_tasks = set()
 
     session_key = build_session_key(_make_source())
-    session_entry = SessionEntry(
-        session_key=session_key, session_id="sess-old",
-        created_at=datetime.now(), updated_at=datetime.now(),
-        platform=Platform.TELEGRAM, chat_type="dm",
-    )
     new_entry = SessionEntry(
         session_key=session_key, session_id="sess-new",
         created_at=datetime.now(), updated_at=datetime.now(),
@@ -71,7 +66,8 @@ def _make_runner_with_cached_agent(close_fn):
     )
     runner.session_store = MagicMock()
     runner.session_store.reset_session.return_value = new_entry
-    runner.session_store._entries = {session_key: session_entry}
+    # This suite isolates resource cleanup, not cold goal/loop-store initialization.
+    runner.session_store._entries = {}
     runner.session_store._generate_session_key.return_value = session_key
     runner._running_agents = {}
     runner._pending_messages = {}

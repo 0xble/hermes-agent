@@ -40,7 +40,11 @@ def test_login_startup_cannot_discard_the_selected_path(tmp_path, monkeypatch, c
                   'export LOGIN_INIT_PROOF=loaded\n'
                   'login_function() { printf function; }\n')
     monkeypatch.setattr(local, '_resolve_shell_init_files', lambda: [str(rc)])
-    monkeypatch.setenv('PATH', '/daemon/bin:/usr/bin:/bin')
+    daemon_bin = tmp_path / 'daemon' / 'bin'
+    daemon_bin.mkdir(parents=True)
+    monkeypatch.setenv('PATH', f'{daemon_bin}:/usr/bin:/bin')
+    if first == '/daemon/bin':
+        first = str(daemon_bin)
     backend = {} if backend_path is None else {'PATH': backend_path}
     with client_env_scope(client):
         terminal = local.LocalEnvironment(cwd=str(tmp_path), env=backend)
@@ -54,9 +58,9 @@ def test_login_startup_cannot_discard_the_selected_path(tmp_path, monkeypatch, c
                 assert entries[0] == first, result
                 assert loaded == 'loaded' and function == 'function' and marker == ''
                 if client is None:
-                    assert '/daemon/bin' in entries
+                    assert str(daemon_bin) in entries
                 elif client.get('PATH') or backend_path:
-                    assert '/daemon/bin' not in entries
+                    assert str(daemon_bin) not in entries
             assert '_HERMES_LOCAL_LAUNCH_PATH' not in Path(terminal._snapshot_path).read_text()
             # PATH remains normal persistent shell state after startup, not a per-command reset.
             assert terminal.execute('export PATH="/turn/bin:$PATH"')['returncode'] == 0

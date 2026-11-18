@@ -7,10 +7,15 @@ and their sidebar lane fell back to a fake ``main`` label (#108694).
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import subprocess
+
+import pytest
 
 from hermes_state import SessionDB
 from tui_gateway import server
+
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
 
 
 class _ImmediateThread:
@@ -36,7 +41,7 @@ def _desktop_session(monkeypatch, tmp_path, cwd):
     })
     sid = resp["result"]["session_id"]
     # Patched only after create: session.create starts real Timers (Thread subclasses).
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
     return db, sid, server._sessions[sid], resp["result"]["stored_session_id"]
 
 

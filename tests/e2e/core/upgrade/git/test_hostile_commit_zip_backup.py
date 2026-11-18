@@ -6,22 +6,11 @@ Every cell keeps a fresh real install; no mutable checkout is shared.
 from __future__ import annotations
 
 from tests.e2e.core.upgrade.git import _hostile_commit as C
-from tests.e2e.core.upgrade.git._hostile_commit import (
-    I,
-    P,
-    _artifacts,
-    _head,
-    _launch,
-    _release,
-    _tracked_dirty,
-    _update,
-    _zip_killed_at,
-    provider as provider,
-    world as world,
-)
+from tests.e2e.core.upgrade.git._hostile_commit import I, P, _artifacts, _head, _launch, _release, _tracked_dirty, _update, _zip_killed_at, provider, world as _world_fixture
+world = _world_fixture
 from tests.e2e.core.upgrade.git._hostile_diagnostics import (
-    hostile_cell as hostile_cell,
-    hostile_diagnostics as hostile_diagnostics,
+    hostile_cell,
+    hostile_diagnostics,
 )
 
 pytestmark = C.pytestmark

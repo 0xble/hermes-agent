@@ -6,6 +6,7 @@ The retained prompt path accepts only an in-process ``DeliveryAuthor`` object.
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 import types
 
@@ -49,7 +50,7 @@ class _InlineThread:
 
 @pytest.fixture()
 def turn_env(monkeypatch, tmp_path):
-    monkeypatch.setattr(srv.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, srv, _InlineThread)
     for name in ("_emit", "_wire_callbacks", "_sync_agent_model_with_config", "_register_session_cwd",
                  "_tts_stream_begin", "_sync_session_key_after_compress"):
         monkeypatch.setattr(srv, name, lambda *a, **k: None)

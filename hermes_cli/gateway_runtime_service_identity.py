@@ -219,12 +219,12 @@ def _verify_launchd_argv(argv: list[str], home: Path) -> None:
 
 def _launchd_command(argv: list[str]) -> tuple[list[str], bool]:
     """``(command, wrapped)``: the command the launchd job runs, and whether it came out of the Local
-    Network wrapper (gateway_launchd.launchd_program_arguments, #71206). The wrapper is accepted only when
+    Network wrapper (gateway_launchd_runtime.launchd_program_arguments, #71206). The wrapper is accepted only when
     the installer regenerates it byte for byte from the inner command and the two log paths it carries,
     so no shell operator, substitution, extra JXA or foreign osascript rides along."""
     if argv[:1] != ["/usr/bin/osascript"]:
         return argv, False
-    from hermes_cli.gateway_launchd import launchd_program_arguments
+    from hermes_cli.gateway_launchd_runtime import launchd_program_arguments
     # Recover the inputs, then let the installer rebuild the whole argv: the comparison is the check.
     script, opener = argv[-1], "$.system("
     try:
@@ -306,6 +306,21 @@ def read_definition(path: Path) -> bytes:
         return value
 
 
+def launcher_text(raw: bytes) -> str:
+    """Current .vbs launchers are UTF-16 with a BOM (wscript.exe reads a BOM-less script in the ANSI
+    code page); launchers written by older versions, and every other service definition, are UTF-8.
+    Undecodable bytes raise ``ValueError``."""
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        try:
+            return raw.decode("utf-16")
+        except UnicodeDecodeError:
+            _unverified()
+    try:
+        return raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        _unverified()
+
+
 def _vbs_identity(script: str) -> tuple[str, list[str]]:
     # Recognize the vendor's complete template, not a HERMES_HOME substring
     # inside an arbitrary executable script. Doubled quotes are VB literals.
@@ -379,6 +394,6 @@ def verify_windows_task(xml: str | bytes, home: Path, account: str, sid: str) ->
     script = _absolute(match[1])
     if script.suffix.lower() != '.vbs':
         _unverified()
-    configured, argv = _vbs_identity(read_definition(script).decode("utf-8"))
+    configured, argv = _vbs_identity(launcher_text(read_definition(script)))
     verify_home(home, configured)
     verify_gateway_argv(argv, home)

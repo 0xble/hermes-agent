@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any, Optional
 from hermes_cli.config import OPTIONAL_ENV_VARS, write_platform_config_field
 from hermes_cli.setup_hidden_env import is_setup_hidden_env as _is_setup_hidden_env
-from hermes_cli.version_info import get_version_info
+from hermes_cli.version_info import hermes_user_agent
 
 # Same logger the code used before extraction (record parity).
 _log = logging.getLogger("hermes_cli.web_server")
@@ -57,7 +57,7 @@ _PLATFORM_OVERRIDES: dict[str, dict[str, Any]] = {
 _PLATFORM_ORDER: tuple[str, ...] = (
     "telegram", "discord", "slack", "mattermost", "matrix", "whatsapp", "signal", "bluebubbles",
     "email", "sms", "dingtalk", "feishu", "google_chat", "wecom", "wecom_callback",
-    "weixin", "qqbot", "yuanbao", "api_server", "webhook",
+    "weixin", "qqbot", "api_server", "webhook",
 )
 
 
@@ -267,7 +267,7 @@ def _telegram_onboarding_request_sync(
     method: str, path: str, *, body: dict[str, Any] | None = None, bearer_token: str | None = None
 ) -> dict[str, Any]:
     import httpx
-    headers = {"Accept": "application/json", "User-Agent": f"HermesDashboard/{get_version_info().base_version}"}
+    headers = {"Accept": "application/json", "User-Agent": hermes_user_agent("HermesDashboard")}
     request_kwargs: dict[str, Any] = {}
     if body is not None:
         headers["Content-Type"] = "application/json"

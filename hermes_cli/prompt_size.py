@@ -14,9 +14,9 @@ from typing import Any, Dict, List, Optional, Tuple
 
 _SKILLS_BLOCK_RE = re.compile(r"<available_skills>.*?</available_skills>", re.DOTALL)
 
-# A rendered skill entry is ``    - name: desc`` (or ``    - name``); category headers use two
-# leading spaces, so the four-space + ``- `` prefix isolates skill lines.
-_SKILL_LINE_PREFIX = "    - "
+# A rendered skill entry is ``- name: desc`` (or ``- name``) indented four spaces under its category
+# header, or two when it is a one-skill category's only row; headers never start with ``- ``.
+_SKILL_LINE_PREFIX = "- "
 
 # Posture-demoted categories render all visible skill names on one shared line.
 _NAMES_ONLY_LINE_RE = re.compile(r"^  .+ \[names only\]: (?P<names>.+)$")
@@ -56,7 +56,7 @@ def _build_inspection_agent(platform: str) -> Any:
     from agent.skill_utils import parse_config_string_list
 
     cfg = load_config()
-    from hermes_cli.model_preset_runtime import resolve_default_route
+    from hermes_cli.model_alias_runtime import resolve_default_route
     route = resolve_default_route(cfg)
     agent_cfg = cfg.get("agent") or {}
     return AIAgent(
@@ -121,9 +121,9 @@ def _compute_skills_breakdown(skills_block: str) -> list[dict[str, Any]]:
                 shared = shared_base + (1 if index < shared_remainder else 0)
                 append_entry(name, index_line_bytes=name_bytes[index] + shared, index_line_total_bytes=line_bytes,
                              index_line_shared_bytes=shared, index_line_skill_count=len(names))
-        elif line.startswith(_SKILL_LINE_PREFIX):
+        elif (row := line.lstrip()).startswith(_SKILL_LINE_PREFIX):
             # Partition on ``": "`` (not ``:``) so namespaced names like ``codex:rescue`` stay intact.
-            name = line[len(_SKILL_LINE_PREFIX):].partition(": ")[0].strip()
+            name = row[len(_SKILL_LINE_PREFIX):].partition(": ")[0].strip()
             if name:
                 append_entry(name, index_line_bytes=line_bytes, index_line_total_bytes=line_bytes,
                              index_line_shared_bytes=0, index_line_skill_count=1)

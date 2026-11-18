@@ -53,7 +53,7 @@ FTS_PROBES = ("hermes", "telegram", "backup")
 def declared_tables() -> set[str]:
     names: set[str] = set()
     # Core tables use bare CREATE TABLE; auxiliary ones use IF NOT EXISTS; FTS uses VIRTUAL TABLE.
-    pattern = re.compile(r"CREATE (?:VIRTUAL )?TABLE (?:IF NOT EXISTS )?\"?([A-Za-z_][A-Za-z0-9_]*)", re.I)
+    pattern = re.compile(r"CREATE (?:VIRTUAL )?TABLE (?:IF NOT EXISTS )?\"?([A-Za-z_][A-Za-z0-9_]*)", re.IGNORECASE)
     for path in REPO.rglob("*.py"):
         if {"tests", ".venv", "venv", ".worktrees"}.intersection(path.relative_to(REPO).parts[:-1]):
             continue
@@ -133,7 +133,7 @@ def open_with_candidate(copy: Path, scratch_home: Path, python: str) -> dict:
     )
     env = {**os.environ, "HERMES_HOME": str(scratch_home), "HERMES_STATE_DB_GUARD_BYPASS": "1"}
     env.pop("PYTHONPATH", None)
-    run = subprocess.run([python, "-c", code], cwd=str(REPO), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600)
+    run = subprocess.run([python, "-c", code], cwd=str(REPO), env=env, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=3600, check=False)
     try:
         result = json.loads(run.stdout.strip().splitlines()[-1])
     except (ValueError, IndexError):
@@ -197,8 +197,8 @@ def assess(path: Path, before: dict, after: dict, pre: dict, post: dict,
     for key in ("store_instance_id", "db_file_generation"):
         changed_meta.pop(key, None)
     transition = (bm.get("fts_storage_version") == "2" and am.get("fts_storage_version") == "3"
-                  and bool(re.search(r"content\s*=\s*['\"]messages['\"]", before["fts_ddl"].get("messages_fts", ""), re.I))
-                  and bool(re.search(r"content\s*=\s*['\"]messages_fts_src['\"]", after["fts_ddl"].get("messages_fts", ""), re.I)))
+                  and bool(re.search(r"content\s*=\s*['\"]messages['\"]", before["fts_ddl"].get("messages_fts", ""), re.IGNORECASE))
+                  and bool(re.search(r"content\s*=\s*['\"]messages_fts_src['\"]", after["fts_ddl"].get("messages_fts", ""), re.IGNORECASE)))
     proof = verify_aligned_fts(path) if transition else {"ok": False, "reason": "not the supported v2->v3 transition"}
     expected = {"rows_changed": {}, "probe_mismatch": {}, "metadata_removed": [], "metadata_changed": {}}
     if transition and proof["ok"]:

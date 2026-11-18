@@ -157,7 +157,7 @@ def compress_now(
 
 
 def _compress_head(
-    agent: Any, before: List[Dict[str, Any]], head: List[Dict[str, Any]], tail: List[Dict[str, Any]],
+    agent: Any, before: list[dict[str, Any]], head: list[dict[str, Any]], tail: list[dict[str, Any]],
     before_tokens: int, request: CompressRequest, *, system_message: Any, task_id: str, skip_without_window: bool,
     snapshot_is_current: Optional[Callable[[], bool]] = None,
 ) -> CompressResult:

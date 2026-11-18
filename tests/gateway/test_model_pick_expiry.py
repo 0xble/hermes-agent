@@ -1,7 +1,7 @@
 """Opt-in wall-clock model picks retain the legacy policy when unconfigured."""
 
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 from zoneinfo import ZoneInfo
@@ -12,6 +12,7 @@ from gateway.config import GatewayConfig, Platform
 from gateway.platforms.event import MessageEvent
 from gateway.run import GatewayRunner
 from gateway.session import SessionSource, SessionStore
+from hermes_cli.model_switch import ModelSwitchResult
 
 
 @pytest.fixture
@@ -41,7 +42,7 @@ def harness(tmp_path, monkeypatch):
         runner._switch_cached_agent_model = lambda *_a: None
         runner._record_switch_metrics = lambda *_a: None
         runner._model_selection_warning = AsyncMock(return_value=None)
-        result = SimpleNamespace(new_model="picked", target_provider="openai", api_key="test-only",
+        result = ModelSwitchResult(success=True, new_model="picked", target_provider="openai", api_key="test-only",
                                  base_url=runtime["base_url"], api_mode="chat_completions", provider_label="OpenAI",
                                  request_overrides={}, runtime_capabilities={}, model_info=None, warning_message=None)
         runner._perform_model_switch = AsyncMock(return_value=(result, None))
@@ -106,7 +107,7 @@ def test_pick_deadline_survives_restart_and_returns_to_normal_route(harness, att
 
     # Fresh process state and store exercise the durable hydration path, not just memory.
     runner = restart()
-    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, timezone.utc))
+    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, UTC))
     clock.now += 1800
 
     def resolve():
@@ -122,7 +123,7 @@ def test_pick_deadline_survives_restart_and_returns_to_normal_route(harness, att
     # At the exact wall-clock deadline it returns to the route live now, not the old default.
     cfg["model"]["default"] = "new-default"
     if attended:
-        runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, timezone.utc))
+        runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, UTC))
         runner._session_state(key).conversation.last_user_activity_at = clock.now
     clock.now = deadline
     assert resolve() == ("attended" if attended else "new-default")
@@ -174,7 +175,7 @@ async def test_short_attended_turn_expires_before_assignment_and_emits_notice_no
     expected_model = "attended"
     if role_hold:
         cfg["model"].pop("attended")
-        cfg["model_presets"] = {"fast": {"model": "fast-model", "provider": "openai"}}
+        cfg["model_aliases"] = {"fast": {"model": "fast-model", "provider": "openai"}}
         expected_model = "fast-model"
     await runner._handle_model_command(MessageEvent(text="/model picked", source=source))
     deadline = runner._session_model_override(key)["expires_at"]
@@ -185,7 +186,7 @@ async def test_short_attended_turn_expires_before_assignment_and_emits_notice_no
         runner = restart()
     runner._gateway_loop = asyncio.get_running_loop()
     clock.now = deadline + past_deadline
-    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, timezone.utc))
+    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, UTC))
     runner._session_state(key).conversation.last_user_activity_at = clock.now
     runner._get_proxy_url = lambda: None
     defaults = TurnContext()
@@ -252,7 +253,7 @@ async def test_short_attended_turn_expires_before_assignment_and_emits_notice_no
 @pytest.mark.asyncio
 @pytest.mark.parametrize("after_restart", [False, True])
 async def test_reset_clears_deadline_even_if_config_opt_in_was_removed(harness, after_restart):
-    cfg, clock, source, restart = harness
+    cfg, _clock, source, restart = harness
     cfg["model"]["pick_ttl_hours"] = 12
     runner = restart()
     key = runner._session_key_for_source(source)
@@ -295,7 +296,7 @@ async def test_temporary_reasoning_keeps_idle_expiry_while_timed_model_survives(
     key = runner._session_key_for_source(source)
     await runner._handle_model_command(MessageEvent(text="/model picked", source=source))
     runner._set_session_reasoning_override(key, {"enabled": True, "effort": "high"}, scope="temporary")
-    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, timezone.utc))
+    runner.session_store.mark_user_activity(key, datetime.fromtimestamp(clock.now, UTC))
     clock.now += 1800
     assert (await runner._resolve_session_agent_runtime_async(source=source, user_config=cfg))[0] == "picked"
     assert runner._session_reasoning_override(key) is None

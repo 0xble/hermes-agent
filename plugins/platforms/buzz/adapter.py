@@ -1954,7 +1954,8 @@ def register(ctx):
     """Plugin entry point: called by the Hermes plugin system."""
     ctx.register_platform(
         **_load_sibling("send_targets").SEND_ENTRY_KWARGS,  # send_message target syntax + routing
-        name="buzz", label="Buzz", adapter_factory=lambda cfg: BuzzAdapter(cfg), check_fn=check_requirements,
+        name="buzz", label="Buzz", adapter_factory=lambda cfg: BuzzAdapter(cfg), adapter_class=BuzzAdapter,
+        check_fn=check_requirements,
         validate_config=validate_config, is_connected=is_connected, required_env=["BUZZ_RELAY_URL", "BUZZ_PRIVATE_KEY"],
         install_hint="Requires the buzz CLI binary (https://github.com/block/buzz) on PATH or at BUZZ_CLI_PATH",
         setup_fn=interactive_setup, env_enablement_fn=_env_enablement, apply_yaml_config_fn=_apply_yaml_config,

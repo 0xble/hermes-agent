@@ -261,6 +261,32 @@ def test_concurrent_admits_respect_the_budget(clock):
     assert sum(allowed) == 20
 
 
+def test_refund_is_token_scoped_and_idempotent_at_the_same_instant(clock):
+    guard = BotLoopGuard(settings=lambda: BotLoopGuardSettings(max_events=3), clock=clock.now)
+    first, second, wrong = object(), object(), object()
+    assert guard.admit("chat", charge=first) == (True, "ok")
+    assert guard.admit("chat", charge=second) == (True, "ok")
+    assert guard.admit("chat") == (True, "ok")  # a non-refundable admission at the same clock
+    assert guard.refund("other-chat", first) is False
+    assert guard.refund("chat", wrong) is False
+    assert guard.refund("chat", first) is True
+    assert guard.refund("chat", first) is False
+    assert guard.admit("chat") == (True, "ok")
+    assert guard.admit("chat") == (False, "tripped")
+    assert guard.refund("chat", second) is False  # tripping already cleared that window
+    assert guard.blocked("chat") is True  # refund must not erase an independently tripped cooldown
+
+    # Expired charges cannot remove a newer window's admission either.
+    guard = BotLoopGuard(settings=lambda: BotLoopGuardSettings(max_events=1, window_seconds=1), clock=clock.now)
+    old, fresh = object(), object()
+    assert guard.admit("chat", charge=old) == (True, "ok")
+    clock.advance(2)
+    assert guard.admit("chat", charge=fresh) == (True, "ok")
+    assert guard.refund("chat", old) is False
+    assert guard.refund("chat", fresh) is True
+    assert guard.admit("chat") == (True, "ok")
+
+
 # --- settings ---------------------------------------------------------------
 
 

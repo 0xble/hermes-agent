@@ -15,6 +15,7 @@ import time as _time
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 
+from agent.deadline import poll_until
 from hermes_cli.update_cmd_common import _best_effort
 
 logger = logging.getLogger("hermes_cli.update_cmd")  # log-record parity with the origin module
@@ -89,7 +90,7 @@ def _wait_for_windows_update_gateway_exit(pids: list[int], *, timeout: float) ->
         remaining = {pid for pid in remaining if _alive(pid)}
         return not remaining
 
-    _poll_until(_all_gone, max(timeout, 0.0), 0.25)
+    poll_until(_all_gone, max(timeout, 0.0), 0.25)
     return {pid for pid in remaining if _alive(pid)}
 
 
@@ -209,7 +210,7 @@ def _cwd_prefix(proc) -> str:
 
 _HOLDER_VALUE_FLAGS_FALLBACK = frozenset({
     "--profile", "-p", "--config", "--model", "-m", "--provider", "--reasoning", "--toolsets", "-t",
-    "--skills", "-s", "--continue", "-c", "--resume", "-r", "--oneshot", "-z", "--in", "--usage-file",
+    "--skills", "-s", "--continue", "-c", "--resume", "-r", "--oneshot", "-z", "--in", "--usage-file", "--cpu-profile",
 })
 _holder_value_flags_cache: frozenset | None = None
 
@@ -358,6 +359,7 @@ def _leftover_pausable_gateway_pids(matches: list[tuple[int, str, str]]) -> list
     Uses the Desktop preflight's ``_is_pausable_gateway`` so exemption and tolerance cannot drift; live argv is
     re-read via psutil when possible since the scan may hold only a cmdline prefix."""
     from hermes_cli._scan_venv_blockers import _is_pausable_gateway
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
     psutil = _psutil()
     pids: list[int] = []
     for pid, _name, cmdline in matches:
@@ -365,7 +367,7 @@ def _leftover_pausable_gateway_pids(matches: list[tuple[int, str, str]]) -> list
         if psutil is not None:
             with suppress(Exception):
                 argv = " ".join(psutil.Process(int(pid)).cmdline()) or cmdline
-        if not _is_pausable_gateway(argv):
+        if not _is_pausable_gateway(argv) or leave_client_owned_gateway(int(pid)):
             return None
         pids.append(int(pid))
     return pids
@@ -693,16 +695,6 @@ def _original_process_is_alive(psutil, pid: int, create_time: float) -> bool:
     return abs(current - create_time) <= 0.001
 
 
-def _poll_until(condition, timeout: float, interval: float = 0.2) -> bool:
-    """Poll *condition* every *interval* seconds until true (True) or *timeout* elapses (False)."""
-    deadline = _time.monotonic() + timeout
-    while _time.monotonic() < deadline:
-        if condition():
-            return True
-        _time.sleep(interval)
-    return False
-
-
 def _process_create_time(psutil, pid: int, label: str) -> float:
     """``create_time`` of *pid*; unreadable identity aborts the stop (RuntimeError)."""
     try:
@@ -748,7 +740,7 @@ def _stop_windows_gateway_service(
     def _alive() -> list[int]:
         return [pid for pid, create_time in expected_processes if _original_process_is_alive(psutil, pid, create_time)]
 
-    if _poll_until(lambda: service.status() == "stopped" and not _alive(), timeout):
+    if poll_until(lambda: service.status() == "stopped" and not _alive(), timeout, 0.2):
         return
     if service.status() != "stopped":
         raise RuntimeError(f"Windows service {name} did not stop within {timeout:.0f}s; venv mutation unsafe.")
@@ -760,7 +752,7 @@ def _start_windows_gateway_service(name: str, *, timeout: float = 30.0) -> None:
     """Start one previously paused Windows service and verify it is running."""
     service = _win_service(name)[1]
     _sc_exe("start", name, service, "running")
-    if not _poll_until(lambda: service.status() == "running", timeout):
+    if not poll_until(lambda: service.status() == "running", timeout, 0.2):
         raise RuntimeError(f"Windows service {name} did not start within {timeout:.0f}s")
 
 
@@ -775,7 +767,7 @@ def _restore_windows_gateway_service(name: str, *, timeout: float = 60.0) -> Non
             _start_windows_gateway_service(name)
         return status in ("running", "stopped")
 
-    if not _poll_until(_settled, timeout):
+    if not poll_until(_settled, timeout, 0.2):
         raise RuntimeError(f"Windows service {name} did not reach a restorable state within {timeout:.0f}s")
 
 
@@ -894,12 +886,13 @@ def _request_socket_pauses(running_pids, profile_processes, service_gateway_pids
     gateway) -> the marker poll / force-kill ladder in the caller. ``on_request(pid)`` runs once the
     request is issued (marker on disk, else a positive socket ACK) and before the socket call: from
     then on a crash leaves that gateway owed while it drains, never before."""
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
     profiles: dict[str, int] = {}
     mapped_pids = []
     socket_acks: list[dict] = []
     for pid in running_pids:
         proc = None if pid in service_gateway_pids else profile_processes.get(pid)
-        if proc is None:
+        if proc is None or leave_client_owned_gateway(int(pid), home=proc.path):
             continue
         profiles[str(proc.profile)] = int(pid)
         mapped_pids.append(int(pid))
@@ -957,6 +950,18 @@ def _pause_windows_gateways_for_update() -> dict | None:
     profile_processes, service_gateways, service_gateway_pids, running_pids = _discover_windows_gateways()
     if not running_pids:
         return _cold_start_pause_token(adopted, claims)
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
+    # Keep discovery's liveness result: only leases running is NOT a cold-start
+    # authorization. Filter before marker writes, durable pause debt or argv replay.
+    running_pids = [pid for pid in running_pids if not leave_client_owned_gateway(
+        pid, home=getattr(profile_processes.get(pid), "path", None))]
+    if not running_pids:
+        if adopted is None:
+            return None
+        return pause_record.record_pause(
+            {"resume_needed": True, "profiles": {}, "unmapped_pids": [], "unmapped": []}, adopted, claims)
+    service_gateways = [s for s in service_gateways if int(s.gateway_pid) in running_pids]
+    service_gateway_pids.intersection_update(running_pids)
     unmapped_pids = [pid for pid in running_pids if pid not in profile_processes and pid not in service_gateway_pids]
     from gateway.status import get_process_start_time
     from hermes_cli.update_fleet_scope import gateway_pid_home

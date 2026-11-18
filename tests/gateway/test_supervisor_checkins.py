@@ -1,4 +1,4 @@
-"""Idle scheduling, FIFO priority, visibility and generated mandatory-reply contracts."""
+"""Idle scheduling, FIFO priority, visibility and generated quiet-inspection contracts."""
 import asyncio
 from contextlib import nullcontext
 from types import SimpleNamespace
@@ -34,7 +34,9 @@ def fixture(tmp_path, monkeypatch):
     runner = SimpleNamespace(session_store=store, _draining=False, _is_session_running=lambda _: False,
                              _restored_source=lambda _: source, _async_profile_scope_for_source=lambda _: nullcontext(),
                              _run_in_executor_with_context=asyncio.to_thread, _delivery_adapter_for=lambda _: adapter,
-                             _is_intentional_silence=lambda result, text: text.strip() in {"NO_REPLY", "[SILENT]"})
+                             _is_intentional_silence=lambda result, text: text.strip() in {"NO_REPLY", "[SILENT]"},
+                             # Fork bot-loop accounting (0754ec0e) runs on every delivered reply.
+                             _note_bot_reply=lambda *_: None)
     pending = []
     authority = SimpleNamespace(db=db, logical_owner=lambda _: "owner", admit_automation=AsyncMock())
     monkeypatch.setattr("gateway.session_authorities.active_authority", lambda _: authority)
@@ -236,22 +238,29 @@ def test_checkin_descriptor_is_not_accepted_from_human_metadata(fixture):
 
 
 @pytest.mark.asyncio
-async def test_silence_is_reprompted_once_and_second_refusal_gets_normal_delivery_fallback(fixture):
+async def test_deliberate_silence_skips_recovery_but_empty_and_unsuccessful_output_get_status(fixture):
     from gateway.run_turn_silence_recovery import silence_recovery_due
     f = fixture
     ctx = SimpleNamespace(persist_user_display_kind="supervisor_checkin", reply_expected=False,
                           _run_still_current=lambda: True)
-    response = {"final_response": "NO_REPLY", "completed": True, "acknowledged_by_reaction": True}
-    assert silence_recovery_due(f.runner, response, ctx, silence_retry=False, scheduled_heartbeat=False)
+    response = {"final_response": "NO_REPLY", "completed": True}
+    assert not silence_recovery_due(f.runner, response, ctx, silence_retry=False, scheduled_heartbeat=False)
     assert not silence_recovery_due(f.runner, response, ctx, silence_retry=True, scheduled_heartbeat=False)
     ctx.persist_user_display_kind = "internal_notification"
     assert not silence_recovery_due(f.runner, response, ctx, silence_retry=False, scheduled_heartbeat=False)
     event = MessageEvent(text="tick", source=f.source, internal=True,
                          metadata={"checkin": ["owner", 1300], "display_kind": "supervisor_checkin"})
     result = await run_checkins.silence_fallback(f.runner, event, f.entry, response)
-    assert "Still outstanding: tests" in result["final_response"]
-    assert "Next check in 30 minutes" in result["final_response"]
-    assert "NO_REPLY" not in result["final_response"]
+    assert result["final_response"] == "" and result["intentional_silence"]
+    # A reaction or missing/error result is not an explicit successful quiet inspection.
+    for invalid in ({"final_response": "", "completed": True, "acknowledged_by_reaction": True},
+                    {"final_response": "NO_REPLY"}, {"final_response": "NO_REPLY", "completed": False},
+                    {**response, "failed": True}, {**response, "partial": True},
+                    {**response, "error": "provider unavailable"},
+                    {**response, "failure_reason": "empty_response"}):
+        status = await run_checkins.silence_fallback(f.runner, event, f.entry, invalid)
+        assert "Still outstanding: tests" in status["final_response"]
+        assert not status["intentional_silence"]
 
 
 def test_native_and_local_restore_preserve_generated_descriptor(fixture):

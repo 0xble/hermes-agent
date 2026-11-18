@@ -162,10 +162,29 @@ async def _ensure_named_dm_topic(
     kwargs = {"force_create": True} if refresh else {}
     if owner_key:
         kwargs.update({"owner_key": owner_key, "allow_parallel": allow_parallel})
-    thread_id = await ensure_dm_topic(chat_id, name, **kwargs)
+    from hermes_constants import get_routing_process_hermes_home, reset_hermes_home_override, set_hermes_home_override
+    owner = getattr(adapter, "_owner_profile", None)
+    if isinstance(owner, str) and owner:
+        from hermes_cli.profiles import get_profile_dir
+        token = set_hermes_home_override(get_profile_dir(owner))
+    else:
+        token = set_hermes_home_override(get_routing_process_hermes_home())
+    try:
+        thread_id = await ensure_dm_topic(chat_id, name, **kwargs)
+    finally:
+        reset_hermes_home_override(token)
     if not thread_id:
         raise RuntimeError(f"Telegram adapter returned no thread for named topic {name!r}")
     return str(thread_id)
+
+
+def telegram_topic_owner_options(metadata: dict) -> dict:
+    """The same automation owner and parallel-lane policy for text and attachments."""
+    owner_key = metadata.get("telegram_topic_owner_key")
+    if not owner_key and metadata.get("job_id"):
+        owner_key = f"cron:{metadata['job_id']}"
+    return {"owner_key": str(owner_key) if owner_key else None,
+            "allow_parallel": bool(metadata.get("telegram_topic_allow_parallel"))}
 
 
 class DeliveryRouter:
@@ -306,12 +325,9 @@ class DeliveryRouter:
 
         # Caller-supplied thread routing always wins over target.thread_id.
         named_topic: Optional[str] = None  # named topic requested for this send
-        topic_owner_key: Optional[str] = None
-        topic_allow_parallel = bool(send_metadata.get("telegram_topic_allow_parallel"))
-        if send_metadata.get("telegram_topic_owner_key"):
-            topic_owner_key = str(send_metadata["telegram_topic_owner_key"])
-        elif send_metadata.get("job_id"):
-            topic_owner_key = f"cron:{send_metadata['job_id']}"
+        topic_options = telegram_topic_owner_options(send_metadata)
+        topic_owner_key = topic_options["owner_key"]
+        topic_allow_parallel = topic_options["allow_parallel"]
         thread_id = target.thread_id
         # A configured numeric destination borrows that live session's topic. Its
         # historical cron owner may name a retired lane, so it must not override
@@ -356,7 +372,7 @@ class DeliveryRouter:
             error = _send_result_error(result)
             if retry or error is None or not named_topic or "thread not found" not in error.lower():
                 break
-            if topic_owner_key and not topic_allow_parallel:
+            if topic_owner_key:
                 mark_unresolved = getattr(adapter, "mark_telegram_topic_owner_unresolved", None)
                 if callable(mark_unresolved):
                     mark_unresolved(target.chat_id, topic_owner_key, reason="remote_topic_unavailable")

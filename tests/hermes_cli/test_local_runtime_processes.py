@@ -10,6 +10,8 @@ import time
 import psutil
 import pytest
 
+from tests.waiting import kill_if_alive
+
 
 _SCRIPT = r'''
 import json, os, subprocess, sys, time
@@ -74,10 +76,7 @@ def _alive(identity):
 
 
 def _kill(identity):
-    if _alive(identity):
-        proc = psutil.Process(identity['pid'])
-        proc.kill()
-        proc.wait(timeout=10)
+    kill_if_alive(identity['pid'], created=identity['created'], timeout=10)
 
 
 @pytest.mark.platforms("windows")

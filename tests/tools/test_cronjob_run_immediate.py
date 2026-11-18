@@ -351,7 +351,7 @@ class TestCronjobRunExecutesImmediately:
 
 def test_manual_run_keeps_live_detached_claim_after_waiter_error(tmp_path, monkeypatch):
     """A post-handoff waiter error must not release a live worker's manual claim."""
-    import cron.scheduler as scheduler
+    from cron import scheduler
 
     job_id = "manual-live-detached-worker"
     process = SimpleNamespace(alive=True)

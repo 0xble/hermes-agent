@@ -67,6 +67,13 @@ jobs:
         if: steps.gate.outputs.configured != '0'
         uses: useblacksmith/checkout@25227e61ff9dafe400e22fa487b673eac4e4409a  # v1
 
+      - name: Cache pinned uv archive
+        if: steps.gate.outputs.configured != '0'
+        uses: ./.github/actions/cache-pinned-tool
+        with:
+          source: uv
+          tool: uv
+          version: '0.12.13'
       - name: Install uv
         if: steps.gate.outputs.configured != '0'
         uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0

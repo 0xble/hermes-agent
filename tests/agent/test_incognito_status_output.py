@@ -57,3 +57,15 @@ def test_verbose_tool_progress_stays_off_private_stdout(private, capsys):
             name="web_search", args={"query": canary}, task_id="t", call_id="c", trace=[]), 1)
         tool_executor._print_tool_completed(agent, 1, 0.1, f"result {canary}")
     assert (canary in capsys.readouterr().out) is not private
+
+
+@pytest.mark.parametrize("private", [True, False])
+def test_ephemeral_prompt_preview_stays_off_private_stdout(private, capsys):
+    """A non-quiet agent previews its ephemeral prompt at init, and a gateway's can carry context."""
+    from run_agent import AIAgent
+    canary = "canary-" + secrets.token_hex(8)
+    AIAgent(model="test-model", api_key="test-key", base_url="http://127.0.0.1:1/v1", platform="telegram",
+            session_id="private-init" if private else "public-init", enabled_toolsets=[], quiet_mode=False,
+            skip_memory=True, skip_context_files=True, incognito=private,
+            ephemeral_system_prompt=f"Context: {canary}")
+    assert (canary in capsys.readouterr().out) is not private

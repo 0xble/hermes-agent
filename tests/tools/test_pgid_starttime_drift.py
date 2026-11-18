@@ -126,7 +126,7 @@ def _stage_orphan(fake_pid: int, monkeypatch, *, witness=True):
             proc.status.return_value = "running"
             proc.children.return_value = []
             _stdio_processes[fake_pid] = {fake_pid: proc}
-    monkeypatch.setattr("psutil.process_iter", lambda: [])
+    monkeypatch.setattr("psutil.process_iter", list)
     monkeypatch.setattr("psutil.wait_procs", lambda procs, **kwargs: ([], procs))
     monkeypatch.setattr(os, "getpgid", lambda pid: fake_pid)
 

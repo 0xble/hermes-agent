@@ -19,6 +19,8 @@ import time
 
 import pytest
 
+from tests.waiting import process_alive
+
 from tests.gateway.fixtures.local_recovery_probe import child_env, daemon
 
 
@@ -169,8 +171,7 @@ scheduler.run_one_job(job, adapters=None, loop=None)
             if lose_worker:
                 os.killpg(worker_pid, signal.SIGKILL)
                 # The unknown path must not replay an agent or its pending tool.
-                wait_for(lambda: not psutil.pid_exists(worker_pid)
-                    or psutil.Process(worker_pid).status() == psutil.STATUS_ZOMBIE)
+                wait_for(lambda: not process_alive(worker_pid))
         with daemon(root, home, env, barrier=False) as (_, _desc):
             if lose_worker:
                 rows = wait_for(lambda: admissions() if admissions()[0]['status'] == 'terminal' else None)
@@ -224,13 +225,13 @@ scheduler.run_one_job(job, adapters=None, loop=None)
 async def test_cron_worker_registration_still_requires_adoption_capability(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from gateway import session_worker
-    from gateway.session_contract import Principal, SessionRef
+    from gateway.session_contract import SessionActor, SessionRef
     from hermes_state_runtime import RuntimeStoreError
     from tests.cron.test_cron_recovery import _owner
 
     owner, db = _owner(tmp_path, monkeypatch)
     monkeypatch.setattr(session_worker, '_claim', lambda *args: 'producer-claim')
-    connection = SimpleNamespace(authority=owner, actor=Principal(
+    connection = SimpleNamespace(authority=owner, actor=SessionActor(
         'human', str(tmp_path), frozenset({'session:control'}), 'test'))
     params = {'profile_id': str(tmp_path), 'session_id': 'cron-session', 'execution_id': 'cron-worker:fire',
               'generation': 1, 'pid': 1, 'birth': 1.0, 'secret': 'x' * 32, 'kind': 'cron'}

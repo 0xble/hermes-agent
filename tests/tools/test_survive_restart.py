@@ -3,10 +3,16 @@
 import json
 import subprocess
 import time
+from unittest.mock import Mock
 
 import pytest
 
 from tools.process_registry import ProcessRegistry, ProcessSession
+from tools.process_registry_survival import (
+    SURVIVOR_POLL_INITIAL_SECONDS,
+    SURVIVOR_POLL_MAX_SECONDS,
+    _next_survivor_poll_delay,
+)
 
 
 def _home(monkeypatch, tmp_path):
@@ -123,6 +129,8 @@ def test_survivor_log_reads_are_bounded_and_unchanged_polls_do_not_read(tmp_path
     registry = ProcessRegistry()
     session = _checkpoint_survivor(registry, home, pid=999999, log_text="x" * 100_000)
     session.max_output_chars = 100
+    streamed = []
+    registry.on_output = lambda session, chunk: streamed.append(chunk)
     original_open = Path.open
     reads = []
 
@@ -135,6 +143,10 @@ def test_survivor_log_reads_are_bounded_and_unchanged_polls_do_not_read(tmp_path
             self.stream.close()
         def seek(self, offset):
             return self.stream.seek(offset)
+        def tell(self):
+            return self.stream.tell()
+        def fileno(self):
+            return self.stream.fileno()
         def read(self, size=-1):
             assert 0 <= size <= session.max_output_chars
             reads.append(size)
@@ -147,11 +159,14 @@ def test_survivor_log_reads_are_bounded_and_unchanged_polls_do_not_read(tmp_path
     monkeypatch.setattr(Path, "open", instrumented_open)
     registry._read_survivor_log(session)
     registry._read_survivor_log(session)
-    assert reads == [100]
-    with original_open(Path(session.log_path), "a") as log:
+    # All unread bytes reach the sink, but each read and the retained tail stay bounded.
+    assert reads == [100] * 1000
+    assert "".join(streamed) == "x" * 100_000
+    with original_open(Path(session.log_path), "a", encoding="utf-8") as log:
         log.write("y" * 10_000 + "TAIL")
     registry._read_survivor_log(session)
-    assert reads == [100, 100]
+    assert reads == [100] * 1100 + [4]
+    assert "".join(streamed) == "x" * 100_000 + "y" * 10_000 + "TAIL"
     assert len(session.output_buffer) <= 100
     assert session.output_buffer.endswith("TAIL")
 
@@ -526,7 +541,7 @@ def test_real_wrapper_survives_producer_exit_and_reports_one_recovered_result(tm
         assert registry.kill_all(source="gateway_shutdown") == 0
         print(session.id, flush=True)
         os._exit(0)
-    """)], capture_output=True, text=True, timeout=10)
+    """)], capture_output=True, text=True, timeout=10, check=False)
     assert producer.returncode == 0, producer.stderr
     session_id = producer.stdout.strip()
     checkpoint = (home / "processes.json").read_text(encoding="utf-8-sig")
@@ -545,6 +560,83 @@ def test_real_wrapper_survives_producer_exit_and_reports_one_recovered_result(tm
     assert again.recover_from_checkpoint() == 1
     time.sleep(0.2)
     assert again.completion_queue.empty()
+
+
+def test_survivor_poller_backoff_grows_resets_and_caps():
+    delay = SURVIVOR_POLL_INITIAL_SECONDS
+    delays = []
+    for _ in range(20):
+        delays.append(delay)
+        delay = _next_survivor_poll_delay(delay, changed=False)
+    assert delays[:4] == pytest.approx([0.1, 0.15, 0.225, 0.3375])
+    assert delays[-1] == SURVIVOR_POLL_MAX_SECONDS
+    assert _next_survivor_poll_delay(SURVIVOR_POLL_MAX_SECONDS, changed=False) == SURVIVOR_POLL_MAX_SECONDS
+    assert _next_survivor_poll_delay(SURVIVOR_POLL_MAX_SECONDS, changed=True) == SURVIVOR_POLL_INITIAL_SECONDS
+
+
+def test_idle_survivor_pollers_wake_at_the_capped_rate():
+    """After warm-up, N idle pollers do not exceed roughly N/cap wakeups/sec."""
+    pollers = 8
+    warmup_seconds, measured_seconds = 10.0, 10.0
+    wakeups = []
+    for _ in range(pollers):
+        now, delay = 0.0, SURVIVOR_POLL_INITIAL_SECONDS
+        while now < warmup_seconds + measured_seconds:
+            if warmup_seconds <= now < warmup_seconds + measured_seconds:
+                wakeups.append(now)
+            now += delay
+            delay = _next_survivor_poll_delay(delay, changed=False)
+    assert len(wakeups) <= pollers * measured_seconds / SURVIVOR_POLL_MAX_SECONDS
+
+
+def test_survivor_completion_is_detected_within_capped_poll(tmp_path, monkeypatch):
+    registry = ProcessRegistry()
+    exit_path = tmp_path / "exit"
+    session = ProcessSession(
+        id="proc_backoff", command="sleep", exit_path=str(exit_path), notify_on_complete=True,
+    )
+    session.process = Mock()
+    session.process.poll.return_value = None
+    registry._running[session.id] = session
+    sleeps = []
+
+    def fake_sleep(delay):
+        sleeps.append(delay)
+        if delay == SURVIVOR_POLL_MAX_SECONDS:
+            exit_path.write_text("0\n", encoding="utf-8")
+
+    monkeypatch.setattr("tools.process_registry_survival.time.sleep", fake_sleep)
+    registry._survivor_poller_loop(session)
+
+    assert sleeps[0] == SURVIVOR_POLL_INITIAL_SECONDS
+    assert max(sleeps) == SURVIVOR_POLL_MAX_SECONDS
+    assert session.exited and session.exit_code == 0
+    assert registry.completion_queue.get_nowait()["exit_code"] == 0
+
+
+@pytest.mark.platforms("posix")
+def test_fast_survivor_completion_uses_eager_first_poll(tmp_path, monkeypatch):
+    registry = ProcessRegistry()
+    exit_path = tmp_path / "exit"
+    session = ProcessSession(
+        id="proc_fast_backoff", command="true", exit_path=str(exit_path), notify_on_complete=True,
+    )
+    session.process = Mock()
+    session.process.poll.return_value = None
+    registry._running[session.id] = session
+    elapsed = 0.0
+
+    def fake_sleep(delay):
+        nonlocal elapsed
+        elapsed += delay
+        assert elapsed < 0.2
+        exit_path.write_text("0\n", encoding="utf-8")
+
+    monkeypatch.setattr("tools.process_registry_survival.time.sleep", fake_sleep)
+    registry._survivor_poller_loop(session)
+
+    assert elapsed == SURVIVOR_POLL_INITIAL_SECONDS
+    assert registry.completion_queue.get_nowait()["exit_code"] == 0
 
 
 def _ready_successors(home, monkeypatch, count=2, **survivor):
@@ -596,7 +688,7 @@ def test_survivor_concurrent_drainers_deliver_exactly_once(tmp_path, monkeypatch
     import threading
 
     home = _home(monkeypatch, tmp_path)
-    session, successors = _ready_successors(home, monkeypatch, count=4)
+    _session, successors = _ready_successors(home, monkeypatch, count=4)
     barrier = threading.Barrier(len(successors))
     delivered = []
 
@@ -630,7 +722,7 @@ def test_survivor_claim_by_crashed_owner_is_reclaimed_once(tmp_path, monkeypatch
         assert registry.get({session.id!r})._completion_event.wait(5)
         assert len(registry.drain_notifications(session_key="session")) == 1
         os._exit(0)  # crash after claim, before render/acknowledgement
-    """)], capture_output=True, text=True, timeout=20)
+    """)], capture_output=True, text=True, timeout=20, check=False)
     assert crashed.returncode == 0, crashed.stderr
     claim = json.loads((home / "process-runs" / session.id / "delivered").read_text(encoding="utf-8-sig"))
     assert claim["state"] == "claimed"

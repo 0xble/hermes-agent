@@ -7,8 +7,10 @@ from pm.filesystem import native
 from pm.package import InstallError
 from pm.registry import get_package
 from pm.store import current_target
+from pm.worker_budget import unbounded
 
 
+@unbounded()
 def _toolchain(*, realize: bool = True, explicit: bool = False) -> tuple[Path, Path] | None:
     """Resolve uv and Python without host discovery or recursive worker dispatch.
 

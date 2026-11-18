@@ -10,7 +10,10 @@ import contextvars
 import json
 import logging
 import time
+import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from gateway.attended_model import is_genuine_user_message
@@ -24,17 +27,30 @@ class ReplyReceipt:
     identity: dict[str, Any]
     started: bool = False
     replied: bool = False
+    visible: bool = False
+    admitted: bool = False
+    last_delivery_at: float | None = None
+    last_delivery_kind: str | None = None
+    last_delivery_text: str = ""
+    log_dir: Path | None = None
 
 
 _current: contextvars.ContextVar[ReplyReceipt | None] = contextvars.ContextVar(
     "gateway_reply_receipt", default=None)
+_delivery_kind: contextvars.ContextVar[str | None] = contextvars.ContextVar(
+    "gateway_reply_delivery_kind", default=None)
 
 
-def _emit(receipt: ReplyReceipt, event: str, timestamp: float) -> None:
+def _emit(receipt: ReplyReceipt, event: str, timestamp: float, **details: Any) -> None:
     try:
-        logger.info("gateway_reply_latency %s", json.dumps(
-            {**receipt.identity, "event": event, "timestamp": timestamp},
-            separators=(",", ":"), sort_keys=True))
+        if event in {"received", "agent_start", "first_reply"}:
+            fields = ("profile", "platform", "chat_id", "thread_id", "turn_id", "message_id", "origin")
+            logger.info("gateway_reply_latency %s", json.dumps(
+                {**{key: receipt.identity[key] for key in fields}, "event": event, "timestamp": timestamp},
+                separators=(",", ":"), sort_keys=True))
+        from gateway.reply_latency_sink import emit, log_directory
+        emit(receipt.log_dir or log_directory(),
+             {**receipt.identity, "event": event, "timestamp": timestamp, **details}, time.time())
     except Exception:
         logger.debug("Could not emit reply latency record", exc_info=True)
 
@@ -60,6 +76,7 @@ def record_received(event: Any) -> ReplyReceipt | None:
     stamp = stamp_received(event)
     try:
         from gateway.outbox import transport_id
+        from gateway.reply_latency_sink import log_directory
         from hermes_cli.profiles import current_profile_name
 
         source = getattr(event, "source", None)
@@ -77,7 +94,13 @@ def record_received(event: Any) -> ReplyReceipt | None:
             "profile": str(getattr(source, "profile", None) or current_profile_name("default")),
             "chat_id": str(source.chat_id),
             "thread_id": str(thread_id) if thread_id is not None else None,
-        })
+            "receipt_id": getattr(event, "_reply_latency_receipt_id", None) or uuid.uuid4().hex,
+        }, log_dir=log_directory())
+        event._reply_latency_receipt_id = receipt.identity["receipt_id"]
+        receipt.identity["inbound_key"] = [receipt.identity[name] for name in
+                                           ("platform", "chat_id", "thread_id", "message_id")]
+        receipt.identity["inbound_identity"] = [receipt.identity[name] for name in
+            ("profile", "platform", "chat_id", "thread_id", "message_id")]
         event._reply_latency_receipt = receipt
         _emit(receipt, "received", stamp)
         return receipt
@@ -99,8 +122,35 @@ def bind_agent_start(event: Any) -> None:
         _emit(receipt, "agent_start", time.time())
 
 
+def record_admitted(event: Any) -> None:
+    """The durable FIFO accepted this inbound, before it waits for execution."""
+    receipt = record_received(event)
+    if receipt is not None and not receipt.admitted:
+        receipt.admitted = True
+        _emit(receipt, "admitted", time.time())
+
+
 def current_receipt() -> ReplyReceipt | None:
     return _current.get()
+
+
+def record_coverage() -> None:
+    """The existing gateway housekeeping tick attests idle instrumentation too."""
+    from gateway.reply_latency_sink import emit, log_directory
+    from hermes_cli.profiles import current_profile_name
+    try:
+        emit(log_directory(), {"event": "coverage", "timestamp": time.time(),
+                              "profile": current_profile_name("default")}, time.time())
+    except Exception:
+        logger.debug("Could not emit reply latency coverage", exc_info=True)
+
+
+def record_no_reply(event: Any) -> None:
+    """Intentional silence ends a human input without inventing assistant text."""
+    receipt = getattr(event, "_terminal_reply_latency_receipt",
+                      getattr(event, "_reply_latency_receipt", None))
+    if receipt is not None and not receipt.replied:
+        _emit(receipt, "no_reply", time.time())
 
 
 def restore_receipt(receipt: ReplyReceipt | None) -> None:
@@ -108,13 +158,71 @@ def restore_receipt(receipt: ReplyReceipt | None) -> None:
     _current.set(receipt)
 
 
-def record_first_reply(receipt: ReplyReceipt | None, text: str, result: Any = None) -> None:
+@contextmanager
+def delivery_scope(receipt: ReplyReceipt | None, kind: str):
+    """Carry a turn's receipt into adapter chunk confirmations, including scheduled progress."""
+    token, kind_token = _current.set(receipt), _delivery_kind.set(kind)
+    try:
+        yield
+    finally:
+        _delivery_kind.reset(kind_token)
+        _current.reset(token)
+
+
+def confirmed(result: Any) -> bool:
+    raw = getattr(result, "raw_response", None)
+    return (getattr(result, "success", False) is True
+            and getattr(result, "deferred", False) is not True
+            and not (isinstance(raw, dict) and raw.get("skipped")))
+
+
+def record_first_reply(
+    receipt: ReplyReceipt | None, text: str, result: Any = None, *, kind: str = "text_send",
+) -> float | None:
     """Call only at a confirmed transport success, never a journal/optimistic mark."""
-    if receipt is None or receipt.replied or not text.strip():
+    if receipt is None or not text.strip() or (result is not None and not confirmed(result)):
         return
-    if result is not None:
-        raw = getattr(result, "raw_response", None)
-        if getattr(result, "success", False) is not True or (isinstance(raw, dict) and raw.get("skipped")):
-            return
-    receipt.replied = True
-    _emit(receipt, "first_reply", time.time())
+    raw = getattr(result, "raw_response", None)
+    stamp = raw.get("reply_latency_confirmed_at", time.time()) if isinstance(raw, dict) else time.time()
+    receipt.last_delivery_at, receipt.last_delivery_kind = stamp, kind
+    receipt.last_delivery_text = text.strip()
+    if not receipt.visible:
+        receipt.visible = True
+        _emit(receipt, "first_visible", stamp, delivery_kind=kind)
+    if not receipt.replied and kind.startswith("text_"):
+        receipt.replied = True
+        _emit(receipt, "first_reply", stamp, delivery_kind=kind)
+    return stamp
+
+
+def record_transport_reply(text: str, *, chat_id: str, thread_id: Any = None) -> float | None:
+    """Only adapters call this, immediately after an actual API confirmation."""
+    receipt, kind = current_receipt(), _delivery_kind.get()
+    thread = str(thread_id) if thread_id is not None else None
+    if (receipt is None or kind is None or str(chat_id) != receipt.identity["chat_id"]
+            or thread != receipt.identity["thread_id"]):
+        return None
+    return record_first_reply(receipt, text, kind=kind)
+
+
+def transport_confirmed(text: str, result: Any, *, chat_id: str, thread_id: Any = None) -> Any:
+    """Attach the API clock before adapter bookkeeping or an outbox commit can delay return."""
+    stamp = record_transport_reply(text, chat_id=chat_id, thread_id=thread_id)
+    if stamp is not None:
+        result.raw_response = {**(result.raw_response or {}), "reply_latency_confirmed_at": stamp}
+    return result
+
+
+def record_final_reply(receipt: ReplyReceipt | None, text: str, result: Any, *, kind="text_send") -> None:
+    stamp = record_first_reply(receipt, text, result, kind=kind)
+    if stamp is not None:
+        _emit(receipt, "final_delivery", stamp, delivery_kind=kind)
+
+
+def record_stream_final(receipt: ReplyReceipt | None, text: str) -> None:
+    """Seal with the last real transport clock, never the optimistic delivered flag's clock."""
+    if (receipt is not None and receipt.last_delivery_at is not None
+            and (receipt.last_delivery_kind or "").startswith("text_")
+            and text.strip() and receipt.last_delivery_text == text.strip()):
+        _emit(receipt, "final_delivery", receipt.last_delivery_at,
+              delivery_kind=receipt.last_delivery_kind)

@@ -16,7 +16,7 @@ def test_outbox_freezes_failed_payload_and_reopens_exclusively(tmp_path):
     try:
         with pytest.raises(TimeoutError):
             store.append_messages_batch('s', rows)
-        disk = json.loads(store.path.read_text())
+        disk = json.loads(store.path.read_text(encoding='utf-8-sig'))
         assert disk['pending'][0]['payload']['messages'][0]['content'] == 'frozen'
         assert store.journal['pending'] == disk['pending']
         with pytest.raises(WorkerPersistenceError, match='outbox_in_use'):
@@ -34,7 +34,7 @@ def test_outbox_freezes_failed_payload_and_reopens_exclusively(tmp_path):
     try:
         assert restored.retry_pending() == []  # reopening already reconciled the acknowledged journal
         assert seen[0]['payload']['messages'][0]['content'] == 'frozen'
-        assert json.loads(restored.path.read_text())['pending'] == []
+        assert json.loads(restored.path.read_text(encoding='utf-8-sig'))['pending'] == []
     finally:
         restored.close()
 
@@ -58,6 +58,8 @@ def test_outbox_capacity_failure_does_not_advance_or_discard(tmp_path):
             store.append_messages_batch('s', [{'role': 'user', 'content': 'x' * 1000}])
         assert store.path.read_bytes() == before
         assert store.failure == 'outbox_full'
+        with pytest.raises(WorkerPersistenceError, match='outbox_full'):
+            store.flush_token_counts()
     finally:
         with pytest.raises(WorkerPersistenceError, match='outbox_full'):
             store.close()
@@ -107,7 +109,7 @@ def test_outbox_journal_survives_a_cross_device_rename(tmp_path, monkeypatch):
     store = RuntimeSessionStore(lambda *a, **k: {}, {'session_id': 's'}, tmp_path / 'private')
     try:
         journal = store.path
-        assert json.loads(journal.read_text())['scope'] == {'session_id': 's'}
+        assert json.loads(journal.read_text(encoding='utf-8-sig'))['scope'] == {'session_id': 's'}
         if os.name == 'posix':
             assert stat.S_IMODE(journal.stat().st_mode) == 0o600
         assert [p.name for p in journal.parent.iterdir() if p.name.startswith('.pending-')] == []

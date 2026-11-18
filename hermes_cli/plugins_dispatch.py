@@ -48,6 +48,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
     "pre_llm_call", "post_llm_call", "pre_api_request", "post_api_request", "api_request_error",
     "pre_auxiliary_call", "post_auxiliary_call", "pre_verify", "on_session_start", "on_session_end",
     "post_steer_delivered",
+"on_session_open",
     # Fail-open consumer on every inbound gateway message: a hung plugin must not stall the profile.
     "post_gateway_admission",
     # Observer on every local session's commands, fired by the gateway (gateway/session_commands.py).
@@ -58,7 +59,7 @@ _HOOK_TIMEOUT_BOUNDED_HOOKS: set[str] = {
 # Hooks whose calls are told apart by another payload field: one session's commands are one
 # sequence, so a still-running callback skips that session's next command, not another session's.
 _HOOK_CALL_IDENTITY_FIELDS: dict[str, tuple[str, ...]] = {
-    "pre_command": ("session_key",), "post_compaction": ("session_id",),
+    "pre_command": ("session_key",), "post_compaction": ("session_id",), "on_session_open": ("session_id",),
 }
 
 # Policy hooks: timeout / still-running must fail closed (block the tool).
@@ -96,6 +97,9 @@ def _delivery_manager():
             def iter_hook_callbacks(self, _name): return ()
             def invoke_middleware(self, _kind, **_kwargs): return []
             def invoke_hook(self, _name, **_kwargs): return []
+            def holds_stream(self): return False
+            def held_transforms(self): return ()
+            def run_held_transforms(self, _callbacks, **_kwargs): return None, False
         return _SafeWorkerManager()
     from hermes_cli import plugins
     manager = plugins.get_plugin_manager()
@@ -196,11 +200,7 @@ def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
     t = plugins._background_discovery_thread
     if t is None or t is threading.current_thread() or plugins.in_plugin_load_worker():
         return
-    if not t.is_alive():
-        if timeout is None and (plugins._background_discovery_error is not None
-                                or not getattr(plugins.get_plugin_manager(), "_discovery_complete", False)):
-            error = plugins._background_discovery_error
-            raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
+    if not t.is_alive() and timeout is not None:
         return
     if timeout is None:
         while t.is_alive():
@@ -214,8 +214,13 @@ def _join_background_discovery(timeout: Optional[float] = 30.0) -> None:
     if plugins._background_discovery_error is not None:
         error = plugins._background_discovery_error
         raise PluginDiscoveryIncomplete("Plugin discovery failed; refusing partial registry delivery") from error
-    if timeout is None and not getattr(plugins.get_plugin_manager(), "_discovery_complete", False):
-        raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
+    if timeout is None:
+        manager = plugins.get_plugin_manager()
+        # The control listener can force-reload before gateway startup finishes. Its
+        # transient false flag is not a failed background sweep; await the verdict.
+        with manager._discovery_lock:
+            if not manager._discovery_complete:
+                raise PluginDiscoveryIncomplete("Plugin discovery worker exited before completing; refusing partial registry delivery")
 
 
 def _await_foreground_discovery(manager, timeout: float = 30.0) -> bool:
@@ -245,6 +250,25 @@ class _PreToolCallDirective:
     message: Optional[str] = None
     rule_key: Optional[str] = None
     modified_args: Optional[dict[str, Any]] = None
+
+# The one hook whose callback rewrites the reply the user would otherwise see streaming.
+STREAM_HOLDING_HOOK = "transform_llm_output"
+
+
+def stream_held() -> bool:
+    """True when a plugin loaded in the active profile registered ``transform_llm_output`` with
+    ``hold_stream=True``: that profile's replies reach the user only as the rewritten final.
+    Lazy-discovers first, like ``has_hook``."""
+    from hermes_cli.plugins import _delivery_manager
+
+    return _delivery_manager().holds_stream()
+
+
+def held_stream_transforms() -> tuple[Callable, ...]:
+    """:meth:`PluginDispatchMixin.held_transforms` of the active profile's manager (lazy-discovers)."""
+    from hermes_cli.plugins import _delivery_manager
+
+    return _delivery_manager().held_transforms()
 
 
 def _policy_error_block_directive(hook_name: str, cb: Callable, exc: BaseException) -> dict[str, str]:
@@ -445,22 +469,29 @@ class PluginDispatchMixin:
         what they declare. Each callback is isolated. Bounded hooks and ``pre_tool_call`` run under
         ``plugins.hook_callback_timeout`` (worker abandoned, never joined); ``pre_tool_call`` fails
         closed with a block directive, others skip. ``_HOOK_CALLER_THREAD_HOOKS`` always run on the
-        caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject.
+        caller thread. ``pre_llm_call`` may return ``{"context": "..."}`` (or a str) to inject, or
+        ``{"action": "block", "message": "..."}`` to end the turn before any inference request.
         """
         from agent.safe_worker_policy import safe_worker_enabled
 
         if safe_worker_enabled():
             return []
-        from hermes_cli.plugins import _resolve_hook_callback_timeout
         # Gateway platform events define event-local envelopes; a bus-wide version here would turn
         # unrelated adapter payloads into one monolithic compatibility contract.
         if hook_name != "gateway_platform_event":
             kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        return self._run_hook_callbacks(hook_name, self._hooks.get(hook_name, []) if _callbacks is None else _callbacks, kwargs)
+
+    def _run_hook_callbacks(self, hook_name: str, callbacks: Any, kwargs: dict[str, Any],
+                            failed: Optional[list] = None) -> list[Any]:
+        """:meth:`invoke_hook`'s loop over ``callbacks``; each one that raised or timed out is
+        appended to ``failed`` when given."""
+        from hermes_cli.plugins import _resolve_hook_callback_timeout
         results: list[Any] = []
         timeout = _resolve_hook_callback_timeout()
         use_timeout = _hook_uses_callback_timeout(hook_name, timeout)
         fail_closed = hook_name in _HOOK_TIMEOUT_FAIL_CLOSED_HOOKS
-        for cb in self._hooks.get(hook_name, []) if _callbacks is None else _callbacks:
+        for cb in callbacks:
             if not callback_allowed(self, cb, kwargs):
                 continue
             cb_timeout, cb_fail_closed = timeout, fail_closed
@@ -485,6 +516,8 @@ class PluginDispatchMixin:
                 if use_timeout:
                     ret = self._run_hook_callback_bounded(hook_name, cb, kwargs, cb_timeout)
                     if ret is _HOOK_SKIPPED:
+                        if failed is not None:
+                            failed.append(cb)
                         if cb_fail_closed:  # policy hook: fail closed with a block directive
                             results.append({"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE})
                         continue
@@ -492,8 +525,10 @@ class PluginDispatchMixin:
                     ret = self._invoke_hook_callback(cb, kwargs)
                 if ret is not None:
                     results.append(ret)
-            except (Exception, SystemExit) as exc:
+            except (Exception, SystemExit) as exc:  # health: allow BLE001 -- moved from invoke_hook: plugin callbacks are untrusted; each failure is reported and isolated
                 self._report_hook_failure(hook_name, cb, kwargs, exc)
+                if failed is not None:
+                    failed.append(cb)
                 if cb_fail_closed:  # a guard that raised made no decision: same veto as a timeout
                     results.append(_policy_error_block_directive(hook_name, cb, exc))
         return results
@@ -754,6 +789,52 @@ class PluginDispatchMixin:
             return False
         return bool(self._hooks.get(hook_name))
 
+    def track_hook(self, context: Any, hook_name: str, callback: Callable, *, hold_stream: bool = False):
+        """Register ``callback`` for ``hook_name`` on behalf of ``context`` (unknown names warn but are
+        still stored). ``hold_stream=True`` on ``transform_llm_output`` declares the rewrite must reach
+        the user first, so this profile's replies are not streamed (:meth:`holds_stream`)."""
+        from hermes_cli.plugins import VALID_HOOKS
+
+        handle = context._track_callback("hook", hook_name, callback, self._hooks, VALID_HOOKS)
+        if hold_stream and hook_name != STREAM_HOLDING_HOOK:
+            logger.warning("Plugin '%s' set hold_stream on '%s'; only %s rewrites the reply, ignored",
+                           context.manifest.name, hook_name, STREAM_HOLDING_HOOK)
+        else:
+            handle.hold_stream = hold_stream
+        return handle
+
+    def holds_stream(self) -> bool:
+        """True while a loaded plugin's ``transform_llm_output`` registration declared ``hold_stream``.
+        Read under the discovery lock: a reload empties the ledger before plugins re-register, and a
+        turn deciding in that window would stream text the plugin must rewrite first."""
+        with self._discovery_lock:
+            return any(r.hold_stream for owned in self._ownership_ledger.values() for r in owned)
+
+    def held_transforms(self) -> tuple[Callable, ...]:
+        """The ``transform_llm_output`` callbacks a turn that holds its stream must run, captured with
+        the hold decision under the discovery lock; ``()`` when nothing holds. A reload during the turn
+        empties ``_hooks`` before plugins re-register, so the held turn keeps the set it started with
+        (:meth:`run_held_transforms`)."""
+        with self._discovery_lock:
+            if not any(r.hold_stream for owned in self._ownership_ledger.values() for r in owned):
+                return ()
+            return tuple(self._hooks.get(STREAM_HOLDING_HOOK, []))
+
+    def run_held_transforms(self, callbacks: tuple[Callable, ...], **kwargs: Any) -> tuple[Optional[str], bool]:
+        """Run a held turn's snapshotted transforms: ``(rewrite, failed)``. ``rewrite`` is the first
+        non-empty string; ``failed`` is True when none came back and a callback raised or timed out,
+        so the caller must not deliver the original."""
+        from agent.safe_worker_policy import safe_worker_enabled
+
+        if safe_worker_enabled():
+            return None, False
+        kwargs.setdefault("telemetry_schema_version", OBSERVER_SCHEMA_VERSION)
+        failed: list = []
+        for ret in self._run_hook_callbacks(STREAM_HOLDING_HOOK, callbacks, kwargs, failed):
+            if isinstance(ret, str) and ret:
+                return ret, False
+        return None, bool(failed)
+
     async def ainvoke_hook(
         self, hook_name: str, *, _callbacks: Optional[tuple[Callable, ...]] = None, **kwargs: Any
     ) -> list[Any]:
@@ -905,7 +986,7 @@ class PluginDispatchMixin:
                 call_kwargs = {**kwargs, _payload_key: _safe_copy(kwargs[_payload_key]),
                                original_key: _safe_copy(kwargs[original_key])}
             try:
-                ret = cb(**call_kwargs)
+                ret = cb(**self._hook_callback_kwargs(cb, call_kwargs))  # narrow signatures, as hooks
                 if ret is not None:
                     results.append(ret)
                     if _payload_key and isinstance(ret, dict) and isinstance(ret.get(_payload_key), dict):

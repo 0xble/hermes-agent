@@ -273,6 +273,8 @@ def main():
     os.environ.update(OPENAI_API_KEY='loopback-only', OPENAI_BASE_URL=url)
     Path(os.environ['HERMES_HOME'], 'config.yaml').write_text(
         f'model:\n  default: local-wire-stub\n  provider: custom\n  base_url: {url}\n'
+        # This probe asserts a distinct durable FIFO row, rather than interrupt-mode redirect.
+        'display:\n  busy_input_mode: queue\n'
         'streaming:\n  enabled: false\nauxiliary:\n  title_generation:\n    enabled: false\n')
     try:
         asyncio.run(probe(peer))

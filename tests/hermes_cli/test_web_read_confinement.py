@@ -61,7 +61,9 @@ def test_git_reads_filter_credentials_without_losing_safe_diffs(
     archive.mkdir()
     (archive / "auth.json").write_text("PRIVATE_EXAMPLE=archived\n", encoding="utf-8")
     (root / "safe.txt").write_text("old\n", encoding="utf-8")
-    git("add", "-A")
+    # Credential paths are intentionally tracked here to exercise historical
+    # diffs and renames, even when the host's default ignore file excludes them.
+    git("add", "-f", "-A")
     git("commit", "-qm", "initial")
     (archive / "auth.json").unlink()
     archive.rmdir()

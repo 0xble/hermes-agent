@@ -283,7 +283,7 @@ def test_bedrock_claude_cached_session_estimates_cost_not_unknown():
     assert result.amount_usd is not None
 
 
-@pytest.mark.parametrize("bare", ["claude-opus-5", "claude-opus-5-5"])
+@pytest.mark.parametrize("bare", ["claude-opus-5", "claude-opus-5-5", "claude-fable-5-2"])
 @pytest.mark.parametrize("scope", ["", "us.", "global."])
 def test_bedrock_claude_opus_5_prices_like_direct_anthropic(bare, scope):
     """Regression for #100848: Bedrock bills Claude at Anthropic's per-token
@@ -933,7 +933,7 @@ def test_anthropic_fast_response_without_a_fast_rate_is_unknown():
         ({"cost": 0.0042}, Decimal("0.0042")),  # OpenRouter flat
         ({"cost": 0.0042, "cost_details": {"upstream_inference_cost": 0}}, Decimal("0.0042")),
         ({"cost": 0.009, "cost_details": {"upstream_inference_cost": 0.003}}, Decimal("0.003")),
-        ({"cost": 0}, Decimal("0")),
+        ({"cost": 0}, Decimal(0)),
         ({"cost": -1}, None),
         ({"cost": float("nan")}, None),
         ({"cost": float("inf")}, None),

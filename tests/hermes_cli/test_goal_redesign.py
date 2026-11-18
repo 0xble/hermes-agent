@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, UTC
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -131,7 +131,7 @@ async def test_slice_2_delivered_event_mid_wait_makes_exactly_one_judge_call(her
 
     mgr = goals.GoalManager(entry.session_id)
     mgr.set("file the quarterly report once the numbers land")
-    until = (datetime.now(timezone.utc) + timedelta(days=5)).isoformat()
+    until = (datetime.now(UTC) + timedelta(days=5)).isoformat()
     with patch.object(goals, "judge_goal", return_value=("wait", "numbers land Monday", False, {"until": until}, False)):
         mgr.evaluate_after_turn("Waiting for the numbers.", user_initiated=True)
     assert goals.GoalManager(entry.session_id).is_waiting()
@@ -383,7 +383,7 @@ def test_slice_3_repeated_non_read_only_evidence_backs_off(hermes_home, monkeypa
             patch("agent.auxiliary_client.call_llm",
                   return_value=_judge_reply({"verdict": "continue", "reason": "CI still pending"})):
         for _ in range(5):
-            d = goals.GoalManager(sid).evaluate_after_turn("checked CI, still pending", user_initiated=False)
+            _d = goals.GoalManager(sid).evaluate_after_turn("checked CI, still pending", user_initiated=False)
             stored = goals.load_goal(sid)
             waits.append(stored.waiting_seconds)
             clock[0] = max(clock[0], stored.waiting_until) + 1

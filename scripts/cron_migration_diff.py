@@ -24,7 +24,7 @@ import argparse
 import json
 import sys
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any
 
@@ -134,7 +134,7 @@ def analyse(jobs: list[dict[str, Any]], *, presets: dict[str, dict[str, Any]],
             try:
                 due = datetime.fromisoformat(str(nra))
                 if due.tzinfo is None:
-                    due = due.replace(tzinfo=timezone.utc)
+                    due = due.replace(tzinfo=UTC)
                 if due < now:
                     entry["overdue_by_seconds"] = int((now - due).total_seconds())
             except ValueError:
@@ -165,7 +165,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     jobs = _load(args.jobs_json)
     report = analyse(jobs, presets=_presets(args.legacy_config), profile_tz=_profile_timezone(args.legacy_config),
-                     now=datetime.now(timezone.utc))
+                     now=datetime.now(UTC))
     if args.json:
         print(json.dumps(report, indent=2, default=str))
     else:

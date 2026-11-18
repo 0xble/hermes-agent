@@ -204,25 +204,25 @@ _DERIVED_LOCAL_PREFIXES = ('bot-chat:', 'a2a:')
 _DERIVED_API_SQL = ("(source='bot_room' OR (source='api_server' AND id GLOB 'api-" + '[0-9a-f]' * 16 + "'))")
 
 
-def _local_conversations(conn):
-    """``(members, derived)``: member id -> every id of its local conversation (the creation id
-    (policy, FIFO, generation), each receipt lineage segment and the current target), and the ids
-    of every derived (Bot Chat, A2A) conversation. One prefix scan, not a lookup per swept id.
-    Malformed receipts name nothing."""
-    from hermes_state_local import POLICY_PREFIX
+def _local_conversations(conn, session_ids):
+    """``(members, derived)`` for *session_ids*: member id -> every id of its local conversation
+    (``local_conversation_ids``: the creation id, then each receipt lineage segment), and the ids
+    of every derived (Bot Chat, A2A) conversation among them. Owner lookups by primary key, never a
+    scan of every creation receipt: a receipt carries its launch request (a cron fire's whole
+    prompt), and on 2026-11-07 re-reading ~1 GB of them inside each 25-session prune transaction
+    held the write lock for 5-20 s per batch. Malformed receipts name nothing."""
+    from hermes_state_local import POLICY_PREFIX, local_conversation_ids, local_lineage_owner
     members, derived = {}, set()
-    for (raw,) in conn.execute('SELECT value FROM state_meta WHERE key GLOB ?', (POLICY_PREFIX + '*',)):
+    for sid in session_ids:
+        ids = tuple(local_conversation_ids(conn, sid))
+        members[sid] = ids
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                             (POLICY_PREFIX + local_lineage_owner(conn, sid),)).fetchone()
         try:
-            receipt = json.loads(raw)
+            receipt = json.loads(saved[0]) if saved else None
         except (TypeError, ValueError):
-            continue
-        if not isinstance(receipt, dict):
-            continue
-        entry, lineage = receipt.get('entry'), receipt.get('lineage')
-        ids = tuple(x for x in [receipt.get('session_id'), *(lineage if isinstance(lineage, list) else []),
-                                entry.get('session_id') if isinstance(entry, dict) else None] if isinstance(x, str))
-        members.update(dict.fromkeys(ids, ids))
-        if str(receipt.get('request_id') or '').startswith(_DERIVED_LOCAL_PREFIXES):
+            receipt = None
+        if isinstance(receipt, dict) and str(receipt.get('request_id') or '').startswith(_DERIVED_LOCAL_PREFIXES):
             derived.update(ids)
     return members, derived
 
@@ -248,7 +248,7 @@ def retire_prunable(conn, session_ids, *, defer_messages=False):
     first unfenced id, so an aged-out marker would send the next turn back to the swept generation.
     A Bot Chat's mailbox receipts also outlive the horizon. A caller-named API id is not derived:
     its marker ages out, so the caller can use that id again, as for any other swept session."""
-    swept, (conversations, derived) = set(session_ids), _local_conversations(conn)
+    swept, (conversations, derived) = set(session_ids), _local_conversations(conn, session_ids)
 
     def removable(sid):
         whole = conversations.get(sid, (sid,))
@@ -314,11 +314,10 @@ def retire_routes(conn, session_ids, *, expiring=()):
         _mark_retired(conn, RETIRED_PREFIX + sid, expires=sid in expiring, own=True)
         conn.execute('DELETE FROM state_meta WHERE key=?', ('gateway.api.settings.v1.' + sid,))
         conn.execute('DELETE FROM state_meta WHERE key=?', (VIEWER_CLOSE_PREFIX + sid,))
-    targets = set(session_ids)
-    for row in conn.execute('SELECT scope,session_key,entry_json FROM gateway_routing').fetchall():
-        if entry_session_id(row['entry_json']) in targets:
-            conn.execute('DELETE FROM gateway_routing WHERE scope=? AND session_key=?',
-                         (row['scope'], row['session_key']))
+    # Filtered in SQL: decoding every routing entry in Python cost ~0.5 s per prune transaction.
+    conn.execute("DELETE FROM gateway_routing WHERE CASE WHEN json_valid(entry_json) "
+                 "THEN json_extract(entry_json, '$.session_id') END IN (SELECT value FROM json_each(?))",
+                 (json.dumps(list(session_ids)),))
 
 
 def route_namespace(session_key):

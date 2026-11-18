@@ -98,6 +98,37 @@ class TestCacheImageFromBytes:
         with pytest.raises(ValueError, match="non-image data"):
             cache_image_from_bytes(b"<!DOCTYPE html><html><title>Slack</title></html>", ".png")
 
+    @pytest.mark.parametrize("brand,ext", [(b"heic", ".heic"), (b"mif1", ".heif"), (b"avif", ".avif")])
+    def test_caches_isobmff_stills(self, tmp_path, monkeypatch, brand, ext):
+        """iPhone photos sent as files are HEIC; image_routing transcodes them for vision."""
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        from gateway.platforms.base import cache_image_from_bytes
+        from io import BytesIO
+        from pathlib import Path
+        import pillow_heif
+        from PIL import Image
+
+        image = Image.new("RGB", (4, 4), "red")
+        encoded = BytesIO()
+        if brand == b"avif":
+            image.save(encoded, format="AVIF")
+        else:
+            pillow_heif.from_pillow(image).save(encoded, format="HEIF")
+        data = encoded.getvalue()
+        if brand == b"mif1":
+            data = data[:8] + brand + data[12:]
+        path = Path(cache_image_from_bytes(data, ext))
+        assert path.suffix == ".png"
+        with Image.open(path) as cached:
+            assert cached.format == "PNG" and cached.size == image.size
+
+    def test_rejects_isobmff_video(self, tmp_path, monkeypatch):
+        """An MP4 shares the ftyp container but is not an image."""
+        monkeypatch.setattr("gateway.platforms.base.IMAGE_CACHE_DIR", tmp_path / "img")
+        from gateway.platforms.base import cache_image_from_bytes
+        with pytest.raises(ValueError, match="non-image data"):
+            cache_image_from_bytes(b"\x00\x00\x00\x18ftypisom\x00\x00\x02\x00isomiso2" + b"\x00" * 64, ".heic")
+
 
 # ---------------------------------------------------------------------------
 # cache_image_from_url (base.py)
@@ -338,17 +369,9 @@ def _make_slack_adapter():
 # SlackAdapter._download_slack_file
 # ---------------------------------------------------------------------------
 
-@pytest.fixture
-def slack_file_dns(monkeypatch):
-    """HTTP is mocked below; DNS must also stay independent of host routing."""
-    def resolve(host, port, *args, **kwargs):
-        assert host == "files.slack.com"
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("93.184.216.34", port))]
-
-    monkeypatch.setattr(socket, "getaddrinfo", resolve)
-
-
-@pytest.mark.usefixtures("slack_file_dns")
+# files.slack.com resolves from a fixture: the SSRF check before each download used to look it up
+# on the live resolver.
+@pytest.mark.usefixtures("public_dns")
 class TestSlackDownloadSlackFile:
     """Tests for SlackAdapter._download_slack_file"""
 
@@ -411,7 +434,7 @@ class TestSlackDownloadSlackFile:
 # SlackAdapter._download_slack_file_bytes
 # ---------------------------------------------------------------------------
 
-@pytest.mark.usefixtures("slack_file_dns")
+@pytest.mark.usefixtures("public_dns")
 class TestSlackDownloadSlackFileBytes:
     """Tests for SlackAdapter._download_slack_file_bytes"""
 

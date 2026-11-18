@@ -2,6 +2,7 @@
 import json
 import time
 
+from hermes_state_common import _MERGE_DISPLAY_META
 from hermes_state_runtime import RuntimeStoreError
 
 
@@ -195,11 +196,17 @@ def worker_message_api_content(db, conn, session_id, payload):
 
 def worker_user_content(db, conn, session_id, payload):
     """Rewrite ONE active user row of this session, same guards as ``SessionDB.set_user_message_content``."""
-    if set(payload) != {'row_id', 'content'}:
+    if set(payload) - {'display_metadata'} != {'row_id', 'content'}:
         raise RuntimeStoreError('invalid_params')
+    if 'display_metadata' not in payload:
+        return {'value': conn.execute(
+            "UPDATE messages SET content=? WHERE id=? AND session_id=? AND role='user' AND active=1",
+            (db._encode_content(payload['content']), _row_id(payload), session_id)).rowcount}
     return {'value': conn.execute(
-        "UPDATE messages SET content=? WHERE id=? AND session_id=? AND role='user' AND active=1",
-        (db._encode_content(payload['content']), _row_id(payload), session_id)).rowcount}
+        f"UPDATE messages SET content=?, api_content=NULL, display_metadata={_MERGE_DISPLAY_META} "
+        "WHERE id=? AND session_id=? AND role='user' AND active=1",
+        (db._encode_content(payload['content']), db._encode_display_metadata(payload['display_metadata']),
+         _row_id(payload), session_id)).rowcount}
 
 
 WORKER_LIFECYCLE_HANDLERS = {
@@ -294,7 +301,12 @@ def insert_session_row_in_transaction(
         ),
     )
     if system_prompt_hash is not None:
-        self._delete_unreferenced_system_prompts(conn)
+        conn.execute(
+            "DELETE FROM system_prompts WHERE hash=? AND NOT EXISTS ("
+            "SELECT 1 FROM sessions WHERE system_prompt_hash=system_prompts.hash) AND NOT EXISTS ("
+            "SELECT 1 FROM sessions WHERE tool_names=system_prompts.hash)",
+            (system_prompt_hash,),
+        )
     if parent_session_id:
         self._inherit_parent_session_metadata(conn, session_id)
     # The upsert may have just filled a compression tip's created_source (update_token_counts).

@@ -113,7 +113,7 @@ def test_launchd_wrapper_pid_still_marks_the_gateway_below_it_pending(monkeypatc
     osascript → stderr_timestamp → gateway → … → updater. Recording only the supervised
     wrapper pid left the gateway row STALE and the receipt ``partial`` on every in-gateway
     update. Every ancestor between the supervised pid and the updater is pending."""
-    import hermes_cli.gateway as gateway
+    from hermes_cli import gateway
 
     updater, cron, gw, stamp, wrapper = os.getpid(), 800001, 800002, 800003, 800004
     parents = {updater: cron, cron: gw, gw: stamp, stamp: wrapper, wrapper: 1}

@@ -20,8 +20,13 @@ of these hold:
 The refusal writes nothing to that home. It tells the caller to rebuild the
 checkout-local venv with
 `python -m pm.build_env --source . --out .venv --group dev --group test`,
-or to set `HERMES_HOME` to a scratch directory. `HERMES_ALLOW_LIVE_HOME_SETUP=1`
-is the only opt-in, and only for a deliberate setup against that home.
+then run `env -u __HERMES_ACTIVATED HERMES_PYTHON="$PWD/.venv/bin/python" scripts/run_tests.sh`
+with their original test arguments. Rebuilding alone does not select `.venv`;
+the explicit interpreter must contain pytest, and a stale activation must be
+cleared for that command because activation takes precedence over `HERMES_PYTHON`.
+The alternative is to set `HERMES_HOME` to a scratch directory.
+`HERMES_ALLOW_LIVE_HOME_SETUP=1` is the only opt-in to setup against a live home,
+and only for a deliberate setup against that home.
 
 `hermes update` and the installer are unchanged. A scratch home, a dead pid
 file, and a non-symlink file named `current` still take the fallback.

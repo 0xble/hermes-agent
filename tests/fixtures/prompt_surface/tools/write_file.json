@@ -7,6 +7,10 @@
         "description": "Complete content to write to the file",
         "type": "string"
       },
+      "node": {
+        "description": "Named execution node from nodes.hosts. Omit to use nodes.default, or the legacy backend when no default is configured. Unknown or unavailable nodes never fall back.",
+        "type": "string"
+      },
       "path": {
         "description": "Path to the file to write (will be created if it doesn't exist, overwritten if it does)",
         "type": "string"

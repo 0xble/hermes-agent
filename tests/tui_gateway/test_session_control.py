@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import importlib
 import json
 import threading
@@ -506,7 +507,7 @@ class TestUpdatePublication:
             "_get_usage": lambda agent: {}, "_hermes_home": tmp_path,
         }.items():
             monkeypatch.setattr(server, name, value)
-        monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+        patch_server_threads(monkeypatch, server, _InlineThread)
         # Deterministic judge: the model-graded verdict is not under test, the ordering is.
         from hermes_cli.goals import GoalManager
 

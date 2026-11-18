@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from unittest.mock import Mock
 
@@ -16,6 +17,57 @@ def _raise_exit(code: int) -> None:
     raise _ExitCalled(code)
 
 
+@pytest.mark.parametrize(
+    ("shutdown_requested", "requested_code"),
+    [(False, None), (True, 0), (True, 75)],
+    ids=["stray-cancellation", "sigterm-shutdown", "restart"],
+)
+def test_cancelled_process_exit_uses_recorded_shutdown_request(
+    monkeypatch, shutdown_requested, requested_code
+):
+    from gateway.run_process_exit import current_process_exit_state, run_gateway_process
+
+    observed = []
+
+    async def start_gateway():
+        state = current_process_exit_state()
+        assert state is not None
+        state.update(shutdown_requested=shutdown_requested, exit_code=requested_code)
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", observed.append)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_gateway_process(start_gateway))
+
+    assert observed == [requested_code if shutdown_requested else 1]
+
+
+@pytest.mark.parametrize(
+    ("service_restart", "expected_code"), [(False, 0), (True, 75)],
+    ids=["detached-or-in-place", "service"],
+)
+def test_cancelled_process_exit_reads_runner_shutdown_flags(monkeypatch, service_restart, expected_code):
+    from gateway.run_bootstrap import _record_process_exit_state
+    from gateway.run_process_exit import run_gateway_process
+
+    async def start_gateway():
+        runner = SimpleNamespace(
+            _restart_requested=True,
+            _restart_via_service=service_restart,
+            _signal_initiated_shutdown=False,
+            _shutdown_event=asyncio.Event(),
+            exit_code=None,
+        )
+        _record_process_exit_state(runner)
+        raise asyncio.CancelledError()
+
+    observed = []
+    monkeypatch.setattr(gateway_run, "_exit_after_graceful_shutdown", observed.append)
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_gateway_process(start_gateway))
+    assert observed == [expected_code]
+
+
 def test_main_terminates_via_os_exit_not_systemexit(monkeypatch):
     """The terminating call must be os._exit, NOT sys.exit — SystemExit is
     exactly what triggers the Py_FinalizeEx non-daemon-thread join hang this
@@ -29,6 +81,7 @@ def test_main_terminates_via_os_exit_not_systemexit(monkeypatch):
     stdout = SimpleNamespace(flush=Mock())
     stderr = SimpleNamespace(flush=Mock())
 
+    monkeypatch.setattr("hermes_cli.boot_bootstrap.maybe_run_boot_bootstrap", lambda _root: None)
     monkeypatch.setattr(gateway_run, "start_gateway", fake_start_gateway)
     monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
     monkeypatch.setattr(gateway_run.sys, "argv", ["gateway.run"])
@@ -53,6 +106,7 @@ def test_main_routes_systemexit_through_os_exit(monkeypatch):
     stdout = SimpleNamespace(flush=Mock())
     stderr = SimpleNamespace(flush=Mock())
 
+    monkeypatch.setattr("hermes_cli.boot_bootstrap.maybe_run_boot_bootstrap", lambda _root: None)
     monkeypatch.setattr(gateway_run, "start_gateway", fake_start_gateway)
     monkeypatch.setattr(gateway_run.os, "_exit", _raise_exit)
     monkeypatch.setattr(gateway_run.sys, "argv", ["gateway.run"])

@@ -208,13 +208,11 @@ def test_publication_and_attempt_metrics_keep_separate_retry_scopes(
     token = current_write_metrics.set(outer)
     try:
         db.create_session("s", "test")
-        attempts, changes = [], []
+        attempts = []
 
         def publish(conn):
             attempts.append(current_write_metrics.get())
-            before = conn.total_changes
             db._insert_message_rows(conn, "s", [{"role": "user", "content": "summary"}])
-            changes.append(conn.total_changes - before)
             if len(attempts) == 1:
                 raise sqlite3.OperationalError("database is locked")
             if abort_final_attempt:
@@ -223,7 +221,6 @@ def test_publication_and_attempt_metrics_keep_separate_retry_scopes(
         monkeypatch.setattr(db, "_sleep_before_write_retry", lambda *_args: True)
         conn = db._conn
         assert conn is not None
-        changes_before = conn.total_changes
         with publication_metrics(10) as publication:
             if abort_final_attempt:
                 with pytest.raises(ValueError, match="abort publication"):
@@ -231,9 +228,9 @@ def test_publication_and_attempt_metrics_keep_separate_retry_scopes(
             else:
                 db._execute_write(publish)
             assert current_write_metrics.get() is outer
-            # SQLite may defer additional FTS changes until commit, after the callback.
-            assert publication["publish_rows_written"] == conn.total_changes - changes_before
-            assert publication["publish_rows_written"] >= sum(changes)
+            # Each attempt inserts 1 message. Trigger/FTS writes never count,
+            # including commit tails and work rolled back before a retry.
+            assert publication["publish_rows_written"] == len(attempts)
             assert publication["publish_hold_ms"] >= 0
             assert publication["publish_wait_ms"] >= 0
         assert len(attempts) == 2

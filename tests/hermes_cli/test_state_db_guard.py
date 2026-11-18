@@ -148,7 +148,7 @@ class TestPreUpdateBackupIntegrityGuard:
         from argparse import Namespace
 
         import hermes_cli.backup as backup_mod
-        import hermes_cli.update_cmd as update_cmd
+        from hermes_cli import update_cmd
         from hermes_cli.update_cmd import _run_pre_update_backup
 
         def boom(**kwargs):

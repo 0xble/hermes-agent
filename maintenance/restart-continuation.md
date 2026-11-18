@@ -3,6 +3,18 @@
 Load this unit when changing gateway restart recovery, the resume-pending recovery
 note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` default.
 
+Fork patch identity: `restart-resume-pending`.
+
+This identity covers preservation of pending restart recovery across extracted
+profile and notification owners. Secondary reconnects replay the owning profile's
+spool, recovered human input keeps its provenance, and startup preclaims retain
+the resolved profile. The existing continuation policy below remains authoritative.
+Contract tests: `tests/gateway/test_restart_resume_pending.py`
+  `tests/gateway/test_restart_interrupted_note.py`
+  `tests/gateway/test_runner_startup_failures.py`.
+Retire this integration seam when upstream carries the same profile-aware recovery
+and provenance behavior through its extracted owners.
+
 ## Required behavior
 
 - `gateway.restart_resume_policy` accepts `ask` or `continue`. `ask` (the upstream
@@ -45,8 +57,13 @@ note, `GatewayConfig` scalar bridging, or any adapter's `interactive_resume` def
   `gateway/restart_loop_planned_exit.json`; boot consumes it once even with no pending
   sessions. Signal/home marker timestamps and the chat `/restart` marker's mtime must
   be within the configured chain gap. Unreadable intent grants no exemption; I/O failure
-  never blocks shutdown or startup. Regressions: `tests/gateway/test_restart_loop_guard.py`
-  and `tests/hermes_cli/test_gateway_restart_loop.py`.
+  never blocks shutdown or startup. The sole shutdown-handler factory lives in
+  `gateway/run_bootstrap.py`, where startup installs it; the legacy facade lifecycle
+  imports that same factory. Takeover and planned-stop intent take precedence over
+  planned restart, and a bare SIGTERM remains unplanned. Regressions:
+  `tests/gateway/test_bootstrap_shutdown_signal.py`,
+  `tests/gateway/test_restart_loop_guard.py`, and
+  `tests/hermes_cli/test_gateway_restart_loop.py`.
 
 The `routine-restart-resume-note` patch also covers background process completion
 notices and delegation interruption/recovery text in

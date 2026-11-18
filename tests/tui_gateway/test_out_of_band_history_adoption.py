@@ -7,6 +7,7 @@ concurrent rows were then silently dropped — the UI showed the full transcript
 held only the early snapshot.
 """
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import contextlib
 import threading
 
@@ -111,7 +112,7 @@ def _immediate_thread(monkeypatch) -> None:
         def start(self):
             self._target()
 
-    monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+    patch_server_threads(monkeypatch, server, _ImmediateThread)
 
 
 def _desktop_prompt(db, session, monkeypatch, text: str = "continue on desktop") -> list:

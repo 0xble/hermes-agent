@@ -5,6 +5,10 @@ Split out of ``hermes_cli/update_cmd.py``; every name is re-imported there so
 imported lazily inside each function (no import cycle; test patches stay effective).
 """
 
+from hermes_cli.update_cmd_fleet_restart_delay import (
+    _service_restart_sec
+)
+
 import json
 import logging
 import re
@@ -158,32 +162,13 @@ def _current_checkout_sha() -> str | None:
         if release is not None:
             return release.name
     try:
-        from hermes_cli.version_info import get_code_identity
-        sha = (get_code_identity(refresh=True) or {}).get("sha")
-        return str(sha) if sha else None
+        from hermes_cli.version_info import read_checkout_sha
+        return read_checkout_sha()
     except Exception:
         return _capture_head_sha(["git"], _m().PROJECT_ROOT)
 
 
-def _receipt_looks_unfinished(receipt: dict) -> bool:
-    """True when *receipt* is from an update that did not finish cleanly.
-
-    The command boundary stamps a ``stop_reason`` on every receipt, including clean
-    ones (``completed at command boundary``, ``sys.exit(0)``); it must not make a
-    successful receipt look unfinished, or the next ``hermes update`` retriggers
-    ``fleet_restart_pending`` from pre-pull plan SHAs (#98022).
-    """
-    exit_code = receipt.get("exit_code")
-    outcome = receipt.get("outcome")
-    if exit_code not in (0, None) or outcome in ("failed", "partial", "running"):
-        return True
-    gateway_restart = receipt.get("gateway_restart")
-    if isinstance(gateway_restart, dict) and gateway_restart.get("incomplete"):
-        return True
-    # A stop_reason alone (update_contract refusals: outcome="refused", no exit_code)
-    # counts only when nothing else vouched for success.
-    succeeded = exit_code == 0 or outcome == "success"
-    return bool(receipt.get("stop_reason")) and not succeeded
+from hermes_cli.update_cmd_fleet_receipts import _receipt_looks_unfinished
 
 
 def _receipt_reports_stale_runtime(receipt: dict, expected_sha: str | None = None) -> bool:
@@ -785,10 +770,11 @@ def _systemctl_reset_and_restart(manage_cmd: list, svc_name: str, *, scope_cmd: 
     auto-restart can wedge a plain ``restart`` against RestartSec backoff and stay dead."""
     # Property reads need no manage-units privileges: narrow sudoers may permit
     # restart/reset-failed but deny show. Keep the same user/system manager scope.
-    from hermes_cli.update_cmd_fleet_unit_budget import systemd_restart_timeout
-    timeout = systemd_restart_timeout(scope_cmd if scope_cmd is not None else manage_cmd, svc_name)
+    from hermes_cli.update_cmd_fleet_unit_budget import run_unit_job, systemd_restart_timeout
+    scope_cmd = scope_cmd if scope_cmd is not None else manage_cmd
+    timeout = systemd_restart_timeout(scope_cmd, svc_name)
     _systemctl(manage_cmd + ["reset-failed", svc_name], timeout=10)
-    return _systemctl(manage_cmd + ["restart", svc_name], timeout=timeout)
+    return run_unit_job(manage_cmd, scope_cmd, "restart", svc_name, timeout=timeout)
 
 
 def _systemd_unit_owned_by_update(scope_cmd: list, svc_name: str) -> bool:
@@ -799,23 +785,23 @@ def _systemd_unit_owned_by_update(scope_cmd: list, svc_name: str) -> bool:
     listed, not because it ran the updated code. Foreign or unreadable ownership prints a notice
     and leaves the unit alone; it is not a failed restart.
     """
-    from hermes_cli.update_fleet_scope import describe_skipped_runtime, systemd_unit_hermes_home, home_in_update_scope
+    from hermes_cli.update_fleet_scope import announce_skipped_runtime, systemd_unit_hermes_home, home_in_update_scope
     home = systemd_unit_hermes_home(scope_cmd, svc_name)
     if home is not None and home_in_update_scope(home):
         return True
-    print(describe_skipped_runtime("systemd unit", svc_name, home))
+    announce_skipped_runtime("systemd unit", svc_name, home)
     return False
 
 
 def _scoped_manual_gateway_pids(pids, *, keep=(), quiet: bool = False) -> list[int]:
     """*pids* whose live home this update owns (plus *keep*, PIDs already mapped to this
     install's profile PID files); every other gateway process is named and left running."""
-    from hermes_cli.update_fleet_scope import describe_skipped_runtime, partition_gateway_pids_by_scope
+    from hermes_cli.update_fleet_scope import announce_skipped_runtime, partition_gateway_pids_by_scope
     keep = set(keep)
     owned, foreign = partition_gateway_pids_by_scope([pid for pid in pids if pid not in keep])
     if not quiet:
         for pid, home in foreign:
-            print(describe_skipped_runtime("gateway process", f"PID {pid}", home))
+            announce_skipped_runtime("gateway process", f"PID {pid}", home)
     return [pid for pid in pids if pid in keep or pid in owned]
 
 
@@ -1395,7 +1381,9 @@ def _repair_unit_without_fatal_exit_park(svc_name: str, scope: str) -> None:
         return
     if parked:
         return
-    if system and not _needs_sudo(scope) and svc_name == get_service_name():
+    from hermes_cli.update_cmd_commit import past_commit_point
+    # Past the move the generator would load the new tree's plugins into this process; the hint stays.
+    if system and not _needs_sudo(scope) and svc_name == get_service_name() and not past_commit_point():
         # The refresh adopts the unit's HERMES_HOME into os.environ (sudo strips it); the rest of the
         # update keeps running for the invoking profile.
         launch_home = os.environ.get("HERMES_HOME")
@@ -1448,17 +1436,15 @@ def _restart_one_systemd_gateway_unit(
         _main_pid, drain_budget, svc_name, self_restart_pending=self_restart_pending)
 
     if _graceful_ok:
-        from hermes_cli.update_cmd_fleet_unit_budget import service_restart_sec, systemd_restart_timeout
+        from hermes_cli.update_cmd_fleet_unit_budget import run_unit_job, service_restart_sec, systemd_restart_timeout
         # ``Restart=always`` respawns only after RestartSec (60s in our unit; dead time for a
         # voluntary restart). ``reset-failed`` + ``start`` skips it (~1-3s); if RestartSec already
         # elapsed, ``start`` is a no-op and we fall through to the poll. Needs manage-units
         # privileges; without them auto-restart still fires after RestartSec.
         if _manage_cmd is not None:
             _systemctl(_manage_cmd + ["reset-failed", svc_name], timeout=10)
-            _systemctl(
-                _manage_cmd + ["start", svc_name],
-                timeout=systemd_restart_timeout(scope_cmd, svc_name, start_only=True),
-            )
+            run_unit_job(_manage_cmd, scope_cmd, "start", svc_name,
+                         timeout=systemd_restart_timeout(scope_cmd, svc_name, start_only=True))
             if _wait_for_service_active(scope_cmd, svc_name, timeout=10.0):
                 restarted_services.append(svc_name)
                 return
@@ -1633,6 +1619,11 @@ class _GatewayRestartOutcome:
     #: (``_drain_or_signal_gateway_for_update`` branch 1): they restart only after this process
     #: exits, so the fleet matrix renders them as pending instead of STALE (#119597).
     self_restart_pending_pids: set = field(default_factory=set)
+    #: Units the restart phase itself could not restart. Verification warns about the ones its fleet
+    #: probe does not prove current: a timed-out ``systemctl`` call can still bring its unit up. Not
+    #: ``failed_or_stale_units``: the Windows resume merge and an aborted phase add to that list, and
+    #: neither gets this systemctl/launchctl advice.
+    unrestarted_units: list = field(default_factory=list)
 
     def fleet_probe_signals(self) -> tuple:
         """``(pre_restart_pids, killed_pids)`` with the unmapped stops removed — the signals that
@@ -1661,7 +1652,7 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     """
     import signal as _signal
     from hermes_cli.gateway import (
-        find_gateway_pids, find_profile_gateway_processes, _capture_gateway_argv,
+        find_gateway_pids, find_profile_gateway_processes,
         _prepare_profile_gateway_update_restart, _get_service_pids,
         _wait_for_gateway_exit,
     )
@@ -1669,50 +1660,20 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     # live gateway's own external-supervisor declaration is the authoritative fallback;
     # otherwise the new child is indistinguishable from a manual process and the sweep
     # SIGTERMs it before launchd's throttle window can settle.
-    from hermes_cli.gateway_supervised_restart import gateway_declares_external_supervisor
+    from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
     from hermes_cli.update_cmd_posix_pause import already_restarted
     # Plus gateways this update paused and already resumed on the new code.
     service_pids = _get_service_pids(all_profiles=True) | already_restarted()["pids"]
-    candidate_pids = find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+    candidate_pids = [pid for pid in find_gateway_pids(exclude_pids=service_pids, all_profiles=True)
+                      if not leave_client_owned_gateway(pid)]
     mapped_processes = {
         proc.pid: proc
         for proc in find_profile_gateway_processes(exclude_pids=service_pids)
         if proc.pid in candidate_pids
     }
-    # Only a supervisor child that appeared after the restart snapshot is outside
-    # this sweep. A pre-existing externally supervised gateway still has to leave
-    # its old process so the supervisor can relaunch it on the new modules (#88654).
-    pre_restart_pids = getattr(out, "pre_restart_gateway_pids", None)
-    pre_restart_pids = set(pre_restart_pids) if pre_restart_pids is not None else None
-    externally_supervised_pids = set()
-    for pid in candidate_pids:
-        proc = mapped_processes.get(pid)
-        if proc is not None:
-            # A mapped process gets the control-socket/state-file check as well as
-            # the live argv fallback, scoped to that profile's home.
-            try:
-                declares_external_supervisor = gateway_declares_external_supervisor(pid, proc.path)
-            except Exception as exc:
-                # An unreadable identity is ambiguous; never turn it into a
-                # destructive manual-stop decision. Report the skipped process so
-                # the update summary/receipt is not silently incomplete.
-                print(
-                    f"  ⚠ Could not determine external-supervisor ownership for "
-                    f"gateway PID {pid} ({proc.profile}): {exc}; "
-                    "protecting it if it appeared after the restart snapshot"
-                )
-                declares_external_supervisor = True
-            if declares_external_supervisor and (pre_restart_pids is None or pid not in pre_restart_pids):
-                externally_supervised_pids.add(pid)
-            continue
-        # Unmapped gateways have no profile home to query. The explicit argv
-        # marker is still enough to identify a supervisor-owned launch.
-        try:
-            argv = _capture_gateway_argv(pid)
-        except Exception:
-            argv = None
-        if argv and "--external-supervisor" in argv and (pre_restart_pids is None or pid not in pre_restart_pids):
-            externally_supervised_pids.add(pid)
+    from hermes_cli.update_cmd_manual_restart import new_supervisor_gateway_pids
+    externally_supervised_pids = new_supervisor_gateway_pids(
+        candidate_pids, mapped_processes, getattr(out, "pre_restart_gateway_pids", None))
     manual_pids = [pid for pid in candidate_pids if pid not in externally_supervised_pids]
     profile_processes = {
         pid: proc for pid, proc in mapped_processes.items() if pid in manual_pids
@@ -1728,6 +1689,8 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     # which is the contract already used for gateways with no profile mapping.
     unrestartable_pids = set()
     for pid, proc in profile_processes.items():
+        if leave_client_owned_gateway(pid, home=proc.path):
+            continue
         restart_mode = _prepare_profile_gateway_update_restart(proc.profile, pid)
         if restart_mode is None:
             # A bare ``continue`` here left it serving stale modules with no signal.
@@ -1756,6 +1719,8 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
             out.relaunched_profiles.append(proc.profile)
 
     for pid in manual_pids:
+        if leave_client_owned_gateway(pid):
+            continue
         if pid in profile_processes and pid not in unrestartable_pids:
             continue
         with suppress(ProcessLookupError, PermissionError):
@@ -1793,7 +1758,8 @@ def _force_kill_stuck_gateways(killed_pids) -> None:
         _time.sleep(3.0)
         _surviving = find_gateway_pids(exclude_pids=_get_service_pids(all_profiles=True), all_profiles=True)
         # Only PIDs we already tried to kill; newer ones are left alone.
-        _stuck = [pid for pid in _surviving if pid in killed_pids]
+        from hermes_cli.gateway_client_ownership import leave_client_owned_gateway
+        _stuck = [pid for pid in _surviving if pid in killed_pids and not leave_client_owned_gateway(pid)]
         if _stuck:
             print()
             print(f"  ⚠ {len(_stuck)} gateway process(es) ignored SIGTERM — force-killing")
@@ -1899,6 +1865,9 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool, *,
     every planned gateway is verifiably covered.
     """
     from hermes_cli.update_cmd import _m, _write_gateway_update_exit_code, get_hermes_home
+    from hermes_cli.update_stage import publish_stage
+
+    publish_stage("Restarting Hermes services")  # also after a failed build: the code is committed
     # All bookkeeping is declared before the try so abort recovery and fleet reconciliation
     # can read it even if the phase raises early. ``pre_restart_gateway_pids`` stays empty
     # until we are about to stop/drain, so an early exception has nothing to fail closed on,
@@ -1976,7 +1945,7 @@ def _restart_gateway_fleet_after_update(_pre_update_plan, gateway_mode: bool, *,
         if out.failed_or_stale_units:
             # Owed restart (C3): verification records the follow-up; the /update marker stays committed.
             out.incomplete = True
-        _warn_incomplete_gateway_fleet_restart(out.failed_or_stale_units)
+        out.unrestarted_units = list(out.failed_or_stale_units)
         out.record_receipt()
         _force_kill_stuck_gateways(out.killed_pids)
 
@@ -2065,27 +2034,6 @@ def _wait_for_service_active(scope_cmd_: list, svc_name_: str, timeout: float = 
 _RESTART_SEC_UNITS = (("ms", 0.001), ("us", 0.000001), ("min", 60.0), ("s", 1.0))
 
 
-def _service_restart_sec(scope_cmd_: list, svc_name_: str, default: float = 0.0) -> float:
-    """Read the unit's ``RestartUSec`` in seconds. ``is-active`` pollers must wait
-    >= RestartSec + slack or they give up *during* the cooldown and misreport."""
-    try:
-        _show = _systemctl(scope_cmd_ + ["show", svc_name_, "--property=RestartUSec", "--value"], timeout=5)
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        return default
-    raw = (_show.stdout or "").strip()
-    # Values like "30s", "100ms", "1min 30s", "infinity"; on any miss return default.
-    if not raw or raw == "infinity":
-        return default
-    total = 0.0
-    matched = False
-    for part in raw.split():
-        for _suf, _mult in _RESTART_SEC_UNITS:
-            if part.endswith(_suf):
-                with suppress(ValueError):
-                    total += float(part[: -len(_suf)]) * _mult
-                    matched = True
-                break
-    return total if matched else default
 
 
 def _run_pending_fleet_restart() -> NoReturn:

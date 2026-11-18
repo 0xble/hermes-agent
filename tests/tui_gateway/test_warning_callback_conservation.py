@@ -1,4 +1,5 @@
 """Real callback and queue boundaries; renderer preference never hides operator logs."""
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import logging
 import queue
 from types import SimpleNamespace
@@ -112,7 +113,7 @@ def test_diagnostic_turn_callbacks_from_real_worker_keep_controls_and_logs(turn_
     # The normal worker starts after the submitter releases _sessions_lock.
     # The shared inline-thread fixture instead holds that lock while joining
     # this real callback thread, creating a fixture-only deadlock.
-    monkeypatch.setattr(server.threading, "Thread", server._RealThread)
+    patch_server_threads(monkeypatch, server, server._RealThread)
     agent = Agent()
     agent.session_id = "session-key"
     agent.clear_interrupt = lambda: None

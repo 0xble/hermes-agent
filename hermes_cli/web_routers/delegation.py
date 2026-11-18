@@ -150,12 +150,13 @@ def _check_default(default: Optional[str], names: list[str], what: str) -> Optio
     return value or None
 
 
-def _clean_model_option(index: int, entry: dict, stored: dict[str, dict]) -> dict[str, Any]:
+def _clean_model_option(index: int, entry: dict, stored: dict[str, dict],
+                        declared: tuple[str, ...] = ()) -> dict[str, Any]:
     from agent.delegation_provider import ROUTE_KEYS
     from agent.fast_mode import STATIC_TIERS, parse_exact_service_tier
     from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
 
-    row = {key: _text(entry, key) for key in _OPTION_TEXT_KEYS if _text(entry, key)}
+    row: dict[str, Any] = {key: _text(entry, key) for key in _OPTION_TEXT_KEYS if _text(entry, key)}
     label = f"Route {index + 1}"
     if not row.get("name"):
         raise _bad_request(f"{label} needs a name.")
@@ -188,25 +189,38 @@ def _clean_model_option(index: int, entry: dict, stored: dict[str, dict]) -> dic
     for field in sorted(ROUTE_KEYS - validated):
         if entry.get(field) not in (None, "", [], {}):
             row[field] = entry[field]
+    # The backend's own keys (DelegationProvider.route_keys, e.g. a ``daybreak`` opt-in) are kept as sent; the
+    # backend validates them. Presence decides, not the value: null is a value, absent = the editor turned it off.
+    for field in declared:
+        if field not in row and field not in ROUTE_KEYS and field in entry:
+            row[field] = entry[field]
+    # A route the renderer came from (a rename names it in original_name; once that save landed, it is stored
+    # under its new name).
+    source = stored.get(_text(entry, "original_name")) or stored.get(row["name"]) or {}
+    # Any other key the stored route carries (hand-written, or declared by a backend that is not loaded now)
+    # survives an untouched round-trip, so a save never silently drops a setting; a key nobody stored is dropped.
+    for field, value in source.items():
+        if (field not in row and field not in ROUTE_KEYS and field != "api_key"
+                and field in entry and entry[field] == value):
+            row[field] = value
     key = entry.get("api_key")
     if is_redacted_credential_preview(key):
-        # The renderer only ever saw a preview: keep the stored key of the route it came from (a rename names
-        # it in original_name; once that save landed, the route is stored under its new name).
-        source = stored.get(_text(entry, "original_name")) or stored.get(row["name"]) or {}
+        # The renderer only ever saw a preview: keep the stored key of the route it came from.
         key = source.get("api_key")
     if isinstance(key, str) and key.strip():
         row["api_key"] = key.strip()
     return row
 
 
-def _write_backend_block(profile: Optional[str], backend: str, build: Callable[[dict], dict]) -> dict:
+def _write_backend_block(profile: Optional[str], backend: str, build: Callable[[dict, dict], dict]) -> dict:
+    """Replace one backend block. *build* gets the stored block and the whole loaded config."""
     from hermes_cli.config import format_managed_message, is_managed
     if is_managed():
         raise _managed_install(format_managed_message(f"save delegation.backends.{backend}"))
     with config_write_scope(profile):
         config = load_config()
         blocks = _section(_section(config, "delegation"), "backends")
-        block = build(_mapping(blocks, backend))
+        block = build(_mapping(blocks, backend), config)
         blocks[backend] = block
         save_config(config)
         return block
@@ -215,14 +229,27 @@ def _write_backend_block(profile: Optional[str], backend: str, build: Callable[[
 @router.put("/api/delegation/backends/model_map")
 async def save_model_routes(body: DelegationModelMapUpdate, profile: Optional[str] = None):
     """Replace ``delegation.backends.model_map`` (``options`` + ``default``) after validating every route."""
-    def _build(current: dict) -> dict:
+    def _build(current: dict, config: dict) -> dict:
         stored = {_text(o, "name"): o for o in current.get("options") or [] if isinstance(o, dict)}
-        options = [_clean_model_option(i, dict(o), stored) for i, o in enumerate(body.options)]
+        declared = next((tuple(b.get("route_keys") or ()) for b in _registered_backends() if b["name"] == MODEL_MAP), ())
+        options = [_clean_model_option(i, dict(o), stored, declared) for i, o in enumerate(body.options)]
         names = [o["name"] for o in options]
         duplicate = next((n for n in names if names.count(n) > 1), None)
         if duplicate:
             raise _bad_request(f"Two routes are named {duplicate!r}; route names must be unique.")
         block: dict[str, Any] = {"options": options}
+        from hermes_cli.config_value_checks import _validate_model_map_options
+        validation_issues: list[Any] = []
+        # Only an option that declares a chain is held to the bar; one without is left alone.
+        # Judged against the whole config with this block in place: a route's model is usually
+        # an alias name, and ``model_aliases`` lives at the config root.
+        delegation = _mapping(config, "delegation")
+        candidate = {**config, "delegation": {
+            **delegation, "backends": {**_mapping(delegation, "backends"), MODEL_MAP: block}}}
+        _validate_model_map_options(options, validation_issues, "delegation.backends.model_map", candidate)
+        if validation_issues:
+            first = validation_issues[0]
+            raise _bad_request(f"{first.message} Hint: {first.hint}")
         default = _check_default(body.default, names, "route")
         if default:
             block["default"] = default
@@ -237,7 +264,7 @@ async def save_model_routes(body: DelegationModelMapUpdate, profile: Optional[st
 async def save_profile_routes(body: DelegationProfileRoutesUpdate, profile: Optional[str] = None):
     """Replace ``delegation.backends.profile_routes`` (``profiles`` + ``default``); every name must be an
     existing profile."""
-    def _build(_current: dict) -> dict:
+    def _build(_current: dict, _config: dict) -> dict:
         known = set(_profile_names())
         profiles: list[dict[str, str]] = []
         names: list[str] = []

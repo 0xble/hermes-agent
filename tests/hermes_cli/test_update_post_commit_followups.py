@@ -141,6 +141,12 @@ def test_failed_config_migration_is_owed_and_later_maintenance_runs(tmp_path, mo
     monkeypatch.setattr("hermes_cli.gitlock.fetch_full_commit_graph", lambda *a, **kw: False)
     monkeypatch.setattr("hermes_cli.model_catalog.seed_cache_from_checkout", lambda root: False)
 
+    def broken_graph_refresh(root):
+        calls.append(("commit_graph", root))
+        raise OSError("fork failed")  # a refresh that cannot start must not fail or owe anything
+
+    monkeypatch.setattr("hermes_cli.git_commit_graph.spawn_commit_graph_refresh", broken_graph_refresh)
+
     def broken_migration(**kwargs):
         raise SystemExit(1)  # a migration helper that exits must not fail the committed update
 
@@ -154,6 +160,7 @@ def test_failed_config_migration_is_owed_and_later_maintenance_runs(tmp_path, mo
         had_desktop_app_before_update=False, pre_update_version=None, followups=owed) is True
     assert [step for step, _ in owed] == ["config_migration"]
     assert calls[0] == "repair_windows_home_acl"
+    assert ("commit_graph", update_cmd._m().PROJECT_ROOT) in calls
     assert calls[-2:] == ["verdict", "notices"]
     assert "⚠ Update follow-up 'config_migration'" in capsys.readouterr().out
     update_receipt.finalize_update_receipt("success")
@@ -317,9 +324,14 @@ def test_both_completion_children_run_in_utf8_mode(tmp_path, monkeypatch):
     monkeypatch.setattr(update_completion, "_settle_after_commit", lambda *a: 0)
     request = {"source": str(tmp_path), "receipt": {"update_id": "u1"}, "bytecode_cache": str(tmp_path / "bc")}
     update_completion._prepare(request, tmp_path / "request.json", tmp_path / "result.json")
-    monkeypatch.setattr(update_completion.sys, "platform", "win32")  # skip the Linux libatomic pre-install
-    with pytest.raises(OSError):
+    # Capture the bootstrap completion, not its ASCII-only POSIX death watcher.
+    # Stub auxiliary work at its boundary instead of faking the host platform.
+    monkeypatch.setattr(update_completion, "_owner_death_watch", lambda *a: None)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: None)  # libatomic pre-install
+    with pytest.raises(OSError, match="stop after capturing the argv"):
         update_completion.run_completion({**request, "home": str(tmp_path)})
     assert len(calls) == 2
+    assert "--prepared" in calls[0] and "--prepared" not in calls[1]
     for command in calls:
+        assert str(tmp_path / "hermes_cli/update_completion.py") in command, command
         assert command[command.index("-I"):].count("utf8") == 1 and "-X" in command, command

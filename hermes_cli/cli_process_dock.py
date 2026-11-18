@@ -33,7 +33,10 @@ def process_status(entry: dict) -> str:
     reason = _STATUS_BY_REASON.get(entry.get("completion_reason") or "")
     if reason:
         return reason
-    return "done" if not entry.get("exit_code") else "failed"
+    from tools.process_registry_notifications import process_exit_unknown
+    if process_exit_unknown(entry.get("exit_code"), entry.get("completion_reason"), entry.get("termination_source")):
+        return "lost"
+    return "done" if entry.get("exit_code") == 0 else "failed"
 
 
 def process_rows(now: float | None = None) -> list:
@@ -85,7 +88,7 @@ def process_activity(row: dict) -> str:
         return f"{row['elapsed']}s · " + (
             t("cli.dock.last_output", detail=row["detail"]) if row["detail"] else t("cli.dock.starting"))
     verdict = _VERDICT_KEYS[row["status"]]
-    verdict = t(verdict, code=row["exit_code"])
+    verdict = t("cli.dock.verdict_unknown") if row["status"] == "lost" else t(verdict, code=row["exit_code"])
     return t("cli.dock.verdict_ago", verdict=verdict, seconds=row["since_exit"])
 
 

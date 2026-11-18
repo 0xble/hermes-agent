@@ -20,7 +20,8 @@ import tempfile
 import threading
 from hermes_dir_acl import make_user_dir
 
-from hermes_state_runtime import RuntimeStoreError
+from hermes_state_runtime import ADMITTED_REQUEST_CONFLICT, RuntimeStoreError
+from hermes_state_common import HELD_MEDIA_WHERE
 from utils import fsync_directory
 
 logger = logging.getLogger(__name__)
@@ -167,7 +168,7 @@ def admit_attachments(attachments, *, admitted=None):
             raise RuntimeStoreError('invalid_params')
         if any(digest is not None and digest != reference['sha256']
                for digest, reference in zip(hashes, committed['media'])):
-            raise RuntimeStoreError('admission_conflict')
+            raise RuntimeStoreError('admission_conflict', **ADMITTED_REQUEST_CONFLICT)
         retry = True
     else:
         # Retry identity is the committed bytes, not the disposable staging name.
@@ -191,6 +192,7 @@ def ingress_fingerprint(payload, raw=None):
     envelope = {**payload['native_text_v1']}
     envelope.pop('ingress_sha256', None)
     envelope.pop('attended_activity', None)
+    envelope.pop('absorbed_synthetic', None)
     if 'media' in envelope:
         envelope['media'] = [[media['sha256'], media['size']] for media in envelope['media']]
     received = {**payload, 'native_text_v1': envelope}
@@ -392,8 +394,7 @@ def _held_media_paths(conn):
             '$.attachments_v1.media', '$.native_text_v1.media', '$.api_turn_v1.media'),
             CASE WHEN status!='terminal' AND request_id LIKE 'hosted:%'
                  THEN json_extract(payload_json, '$.text') END
-            FROM session_admissions WHERE status!='terminal'
-            OR json_type(payload_json, '$.api_turn_v1.media') IS NOT NULL""").fetchall()
+            FROM session_admissions WHERE """ + HELD_MEDIA_WHERE).fetchall()
     held = set()
     for status, request_id, encoded, text in rows:
         attachments, native, api = json.loads(encoded)

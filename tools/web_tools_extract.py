@@ -2,14 +2,17 @@
 
 Order of controls (each is a gate, never skipped by a cache hit): secret-URL
 refusal -> SSRF filter (in web_tools.web_extract_tool) -> provider resolution
-(strict selection) -> per-URL website policy -> direct/local route -> disk cache
--> vendor call with one-shot keyless rescue. Logs under the origin (tools.web_tools) logger.
+(strict selection) -> per-URL website policy -> direct/local route -> disk cache -> vendor call with
+one-shot keyless rescue -> website policy + SSRF on every page reported under a
+URL that was not requested (redirect targets). Logs under the origin
+(tools.web_tools) logger.
 """
 
 import asyncio
 import json
 import logging
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlsplit
 
 from tools.tool_backend_helpers import selection_error, selection_exists
 from tools.url_safety import normalize_url_for_request
@@ -73,11 +76,186 @@ def _refuse_all(error: str):
     return None, None, None, json.dumps({"success": False, "error": error})
 
 
+def _extract_identity_key(url: Any) -> Optional[tuple]:
+    """Compare provider canonicalizations without changing fetch targets or cache keys."""
+    if not isinstance(url, str) or not url:
+        return None
+    try:
+        parts = urlsplit(url)
+        port = parts.port
+    except ValueError:
+        return (url,)
+    scheme = parts.scheme.lower()
+    if (scheme, port) in (("http", 80), ("https", 443)):
+        port = None
+    # HTTP upgrades identify the same resource, but distinct hosts (including
+    # www), non-default ports, path case and query values are not aliases.
+    # www/apex pairing is a separate 1:1 step, so consuming one alias cannot
+    # leave a leftover page to be inferred onto another requested URL.
+    transport = "http(s)" if scheme in ("http", "https") else scheme
+    return (transport, parts.hostname, port, parts.path.rstrip("/"),
+            parts.query, parts.username, parts.password)
+
+
+def _extract_result_identity(result: dict, requested: set[str], keys: dict) -> Optional[str]:
+    metadata = result.get("metadata")
+    source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+    # sourceURL owns a redirect even when its final URL is another requested URL.
+    for candidate in (source, result.get("url")):
+        if isinstance(candidate, str) and candidate in requested:
+            return candidate
+        identities = keys.get(_extract_identity_key(candidate), set())
+        if identities:
+            return next(iter(identities)) if len(identities) == 1 else None
+    return None
+
+
+def _infer_extract_redirect(result: dict, keys: dict) -> bool:
+    metadata = result.get("metadata")
+    source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+    final = _extract_identity_key(result.get("url"))
+    # A canonical collision is not an unknown redirect, even with one slot left.
+    return bool(final and final not in keys and (not source or _extract_identity_key(source) == final))
+
+
+def _strip_www_label(hostname: str) -> Optional[str]:
+    """Drop one leading www label. ``www.example.com`` becomes ``example.com``."""
+    if hostname.startswith("www.") and hostname.count(".") >= 2:
+        return hostname[4:]
+    return None
+
+
+def _www_apex_pair(left: Any, right: Any) -> bool:
+    """True when the URLs differ only by a single leading www label.
+
+    Transport, port, path, query and userinfo must already match. http and https
+    share a transport in the identity key, so a scheme change does not block the
+    pair. Distinct non-www hosts stay distinct.
+    """
+    a = _extract_identity_key(left)
+    b = _extract_identity_key(right)
+    if not a or not b or len(a) != len(b) or a[0] != b[0] or a[2:] != b[2:]:
+        return False
+    left_host, right_host = a[1], b[1]
+    if not isinstance(left_host, str) or not isinstance(right_host, str) or left_host == right_host:
+        return False
+    return _strip_www_label(left_host) == right_host or _strip_www_label(right_host) == left_host
+
+
+def _aliasable_result_url(result: dict) -> Optional[str]:
+    """Final URL safe to www/apex-pair, or None when source evidence names a third host."""
+    final = result.get("url")
+    if not isinstance(final, str) or not final:
+        return None
+    metadata = result.get("metadata")
+    source = metadata.get("sourceURL") if isinstance(metadata, dict) else None
+    if isinstance(source, str) and source and not (
+        _extract_identity_key(source) == _extract_identity_key(final) or _www_apex_pair(source, final)
+    ):
+        return None
+    return final
+
+
+def _pair_unique_www_apex(remaining: set[str], unmatched: list[dict]) -> dict[str, dict]:
+    """Pair only when one remaining request and one result share path+query after www/apex normalization."""
+    usable = []
+    for result in unmatched:
+        final = _aliasable_result_url(result)
+        if final is not None:
+            usable.append((result, final))
+    request_hits = {url: [] for url in remaining}
+    result_hits = {id(result): [] for result, _final in usable}
+    for url in remaining:
+        for result, final in usable:
+            if _www_apex_pair(url, final):
+                request_hits[url].append(result)
+                result_hits[id(result)].append(url)
+    paired = {}
+    for url, hits in request_hits.items():
+        if len(hits) == 1 and len(result_hits[id(hits[0])]) == 1:
+            paired[url] = hits[0]
+    return paired
+
+
+_AMBIGUOUS_MATCH_ERROR = (
+    "provider returned results that could not be matched to this URL; retry it alone"
+)
+
+
+def _match_extract_results(urls: list[str], results: list[dict]) -> list[dict]:
+    """Only successes fill slots; errors remain replaceable by a lone redirect."""
+    requested = set(urls)
+    keys = {}
+    for url in requested:
+        keys.setdefault(_extract_identity_key(url), set()).add(url)
+    successes, errors = {}, {}
+    unmatched = []
+    for result in results:
+        identity = _extract_result_identity(result, requested, keys)
+        if result.get("error"):
+            if identity is not None:
+                errors.setdefault(identity, result)
+        elif identity is None:
+            unmatched.append(result)
+        else:
+            successes.setdefault(identity, result)
+    remaining = requested - successes.keys()
+    # Provider placeholders do not consume slots or compete with real content.
+    # Infer only a lone success/request pair without conflicting source evidence.
+    # Do not run that inference after a partial www/apex pairing: the leftover
+    # page would be attributed to the other requested URL.
+    if len(remaining) == 1 and len(unmatched) == 1 and _infer_extract_redirect(unmatched[0], keys):
+        successes[remaining.pop()] = unmatched[0]
+        unmatched = []
+    elif remaining and unmatched:
+        for url, result in _pair_unique_www_apex(remaining, unmatched).items():
+            successes[url] = result
+            remaining.discard(url)
+            unmatched.remove(result)
+    matched = {**errors, **successes}
+    ambiguous = bool(unmatched)
+    ordered = []
+    for url in urls:
+        result = dict(matched[url]) if url in matched else _result_entry(
+            url, _AMBIGUOUS_MATCH_ERROR if ambiguous else _NO_RESULT_ERROR)
+        if not result.get("url"):
+            result["url"] = url
+        if result["url"] != url:
+            result["requested_url"] = url
+        ordered.append(result)
+    return ordered
+
+
+def _cache_extract_results(
+    provider_name: str, urls: list[str], results: list[dict],
+    format: Optional[str], direct_fallbacks: set[str],
+) -> None:
+    from tools.web_extract_html import MIN_DIRECT_CHARS
+    from tools.web_result_cache import extract_cache_put, extract_cache_record_final_url
+
+    for url, fetched in zip(urls, results):
+        content = fetched.get("raw_content", "") or fetched.get("content", "")
+        metadata = fetched.get("metadata")
+        rescued = isinstance(metadata, dict) and metadata.get("rescued_from")
+        if not content or fetched.get("error") or rescued:
+            continue
+        # Direct misses may be walls/previews. Cache the paid replacement only
+        # when it supplies substantial text, never the thin direct response.
+        if url in direct_fallbacks and len(content.strip()) < MIN_DIRECT_CHARS:
+            continue
+        cache_fields: dict[str, Any] = {"result_url": fetched["url"]} if fetched.get("url") != url else {}
+        if url in direct_fallbacks:
+            _attribute_direct_fallbacks([fetched], provider_name)
+            cache_fields["provenance"] = {key: fetched[key] for key in ("fallback_from", "extract_backend", "direct_fetch_error")}
+        stored = extract_cache_put(url, content, fetched.get("title", ""), format=format, provider=provider_name, **cache_fields)
+        if stored and fetched.get("url") and fetched["url"] != url:
+            extract_cache_record_final_url(url, fetched["url"], content, format=format, provider=provider_name)
+
+
 def _merge_in_order(
     total: int, fixed: dict[int, dict], fetch_positions: list[int], fetch_urls: list[str], results: list[dict]
 ) -> list[dict]:
-    """Rebuild a ``total``-long result list: *fixed* entries by position, fetched *results* at
-    *fetch_positions* (a short provider list yields ``_NO_RESULT_ERROR`` entries for the rest)."""
+    """Merge fixed entries and already identity-aligned dispatch results by request position."""
     merged = dict(fixed)
     for pos, position in enumerate(fetch_positions):
         missing = _result_entry(fetch_urls[pos], _NO_RESULT_ERROR)
@@ -146,14 +324,20 @@ def _extract_timeout_seconds() -> float:
         return _DEFAULT_EXTRACT_TIMEOUT_S
 
 
-async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[str], *, direct_fallbacks: Optional[set[str]] = None) -> list[dict]:
+def _backend_failed_whole_batch(results: list[dict]) -> bool:
+    from plugins.web._common import is_origin_http_error
+    errors = [r.get("error") for r in results]
+    return bool(errors) and all(errors) and not any(is_origin_http_error(e) for e in errors)
+
+
+async def _fetch_with_rescue(provider, fetch_urls: list[str], format: Optional[str]) -> tuple[list[dict], bool]:
     """Call ``provider.extract`` (async or sync-in-thread), with one-shot keyless rescue.
 
     Rescue fires on a raised exception — including a dispatch timeout — or when the WHOLE batch
-    failed (backend outage, not per-page problems). Rescued batches are never cached.
+    failed (backend outage, not per-page problems): an origin HTTP 4xx/5xx is the page's own answer,
+    so a batch with one never triggers it. Returns ``(results, rescued)``.
     """
     import inspect
-    from tools.web_result_cache import extract_cache_put
     timeout = _extract_timeout_seconds()
     try:
         if inspect.iscoroutinefunction(provider.extract):
@@ -170,30 +354,18 @@ async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[st
         failed = [_result_entry(u, f"Extract timed out after {timeout:.0f}s via {provider.name}")
                   for u in fetch_urls]
         if not _rescue_eligible(provider):
-            return failed
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
+            return failed, False
+        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed), True
     except Exception as exc:
-        if not _rescue_eligible(provider):
-            raise
+        logger.warning("web_extract provider %s failed: %s", provider.name, exc,
+                       exc_info=logger.isEnabledFor(logging.DEBUG))
         failed = [_result_entry(u, str(exc)) for u in fetch_urls]
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed)
-    if results and all(r.get("error") for r in results) and _rescue_eligible(provider):
-        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results)
-
-    # Cache each successful fetch under the REQUESTED url it reports as its own — never by list
-    # position: providers omit failed URLs or return successes out of request order, and a positional
-    # write filed one page's text under another URL's key for the whole TTL. ``metadata.sourceURL``
-    # counts because Keenable/Firecrawl put the requested URL there when ``url`` is the redirect target.
-    # An entry naming no requested URL is served but not cached (a miss re-fetches; a mis-key poisons).
-    requested = set(fetch_urls)
-    for fetched in results:
-        meta = fetched.get("metadata")
-        source = meta.get("sourceURL") if isinstance(meta, dict) else None
-        url = next((u for u in (fetched.get("url"), source) if u in requested), None)
-        _content = fetched.get("raw_content", "") or fetched.get("content", "")
-        if url and _content and not fetched.get("error") and url not in (direct_fallbacks or set()):
-            extract_cache_put(url, _content, fetched.get("title", ""), format=format, provider=provider.name)
-    return results
+        if not _rescue_eligible(provider):
+            return failed, False
+        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, failed), True
+    if _backend_failed_whole_batch(results) and _rescue_eligible(provider):
+        return await asyncio.to_thread(_rescue_extract, provider.name, fetch_urls, results), True
+    return results, False
 
 
 def _direct_html_enabled(provider) -> bool:
@@ -246,12 +418,78 @@ async def _dispatch_extract_groups(provider, fetch_urls: list[str], format: Opti
     return results
 
 
+async def _final_url_refusal(fetched: dict) -> Optional[dict]:
+    """Refusal entry when a page's reported (post-redirect) URL fails the website policy or SSRF gate,
+    in the shape Firecrawl's own redirect re-check returns; None when it passes. A policy check that
+    raises refuses (fail closed): the requested URL passed, but nothing vouches for this one."""
+    from tools.url_safety import async_is_safe_url
+    from tools.website_policy import check_website_access
+    final_url, title = fetched["url"], fetched.get("title", "")
+    refusal = {"url": final_url, "title": title, "content": "", "raw_content": ""}
+    try:
+        blocked = check_website_access(final_url)
+    except Exception as exc:
+        logger.warning("Website policy check failed for redirect target %s", final_url, exc_info=True)
+        return {**refusal, "error": f"Website policy check failed for redirect target: {exc}"}
+    if blocked:
+        logger.info("Blocked redirected web_extract for %s by rule %s", blocked["host"], blocked["rule"])
+        policy = {k: blocked[k] for k in ("host", "rule", "source")}
+        return {**refusal, "error": blocked["message"], "blocked_by_policy": policy}
+    if not await async_is_safe_url(final_url):
+        logger.info("Blocked redirected web_extract for unsafe final URL: %s", final_url)
+        return {**refusal, "error": "Blocked: URL targets a private or internal network address"}
+    return None
+
+
+async def _gate_final_urls(results: list[dict], requested: set[str]) -> list[dict]:
+    """Re-gate every page a provider reports under a URL other than one we asked for (a redirect
+    target, a canonicalised host): the SSRF and website-policy checks only ever saw the requested URL.
+    Covers every provider shape — Keenable reports the target in ``url`` with ``sourceURL`` = requested,
+    Exa/Parallel/Tavily report the vendor's URL in both — and rescued batches alike."""
+    gated = []
+    for fetched in results:
+        url = fetched.get("url")
+        if url and url not in requested and not fetched.get("error"):
+            fetched = await _final_url_refusal(fetched) or fetched
+        gated.append(fetched)
+    return gated
+
+
+async def _dispatch_extract(provider, fetch_urls: list[str], format: Optional[str], *,
+                            direct_fallbacks: Optional[set[str]] = None) -> list[dict]:
+    """Fetch *fetch_urls* (with keyless rescue), re-gate redirect targets, then cache the passes.
+    Rescued batches are never cached."""
+    results, rescued = await _fetch_with_rescue(provider, fetch_urls, format)
+    results = _match_extract_results(fetch_urls, results)
+    results = await _gate_final_urls(results, set(fetch_urls))
+    if not rescued:
+        _cache_extract_results(provider.name, fetch_urls, results, format, direct_fallbacks or set())
+    return results
+
+
+async def _cached_final_url_allowed(hit: dict, requested: str) -> bool:
+    """Gate a cache hit on the URL its content came from: a redirector cached before its target was
+    blocklisted (or turned private) must not keep serving that target. Consumes ``final_url``."""
+    final_url = hit.pop("final_url", requested)
+    if final_url == requested:  # the requested URL already passed both gates
+        return True
+    from tools.url_safety import async_is_safe_url
+    from tools.website_policy import check_website_access
+    try:
+        if check_website_access(final_url) is not None:
+            return False
+    except Exception:  # fail closed: a miss, and the live fetch re-gates the redirect
+        logger.warning("Website policy check failed for cached final URL %s", final_url, exc_info=True)
+        return False
+    return await async_is_safe_url(final_url)
+
+
 async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[str]) -> list[dict]:
     """Serve cache hits, fetch the rest, and merge back in ``safe_urls`` order.
 
     The disk cache (tools/web_result_cache.py) sits AFTER the secret-URL gate, SSRF gate, and provider
     resolution, and is gated per-URL on the website policy — a hit skips only the vendor call, never a
-    control; policy-blocked URLs are cache misses. Keys include provider and format, so switching either
+    control; policy-blocked URLs are cache misses, judged on both the requested and the cached final URL. Keys include provider and format, so switching either
     within the TTL never serves the other's content."""
     from tools.web_result_cache import extract_cache_get
     from tools.web_extract_direct import is_html_candidate
@@ -277,8 +515,10 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
             if allow_html:
                 direct_fallbacks.add(url)
         hit = extract_cache_get(url, format=format, provider=provider.name) if policy_block is None else None
+        if hit is not None and not await _cached_final_url_allowed(hit, url):
+            hit = None  # a miss: the live fetch re-checks the redirect and refuses with blocked_by_policy
         if hit is not None:
-            if url in direct_fallbacks:
+            if url in direct_fallbacks or hit.get("fallback_from") == "direct_http":
                 _attribute_direct_fallbacks([hit], provider.name + "_cache")
             fixed[position] = hit
         else:
@@ -292,6 +532,4 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
         results = await _dispatch_extract_groups(provider, fetch_urls, format, direct_fallbacks)
     else:
         results = await _dispatch_extract(provider, fetch_urls, format)
-    if not fixed:
-        return results
     return _merge_in_order(len(safe_urls), fixed, fetch_positions, fetch_urls, results)

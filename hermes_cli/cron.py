@@ -8,8 +8,11 @@ from datetime import timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
-PROJECT_ROOT = Path(__file__).parent.parent.resolve()
-sys.path.insert(0, str(PROJECT_ROOT))
+from hermes_cli._startup_fast import project_root_str
+
+PROJECT_ROOT = Path(project_root_str())
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from hermes_cli.colors import Colors, color
 
@@ -129,6 +132,9 @@ def _next_run_row(job: dict[str, Any]) -> tuple[str, str]:
     user-visible trace of a dead scheduler; never present it as an upcoming run (#114309).
     """
     stamp = job.get("next_run_at", "?")
+    if job.get("state") == "missed":
+        return ("Missed", color(f"{stamp} — payload held; owner decision required "
+                               "(cron resume --run-now / --at, or remove)", Colors.YELLOW))
     overdue_s = _next_run_overdue_seconds(stamp)
     if (overdue_s is None or overdue_s <= _OVERDUE_GRACE_SECONDS
             or not job.get("enabled", True) or job.get("state") in {"paused", "completed"}):
@@ -171,7 +177,8 @@ def _unverified_targets(unverified) -> str:
     return ", ".join(map(str, unverified)) if isinstance(unverified, list) else str(unverified)
 
 
-_STATE_BADGES = {"paused": ("[paused]", Colors.YELLOW), "completed": ("[completed]", Colors.BLUE)}
+_STATE_BADGES = {"paused": ("[paused]", Colors.YELLOW), "completed": ("[completed]", Colors.BLUE),
+                 "missed": ("[missed]", Colors.YELLOW)}
 
 
 def cron_list(show_all: bool = False):
@@ -183,7 +190,7 @@ def cron_list(show_all: bool = False):
     if not show_all:
         jobs = [
             job for job in jobs
-            if job.get("enabled", True) or effective_job_state(job) == "paused"
+            if job.get("enabled", True) or effective_job_state(job) in {"paused", "missed"}
         ]
 
     from hermes_cli.profiles import get_active_profile_name
@@ -246,8 +253,9 @@ def _job_rows(job: dict[str, Any]) -> list[tuple[str, str]]:
         ("Changed", mon_state.get("last_changed_at") if monitor_source else ""),
         ("Mode", color("no-agent", Colors.DIM) + " (script stdout delivered directly)"
          if job.get("no_agent") else ""),
-        ("Workdir", job.get("workdir")),
         ("Timezone", job.get("timezone")),
+        ("Grace", f"{job['grace_minutes']} min" if job.get("grace_minutes") is not None else ""),
+        ("Workdir", job.get("workdir")),
         ("Python", job.get("interpreter")),
         ("Last run", f"{job.get('last_run_at', '?')}  {_last_run_display(job)}"
      if job.get("last_status") else ""),
@@ -729,7 +737,10 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     if isinstance(fire_err := job.get("last_fire_error"), dict) and fire_err.get("detail"):
         # The handoff error survives next_run_at advancing beyond the failed dispatch.
         issues.append(_missed_fire_issue(job, fire_err))
-    if job.get("enabled", True) and job.get("state") not in {"paused", "completed"}:
+    if job.get("state") == "missed":
+        issues.append("missed one-shot payload held; owner decision required: "
+                      "cron resume --run-now / --at <ISO-8601>, or remove")
+    elif job.get("enabled", True) and job.get("state") not in {"paused", "completed"}:
         next_run = str(job.get("next_run_at") or "").strip()
         issue = _next_run_overdue_issue(next_run) if next_run else "active job has no next_run_at"
         if issue:
@@ -742,13 +753,28 @@ def _cron_doctor_issues_for_job(job: dict[str, Any]) -> list[str]:
     workdir = str(job.get("workdir") or "").strip()
     if workdir and not Path(workdir).expanduser().exists():
         issues.append(f"workdir not found: {workdir}")
+    if job.get("timezone"):
+        from cron.jobs_time import zone_for_job
+        if zone_for_job(job) is None:
+            issues.append(f"timezone {job['timezone']!r} is not a valid IANA zone; "
+                          "the job falls back to the profile timezone")
+    if job.get("grace_minutes") is not None:
+        from cron.jobs_time import normalize_grace_minutes
+        try:
+            normalize_grace_minutes(job.get("grace_minutes"))
+        except ValueError as exc:
+            issues.append(f"grace_minutes is unusable ({exc})")
+        else:
+            if (job.get("schedule") or {}).get("kind") != "cron":
+                issues.append("grace_minutes has no effect on a non-cron schedule")
     return issues
 
 
 def cron_doctor() -> int:
     """Run read-only cron health checks and return a shell-friendly status."""
     from cron.jobs import list_jobs
-    jobs = list_jobs(include_disabled=False)
+    jobs = [job for job in list_jobs(include_disabled=True)
+            if job.get("enabled", True) or job.get("state") == "missed"]
     findings = [(job, issues) for job in jobs if (issues := _cron_doctor_issues_for_job(job))]
     if not findings:
         print(color("✓ Cron doctor found no issues", Colors.GREEN))
@@ -776,7 +802,8 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("hard_wall_timeout_seconds", "hard_wall_timeout_seconds"),
                    ("max_catch_up_lateness_seconds", "max_catch_up_lateness_seconds"),
                    ("review_json", "review_json"), ("clear_review", "clear_review"),
-                   ("keep_pinned_lane", "keep_pinned_lane"))
+                   ("keep_pinned_lane", "keep_pinned_lane"), ("timezone", "timezone"),
+                   ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"))
 
 
 def _job_api_kwargs(args) -> dict[str, Any]:
@@ -790,6 +817,7 @@ _JOB_DETAIL_LINES = (
     ("monitor_url", "  Monitor: {} (agent runs only on output change)"),
     ("no_agent", "  Mode: no-agent (script stdout delivered directly)"),
     ("continuity", "  Continuity: on (each run sees the previous run's output)"),
+    ("timezone", "  Timezone: {} (schedule runs on this zone's wall clock)"),
     ("workdir", "  Workdir: {}"),
     ("interpreter", "  Python: {}"))
 
@@ -899,6 +927,7 @@ def _job_action(action: str, job_id: str, success_verb: str) -> int:
     if action == "run":
         print(f"  {_run_outcome(result.get('job', {}))}")
         if (job.get('executed') and job.get('execution_success') is False
+                and job.get('last_status') != 'cancelled'
                 and not job.get('delegation_id') and job.get('execution_mode') != 'background'):
             return 1
     return 0
@@ -915,6 +944,8 @@ def _run_outcome(job: dict[str, Any]) -> str:
     if job.get("execution_mode") == "background":
         return "Running in background."
     if job.get("executed"):
+        if not job.get("execution_success") and job.get("last_status") == "cancelled":
+            return "Ran now: cancelled."
         return f"Ran now: {'succeeded' if job.get('execution_success') else 'failed'}."
     return job.get("execution_skipped") or "It will run on the next scheduler tick."
 
@@ -988,6 +1019,24 @@ def cron_notepad(args) -> int:
         return 1
 
 
+def cron_cancel(args) -> int:
+    """Stop a job's live run. The schedule is untouched — the next fire still happens."""
+    result = _cron_api(action="cancel", job_id=args.job_id,
+                       reason=getattr(args, "reason", None))
+    if not result.get("success"):
+        print(color(f"Failed to cancel run: {result.get('error', 'unknown error')}", Colors.RED))
+        return 1
+    job = result.get("job") or {}
+    label = f"{job.get('name', args.job_id)} ({args.job_id})"
+    if not result.get("cancelled"):
+        print(color(f"Nothing to cancel for {label}", Colors.YELLOW))
+        return 0
+    print(color(f"Cancel requested for {label}", Colors.GREEN))
+    print(f"  Execution: {result['execution_id']} (pid {result.get('pid')})")
+    print(f"  {result.get('detail', '')}")
+    return 0
+
+
 # Late-bound lambdas keep module-level monkeypatching working; list/status/runs return None -> 0.
 _CRON_SUBCOMMANDS = {
     "list": lambda a: cron_list(getattr(a, "all", False)) or 0,
@@ -1002,6 +1051,7 @@ _CRON_SUBCOMMANDS = {
     "pause": lambda a: _job_action("pause", a.job_id, "Paused"),
     "resume": lambda a: cron_resume(a),
     "run": lambda a: _job_action("run", a.job_id, "Triggered"),
+    "cancel": lambda a: cron_cancel(a),
     "remove": lambda a: _job_action("remove", a.job_id, "Removed"),
 }
 _CRON_SUBCOMMANDS["history"] = _CRON_SUBCOMMANDS["runs"]
@@ -1016,5 +1066,5 @@ def cron_command(args):
     if handler is not None:
         return handler(args)
     print(f"Unknown cron command: {subcmd}\n"
-          "Usage: hermes cron [list|create|edit|pause|resume|run|remove|status|runs|doctor|tick]")
+          "Usage: hermes cron [list|create|edit|pause|resume|run|cancel|remove|status|runs|doctor|tick]")
     sys.exit(1)

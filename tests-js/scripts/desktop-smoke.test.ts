@@ -79,7 +79,7 @@ test('provider reconfiguration preserves feed, plugins, history and explicit fix
 
   try {
     const feed = { desktop_feed_base_url: 'http://127.0.0.1:8123/feed' }
-    fs.writeFileSync(path.join(home, 'config.yaml'), yaml.dump({ updates: feed, plugins: { witness: true }, model: { temperature: 0.7 } }))
+    fs.writeFileSync(path.join(home, 'config.yaml'), yaml.dump({ updates: feed, plugins: { witness: true }, model: { temperature: 0.7 }, stt: { provider: 'local' } }))
     fs.writeFileSync(path.join(home, 'state.db'), 'history witness')
     fs.writeFileSync(path.join(home, '.env'), 'OTHER_TEST_VALUE=kept\nMOCK_API_KEY=old\n')
     writeMockProviderConfig(home, 'http://127.0.0.1:9000')
@@ -96,6 +96,7 @@ test('provider reconfiguration preserves feed, plugins, history and explicit fix
       custom_providers: [{ name: 'Mock', base_url: 'http://127.0.0.1:9001/v1', key_env: 'OPENAI_API_KEY' }],
       auxiliary: { title_generation: { enabled: false } }, approvals: { mode: 'smart' }, display: { interim_assistant_messages: true },
       onboarding: { run: false },
+      stt: { provider: 'local', enabled: false },
     })
     expect(fs.readFileSync(path.join(home, '.env'), 'utf8')).toBe('OTHER_TEST_VALUE=kept\nMOCK_API_KEY=e2e-mock-key\n')
     expect(fs.readFileSync(path.join(home, 'state.db'), 'utf8')).toBe('history witness')
@@ -160,6 +161,11 @@ test.runIf(process.platform === 'linux')('origin proof finds the live child list
   } finally { child.kill(); await new Promise<void>((resolve): void => { child.once('exit', (): void => resolve()) }) }
 })
 
+const mountWarning = `lsof: WARNING: can't stat() smbfs file system /Volumes/.timemachine/macstudio-vxylvww42k.local/872DC7F0-4C84-4959-8117-A1A5C041EA9B/TM MacBook
+      Output information may be incomplete.
+      assuming "dev=36000212" from mount table
+`
+
 test('macOS listener discovery skips empty ownership and intersects eligible PIDs with the port', (): void => {
   const calls: Array<{ command: string; args: string[] }> = []
 
@@ -176,8 +182,26 @@ test('macOS listener discovery skips empty ownership and intersects eligible PID
 
   const noMatches = Object.assign(new Error('no matches'), { status: 1, stdout: '', stderr: '' })
   expect(macosListeningPids(31337, [42], () => { throw noMatches })).toEqual([])
-  const nativeFailure = Object.assign(new Error('native failure'), { status: 1, stdout: '', stderr: 'permission denied' })
-  expect(() => macosListeningPids(31337, [42], () => { throw nativeFailure })).toThrow(nativeFailure)
+
+  for (const result of [
+    { status: 1, stdout: '', stderr: 'permission denied' },
+    { status: 1, stdout: '', stderr: `${mountWarning}lsof: unknown failure` },
+    { status: 2, stdout: '', stderr: mountWarning },
+    { status: 1, stdout: 'p42\n', stderr: mountWarning },
+    { status: 1, stdout: '', stderr: mountWarning.split('\n')[0] },
+    { status: 1, stdout: '', stderr: 'Output information may be incomplete.' },
+  ]) {
+    const nativeFailure = Object.assign(new Error('native failure'), result)
+    expect(() => macosListeningPids(31337, [42], () => { throw nativeFailure })).toThrow(nativeFailure)
+  }
+})
+
+test.each([
+  { name: 'the attempt-6 network-mount warning', stderr: mountWarning },
+  { name: 'two whitespace-trimmed mount-warning blocks', stderr: ` \n${mountWarning}${mountWarning.replace('36000212', '36000213')}\t ` },
+])('macOS no-listener answers tolerate $name', ({ stderr }): void => {
+  const noMatches = Object.assign(new Error('no matches'), { status: 1, stdout: '', stderr })
+  expect(macosListeningPids(31337, [42], () => { throw noMatches })).toEqual([])
 })
 
 test.runIf(process.platform === 'linux' || process.platform === 'darwin')('a shared host listener is proven by this home ledger, not Electron ancestry', async (): Promise<void> => {

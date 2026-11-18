@@ -169,7 +169,7 @@ def test_worker_launch_bounds_secret_hydration_and_spawn(trace_home, tmp_path, m
     job["execution_id"] = row["id"]
     handoff_dir = tmp_path / "cron" / "external-workers"
     ack_path = handoff_dir / f"{row['id']}.ready"
-    monkeypatch.setattr(scheduler, "load_config_readonly", lambda: {})
+    monkeypatch.setattr(scheduler, "load_config_readonly", dict)
     monkeypatch.setattr(scheduler.immutable_releases, "worker_launch_spec",
                         lambda root, env: (sys.executable, tmp_path, env))
     monkeypatch.setattr(process_registry, "restart_safe_gateway_child_argv",

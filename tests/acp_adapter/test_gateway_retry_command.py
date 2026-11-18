@@ -60,10 +60,10 @@ async def _editor(tmp_path, monkeypatch, wire_class=SlashWire, *, persist_answer
                              _handle_message=answer, _adapter_for_source=lambda source: None,
                              _cached_agent_for=lambda route: None, _evict_cached_agent=lambda route: None,
                              _resolve_session_agent_runtime=lambda **kwargs: ('frozen', {}))
-    authority = await initialize_session_authority(runner, profile_id='p', instance_id='owner')
+    authority = await initialize_session_authority(runner, profile_id=str(tmp_path), instance_id='owner')
     wire = wire_class(asyncio.get_running_loop())
     wire.lose_ack = False
-    wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor', 'profile_id': 'p'})
+    wire.viewer = AuthorityConnection(authority, wire, {'user_id': 'editor', 'profile_id': str(tmp_path)})
     sid = create_local_session(authority, wire.viewer.actor, {'request_id': 'editor', 'source': 'acp',
                                                              'cwd': str(tmp_path), 'model': 'frozen',
                                                              'toolsets': []}).session_id

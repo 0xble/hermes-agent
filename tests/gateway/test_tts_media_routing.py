@@ -160,6 +160,27 @@ class _DiscordMediaFailureAdapter(BasePlatformAdapter):
         return {"id": chat_id, "type": "dm"}
 
 
+class _DiscordMediaFailureAdapter(BasePlatformAdapter):
+    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
+
+    def __init__(self):
+        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
+        self.notices: list[str] = []
+
+    async def connect(self, *, is_reconnect: bool = False):
+        return True
+
+    async def disconnect(self):
+        pass
+
+    async def send(self, chat_id, content=None, **kwargs):
+        self.notices.append(content or "")
+        return SendResult(success=True, message_id="notice")
+
+    async def get_chat_info(self, chat_id):
+        return {"id": chat_id, "type": "dm"}
+
+
 @pytest.mark.asyncio
 async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
     """Attachmentless send_video results must surface a user-visible notice (#66797)."""
@@ -181,27 +202,6 @@ async def test_non_streaming_media_failure_notifies_user(tmp_path, monkeypatch):
 
     adapter.send_video.assert_awaited_once()
     assert adapter.notices == ["⚠️ Couldn't deliver the video attachment."]
-
-
-class _DiscordMediaFailureAdapter(BasePlatformAdapter):
-    """Minimal adapter to exercise non-streaming MEDIA failure notification."""
-
-    def __init__(self):
-        super().__init__(PlatformConfig(enabled=True, token="test"), Platform.DISCORD)
-        self.notices: list[str] = []
-
-    async def connect(self, *, is_reconnect: bool = False):
-        return True
-
-    async def disconnect(self):
-        pass
-
-    async def send(self, chat_id, content=None, **kwargs):
-        self.notices.append(content or "")
-        return SendResult(success=True, message_id="notice")
-
-    async def get_chat_info(self, chat_id):
-        return {"id": chat_id, "type": "dm"}
 
 
 @pytest.mark.asyncio
@@ -539,7 +539,6 @@ async def test_queued_resend_branch_delivers_media_and_preserves_protected_examp
     runner._fallback_model = None
     runner._session_db = None
     runner._running_agents = {}
-    runner._session_run_generation = {}
     runner.session_store = SimpleNamespace(
         _entries={}, _save=lambda: None, get_model_role=lambda _key: None,
         get_model_override=lambda _key: None, get_model_override_scope=lambda _key: "session",

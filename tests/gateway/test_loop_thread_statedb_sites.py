@@ -57,7 +57,8 @@ async def test_stale_topic_binding_prune_runs_off_the_loop(tmp_path):
         adapter = TelegramAdapter(PlatformConfig(enabled=True, token="test-token"))
         adapter._session_store = SimpleNamespace(_db=db)
         adapter._bot = SimpleNamespace(send_message=AsyncMock(side_effect=[
-            BadRequest("Message thread not found"), SimpleNamespace(message_id=120)]))
+            BadRequest("Message thread not found"), BadRequest("Message thread not found"),
+            SimpleNamespace(message_id=120)]))
         _arm()
         result = await adapter._send_with_retry(
             chat_id="2027045491", content="Completed response", reply_to="150565",
@@ -66,6 +67,7 @@ async def test_stale_topic_binding_prune_runs_off_the_loop(tmp_path):
         )
         hermes_loop_guard.set_loop_thread(None)
         assert result.success is True
+        assert adapter._bot.send_message.await_count == 3
         # On the loop the guarded delete raised inside the best-effort prune and the row survived.
         assert db.get_telegram_topic_binding(chat_id="2027045491", thread_id="150565") is None
     finally:
@@ -75,7 +77,7 @@ async def test_stale_topic_binding_prune_runs_off_the_loop(tmp_path):
 
 @pytest.mark.asyncio
 async def test_goal_continuation_recheck_runs_off_the_loop(monkeypatch):
-    import hermes_cli.session_controls as session_controls
+    from hermes_cli import session_controls
     from gateway.turn_context import TurnContext
 
     runner = object.__new__(GatewayRunner)
@@ -83,7 +85,6 @@ async def test_goal_continuation_recheck_runs_off_the_loop(monkeypatch):
 
     def refresh(event, session_id):
         threads.append(threading.get_ident())
-        return None
 
     monkeypatch.setattr(session_controls, "refresh_goal_continuation", refresh)
 
@@ -167,7 +168,6 @@ async def test_process_watcher_lookup_runs_off_the_loop(tmp_path, monkeypatch):
         def get(self, session_id):
             # A finished process falls back to retained results, whose ownership check opens state.db.
             threads.append(threading.get_ident())
-            return None
 
     monkeypatch.setattr(pr_module, "process_registry", _Registry())
     runner = GatewayRunner(GatewayConfig())

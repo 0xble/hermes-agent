@@ -89,7 +89,7 @@ def test_the_cap_comes_from_the_route_owner_only(tmp_path, monkeypatch):
     from tools import delegate_tool as dt
     import tools.delegate_tool_config as dtc
     monkeypatch.setattr(dt, "_load_config", lambda: {"max_retry_wait_seconds": 5})
-    monkeypatch.setattr(dtc, "_load_config", lambda: {})
+    monkeypatch.setattr(dtc, "_load_config", dict)
     kw = dict(api_key="k", base_url="https://openrouter.ai/api/v1", provider="openrouter",
               api_mode="chat_completions", model="anthropic/claude-sonnet-4.6", platform="cli", quiet_mode=True,
               skip_context_files=True, skip_memory=True, save_trajectories=False, enabled_toolsets=["file"])

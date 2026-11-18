@@ -11,6 +11,7 @@ import logging
 import inspect
 import threading
 import time
+from contextlib import contextmanager
 from typing import Any, Dict, Optional
 from tools.terminal_tool_backends import (
     _container_config_from_config,
@@ -31,7 +32,7 @@ def _create_configured_env(
     (shared by the terminal tool, the file tools and the lazy :func:`ensure_task_env` bring-up)."""
     from tools.terminal_tool_backends import _create_environment
     from tools.terminal_tool_config import _is_container_backend
-    return _create_environment(
+    env = _create_environment(
         env_type=env_type, image=image, cwd=cwd, timeout=timeout,
         ssh_config=_ssh_config_from_config(config) if env_type == "ssh" else None,
         container_config=(
@@ -40,6 +41,13 @@ def _create_configured_env(
         local_config=_local_config_from_config(config) if env_type == "local" else None,
         task_id=task_id, host_cwd=host_cwd,
     )
+    if config.get("ssh_node") is not None:
+        from tools.node_execution import current_execution
+        from hermes_constants import get_hermes_home
+        env._hermes_node = config["ssh_node"]
+        env._hermes_owner_tasks = {current_execution().task_id}
+        env._hermes_profile_home = str(get_hermes_home())
+    return env
 
 
 def _cleanup_env(env: Any, *, force_remove: Optional[bool] = None) -> None:
@@ -104,10 +112,37 @@ def _unregister_env(task_id: str):
     return env
 
 
+@contextmanager
+def _call_in_flight(*keys: Optional[str]):
+    """Hold the env cached under *keys* against the idle reaper for the duration of a call.
+
+    Only background processes on workspace keys refresh ``_last_activity`` mid-run, so a
+    foreground command longer than ``lifetime_seconds`` had its sandbox reaped out from under
+    it. Refcounted (parallel calls share a key); exit restamps, so the idle countdown starts at
+    call end.
+    """
+    from tools.terminal_tool import _calls_in_flight, _env_lock, _last_activity
+    held = [k for k in dict.fromkeys(keys) if k]
+    with _env_lock:
+        for k in held:
+            _calls_in_flight[k] = _calls_in_flight.get(k, 0) + 1
+    try:
+        yield
+    finally:
+        with _env_lock:
+            now = time.time()
+            for k in held:
+                left = _calls_in_flight.pop(k) - 1
+                if left:
+                    _calls_in_flight[k] = left
+                if k in _last_activity:
+                    _last_activity[k] = now
+
+
 def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     """Clean up environments that have been inactive for longer than lifetime_seconds."""
     from tools.terminal_tool import (
-        _active_environments, _creation_locks, _creation_locks_lock, _env_lock,
+        _active_environments, _calls_in_flight, _creation_locks, _creation_locks_lock, _env_lock,
         _last_activity,
     )
     current_time = time.time()
@@ -128,7 +163,9 @@ def _cleanup_inactive_envs(lifetime_seconds: int = 300):
     # Phase 1: unregister stale entries atomically under the lock; phase 2:
     # stop them outside it (see _unregister_env for why).
     with _env_lock:
-        stale = [t for t, last in list(_last_activity.items()) if current_time - last > lifetime_seconds]
+        # A key with a foreground call in flight is busy, however old its stamp.
+        stale = [t for t, last in list(_last_activity.items())
+                 if current_time - last > lifetime_seconds and t not in _calls_in_flight]
         envs_to_stop = [(t, _active_environments.pop(t, None)) for t in stale]
         for t in stale:
             _last_activity.pop(t, None)
@@ -151,12 +188,36 @@ def _is_workspace_key(key: str) -> bool:
     return ":ws:" in str(key or "")
 
 
+def _local_shell_owner(task_id: Optional[str]) -> Optional[str]:
+    """Local exports belong to one child/run, not its inherited parent session.
+
+    Container aliases deliberately share a filesystem/backend for delegation.
+    A local environment also owns a mutable bash export snapshot, so following
+    those aliases would let a reviewer change the parent's HERMES_HOME. Use the
+    registered child ID (including nested/lifecycle children), never an ID prefix.
+    """
+    from tools import terminal_tool as tt
+
+    if not task_id:
+        return None
+    with tt._container_alias_lock:
+        if task_id in tt._container_aliases or task_id in tt._run_scoped_tasks:
+            return task_id
+    return None
+
+
 def get_active_env(task_id: str):
     """Return the active BaseEnvironment for *task_id*, or None."""
     from tools.terminal_tool import _active_environments, _env_lock, _resolve_container_task_id
     lookup = _resolve_container_task_id(task_id)
     with _env_lock:
-        return _active_environments.get(lookup) or _active_environments.get(task_id)
+        from tools.node_execution import current_execution
+        env = _active_environments.get(lookup)
+        if current_execution():
+            if env is not None:
+                env._hermes_owner_tasks.add(current_execution().task_id)
+            return env
+        return env or _active_environments.get(task_id)
 
 
 def ensure_task_env(task_id: Optional[str] = None):
@@ -272,8 +333,26 @@ def cleanup_vm(task_id: str, *, force_remove: bool = False):
     directly, so persist-mode idle envs are likewise no-op'd; only the orphan
     reaper at next startup reclaims them.
     """
-    env = _unregister_env(task_id)
+    from hermes_constants import get_hermes_home
+    from tools.terminal_tool import _active_environments, _env_lock
+    home = str(get_hermes_home())
     _clear_file_ops_cache(task_id)
+    # Preserve raw lifecycle ownership alongside the node/session state key.
+    with _env_lock:
+        selected = []
+        for key, candidate in list(_active_environments.items()):
+            owners = getattr(candidate, "_hermes_owner_tasks", set())
+            if getattr(candidate, "_hermes_profile_home", None) == home and task_id in owners:
+                owners.discard(task_id)
+                if not owners:
+                    selected.append(key)
+    for key in selected:
+        candidate = _unregister_env(key)
+        from tools.file_tools_paths import _ssh_home_failed_at
+        _ssh_home_failed_at.pop(key, None)
+        if candidate is not None:
+            _teardown_env(candidate, key, force_remove=force_remove, done_msg="Cleaned node scope: %s")
+    env = _unregister_env(task_id)
     if env is None:
         return
     _teardown_env(

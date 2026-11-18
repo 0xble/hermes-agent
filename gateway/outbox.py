@@ -491,9 +491,10 @@ async def _schedule_retry(store: Outbox, adapter) -> None:
         return
     wake = asyncio.Event()
     from gateway.platforms.base import OUTBOUND_FINAL, outbound_class
-    # Background sweeps must never inherit a caller's notice/progress label. Each row
-    # is rebound below from its persisted class before its adapter call.
-    with outbound_class(OUTBOUND_FINAL):
+    from gateway.reply_latency import delivery_scope
+    # Background sweeps must never inherit a caller's receipt or notice/progress label.
+    # Each row is rebound below from its persisted class before its adapter call.
+    with outbound_class(OUTBOUND_FINAL), delivery_scope(None, "text_send"):
         task = asyncio.create_task(_deferred_sweep(store, adapter, profile, key, wake))
     _SWEEPS[key] = (task, wake)
 

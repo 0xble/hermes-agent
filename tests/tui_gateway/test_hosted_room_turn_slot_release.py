@@ -9,11 +9,16 @@ exited (#106847). Ordinary sessions keep their slot for the life of the live ses
 
 from __future__ import annotations
 
+from tests.tui_gateway._thread_fixtures import patch_server_threads
 import threading
 import types
 
+import pytest
+
 from tui_gateway import server
 from tui_gateway.hosted_room_driver import ROOM_SESSION_SOURCE
+
+pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
 
 
 class _InlineThread:
@@ -54,7 +59,7 @@ def _session(source: str, lease: _Lease):
 
 
 def _turn_env(monkeypatch, tmp_path) -> None:
-    monkeypatch.setattr(server.threading, "Thread", _InlineThread)
+    patch_server_threads(monkeypatch, server, _InlineThread)
     monkeypatch.setattr(server, "_emit", lambda event_type, sid, payload=None: None)
     monkeypatch.setattr(server, "_wire_callbacks", lambda sid: None)
     monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda sid, session: None)

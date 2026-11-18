@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 
 from hermes_cli.update_lock import UpdateLock, update_in_progress
+from tests.waiting import process_name
 
 pytestmark = pytest.mark.platforms("windows")
 
@@ -190,7 +191,7 @@ def _tree_dies_with_its_owner(tmp_path: Path, install: Path, owner_args: list[st
         deadline = time.time() + 15
         while any(p.is_running() for p in tree) and time.time() < deadline:
             time.sleep(0.2)
-        survivors = [f"{p.pid}:{p.name()}" for p in tree if p.is_running()]
+        survivors = [(p.pid, process_name(p)) for p in tree if p.is_running()]
         assert not survivors, f"update children outlived their killed owner: {survivors}"
         fresh = UpdateLock(path=tmp_path / "other-marker", install_root=install)
         assert fresh.acquire() is True, "the checkout stayed locked after the whole tree died"
@@ -299,7 +300,7 @@ def _writer_fenced_or_refused(tmp_path: Path, install: Path, owner_args: list[st
         deadline = time.time() + 15
         while any(p.is_running() for p in tree) and time.time() < deadline:
             time.sleep(0.2)
-        survivors = [f"{p.pid}:{p.name()}" for p in tree if p.is_running()]
+        survivors = [(p.pid, process_name(p)) for p in tree if p.is_running()]
         assert not survivors or update_in_progress(install), \
             f"update writer(s) {survivors} outlived the killed owner while the checkout lock is free"
         return "fenced"

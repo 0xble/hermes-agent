@@ -85,7 +85,9 @@ _CHAIN_CAP = 1000
 
 # model_config keys that belong to the whole conversation, not one compression segment: a rotation
 # carries them onto the child (per-segment keys such as usage anchors stay behind).
-_CONVERSATION_MODEL_CONFIG_KEYS = ("onboarding_run",)
+# ``prompt_refresh_epoch`` too: without it a rotated child looks older than any past
+# ``hermes sessions refresh-prompts`` request and rebuilds its prompt once more after eviction.
+_CONVERSATION_MODEL_CONFIG_KEYS = ("onboarding_run", "prompt_refresh_epoch")
 
 
 def _walk_compression_chain(session_id: str, step) -> list[str]:
@@ -132,7 +134,7 @@ _UNSET_ANCESTOR_SQL = """
 """
 
 
-def stamp_compression_ancestors(conn, session_id: str) -> None:
+def stamp_compression_ancestors(conn, session_id: str) -> int:
     """Copy *session_id*'s ``created_source`` onto compression ancestors that have none.
 
     A list page shows a compressed conversation as its root, painted as the tip, and filters on
@@ -143,24 +145,28 @@ def stamp_compression_ancestors(conn, session_id: str) -> None:
     count as unset, as in the creator upsert. An ancestor already on the same surface is walked through
     (a NULL root behind a stamped mid segment still gets stamped); another surface stops it.
     A chain with no unset ancestor returns after one query (``_UNSET_ANCESTOR_SQL``).
+    Returns only the session rows stamped, excluding writes made by triggers.
     """
     row = conn.execute(_CREATED_ROW_SQL, (session_id,)).fetchone()
     surface = row["created_source"] if row else None
     if surface in _UNSET_CREATED_SOURCES:
-        return
+        return 0
     if conn.execute(_UNSET_ANCESTOR_SQL, (session_id, surface, _CHAIN_CAP)).fetchone() is None:
-        return
+        return 0
     current, parent_id = session_id, row["parent_session_id"]
+    stamped = 0
     for _ in range(_CHAIN_CAP):
         parent = parent_id and conn.execute(_CREATED_ROW_SQL, (parent_id,)).fetchone()
         if not parent or parent["created_source"] not in (*_UNSET_CREATED_SOURCES, surface):
-            return
+            return stamped
         step = conn.execute(_CHAIN_STEP_SQL, (parent_id,)).fetchone()
         if step is None or step["id"] != current:
-            return
+            return stamped
         if parent["created_source"] != surface:
-            conn.execute("UPDATE sessions SET created_source = ? WHERE id = ?", (surface, parent_id))
+            stamped += conn.execute(
+                "UPDATE sessions SET created_source = ? WHERE id = ?", (surface, parent_id)).rowcount
         current, parent_id = parent_id, parent["parent_session_id"]
+    return stamped
 
 
 # Compression edges whose parent is unset and whose continuation child carries a real surface: what
@@ -231,10 +237,8 @@ class SessionCompressionMixin:
         a one-hop walk per stamped child of an unset compression parent that the walk does not
         follow (a non-preferred sibling). Returns the rows stamped."""
         def _do(conn):
-            before = conn.total_changes
-            for row in conn.execute(_UNSTAMPED_EDGE_CHILD_SQL).fetchall():
-                stamp_compression_ancestors(conn, row["id"])
-            return conn.total_changes - before
+            return sum(stamp_compression_ancestors(conn, row["id"])
+                       for row in conn.execute(_UNSTAMPED_EDGE_CHILD_SQL).fetchall())
         return self._execute_write(_do)
 
     def find_live_compression_child(self, parent_session_id: str) -> Optional[dict[str, Any]]:
@@ -332,13 +336,13 @@ class SessionCompressionMixin:
         # parent is not authority to publish after its retirement commit.
         parent = _session(conn, parent_session_id)
         from hermes_state_sessions import _parse_model_config
+        # Pin/archive and the conversation keys are compression-lineage state; canonical branch/reset
+        # verbs also publish through here, and their child is its own conversation.
+        continuation = not any(k in (model_config or {}) for k in ("_branched_from", "_reset_from"))
         carried = {key: value for key, value in _parse_model_config(parent["model_config"]).items()
-                   if key in _CONVERSATION_MODEL_CONFIG_KEYS}
+                   if continuation and key in _CONVERSATION_MODEL_CONFIG_KEYS}
         model_config = {**carried, **(model_config or {})}
         system_prompt_hash = self._store_system_prompt(conn, system_prompt)
-        # Pin/archive are compression-lineage flags; canonical branch/reset verbs also publish through
-        # here, and their child is its own conversation, so it starts unpinned and visible.
-        continuation = not any(k in (model_config or {}) for k in ("_branched_from", "_reset_from"))
         # Copy a real creating surface. Automatic compression passes the parent's live
         # label (``local`` after the peer refresh); reset, branch and the compress
         # mutation pass the policy label. ``local`` and ``unknown`` are not surfaces,
@@ -954,3 +958,20 @@ class SessionCompressionMixin:
             current = next_child
         # Later tips are included only when the requested session itself was compacted.
         return lineage if session_id in lineage else [session_id]
+
+    def get_tool_rotation_root(self, session_id: str) -> str:
+        """Root of a ``--source tool`` run's compression chain. ``get_compression_lineage`` treats every
+        ``tool`` row as a fork, but rotation copies the parent's source onto its continuation, so climb only
+        hops where both rows are ``tool`` and the child is an unmarked continuation of a compression-ended
+        parent. A ``tool`` fork of another source's session keeps its own id.
+
+        Storage interface: port as ``sessions.tool_rotation_root``."""
+        row, seen = self.get_session(session_id), {session_id}
+        while row and row.get("source") == "tool" and (parent_id := row.get("parent_session_id")) not in seen:
+            parent = self.get_session(parent_id) if parent_id else None
+            if not parent or parent.get("source") != "tool" or not self._is_compression_child_row(
+                    {**row, "source": None}):
+                break
+            seen.add(parent_id)
+            row = parent
+        return row["id"] if row else session_id
