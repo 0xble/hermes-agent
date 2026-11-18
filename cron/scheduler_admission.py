@@ -68,6 +68,10 @@ class PriorityThreadPoolExecutor:
 
     def _run_next(self) -> None:
         with self._lock:
+            if not self._heap:
+                # A token whose submit raised after the inner pool queued it (thread start failed)
+                # outlives its removed entry; it has nothing to run.
+                return
             _, _, fn, args, kwargs, future = heapq.heappop(self._heap)
         if future.set_running_or_notify_cancel():
             try:

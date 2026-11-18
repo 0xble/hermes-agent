@@ -17,7 +17,7 @@ def test_priority_rank_defaults_to_production_and_normalizer_clear():
     assert jobs._normalize_priority("live") == "live"
     assert jobs._normalize_priority("background") == "background"
     assert jobs._normalize_priority(None) is None
-    assert jobs._normalize_priority_update("") is None
+    assert jobs._normalize_priority("") is None
     with pytest.raises(ValueError, match="priority must be one of"):
         jobs._normalize_priority("urgent")
 
@@ -163,3 +163,48 @@ def test_script_subprocess_gets_work_priority_and_never_inherits_it(
     assert ok, output
     assert output.strip() == expected
     assert "HEAVY_SLOT_URGENCY" not in output
+
+
+def test_create_with_empty_priority_is_unset(tmp_path):
+    with _profile_cron_scope(tmp_path):
+        record = jobs.create_job(prompt="p", schedule="every 10m", priority="")
+        assert "priority" not in record
+
+
+def test_monitor_and_prerun_scripts_get_the_job_priority(tmp_path, monkeypatch):
+    """Every script path for a job carries that job's lane, not the production default."""
+    from cron import monitor, scheduler_script
+
+    seen = []
+    monkeypatch.setattr(scheduler_script, "_run_job_script",
+                        lambda path, **kw: seen.append(kw.get("priority")) or (True, ""))
+    job = {"id": "j", "monitor_script": "m.py", "priority": "live"}
+    monitor._run_monitor_source(job)
+    assert seen == ["live"]
+
+
+def test_spare_token_after_failed_submit_is_a_no_op():
+    pool = admission.PriorityThreadPoolExecutor(1, thread_name_prefix="priority-test")
+    pool._run_next()  # empty heap: a stray token must not raise
+    assert pool.submit_ranked(0, lambda: 3).result(5) == 3
+    pool.shutdown(wait=True)
+    with pytest.raises(RuntimeError):
+        pool.submit_ranked(0, lambda: None)
+    assert pool._heap == []
+
+
+def test_submit_due_jobs_runs_reserved_first_then_rank_order(tmp_path, monkeypatch):
+    from cron import scheduler
+
+    calls = []
+    monkeypatch.setattr(admission, "reserved_job_id", lambda jobs_, home: "protected")
+    monkeypatch.setattr(admission, "submit_reserved", lambda job, fn: calls.append(("reserved", job["id"])))
+    monkeypatch.setattr(scheduler, "_submit_with_guard",
+                        lambda job, pool, fn, **kw: calls.append((kw.get("dispatch_lane", "general"), job["id"])))
+    monkeypatch.setattr("cron.jobs.load_jobs", list)
+    due = [{"id": "bg", "priority": "background"}, {"id": "unset"},
+           {"id": "protected"}, {"id": "live", "priority": "live"}, {"id": "prod2"}]
+    with _profile_cron_scope(tmp_path):
+        admission.submit_due_jobs(due, object(), lambda job: True)
+    assert calls == [("reserved", "protected"), ("general", "live"), ("general", "unset"),
+                     ("general", "prod2"), ("general", "bg")]

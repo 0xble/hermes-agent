@@ -1993,7 +1993,7 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Spelling-only validation via the shared parser (cron knob never stricter/looser than
     config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
     transports clamp at send time). None for unset, lowercase level, or ValueError."""
-    if value is None:
+    if value is None or value == "":
         return None
     text = str(value).strip().lower()
     if not text:
@@ -2020,21 +2020,17 @@ def _normalize_catch_up(value: Any) -> Optional[bool]:
 
 
 def _normalize_priority(value: Any) -> Optional[str]:
-    """Normalize a business-impact lane; ``None`` means the legacy production default."""
+    """Normalize a business-impact lane; unset (``None`` or ``''``) means the production default."""
     if value is None:
         return None
     text = str(value).strip().lower()
+    if not text:
+        return None
     if text in {"live", "production", "background"}:
         return text
     raise ValueError(
         "priority must be one of live, production, or background "
-        "(empty string clears the override on update).")
-
-
-def _normalize_priority_update(value: Any) -> Optional[str]:
-    if value == "":
-        return None
-    return _normalize_priority(value)
+        "(an empty string means unset, which is production).")
 
 
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
@@ -2076,7 +2072,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
-    "priority": _normalize_priority_update,
+    "priority": _normalize_priority,
 }
 
 
