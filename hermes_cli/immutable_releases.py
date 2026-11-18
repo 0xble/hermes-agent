@@ -12,6 +12,7 @@ import hashlib
 import json
 import logging
 import os
+import sqlite3
 import tempfile
 import shutil
 import subprocess
@@ -1334,6 +1335,40 @@ def _receipt_pins(home: Path) -> set[Path]:
     return pins
 
 
+def _execution_code_sha_pins(home: Path) -> set[Path]:
+    """Keep releases referenced by the durable cron execution ledger.
+
+    Detached cron workers import an immutable release and persist its ``code_sha``.
+    An execution can remain ``unknown`` after its owner disappears, so that row is
+    still a live code-generation pin until execution-ledger retention removes it.
+    Read the ledger without acquiring a writer handle; an unreadable ledger must
+    fail closed rather than allowing release deletion under uncertainty.
+    """
+    database = home / "cron" / "executions.db"
+    if not database.is_file():
+        return set()
+    try:
+        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=2.0) as connection:
+            connection.execute("PRAGMA busy_timeout=2000")
+            columns = {row[1] for row in connection.execute("PRAGMA table_info(executions)")}
+            if "code_sha" not in columns:
+                return set()
+            values = connection.execute(
+                "SELECT DISTINCT code_sha FROM executions WHERE code_sha IS NOT NULL"
+            ).fetchall()
+    except sqlite3.Error as exc:
+        raise RuntimeError(f"cannot safely prune releases: unreadable cron execution ledger {database}: {exc}") from exc
+    releases = (home / "releases").resolve()
+    pins = set()
+    for (value,) in values:
+        if not isinstance(value, str) or not re.fullmatch(r"[0-9a-fA-F]{40}", value):
+            continue
+        candidate = releases / value.lower()
+        if candidate.is_dir():
+            pins.add(candidate.resolve())
+    return pins
+
+
 def _live_process_pins(home: Path) -> set[Path]:
     """Find release paths advertised by live Hermes processes (best effort, fail closed)."""
     pins: set[Path] = set()
@@ -1385,6 +1420,7 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
     keep = {p.resolve() for p in (read_pointer(paths.current), read_pointer(paths.previous)) if p}
     keep.update(p.resolve() for p in extra_pins)
     keep.update(_live_process_pins(paths.home))
+    keep.update(_execution_code_sha_pins(paths.home))
     keep.update(_receipt_pins(paths.home))
     current_previous = {p.resolve() for p in (read_pointer(paths.current), read_pointer(paths.previous)) if p}
     keep.update(p.resolve() for p in [p for p in releases if p.resolve() not in current_previous][:rollback_count])

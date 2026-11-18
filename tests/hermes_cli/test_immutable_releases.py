@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import queue
+import sqlite3
 import stat
 import subprocess
 import sys
@@ -885,6 +886,26 @@ def test_retention_prunes_excess_without_uncertain_processes(tmp_path, monkeypat
     removed = releases.retain(home)
     assert {path.name for path in paths if path.exists()} == {"0", "1", "4", "5", "6", "7", "8"}
     assert {path.name for path in removed} == {"2", "3"}
+
+
+def test_retention_keeps_cron_execution_release_pins(tmp_path, monkeypatch):
+    home = tmp_path / "profile"
+    shas = [f"{i:040x}" for i in range(5)]
+    paths = [home / "releases" / sha for sha in shas]
+    for i, path in enumerate(paths):
+        _fake_release(path, shas[i])
+        os.utime(path, (i, i))
+    releases.promote(home, paths[-1])
+    releases.promote(home, paths[-2])
+    monkeypatch.setattr(releases, "_live_process_pins", lambda _: set())
+    database = home / "cron" / "executions.db"
+    database.parent.mkdir(parents=True)
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE executions (code_sha TEXT)")
+        connection.execute("INSERT INTO executions(code_sha) VALUES (?)", (shas[0],))
+    removed = releases.retain(home, rollback_count=0)
+    assert paths[0].resolve() not in {path.resolve() for path in removed}
+    assert paths[0].is_dir()
 
 
 def test_sigkill_stage_and_flip_converge_with_complete_current(tmp_path):
