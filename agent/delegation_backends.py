@@ -114,7 +114,7 @@ def refresh_gateway_delegation_mode(agent: Any, *, apply: bool = True) -> bool:
 
     try:
         raw_config = read_user_config_raw(get_config_path())
-    except (OSError, ValueError, TypeError, RuntimeError, SystemExit):
+    except Exception:
         return False
     raw_delegation = raw_config.get("delegation") if isinstance(raw_config, dict) else None
     # An absent key means the agent's original surface decision remains the
@@ -125,6 +125,8 @@ def refresh_gateway_delegation_mode(agent: Any, *, apply: bool = True) -> bool:
     if not isinstance(user_config, dict):
         user_config = raw_config
     delegation = user_config.get("delegation") if isinstance(user_config, dict) else None
+    if not isinstance(delegation, dict):
+        return False
     configured_mode = str(delegation.get("gateway_mode") or "").strip().lower()
     if configured_mode not in {"auto", "inline", "background", "async"}:
         return False

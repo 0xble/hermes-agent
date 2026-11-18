@@ -169,6 +169,42 @@ def test_cache_break_uses_session_interim_setting_for_heartbeat(monkeypatch):
     assert agent._delegation_inline is False
 
 
+def test_prompt_refresh_converges_backend_pin_with_schema(monkeypatch):
+    from tools.mcp_tool_agent import refresh_agent_delegation_tool
+
+    agent = _built(inline=False)
+    agent._notification_config = {"delegation": {"gateway_mode": "inline", "backend": "default"}}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: agent._notification_config)
+    monkeypatch.setattr("agent.delegation_backends.saved_backend", lambda: "default")
+    assert refresh_agent_delegation_tool(agent) is True
+    assert agent._delegation_inline is True
+    assert agent._delegation_backend == "default"
+
+
+@pytest.mark.parametrize("malformed", ["broken", {"gateway_mode": []}])
+def test_malformed_gateway_config_keeps_existing_mode(monkeypatch, malformed):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent._notification_config = {"delegation": malformed}
+    monkeypatch.setattr("hermes_cli.config.read_user_config_raw", lambda _path: {"delegation": malformed})
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert getattr(agent, "_delegation_inline", False) is False
+
+
+def test_unreadable_gateway_config_keeps_existing_mode(monkeypatch):
+    from agent.delegation_backends import refresh_gateway_delegation_mode
+
+    agent = _built(inline=False)
+    agent._notification_config = {"delegation": {"gateway_mode": "inline"}}
+    monkeypatch.setattr(
+        "hermes_cli.config.read_user_config_raw",
+        lambda _path: (_ for _ in ()).throw(ValueError("bad yaml")),
+    )
+    assert refresh_gateway_delegation_mode(agent) is False
+    assert getattr(agent, "_delegation_inline", False) is False
+
+
 def _parent(tools, depth=0):
     parent = MagicMock()
     parent._delegate_depth = depth

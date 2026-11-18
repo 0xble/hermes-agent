@@ -269,6 +269,8 @@ def refresh_agent_delegation_tool(agent) -> bool:
         agent._delegation_inline = pending_mode
     if hasattr(agent, "_pending_delegation_inline"):
         del agent._pending_delegation_inline
+    from agent.delegation_backends import adopt_built_backend, saved_backend
+    adopt_built_backend(agent, [fresh_delegate], saved_backend())
     persist_agent_tool_names(agent)
     return True
 
