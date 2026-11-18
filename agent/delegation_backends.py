@@ -104,11 +104,9 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
     # cache-break boundary. ACP and other non-gateway agents can use a platform
     # name that is not in the deny-list, so positive wiring evidence owns this
     # guard.
-    if not hasattr(agent, "_gateway_interim_messages_enabled"):
-        return False
     from gateway.session_context import NON_MESSAGING_SESSION_SURFACES
     if str(getattr(agent, "platform", "") or "").strip().lower() in (
-        NON_MESSAGING_SESSION_SURFACES | {"cron", "subagent"}
+        NON_MESSAGING_SESSION_SURFACES | {"acp", "cron", "subagent"}
     ):
         return False
 
