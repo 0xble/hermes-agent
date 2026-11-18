@@ -142,7 +142,10 @@ def _registry_candidates(runner, platform):
 
 
 def _slot_adapter(candidates, profile):
-    return next((adapter for owner, adapter in candidates if owner == profile), None)
+    # The primary adapter is registered under ``None`` while durable routing
+    # records spell its transport profile as ``default``.
+    lookup_profile = None if profile == 'default' else profile
+    return next((adapter for owner, adapter in candidates if owner == lookup_profile), None)
 
 
 # A platform adapter leaves its registry slot when it goes fatal and returns when the reconnect
@@ -186,7 +189,8 @@ def _binding(runner, source, profile):
     adapter = _slot_adapter(candidates, profile)
     if adapter is None or sum(item is adapter for _, item in candidates) != 1:
         raise RuntimeStoreError('not_found')
-    home = getattr(runner, '_native_transport_homes', {}).get(profile)
+    home = getattr(runner, '_native_transport_homes', {}).get(
+        None if profile == 'default' else profile)
     if home is None or not home.is_dir():
         raise RuntimeStoreError('profile_mismatch')
     runtime_home = home
