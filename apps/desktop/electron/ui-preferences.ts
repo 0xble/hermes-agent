@@ -216,9 +216,15 @@ async function breakIfStale(lockDir: string): Promise<void> {
   const judgedOwner = await ownerToken(lockDir)
   const pid = await ownerPid(lockDir)
 
+  // Age the owner file, or the lock directory itself when no owner was written: a writer
+  // that died between mkdir and the owner write must still age out.
   const ownerAge = await fs.promises.stat(ownerFile(lockDir)).then(
     stat => Date.now() - stat.mtimeMs,
-    () => null
+    () =>
+      fs.promises.stat(lockDir).then(
+        stat => Date.now() - stat.mtimeMs,
+        () => null
+      )
   )
 
   if (pidIsAlive(pid) && (ownerAge === null || ownerAge <= LOCK_MAX_AGE_MS)) {

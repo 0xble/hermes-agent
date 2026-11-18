@@ -160,7 +160,7 @@ def _owner_pid(lock_dir: Path) -> Optional[int]:
     if raw is None:
         return None
     pid_field = raw.split("-", 1)[0]
-    if not pid_field.isdigit():
+    if not (pid_field.isascii() and pid_field.isdigit()) or len(pid_field) > 10:
         return None
     pid = int(pid_field)
     return pid if pid > 0 else None
@@ -181,10 +181,14 @@ def _owner_is_live(lock_dir: Path) -> bool:
 
 
 def _owner_age(lock_dir: Path) -> Optional[float]:
-    try:
-        return time.time() - _owner_file(lock_dir).stat().st_mtime
-    except FileNotFoundError:
-        return None
+    """Age of the owner file, or of the lock directory itself when no owner was written:
+    a writer that died between mkdir and the owner write must still age out."""
+    for candidate in (_owner_file(lock_dir), lock_dir):
+        try:
+            return time.time() - candidate.stat().st_mtime
+        except FileNotFoundError:
+            continue
+    return None
 
 
 def _break_if_stale(lock_dir: Path) -> None:

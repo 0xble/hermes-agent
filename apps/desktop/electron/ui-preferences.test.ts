@@ -135,6 +135,20 @@ test('a dead-pid lock is reclaimed', async () => {
   assert.equal(fs.existsSync(lockDir), false)
 })
 
+test('an ownerless lock dir is reclaimed once it is stale', async () => {
+  const root = scratchHome()
+  const file = uiPreferencesPath(root)
+  const lockDir = `${file}.lock`
+  fs.mkdirSync(lockDir)
+  const old = new Date(Date.now() - 11_000)
+  fs.utimesSync(lockDir, old, old)
+
+  const written = await writeUiPreferences(file, { values: { 'hermes.desktop.reclaimed': 'ownerless' } })
+
+  assert.equal(written.values['hermes.desktop.reclaimed'], 'ownerless')
+  assert.equal(fs.existsSync(lockDir), false)
+})
+
 test('a live owner hits the bounded backstop and does not wedge later writes', async () => {
   // Fake only the wall clock. The lock loop awaits real fs I/O between polls, so faking
   // setTimeout would strand a poll scheduled after the jump; real 20 ms polls keep running.
@@ -172,6 +186,7 @@ test('a live owner hits the bounded backstop and does not wedge later writes', a
   const written = await writeUiPreferences(file, { values: { 'hermes.desktop.afterBusy': 'yes' } })
   assert.equal(written.values['hermes.desktop.afterBusy'], 'yes')
 })
+
 test('concurrent native and Webapp writers keep every key the other wrote', async () => {
   const home = scratchHome()
   const root = path.join(home, 'root')

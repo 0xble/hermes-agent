@@ -147,6 +147,31 @@ def test_lock_reclaims_a_dead_pid(tmp_path):
     assert not lock_dir.exists()
 
 
+def test_lock_reclaims_an_ownerless_lock_dir_once_it_is_stale(tmp_path):
+    """A writer that died between mkdir and the owner write leaves no owner file; it must age out."""
+    path = tmp_path / "ui-preferences.json"
+    lock_dir = path.with_name(path.name + ".lock")
+    lock_dir.mkdir()
+    old = time.time() - ui_preferences._LOCK_STALE_S - 1
+    os.utime(lock_dir, (old, old))
+
+    written = ui_preferences.write_preferences({"hermes.desktop.reclaimed": "ownerless"}, path=path)
+
+    assert written["values"] == {"hermes.desktop.reclaimed": "ownerless"}
+    assert not lock_dir.exists()
+
+
+def test_a_fresh_ownerless_lock_dir_is_left_for_its_writer(tmp_path):
+    """A contender between mkdir and its owner write must not be broken while the dir is fresh."""
+    path = tmp_path / "ui-preferences.json"
+    lock_dir = path.with_name(path.name + ".lock")
+    lock_dir.mkdir()
+
+    ui_preferences._break_if_stale(lock_dir)
+
+    assert lock_dir.is_dir()
+
+
 def test_lock_reclaims_a_live_pid_when_the_owner_age_backstop_expires(tmp_path):
     path = tmp_path / "ui-preferences.json"
     lock_dir = path.with_name(path.name + ".lock")
