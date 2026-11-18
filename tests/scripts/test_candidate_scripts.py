@@ -378,7 +378,8 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     """Background review is an owner choice; enabling it must not fail the fork-patch check."""
     mod = _load("check_fork_patches")
     assert "auxiliary.background_review.enabled" not in mod.EXPECTED_CONFIG
-    values = {"memory.write_approval": "false", "delegation.backend": "model_map",
+    values = {"memory.write_approval": "false", "delegation.model": "",
+              "delegation.backend": "model_map",
               "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m",
               "auxiliary.background_review.enabled": "true"}
 
@@ -481,7 +482,8 @@ def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch)
     python.write_text("placeholder", encoding="utf-8")
     (tmp_path / "current").symlink_to(release, target_is_directory=True)
     calls = []
-    values = {"memory.write_approval": "false", "delegation.backend": "model_map",
+    values = {"memory.write_approval": "false", "delegation.model": "",
+              "delegation.backend": "model_map",
               "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m"}
 
     def fake_run(cmd, **kwargs):
