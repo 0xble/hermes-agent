@@ -15,10 +15,11 @@ import time
 import uuid
 from typing import Any, Dict, Optional
 
-from tools.environments.base import BaseEnvironment
+from tools.environments.base import BaseEnvironment, touch_activity_if_due
 from tools.environments.base_session_env import relay_parent_export_line
 from tools.interrupt import is_interrupted
 from tools.managed_tool_gateway import resolve_managed_tool_gateway
+from tools.terminal_tool_sudo_askpass import fill_timeout_token
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +47,9 @@ class ManagedModalEnvironment(BaseEnvironment):
     """Gateway-owned Modal sandbox with Hermes-compatible execute/cleanup."""
 
     _stdin_mode = "payload"
+    # The askpass prologue checks sudo ``-A`` support inside each command, so no capability probe
+    # runs here (a timed-out probe could only be cancelled by stopping the sandbox).
+    _sudo_askpass_runtime_checked = True
     _CONNECT_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_CONNECT_TIMEOUT_SECONDS", 1.0)
     _POLL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_POLL_READ_TIMEOUT_SECONDS", 5.0)
     _CANCEL_READ_TIMEOUT_SECONDS = _request_timeout_env("TERMINAL_MANAGED_MODAL_CANCEL_READ_TIMEOUT_SECONDS", 5.0)
@@ -91,6 +95,7 @@ class ManagedModalEnvironment(BaseEnvironment):
         if relay_parent := in_process_child_relay_parent_address():
             exec_command = f"{relay_parent_export_line(relay_parent)}\n{exec_command}"
         timeout = timeout or self.timeout
+        exec_command = fill_timeout_token(exec_command, timeout)
         exec_id = str(uuid.uuid4())
         payload: dict[str, Any] = {"execId": exec_id, "command": exec_command, "cwd": cwd or self.cwd,
                                    "timeoutMs": int(timeout * 1000)}
@@ -122,13 +127,7 @@ class ManagedModalEnvironment(BaseEnvironment):
             if time.monotonic() >= deadline:
                 self._cancel_exec(exec_id)
                 return _result(f"Managed Modal exec timed out after {timeout}s", 124)
-            # Periodic activity touch so the gateway knows we're alive (lazy import:
-            # tests stub tools.environments.base with only BaseEnvironment)
-            try:
-                from tools.environments.base import touch_activity_if_due
-                touch_activity_if_due(_activity_state, "modal command running")
-            except Exception:
-                pass
+            touch_activity_if_due(_activity_state, "modal command running")
             time.sleep(0.25)
 
     @staticmethod

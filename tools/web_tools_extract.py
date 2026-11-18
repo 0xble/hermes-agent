@@ -489,8 +489,9 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
 
     The disk cache (tools/web_result_cache.py) sits AFTER the secret-URL gate, SSRF gate, and provider
     resolution, and is gated per-URL on the website policy — a hit skips only the vendor call, never a
-    control; policy-blocked URLs are cache misses, judged on both the requested and the cached final URL. Keys include provider and format, so switching either
-    within the TTL never serves the other's content."""
+    control. Policy-blocked URLs are refused outright — never fetched, never served from cache — so the
+    blocklist is a gate on this path like every other control; a cached hit's final URL is re-judged too.
+    Keys include provider and format, so switching either within the TTL never serves the other's content."""
     from tools.web_result_cache import extract_cache_get
     from tools.web_extract_direct import is_html_candidate
     from tools.website_policy import check_website_access as _check_site

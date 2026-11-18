@@ -3,8 +3,10 @@
 No execution, transport, or authority objects live here. Every mutation uses the
 SessionDB transaction owner, including its inode guard and SQLite retry policy.
 """
+import heapq
 import json
 import uuid
+from pathlib import Path
 from typing import NamedTuple, Optional
 
 from agent.conversation_compression_archive import ABSORBED_ROW_IDS
@@ -217,6 +219,24 @@ def list_session_admissions(db, *, session_id: str, pending_only: bool = True) -
         sql = ("SELECT * FROM session_admissions WHERE target_session_id=? "
                + ("AND status IN ('queued','started','unknown') " if pending_only else "") + "ORDER BY seq")
         return [_row(row) for row in conn.execute(sql, (session_id,))]
+
+
+_ADMISSION_STATUSES = ('queued', 'started', 'unknown', 'terminal')  # the table's status CHECK
+
+
+def latest_session_admission(db, *, session_id: str, accept) -> dict | None:
+    """The newest admission whose payload ``accept`` takes, stopping at the first match: a restored
+    lane needs only its latest envelope, not the session's whole history. One newest-first stream
+    per status, merged by ``seq``, so each walks the (target, status, seq) index with no sort."""
+    sql = "SELECT * FROM session_admissions WHERE target_session_id=? AND status=? ORDER BY seq DESC"
+    with db._read_ctx() as conn:
+        cursors = [conn.execute(sql, (session_id, status)) for status in _ADMISSION_STATUSES]
+        try:
+            rows = heapq.merge(*cursors, key=lambda row: row['seq'], reverse=True)
+            return next((row for row in map(_row, rows) if accept(row['payload'])), None)
+        finally:
+            for cursor in cursors:  # before the connection goes back to the pool
+                cursor.close()
 
 
 _ANY_HEAD = object()
@@ -964,7 +984,7 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
         raw = payload.get('source')
         source = raw if isinstance(raw, str) else None
         payload = {k: v for k, v in payload.items() if k != 'source'}
-    allowed = (_MODEL_USAGE_FIELDS - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'} | {'task'}) if auxiliary else (_MODEL_USAGE_FIELDS | {'pricing_version', 'absolute', 'task'})
+    allowed = (_MODEL_USAGE_FIELDS - {'billing_mode', 'actual_cost_usd', 'cost_status', 'cost_source'} | {'task'}) if auxiliary else (_MODEL_USAGE_FIELDS | {'pricing_version', 'absolute', 'task', 'prompt_cache_clock'})
     if set(payload) - allowed:
         raise RuntimeStoreError('invalid_params')
     for key, value in payload.items():
@@ -983,6 +1003,10 @@ def _worker_usage(db, conn, session_id, payload, *, auxiliary=False):
             raise RuntimeStoreError('invalid_params')
         db._record_model_usage(conn, session_id, **({'api_call_count': 1} | payload))
     else:
+        if payload.get('prompt_cache_clock') is not None:
+            from hermes_state_worker_context import stamp_cache_generation
+            payload = dict(payload, prompt_cache_clock=stamp_cache_generation(conn, session_id,
+                                                                              payload['prompt_cache_clock']))
         db._update_token_counts_in_transaction(conn, session_id, **payload)
         # The managed worker's platform is the policy label (gui), not the in-process
         # agent surface (desktop). Stamp the same created_surface the insert uses.

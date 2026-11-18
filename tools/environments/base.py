@@ -7,7 +7,8 @@ or a temp file (local). Cohesive pieces live in sibling modules (``base_output``
 ``base_session_env``, ``base_wait``, ``path_utils``).
 """
 
-import json
+import contextvars
+import hashlib
 import logging
 import os
 import shlex
@@ -16,6 +17,7 @@ import threading
 import time
 import uuid
 from abc import ABC, abstractmethod
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Callable, Iterable
 
@@ -31,7 +33,7 @@ from tools.environments.base_session_env import (
 from tools.environments.base_processes import LongLivedProcessMixin
 from tools.environments.base_wait import _WaitTrace
 from tools.terminal_tool_sudo_askpass import fill_timeout_token, sudo_askpass_supported_once
-from utils import atomic_json_write, env_var_enabled, file_signature
+from utils import atomic_json_write, env_var_enabled, file_signature, read_json_or_empty
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +73,23 @@ _HOST_EXITING_OUTPUT = (
     "Hermes is restarting or shutting down; the command was NOT run. "
     "This turn's work will resume after restart. Do not retry this command in this turn."
 )
+
+# Task ids whose shell state a command reads and writes, own id first, then its delegation
+# ancestors; empty means the environment's own snapshot. One environment serves a parent and
+# its delegate_task children (shared sandbox, #16177), so without this a child's ``export``
+# became the parent's shell state (#84536).
+_shell_state_chain: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "terminal_shell_state_chain", default=())
+
+
+@contextmanager
+def shell_state_scope(chain: tuple[str, ...]):
+    """Run commands against the per-task snapshot of ``chain[0]`` (seeded from its ancestors)."""
+    token = _shell_state_chain.set(tuple(chain))
+    try:
+        yield
+    finally:
+        _shell_state_chain.reset(token)
 
 
 def _enter_foreground_spawn() -> bool:
@@ -222,15 +241,6 @@ def get_sandbox_dir() -> Path:
     return p
 
 
-def _load_json_store(path: Path) -> dict:
-    """Treat a missing or damaged snapshot store as empty."""
-    try:
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return {}
-    return data if isinstance(data, dict) else {}
-
-
 def _save_json_store(path: Path, data: dict) -> None:
     """Write *data* as pretty-printed JSON to *path* atomically (readers never see a torn file)."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -259,7 +269,7 @@ def _update_json_store(path: Path, update: Callable[[dict], None]) -> None:
             ))
         except (OSError, TimeoutError):
             logger.warning("Updating %s without its lock", path, exc_info=True)
-        data = _load_json_store(path)
+        data = read_json_or_empty(path)
         before = dict(data)
         update(data)
         if data != before:
@@ -442,14 +452,19 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             logger.debug("Could not refresh profile-scoped snapshot exclusions", exc_info=True)
         return tuple(sorted(self._snapshot_passthrough_names))
 
-    def _snapshot_script_kwargs(self, cwd: str) -> dict:
+    def _task_snapshot_path(self, task_id: str) -> str:
+        """Per-task snapshot beside the environment's own (``cleanup`` globs the prefix)."""
+        digest = hashlib.sha256(task_id.encode()).hexdigest()[:16]
+        return f"{self._snapshot_path[:-len('.sh')]}-{digest}.sh"
+
+    def _snapshot_script_kwargs(self, cwd: str, snap: str | None = None) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.
         ``_quote_cwd_for_cd`` / ``_quote_shell_path`` (not bare shlex.quote) let the Windows
         subclass rewrite ``C:\\...`` to ``/c/...`` so ``cd`` resolves and MSYS doesn't choke."""
         return dict(
             quoted_cwd=self._quote_cwd_for_cd(cwd),
-            quoted_snap=self._quote_shell_path(self._snapshot_path),
-            snap_tmp_template=self._quote_shell_path(self._snapshot_path + _SNAP_TMP_SUFFIX),
+            quoted_snap=self._quote_shell_path(snap or self._snapshot_path),
+            snap_tmp_template=self._quote_shell_path((snap or self._snapshot_path) + _SNAP_TMP_SUFFIX),
             cwd_marker=self._cwd_marker)
 
     def init_session(self):
@@ -518,6 +533,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         from agent.delegation_context import in_process_child_relay_parent_address
         from agent.incognito import is_incognito
+        chain = [self._task_snapshot_path(t) for t in _shell_state_chain.get()]
+        seeds = [self._quote_shell_path(p) for p in (*chain[1:], self._snapshot_path)] if chain else []
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
@@ -525,7 +542,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             relay_parent_address=in_process_child_relay_parent_address(),
             persist_env=self._persist_env and not is_incognito(),
             pipe_marker=self._pipe_marker,
-            **self._snapshot_script_kwargs(cwd))
+            seed_snaps=seeds,
+            **self._snapshot_script_kwargs(cwd, chain[0] if chain else None))
 
     @staticmethod
     def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:
@@ -726,6 +744,13 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         old workspace state (lobehub/lobehub#19329 class)."""
         self._recreated_notice_pending = True
 
+    def _usable_cwd(self, cwd: str) -> tuple[str, dict | None]:
+        """Directory the command may actually start in, plus ``{"requested", "used"}`` when it
+        differs. Local swaps a deleted/unenterable one (it would make the wrapper's ``cd`` exit
+        126 on every call); sandboxes resolve their own. Returned, never stored on ``self``:
+        concurrent commands share one environment."""
+        return cwd, None
+
     # --- Unified execute() ---
     def execute(
         self,
@@ -764,7 +789,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         # skip dispatch themselves when less than one second remains.
         effective_timeout = max(1, int(timeout or self.timeout))
         exec_command = fill_timeout_token(exec_command, effective_timeout)
-        effective_cwd = cwd or self.cwd
+        # An explicit ``cwd`` (the session's recorded cd state) can be just as dead as
+        # ``self.cwd``; resolving only the latter left every call exiting 126 at ``cd``.
+        effective_cwd, cwd_fallback = self._usable_cwd(cwd or self.cwd)
 
         # Merge sudo stdin with caller stdin.
         effective_stdin = sudo_stdin + (stdin_data or "") if sudo_stdin is not None else stdin_data
@@ -855,6 +882,8 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         if getattr(self, "_recreated_notice_pending", False):
             self._recreated_notice_pending = False
             result["environment_recreated"] = True
+        if cwd_fallback:
+            result["cwd_fallback"] = cwd_fallback
         return result
 
     def _kill_spawned_tree(self, spawned) -> None:
@@ -882,13 +911,16 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
     def _prepare_command(self, command: str) -> tuple[str, str | None]:
         """Rewrite sudo for an askpass helper or a piped password (untouched under NOPASSWD) and
         apply the macOS ``open`` raise-ladder (no-op off Darwin) so opened files come to the front."""
+        from tools.environments.sudo_password_note import note_sudo_password_sent
         from tools.terminal_tool_macos_open import _transform_macos_open_command
         from tools.terminal_tool_sudo import _transform_sudo_command
-        return _transform_sudo_command(
+        prepared = _transform_sudo_command(
             _transform_macos_open_command(command),
             sudo_nopasswd_check=self._sudo_nopasswd_works,
             askpass_supported=self._sudo_askpass_supported,
         )
+        note_sudo_password_sent(self, prepared[1])  # once per non-local backend class
+        return prepared
 
     _sudo_askpass_supported = sudo_askpass_supported_once
     _SUDO_PROBE_TIMEOUT_S = 3

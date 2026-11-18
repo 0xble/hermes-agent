@@ -32,6 +32,7 @@ from tools.async_delegation_completion import (
 )
 from tools.thread_context import propagate_context_to_thread
 from tools.async_delegation_worker import worker_ledger, require_ledger_owner
+from tools.delegate_tool_progress import SUBAGENT_FAILURE_STATUSES
 from tools.delegation_redaction import redact_child_result, redact_completion_event
 
 logger = logging.getLogger(__name__)
@@ -203,7 +204,7 @@ _OWNERSHIP_RETRY_MAX_S = 300.0
 _unresolved: dict[tuple, dict[str, Any]] = {}
 
 
-_FAILED_TASK_STATES = frozenset({"error", "failed", "failure", "timeout", "stalled", "unknown", "interrupted"})
+_FAILED_TASK_STATES = SUBAGENT_FAILURE_STATUSES | {"stalled", "unknown", "interrupted"}
 _FAILURE_SURFACE_WINDOW_S = 24 * 3600.0
 
 
@@ -362,8 +363,7 @@ def _batch_crash(error: str, duration: float) -> dict[str, Any]:
 def _batch_status(combined: dict[str, Any]) -> str:
     """Batch status: completed unless every child errored/was interrupted."""
     child_results = combined.get("results") or []
-    ok = ("completed", "success")
-    return "error" if child_results and all(r.get("status") not in ok for r in child_results) else "completed"
+    return "error" if child_results and all(r.get("status") != "completed" for r in child_results) else "completed"
 
 
 def _dispatch(**kwargs) -> dict[str, Any]:

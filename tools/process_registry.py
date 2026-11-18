@@ -54,20 +54,15 @@ from tools.process_registry_results import (
 from tools.process_registry_env_log import fallback_exit_code, log_delta_command, parse_log_delta_reply
 from tools.process_registry_wait import monotonic as _monotonic, plan_for as _wait_plan
 from tools.process_registry_wsl import _is_wsl_launcher_command
+from tools.process_registry_wait import max_wait_timeout, process_deadline_floor
 
 logger = logging.getLogger(__name__)
 
-# Crash-recovery checkpoint (gateway only)
-CHECKPOINT_PATH = get_hermes_home() / "processes.json"
-_CHECKPOINT_PATH_AT_IMPORT = CHECKPOINT_PATH
-
-
 def _checkpoint_path() -> Path:
-    """Active profile's checkpoint file at call time: the patched ``CHECKPOINT_PATH`` when a test
-    changed it, else live profile-scoped HERMES_HOME — the multiplexed gateway serves every
-    profile from one process, so the import-time constant would pin every profile's process
-    checkpoint to the launch home."""
-    return CHECKPOINT_PATH if CHECKPOINT_PATH != _CHECKPOINT_PATH_AT_IMPORT else get_hermes_home() / "processes.json"
+    """Active profile's crash-recovery checkpoint file, resolved per call: the multiplexed gateway
+    serves every profile from one process, so an import-time path would pin every profile's
+    process checkpoint to the launch home."""
+    return get_hermes_home() / "processes.json"
 
 MAX_OUTPUT_CHARS = 200_000      # rolling output buffer
 # Tail of the output a completion notification carries. Right for a build log; a spawner whose
@@ -601,8 +596,8 @@ class ProcessSession:
     exited: bool = False
     exited_at: float = 0.0                      # time.time() of the FIRST move to finished (0 = unknown)
     exit_code: Optional[int] = None             # None while running
-    completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
-    termination_source: str = ""                # process.kill|kill_all|backend_lost|env_closed|failed_start
+    completion_reason: str = "exited"           # exited|killed|lost
+    termination_source: str = ""                # process.kill|kill_all|backend_lost|env_closed
     output_buffer: str = ""                     # Rolling tail (last max_output_chars)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # Recovered from checkpoint (no pipe)
@@ -1132,7 +1127,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         return session
 
     @staticmethod
-    def _config_value(section: str, key: str, fallback):
+    def _config_value(section: str, key: str):
         """``config.yaml`` value for ``section.key``, else the DEFAULT_CONFIG value.
         Raises if config is unreadable; callers wrap with their own hard fallback so
         registry code paths never crash on a broken config file."""
@@ -1145,7 +1140,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
     def _config_seconds(key: str, fallback: float) -> float:
         """``terminal.<key>`` as a non-negative float (0 disables); *fallback* if unreadable."""
         try:
-            return max(float(ProcessRegistry._config_value("terminal", key, fallback)), 0.0)
+            return max(float(ProcessRegistry._config_value("terminal", key)), 0.0)
         except Exception:
             return fallback
 
@@ -1447,8 +1442,54 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
                 session.process.wait, lambda: session.process.returncode)
 
 
-    _log_delta_command = staticmethod(log_delta_command)
 
+    def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
+        """Background thread: poll a sandbox log file for non-local backends.
+
+        One ``execute()`` per tick: the read command also reports the process
+        status (see ``log_delta_command``). Sandboxes rate-limit exec starts."""
+        q = shlex.quote
+        # Byte offset already read from the log (bytes, not chars: the shell counts bytes).
+        prev_output_bytes = 0
+        while not session.exited:
+            time.sleep(2)
+            try:
+                # Read only the bytes written since the last poll, plus the process status.
+                raw = env.execute(
+                    self._log_delta_command(q(log_path), prev_output_bytes, q(pid_path), q(exit_path)),
+                    timeout=10).get("output", "")
+                reply = parse_log_delta_reply(raw)
+                delta = reply.delta if reply else ""
+                if reply:
+                    if reply.offset < prev_output_bytes:
+                        # Log rotated/truncated: what we hold no longer lines up. Restart.
+                        with session._lock:
+                            if session.exited:
+                                return
+                            session.output_buffer = ""
+                    prev_output_bytes = reply.size
+                if delta:
+                    # A kill that landed after this fetch already published its output
+                    # snapshot: leave the output as the kill reported it (as the PTY reader does).
+                    with session._lock:
+                        if session.exited:
+                            return
+                        session.output_buffer += delta
+                        if len(session.output_buffer) > session.max_output_chars:
+                            session.output_buffer = session.output_buffer[-session.max_output_chars:]
+                    self._check_watch_patterns(session, delta)
+                    self._emit_output(session, delta)
+
+                # Unreadable reply: separate liveness and exit-code reads, as before the combined read.
+                exit_code = reply.exit_code if reply else fallback_exit_code(env, q(pid_path), q(exit_path))
+                if exit_code is not None:
+                    self._finish_exited(session, exit_code)
+                    return
+            except Exception:
+                # Environment might be gone (sandbox reaped, etc.). A kill that already
+                # settled the session keeps its result.
+                self._finish_exited(session, -1, reason="lost", source="backend_lost")
+                return
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -1646,7 +1687,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
                 and reader is not None and reader.is_alive())
 
     def is_completion_consumed(self, session_id: str) -> bool:
-        """Check if a completion notification was already consumed via wait/log."""
+        """True once wait/log/kill/acked poll consumed it; keyed by the full id, never a short prefix."""
         return session_id in self._completion_consumed
 
     def is_session_waiting(self, session_id: str) -> bool:
@@ -1770,7 +1811,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         """``delegation.surface_child_process_notifications``; False on any config
         error — never crash the drain loop."""
         try:
-            return bool(ProcessRegistry._config_value("delegation", "surface_child_process_notifications", False))
+            return bool(ProcessRegistry._config_value("delegation", "surface_child_process_notifications"))
         except Exception:
             return False
 
@@ -2000,10 +2041,8 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
                 logger.debug("Non-blocking drain failed for %s: %s", session.id, e)
         with session._lock:
             session.mark_exited(rc)
-        logger.info(
-            "Reconciled session %s: direct child exited with code %s but reader "
-            "was still blocked (orphaned pipe). Flipped to exited.",
-            session.id, rc)
+        logger.info("Reconciled session %s: direct child exited with code %s but reader was still blocked "
+                    "(orphaned pipe). Flipped to exited.", session.id, rc)
         self._move_to_finished(session)
 
     @staticmethod
@@ -2011,7 +2050,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         return {"session_id": session.id, "command": session.command, "status": "exited" if session.exited else "running",
                 **process_provenance(session)}
 
-    def poll(self, session_id: str) -> dict:
+    def poll(self, session_id: str, acknowledge: bool = False) -> dict:
         """Check status and get new output for a background process."""
         session = self.get(session_id)
         if session is None:
@@ -2027,10 +2066,9 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             "uptime_seconds": int(time.time() - session.started_at), "output_preview": output_preview}
         if exited:
             result.update(self._exit_fields(session))
-            # Read-only: record in _poll_observed (CLI inline dedup) but NOT in
-            # _completion_consumed, or a status check would suppress the watcher's
-            # autonomous delivery turn. See __init__. A preview taken before the reader's
-            # final drain is partial and must not suppress the full completion.
+            # Read-only unless acknowledged: _poll_observed is CLI inline dedup only; a plain status check must
+            # not suppress the watcher's autonomous turn (#10156), an acknowledged handled result must (#94455).
+            # A preview taken before the reader's final drain is partial and must not suppress the completion.
             if not finalizing:
                 self._poll_observed.add(session_id)
         if session.detached and session.pid_scope == "host" and not session.output_log:
@@ -2067,7 +2105,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             "total_lines": total_lines, "showing": f"{len(selected)} lines"}
         if exited and observed_completion_output and not finalizing:
             self._completion_consumed.add(session_id)
-            self._consume_survivor_completion(session_id)
+            self._completion_consumed.add(session.id)
         return result
 
     def wait(self, session_id: str, timeout: int | None = None) -> dict:
@@ -2078,10 +2116,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         with status exited|timeout|interrupted|not_found|error and an output snapshot."""
         from tools.interrupt import consume_yield as _consume_yield, is_interrupted as _is_interrupted
 
-        try:
-            max_timeout = int(os.getenv("TERMINAL_TIMEOUT", "180"))
-        except (ValueError, TypeError):
-            max_timeout = 180
+        max_timeout = max_wait_timeout()
         # The schema says minimum=1 but not every caller enforces it; timeout=0 is
         # falsy and would silently fall through to the default wait.
         if timeout is not None and timeout <= 0:
@@ -2104,7 +2139,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             result = None
             if session.exited and not self._reader_finalizing(session):
                 self._completion_consumed.add(session_id)
-                self._consume_survivor_completion(session_id)
+                self._completion_consumed.add(session.id)
                 result = self._exit_snapshot(session, "exited")
             elif _is_interrupted():
                 result = {
@@ -2159,41 +2194,48 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
-        if deadline is not None and time.monotonic() >= deadline:
-            return {"status": "deadline", "session_id": session_id}
-        previous_kill_deadline = session._kill_deadline
-        session._kill_deadline = deadline
-        if self._collect_recorded_exit(session):
-            try:
-                return self._already_exited_kill_result(session, consume_output, deadline)
-            finally:
-                session._kill_deadline = previous_kill_deadline
-        # Keep an additive receipt before a restart/shutdown signal can outlive this
-        # gateway. The normal completion write below may be fenced by the shared deadline.
-        session._kill_requested = True
-        if (source == "gateway_shutdown" or deadline is not None) and (
-            session._pty
-            or session.process
-            or (session.env_ref and session.pid)
-            or (session.detached and session.pid_scope == "host" and session.pid)
-        ):
-            # Set the marker before the snapshot/write so a reader that wins the race
-            # still persists the final receipt in the cut-retention budget.
-            session._cut_receipt = True
-            # Bounded kills keep half the remaining budget for the signals themselves.
-            save_cut_pending_result(
-                session, source, include_output=deadline is None, prune=deadline is None,
-                lock_timeout=(
-                    None if deadline is None
-                    else max(0.0, deadline - time.monotonic()) / 2
-                ),
-            )
-        # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
-        bounded = {} if deadline is None else {"deadline": deadline}
+        if session.exited:
+            # A double-forked descendant may still be alive in the systemd scope even
+            # though the main process exited — stop the scope to reap survivors.
+            # See #70716.
+            # If the worker was spawned in its own systemd scope (#70716), stop the entire unit to reap any
+            # double-forked descendants that were reparented inside the scope and survived the PID signal
+            # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
+            # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
+            # above already handled the main process; this catches stragglers.
+            scope_stopped = self._stop_scope(session)
+            with session._lock:
+                result = self._exit_snapshot(session, "already_exited")
+                finalizing = self._reader_finalizing(session)
+            if not scope_stopped:
+                result["scope_stop_failed"] = session.systemd_unit
+            # Only suppress the autonomous turn after its output is present in
+            # the explicit kill result, matching wait/log consumption.
+            if consume_output and not finalizing:
+                self._completion_consumed.add(session_id)
+            return result
+        if session.exited:
+            # A double-forked descendant may still be alive in the systemd scope even
+            # though the main process exited — stop the scope to reap survivors.
+            # See #70716.
+            # If the worker was spawned in its own systemd scope (#70716), stop the entire unit to reap any
+            # double-forked descendants that were reparented inside the scope and survived the PID signal
+            # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
+            # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
+            # above already handled the main process; this catches stragglers.
+            scope_stopped = self._stop_scope(session)
+            with session._lock:
+                result = self._exit_snapshot(session, "already_exited")
+                finalizing = self._reader_finalizing(session)
+            if not scope_stopped:
+                result["scope_stop_failed"] = session.systemd_unit
+            # Only suppress the autonomous turn after its output is present in
+            # the explicit kill result, matching wait/log consumption.
+            if consume_output and not finalizing:
+                self._completion_consumed.add(session.id)
+            return result
         try:
-            if session.pid_scope == "ssh":
-                session._ssh_kill_source = source
-            early = self._signal_kill(session, session_id, consume_output, **bounded)
+            early = self._signal_kill(session, session_id, consume_output, deadline=deadline)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
@@ -2239,7 +2281,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             with session._lock:
                 output = _completion_output(session)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._completion_consumed.add(session.id)
                 session.exited = True
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
@@ -2320,7 +2362,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
                 with session._lock:
                     output = _completion_output(session)
                 if consume_output:
-                    self._completion_consumed.add(session_id)
+                    self._completion_consumed.add(session.id)
                 # No waitable handle, so this is not a collected exit. Close the
                 # entry without queueing a completion, and do not signal a PID
                 # whose start time does not match.
@@ -3150,6 +3192,7 @@ PROCESS_SCHEMA = {
                 "type": "integer",
                 "description": "Log line offset (default: last 200)."
             },
+            "acknowledge": {"type": "boolean", "description": "'poll' on an exited process: you handled its result, so skip its notify_on_complete turn."},
             "limit": {
                 "type": "integer",
                 "description": "Max log lines.",
@@ -3201,22 +3244,17 @@ def _redact_process_result(result: dict) -> dict:
 def _list_processes(task_id, node=None) -> dict:
     # Also surface session-scoped background processes (e.g. a forgotten preview
     # server): they share the gateway session_key and can block session reset.
-    session_key = ""
-    with suppress(Exception):
-        # See #29177.
-        from tools.approval_context import get_current_session_key
-        session_key = get_current_session_key(default="") or ""
+    from tools.process_registry_access import caller_session_key
     return {"processes": [
         _redact_process_result(p)
         for p in process_registry.list_sessions(
-            task_id=task_id, session_key=session_key or None, include_retained=True,
-            **({"node": node} if node is not None else {}))]}
+            task_id=task_id, session_key=caller_session_key() or None, include_retained=True)]}
 
 
 # action -> (handler(session_id, args) -> dict, redact output?). Output-bearing
 # actions are redacted; stdin actions return only status.
 _SESSION_ACTIONS = {
-    "poll": (lambda sid, a: process_registry.poll(sid), True),
+    "poll": (lambda sid, a: process_registry.poll(sid, acknowledge=a.get("acknowledge") is True), True),
     "log": (lambda sid, a: process_registry.read_log(sid, offset=a.get("offset"), limit=a.get("limit", 200)), True),
     "wait": (lambda sid, a: process_registry.wait(sid, timeout=a.get("timeout")), True),
     "kill": (lambda sid, a: process_registry.kill_process(sid), True),
@@ -3235,8 +3273,28 @@ _MAX_HANDOFFS_PER_CHILD = 3
 
 
 def _handle_process(args, **kw):
-    from tools.process_registry_ssh import handle_process
-    return handle_process(args, **kw)
+    action = args.get("action", "")
+    # Coerce to string — some models send session_id as an integer
+    session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
+    if action == "list":
+        return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
+    if action == "handoff":
+        if not session_id:
+            return tool_error("session_id is required for handoff")
+        from tools.process_registry_handoff import handoff_process
+        return json.dumps(handoff_process(session_id, args, kw.get("task_id")), ensure_ascii=False)
+    if action in _SESSION_ACTIONS:
+        if not session_id:
+            return tool_error(f"session_id is required for {action}")
+        from tools.process_registry_access import resolve_actionable
+        allowed, session_id = resolve_actionable(session_id, kw.get("task_id"))
+        if not allowed:
+            return json.dumps(_not_found(session_id), ensure_ascii=False)
+        handler, redact = _SESSION_ACTIONS[action]
+        from tools.process_registry_wait_policy import apply_wait_poll_policy
+        result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
+        return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
+    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
 
 
 registry.register(
@@ -3245,4 +3303,5 @@ registry.register(
     schema=PROCESS_SCHEMA,
     handler=_handle_process,
     emoji="⚙️",
+    deadline_floor=process_deadline_floor,
 )

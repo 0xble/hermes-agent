@@ -153,6 +153,20 @@ def _still_names(path: Path, fd: int) -> bool:
 #: probe from this process would report its own reservation as held.
 _live_ownerships: weakref.WeakSet[ProfileOwnership] = weakref.WeakSet()
 
+# Homes whose gateway.lock a ProfileOwnership in THIS process holds right now, with the pid that
+# took it. A forked child answers False here, but it shares the flock's open file description and
+# the inherited process_ownership, so runtime_lock_held_elsewhere() still answers False for it too.
+_held_here: dict[Path, int] = {}
+_held_here_mutex = threading.Lock()
+
+
+def held_by_this_process(home: Path) -> bool:
+    """Whether a reservation in this process (any :class:`ProfileOwnership`: the gateway, a served
+    secondary, a maintenance reservation) holds *home*'s ``gateway.lock`` now. Unlike the lock
+    record, which outlives :meth:`ProfileOwnership.release`, this is cleared on release."""
+    with _held_here_mutex:
+        return _held_here.get(canonical_home(home)) == os.getpid()
+
 
 class ProfileOwnership:
     def __init__(self, *, all_slots: bool = False):
@@ -200,6 +214,8 @@ class ProfileOwnership:
                             handle.flush()
                             os.fsync(handle.fileno())
                         self._handles[home] = locks.pop_all()
+                        with _held_here_mutex:
+                            _held_here[home] = os.getpid()
                         self._slots[home] = slots
                     added.append(home)
             except BaseException:
@@ -221,6 +237,8 @@ class ProfileOwnership:
             locks = self._handles.pop(canonical_home(home), None)
             self._slots.pop(canonical_home(home), None)
             if locks is not None:
+                with _held_here_mutex:
+                    _held_here.pop(canonical_home(home), None)
                 locks.close()
 
     def start_writer(self, thread: threading.Thread) -> None:

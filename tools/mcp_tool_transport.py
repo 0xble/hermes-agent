@@ -160,8 +160,6 @@ def _sdk_unavailable_error(server_name: str) -> ImportError:
 class MCPServerTransportMixin:
     """Methods of :class:`tools.mcp_tool.MCPServerTask` (mixed in; relies on its attributes)."""
 
-    __slots__ = ()
-
     def _advertises_tools(self) -> bool:
         """False only when captured capabilities omit ``tools`` (prompt-/resource-only servers,
         where ``tools/list`` raises -32601); True without capability info (legacy fallback).
@@ -527,7 +525,9 @@ class MCPServerTransportMixin:
         if not _non_mcp_2xx(resp):
             return
         ct_base = _content_type_base(resp)
-        raise NonMcpEndpointError(f"MCP server '{self.name}' at {url} returned Content-Type '{ct_base}', not an MCP "
+        from agent.redact import redact_sensitive_text  # error text reaches the model: no ?token= credential
+        shown = redact_sensitive_text(str(url), redact_url_credentials=True)
+        raise NonMcpEndpointError(f"MCP server '{self.name}' at {shown} returned Content-Type '{ct_base}', not an MCP "
             f"response (expected one of: {', '.join(self._MCP_CONTENT_TYPES)}). The URL most likely "
             "points at a web page rather than an MCP endpoint — check it resolves to a Streamable "
             "HTTP / SSE endpoint (e.g. https://host/mcp, not https://host/).")
@@ -747,6 +747,12 @@ class MCPServerTransportMixin:
         """
         if self._registered_tool_names:
             self._publish_discovered_tools(self._tools)
+            with _core._lock:
+                owned = [key for key, live in _core._servers.items() if live is self]
+            # A reconnect keeps the registered tools, but the trust gate must judge the session that will
+            # run the call: refresh readOnlyHint from this listing (#144380).
+            for key in owned:
+                _registration._record_tool_trust_metadata(self.name, self._config, self._tools, key)
             return
         with _core._lock:
             owned = [key for key, live in _core._servers.items() if live is self]

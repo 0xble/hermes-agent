@@ -456,8 +456,8 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
 
     payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
         result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
- flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
- field_context=_cdp_field_context(method, call_params), vault_tab=effective_task_id)}
+        flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
+        field_context=_cdp_field_context(method, call_params), vault_tab=effective_task_id)}
     if target_id:
         payload["target_id"] = target_id
     return json.dumps(payload, ensure_ascii=False)

@@ -175,12 +175,12 @@ def test_cold_cli_builds_own_runtime_discovers_plugins_and_repairs_app(tmp_path,
     )
 
     bootstrap = """
-import importlib.util
-assert importlib.util.find_spec('ruamel') is None
-assert importlib.util.find_spec('yaml') is None
-assert importlib.util.find_spec('packaging') is None
-assert importlib.util.find_spec('idna') is None
-"""
+    import importlib.util
+    assert importlib.util.find_spec('ruamel') is None
+    assert importlib.util.find_spec('yaml') is None
+    assert importlib.util.find_spec('packaging') is None
+    assert importlib.util.find_spec('idna') is None
+    """
     cli = "\nsys.argv = ['hermes', 'pm', {action!r}]; import hermes_cli.main\n"
     try:
         assert not store.exists()
@@ -220,14 +220,14 @@ assert importlib.util.find_spec('idna') is None
     expected_config = config.read_text()
 
     report_code = """
-import json
-from pathlib import Path
-from pm.environments import install_state_dir, selected_venv, runtime_facts_path
-root = Path(sys.path[0])
-state = install_state_dir(root)
-print(json.dumps({'state': str(state), 'app': str(selected_venv(root)),
+    import json
+    from pathlib import Path
+    from pm.environments import install_state_dir, selected_venv, runtime_facts_path
+    root = Path(sys.path[0])
+    state = install_state_dir(root)
+    print(json.dumps({'state': str(state), 'app': str(selected_venv(root)),
                   'facts': json.loads(runtime_facts_path(root).read_text())}))
-"""
+    """
     report = json.loads(_bare(python, repo, report_code, env=env).stdout)
     state, app = Path(report["state"]), Path(report["app"])
     assert state.is_relative_to(hermes_home)
@@ -244,32 +244,32 @@ print(json.dumps({'state': str(state), 'app': str(selected_venv(root)),
         assert tree_digest(store / fact["entry"]) == fact["digest"]
 
     probe = _run([str(pm_python), "-I", "-B", "-c", f"""
-import importlib.util, json, sys
-from pathlib import Path
-sys.path.insert(0, {str(repo)!r})
-from pm.workspace import enabled_member_dirs
-from ruamel.yaml import YAML
-import ruamel.yaml
-assert enabled_member_dirs() == [Path({str(plugin)!r})]
-assert importlib.util.find_spec('idna') is None
-assert importlib.util.find_spec('openai') is None
-print(json.dumps({{'yaml': ruamel.yaml.__file__, 'prefix': sys.prefix}}))
-"""], cwd=tmp_path, env=env)
+    import importlib.util, json, sys
+    from pathlib import Path
+    sys.path.insert(0, {str(repo)!r})
+    from pm.workspace import enabled_member_dirs
+    from ruamel.yaml import YAML
+    import ruamel.yaml
+    assert enabled_member_dirs() == [Path({str(plugin)!r})]
+    assert importlib.util.find_spec('idna') is None
+    assert importlib.util.find_spec('openai') is None
+    print(json.dumps({{'yaml': ruamel.yaml.__file__, 'prefix': sys.prefix}}))
+    """], cwd=tmp_path, env=env)
     pm_report = json.loads(probe.stdout)
     assert Path(pm_report["yaml"]).is_relative_to(runtime)
     app_code = """
-import json
-from pathlib import Path
-from pm.environments import activate_dependencies, selected_venv
-root = Path(sys.path[0])
-activate_dependencies(root)
-import ruamel.yaml, idna
-from ruamel.yaml import YAML
-assert idna.encode('bücher.example') == b'xn--bcher-kva.example'
-assert YAML(typ='safe').load('proof: true')['proof'] is True
-print(json.dumps({'yaml': ruamel.yaml.__file__, 'idna': idna.__file__,
+    import json
+    from pathlib import Path
+    from pm.environments import activate_dependencies, selected_venv
+    root = Path(sys.path[0])
+    activate_dependencies(root)
+    import ruamel.yaml, idna
+    from ruamel.yaml import YAML
+    assert idna.encode('bücher.example') == b'xn--bcher-kva.example'
+    assert YAML(typ='safe').load('proof: true')['proof'] is True
+    print(json.dumps({'yaml': ruamel.yaml.__file__, 'idna': idna.__file__,
                   'app': str(selected_venv(root))}))
-"""
+    """
     app_report = json.loads(_bare(python, repo, app_code, env=env).stdout)
     assert Path(app_report["yaml"]).is_relative_to(app)
     assert Path(app_report["idna"]).is_relative_to(app)

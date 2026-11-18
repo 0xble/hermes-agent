@@ -225,24 +225,30 @@ class GatewayTurnPersistenceMixin:
         block = self._hmwa_reasoning_block(agent_result, response, source, _intentional_silence)
         return f"{block}\n\n{response}" if block else response
 
-    def _hmwa_reasoning_block(self, agent_result, response, source, _intentional_silence) -> str:
-        """The rendered reasoning block for this turn's reply, or "" when none is shown."""
+    def _show_reasoning_for_source(self, source) -> bool:
+        """Whether ``show_reasoning`` is effectively on for this source's platform.
+
+        LOCAL viewers (Desktop/TUI) read reasoning from their event stream, never the projected
+        block, so they are always False here. The single resolver for the block renderer AND the
+        stream gate that keeps reasoning above a streamed answer (one combined message)."""
         if source.platform == Platform.LOCAL and not _acp_launch(self, source):
-            # Local viewers receive reasoning.delta through their event stream; projecting it into
-            # the final response duplicates it and leaks messaging-platform formatting into Desktop.
-            return ""
+            return False
         from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
         try:
-            _show_reasoning_effective = _resolve_gateway_display_bool(
+            return _resolve_gateway_display_bool(
                 _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
                 require_platform_override_for={Platform.MATTERMOST},
             )
         except Exception:
             logger.debug("show_reasoning resolution failed; using the gateway default", exc_info=True)
-            _show_reasoning_effective = (
-                False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
+            return (
+                False if source.platform == Platform.MATTERMOST else bool(getattr(self, "_show_reasoning", False))
             )
+
+    def _hmwa_reasoning_block(self, agent_result, response, source, _intentional_silence) -> str:
+        """The rendered reasoning block for this turn's reply, or "" when none is shown."""
+        _show_reasoning_effective = self._show_reasoning_for_source(source)
         last_reasoning = agent_result.get("last_reasoning")
         if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning):
             return ""
@@ -256,6 +262,7 @@ class GatewayTurnPersistenceMixin:
         # Per-platform render style: Discord defaults to "-# " subtext, others keep the code block.
         try:
             from gateway.display_config import resolve_display_setting
+            from gateway.run import _load_gateway_config, _platform_config_key
             _reasoning_style = resolve_display_setting(
                 _load_gateway_config(), _platform_config_key(source.platform), "reasoning_style", "code",
             )

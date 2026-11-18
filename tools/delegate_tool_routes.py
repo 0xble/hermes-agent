@@ -20,6 +20,7 @@ from typing import Any, Iterator, Mapping, Optional
 from agent.delegation_provider import (
     RESERVED_TASK_PARAMETERS, ROUTE_KEYS, DelegationProvider, DelegationRouteError,
 )
+from tools.delegate_tool_config import _resolve_delegation_credentials
 
 logger = logging.getLogger("tools.delegate_tool")  # log-record parity with the origin module
 
@@ -132,6 +133,7 @@ def delegated_profile_scope(home: Any) -> Iterator[None]:
     from agent.secret_scope import (
         reset_multiplex_context, reset_secret_scope, set_multiplex_context, set_secret_scope,
     )
+    from gateway.hosted_room_execution_policy import bind_profile_routed, reset_profile_routed
     from hermes_cli.env_loader import hydrate_profile_secret_sources
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
     from tools.terminal_scope import install_profile_terminal_scope, reset_terminal_scope
@@ -144,6 +146,11 @@ def delegated_profile_scope(home: Any) -> Iterator[None]:
     with contextlib.ExitStack() as stack:
         stack.callback(reset_hermes_home_override, set_hermes_home_override(str(home)))
         stack.callback(reset_secret_scope, set_secret_scope(owner_secret_scope(home), profile_home=str(home)))
+        # This route's own scope marks the child: a hosted room's execution
+        # policy was signed for the delegating member's profile and must not
+        # govern this differently-profiled child's approval decisions, and the
+        # parent's "session" grants do not cover this profile (any route).
+        stack.callback(reset_profile_routed, bind_profile_routed())
         if routed:
             stack.callback(reset_multiplex_context, set_multiplex_context(True))
         stack.callback(reset_terminal_scope, install_profile_terminal_scope(home))
@@ -362,5 +369,4 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
 def route_for_config(routing_cfg: dict[str, Any], parent_agent: Any) -> TaskRoute:
     """The route an internal caller's explicit config block describes (``/review`` ->
     ``auxiliary.review``); bypasses the provider, as those callers own their route."""
-    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
     return TaskRoute(_resolve_delegation_credentials(routing_cfg, parent_agent), routing_cfg)

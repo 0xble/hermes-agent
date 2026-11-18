@@ -2107,7 +2107,7 @@ class TestCheckpoint:
             "pid": 999999999,  # almost certainly not running
             "task_id": "t1", "notify_on_complete": notify,
         }]))
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+        with patch("tools.process_registry._checkpoint_path", return_value=checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 1
             assert registry.poll("proc_dead")["exit_code"] is None
@@ -2132,7 +2132,7 @@ class TestCheckpoint:
         monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_args: False)
         monkeypatch.setattr(registry, "_is_host_pid_alive", lambda *_args: False)
 
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), patch(
+        with patch("tools.process_registry._checkpoint_path", return_value=checkpoint), patch(
             "tools.process_registry._stop_systemd_unit", return_value=False
         ) as stop_unit:
             assert registry.recover_from_checkpoint() == 0
@@ -2156,7 +2156,7 @@ class TestCheckpoint:
         monkeypatch.setattr(registry, "_host_pid_is_ours", lambda *_args: False)
         monkeypatch.setattr(registry, "_is_host_pid_alive", lambda *_args: False)
 
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint), patch(
+        with patch("tools.process_registry._checkpoint_path", return_value=checkpoint), patch(
             "tools.process_registry._stop_systemd_unit", return_value=True
         ) as stop_unit:
             assert registry.recover_from_checkpoint() == 1
@@ -2176,7 +2176,7 @@ class TestCheckpoint:
         }]
         checkpoint.write_text(json.dumps(original), encoding="utf-8")
 
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+        with patch("tools.process_registry._checkpoint_path", return_value=checkpoint):
             recovered = registry.recover_from_checkpoint()
             assert recovered == 0
             assert registry.get("proc_remote") is None
@@ -2190,7 +2190,7 @@ class TestCheckpoint:
         redacted before write. Recovery only uses command for display/logging
         (the process is already running), so masking is lossless."""
         checkpoint = tmp_path / "procs.json"
-        with patch("tools.process_registry.CHECKPOINT_PATH", checkpoint):
+        with patch("tools.process_registry._checkpoint_path", return_value=checkpoint):
             secret = "sk-secret1234567890"
             command = f"curl -H 'Authorization: Bearer {secret}' http://x"
             s = _make_session(sid="proc_secret", command=command)
@@ -2947,7 +2947,7 @@ class TestHandleProcessTransformHook:
         from tools import process_registry as pr
         reg = ProcessRegistry()
         sess = _make_session(sid="proc_xform1", command="python app.py")
-        sess.output_buffer = output
+        sess.owner_task_id, sess.output_buffer = "task-bg", output  # owner = the caller (#108413)
         sess.exited = True
         sess.exit_code = 3
         reg._running[sess.id] = sess

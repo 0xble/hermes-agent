@@ -69,6 +69,44 @@ _LEGACY_HOME_TARGET_ENV_VARS = {"QQBOT_HOME_CHANNEL": "QQ_HOME_CHANNEL"}
 
 
 
+def _fresh_thread_overrides_origin_topic(pconfig) -> bool:
+    """``platforms.<p>.extra.cron_fresh_thread_per_run: true``: a continuable job created inside a
+    topic/thread opens a fresh thread per run instead of delivering back to its origin topic
+    (#76548). Off by default; any value but a boolean ``true`` keeps the origin topic and warns."""
+    extra = getattr(pconfig, "extra", None) or {}
+    raw = extra.get("cron_fresh_thread_per_run", False) if isinstance(extra, dict) else False
+    if isinstance(raw, bool):
+        return raw
+    logger.warning("cron_fresh_thread_per_run must be true or false, got %r; keeping the origin topic", raw)
+    return False
+
+
+def _origin_thread_is(job: dict, thread_id) -> bool:
+    """Whether ``thread_id`` is the thread/topic recorded on the job's own origin."""
+    origin_thread = (_resolve_origin(job) or {}).get("thread_id")
+    return origin_thread is not None and str(origin_thread) == str(thread_id)
+
+
+def _resolve_origin(job: dict) -> Optional[dict]:
+    """Extract origin info from a job. Non-dict origins (provenance strings, hand-edited
+    jobs.json) are treated as missing — otherwise every fire crashed on ``origin.get``.
+
+    Without this guard, a job tagged with e.g. ``"combined-digest-replaces-x-and-y"`` crashed every fire
+    attempt with ``'str' object has no attribute 'get'`` — ``mark_job_run`` recorded the failure, but the
+    next tick re-loaded the same poisoned origin and crashed identically until the field was patched
+    manually (#18722).
+    """
+    origin = job.get("origin")
+    if isinstance(origin, dict) and origin.get("platform") and origin.get("chat_id"):
+        # Jobs stamped before non-push origins stopped being captured (#69304): the api_server
+        # adapter's send() is a stub, so honouring this origin fails every fire with
+        # last_status=ok. Treat it as missing so deliver=origin takes the home-channel fallback.
+        if str(origin["platform"]).lower() in _NON_PUSH_ORIGIN_PLATFORMS:
+            return None
+        return origin
+    return None
+
+
 
 
 
@@ -363,7 +401,7 @@ def _resolve_single_delivery_target(
     if ":" in deliver_value:
         platform_name, rest = deliver_value.split(":", 1)
         platform_key = platform_name.lower()
-        from tools.send_message_tool import prepare_send_message_platforms, resolve_send_target
+        from gateway.outbound.send import prepare_send_message_platforms, resolve_send_target
         prepare_send_message_platforms()
         # pass_unresolved_references: no model in the loop to react; an unknown-to-directory target
         # must reach the adapter as written or the job's output is silently lost.
@@ -1590,7 +1628,11 @@ def _prepare_target_delivery(
         and not in_channel_surface
         and runtime_adapter is not None
         and loop is not None
-        and not thread_id  # never override an explicit origin thread/topic
+        # Never override a target thread/topic unless the platform opted in AND it is the job's own
+        # origin topic (#76548): an origin without a thread matches any thread as a wildcard, so a
+        # topic the user named explicitly must not count as the origin's.
+        and (not thread_id or (
+            origin_target and _origin_thread_is(job, thread_id) and _fresh_thread_overrides_origin_topic(pconfig)))
     ):
         opened_thread_id = _open_continuable_cron_thread(
             job, runtime_adapter, chat_id, loop) or None
@@ -1613,6 +1655,44 @@ def _uses_external_delivery_queue(job: dict, adapters, targets: list, external_e
         and external_execution == str(job.get("execution_id") or "")
         and any(target["platform"] not in (BOT_CHAT_PLATFORM, ROOM_PLATFORM) for target in targets)
     )
+
+
+def _unresolved_delivery_outcome(job: dict, for_failure: bool) -> Optional[str]:
+    """``_deliver_result`` outcome when no target resolved: None (not a failure) for ``local`` and
+    origin-less ``origin`` (CLI jobs never capture an origin — a spurious error every run), else
+    an error string."""
+    deliver_value = _normalize_deliver_value(_delivery_lane_value(job, for_failure=for_failure))
+    if deliver_value == "local":
+        return None
+    if deliver_value == "origin":
+        logger.info(
+            # deliver=origin with no resolvable origin and no configured home channels: treat as local
+            # rather than reporting an error. CLI-created jobs never capture a {platform, chat_id} origin,
+            # so failing here would make every CLI `deliver=origin` (or auto-detect) job emit a spurious "no
+            # delivery target resolved" error on every run (#43014). The output is still persisted in
+            # last_output for `cron list`/resume.
+            "Job '%s': deliver=origin but no origin or home channels — "
+            "skipping delivery (output saved in last_output)",
+            job.get("name", job.get("id", "?")))
+        return None
+    msg = f"no delivery target resolved for deliver={deliver_value}"
+    logger.warning("Job '%s': %s", job["id"], msg)
+    return msg
+
+
+def _should_wrap_cron_response(job: dict, user_cfg: Any) -> bool:
+    """Whether to wrap delivered output in the cron header/footer. A bool per-job
+    ``wrap_response`` overrides the global ``cron.wrap_response`` (read from the active
+    profile); an unreadable or malformed config falls back to the default (wrap)."""
+    if isinstance(job.get("wrap_response"), bool):
+        return job["wrap_response"]
+    cron_cfg = user_cfg.get("cron") if isinstance(user_cfg, dict) else None
+    if not isinstance(cron_cfg, dict):
+        return True
+    # Truthiness, as the inline check this replaces used; YAML yields real bools here.
+    return bool(cron_cfg.get("wrap_response", True))
+
+
 
 
 def _deliver_result(
@@ -1660,12 +1740,11 @@ def _deliver_result(
 
     from gateway.config import load_gateway_config
 
-    # Wrap with header/footer unless cron.wrap_response: false.
-    wrap_response = True
+    # user_cfg is loaded either way: the wrap decision and the delivery settings below reuse it.
     user_cfg = None
     with contextlib.suppress(Exception):
         user_cfg = _sched.load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
+    wrap_response = _should_wrap_cron_response(job, user_cfg)
     # Mark live sends FINAL so the platform pushes them (Telegram "important" mode mutes otherwise).
     notify_delivery = _cron_delivery_notify_enabled(user_cfg)
     # Targets acked with NO evidence (bare SendResult(success=True) — Slack/Matrix/Mattermost);

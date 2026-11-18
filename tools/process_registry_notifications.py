@@ -17,6 +17,8 @@ WATCH_STATUS_EVENT_TYPES = ("watch_disabled", "watch_overflow_tripped", "watch_o
 GATEWAY_PROCESS_EVENT_TYPES = ("heartbeat", "watch_match", *WATCH_STATUS_EVENT_TYPES, "async_delegation")
 PROCESS_NOTIFICATION_EVENT_TYPES = ("completion", *GATEWAY_PROCESS_EVENT_TYPES)
 
+from tools import delegate_tool_config
+
 
 def _cut_is_user_stop(reason) -> bool:
     """Load stop classification lazily to avoid the delegation notification cycle."""
@@ -44,9 +46,8 @@ def acknowledge_survivor_notifications(registry, notifications) -> None:
         if event.get("type", "completion") == "completion":
             acknowledge(event.get("session_id", ""))
 
-
 _DONE = ("completed", "success")
-_REASON_STATUS = {"lost": "marked lost because the process backend disappeared", "failed_start": "failed to start"}
+_REASON_STATUS = {"lost": "marked lost because the process backend disappeared"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -138,10 +139,9 @@ def _model_not_found_patterns() -> list[str]:
 
 
 def _delegation_config() -> dict:
-    """Active delegation config; ``{}`` on any error. Lazy: delegate_tool is heavy."""
+    """Active delegation config; ``{}`` on any error."""
     try:
-        from tools.delegate_tool import _load_config as _cfg
-        return _cfg() or {}
+        return delegate_tool_config._load_config() or {}
     except Exception:
         return {}
 
@@ -610,7 +610,7 @@ def process_completion_display_text(events: list) -> str:
     if reason == "killed":
         outcome = "Terminated"
     elif reason in _REASON_STATUS:
-        outcome = "Lost" if reason == "lost" else "Failed to Start"
+        outcome = "Lost"
     else:
         outcome = "Finished" if exit_code == 0 else "Failed"
     unknown = process_exit_unknown(evt.get("exit_code"), reason, evt.get("termination_source", ""))

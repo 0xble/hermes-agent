@@ -894,7 +894,7 @@ class SearchMixin:
                       f"Nearest existing parent: {nearest_parent or 'unknown'}"]
         parent_check = self._exec(f"test -d {self._escape_shell_arg(parent)} && echo yes || echo no")
         if "yes" in parent_check.stdout and basename_query:
-            ls_result = self._exec(f"ls -1 {self._escape_shell_arg(parent)} 2>/dev/null | head -20")
+            ls_result = self._exec(f"ls -1 -- {self._escape_shell_arg(parent)} 2>/dev/null | head -20")
             if ls_result.exit_code == 0 and ls_result.stdout.strip():
                 lq = basename_query.lower()
                 candidates = [
@@ -1096,20 +1096,26 @@ class SearchMixin:
     def _filter_gitignored_paths(
         self, paths: list[str], root: str, deadline: float
     ) -> tuple[list[str], Optional[str]]:
-        """Drop gitignored paths without extending the filename search deadline."""
+        """Drop paths ignored by git when *root* is inside a git worktree.
+
+        ``-c core.fsmonitor=false`` is a security override, not a preference: git runs
+        the program named by the searched repo's own ``core.fsmonitor`` config, and a
+        command-line ``-c`` outranks the repo config (#137582). The subprocesses use only
+        the filename search's remaining wall-clock budget.
+        """
         if not paths:
             return paths, None
 
         escaped_root = self._escape_shell_arg(root)
         probe = self._exec_before_deadline(
-            f"git -C {escaped_root} rev-parse --is-inside-work-tree >/dev/null 2>&1",
+            f"git -c core.fsmonitor=false -C {escaped_root} rev-parse --is-inside-work-tree >/dev/null 2>&1",
             deadline, timeout=10,
         )
         if probe.exit_code != 0:
             return paths, "search_timeout" if probe.exit_code == 124 else None
 
         result = self._exec_before_deadline(
-            f"git -C {escaped_root} check-ignore --stdin",
+            f"git -c core.fsmonitor=false -C {escaped_root} check-ignore --stdin",
             deadline, timeout=10, stdin_data="\n".join(paths),
         )
         if result.exit_code == 124:

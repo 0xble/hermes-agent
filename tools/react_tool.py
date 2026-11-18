@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""React to the triggering gateway message or persist a desktop tapback."""
+"""Agent emoji reaction in the Hermes desktop app: the counterpart to the user's tapback
+(same store, one-per-author, ``author="agent"``). Lives in the ``desktop_ui`` toolset so it
+costs nothing elsewhere; defaults to the triggering message and emits ``message.reaction``
+for live painting."""
 
 import contextlib
 import json
