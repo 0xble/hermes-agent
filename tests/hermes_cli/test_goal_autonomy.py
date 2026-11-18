@@ -156,8 +156,8 @@ def test_model_controls_apply_without_approval(home, action):
         payload={"goal": "alternate route"} if action == "replace" else None)
     assert result.get("status") != "pending"
     if action == "clear":
-        assert result["ok"], result
-        assert goals.load_goal("autonomy").status == "cleared"
+        assert not result["ok"] and result["error_code"] == "retirement_proof_required", result
+        assert goals.load_goal("autonomy").status == "active"
     elif action == "resume":
         # The pause above is the user's, which the agent never lifts.
         assert not result["ok"] and result["error_code"] == "user_paused", result

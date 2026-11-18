@@ -212,7 +212,10 @@ def _reap_orphaned_cua_drivers() -> None:
     except ImportError:
         logger.debug("cua-driver startup sweep unavailable", exc_info=True)
         return
-    sweep_on_startup()
+    try:
+        sweep_on_startup()
+    except Exception:  # a cleanup sweep must never become a global startup outage
+        logger.debug("cua-driver startup sweep failed", exc_info=True)
 
 
 def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:

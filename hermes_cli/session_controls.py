@@ -1449,6 +1449,7 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
 
 def _clear_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
+    import re
 
     manager = GoalManager(sid, cursor=cursor)
     if (authority or {}).get("via") == "autonomy":
@@ -1456,6 +1457,20 @@ def _clear_goal(sid, reason, payload, authority, cursor=None):
         if state is not None and state.status == "paused" and state.paused_by != "agent":
             # A reason never ends a /goal pause, /stop, Ctrl+C, quoted or system pause.
             return _user_paused(state, "goal")
+        reason_text = str(reason or "").strip()
+        # Autonomous retirement is a destructive control. It is only available for
+        # an agent-owned pause, or for an active goal whose reason names a concrete
+        # retirement class. A generic model instruction such as "next step" cannot
+        # erase an active goal, even when goals.autonomy is enabled.
+        if state is not None and state.status == "active":
+            if not re.search(r"(?i)\b(?:obsolete|superseded|duplicate|duplicated)\b", reason_text):
+                return {"ok": False, "error_code": "retirement_proof_required",
+                        "error": "autonomous clear requires an obsolete, superseded or duplicate retirement reason"}
+        if re.search(r"(?i)\b(?:handed?[- ]off|takeover)\b", reason_text) and not re.search(
+                r"(?i)\bverified\s+takeover\b", reason_text):
+            return {"ok": False, "error_code": "retirement_proof_required",
+                    "error": "a handoff retirement requires a verified takeover"
+                    }
         return manager.clear(reason=reason, actor="agent", authority="autonomy")
     return manager.clear()
 

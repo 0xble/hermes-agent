@@ -188,7 +188,7 @@ def _submit():
                 if not adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid()):
                     print('Kanban owner refused: stale dispatcher claim', file=sys.stderr)
                     return 1
-        except sqlite3.Error as exc:
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
             print(f'Kanban owner refused: {exc}', file=sys.stderr)
             return 1
 

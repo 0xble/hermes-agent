@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Sourced, read-only setup admission. Resolution belongs to the Python runtime.
 # Source-only use changes no shell options and performs no writes.
 
@@ -89,6 +90,24 @@ hermes_guard_python() {
 hermes_guard_default_repo() {
   local source="${BASH_SOURCE[0]}"
   cd "${source%/*}/.." && pwd -P
+}
+
+# Keep setup admission usable when this file is sourced on its own by
+# hermes_sync, before scripts/_activation.sh has been loaded.
+hermes_bootstrap_python() {
+  local repo="$1" store candidate
+  for candidate in "$repo/.venv/bin/python" "$repo/.venv/Scripts/python.exe" \
+                   "$repo/venv/bin/python" "$repo/venv/Scripts/python.exe"; do
+    [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+  done
+  for store in "${HERMES_RUNTIME_DIR:-}" "$repo/../tools" "${HERMES_HOME:-$HOME/.hermes}/tools"; do
+    [ -n "$store" ] || continue
+    for candidate in "$store"/python-*/bin/python3 "$store"/python-*/python.exe \
+                     "$store"/python-*/bin/python "$store"/python-*/bin/python.exe; do
+      [ -x "$candidate" ] && { printf '%s\n' "$candidate"; return 0; }
+    done
+  done
+  return 1
 }
 
 hermes_resolve_path() {
