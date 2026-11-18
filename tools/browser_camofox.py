@@ -313,8 +313,8 @@ SHARED_IDENTITY_GROUP = "__shared_identity__"
 _sessions: dict[str, dict[str, Any]] = {}  # task_id -> {"user_id": str, "tab_id": str|None, ...}
 _sessions_lock = threading.RLock()
 # Cleanup epochs invalidate identity lookups that started before a task was released.
-_task_release_epochs: Dict[str, int] = {}
-_active_identity_lookups: Dict[str, int] = {}
+_task_release_epochs: dict[str, int] = {}
+_active_identity_lookups: dict[str, int] = {}
 # Only successful POST /tabs creates ownership. Bindings may be replaced or carried;
 # keep the exact identity and profile separately until close is confirmed.
 _owned_tabs: dict[tuple[str, str, str, str], dict[str, Any]] = {}
@@ -540,6 +540,27 @@ def keep_task_tabs(task_id: Optional[str], keep: bool = True) -> int:
     return changed
 
 
+def _owned_tab_refusal(
+    key: tuple[str, str, str, str],
+    record: dict[str, Any],
+    live_other_tabs: set[str],
+    live_protected: set[str],
+) -> Optional[str]:
+    """Return the shared cleanup refusal for an owned tab, if any."""
+    _profile, _owner, _server, tab_id = key
+    if record.get("kept"):
+        return "Tab is shown to the user; release the handoff first"
+    if record.get("session_key") == SHARED_IDENTITY_GROUP:
+        return "Tab belongs to the shared visible identity"
+    if record["user_id"] in _handoffs_in_flight:
+        return "Tab handoff is still in progress"
+    if tab_id in live_other_tabs:
+        return "Tab is bound to another browser task"
+    if tab_id in live_protected:
+        return "Cannot close a tab while protected browser data is active"
+    return None
+
+
 def _delete_owned_tabs(task_id: Optional[str]) -> None:
     """Close disposable owned tabs without holding the binding lock over HTTP I/O.
 
@@ -571,9 +592,7 @@ def _delete_owned_tabs(task_id: Optional[str]) -> None:
         for key, record in list(_owned_tabs.items()):
             profile, owner, server, tab_id = key
             if (profile != hermes_home_key() or owner != task or server != get_camofox_url()
-                    or record.get("kept") or record.get("session_key") == SHARED_IDENTITY_GROUP
-                    or record["user_id"] in _handoffs_in_flight
-                    or tab_id in live_other_tabs or tab_id in live_protected
+                    or _owned_tab_refusal(key, record, live_other_tabs, live_protected)
                     or not leases.claim(server, record["user_id"], tab_id)):
                 continue
             stale = _stale_tab_ids.setdefault(record["user_id"], set())
@@ -1313,13 +1332,23 @@ def camofox_close_tab(task_id: Optional[str] = None, tab_id: Optional[str] = Non
         key = _owned_tab_key(task, target)
         record = _owned_tabs.get(key)
         server = key[2]
-        if record is not None and record.get("kept"):
-            return tool_error("Tab is shown to the user; release the handoff first", success=False, closed=False)
-        if (record is None or record["user_id"] != session["user_id"]
-                or record.get("session_key") == SHARED_IDENTITY_GROUP
-                or record["user_id"] in _handoffs_in_flight
-                or session.get("closing_tab_id")
-                or any(target in _session_tab_ids(other) for owner, other in _sessions.items() if owner != task)
+        if record is None or record["user_id"] != session["user_id"]:
+            return tool_error("Tab is unavailable or was not created by this browser task", success=False, closed=False)
+        live_other_tabs = {
+            tab for owner, other in _sessions.items() if owner != task
+            for tab in _session_tab_ids(other)
+        }
+        live_protected = {
+            other_session["tab_id"] for other_owner, other_session in _sessions.items()
+            if other_session.get("tab_id") and (has_vault_date_components(other_owner)
+                                                 or _protected_tab_owners.get(other_session["tab_id"]) == other_owner)
+        }
+        live_protected |= {tab_id for tab_id, owner in _protected_tab_owners.items()
+                           if owner in _sessions}
+        refusal = _owned_tab_refusal(key, record, live_other_tabs, live_protected)
+        if refusal:
+            return tool_error(refusal, success=False, closed=False)
+        if (session.get("closing_tab_id")
                 or any(k != key and k[2:] == (server, target) and r["user_id"] == record["user_id"]
                        for k, r in _owned_tabs.items())
                 or (server, session["user_id"], target) in _closing_tabs):
@@ -1349,7 +1378,7 @@ def camofox_close_tab(task_id: Optional[str] = None, tab_id: Optional[str] = Non
             # Never follow a redirect to another server for a destructive operation.
             _request("delete", f"/tabs/{quote(target, safe='')}", 10, server=server,
                      params={"userId": user}, allow_redirects=False)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- reconcile DELETE failures with the mandatory readback
             logger.debug("Camofox explicit DELETE needs reconciliation: %s", exc)
         response = _request("get", "/tabs", 10, server=server,
                             params={"userId": user}, allow_redirects=False)
@@ -1363,7 +1392,7 @@ def camofox_close_tab(task_id: Optional[str] = None, tab_id: Optional[str] = Non
             raise RuntimeError("Camofox closure readback did not return a valid tab list")
         if any(tab["tabId"] == target for tab in tabs):
             raise RuntimeError("Camofox still lists the tab after DELETE")
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- retain ownership after any ambiguous readback failure
         logger.warning("Camofox explicit closure readback failed: %s", exc)
         error = "Camofox did not confirm the tab is absent; retry browser_close"
 
