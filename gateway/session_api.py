@@ -98,7 +98,10 @@ def run_steps(steps):
         try:
             write = steps.throw(error) if error is not None else steps.send(result)
         except StopIteration as done:
-            return done.value
+            value = done.value
+            if isinstance(value, _RestoreApiSession):
+                return value()
+            return value
         try:
             result, error = write(), None
         except Exception as exc:  # health: allow BLE001 -- not swallowed: thrown back into the steps, which re-raise it
@@ -133,7 +136,10 @@ async def run_steps_off_loop(authority, steps, *, orphaned=None):
             return await drive()
     task = track_mutation(authority, serialized())
     try:
-        return await asyncio.shield(task)
+        result = await asyncio.shield(task)
+        if isinstance(result, _RestoreApiSession):
+            return await asyncio.to_thread(result)
+        return result
     except asyncio.CancelledError:
         if orphaned is not None:
             task.add_done_callback(lambda done: done.cancelled() or done.exception() or orphaned(done.result()))
@@ -265,7 +271,18 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
                      (_BINDING_PREFIX + session_id, _json(receipt)))
     yield partial(authority.db._execute_write, write)
-    return restore_api_session(authority, session_id)
+    return _RestoreApiSession(authority, session_id)
+
+
+class _RestoreApiSession:
+    """Defer the in-memory route restore until the admission worker is off the gateway loop."""
+
+    def __init__(self, authority, session_id):
+        self.authority = authority
+        self.session_id = session_id
+
+    def __call__(self):
+        return restore_api_session(self.authority, self.session_id)
 
 
 def _heal_replacement(conn, caller, holder):
