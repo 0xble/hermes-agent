@@ -72,10 +72,9 @@ def test_incognito_admission_can_claim_and_settle(tmp_path):
 
     with store(tmp_path) as db:
         epoch = _begin_owned_runtime_epoch(db, instance_id='incognito-owner')
-        with incognito_scope(True, 's'):
-            row = rt.admit_session_input(
-                db, epoch=epoch, principal_id='private', session_id='s', request_id='private',
-                payload={'text': 'private'})
+        row = rt.admit_session_input(
+            db, epoch=epoch, principal_id='private', session_id='s', request_id='private',
+            payload={'text': 'private'})
         claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
         with incognito_scope(True, 's'):
             settled = rt.settle_session_input(
