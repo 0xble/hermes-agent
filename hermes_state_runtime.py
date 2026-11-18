@@ -201,7 +201,9 @@ def admit_session_input(db, *, epoch: int, principal_id: str, session_id: str,
             (admission_id, request_id, principal_id, session_id, json.dumps([session_id]), encoded, digest, intent, epoch))
         return _row(_admission(conn, admission_id))
     if is_incognito():
-        return db._execute_write(write, session_ids=(session_id, payload), skip_result={})
+        from hermes_state_incognito import runtime_internal_write
+        with runtime_internal_write():
+            return db._execute_write(write, session_ids=(session_id, payload), skip_result={})
     return execute_owned_write(db, write, owners, resolve=lambda conn: session_owners(conn, owners))
 
 
@@ -323,7 +325,9 @@ def settle_session_input(db, *, epoch: int, admission_id: str, generation: int, 
     from agent.incognito import is_incognito
     from hermes_state_runtime_privacy import admission_owners, execute_owned_write
     if is_incognito():
-        return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id), result,), skip_result={})
+        from hermes_state_incognito import runtime_internal_write
+        with runtime_internal_write():
+            return db._execute_write(write, session_ids=(_incognito_admission_ids(db, admission_id), result,), skip_result={})
     return execute_owned_write(db, write, (), resolve=lambda conn: admission_owners(conn, admission_id, _transfers))
 
 
