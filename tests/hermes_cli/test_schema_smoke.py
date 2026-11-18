@@ -147,8 +147,9 @@ def test_staging_refuses_a_candidate_whose_schema_smoke_fails(tmp_path, monkeypa
     assert ran == []
 
     (release / "hermes_cli" / "schema_smoke.py").write_text("")
-    exit_code = 1  # the probe crashed: reported, never a refusal
-    releases.smoke_schemas(release, tmp_path / "profile")
+    exit_code = 1  # the probe crashed: staging fails closed
+    with pytest.raises(RuntimeError, match=r"candidate schema smoke probe failed with exit 1"):
+        releases.smoke_schemas(release, tmp_path / "profile")
     ran.clear()
     exit_code = 3
     with pytest.raises(RuntimeError, match=r"candidate schema smoke failed: cron/executions\.db schema is still"):
