@@ -251,11 +251,13 @@ class StreamTransportMixin:
             return
         if getattr(type(self.adapter), "abandon_open_draft", None) is None:
             return
-        self._native_stream_abandoned = True
         try:
             result = await self.adapter.abandon_open_draft(
                 self.chat_id, self._last_sent_text or self._clean_for_display(self._accumulated),
                 metadata={**(self._draft_metadata() or {}), "_draft_id": self._draft_id})
+            if not getattr(result, "success", False):
+                return
+            self._native_stream_abandoned = True
             if reconcile and getattr(result, "success", False) and getattr(result, "message_id", None):
                 # A sealed preview is editable, not yet a confirmed final.
                 self._message_id = result.message_id

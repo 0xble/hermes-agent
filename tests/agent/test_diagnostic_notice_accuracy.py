@@ -52,13 +52,14 @@ def shared_outage(monkeypatch):
     return agent_with
 
 
-def test_fallback_notice_with_a_past_reset_says_recovering(shared_outage):
+def test_fallback_notice_with_a_past_reset_does_not_claim_active_recovery(shared_outage):
     agent = shared_outage(time.time() - 180)
     use_generic, notice = _rate_limit_fallback_notice(
         agent, FailoverReason.rate_limit, False, "gpt-6.1-sol", "claude-opus-5-5", "custom:claude-proxy")
     assert use_generic is False
-    assert notice == ("⚠️ gpt-6.1-sol was rate-limited and is recovering; using claude-opus-5-5 via "
-                      "custom:claude-proxy until it is back.")
+    assert notice == ("⚠️ gpt-6.1-sol was rate-limited; using claude-opus-5-5 via "
+                      "custom:claude-proxy while the primary is rechecked.")
+    assert "until it is back" not in notice
 
 
 def test_fallback_notice_with_a_future_reset_names_it(shared_outage):

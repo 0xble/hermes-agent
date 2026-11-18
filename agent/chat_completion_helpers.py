@@ -2203,10 +2203,10 @@ def _rate_limit_fallback_notice(agent, reason, shared_adoption, old_model, fb_mo
             except (KeyError, TypeError, ValueError, OSError, OverflowError):
                 reset_at, reset_label = None, "the cooldown expiry"
             if reset_at is not None and reset_at <= time.time():
-                # The recorded reset already passed (a stale outage record): an "until <past time>"
-                # reads as wrong; the primary is due back and is probed again.
-                return False, (f"⚠️ {old_model} was {state} and is recovering; using {fb_model} via "
-                               f"{fb_provider} until it is back.")
+                # The recorded reset already passed. Do not imply an active
+                # recovery window or promise that the primary is back.
+                return False, (f"⚠️ {old_model} was {state}; using {fb_model} via "
+                               f"{fb_provider} while the primary is rechecked.")
             return False, f"⚠️ {old_model} is {state} until {reset_label}; using {fb_model} via {fb_provider} until then."
         if announced_fallback(route, outage_id) == target:
             return False, None
