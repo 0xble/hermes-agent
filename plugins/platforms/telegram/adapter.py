@@ -401,7 +401,7 @@ def _strip_mdv2(text: str) -> str:
 
 from plugins.platforms.telegram.telegram_chunking import (
     separate_chunk_indicator_from_fence as _separate_chunk_indicator_from_fence, split_formatted_mdv2, split_raw_carrying_emphasis)
-from plugins.platforms.telegram.telegram_split import _strip_mdv2, quotable_text
+from plugins.platforms.telegram.telegram_split import _strip_mdv2, quotable_text, split_reply_anchor
 
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
@@ -4587,6 +4587,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         requested_thread_id = self._message_thread_id_for_send(thread_id)
         used_thread_fallback = False
         prior = len(delivered)
+        reply_to = split_reply_anchor(self, chat_id, reply_to, metadata, prior + len(chunks))
         confirmed_at = None
         for chunk in chunks:
             if (delivered and current_outbound_class() == OUTBOUND_TOOL_PROGRESS
