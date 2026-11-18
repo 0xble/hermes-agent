@@ -13,6 +13,11 @@ from pathlib import Path
 import threading
 from typing import Iterator
 
+try:  # POSIX only; other platforms fall back to the in-process lock.
+    import fcntl
+except ImportError:  # pragma: no cover - non-POSIX
+    fcntl = None
+
 logger = logging.getLogger(__name__)
 
 _CALLER_SURFACE: ContextVar[str] = ContextVar("web_search_caller_surface", default="assistant_tool_call")
@@ -56,12 +61,32 @@ def _session_identity(session_id: str | None) -> tuple[str, str, str]:
         root = delegated_child_root_session_id()
     except (ImportError, LookupError, RuntimeError) as exc:
         logger.debug("web_search attribution: delegation context unavailable: %s", exc)
-    return sid, parent, root
+    # A session outside any delegation chain is its own root.
+    return sid, parent, root or sid
 
 
 def _log_path() -> Path:
     from hermes_constants import get_hermes_home
     return get_hermes_home() / "logs" / "web_search_calls.jsonl"
+
+
+@contextlib.contextmanager
+def _interprocess_lock(path: Path) -> Iterator[None]:
+    """Serialize append and rotation across CLI, gateway, cron and child processes."""
+    with _WRITE_LOCK, path.with_name(f"{path.name}.lock").open("a") as handle:
+        locked = False
+        if fcntl is not None:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+                locked = True
+            except OSError as exc:
+                logger.debug("web_search attribution: file lock unavailable: %s", exc)
+        try:
+            yield
+        finally:
+            if locked and fcntl is not None:
+                with contextlib.suppress(OSError):
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
 
 def _rotate_if_needed(path: Path) -> None:
@@ -74,8 +99,8 @@ def _rotate_if_needed(path: Path) -> None:
             with contextlib.suppress(OSError):
                 path.with_name(f"{path.name}.{index}").replace(path.with_name(f"{path.name}.{index + 1}"))
         path.replace(path.with_name(f"{path.name}.1"))
-    except OSError:
-        pass
+    except OSError as exc:
+        logger.debug("web_search attribution: rotation skipped: %s", exc)
 
 
 def record_search_call(
@@ -110,7 +135,7 @@ def record_search_call(
         path = _log_path()
         path.parent.mkdir(parents=True, exist_ok=True)
         line = json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n"
-        with _WRITE_LOCK:
+        with _interprocess_lock(path):
             _rotate_if_needed(path)
             with path.open("a", encoding="utf-8") as handle:
                 handle.write(line)
@@ -126,11 +151,13 @@ def summarize_records(path: str | os.PathLike[str]) -> list[dict]:
         for line in handle:
             try:
                 row = json.loads(line)
-                day = str(row.get("timestamp", ""))[:10]
-                key = (day, str(row.get("caller_surface", "")), str(row.get("root_session_id", "")), str(row.get("cache_outcome", "")))
-                counts[key] += 1
             except (json.JSONDecodeError, TypeError):
                 continue
+            if not isinstance(row, dict):
+                continue
+            day = str(row.get("timestamp", ""))[:10]
+            key = (day, str(row.get("caller_surface", "")), str(row.get("root_session_id", "")), str(row.get("cache_outcome", "")))
+            counts[key] += 1
     return [
         {"day": day, "caller_surface": surface, "root_session_id": root, "cache_outcome": outcome, "calls": count}
         for (day, surface, root, outcome), count in sorted(counts.items())

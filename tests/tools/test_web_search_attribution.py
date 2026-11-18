@@ -192,3 +192,48 @@ def test_guidance_never_blocks_a_large_fan_out(_isolated):
     for index in range(12):
         assert web_tools._memoized_search(provider, f"templated query {index}", 5, session_id="s")["success"]
     assert provider.calls == 12 and len(_records(_isolated)) == 12
+
+
+def test_top_level_session_is_its_own_root(_isolated):
+    web_tools._memoized_search(_FakeProvider(), "top level", 5, session_id="sess-top")
+    (record,) = _records(_isolated)
+    assert record["session_id"] == "sess-top"
+    assert record["root_session_id"] == "sess-top"
+    assert record["parent_session_id"] == ""
+
+
+def test_concurrent_processes_never_lose_or_tear_records(_isolated):
+    import multiprocessing
+
+    ctx = multiprocessing.get_context("spawn")
+    workers = [ctx.Process(target=_write_records, args=(str(_isolated), n, 40)) for n in range(4)]
+    for worker in workers:
+        worker.start()
+    for worker in workers:
+        worker.join(60)
+        assert worker.exitcode == 0
+    records = _records(_isolated)
+    assert len(records) == 160
+    assert {r["session_id"] for r in records} == {f"proc-{n}" for n in range(4)}
+
+
+def _write_records(log_path, n, count):
+    from pathlib import Path
+
+    import tools.web_search_attribution as attr
+
+    attr._log_path = lambda: Path(log_path)
+    for _ in range(count):
+        attr.record_search_call(
+            session_id=f"proc-{n}", provider="fake", search_type="auto", search_type_reason="lite_paused",
+            query="q", cache_outcome="miss", success=True,
+        )
+
+
+def test_summarizer_skips_non_object_json_lines(tmp_path):
+    log = tmp_path / "calls.jsonl"
+    good = {"timestamp": "2026-11-17T00:00:00+00:00", "caller_surface": "assistant_tool_call", "root_session_id": "r", "cache_outcome": "miss"}
+    log.write_text("null\n[1, 2]\n\"text\"\n" + json.dumps(good) + "\nnot json\n", encoding="utf-8")
+    assert attribution.summarize_records(log) == [
+        {"day": "2026-11-17", "caller_surface": "assistant_tool_call", "root_session_id": "r", "cache_outcome": "miss", "calls": 1}
+    ]
