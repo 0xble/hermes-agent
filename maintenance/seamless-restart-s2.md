@@ -1,6 +1,6 @@
 # Immutable releases (S2) — activation runbook
 
-Patch identity: `seamless-restart-s2`.
+Patch identities: `seamless-restart-s2`, `immutable-releases` (legacy trailer identity owned by this unit).
 
 ### PM worker deadlines and offline validation
 
