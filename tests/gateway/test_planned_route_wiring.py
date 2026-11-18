@@ -146,7 +146,13 @@ def test_stopped_gateway_refresh_reloads_the_written_definition_directly(monkeyp
     assert plist.read_text(encoding="utf-8") == "new"
 
 
-def test_stopped_gateway_start_refreshes_without_handover(monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    ("running_pid", "expected"),
+    [(None, {"use_planned_handover": False}), (1234, {"use_planned_handover": True})],
+)
+def test_gateway_start_selects_reload_route_from_liveness(
+    monkeypatch, tmp_path, running_pid, expected
+):
     plist = tmp_path / "gateway.plist"
     plist.write_text("current", encoding="utf-8")
     calls = []
@@ -158,7 +164,7 @@ def test_stopped_gateway_start_refreshes_without_handover(monkeypatch, tmp_path)
         _clear_launchd_unsupported_marker=lambda: None,
     )
     monkeypatch.setattr(launchd, "_gw", lambda: fake_gateway)
-    monkeypatch.setattr("gateway.status.get_running_pid", lambda: None)
+    monkeypatch.setattr("gateway.status.get_running_pid", lambda: running_pid)
     monkeypatch.setattr(
         "hermes_cli.gateway_service_owner.refuse_foreign_launchd_plist",
         lambda *_: None,
@@ -169,7 +175,7 @@ def test_stopped_gateway_start_refreshes_without_handover(monkeypatch, tmp_path)
 
     launchd._launchd_start_locked()
 
-    assert calls == [{"use_planned_handover": False}]
+    assert calls == [expected]
 
 
 def test_stopped_restart_forwards_direct_reload_to_the_locked_route(monkeypatch, tmp_path):
