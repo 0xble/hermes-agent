@@ -4,6 +4,7 @@ import subprocess
 import sys
 import venv
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -203,7 +204,9 @@ def test_activation_spends_one_shared_probe_budget(tmp_path, monkeypatch, caplog
     releases.promote(home, b)
     (home / "config.yaml").write_text("memory:\n  provider: hindsight\n", encoding="utf-8")
     clock = [100.0]
-    monkeypatch.setattr(preflight.time, "monotonic", lambda: clock[0])
+    # Patch this module's binding, not the shared stdlib time module: release
+    # acknowledgement may be polling concurrently and must keep its real clock.
+    monkeypatch.setattr(preflight, "time", SimpleNamespace(monotonic=lambda: clock[0]))
     real_run, budgets = subprocess.run, []
 
     def spend(command, **kwargs):
@@ -223,6 +226,19 @@ def test_activation_spends_one_shared_probe_budget(tmp_path, monkeypatch, caplog
     assert releases.read_pointer(home / "current") == a
     assert "budget exhausted" in caplog.text
     assert budgets == [0.75, 0.5, 0.25]
+
+
+def test_preflight_fake_clock_does_not_patch_release_wait_clock(tmp_path, monkeypatch):
+    from hermes_cli import immutable_release_preflight as preflight
+
+    clock = [100.0]
+    monkeypatch.setattr(preflight, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(releases, "acknowledge_running_release", lambda *args, **kwargs: False)
+    pending = tmp_path / "release-txn.json"
+    pending.write_text("{}", encoding="utf-8")
+
+    assert not releases.wait_for_release_acknowledgement(tmp_path, timeout_seconds=0.05)
+    assert clock == [100.0]
 
 
 @pytest.mark.parametrize("damage", ["unrelated-module", "absent", "broken-primary"])

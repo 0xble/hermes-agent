@@ -48,12 +48,10 @@ def _resolve_repo() -> Path:
 
 REPO = _resolve_repo()
 EXTENSION_TOOLS = ("goal_set", "loop_set", "review_candidate", "memory_undo", "memory_journal_list", "request_update")
-# key -> (expected, or None meaning "must be set"). Delegated children route through Advanced
-# Delegation's model_map and its default route (v0.23.1 retired ``delegation.model`` presets).
+# key -> (expected, or None meaning "must be set"). Delegation is checked separately because
+# legacy ``delegation.model`` and Advanced Delegation's model-map route are both supported.
 EXPECTED_CONFIG = {
     "memory.write_approval": "false",
-    "delegation.backend": "model_map",
-    "delegation.backends.model_map.default": None,
     "auxiliary.review.model": None,
 }
 # Fallback only: the accepted baseline is read from MAINTENANCE.md (scripts/ci/release_baseline.py),
@@ -403,6 +401,55 @@ def check_extensions(home: Path) -> list[str]:
     return failures
 
 
+def _config_get(python: Path, code_root: Path, env: dict[str, str], key: str, *, as_json: bool = False
+                ) -> tuple[subprocess.CompletedProcess[str], object]:
+    """Read one value through the release CLI, keeping config resolution in one place."""
+    command = [str(python), "-m", "hermes_cli.main", "config", "get", key]
+    if as_json:
+        command.append("--json")
+    run = subprocess.run(command, cwd=str(code_root), env=env,
+                         capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
+    stdout = run.stdout.strip()
+    if as_json:
+        try:
+            return run, json.loads(stdout)
+        except (json.JSONDecodeError, TypeError):
+            return run, stdout
+    return run, (stdout.splitlines() or [""])[-1].strip()
+
+
+def _is_set(run: subprocess.CompletedProcess[str], value: object) -> bool:
+    """Whether a CLI value is present, including list/mapping values parsed from all stdout."""
+    if run.returncode != 0 or value is None:
+        return False
+    if isinstance(value, (list, dict)):
+        return bool(value)
+    if not isinstance(value, str):
+        return bool(value)
+    return bool(value.strip()) and value.strip().lower() not in ("none", "null")
+
+
+def _model_map_route(default: object, options: object) -> tuple[bool, str]:
+    """Resolve the model-map default against the declared route options.
+
+    This mirrors ``tools.delegate_tool_routes.resolve_task_routes``'s runtime guard. The
+    advanced-delegation provider accepts a model route or a profile route, so either non-empty
+    field makes the selected option runnable.
+    """
+    if not isinstance(default, str) or not default.strip():
+        return False, f"default {default!r} is empty"
+    if not isinstance(options, list):
+        return False, f"default {default!r} has no declared options"
+    option = next((entry for entry in options
+                   if isinstance(entry, dict) and entry.get("name") == default), None)
+    if option is None:
+        return False, f"default {default!r} is not declared in delegation.backends.model_map.options"
+    if not (isinstance(option.get("model"), str) and option["model"].strip()) and not (
+            isinstance(option.get("profile"), str) and option["profile"].strip()):
+        return False, f"default {default!r} names an option without a non-empty model or profile"
+    return True, ""
+
+
 def check_config(home: Path) -> list[str]:
     failures: list[str] = []
     context = _runtime_context(home)
@@ -411,14 +458,33 @@ def check_config(home: Path) -> list[str]:
     python, code_root = context
     env = _runtime_env(home, code_root)
     for key, expected in EXPECTED_CONFIG.items():
-        run = subprocess.run([str(python), "-m", "hermes_cli.main", "config", "get", key], cwd=str(code_root), env=env,
-                             capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=120, check=False)
-        value = (run.stdout.strip().splitlines() or [""])[-1].strip()
+        run, value = _config_get(python, code_root, env, key)
         if expected is None:
-            if run.returncode != 0 or not value or value.lower() in ("none", "null", ""):
+            if not _is_set(run, value):
                 failures.append(f"config {key} is not set")
         elif value.lower() != expected.lower():
             failures.append(f"config {key} = {value!r}, expected {expected!r}")
+
+    # ``delegation.model`` is the legacy route. Advanced Delegation stores the selected
+    # provider and its effective default route separately; ask the same config resolver that
+    # the CLI uses instead of reading YAML or deleting the route requirement altogether.
+    legacy_run, legacy_model = _config_get(python, code_root, env, "delegation.model")
+    if not _is_set(legacy_run, legacy_model):
+        backend_run, backend = _config_get(python, code_root, env, "delegation.backend")
+        default_run, default_route = _config_get(python, code_root, env, "delegation.backends.model_map.default")
+        options_run, options = _config_get(
+            python, code_root, env, "delegation.backends.model_map.options", as_json=True)
+        if (_is_set(backend_run, backend) and isinstance(backend, str)
+                and backend.strip().lower() == "model_map" and _is_set(default_run, default_route)
+                and _is_set(options_run, options)):
+            resolved, reason = _model_map_route(default_route, options)
+            if not resolved:
+                failures.append(f"config delegation route is not resolvable: {reason}")
+        else:
+            failures.append(
+                "config delegation route is not resolvable: set delegation.model or "
+                "delegation.backend='model_map' with a non-empty default and declared options"
+            )
     return failures
 
 
