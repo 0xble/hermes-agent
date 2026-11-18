@@ -7,7 +7,7 @@ Canonical source: `/Users/brianle/Repos/hermes-agent`, published as
 Upstream is [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent),
 default branch `main`, remote `upstream-live`. Accepted release baseline:
 `v0.23.1`, `3b421578588243f920886e6fe79a6faa87ea026e`.
-Brian selected this release explicitly for the sync/v0.23.1-prep candidate.
+The live runtime reports code version `0.23.1` at deployment SHA `b3a9d8babd3920b6c8489486c37c21816e86139f`, whose upstream release ancestor is this accepted tag revision.
 Fork policy checks classify only changes beyond this immutable upstream baseline.
 The candidate still requires its exact-head full gate before draft publication.
 This source-preparation contract authorizes no landing, promotion, installation,
