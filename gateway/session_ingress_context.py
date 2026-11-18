@@ -276,8 +276,30 @@ def restore_provenance(runner, source, provenance):
     candidate = copy(source)
     candidate.delivered_via_upstream_relay = 'relay' in provenance
     adapter, home, runtime_home, expected = _binding(runner, candidate, provenance.get('transport_profile'))
+    # Before multiplexing, primary native envelopes had no transport_profile field.  The
+    # current primary binding spells the same slot as ``None`` (and some durable route
+    # records spell it ``default``).  Accept that legacy omission only after _binding has
+    # proved this is the primary home.  Named secondary profiles keep exact provenance
+    # equality so a missing field cannot cross a profile boundary.
     if provenance != expected:
-        raise RuntimeStoreError('profile_mismatch')
+        stored_profile = provenance.get('transport_profile')
+        expected_profile = expected.get('transport_profile')
+        primary_profile_equivalent = (
+            stored_profile in (None, 'default')
+            and expected_profile in (None, 'default')
+            and (stored_profile is None or 'transport_profile' not in provenance)
+            and (expected_profile is None or candidate.profile in (None, 'default')))
+        if primary_profile_equivalent:
+            stored_without_profile = {
+                key: value for key, value in provenance.items() if key != 'transport_profile'}
+            expected_without_profile = {
+                key: value for key, value in expected.items() if key != 'transport_profile'}
+            if stored_without_profile == expected_without_profile:
+                provenance = expected
+            else:
+                raise RuntimeStoreError('profile_mismatch')
+        else:
+            raise RuntimeStoreError('profile_mismatch')
     source.delivered_via_upstream_relay = candidate.delivered_via_upstream_relay
     source._transport_adapter_ref = weakref.ref(adapter)
     # Re-pin the identity ingress resolved: the drained turn's route records the receiving bot from it
