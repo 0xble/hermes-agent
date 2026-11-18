@@ -42,10 +42,10 @@ def isolated(monkeypatch):
     monkeypatch.setattr(local, "_sweep_stale_staging_dirs", lambda: None)
     monkeypatch.setattr(local, "_ensure_background_reaper", lambda: None)
     monkeypatch.setattr(local, "_resolve_owner", lambda task: task)
-    from tools.code_execution_tool import _kill_process_group
-    monkeypatch.setattr("tools.code_execution_tool._kill_process_group",
+    original_kill = local._kill_process_group
+    monkeypatch.setattr(local, "_kill_process_group",
                         lambda proc, **_: setattr(proc, "returncode", 0))
-    yield _kill_process_group
+    yield original_kill
     local.shutdown_all_kernels()
     remote.shutdown_all_remote_kernels()
 
@@ -146,7 +146,7 @@ def test_dead_process_is_reaped_before_idle_timeout():
 def spawn_stub(monkeypatch):
     proc = Process()
     killed = Mock(side_effect=lambda *_, **__: setattr(proc, "returncode", 0))
-    monkeypatch.setattr("tools.code_execution_tool._kill_process_group", killed)
+    monkeypatch.setattr(local, "_kill_process_group", killed)
     monkeypatch.setattr(local, "_rpc_forever", lambda *_, **__: None)
     monkeypatch.setattr(local, "_stdout_reader", lambda *_, **__: None)
     monkeypatch.setattr(local, "_stderr_reader", lambda *_, **__: None)

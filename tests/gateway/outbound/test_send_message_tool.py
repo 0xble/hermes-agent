@@ -812,7 +812,7 @@ class TestStandaloneTelegramRichMessages:
         monkeypatch.setattr("plugins.platforms.telegram.standalone._telegram_bot", lambda _token, extra=None: bot)
         # Discovery loads a profile-owned module namespace. Patch the registered sender's
         # actual bot seam as well as the canonical module used by direct helper tests.
-        from tools.send_message_senders import _plugin_standalone_sender
+        from gateway.outbound.senders import _plugin_standalone_sender
         sender, error = _plugin_standalone_sender("telegram")
         assert error is None
         monkeypatch.setitem(sender.__globals__, "_telegram_bot", lambda _token, extra=None: bot)
