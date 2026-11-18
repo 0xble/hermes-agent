@@ -44,7 +44,11 @@ MAX_VALUE_CHARS = 256 * 1024
 MAX_KEYS = 512
 MAX_TOTAL_CHARS = 2 * 1024 * 1024
 _LOCK_STALE_S = 10.0
+_LOCK_MAX_AGE_S = 10 * 60.0
+_LOCK_WAIT_S = 30.0
 _LOCK_POLL_S = 0.02
+_monotonic = time.monotonic
+_sleep = time.sleep
 
 
 class PreferencesError(ValueError):
@@ -144,12 +148,21 @@ def _owns(lock_dir: Path, token: str) -> bool:
         return False
 
 
-def _owner_pid(lock_dir: Path) -> Optional[int]:
+def _owner_token(lock_dir: Path) -> Optional[str]:
     try:
-        raw = _owner_file(lock_dir).read_text(encoding="utf-8-sig").split("-", 1)[0]
-        pid = int(raw)
-    except (OSError, ValueError):
+        return _owner_file(lock_dir).read_text(encoding="utf-8-sig")
+    except OSError:
         return None
+
+
+def _owner_pid(lock_dir: Path) -> Optional[int]:
+    raw = _owner_token(lock_dir)
+    if raw is None:
+        return None
+    pid_field = raw.split("-", 1)[0]
+    if not pid_field.isdigit():
+        return None
+    pid = int(pid_field)
     return pid if pid > 0 else None
 
 
@@ -163,24 +176,44 @@ def _pid_is_alive(pid: Optional[int]) -> bool:
     return _pid_exists(pid)
 
 
-def _break_if_stale(lock_dir: Path) -> None:
-    """Atomically quarantine a lock whose recorded owner is no longer alive."""
-    pid = _owner_pid(lock_dir)
-    if _pid_is_alive(pid):
-        return
+def _owner_is_live(lock_dir: Path) -> bool:
+    return _pid_is_alive(_owner_pid(lock_dir))
+
+
+def _owner_age(lock_dir: Path) -> Optional[float]:
     try:
-        stale = time.time() - lock_dir.stat().st_mtime > _LOCK_STALE_S
+        return time.time() - _owner_file(lock_dir).stat().st_mtime
+    except FileNotFoundError:
+        return None
+
+
+def _break_if_stale(lock_dir: Path) -> None:
+    """Atomically quarantine a lock whose owner is dead or whose age backstop expired."""
+    judged_owner = _owner_token(lock_dir)
+    pid = _owner_pid(lock_dir)
+    age = _owner_age(lock_dir)
+    if _owner_is_live(lock_dir) and (age is None or age <= _LOCK_MAX_AGE_S):
+        return
+    if pid is None and (age is None or age <= _LOCK_STALE_S):
+        return
+
+    abandoned = lock_dir.with_name(f"{lock_dir.name}.stale-{os.getpid()}-{secrets.token_hex(4)}")
+    try:
+        os.rename(lock_dir, abandoned)
     except FileNotFoundError:
         return
-    if pid is not None or stale:
-        abandoned = lock_dir.with_name(f"{lock_dir.name}.stale-{os.getpid()}-{secrets.token_hex(4)}")
+    except OSError:
+        return
+
+    # A holder can update its owner file between our liveness check and rename. Do not discard
+    # a takeover we did not judge; restore it when possible and make the waiter retry.
+    if _owner_token(abandoned) != judged_owner:
         try:
-            os.rename(lock_dir, abandoned)
-        except FileNotFoundError:
-            return
-        except OSError:
-            return
-        shutil.rmtree(abandoned, ignore_errors=True)
+            os.rename(abandoned, lock_dir)
+        except FileExistsError:
+            pass
+        raise PreferencesBusy("preferences store is busy")
+    shutil.rmtree(abandoned, ignore_errors=True)
 
 
 @contextmanager
@@ -189,13 +222,16 @@ def _store_lock(path: Path) -> Iterator[Callable[[], bool]]:
     ``owner`` file names the holder."""
     lock_dir = path.with_name(path.name + ".lock")
     token = f"{os.getpid()}-{secrets.token_hex(8)}"
+    started = _monotonic()
     while True:
         try:
             os.mkdir(lock_dir)
             break
         except FileExistsError:
+            if _monotonic() - started >= _LOCK_WAIT_S:
+                raise PreferencesBusy("preferences store is busy")
             _break_if_stale(lock_dir)
-            time.sleep(_LOCK_POLL_S)
+            _sleep(_LOCK_POLL_S)
     try:
         _owner_file(lock_dir).write_text(token, encoding="utf-8")
         yield lambda: _owns(lock_dir, token)

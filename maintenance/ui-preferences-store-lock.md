@@ -7,20 +7,34 @@ native Desktop and Webapp writers.
 
 Fork patch identity: `ui-preferences-store-lock`.
 
-A writer waits for a live lock owner to release the directory, regardless of
-wall-clock duration. Stale recovery checks the owner PID and atomically renames
-an abandoned lock aside before removing it, so competing stale recoverers cannot
-remove a newly acquired lock.
+A writer waits for a live lock owner to release the directory, with a generous
+30-second overall backstop for a stuck writer. The backstop is not a contention
+retry or flake fix: it preserves the existing poll interval and fails with
+`PreferencesBusy`/`preferences store is busy` rather than waiting forever.
+Stale recovery checks the owner PID while both writers reclaim a
+live-looking owner whose owner file is older than ten minutes. The age backstop
+is the shared protection against PID reuse. Old `<pid>-<random>` tokens remain
+readable during rolling upgrades. Stale locks are atomically renamed aside
+before removal, with a post-rename owner check so a concurrent takeover is
+treated as busy.
+
+PID liveness is platform-dependent: zombies are treated as dead by the Python
+gateway helper, and PID namespaces can make a PID visible in one process and
+not another. The age backstop remains the protection when a start identity is
+unavailable or a PID has been recycled.
 
 ## Contract Tests
 
-Contract tests: `tests/hermes_cli/test_ui_preferences.py::test_lock_waits_for_a_slow_holder_instead_of_failing_after_a_wall_clock_budget`
+Contract tests: the live-owner, dead-PID, age-backstop and bounded-wait cases in
+`tests/hermes_cli/test_ui_preferences.py`, plus the matching cases in
+`apps/desktop/electron/ui-preferences.test.ts`.
 
 ## Verification
 
-Run `env -u HERMES_HOME TMPDIR=/private/tmp/x.XXXX /Users/brianle/Repos/hermes-agent/.venv/bin/python -m pytest tests/hermes_cli/test_ui_preferences.py -p no:cacheprovider -o addopts=''`.
-Run the focused Electron `ui-preferences.test.ts` suite through the desktop
-package's `test:desktop:platforms` script.
+Run `env -u HERMES_HOME -u __HERMES_ACTIVATED bash scripts/run_tests.sh
+--file-retries 0 tests/hermes_cli/test_ui_preferences.py`.
+Run `cd apps/desktop && pnpm exec vitest run --project electron
+ electron/ui-preferences.test.ts` and the changed-file ESLint check.
 
 ## Retirement And Rollback
 

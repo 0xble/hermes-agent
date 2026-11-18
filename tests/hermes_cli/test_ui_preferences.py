@@ -12,6 +12,7 @@ import json
 import multiprocessing
 import os
 import threading
+import time
 
 import pytest
 from fastapi.testclient import TestClient
@@ -89,24 +90,21 @@ def test_an_unreadable_or_corrupt_store_is_never_merged_over(tmp_path):
     assert after["generation"] != kept["generation"]
 
 
-def test_lock_waits_for_a_slow_holder_instead_of_failing_after_a_wall_clock_budget(tmp_path, monkeypatch):
+def test_lock_waits_for_a_live_holder_and_keeps_the_lock_unchanged_until_release(tmp_path, monkeypatch):
     """A live holder must release a waiter; contention is not data loss."""
     path = tmp_path / "ui-preferences.json"
     lock_dir = path.with_name(path.name + ".lock")
+    owner = lock_dir / "owner"
     lock_dir.mkdir()
-    (lock_dir / "owner").write_text(str(os.getpid()))
+    owner.write_text(str(os.getpid()))
     seen_existing = threading.Event()
     original_break_if_stale = ui_preferences._break_if_stale
 
-    def observe_break(lock_dir):
+    def observe_break(existing_lock_dir):
         seen_existing.set()
-        return original_break_if_stale(lock_dir)
+        return original_break_if_stale(existing_lock_dir)
 
     monkeypatch.setattr(ui_preferences, "_break_if_stale", observe_break)
-    # The base implementation's wall-clock budget is forced to expire immediately. The fixed
-    # implementation waits for the owner PID's release instead of treating contention as failure.
-    clock = iter((0.0, 4.0))
-    monkeypatch.setattr(ui_preferences.time, "monotonic", lambda: next(clock))
     errors = []
 
     def wait_write():
@@ -118,13 +116,63 @@ def test_lock_waits_for_a_slow_holder_instead_of_failing_after_a_wall_clock_budg
     waiter = threading.Thread(target=wait_write)
     waiter.start()
     assert seen_existing.wait(10)
-    (lock_dir / "owner").unlink()
+    time.sleep(0.1)  # Several unchanged polls, without patching the stdlib clock globally.
+    assert waiter.is_alive()
+    assert lock_dir.is_dir()
+    assert owner.read_text() == str(os.getpid())
+    assert not errors
+
+    owner.unlink()
     lock_dir.rmdir()
     waiter.join(10)
 
     assert not waiter.is_alive()
     assert not errors
     assert ui_preferences.read_preferences(path)["values"] == {"hermes.desktop.waiter": "released"}
+
+
+def test_lock_reclaims_a_dead_pid(tmp_path):
+    path = tmp_path / "ui-preferences.json"
+    lock_dir = path.with_name(path.name + ".lock")
+    lock_dir.mkdir()
+    (lock_dir / "owner").write_text("2147483647-dead")
+
+    written = ui_preferences.write_preferences({"hermes.desktop.reclaimed": "yes"}, path=path)
+
+    assert written["values"] == {"hermes.desktop.reclaimed": "yes"}
+    assert not lock_dir.exists()
+
+
+def test_lock_reclaims_a_live_pid_when_the_owner_age_backstop_expires(tmp_path):
+    path = tmp_path / "ui-preferences.json"
+    lock_dir = path.with_name(path.name + ".lock")
+    owner = lock_dir / "owner"
+    lock_dir.mkdir()
+    owner.write_text(str(os.getpid()))
+    old = time.time() - ui_preferences._LOCK_MAX_AGE_S - 1
+    os.utime(owner, (old, old))
+
+    written = ui_preferences.write_preferences({"hermes.desktop.reclaimed": "old"}, path=path)
+
+    assert written["values"] == {"hermes.desktop.reclaimed": "old"}
+    assert not lock_dir.exists()
+
+
+def test_lock_backstop_raises_preferences_busy_without_waiting(tmp_path, monkeypatch):
+    path = tmp_path / "ui-preferences.json"
+    lock_dir = path.with_name(path.name + ".lock")
+    owner = lock_dir / "owner"
+    lock_dir.mkdir()
+    owner.write_text(str(os.getpid()))
+    clock = iter((0.0, ui_preferences._LOCK_WAIT_S + 1))
+    monkeypatch.setattr(ui_preferences, "_monotonic", lambda: next(clock))
+    monkeypatch.setattr(ui_preferences, "_sleep", lambda _seconds: None)
+
+    with pytest.raises(ui_preferences.PreferencesBusy, match="preferences store is busy"):
+        ui_preferences.write_preferences({"hermes.desktop.stuck": "yes"}, path=path)
+
+    assert lock_dir.is_dir()
+    assert owner.read_text() == str(os.getpid())
 
 
 def test_writes_merge_per_key_and_concurrent_writers_keep_each_others_keys(tmp_path):

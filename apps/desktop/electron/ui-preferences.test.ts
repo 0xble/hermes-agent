@@ -5,7 +5,7 @@ import os from 'node:os'
 import path from 'node:path'
 import { promisify } from 'node:util'
 
-import { afterEach, test } from 'vitest'
+import { afterEach, test, vi } from 'vitest'
 
 import { resolveDesktopHermesHome } from './data-paths'
 import { readUiPreferences, uiPreferencesPath, uiPreferencesRoot, writeUiPreferences } from './ui-preferences'
@@ -96,6 +96,62 @@ test('a custom home inside the default home resolves the same store on both side
   assert.equal(fs.realpathSync(path.dirname(pythonFile)), fs.realpathSync(path.dirname(electronFile)))
 })
 
+test('a live-owner lock stays pending and unchanged until the owner releases it', async () => {
+  const root = scratchHome()
+  const file = uiPreferencesPath(root)
+  const lockDir = `${file}.lock`
+  const owner = path.join(lockDir, 'owner')
+  fs.mkdirSync(lockDir)
+  fs.writeFileSync(owner, String(process.pid))
+
+  let settled = false
+  const pending = writeUiPreferences(file, { values: { 'hermes.desktop.waiter': 'released' } }).finally(() => {
+    settled = true
+  })
+
+  await new Promise(resolve => setTimeout(resolve, 100))
+  assert.equal(settled, false)
+  assert.equal(fs.readFileSync(owner, 'utf8'), String(process.pid))
+  assert.equal(fs.existsSync(lockDir), true)
+
+  fs.rmSync(lockDir, { force: true, recursive: true })
+  await pending
+  assert.equal(readUiPreferences(file).values['hermes.desktop.waiter'], 'released')
+})
+
+test('a dead-pid lock is reclaimed', async () => {
+  const root = scratchHome()
+  const file = uiPreferencesPath(root)
+  const lockDir = `${file}.lock`
+  fs.mkdirSync(lockDir)
+  fs.writeFileSync(path.join(lockDir, 'owner'), '2147483647-dead')
+
+  const written = await writeUiPreferences(file, { values: { 'hermes.desktop.reclaimed': 'yes' } })
+
+  assert.equal(written.values['hermes.desktop.reclaimed'], 'yes')
+  assert.equal(fs.existsSync(lockDir), false)
+})
+
+test('a live owner hits the bounded backstop and does not wedge later writes', async () => {
+  vi.useFakeTimers()
+  const root = scratchHome()
+  const file = uiPreferencesPath(root)
+  const lockDir = `${file}.lock`
+  fs.mkdirSync(lockDir)
+  fs.writeFileSync(path.join(lockDir, 'owner'), String(process.pid))
+
+  try {
+    const pending = writeUiPreferences(file, { values: { 'hermes.desktop.stuck': 'yes' } })
+    await vi.advanceTimersByTimeAsync(30_001)
+    await assert.rejects(pending, /preferences store is busy/)
+  } finally {
+    fs.rmSync(lockDir, { force: true, recursive: true })
+    vi.useRealTimers()
+  }
+
+  const written = await writeUiPreferences(file, { values: { 'hermes.desktop.afterBusy': 'yes' } })
+  assert.equal(written.values['hermes.desktop.afterBusy'], 'yes')
+})
 test('concurrent native and Webapp writers keep every key the other wrote', async () => {
   const home = scratchHome()
   const root = path.join(home, 'root')

@@ -25,6 +25,8 @@ const MAX_VALUE_CHARS = 256 * 1024
 const MAX_KEYS = 512
 const MAX_TOTAL_CHARS = 2 * 1024 * 1024
 const LOCK_STALE_MS = 10_000
+const LOCK_MAX_AGE_MS = 10 * 60_000
+const LOCK_WAIT_MS = 30_000
 const LOCK_POLL_MS = 20
 const WATCH_INTERVAL_MS = 1500
 
@@ -169,18 +171,31 @@ const sleep = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
 
 const ownerFile = (lockDir: string) => path.join(lockDir, 'owner')
 
-async function owns(lockDir: string, token: string): Promise<boolean> {
+async function ownerToken(lockDir: string): Promise<string | null> {
   return fs.promises.readFile(ownerFile(lockDir), 'utf8').then(
-    owner => owner === token,
-    () => false
+    owner => owner.replace(/^\uFEFF/, ''),
+    () => null
   )
 }
 
 async function ownerPid(lockDir: string): Promise<number | null> {
-  const raw = await fs.promises.readFile(ownerFile(lockDir), 'utf8').catch(() => '')
-  const pid = Number.parseInt(raw.split('-', 1)[0] ?? '', 10)
+  const raw = await ownerToken(lockDir)
+  const pidField = raw?.split('-', 1)[0] ?? ''
 
-  return Number.isInteger(pid) && pid > 0 ? pid : null
+  if (!/^\d+$/.test(pidField)) {
+    return null
+  }
+
+  const pid = Number(pidField)
+
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null
+}
+
+async function owns(lockDir: string, token: string): Promise<boolean> {
+  return fs.promises.readFile(ownerFile(lockDir), 'utf8').then(
+    owner => owner.replace(/^\uFEFF/, '') === token,
+    () => false
+  )
 }
 
 function pidIsAlive(pid: number | null): boolean {
@@ -198,18 +213,19 @@ function pidIsAlive(pid: number | null): boolean {
 }
 
 async function breakIfStale(lockDir: string): Promise<void> {
+  const judgedOwner = await ownerToken(lockDir)
   const pid = await ownerPid(lockDir)
 
-  if (pidIsAlive(pid)) {
-    return
-  }
-
-  const mtime = await fs.promises.stat(lockDir).then(
-    stat => stat.mtimeMs,
+  const ownerAge = await fs.promises.stat(ownerFile(lockDir)).then(
+    stat => Date.now() - stat.mtimeMs,
     () => null
   )
 
-  if (pid === null && (mtime === null || Date.now() - mtime <= LOCK_STALE_MS)) {
+  if (pidIsAlive(pid) && (ownerAge === null || ownerAge <= LOCK_MAX_AGE_MS)) {
+    return
+  }
+
+  if (pid === null && (ownerAge === null || ownerAge <= LOCK_STALE_MS)) {
     return
   }
 
@@ -217,12 +233,19 @@ async function breakIfStale(lockDir: string): Promise<void> {
 
   try {
     await fs.promises.rename(lockDir, abandoned)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      return
+  } catch {
+    return
+  }
+
+  // Re-read after quarantine: if the owner changed during the liveness check, preserve that takeover.
+  if ((await ownerToken(abandoned)) !== judgedOwner) {
+    try {
+      await fs.promises.rename(abandoned, lockDir)
+    } catch {
+      // Another contender already owns the original name; either way this write must not proceed.
     }
 
-    return
+    throw new Error('preferences store is busy')
   }
 
   await fs.promises.rm(abandoned, { force: true, recursive: true }).catch(() => undefined)
@@ -234,6 +257,7 @@ async function breakIfStale(lockDir: string): Promise<void> {
 async function withStoreLock<T>(file: string, run: (stillOurs: () => Promise<boolean>) => Promise<T>): Promise<T> {
   const lockDir = `${file}.lock`
   const token = `${process.pid}-${randomBytes(8).toString('hex')}`
+  const started = Date.now()
 
   for (;;) {
     try {
@@ -243,6 +267,11 @@ async function withStoreLock<T>(file: string, run: (stillOurs: () => Promise<boo
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
         throw error
+      }
+
+      // This is only a backstop for a genuinely stuck writer, not the contention/flakiness fix.
+      if (Date.now() - started >= LOCK_WAIT_MS) {
+        throw new Error('preferences store is busy')
       }
 
       await breakIfStale(lockDir)
