@@ -49,7 +49,7 @@ from plugins.platforms.telegram.chat_budget import (
 from gateway.platforms._shared import (
     decode_json_list_literal as _decode_json_list_literal,
     extra_or_secret as _extra_or_secret, get_scoped_secret as _get_scoped_secret,
-    platform_gate_env as _scoped_gate_env,
+    mark_live_gate_baseline, platform_gate_env as _scoped_gate_env,
 )
 
 
@@ -172,7 +172,7 @@ from gateway.config import Platform, PlatformConfig, normalize_telegram_rich_mes
 from gateway.platforms.typing_state import call_typing_with_metadata
 from agent.i18n import get_language, t
 from gateway.platforms.base import (
-    BasePlatformAdapter, ExecApprovalPrompt, SendResult, classify_send_error, unauthorized_action_notice,
+    BasePlatformAdapter, ExecApprovalPrompt, SendResult, unauthorized_action_notice,
     cache_image_from_bytes_async, cache_audio_from_bytes_async, cache_video_from_bytes_async, resolve_proxy_url, safe_proxy_url_for_log, describe_proxy_error, SUPPORTED_VIDEO_TYPES,
     SUPPORTED_DOCUMENT_TYPES, SUPPORTED_IMAGE_DOCUMENT_TYPES, _TEXT_INJECT_EXTENSIONS, utf16_len, env_proxy_for_redaction, in_ingress_consumer,
     OUTBOUND_NOTICE, OUTBOUND_PROGRESS, OUTBOUND_TOOL_PROGRESS, SEND_SHED_BY_BUDGET, current_outbound_class,
@@ -220,6 +220,7 @@ from plugins.platforms.telegram.telegram_ingress import TelegramContactMixin
 from plugins.platforms.telegram.telegram_replacement import TelegramReplacementMixin
 from plugins.platforms.telegram.telegram_polling_probe import TelegramPendingProbeMixin
 from plugins.platforms.telegram.telegram_intake import effective_update_message
+from plugins.platforms.telegram.telegram_live_gates import env_allowlist_decision, refresh_telegram_gates
 from plugins.platforms.telegram.telegram_media_group import (
     add_item_note, flush_media_group_event, queue_media_group_event, tracking_album_items)
 from plugins.platforms.telegram.telegram_media_retry import unconfirmed_media_result as _unconfirmed
@@ -232,18 +233,21 @@ from plugins.platforms.telegram.telegram_text_photo_pairing import (
 from plugins.platforms.telegram.telegram_media_flood import TelegramMediaFloodMixin
 from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id, parse_send_target, parse_telegram_message_id
 from plugins.platforms.telegram.telegram_resolved_prompt import edit_keeping_prompt
-from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, log_resolved, tap_matches_prompt
+from plugins.platforms.telegram.telegram_clarify_binding import ClarifyPrompt, tap_matches_prompt
+from plugins.platforms.telegram.telegram_clarify_multi import handle_multi_token, multi_prompt_extras, resolve_clarify_choice
 from plugins.platforms.telegram.telegram_topic_transfer import TopicTransferFn, apply_root_dm_topic_transfer
 from gateway.approval_actor import picker_refusal, update_prompt_refusal
-from gateway.platforms.helpers import caption_is_command, hand_off_split, prompt_id_counter, tag_safe_display_name
+from gateway.platforms.helpers import caption_is_command, hand_off_split, hash_for_log, prompt_id_counter, tag_safe_display_name
 from plugins.platforms.telegram.telegram_draft_budget import claim_ai_action
 from plugins.platforms.telegram.callback_answer import TOAST_LIMIT as _TOAST_LIMIT, answer_callback, answer_or_note, refuse_tap
 from plugins.platforms.telegram.telegram_network import (
-    SEED_FALLBACK_IPS, TelegramFallbackTransport, build_ptb_requests, discover_fallback_ips, parse_fallback_ip_env,
-    proxy_target_hosts, telegram_verify)
+    SEED_FALLBACK_IPS, TelegramFallbackTransport, bot_api_urls, build_ptb_requests, discover_fallback_ips,
+    parse_fallback_ip_env, proxy_target_hosts, telegram_verify)
 from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
 from plugins.platforms.telegram.telegram_send_path_recovery import mark_send_path_recovered
-from plugins.platforms.telegram.telegram_send_errors import LOST, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind
+from plugins.platforms.telegram.telegram_flood_cooldown import TelegramFloodCooldownMixin, land_persisted_state
+from plugins.platforms.telegram.telegram_vault_code import TelegramVaultCodeMixin
+from plugins.platforms.telegram.telegram_send_errors import LOST, classify_send_exception, explain_username_chat_not_found, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind, FLOOD, UNSENT
 from plugins.platforms.telegram.telegram_send_errors import rich_failure_result
 from plugins.platforms.telegram.telegram_voice_mention import admit_media, cache_inbound_voice
 from plugins.platforms.telegram.telegram_typing_gate import typing_may_fire
@@ -397,7 +401,7 @@ def _strip_mdv2(text: str) -> str:
 
 from plugins.platforms.telegram.telegram_chunking import (
     separate_chunk_indicator_from_fence as _separate_chunk_indicator_from_fence, split_formatted_mdv2, split_raw_carrying_emphasis)
-from plugins.platforms.telegram.telegram_split import _strip_mdv2
+from plugins.platforms.telegram.telegram_split import _strip_mdv2, quotable_text
 
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
@@ -846,6 +850,7 @@ class _PollingStallError(RuntimeError):
 
 class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramContactMixin, TelegramHeldInboundMixin,
                       TelegramReplacementMixin, TelegramTopicRoutingMixin, TelegramPendingProbeMixin, TelegramMediaFloodMixin,
+                      TelegramVaultCodeMixin, TelegramFloodCooldownMixin,
                       BasePlatformAdapter):
     """Telegram bot adapter: users/groups, MarkdownV2 replies, forum topics, media."""
 
@@ -944,6 +949,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
+        self._anchor_multipart_replies: bool = self._coerce_bool_extra("anchor_multipart_replies", True)  # #55059
         self._disable_link_previews: bool = self._coerce_bool_extra("disable_link_previews", False)
         # One policy for final sends and finalized edits. Booleans retain the
         # opt-in contract: true=auto, false=never. Safety guards still apply.
@@ -1075,6 +1081,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         self._approval_request_ids: dict[int, str] = {}  # approval id → tools.approval request id
         self._slash_confirm_state: dict[str, str] = {}  # confirm_id → session_key
         self._clarify_state: dict[str, ClarifyPrompt] = {}  # clarify_id → prompt bound to its sent message
+        self._clarify_multi: dict[str, set[int]] = {}  # clarify_id → checked indices (multi-select only)
         # "important" (default): only final responses, approvals and slash confirmations notify;
         # "all": every message notifies (display.platforms.telegram.notifications).
         self._notifications_mode: str = "important"
@@ -1166,14 +1173,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         auth_fn = getattr(runner, "_is_user_authorized", None)
         return auth_fn if callable(auth_fn) else None
 
-    @staticmethod
-    def _env_allowlist_decision(user_id: str) -> Optional[bool]:
-        """TELEGRAM_ALLOWED_USERS decision; None when no allowlist is configured."""
-        allowed_csv = _scoped_gate_env("TELEGRAM_ALLOWED_USERS").strip()
-        if not allowed_csv:
-            return None
-        allowed_ids = {uid.strip() for uid in allowed_csv.split(",") if uid.strip()}
-        return "*" in allowed_ids or user_id in allowed_ids
+    _env_allowlist_decision = staticmethod(env_allowlist_decision)
 
     def _is_callback_user_authorized(
         self, user_id: str, *, chat_id: Optional[str] = None, chat_type: Optional[str] = None,
@@ -1182,6 +1182,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         normalized_user_id = str(user_id or "").strip()
         if not normalized_user_id:
             return False
+        refresh_telegram_gates(self)
         normalized_chat_type = self._normalize_chat_type(chat_type, is_forum=thread_id is not None)
         # Preferred: the auth callback GatewayRunner injects (set_authorization_check) → full
         # _is_user_authorized chain; also works for a multiplexed adapter whose _message_handler is a
@@ -1292,6 +1293,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
         Only rejects when it can make the same context-aware decision the runner would; unknown DMs pass through when
         there is no allowlist or pairing is the unauthorized-DM behavior."""
+        refresh_telegram_gates(self)
         source = self._source_from_message_for_auth(message)
         user_id = source.user_id
         # No identity → service message or channel post without sender_chat; defer to message gating.
@@ -1825,15 +1827,19 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 or (isinstance(result.raw_response, dict) and bool(result.raw_response.get("delivery_uncertain"))))
 
     @staticmethod
-    async def _record_rich_sent(chat_id: Any, message_id: Any, content: str) -> None:
-        """Index rich content we sent: Telegram won't echo it back in reply_to_message.
+    async def _record_sent_text(chat_id: Any, message_id: Any, content: str) -> None:
+        """Index the text of a message we sent: Telegram does not echo a message body back in
+        ``reply_to_message``, so a later quote-reply can only be resolved from this index.
+
+        Covers BOTH send paths (rich ``sendRichMessage`` and legacy MarkdownV2 ``sendMessage``)
+        and the legacy finalize edit — anything the user can see and quote.
 
         Awaited so the store's read-modify-write + ``os.replace`` runs off the loop."""
-        try:
-            from gateway import rich_sent_store
-            await rich_sent_store.record_async(str(chat_id), str(message_id), content)
-        except Exception:
-            pass
+        from gateway import rich_sent_store
+        # The store never raises (a failed index write must not fail a send that landed), so its
+        # result is the only signal: a broken index silently degrades every later quote-reply.
+        if not await rich_sent_store.record_async(str(chat_id), str(message_id), content):
+            logger.warning("[Telegram] failed to index sent message %s for quote-reply recovery", message_id)
 
     async def _try_send_rich(
         self, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]]) -> Optional[SendResult]:
@@ -3483,6 +3489,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     def _source_for_platform_event_auth(self, update):
         """Route a supported update to its event-specific auth-source extractor (reactor / editor);
         raises ``ValueError`` for updates without one so the boundary fails closed."""
+        refresh_telegram_gates(self)
         if getattr(update, "message_reaction", None) is not None:
             return self._source_from_reaction_for_auth(update)
         edited = getattr(update, "edited_message", None)
@@ -3890,6 +3897,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         try:
             if not self._acquire_platform_lock('telegram-bot-token', self.config.token, 'Telegram bot token'):
                 return False
+            mark_live_gate_baseline(self)
             from plugins.platforms.telegram.update_admission import TelegramApplication, build_update_processor
             builder = Application.builder().token(self.config.token)
             builder.application_class(private_application_class(TelegramApplication), {"adapter": self})
@@ -4137,10 +4145,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 logger.warning("[%s] Error during Telegram disconnect: %s", self.name, _redact_telegram_error_text(e))
         self._app = None
         self._bot = None
-        # Land the last completed receipts before a replacement adapter reads them.
-        flush = getattr(self, "_update_receipt_flush", None)
-        if flush is not None and not flush.done():
-            await self._await_disconnect_step(asyncio.shield(flush), _DISCONNECT_STEP_TIMEOUT, "update-receipt flush")
+        await land_persisted_state(self)  # update receipts + flood windows, before a replacement reads them
         logger.info("[%s] Disconnected from Telegram", self.name)
 
     def _should_thread_reply(self, reply_to: Optional[str], chunk_index: int) -> bool:
@@ -4497,7 +4502,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # One chat at a time (held only around the API calls, never across the reconnect wait above), so
         # two concurrent split replies to one chat cannot interleave their chunks (#114396).
         async with self._chat_send_lock(chat_id):
-            return await self._send_text_locked(chat_id, content, reply_to, metadata)
+            result = await self._send_text_locked(chat_id, content, reply_to, metadata)
+        return explain_username_chat_not_found(result, chat_id)  # live sends bypass standalone_send
 
     async def _send_text_locked(
         self, chat_id: str, content: str, reply_to: Optional[str], metadata: Optional[dict[str, Any]]) -> SendResult:
@@ -4569,22 +4575,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 return as_file
             return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)
         except Exception as e:
-            classified = self._classify_send_exception(e, error_types)
+            classified = classify_send_exception(self, e)
             return self._with_partial_send(classified, chunks[len(delivered):], delivered, tail_certain=classified.retryable)
-
-    def _classify_send_exception(self, e: Exception, error_types: tuple) -> SendResult:
-        """The failed ``SendResult`` for an exception escaping the chunk loop. ``retryable`` doubles as
-        "non-delivery is certain": a plain ``TimedOut`` may have reached Telegram, so it is neither re-sent
-        by ``_send_with_retry`` nor resumed from; a wrapped ConnectTimeout / httpx pool timeout never left."""
-        safe_error = _redact_telegram_error_text(e)
-        logger.error("[%s] Failed to send Telegram message: %s", self.name, safe_error)
-        err_str = str(e).lower()
-        error_kind = classify_send_error(e)
-        # Content exceeded 4096 chars: fail so the stream consumer enters fallback mode.
-        if "message_too_long" in err_str or "too long" in err_str:
-            logger.debug("[%s] send() content too long, falling back to new-message continuation", self.name)
-            return SendResult(success=False, error="message_too_long", error_kind="too_long")
-        return _maybe_delivered_result(e, safe_error, error_kind=error_kind)
 
     async def _send_chunks(
         self, chat_id: str, chunks: list[str], delivered: list[str], reply_to: Optional[str],
@@ -4610,6 +4602,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             from gateway.reply_latency import record_transport_reply
             confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
             delivered.append(str(msg.message_id))
+            # Telegram echoes no body in ``reply_to_message``: a later quote-reply resolves only here.
+            await self._record_sent_text(chat_id, msg.message_id, quotable_text(chunk, mdv2=True))
         await self._retrigger_typing(chat_id, metadata)
         return SendResult(
             success=True, message_id=delivered[0] if delivered else None,
@@ -4656,7 +4650,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             try:
                 return await self._send_chunks(chat_id, list(undelivered), delivered, reply_to, metadata, error_types)
             except Exception as e:
-                classified = self._classify_send_exception(e, error_types)
+                classified = classify_send_exception(self, e)
                 return self._with_partial_send(
                     classified, list(undelivered)[len(delivered) - prior:], delivered, tail_certain=classified.retryable)
 
@@ -4845,6 +4839,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     return _flood_cap_result(remaining)
                 try:
                     await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
+                    await self._after_legacy_edit(chat_id, message_id, content, plain, finalize, _saturated_preview)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
@@ -5308,10 +5303,13 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             if choices:
                 # Full option text in the body (mobile truncates button labels); buttons keep numeric labels.
                 text += "\n\n" + "\n".join(f"{i + 1}. {_html.escape(str(c))}" for i, c in enumerate(choices))
-                # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
-                rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
-                rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
-                keyboard = InlineKeyboardMarkup(rows)
+                if multi := multi_prompt_extras(self, clarify_id, len(choices)):  # toggles + Send (#154195)
+                    text, keyboard = text + multi[0], multi[1]
+                else:
+                    # Telegram caps callback_data at 64 bytes; keep "cl:<id>:<idx>" short.
+                    rows = [[InlineKeyboardButton(str(idx + 1), callback_data=f"cl:{clarify_id}:{idx}")] for idx in range(len(choices))]
+                    rows.append([InlineKeyboardButton(t("platform.telegram.prompt.other"), callback_data=f"cl:{clarify_id}:other")])
+                    keyboard = InlineKeyboardMarkup(rows)
             return text, keyboard, lambda msg: self._clarify_state.__setitem__(clarify_id, ClarifyPrompt.from_sent(session_key, msg))
         return await self._send_prompt(
             "send_clarify", chat_id, metadata, build, parse_mode=ParseMode.HTML, thread_id=self._metadata_thread_id(metadata))
@@ -5839,7 +5837,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             from tools.approval import resolve_gateway_approval_card
             count = resolve_gateway_approval_card(session_key, choice, request_id,
                                                   actor_id=getattr(query.from_user, "id", ""), extra=self.config.extra)
-            logger.info("Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)", count, session_key, choice, user_display)
+            logger.info("Telegram button resolved %d approval(s) for session %s (choice=%s, user=%s)", count, session_key, choice, getattr(query.from_user, "id", None))
         except Exception as exc:
             logger.error("Failed to resolve gateway approval from Telegram button: %s", exc)
             count = 0
@@ -5924,7 +5922,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         if requester := clarify_refusal(clarify_id, getattr(query.from_user, "id", ""), extra=self.config.extra):
             return await answer_callback(query, refusal_text(requester)[:_TOAST_LIMIT], show_alert=True)
         user_display = getattr(query.from_user, "first_name", None) or t("platform.telegram.user_fallback")
+        if await handle_multi_token(self, query, clarify_id, choice_token, prompt, user_display):
+            return
         if choice_token == "other":
+            self._clarify_multi.pop(clarify_id, None)
             # Flip to text-capture (the next message resolves it); keep _clarify_state until then.
             flipped = False
             try:
@@ -5960,22 +5961,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         if resolved_text is None:
             # Race (timeout / session reset): echo the index so the agent sees an intentional response.
             resolved_text = f"choice {idx + 1}"
-        self._clarify_state.pop(clarify_id, None)
-        try:
-            from tools.clarify_gateway import resolve_gateway_clarify
-            resolved = resolve_gateway_clarify(clarify_id, resolved_text)
-        except Exception as exc:
-            logger.error("[%s] resolve_gateway_clarify failed: %s", self.name, exc)
-            resolved = False
-        if resolved:
-            await answer_callback(query, f"✓ {resolved_text[:60]}")
-            await self._edit_html_quiet(
-                query, f"❓ {_html.escape(query.message.text or '')}\n\n<b>{_html.escape(user_display)}:</b> {_html.escape(resolved_text)}")
-            log_resolved(query, clarify_id, prompt, resolved_text, user_display)
-        else:
-            # Entry evicted / gateway restarted between ask and tap.
-            await self._notify_clarify_expired(query, user_display)
-            logger.warning("Telegram clarify button: resolve_gateway_clarify returned False (id=%s)", clarify_id)
+        await resolve_clarify_choice(self, query, clarify_id, prompt, resolved_text, user_display)
 
     async def _handle_update_prompt_callback(self, query, data: str, cb: dict[str, Any]) -> None:
         """``update_prompt:<y|n>[:<id>]`` — forward the answer to the update process."""
@@ -5994,7 +5980,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             tmp = response_path.with_suffix(".tmp")
             tmp.write_text(answer, encoding="utf-8")
             tmp.replace(response_path)
-            logger.info("Telegram update prompt answered '%s' by user %s", answer, getattr(query.from_user, "id", "unknown"))
+            logger.info("Telegram update prompt answered '%s' by user %s", answer, hash_for_log(getattr(query.from_user, "id", None)))
         except Exception as exc:
             logger.error("Failed to write update response from callback: %s", exc)
             return
@@ -7557,6 +7543,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # counted as incoming unread in the Hermes inbox (#52363). Otherwise a BotFather rename leaves the
         # stale handle in place and the exclusive-mention gate reads a message addressed to us as one
         # addressed to some other bot.
+        refresh_telegram_gates(self)  # commands reach this gate before the auth prefilter's refresh
         self._observe_bot_identity_from_message(message)
         if self._is_own_message(message):
             return False
@@ -7641,6 +7628,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # Auth check first: blocked users must not reach batching, the observed transcript, or the agent.
         if not self._is_user_authorized_from_message(msg):
             self._log_blocked_user(msg)
+            return
+        if await self.consume_vault_code_reply(msg):  # a one-time code: deleted, handed over, never a turn
             return
         if not self._gate_or_observe(msg, update, MessageType.TEXT):
             return
@@ -8080,7 +8069,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             await self.handle_message(self._apply_telegram_group_observe_attribution(event))
             return
         event = self._apply_telegram_group_observe_attribution(event)
-        claim_pending_text(self, msg, event)  # before the first await: the question typed just before waits for us
+        claim_pending_text(self, msg, event)  # before the first await: the comment typed just before waits for us
         # Cache photo locally: Telegram's file URLs expire (~1 hour) before vision may run.
         if msg.photo:
             try:
@@ -8103,6 +8092,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             await self._cache_inbound_av(msg, event, video, "video file" if msg.video else "video note", "video", ".mp4", "video/mp4")
         elif msg.document and await self._cache_inbound_document(msg, event):
             return
+        absorb_claimed_text(self, msg, event)  # the comment sent just before this attachment joins its turn
         media_group_id = getattr(msg, "media_group_id", None)
         if media_group_id:
             await self._queue_media_group_event(str(media_group_id), event)
@@ -8155,11 +8145,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         try:
             from hermes_cli.config import load_config  # deep-copied: _setup_dm_topics writes thread_ids into it
             dm_topics = load_config().get("platforms", {}).get("telegram", {}).get("extra", {}).get("dm_topics", [])
-            if not dm_topics:
-                self._dm_topics_config = []
+            if not dm_topics:  # config.extra too: session keys read declared topics there (dm_threads)
+                self._dm_topics_config = self.config.extra["dm_topics"] = []
                 self._dm_topic_chat_ids = set()
                 return
-            self._dm_topics_config = dm_topics
+            self._dm_topics_config = self.config.extra["dm_topics"] = dm_topics
             self._dm_topic_chat_ids = {str(chat_entry["chat_id"]) for chat_entry in dm_topics if "chat_id" in chat_entry}
             for chat_entry in dm_topics:
                 cid = chat_entry.get("chat_id")
@@ -8371,6 +8361,13 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 # didn't quote (#22619). Fall back to the full replied-to message text / caption when no
                 # native quote is present.
                 reply_to_text = None
+        if not reply_to_text:
+            # The quoted body is unrecoverable: Telegram echoed nothing and the sent index has no
+            # entry. Say so — a silently dropped quote makes the agent answer a question whose
+            # subject it cannot see, and nothing in the logs shows why.
+            logger.warning(
+                "[%s] reply_to_id=%s carries no recoverable text: Telegram echoed no body and the sent index has no entry",
+                self.name, reply_to_id)
         return reply_to_id, reply_to_text
 
     def _build_message_event(self, message: Message, msg_type: MessageType, update_id: Optional[int] = None) -> MessageEvent:
