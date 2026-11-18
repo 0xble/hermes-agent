@@ -1,6 +1,8 @@
 """Regression tests for durable session controls."""
 from __future__ import annotations
 
+import time
+
 import pytest
 
 
@@ -45,12 +47,30 @@ def test_goal_pause_receipt_records_actual_outcome(state, quoted, entry, target)
     assert result["ok"] and result["status"] == "applied"
     record = session_controls._load_record(result["record"]["id"])
     durable = load_goal("target")
-    assert durable.status == "paused" and not durable.waiting_until
-    assert record["authority"]["via"] == ("quote" if quoted and entry == "apply" else "autonomy")
-    assert record["outcome"] == result["outcome"] == "paused"
-    assert "paused" in result["notice"].lower()
-    assert "wait_seconds" not in record
-    assert "waiting_until" not in record
+    assert record is not None
+    assert durable is not None
+    authority_via = record["authority"]["via"]
+    autonomous = authority_via == "autonomy"
+    assert durable.status == ("active" if autonomous else "paused")
+    if autonomous:
+        wait_seconds = getattr(durable, "waiting_seconds", None)
+        waiting_until = getattr(durable, "waiting_until", None)
+        assert waiting_until > time.time()
+        assert wait_seconds == 900
+        assert durable.paused_reason is None
+        assert record["outcome"] == result["outcome"] == "timed_wait"
+        assert record["wait_seconds"] == result["wait_seconds"] == 900
+        assert record["waiting_until"] == result["waiting_until"] == waiting_until
+        assert record["notice"] == result["notice"] == (
+            "Goal waiting 15 min (autonomous timed wait, no approval); still active"
+        )
+        assert "paused" not in result["notice"]
+    else:
+        assert not getattr(durable, "waiting_until", None)
+        assert record["outcome"] == result["outcome"] == "paused"
+        assert "Goal paused" in result["notice"]
+        assert "wait_seconds" not in record
+        assert "waiting_until" not in record
 
 
 @pytest.mark.parametrize("target", ["requester", "target"])
@@ -94,7 +114,7 @@ def test_autonomous_clear_records_reason_actor_and_notice(state, target, entry):
 
 
 @pytest.mark.parametrize("target", ["requester", "target"])
-def test_autonomous_goal_pause_is_agent_owned_and_agent_resumable(state, target):
+def test_autonomous_goal_pause_is_timed_wait_and_user_pause_stays_indefinite(state, target):
     from hermes_constants import get_hermes_home
     from hermes_cli import session_controls
     from hermes_cli.goals import GoalManager, load_goal
@@ -104,11 +124,22 @@ def test_autonomous_goal_pause_is_agent_owned_and_agent_resumable(state, target)
     paused = session_controls.apply_control("goal", "pause", target, requester_sid="requester",
                                             reason="waiting on a deploy")
     assert paused["ok"] and paused["record"]["authority"]["via"] == "autonomy", paused
-    assert load_goal(target).status == "paused" and load_goal(target).paused_by == "agent"
+    state = load_goal(target)
+    assert state is not None
+    assert state.status == "active" and state.waiting_until > time.time()
+    assert state.waiting_seconds == 900 and state.paused_by == ""
+
+    # A user-owned pause remains indefinite even while autonomy is enabled.
+    GoalManager(target).pause(reason="user requested a hold")
+    state = load_goal(target)
+    assert state is not None
+    assert state.status == "paused" and not state.waiting_until
+    assert state.paused_by == "user"
     resumed = session_controls.apply_control("goal", "resume", target, requester_sid="requester",
                                              reason="deploy finished")
-    assert resumed["ok"] and resumed["status"] == "applied", resumed
-    assert load_goal(target).status == "active" and load_goal(target).paused_by == ""
+    assert not resumed["ok"] and resumed["error_code"] == "user_paused"
+    final_state = load_goal(target)
+    assert final_state is not None and final_state.status == "paused"
 
 
 def _legacy_unowned_pause(manager, target):

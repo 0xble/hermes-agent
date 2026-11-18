@@ -567,7 +567,16 @@ def _manager_apply(kind: str, action: str, target_sid: str, *, reason: str,
     receipt = {"result": result, "state": state}
     if cleared_goal and (authority or {}).get("via") == "autonomy":
         receipt["notice"] = f"Goal cleared autonomously without approval. Reason: {reason}"
-    if (kind, action) == ("goal", "pause"):
+    if ((kind, action) == ("goal", "pause")
+            and (authority or {}).get("via") == "autonomy"):
+        seconds = int(getattr(state, "waiting_seconds", 0) or 0)
+        waiting_until = getattr(state, "waiting_until", None)
+        duration = f"{seconds // 60} min" if seconds % 60 == 0 else f"{seconds} sec"
+        receipt.update(
+            outcome="timed_wait", wait_seconds=seconds, waiting_until=waiting_until,
+            notice=f"Goal waiting {duration} (autonomous timed wait, no approval); still active",
+        )
+    elif (kind, action) == ("goal", "pause"):
         receipt.update(outcome="paused", notice="Goal paused; use /goal resume to continue")
     return receipt
 
@@ -1438,12 +1447,14 @@ def _pause_goal(sid, reason, payload, authority, cursor=None):
     from hermes_cli.goals import GoalManager
 
     manager = GoalManager(sid, cursor=cursor)
-    autonomous = (authority or {}).get("via") == "autonomy"
+    if (authority or {}).get("via") == "autonomy":
+        if not manager.is_active():
+            return None
+        return manager.wait_for_seconds(manager._autonomy_wait_seconds(),
+                                        reason=reason or "session-control")
     # Mark explicit controls separately from migratable legacy judge/budget pauses.
     # Model-supplied reason text must not accidentally opt this pause into migration.
-    # Record the agent as owner of its own pause so it may later lift it, as for loops.
-    return manager.pause(reason="session-control: " + (reason or "paused"),
-                         by="agent" if autonomous else "user")
+    return manager.pause(reason="session-control: " + (reason or "paused"), by="user")
 
 
 

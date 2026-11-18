@@ -93,10 +93,11 @@ remain paused. Legacy blocked/input/approval states and automatic pauses migrate
 to active timed waits on load. Idle scans include those rows so migration is not
 dependent on a new user message. Stale resume_pending takeover continues through
 the existing generation-fenced gateway path.
-Explicit `goal_set action=pause` controls use the native paused transition for both self
-and cross-session targets. They clear wait barriers, survive reload and stay out of the idle
-wake scan until resumed. Session-control pause reasons carry a control prefix so legacy
-judge/budget migration cannot reinterpret model-supplied reason text as an automatic pause.
+Explicit `goal_set action=pause` controls use the timed-wait transition for autonomous
+self and cross-session targets. They preserve the active goal and native wake barrier; user
+pauses use the native paused transition, clear wait barriers, survive reload and stay out of
+the idle wake scan until resumed. Session-control pause reasons carry a control prefix so
+legacy judge/budget migration cannot reinterpret model-supplied reason text.
 Native user pauses and default-off authority requirements remain unchanged.
 The CLI idle hook refreshes its cached goal snapshot before deciding whether a
 tool-authored wait is due. Reload adopts durable state and retains the existing
@@ -158,10 +159,11 @@ or loop row keeps the outcome.
 ## Pause Authority
 
 `GoalState.paused_by` records who paused a goal (`agent`, `user` or `system`).
-It is never inferred from `paused_reason`. An autonomous session-control pause records
-`agent`. Under `goals.autonomy` a session-control resume or clear lifts or ends only an
-`agent` pause and refuses any other with `user_paused`, so a `/goal pause`, `/stop`,
-Ctrl+C, quoted or system pause stays the user's even when the agent supplies a clear
+It is never inferred from `paused_reason`. An autonomous session-control pause is a timed
+wait and leaves the goal active; it does not create an agent-owned indefinite pause. Under
+`goals.autonomy`, session-control resume or clear lifts or ends only an `agent` pause and
+refuses other pauses with `user_paused` (see `maintenance/loop-lifecycle.md`). A `/goal pause`,
+`/stop`, Ctrl+C, quoted or system pause stays the user's even when the agent supplies a clear
 reason. A current user quote to resume still applies with quote authority.
 Legacy rows load with an empty owner, which counts as not the agent's.
 
