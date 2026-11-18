@@ -736,6 +736,7 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         # This turn continues the original platform message, not a synthetic producer identity.
         event = MessageEvent(text="", message_type=MessageType.TEXT, source=source,
                              message_id=getattr(source, "message_id", None), internal=True,
+                             metadata={"restart_auto_resume": True},
                              reply_anchor_override=getattr(source, "message_id", None))
         if resume_marker:
             # Keep the transport reply anchor for threading, but admit each interruption marker
