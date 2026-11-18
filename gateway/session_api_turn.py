@@ -46,7 +46,14 @@ def api_settings(authority, ref):
 
 
 def check_api_turn(authority, ref, payload):
-    live = authority.sessions[ref.session_id]
+    live = authority.sessions.get(ref.session_id)
+    if live is None:
+        # Startup recovery and session reaping can race the off-loop binding restore. Reconcile
+        # the durable API receipt once more before treating the request as a missing session.
+        restore_api_session(authority, ref.session_id)
+        live = authority.sessions.get(ref.session_id)
+    if live is None:
+        raise RuntimeStoreError('runtime_draining')
     if live.source.platform == Platform.API_SERVER:
         restore_api_session(authority, ref.session_id)
     adapter = authority.runner._adapter_for_source(live.source)
