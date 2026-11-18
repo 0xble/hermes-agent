@@ -14,6 +14,8 @@ import re
 from hermes_time import now as _hermes_now
 from typing import Optional
 
+from cron.constants import job_priority
+
 # Log-record parity with the origin module.
 logger = logging.getLogger("cron.scheduler")
 
@@ -332,7 +334,8 @@ def _build_job_prompt(
             prerun_script if prerun_script is not None
             else _script._run_job_script(
                 script_path, workdir=_sched._resolve_job_workdir(job, str(job.get("id") or "")),
-                interpreter=job.get("interpreter"), cron_job_id=str(job.get("id") or "")))
+                interpreter=job.get("interpreter"), cron_job_id=str(job.get("id") or ""),
+                priority=job_priority(job)))
         if success and not script_output:
             return None  # no output → nothing to report, skip the AI call
         heading, intro = (

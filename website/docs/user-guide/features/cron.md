@@ -211,6 +211,22 @@ When `workdir` is set:
 Each agent run binds its `workdir` to that run's unique task identity. Workdir jobs therefore use the normal parallel pool without mutating process-global terminal state or leaking paths between concurrent runs. `cron.max_parallel_jobs` limits how many due jobs run at once (default `4`, `0` for unbounded), which also keeps the catch-up after a restart from firing every missed job at the same moment.
 :::
 
+## Business-impact admission lanes
+
+When due jobs compete for workers, mark the job's business impact with `priority`:
+
+- `live`: a person or customer is waiting, such as a reply watcher during a live event.
+- `production`: ordinary business work. This is the default when unset.
+- `background`: housekeeping and best-effort work.
+
+Due jobs are submitted in that order. The single reserved worker for intervals of 2 minutes or less goes to the highest-ranked such job, with ties in job-store order. The four-worker script lane starts the best queued rank first, then FIFO. Worker counts are unchanged. Detached workers and script jobs see the effective lane in `HERMES_WORK_PRIORITY`.
+
+```bash
+hermes cron create "every 2m" --priority live "Review customer queue"
+hermes cron edit <job_id> --priority background
+hermes cron edit <job_id> --priority ""  # clear to unset/production
+```
+
 ## Per-job timezone
 
 By default a job's cron expression is read in your profile's timezone (`timezone:` in `config.yaml`). A job can pin its own zone instead, so one profile can serve several markets:
