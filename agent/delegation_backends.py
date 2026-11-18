@@ -117,7 +117,7 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
 
     try:
         user_config = load_user_config_effective(get_config_path())
-    except (Exception, SystemExit):
+    except (Exception, SystemExit):  # health: allow BLE001 -- config is an optional refresh input; keep the current mode
         return False
     raw_delegation = user_config.get("delegation") if isinstance(user_config, dict) else None
     # An absent key means the agent's original surface decision remains the
