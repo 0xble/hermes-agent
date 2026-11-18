@@ -57,7 +57,7 @@ def test_the_seed_import_only_adds_keys_and_never_creates_an_empty_store(tmp_pat
     assert first["values"] == {"hermes.desktop.sessionListDensity": "detailed"}
     assert second["values"] == {"hermes.desktop.sessionListDensity": "detailed", "hermes-desktop-mode-v1": "dark"}
     assert second["generation"] == first["generation"]
-    assert json.loads(path.read_text())["values"] == second["values"]
+    assert json.loads(path.read_text(encoding="utf-8-sig"))["values"] == second["values"]
 
 
 @pytest.mark.platforms("linux", "macos")
@@ -96,7 +96,7 @@ def test_lock_waits_for_a_live_holder_and_keeps_the_lock_unchanged_until_release
     lock_dir = path.with_name(path.name + ".lock")
     owner = lock_dir / "owner"
     lock_dir.mkdir()
-    owner.write_text(str(os.getpid()))
+    owner.write_text(str(os.getpid()), encoding="utf-8")
     seen_existing = threading.Event()
     original_break_if_stale = ui_preferences._break_if_stale
 
@@ -119,7 +119,7 @@ def test_lock_waits_for_a_live_holder_and_keeps_the_lock_unchanged_until_release
     time.sleep(0.1)  # Several unchanged polls, without patching the stdlib clock globally.
     assert waiter.is_alive()
     assert lock_dir.is_dir()
-    assert owner.read_text() == str(os.getpid())
+    assert owner.read_text(encoding="utf-8-sig") == str(os.getpid())
     assert not errors
 
     owner.unlink()
@@ -135,7 +135,7 @@ def test_lock_reclaims_a_dead_pid(tmp_path):
     path = tmp_path / "ui-preferences.json"
     lock_dir = path.with_name(path.name + ".lock")
     lock_dir.mkdir()
-    (lock_dir / "owner").write_text("2147483647-dead")
+    (lock_dir / "owner").write_text("2147483647-dead", encoding="utf-8")
 
     written = ui_preferences.write_preferences({"hermes.desktop.reclaimed": "yes"}, path=path)
 
@@ -148,7 +148,7 @@ def test_lock_reclaims_a_live_pid_when_the_owner_age_backstop_expires(tmp_path):
     lock_dir = path.with_name(path.name + ".lock")
     owner = lock_dir / "owner"
     lock_dir.mkdir()
-    owner.write_text(str(os.getpid()))
+    owner.write_text(str(os.getpid()), encoding="utf-8")
     old = time.time() - ui_preferences._LOCK_MAX_AGE_S - 1
     os.utime(owner, (old, old))
 
@@ -163,7 +163,7 @@ def test_lock_backstop_raises_preferences_busy_without_waiting(tmp_path, monkeyp
     lock_dir = path.with_name(path.name + ".lock")
     owner = lock_dir / "owner"
     lock_dir.mkdir()
-    owner.write_text(str(os.getpid()))
+    owner.write_text(str(os.getpid()), encoding="utf-8")
     clock = iter((0.0, ui_preferences._LOCK_WAIT_S + 1))
     monkeypatch.setattr(ui_preferences, "_monotonic", lambda: next(clock))
     monkeypatch.setattr(ui_preferences, "_sleep", lambda _seconds: None)
@@ -172,7 +172,7 @@ def test_lock_backstop_raises_preferences_busy_without_waiting(tmp_path, monkeyp
         ui_preferences.write_preferences({"hermes.desktop.stuck": "yes"}, path=path)
 
     assert lock_dir.is_dir()
-    assert owner.read_text() == str(os.getpid())
+    assert owner.read_text(encoding="utf-8-sig") == str(os.getpid())
 
 
 def test_writes_merge_per_key_and_concurrent_writers_keep_each_others_keys(tmp_path):
@@ -237,7 +237,7 @@ def test_the_webapp_reads_and_writes_the_machine_store_behind_the_session_gate(w
     assert tab.get("/api/ui-preferences").json() == {"exists": False, "revision": 0, "values": {}}
     written = tab.patch("/api/ui-preferences", json={"values": {"hermes-desktop-mode-v1": "dark"}})
     assert written.status_code == 200
-    assert json.loads(store.read_text())["values"] == {"hermes-desktop-mode-v1": "dark"}
+    assert json.loads(store.read_text(encoding="utf-8-sig"))["values"] == {"hermes-desktop-mode-v1": "dark"}
     assert tab.patch("/api/ui-preferences", json={"values": {"hermes.other": "x"}}).status_code == 400
 
 
