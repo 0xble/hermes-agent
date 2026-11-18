@@ -88,7 +88,7 @@ def pinned_backend(agent: Any) -> str:
     return pinned if isinstance(pinned, str) else ""
 
 
-def refresh_gateway_delegation_mode(agent: Any) -> bool:
+def refresh_gateway_delegation_mode(agent: Any, *, apply: bool = True) -> bool:
     """Re-derive a gateway session's joined/background schema from current config.
 
     A restored ``tools[]`` pin remains authoritative during ordinary turns. The
@@ -100,32 +100,31 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
     if getattr(agent, "_oneshot_session", None) is True:
         return False
 
-    # Only agents wired by the gateway turn runner may change this mode at a
-    # cache-break boundary. ACP and other non-gateway agents can use a platform
-    # name that is not in the deny-list, so positive wiring evidence owns this
-    # guard.
+    # Only a gateway-owned messaging session may change this mode. The stable
+    # gateway key is positive wiring evidence. ACP and unknown non-gateway
+    # agents stay on their existing contract.
     from gateway.session_context import NON_MESSAGING_SESSION_SURFACES
-    if str(getattr(agent, "platform", "") or "").strip().lower() in (
-        NON_MESSAGING_SESSION_SURFACES | {"acp", "cron", "subagent"}
-    ):
+    platform = str(getattr(agent, "platform", "") or "").strip().lower()
+    if (platform in NON_MESSAGING_SESSION_SURFACES or platform in {"acp", "cron", "subagent"}
+            or not getattr(agent, "_gateway_session_key", None)):
         return False
 
-    from hermes_cli.config import get_config_path
-    from hermes_cli.config_effective import load_user_config_effective
+    user_config = getattr(agent, "_notification_config", None)
+    from hermes_cli.config import get_config_path, read_user_config_raw
 
     try:
-        user_config = load_user_config_effective(get_config_path())
-    except (Exception, SystemExit):  # health: allow BLE001 -- config is an optional refresh input; keep the current mode
+        raw_config = read_user_config_raw(get_config_path())
+    except (OSError, ValueError, TypeError, RuntimeError, SystemExit):
         return False
-    raw_delegation = user_config.get("delegation") if isinstance(user_config, dict) else None
+    raw_delegation = raw_config.get("delegation") if isinstance(raw_config, dict) else None
     # An absent key means the agent's original surface decision remains the
-    # contract. The effective loader preserves presence without injecting
-    # defaults, while also applying the managed overlay consistently.
+    # contract. Check the raw file so a merged default ``auto`` does not look
+    # like an explicit operator change.
     if not isinstance(raw_delegation, dict) or "gateway_mode" not in raw_delegation:
         return False
+    if not isinstance(user_config, dict):
+        user_config = raw_config
     delegation = user_config.get("delegation") if isinstance(user_config, dict) else None
-    if not isinstance(delegation, dict):
-        return False
     configured_mode = str(delegation.get("gateway_mode") or "").strip().lower()
     if configured_mode not in {"auto", "inline", "background", "async"}:
         return False
@@ -143,7 +142,10 @@ def refresh_gateway_delegation_mode(agent: Any) -> bool:
         interim_enabled=bool(interim_enabled),
     )
     previous = getattr(agent, "_delegation_inline", None)
-    agent._delegation_inline = desired
+    if apply:
+        agent._delegation_inline = desired
+    else:
+        agent._pending_delegation_inline = desired
     return previous != desired
 
 
