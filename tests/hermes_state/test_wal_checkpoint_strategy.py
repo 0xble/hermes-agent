@@ -6,6 +6,7 @@ transient per-cron-run connections closing many times an hour would race
 the live gateway writer and corrupt B-tree pages (#45383).
 """
 
+from contextlib import closing
 import logging
 import sqlite3
 from unittest.mock import MagicMock
@@ -44,6 +45,32 @@ def db(tmp_path):
 
 class TestTryWalCheckpointPassive:
     """_try_wal_checkpoint() should use PASSIVE mode for periodic use."""
+
+    @pytest.mark.platforms("macos")
+    def test_reader_backlog_is_checkpointed_after_writer_commit(self, db, monkeypatch):
+        """A writer commit must not copy the WAL backlog once a reader releases it."""
+        db._write_sql("CREATE TABLE checkpoint_probe (payload BLOB NOT NULL)")
+        db._try_wal_checkpoint()
+        before = db.db_path.stat().st_size
+        page_size = db._conn.execute("PRAGMA page_size").fetchone()[0]
+        with closing(sqlite3.connect(db.db_path)) as reader:
+            reader.execute("BEGIN")
+            assert reader.execute("SELECT count(*) FROM checkpoint_probe").fetchone()[0] == 0
+            db._execute_write(lambda conn: conn.executemany(
+                "INSERT INTO checkpoint_probe VALUES (zeroblob(?))", [(page_size * 3 // 4,)] * 1250,
+            ))
+            reader.rollback()
+            db._write_sql("INSERT INTO checkpoint_probe VALUES (zeroblob(42))")
+            assert reader.execute("SELECT count(*) FROM checkpoint_probe").fetchone()[0] == 1251
+            assert db.db_path.stat().st_size == before
+
+        # The existing periodic checkpoint must still flush the backlog.
+        monkeypatch.setattr(db, "_write_count", db._CHECKPOINT_EVERY_N_WRITES - 1)
+        db._write_sql("INSERT INTO checkpoint_probe VALUES (zeroblob(42))")
+        assert db.db_path.stat().st_size > before
+        assert db._conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+        with db._maintenance_conn() as conn:
+            assert conn.execute("PRAGMA checkpoint_fullfsync").fetchone()[0] == 1
 
     def test_checkpoint_uses_passive_mode(self, db, monkeypatch):
         """PASSIVE checkpoint does not require exclusive lock — safe for large DBs."""

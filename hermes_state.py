@@ -900,6 +900,10 @@ class SessionDB(
             # Existing WAL/SHM files may predate the main-file hardening;
             # normalize any sidecars that became visible during WAL setup.
             _secure_state_db_files(self.db_path)
+            if self._wal_active and sys.platform == "darwin":
+                # The periodic PASSIVE checkpoint runs off the writer lock. SQLite's
+                # default auto-checkpoint can otherwise do the same fullfsync work in commit().
+                conn.execute("PRAGMA wal_autocheckpoint=0")
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
         except BaseException:

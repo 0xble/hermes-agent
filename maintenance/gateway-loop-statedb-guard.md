@@ -95,6 +95,13 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   merge (`_merge_fts_incrementally`, every `_FTS_MERGE_EVERY_N_WRITES`) runs on the same
   maintenance connection, also outside the writer lock (11:39: 19 turns and 48 writers queued
   behind it); usermerge floor and bounded pages unchanged.
+- Managed macOS WAL connections disable SQLite's default commit-time auto-checkpoint because
+  a writer can copy a reader-blocked backlog as soon as the reader releases its snapshot. The
+  existing periodic PASSIVE checkpoint takes that work outside the process writer guard.
+  An explicit `database.wal_autocheckpoint` still takes precedence. Commits retain
+  `synchronous=FULL` and checkpoints retain `checkpoint_fullfsync=1`.
+  `test_wal_checkpoint_strategy.py` verifies that the first commit after a reader releases a
+  backlog leaves the main file unchanged and that the periodic checkpoint still flushes it.
 - Compaction recomputes historical display identities on a pooled-reader snapshot before
   taking `SessionDB._lock`. Under the writer lock it folds from the display indexes and
   recomputes only new or changed rows, including user `display_metadata` edits not watched
