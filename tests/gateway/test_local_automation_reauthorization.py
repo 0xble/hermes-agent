@@ -32,7 +32,7 @@ async def test_local_automation_reauthorization_rechecks_after_worker(monkeypatc
     live = SimpleNamespace(route='route')
     authority = SessionAuthority.__new__(SessionAuthority)
     authority.sessions = {ref.session_id: live}
-    authority._require_admission_open = lambda *, queue_only=False: None
+    authority._require_admission_open = lambda *, queue_only=False, owned_work=False: None
     task = asyncio.create_task(authority._check_local_automation(ref, {}, route='route'))
     try:
         assert await asyncio.wait_for(asyncio.to_thread(entered.wait, 3), 4)
@@ -42,7 +42,7 @@ async def test_local_automation_reauthorization_rechecks_after_worker(monkeypatc
         elif change == 'replacement':
             authority.sessions[ref.session_id] = SimpleNamespace(route='route')
         elif change == 'draining':
-            def refused(*, queue_only=False):
+            def refused(*, queue_only=False, owned_work=False):
                 raise RuntimeStoreError('runtime_draining')
             authority._require_admission_open = refused
     finally:

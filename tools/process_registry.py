@@ -33,7 +33,7 @@ from typing import Any, Dict, List, Literal, NamedTuple, Optional
 from hermes_cli.config import get_hermes_home
 
 from tools.process_registry_notifications import (
-    format_process_notification, heartbeat_output_tail, is_child_process_notification, should_surface_notification)
+    format_process_notification, heartbeat_output_tail, is_child_process_notification, promote_to_completion_notice, should_surface_notification)
 from tools.process_registry_checkpoint import ProcessCheckpointMixin
 from tools.process_registry_env import EnvironmentProcessMixin
 from tools.process_registry_ssh import SSHProcessBinding, SSHProcessMixin, process_provenance
@@ -908,7 +908,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
                 session._watch_disabled = True
                 # Promote so the agent still gets exactly one notification on exit,
                 # plus exactly one summary so it sees why things went quiet.
-                session.notify_on_complete = True
+                promote_to_completion_notice(self, session)
                 self._emit_watch_disabled(
                     session, session._watch_suppressed,
                     f"{WATCH_STRIKE_LIMIT} consecutive rate-limit windows triggered "
@@ -928,7 +928,7 @@ class ProcessRegistry(ProcessTerminationMixin, ProcessCheckpointMixin, ProcessSu
             lifetime_exhausted = session._watch_hits >= WATCH_LIFETIME_MAX_HITS
             if lifetime_exhausted:
                 session._watch_disabled = True
-                session.notify_on_complete = True
+                promote_to_completion_notice(self, session)
         output = "\n".join(matched_lines[:20])
         if len(output) > 2000:
             output = output[:2000] + "\n...(truncated)"
