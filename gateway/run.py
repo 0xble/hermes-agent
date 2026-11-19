@@ -49,7 +49,6 @@ from agent.turn_context import compression_made_progress
 from agent.session_activity import ActivityProvenance, AwakeIdleMeter
 from hermes_cli.config import _is_ssh_remote_tilde_cwd, cfg_get, config_exists
 from gateway.run_common import _csv_or_list_to_set
-from hermes_cli.fallback_config import pre_agent_fallback_notice
 from gateway.turn_executor import _UnboundedThreadExecutor
 from gateway.run_background_admission import GatewayBackgroundAdmissionMixin
 
@@ -2289,7 +2288,7 @@ from gateway.run_turn import GatewayTurnMixin, is_context_overflow_failure_resul
 from gateway.run_shutdown import GatewayShutdownMixin, _resolve_gateway_exit_verdict
 from gateway.run_busy import GatewayBusySessionMixin
 from gateway.zero_cut_busy import ZeroCutBusyRoutingMixin
-from gateway.run_config_loaders import GatewayConfigLoadersMixin
+from gateway.run_config_loaders import GatewayConfigLoadersMixin, resolve_default_runtime_agent_kwargs
 from gateway.run_startup import GatewayStartupMixin, _own_policy_envs
 from gateway.run_watchers import GatewaySessionWatchersMixin
 from gateway.run_notifications import GatewayNotificationsMixin
@@ -2388,47 +2387,7 @@ _CONVERSATION_SCOPED_STATE: tuple = (
 
 
 def _resolve_runtime_agent_kwargs() -> dict:
-    """Resolve provider credentials for gateway-created AIAgent instances.
-    ``resolve_runtime_provider()`` may fall back to env vars; behavioral config is config.yaml only.
-    An ``AuthError`` from the primary walks the configured fallback chain through the shared
-    ``resolve_runtime_with_fallback`` (the gateway keeps no resolver loop of its own)."""
-    from hermes_cli.runtime_provider import (
-        resolve_runtime_with_fallback, format_runtime_provider_error, _get_model_config)
-
-    # Capture primary provider/model from config before the try block so we
-    # can include it in the fallback notice if the primary fails (#74349).
-    from hermes_cli.model_alias_runtime import resolve_default_route
-    _primary_route = resolve_default_route(_load_gateway_config())
-    if not _primary_route.model and not _primary_route.provider:
-        _legacy_route = _get_model_config()
-        _primary_model = str(_legacy_route.get("default") or _legacy_route.get("model") or "").strip()
-        _primary_provider = str(_legacy_route.get("provider") or "").strip()
-    else:
-        _primary_model = _primary_route.model.strip()
-        _primary_provider = _primary_route.provider.strip()
-
-    try:
-        runtime, fallback_entry = resolve_runtime_with_fallback(_load_gateway_config())
-    except Exception as exc:
-        raise RuntimeError(format_runtime_provider_error(exc)) from exc
-
-    if fallback_entry is not None:
-        # The entry's model is the one this agent must send (#112600). Carry the fallback notice so the
-        # gateway can surface a user-visible provider switch (#74349); the caller must pop
-        # ``_fallback_notice`` before forwarding kwargs to AIAgent.
-        return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"],
-                "_preflight_fallback": {**(runtime.get("_preflight_fallback") or {}), "requested_model": _primary_model},
-                "_fallback_notice": pre_agent_fallback_notice(
-                    _primary_provider, _primary_model,
-                    runtime.get("provider") or fallback_entry.get("provider") or "unknown",
-                    fallback_entry.get("model") or "default")}
-
-    capabilities = runtime.get("capabilities")
-    capabilities = (
-        {k: v for k, v in capabilities.items() if isinstance(k, str) and isinstance(v, bool)}
-        if isinstance(capabilities, dict) else {})
-
-    return {**_runtime_agent_kwargs(runtime), "capabilities": capabilities}
+    return resolve_default_runtime_agent_kwargs()
 
 
 def _runtime_agent_kwargs(runtime: dict) -> dict:

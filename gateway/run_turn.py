@@ -1,4 +1,3 @@
-# health: allow FILE_LINES -- strict session-pin and loop-effect integration lives in this established turn facade; follow-up extraction is required before adding unrelated behavior.
 """Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
 MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
 are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
@@ -705,111 +704,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
     @staticmethod
     def _load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route=None):
         """Resolve a detached snapshot off-loop; all runner-state commits belong to the caller."""
-        from gateway.run import (
-            _get_channel_override, _resolve_gateway_model,
-            _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
-        )
-        from gateway.run_agent_cache import GatewayAgentCacheMixin
-
-        notice = None
-        model = _resolve_gateway_model(user_config)
-        from gateway.run_turn_prepare import resolve_stored_override
-        selected = resolve_stored_override(override, model)
-        if selected is not None:
-            if override.get("model"):
-                selected[1]["model_pinned"] = True
-            return *selected, None, False
-
-        runtime_kwargs, unavailable_override = None, None
-        if override and override.get("provider"):
-            try:
-                runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                    override["provider"], target_model=override.get("model") or None)
-            except Exception as exc:
-                # Layering the override on the default runtime sent its model to the default provider's
-                # endpoint (openai-codex on the Nous URL). Run this turn on the whole default route and say
-                # so; the persisted override is kept, so the next turn retries it.
-                logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
-                if override.get("model"):
-                    raise  # An explicit model cannot move onto the default route.
-                unavailable_override, override = override, None
-        if runtime_kwargs is None:
-            runtime_kwargs = _resolve_runtime_agent_kwargs()
-        # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
-        # runner surfaces it through the agent's one-shot fallback notice (#74349).
-        notice = runtime_kwargs.pop("_fallback_notice", None)
-        runtime_model = runtime_kwargs.pop("model", None)
-        if runtime_model:
-            logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
-            model = runtime_model
-        if unavailable_override and not notice:
-            from hermes_cli.fallback_config import pre_agent_fallback_notice
-            notice = pre_agent_fallback_notice(
-                unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
-
-        if config and source is not None:
-            ch = _get_channel_override(
-                config, source.platform, str(source.chat_id) if source.chat_id else "",
-                thread_id=str(source.thread_id) if getattr(source, "thread_id", None) else None,
-                parent_id=str(source.parent_chat_id) if getattr(source, "parent_chat_id", None) else None,
-            )
-            if ch:
-                if ch.model:
-                    model = ch.model
-                if ch.provider:
-                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(ch.provider, target_model=model or None)
-                    ch_runtime_model = runtime_kwargs.pop("model", None)
-                    # Adopt the provider's bundled model only when the override named none.
-                    if ch_runtime_model and not ch.model:
-                        model = ch_runtime_model
-
-        if attended_route and attended_route.get("active"):
-            attended_model = attended_route.get("model") or model
-            attended_provider = attended_route.get("provider") or ""
-            if attended_provider:
-                try:
-                    runtime_kwargs = _resolve_runtime_agent_kwargs_for_provider(
-                        attended_provider, target_model=attended_model or None,
-                    )
-                    provider_model = runtime_kwargs.pop("model", None)
-                    if provider_model and not attended_route.get("model"):
-                        attended_model = provider_model
-                    model = attended_model
-                except Exception as exc:
-                    logger.warning("Attended route %s unavailable: %s", attended_provider, exc)
-                    notice = ContextNotice(f"⚠️ Attended model unavailable; staying on {model}.")
-            else:
-                model = attended_model
-
-        if override and skey:
-            model, runtime_kwargs = GatewayAgentCacheMixin._apply_model_override(override, model, runtime_kwargs)
-            if override and override.get("model"):
-                runtime_kwargs["model_pinned"] = True
-
-        # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
-        # provider's first catalog model.
-        if not model and runtime_kwargs.get("provider"):
-            with suppress(Exception):
-                from hermes_cli.models import get_default_model_for_provider
-                model = get_default_model_for_provider(runtime_kwargs["provider"])
-                if model:
-                    logger.info(
-                        "No model configured — defaulting to %s for provider %s", model, runtime_kwargs["provider"],
-                    )
-
-        # Final safety net: an empty model (transient config-cache miss) makes every API call 400 and
-        # the session goes silent — reuse the last model resolved for this session, else process-wide.
-        cache_model = bool(model)
-        if not model:
-            if last_model:
-                logger.warning(
-                    "Empty model resolved for session=%s — recovering "
-                    "last-known-good model %s (config read likely returned "
-                    "empty; see #35314)", skey or "", last_model,
-                )
-                model = last_model
-
-        return model, runtime_kwargs, notice, cache_model
+        from gateway.run_turn_prepare import load_session_agent_runtime
+        return load_session_agent_runtime(source=source, skey=skey, user_config=user_config, config=config,
+                                          override=override, last_model=last_model, attended_route=attended_route)
 
     async def _resolve_session_agent_runtime_async(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,

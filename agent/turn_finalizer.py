@@ -789,12 +789,7 @@ def finalize_turn(
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
-    model_fields = result_model_fields(agent)
-    if model_fields.get("fallback_reason"):
-        if not api_call_count or (failed and not getattr(agent, "last_served_model", None)):
-            model_fields["served_model"] = None
-        logger.info("Model fallback result: requested_model=%s served_model=%s reason=%s",
-                    model_fields["requested_model"], model_fields["served_model"], model_fields["fallback_reason"])
+    model_fields = result_model_fields(agent, api_call_count=api_call_count, failed=failed)
     result = {
         "final_response": final_response,
         "last_reasoning": _last_turn_reasoning(messages),

@@ -581,6 +581,11 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None, *, pinned
         raise
 
 
+def _has_model_pin(model_override: dict | str | None) -> bool:
+    explicit_model = model_override.get("model") if isinstance(model_override, dict) else model_override
+    return bool(str(explicit_model or "").strip() or _env_model_seed())
+
+
 def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str, dict]:
     """(model, runtime) for a new agent; a per-session override (/model switch or a resumed row's persisted
     runtime) wins over global config/env. Older rows stored the resolved provider "custom" (no named entry
@@ -617,7 +622,7 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
         resolve_kwargs = {"requested": requested_provider, "target_model": model or None}
         overrides = {}
     resolution = (_resolve_runtime_with_fallback(resolve_kwargs, pinned_model=model)
-                  if model_override else _resolve_runtime_with_fallback(resolve_kwargs))
+                  if _has_model_pin(model_override) else _resolve_runtime_with_fallback(resolve_kwargs))
     if resolution.used_fallback:
         if not resolution.selected_model:
             raise RuntimeError("Auth fallback resolved without a model")
@@ -731,7 +736,7 @@ def _make_agent(
         checkpoints_enabled=_resolve_checkpoints_enabled(cfg),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
-        model_pinned=bool(model_override),
+        model_pinned=_has_model_pin(model_override),
         # The resolved provider's request body (a custom entry's extra_body), as the CLI/cron/gateway pass it.
         request_overrides=runtime.get("request_overrides"),
         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))

@@ -148,14 +148,12 @@ def _dict_list(value):
 
 
 def policy_pins_model(policy, config):
-    from json import loads
+    """Use effective pin provenance: a profile edit can supersede the immutable launch request."""
     from gateway.session_policy import session_pinned
     request = getattr(policy, 'request_json', None)
-    pins = config.get('session_pins') or {}
-    return bool((isinstance(request, str) and loads(request).get('model'))
-                or pins.get('model') is True
-                or (config.get('model') or {}).get('selection_profile')
-                or session_pinned(config, 'model', False))
+    legacy_pin = bool((isinstance(request, str) and json.loads(request).get('model'))
+                      or (config.get('model') or {}).get('selection_profile'))
+    return session_pinned(config, 'model', legacy_pin)
 
 
 def route_runtime(policy, frozen, model, key, *, fallback=True):

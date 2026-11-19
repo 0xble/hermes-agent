@@ -16,7 +16,7 @@ def note_fallback(agent, old_model, model, provider, reason):
         "fallback_model": model,
         "fallback_reason": reason,
     }
-    logger.warning("Model fallback: requested_model=%s fallback_model=%s provider=%s reason=%s",
+    logger.info("Model fallback: requested_model=%s fallback_model=%s provider=%s reason=%s",
                    requested, model, provider, reason)
 
 
