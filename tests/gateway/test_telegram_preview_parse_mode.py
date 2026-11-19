@@ -3,6 +3,7 @@
 A plain preview finalized as MarkdownV2 flips the message's parse mode in place, and Telegram
 clients then draw the old layout over the new text until a refresh.
 """
+import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -52,7 +53,8 @@ async def test_final_edit_after_short_flood_wait_retries_in_markdown(monkeypatch
     flood = Exception("Flood control exceeded. Retry after 2 seconds")
     flood.retry_after = 2.0
     adapter._bot.edit_message_text.side_effect = [flood, None]
-    sleep = AsyncMock()
+    # The shared penalty checks elapsed time after sleeping before allowing a retry.
+    sleep = AsyncMock(wraps=asyncio.sleep)
     monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", sleep)
 
     result = await adapter.edit_message("123", "456", "Done: **bold**", finalize=True)
