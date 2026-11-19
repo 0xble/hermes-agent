@@ -262,7 +262,7 @@ def _fire_for(payload: dict[str, Any], session_id: str) -> None:
 
 def _publish(
     build: Any, *args: Any, turn_session_id: str | None = None, require_target_session_id: str | None = None,
-    live_session_id: str | None = None, **kwargs: Any,
+    live_session_id: str | None = None, log_prune_commit: bool = False, **kwargs: Any,
 ) -> None:
     """Build one record, fire ``post_compaction`` for a committed one, and fan it out to the built-in Relay
     integration. ``live_session_id`` is the session holding the compacted transcript now (a rotating commit
@@ -270,6 +270,13 @@ def _publish(
     its traceback, later ones at DEBUG."""
     global _warned
     try:
+        payload = None
+        if log_prune_commit:
+            payload = build(*args, **kwargs)
+            logger.info(
+                "Proactive tool-result prune committed: tokens_reclaimed=%d tool_results_pruned=%d",
+                payload["tokens_reclaimed"], payload["tool_results_pruned"],
+            )
         relay = True
         if require_target_session_id is not None:
             from agent.relay_compaction import compaction_target_available
@@ -280,7 +287,8 @@ def _publish(
         hook = has_hook("post_compaction")
         if not (relay or hook):
             return
-        payload = build(*args, **kwargs)
+        if payload is None:
+            payload = build(*args, **kwargs)
         name = event_name(payload)
         if hook and name == COMPACTION_MARK:
             _fire_for(payload, live_session_id or payload["session_id"])
@@ -307,9 +315,29 @@ def _turn_session_id(agent: Any) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+def _note_local_rewrite(session_id: Any, *, pruned: bool = False, origin_session_id: Any = None) -> bool:
+    """Keep local request attribution independent of Relay and plugin subscribers."""
+    try:
+        from hermes_cli.observability.request_usage_ledger import note_history_rewrite
+
+        if not isinstance(session_id, str) or not session_id:
+            return False
+        return note_history_rewrite(session_id, pruned=pruned, origin_session_id=origin_session_id)
+    except Exception:
+        logger.debug("failed to record local history rewrite telemetry", exc_info=True)
+        return False
+
+
 def publish_attempt(agent: Any, record: dict[str, Any]) -> None:
     """Publish one ``compress_context`` attempt record (the attempt telemetry seam calls this)."""
     if _publishes_for(agent):
+        if record.get("route") != "codex_app_server" and (
+            record.get("history_rewritten") is True or record.get("commit_status") == "committed"
+        ):
+            # Rotating commits are recorded against the starting session but the next
+            # request sends the child session's context. Codex app-server owns its own
+            # thread and bypasses this request ledger.
+            _note_local_rewrite(getattr(agent, "session_id", None), origin_session_id=record.get("session_id"))
         _publish(lambda: attempt_payload(
             record, compression_count=getattr(getattr(agent, "context_compressor", None), "compression_count", None),
         ), turn_session_id=_turn_session_id(agent), live_session_id=getattr(agent, "session_id", None))
@@ -318,6 +346,8 @@ def publish_attempt(agent: Any, record: dict[str, Any]) -> None:
 def publish_micro(record: dict[str, Any], *, turn_session_id: str | None = None) -> None:
     """Publish one micro-compaction pass record. The finalizer never runs micro-compaction for a fork, and passes
     the session its turn started in (``_turn_session_id``) because the pass may run in a rotated child."""
+    if record.get("outcome") in ("absorbed", "defrag"):
+        _note_local_rewrite(record.get("session_id"), origin_session_id=turn_session_id)
     _publish(micro_payload, record, turn_session_id=turn_session_id)
 
 
@@ -327,11 +357,13 @@ def publish_prune(agent: Any, messages: list, pruned: list, tool_results_pruned:
     session_id = getattr(agent, "session_id", None) or ""
     turn_session_id = _turn_session_id(agent)
     if _publishes_for(agent):
+        public_rewrite = _note_local_rewrite(session_id, pruned=True, origin_session_id=turn_session_id)
         _publish(lambda: prune_payload(
             session_id=session_id, tokens_before=estimate_messages_tokens_rough(messages),
             tokens_after=estimate_messages_tokens_rough(pruned), messages=len(pruned),
             tool_results_pruned=tool_results_pruned,
-        ), turn_session_id=turn_session_id, require_target_session_id=session_id)
+        ), turn_session_id=turn_session_id, require_target_session_id=session_id,
+            log_prune_commit=public_rewrite and logger.isEnabledFor(logging.INFO))
 
 
 def publish_provider_native(agent: Any) -> None:
