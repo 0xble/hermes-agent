@@ -29,6 +29,13 @@ _LEGACY_MAX_ASYNC_WARNED = False
 # delegation.child_timeout_seconds opts back in.
 DEFAULT_CHILD_TIMEOUT: Optional[float] = None
 
+
+def _cfg() -> dict:
+    """The ``delegation`` section, read through the origin so tests can patch it."""
+    from tools.delegate_tool import _load_config
+    return _load_config()
+
+
 # ── Subagent approval callbacks ─────────────────────────────────────────────
 # Subagent worker threads don't inherit the CLI's threading.local approval
 # callback, so prompt_dangerous_approval() would fall back to input() and

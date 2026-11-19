@@ -129,7 +129,7 @@ async def send_rich_standalone(bot, extra: dict, chat_id, content: str, *, threa
     else:
         message_id = getattr(response, "message_id", None)
     if message_id is not None:
-        await adapter._record_rich_sent(chat_id, message_id, content)
+        await adapter._record_sent_text(chat_id, message_id, content)
     return SendResult(success=True, message_id=str(message_id) if message_id is not None else None)
 
 

@@ -1,7 +1,6 @@
 """Tests for tools/terminal_hints.py — output-pattern failure hints."""
 
 import shlex
-import shlex
 import subprocess
 from unittest.mock import patch as mock_patch
 

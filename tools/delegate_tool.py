@@ -38,13 +38,6 @@ from tools.delegate_tool_config import (
     _resolve_delegation_credentials, explicit_parent_reasoning,
     _subagent_auto_approve, _subagent_auto_deny,
 )
-from tools.delegate_tool_config import (
-    _DEFAULT_MAX_CONCURRENT_CHILDREN, _get_max_concurrent_children,
-    _get_max_spawn_depth, _get_oneshot_max_children, _get_orchestrator_enabled,
-    _inherit_parent_capabilities, _merge_request_overrides, _resolve_child_credential_pool,
-    _resolve_child_runtime,
-    _subagent_auto_approve, _subagent_auto_deny,
-)
 from tools.delegate_tool_dispatch import _Batch, _announce_batch, _capture_origin, _run_batch
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _build_child_progress_callback,

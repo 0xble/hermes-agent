@@ -7,6 +7,7 @@ Nothing runs on the host unless TERMINAL_ENV=local; other backends run in their 
 import codecs
 from contextlib import suppress
 import inspect
+import json
 import logging
 import os
 import platform
@@ -1491,6 +1492,8 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
                 self._finish_exited(session, -1, reason="lost", source="backend_lost")
                 return
 
+    _log_delta_command = staticmethod(log_delta_command)
+
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
         pty = session._pty
@@ -2182,6 +2185,14 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             "status": status, "command": session.command,
             **ProcessRegistry._exit_fields(session), **_completion_output(session), **process_provenance(session)}
 
+    def _uncollected_gone(self, session: Optional[ProcessSession]) -> bool:
+        """True when a detached entry was closed without a collected exit status
+        and the PID is no longer alive. List/poll must not report that as exited."""
+        return bool(
+            session is not None and session.exited and session.exit_code is None
+            and session.detached and session.pid_scope == "host"
+            and not self._is_host_pid_alive(session.pid))
+
     def kill_process(
         self, session_id: str, *, source: str = "process.kill", consume_output: bool = True,
         deadline: Optional[float] = None,
@@ -2194,48 +2205,41 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         session = self.get(session_id)
         if session is None:
             return _not_found(session_id)
-        if session.exited:
-            # A double-forked descendant may still be alive in the systemd scope even
-            # though the main process exited — stop the scope to reap survivors.
-            # See #70716.
-            # If the worker was spawned in its own systemd scope (#70716), stop the entire unit to reap any
-            # double-forked descendants that were reparented inside the scope and survived the PID signal
-            # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
-            # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
-            # above already handled the main process; this catches stragglers.
-            scope_stopped = self._stop_scope(session)
-            with session._lock:
-                result = self._exit_snapshot(session, "already_exited")
-                finalizing = self._reader_finalizing(session)
-            if not scope_stopped:
-                result["scope_stop_failed"] = session.systemd_unit
-            # Only suppress the autonomous turn after its output is present in
-            # the explicit kill result, matching wait/log consumption.
-            if consume_output and not finalizing:
-                self._completion_consumed.add(session_id)
-            return result
-        if session.exited:
-            # A double-forked descendant may still be alive in the systemd scope even
-            # though the main process exited — stop the scope to reap survivors.
-            # See #70716.
-            # If the worker was spawned in its own systemd scope (#70716), stop the entire unit to reap any
-            # double-forked descendants that were reparented inside the scope and survived the PID signal
-            # above (reviewer gap #2). ``systemctl --user stop`` sends SIGTERM to every process in the
-            # cgroup and escalates to SIGKILL after TimeoutStopSec. This is additive — the PID-based kill
-            # above already handled the main process; this catches stragglers.
-            scope_stopped = self._stop_scope(session)
-            with session._lock:
-                result = self._exit_snapshot(session, "already_exited")
-                finalizing = self._reader_finalizing(session)
-            if not scope_stopped:
-                result["scope_stop_failed"] = session.systemd_unit
-            # Only suppress the autonomous turn after its output is present in
-            # the explicit kill result, matching wait/log consumption.
-            if consume_output and not finalizing:
-                self._completion_consumed.add(session.id)
-            return result
+        if deadline is not None and time.monotonic() >= deadline:
+            return {"status": "deadline", "session_id": session_id}
+        previous_kill_deadline = session._kill_deadline
+        session._kill_deadline = deadline
+        if self._collect_recorded_exit(session):
+            try:
+                return self._already_exited_kill_result(session, consume_output, deadline)
+            finally:
+                session._kill_deadline = previous_kill_deadline
+        # Keep an additive receipt before a restart/shutdown signal can outlive this
+        # gateway. The normal completion write below may be fenced by the shared deadline.
+        session._kill_requested = True
+        if (source == "gateway_shutdown" or deadline is not None) and (
+            session._pty
+            or session.process
+            or (session.env_ref and session.pid)
+            or (session.detached and session.pid_scope == "host" and session.pid)
+        ):
+            # Set the marker before the snapshot/write so a reader that wins the race
+            # still persists the final receipt in the cut-retention budget.
+            session._cut_receipt = True
+            # Bounded kills keep half the remaining budget for the signals themselves.
+            save_cut_pending_result(
+                session, source, include_output=deadline is None, prune=deadline is None,
+                lock_timeout=(
+                    None if deadline is None
+                    else max(0.0, deadline - time.monotonic()) / 2
+                ),
+            )
+        # Only a bounded caller passes its deadline down; an unbounded kill keeps the plain calls.
+        bounded = {} if deadline is None else {"deadline": deadline}
         try:
-            early = self._signal_kill(session, session_id, consume_output, deadline=deadline)
+            if session.pid_scope == "ssh":
+                session._ssh_kill_source = source
+            early = self._signal_kill(session, session_id, consume_output, **bounded)
             if early is not None:
                 return early
             # Additive to the PID kill: stopping the scope reaps double-forked
@@ -2281,7 +2285,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             with session._lock:
                 output = _completion_output(session)
                 if consume_output:
-                    self._completion_consumed.add(session.id)
+                    self._completion_consumed.add(session_id)
                 session.exited = True
                 session.exit_code = -15  # SIGTERM
                 session.completion_reason = "killed"
@@ -3145,7 +3149,7 @@ process_registry = ProcessRegistry()
 
 
 # --- the "process_manage" tool schema + handler -----------------------------------
-from tools.registry import registry
+from tools.registry import registry, tool_error
 
 PROCESS_SCHEMA = {
     "name": "process_manage",

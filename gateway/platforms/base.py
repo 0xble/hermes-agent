@@ -506,9 +506,9 @@ if (_checkout_root := str(Path(__file__).resolve().parents[2])) not in sys.path:
     sys.path.append(_checkout_root)  # append, never prepend: never shadow same-named installed packages
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.helpers import (
-    consume_detached_handler_exception, fence_state_after, reply_file_off, try_reply_file, typing_metadata_for_turn, typing_pause_key,
+    consume_detached_handler_exception, fence_state_after, reply_file_off, try_reply_file, typing_metadata_for_turn,
+    sender_may_see_activity, typing_pause_key, typing_refresh_wanted,
 )
-from gateway.platforms.helpers import fence_state_after, reply_file_off, try_reply_file, typing_metadata_for_turn, sender_may_see_activity, typing_pause_key, typing_refresh_wanted
 from gateway.platforms.base_post_delivery import run_post_delivery_callback
 from gateway.platforms.base_delivery_ledger import (
     finalize_final_obligation, ledger_attempted, ledger_bracket, record_final_obligation)
@@ -4689,6 +4689,15 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         lo, hi = bounds
         return random.uniform(lo / 1000.0, hi / 1000.0)
 
+    def _spoken_reply_text(self, extracted: "_ExtractedResponse") -> str:
+        """The reply as auto-TTS speaks it: paste-ready copy bodies are read, never spoken."""
+        raw = extracted.pre_extract or ""
+        without_copy = strip_copy_blocks(raw)
+        if without_copy == raw:
+            return extracted.text_content
+        _, spoken = self.extract_images(self.extract_media(without_copy)[1])
+        return _strip_media_directives(spoken).strip()
+
     async def _synthesize_auto_tts(self, text_content: str, source: Optional[SessionSource] = None,
                                    ) -> tuple[list[str], Optional[str]]:
         """``(existing_paths, requested_path)``, synthesized in ``source``'s profile scope (the turn's
@@ -5384,7 +5393,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 _spoken_text = self._spoken_reply_text(extracted)
                 if self._wants_auto_tts(
                         event, session_key, interrupt_event, _spoken_text, media_files):
-                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(_spoken_text)
+                    _tts_paths, _tts_requested_path = await self._synthesize_auto_tts(_spoken_text, event.source)
                 # TTS plays before text; generated files are removed afterwards.
                 _tts_caption_delivered = False
                 for _tts_index, _tts_path in enumerate(_tts_paths):
@@ -5453,7 +5462,7 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                 logger.debug("[%s] Processing queued follow-up message", self.name)
                 self._clear_session_guard(session_key)
                 await self._stop_typing_refresh(event.source.chat_id, typing_task, metadata=_typing_metadata, event=event)
-                await self._fire_post_delivery_callback(session_key, generation)  # done before the follow-up starts
+                await self._fire_post_delivery_callback(session_key, delivery_generation)  # done before the follow-up starts
                 self._spawn_drain_task(pending_event, session_key, delay=delay)
                 return  # Drain task owns the session now.
         except asyncio.CancelledError:

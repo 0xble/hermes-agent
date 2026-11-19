@@ -18,7 +18,6 @@ from hermes_cli.observability.shared_metrics_loop import begin_delegation_run, f
 from tools.async_delegation import _new_delegation_id
 from tools.async_delegation_completion import record_unit_child
 from tools.delegate_tool_child_run import _attach_child, _close_child, _detach_child, _fabricated_entry, _signal_child_stop
-from tools.delegate_tool_config import _get_max_async_children
 from tools.delegate_tool_progress import (
     SUBAGENT_FAILURE_STATUSES, _print_completion_line, _quiet, describe_subagent_failure, format_batch_tag,
 )

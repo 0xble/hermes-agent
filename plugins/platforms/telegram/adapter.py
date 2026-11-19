@@ -1882,7 +1882,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         if message_id is None:
             from plugins.platforms.telegram.telegram_send_errors import idless_send_result
             return idless_send_result(self.name, chat_id, "sendRichMessage")
-        await self._record_rich_sent(chat_id, message_id, content)
+        await self._record_sent_text(chat_id, message_id, content)
         return result
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
@@ -1928,7 +1928,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # Mirror the fresh-send index: a streamed final finalized via edit is otherwise never recorded.
         from gateway.reply_latency import transport_confirmed
         result = transport_confirmed(content, SendResult(success=True, message_id=message_id), chat_id=chat_id, thread_id=self._metadata_thread_id(metadata))
-        await self._record_rich_sent(chat_id, message_id, content)
+        await self._record_sent_text(chat_id, message_id, content)
         return result
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
@@ -4702,6 +4702,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         return False
 
     @durable_egress("edit_message")
+    async def _after_legacy_edit(
+        self, chat_id: str, message_id: str, content: str, finalize: bool, saturated_preview: bool,
+    ) -> None:
+        if saturated_preview:
+            self._last_overflow_preview[(str(chat_id), str(message_id))] = content
+        if finalize:
+            await self._record_sent_text(chat_id, message_id, quotable_text(content))
+
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[dict[str, Any]] = None,
        ) -> SendResult:
@@ -4798,13 +4806,13 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 if _saturated_preview:
                     self._last_overflow_preview[_preview_key] = content
                 return SendResult(success=True, message_id=message_id)
-            await self._edit_markdown_or_plain(
-                chat_id, message_id, self.format_message(content), _strip_mdv2(content) if content else content,
-                "[%s] MarkdownV2 edit failed, falling back to plain text: %s")
+            await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
+            await self._after_legacy_edit(chat_id, message_id, content, finalize, _saturated_preview)
             return SendResult(success=True, message_id=message_id)
         except Exception as e:
             err_str = str(e).lower()
             if "not modified" in err_str:
+                await self._after_legacy_edit(chat_id, message_id, content, finalize, _saturated_preview)
                 return SendResult(success=True, message_id=message_id)
             # Reactive split: MarkdownV2 escapes can inflate the payload past the limit even when raw text fit.
             if "message_too_long" in err_str or "too long" in err_str:
@@ -4834,13 +4842,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     return self._record_send_flood_cooldown(chat_id, wait)
                 logger.warning("[%s] Telegram flood control, waiting %.1fs", self.name, wait)
                 self._record_send_flood_cooldown(chat_id, wait)
-                await asyncio.sleep(wait)
+                remaining = self._send_flood_cooldown_remaining(chat_id)
+                await asyncio.sleep(max(wait, remaining or 0.0))
                 remaining = self._send_flood_cooldown_remaining(chat_id)
                 if remaining is not None:
                     return _flood_cap_result(remaining)
                 try:
                     await self._edit_markdown_or_plain(chat_id, message_id, formatted, plain, warn)
-                    await self._after_legacy_edit(chat_id, message_id, content, plain, finalize, _saturated_preview)
+                    await self._after_legacy_edit(chat_id, message_id, content, finalize, _saturated_preview)
                     return SendResult(success=True, message_id=message_id)
                 except Exception as retry_err:
                     safe_retry_error = _redact_telegram_error_text(retry_err)
@@ -4957,6 +4966,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         from gateway.reply_latency import record_transport_reply
         thread_id = self._metadata_thread_id(metadata)
         confirmed_at = record_transport_reply(first_chunk, chat_id=chat_id, thread_id=thread_id)
+        if finalize:
+            await self._record_sent_text(chat_id, message_id, quotable_text(first_chunk))
         # Continuations call self._bot.send_message directly to skip self.send's pre-chunking.
         continuation_ids: list[str] = []
         delivered_chunks = [first_chunk]
@@ -4987,6 +4998,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     raw_response=raw, continuation_message_ids=tuple(continuation_ids))
             new_id = str(getattr(sent_msg, "message_id", "")) or prev_id
             confirmed_at = record_transport_reply(chunk, chat_id=chat_id, thread_id=thread_id)
+            if finalize:
+                await self._record_sent_text(chat_id, new_id, quotable_text(chunk))
             continuation_ids.append(new_id)
             delivered_chunks.append(chunk)
             prev_id = new_id
