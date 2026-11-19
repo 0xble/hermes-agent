@@ -4808,7 +4808,8 @@ def _start_gateway_housekeeping(
         # rather than delaying this tick's and hiding the stall.
         (1, "Runtime heartbeat", _write_runtime_status_quiet, False),
         (1, "Reply latency coverage", record_coverage, False)]
-    if adapters is not None or runner is not None:
+    watch_delivery_queue = adapters is not None or runner is not None
+    if watch_delivery_queue:
         # Restart-safe cron workers run outside the gateway cgroup and queue their final send for
         # whichever gateway is live; drained here (not the scheduler tick) so external providers get it too.
         chores.append((1, DRAIN_LABEL, lambda: _drain_restart_safe_cron_deliveries(adapters, loop, runner), False))
@@ -4835,7 +4836,7 @@ def _start_gateway_housekeeping(
             # Default-bound now, i.e. OUTSIDE any profile scope: this is the launch home's override.
             lambda _launch=_launch_sessions_dir(getattr(runner, "config", None)):
                 _housekeeping_state_db_maintenance(_launch),
-        ), True),
+        ), watch_delivery_queue),  # Bootstrap maintenance follows the first delivery watch window.
         # Due-gated inside: the first tick after startup runs an overdue check, not tick 60.
         # Per served profile: plugins dir, last-run marker and plugins.auto_apply are all the
         # profile's own (get_hermes_home()/load_config_readonly() bind to the scope).
@@ -4853,7 +4854,7 @@ def _start_gateway_housekeeping(
     # Between ticks the queue file is watched so a worker's send goes out when it is queued,
     # not up to ``interval`` later (#117307); the tick's drain above remains the fallback.
     queue_watch = None
-    if adapters is not None or runner is not None:
+    if watch_delivery_queue:
         def served_homes() -> list:
             return [home for _name, home in _handoff_watch_scopes(runner)] if runner is not None else [None]
 
