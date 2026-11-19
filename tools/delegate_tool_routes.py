@@ -260,7 +260,8 @@ def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> Ta
                 route.update(base_url=alias.base_url, api_key=alias.api_key)
             if "reasoning_effort" not in route and alias.reasoning_effort != "":
                 route["reasoning_effort"] = alias.reasoning_effort
-    from tools.delegate_tool import _resolve_delegation_credentials  # the facade is the patch seam
+    # This module's global is the one patch seam, as in route_for_config below: a local import of
+    # the tools.delegate_tool facade here shadowed it and left a patched resolver unused.
     creds = _resolve_delegation_credentials(route, parent_agent)
     if route.get("service_tier") not in (None, ""):
         from tools.delegate_tool_tuning import task_service_tier
