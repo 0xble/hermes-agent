@@ -69,11 +69,17 @@ def test_a_replaced_database_is_reconciled_again(home, reconcile_calls):
 
 def test_a_recreated_database_on_a_recycled_inode_still_gets_its_ledger(home, reconcile_calls):
     """The filesystem may hand a recreated state.db the deleted file's inode, so no file-identity key can
-    tell the two apart; the schema_version header can (the fresh file reads 0)."""
+    tell the two apart; the stored schema can (the fresh file has no ledger table)."""
     _sweep_once()
     for suffix in ("", "-wal", "-shm", "-journal"):
         (home / f"state.db{suffix}").unlink(missing_ok=True)
-    (home / "state.db").touch()  # an empty file at the same path, whatever inode it got
+    # A valid, table-less database at the same path, whatever inode it got. Not a 0-byte file: the
+    # shared-state opener refuses one and leaves it to SessionDB to recover
+    # (tests/hermes_state/test_delegation_startup_race.py).
+    with closing(sqlite3.connect(str(home / "state.db"))) as fresh:
+        fresh.execute("PRAGMA user_version = 0")
+        fresh.commit()
+    assert (home / "state.db").read_bytes().startswith(b"SQLite format 3")
     ad._persist_dispatch({"delegation_id": "d-2", "session_key": "", "origin_ui_session_id": "ui",
                           "parent_session_id": "p", "dispatched_at": time.time()})
     assert ad.get_durable_delegation("d-2") is not None

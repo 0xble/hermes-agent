@@ -137,11 +137,16 @@ def test_post_open_hardening_failure_closes_connection(monkeypatch, tmp_path):
     real_connect = sqlite3.connect
 
     def tracking_connect(database, *args, **kwargs):
-        conn = real_connect(database, *args, **kwargs)
         if str(database) == ":memory:":  # the reconciler's private reference shape
-            return conn
+            return real_connect(database, *args, **kwargs)
+        # Track through the requested factory, as _track_connections does: a delegating proxy is
+        # not a SQLite connection.
+        factory = kwargs.pop("factory", sqlite3.Connection)
+        kwargs["factory"] = type("ObservedConnection", (_TrackingConnection, factory), {})
+        conn = real_connect(database, *args, **kwargs)
+        conn._closed_ids = closed
         opened.append(id(conn))
-        return _TrackingConnection(conn, closed)
+        return conn
 
     monkeypatch.setattr(ad.sqlite3, "connect", tracking_connect)
     real_secure = hermes_state._secure_state_db_files

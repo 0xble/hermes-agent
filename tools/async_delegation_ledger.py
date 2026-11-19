@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sqlite3
@@ -59,10 +60,11 @@ def _connect() -> sqlite3.Connection:
     # connector, rather than exposing an unprotected empty first-open inode.
     # wal=False: SessionDB owns the journal mode (_initialize_schema applies the barriers).
     path = _db_path()
-    # None while the file does not exist yet: the opener creates it under the startup lock.
+    # None while the file does not exist yet: the opener creates it under the startup lock, and a
+    # first open has no earlier file to tell apart, so the initializer runs as it does on live.
     identity = _db_identity(path)
-    return open_shared_state_db(path, db_label="state.db (async_delegation)", wal=False,
-                                initialize=lambda conn: _initialize_schema(conn, identity=identity))
+    initialize = _initialize_schema if identity is None else functools.partial(_initialize_schema, identity=identity)
+    return open_shared_state_db(path, db_label="state.db (async_delegation)", wal=False, initialize=initialize)
 
 
 def _initialize_schema(conn: sqlite3.Connection, *, identity: tuple[int, int] | None = None) -> None:
