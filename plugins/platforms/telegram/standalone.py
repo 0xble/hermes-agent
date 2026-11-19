@@ -385,10 +385,7 @@ def _telegram_text_chunks(formatted, has_html, copy_block):
     # Same split as the live adapter: entities cut by a split are closed and reopened, and the
     # " (1/2)" markers come back MarkdownV2-escaped (#74004).
     from plugins.platforms.telegram.telegram_chunking import split_formatted_mdv2
-    return split_formatted_mdv2(
-        formatted, 4096,
-        lambda text, limit, len_fn: BasePlatformAdapter.truncate_message(text, limit, len_fn=len_fn, indicator_overhead=3),
-        utf16_len)
+    return split_formatted_mdv2(formatted, 4096, BasePlatformAdapter.truncate_message, utf16_len)
 
 
 async def _telegram_send_media_files(bot, int_chat_id, media_files, *, _tg_caption, send_parse_mode,

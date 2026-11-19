@@ -4571,7 +4571,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             copy_chunks = truncate_copy_source(
                 content, self.MAX_MESSAGE_LENGTH, utf16_len, self.CHUNK_INDICATOR_OVERHEAD, close_chunks=True)
             chunks = ([self.format_message(chunk) for chunk in copy_chunks] if copy_chunks is not None else
-                      split_formatted_mdv2(self.format_message(content), self.MAX_MESSAGE_LENGTH, self.truncate_message, utf16_len))
+                      split_formatted_mdv2(self.format_message(content), self.MAX_MESSAGE_LENGTH, self.truncate_message,
+                                           utf16_len, indicator_overhead=self.CHUNK_INDICATOR_OVERHEAD))
             if as_file := await hand_off_split(self, chat_id, content, len(chunks), reply_to=reply_to, metadata=metadata):
                 return as_file
             return await self._send_chunks(chat_id, chunks, delivered, reply_to, metadata, error_types)

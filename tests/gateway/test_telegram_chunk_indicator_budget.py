@@ -37,7 +37,10 @@ async def test_long_single_line_fence_chunks_fit_telegram_limit(count, body_unit
     # Fill the head chunks and leave a small tail. These source lengths bound the
     # indicator to six/seven digits; UTF-16 units, not codepoints, fill the body.
     repeats = (body_units // utf16_len(character)) * (count - 1) + 50
-    result = await adapter.send("4242", "```\n" + character * repeats + "\n```")
+    from gateway.platforms.helpers import reply_file_off
+    # Exercise the text transport at count-width boundaries, not the long-reply file handoff.
+    with reply_file_off():
+        result = await adapter.send("4242", "```\n" + character * repeats + "\n```")
 
     assert result.success is True
     oversized = [(i, utf16_len(text)) for i, text in enumerate(sent) if utf16_len(text) > adapter.MAX_MESSAGE_LENGTH]
