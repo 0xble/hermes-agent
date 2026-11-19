@@ -6,9 +6,15 @@ Fork patch identity: `goal-autonomy`.
 
 `goals.autonomy` defaults to `false`. The existing judge, approval and continuation
 behavior remains the default. When explicitly enabled, native goal management
-supports agent set, revise, replace, pause, resume and complete without approval.
-The external `goal-lifecycle` plugin in `0xble/agents` owns the model tool. Clear
-is user-only on that tool in every mode. Native `/goal clear` remains available.
+supports agent set, revise, replace, pause, resume, clear and complete without approval.
+The external `goal-lifecycle` plugin in `0xble/agents` owns the model tool. Under
+`goals.autonomy`, clear requires a nonempty reason and retires only an obsolete,
+superseded, duplicated or handed-off goal; cite verified takeover for a handoff.
+Never clear to escape unmet criteria or failing checks. Use complete for an
+achieved outcome. The shared session-control transaction records the reason and
+agent/autonomy authority in existing goal revisions and the control receipt,
+and the applied notice names the reason subject to the configured notice policy.
+Native `/goal clear` and default-off controls are unchanged.
 
 This belongs in core because contract preservation, evidence admission, atomic
 completion, and idle wake admission share durable goal state across CLI, gateway
