@@ -329,8 +329,6 @@ _DB_PERSISTED_MARKER = "_db_persisted"
 # they don't duplicate live copies in recall; never persisted (unknown column).
 _COMPACTION_TAIL_MARKER = "_compaction_tail"
 PROACTIVE_PRUNE_REARM_MODEL_CONFIG_KEY = "_proactive_prune_rearm_tokens"
-# Reclaim gate for a prune on an already-expired provider cache (no cache break to amortize).
-_COLD_CACHE_MIN_RECLAIM_TOKENS = 16_000
 
 _NO_USER_TASK_SENTINEL = "None. This session contains no user-authored turns."
 COMPRESSION_CONTINUATION_USER_CONTENT = (
@@ -3327,20 +3325,6 @@ class ContextCompressor(
                 result, prune_boundary, protect_tail_tokens, call_id_to_tool, min_prune_chars, spared,
             )
         return result, pruned
-
-    def _reset_proactive_prune_rearm(self) -> None:
-        """Fully rearm the proactive prune and let a future lockout warn again.
-
-        Every path that zeroes the rearm mark (compaction, session
-        reset/end/rebind, model recalibration) is a reclamation or a fresh
-        start, so the over-threshold no-op dedup key must not survive it —
-        otherwise an identical lockout after a full compaction (rearm back
-        at 0) would be silent (#101889).
-        """
-        self._proactive_prune_rearm_tokens = self._proactive_prune_cold_credit = 0
-        self._consecutive_archive_capacity_failures = 0
-        self._optional_archive_cooldown_until = 0.0
-        self._last_reclaim_block_warn = None
 
     def _billed_basis_over_threshold(self, current_tokens: int | None) -> bool:
         """Whether a provider-billed reading says the session is over threshold.

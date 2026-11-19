@@ -15,6 +15,24 @@ from typing import Any, Optional
 
 logger = logging.getLogger("agent.context_compressor")
 
+# Reclaim floor for an expired cache, where pruning doesn't cause a cache break.
+_COLD_CACHE_MIN_RECLAIM_TOKENS = 16_000
+
+
+def _restore_protected_prune_rows(
+    messages: list[dict[str, Any]], pruned_msgs: list[dict[str, Any]],
+    turn_start: int | None, boundary: int,
+) -> None:
+    """Keep the running turn and the protected parallel tool round intact."""
+    if turn_start is not None:
+        pruned_msgs[turn_start:] = messages[turn_start:]
+    # A protected parallel round stays whole, including dedup and image retirement.
+    if 0 <= boundary < len(messages) and messages[boundary].get("tool_calls"):
+        end = boundary + 1
+        while end < len(messages) and messages[end].get("role") == "tool":
+            end += 1
+        pruned_msgs[boundary:end] = messages[boundary:end]
+
 
 def _cc():
     """The origin module, resolved lazily: avoids the import cycle and keeps tests that patch
@@ -33,6 +51,20 @@ class ProactivePruneMixin:
         """
         seconds = _cc()._next_timeout_cooldown(self, "_consecutive_archive_capacity_failures")
         self._optional_archive_cooldown_until = max(self._optional_archive_cooldown_until, time.monotonic() + seconds)
+
+    def _reset_proactive_prune_rearm(self) -> None:
+        """Fully rearm the proactive prune and let a future lockout warn again.
+
+        Every path that zeroes the rearm mark (compaction, session
+        reset/end/rebind, model recalibration) is a reclamation or a fresh
+        start, so the over-threshold no-op dedup key must not survive it —
+        otherwise an identical lockout after a full compaction (rearm back
+        at 0) would be silent (#101889).
+        """
+        self._proactive_prune_rearm_tokens = self._proactive_prune_cold_credit = 0
+        self._consecutive_archive_capacity_failures = 0
+        self._optional_archive_cooldown_until = 0.0
+        self._last_reclaim_block_warn = None
 
     def would_proactively_prune(self, current_tokens: int | None = None) -> bool:
         """Configured on AND above its trigger: the two state-free preconditions
@@ -96,14 +128,7 @@ class ProactivePruneMixin:
             messages, protect_tail_count=len(messages) - boundary, protect_tail_tokens=None,
             min_prune_chars=self.proactive_prune_min_result_chars,
         )
-        if turn_start is not None:
-            pruned_msgs[turn_start:] = messages[turn_start:]
-        # A protected parallel round stays whole, including dedup and image retirement.
-        if 0 <= boundary < len(messages) and messages[boundary].get("tool_calls"):
-            end = boundary + 1
-            while end < len(messages) and messages[end].get("role") == "tool":
-                end += 1
-            pruned_msgs[boundary:end] = messages[boundary:end]
+        _restore_protected_prune_rows(messages, pruned_msgs, turn_start, boundary)
         pruned_count = sum(a != b for a, b in zip(messages, pruned_msgs))
         from agent.context_compressor_tail import with_pruned_row_skill_safety_rule
         pruned_msgs = with_pruned_row_skill_safety_rule(messages, pruned_msgs)
@@ -115,7 +140,7 @@ class ProactivePruneMixin:
         after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
         reclaimed = max(0, before - after)
         gate = self.proactive_prune_min_reclaim_tokens
-        cold_gate = _cc()._COLD_CACHE_MIN_RECLAIM_TOKENS
+        cold_gate = _COLD_CACHE_MIN_RECLAIM_TOKENS
         if self.proactive_prune_tokens > 0:
             cold_gate = min(gate, cold_gate)
         if reclaimed < (cold_gate if cold_cache else max(cold_gate, gate - self._proactive_prune_cold_credit)):

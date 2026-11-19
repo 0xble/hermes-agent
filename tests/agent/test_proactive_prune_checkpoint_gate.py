@@ -20,6 +20,9 @@ class _CountingPruneCompressor:
     """Built-in-shaped double: counts instead of asserting, because the call site swallows
     exceptions. Publishes ``would_proactively_prune`` with a configured trigger by default."""
 
+    # The host dispatches only when the engine is bound to a session store.
+    _session_db, _session_id = object(), "s1"
+
     def __init__(self, proactive_prune_tokens: int = 48_000):
         self.calls = 0
         self.proactive_prune_tokens = proactive_prune_tokens
@@ -97,6 +100,7 @@ def test_engine_override_of_prune_is_suppressed_too():
 
     class _PruningEngine(_engine_stub()):
         calls = 0
+        _session_db, _session_id = object(), "s1"
 
         def prune_tool_results_only(self, messages, current_tokens=None):
             type(self).calls += 1

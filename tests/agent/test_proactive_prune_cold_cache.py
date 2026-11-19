@@ -6,7 +6,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.context_compressor import _COLD_CACHE_MIN_RECLAIM_TOKENS, ContextCompressor
+from agent.context_compressor import ContextCompressor
+from agent.context_compressor_prune import _COLD_CACHE_MIN_RECLAIM_TOKENS
 from agent.prompt_caching import provider_cache_expired
 from agent.turn_context_compaction import CompactionOutcome, run_turn_start_compaction
 from agent.turn_proactive_prune import run_proactive_prune, turn_start_cold_prune
