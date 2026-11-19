@@ -2345,7 +2345,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if model_pinned:
             agent_kwargs["model_pinned"] = True
         agent = AIAgent(**agent_kwargs)
-        agent._preflight_fallback = None if model_pinned else preflight_fallback
+        if preflight_fallback is not None and not model_pinned:
+            agent._preflight_fallback = preflight_fallback
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override

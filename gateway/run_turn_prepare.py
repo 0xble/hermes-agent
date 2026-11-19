@@ -276,7 +276,25 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
             # Never pair an explicitly picked model with the default provider's credentials.
             logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
             if override.get("model"):
-                raise  # An explicit model cannot move onto the default route.
+                from hermes_cli.fallback_config import get_fallback_chain, same_model_fallbacks
+                from hermes_cli.fallback_config import pre_agent_fallback_notice
+                for fallback in same_model_fallbacks(get_fallback_chain(user_config), override["model"]):
+                    try:
+                        fallback_runtime = _resolve_runtime_agent_kwargs_for_provider(
+                            fallback["provider"], target_model=fallback["model"])
+                    except Exception:
+                        continue
+                    fallback_runtime["model_pinned"] = True
+                    fallback_runtime["_preflight_fallback"] = {
+                        "requested_model": override["model"],
+                        "fallback_model": fallback["model"],
+                        "fallback_reason": "credentials_unavailable",
+                    }
+                    notice = pre_agent_fallback_notice(
+                        override.get("provider"), override["model"],
+                        fallback.get("provider"), fallback["model"])
+                    return override["model"], fallback_runtime, notice, False
+                raise  # An explicit model has no eligible same-model route.
             unavailable_override, override = override, None
     if runtime_kwargs is None:
         runtime_kwargs = _resolve_runtime_agent_kwargs()
