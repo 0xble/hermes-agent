@@ -5256,9 +5256,9 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
         if inline_bodies:
             # Same outer trim as text without blocks; bodies inside stay byte-exact.
             text_content = restore_inline_copy_bodies(text_content, inline_bodies).strip()
-        return _ExtractedResponse(
+        return footer_onto_photo_caption(self, _ExtractedResponse(
             text_content=text_content, copy_blocks=copy_blocks, images=images, media_files=media_files,
-            local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract)
+            local_files=local_files, force_document_attachments=force_document, pre_extract=pre_extract), _IMAGE_EXTS)
 
     async def _fire_post_delivery_callback(
         self, session_key: str, generation: int | None,
