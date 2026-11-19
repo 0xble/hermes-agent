@@ -1379,7 +1379,17 @@ def _redact_assignments(text: str, *, mask_nonreusable: bool = False) -> str:
         text = redact_cookie_assignments(text, mask)
         if "://" not in text and _CFG_SECRET_WORD_RE.search(text):  # before the ENV passes: their ``\S+``
             text = redact_spaced_cfg_assignments(text, mask)        # value stops at a quoted value's space
-        _redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
+        redact_env = _assignment_sub(lambda g: f"{g[0]}={g[1]}{mask(g[2])}{g[1]}", check_keyword=True)
+
+        def _redact_env(match: re.Match) -> str:
+            # An unquoted, fully masked value inside a JSON string is already
+            # safe. The ENV regex includes the terminating JSON quote in its
+            # match; don't let a second pass remove it.
+            start = match.start()
+            if (not match[2] and start >= 3 and match.string[start - 3:start] == ': "'
+                    and re.fullmatch(r'\*{3}"[,}\]]*', match[3])):
+                return match[0]
+            return redact_env(match)
         text = _ENV_ASSIGN_RE.sub(_redact_env, text)
         if "://" not in text:  # lowercase names would match URL params
             # Skip URLs — the query string may contain ``token=``/``key=`` params that are intentionally
