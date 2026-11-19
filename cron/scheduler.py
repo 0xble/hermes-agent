@@ -54,6 +54,7 @@ from cron.worker_bootstrap import WORKER_MARKER, finish_worker_boot
 from hermes_constants import get_hermes_home, hermes_home_key
 from hermes_cli.observability.shared_metrics_gateway import note_cron_execution, note_cron_skipped
 from cron.env_settings import cron_env_setting
+from cron.constants import job_priority
 from cron.scheduler_diagnostics import dispatch_context, note_dispatch_stage, run_dispatched_job
 from hermes_cli._subprocess_compat import windows_hide_flags
 from hermes_cli.config import (
@@ -4131,7 +4132,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
             extra={"HERMES_HOME": str(profile_home)},
         ))
     note_dispatch_stage(job, "secret_scope_ready")
-    worker_env = systemd_user_bus_env(worker_env)
+    worker_env = {**systemd_user_bus_env(worker_env), "HERMES_WORK_PRIORITY": job_priority(job)}
     note_dispatch_stage(job, "worker_env_ready")
     # Unattended worker: the gateway sets HERMES_EXEC_ASK at startup (interactive launches set
     # the other two), and an inherited presence var makes every env-fallback consumer in the
@@ -4829,7 +4830,7 @@ def _submit_with_guard(
                          execution_err)
         return None
 
-    from cron.scheduler_admission import AgentAdmissionRequired
+    from cron.scheduler_admission import AgentAdmissionRequired, submit_ranked
 
     # A script queued from a stale snapshot may need agent admission. Flatten the
     # executor handoff into one completion: sync ticks, drain, and dedup must still
@@ -4851,7 +4852,7 @@ def _submit_with_guard(
                         target_pool = script_pool(_get_hermes_home())
                     else:
                         target_pool = _get_parallel_pool(_resolve_max_parallel_workers())
-                    return target_pool.submit(_run_and_release, target_ctx)
+                    return submit_ranked(target_pool, job, _run_and_release, target_ctx)
                 except BaseException as exc:
                     settle_unstarted_execution(
                         execution["id"], job_id, f"{target_lane} admission handoff failed: {exc}")
@@ -4876,7 +4877,7 @@ def _submit_with_guard(
 
     try:
         _ctx.run(note_dispatch_stage, dispatched_job, "executor_queued")
-        fut = pool.submit(_run_and_release)
+        fut = submit_ranked(pool, job, _run_and_release)
         if dispatch_lane in {"script", "person-send"}:
             completion.set_running_or_notify_cancel()
             fut.add_done_callback(_complete)

@@ -824,7 +824,7 @@ _JOB_ARG_FIELDS = (("name", "name"), ("deliver", "deliver"), ("failure_deliver",
                    ("hard_wall_timeout_seconds", "hard_wall_timeout_seconds"),
                    ("max_catch_up_lateness_seconds", "max_catch_up_lateness_seconds"),
                    ("review_json", "review_json"), ("clear_review", "clear_review"),
-                   ("keep_pinned_lane", "keep_pinned_lane"), ("timezone", "timezone"),
+                   ("keep_pinned_lane", "keep_pinned_lane"), ("priority", "priority"), ("timezone", "timezone"),
                    ("grace_minutes", "grace_minutes"), ("catch_up", "catch_up"))
 
 

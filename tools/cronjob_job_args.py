@@ -7,6 +7,7 @@ from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Union
 
 from cron.jobs import effective_job_state, job_running_state
+from cron.constants import job_priority
 
 import hermes_time
 
@@ -497,6 +498,7 @@ def _format_job(job: dict[str, Any]) -> dict[str, Any]:
         "repeat": _repeat_display(job),
         "deliver": job.get("deliver", "local"),
         "keep_pinned_lane": bool(job.get("keep_pinned_lane", False)),
+        "priority": job_priority(job),
         "next_run_at": job.get("next_run_at"),
         "last_run_at": job.get("last_run_at"),
         "last_status": job.get("last_status"),
