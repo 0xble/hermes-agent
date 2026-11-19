@@ -202,7 +202,7 @@ Sessions and messages created after the update are not in that snapshot.
 
 ### Why the gateway restart can take a while
 
-The restart is drain-first: the running gateway refuses new turns, then waits for in-flight work (chat turns, cron jobs, API runs) to finish before exiting, capped by `agent.restart_after_turn_timeout` (30 minutes by default). Background delegations have an independent wait budget, `gateway.restart_delegation_timeout` (15 minutes by default, `0` skips their wait), and do not extend the turn budget. While that wait is in progress the gateway logs the remaining budgets every 10 seconds; the updater also displays the work the gateway is still holding for, for example:
+The restart waits for idle: the running gateway keeps serving while in-flight work (chat turns, cron jobs, API runs) finishes, then exits. That wait is capped by `agent.restart_after_turn_timeout` (30 minutes by default); past the cap the gateway refuses new turns and stops what is still running. Background delegations have an independent wait budget, `gateway.restart_delegation_timeout` (15 minutes by default, `0` skips their wait), and do not extend the turn budget. While that wait is in progress the gateway logs the remaining budgets every 10 seconds; the updater also displays the work the gateway is still holding for, for example:
 
 ```
   → hermes-gateway: draining (up to 1875s)...

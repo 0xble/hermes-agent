@@ -2042,7 +2042,18 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         units.extend(uncounted_runtime_work_units(self))
         for kind, count in (("api", self._active_api_run_count()), ("deferred", self._active_deferred_agent_worker_count())):
             units.extend({"kind": kind, "pid": os.getpid()} for _ in range(count))
+        # Delegations with the parent session each reports back to (restart_when_idle). Its process
+        # and notice units are not listed: the bounded wait below does not hold for them.
+        named: set = set()
+        with suppress(Exception):
+            from gateway.restart_when_idle import background_units
+            for unit in background_units(self):
+                if unit.get("kind") == "delegation":
+                    units.append(unit)
+                    named.add(unit.get("delegation_id"))
         for record in self._active_async_delegation_records():
+            if record.get("delegation_id") in named:
+                continue
             dispatched_at = record.get("dispatched_at")
             elapsed = round(max(0.0, now - float(dispatched_at)), 1) if dispatched_at else 0.0
             units.append({
@@ -2052,29 +2063,36 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         return units
 
     async def _await_active_work_before_restart(self) -> bool:
-        """Wait for in-flight work before ``stop()`` so the requesting turn isn't force-interrupted.
+        """Serve normally until in-flight work finishes or its wait budget runs out.
 
-        Wedged turns are excluded (restart is their remedy). True when drained to zero, False when the
-        cap elapsed or only wedged work remains (caller proceeds to ``stop()``).
+        Restart when idle, bounded: admission stays open for the whole wait (``request_restart``
+        closes it when this returns). Turns and delegations each wait under their own budget
+        (``agent.restart_after_turn_timeout`` / ``gateway.restart_delegation_timeout``), and a forced
+        restart (``restart_when_idle.force_restart``) ends the wait at once. Wedged turns are
+        excluded (restart is their remedy). True when drained to zero, False when a budget elapsed,
+        a force arrived or only wedged work remains (caller proceeds to ``stop()``).
         """
         active = self._active_work_count()
         if active <= 0:
             return True
+        from gateway.restart_when_idle import _log_view
+        force = getattr(self, "_restart_force_event", None)
+        if force is not None and force.is_set():
+            logger.warning("Forced restart: stopping now and interrupting: %s", _log_view(self._describe_active_work()))
+            return False
         delegation_timeout = float(getattr(self, "_restart_delegation_timeout", 0.0) or 0.0)
         turn_timeout = float(getattr(self, "_restart_after_turn_timeout", 0.0) or 0.0)
         delegation_count = self._active_async_delegation_count()
         non_delegation_awaitable = max(0, self._awaitable_work_count() - delegation_count)
         loop = asyncio.get_running_loop()
         wait_started = loop.time()
-        turn_deadline = (
-            wait_started + turn_timeout if non_delegation_awaitable > 0 and turn_timeout > 0 else None
-        )
-        # Per-kind deadlines are fixed from entry counts; units arriving after entry get no in-band
-        # budget and are covered only by stop()'s drain (cron_drain_timeout floor).
-        delegation_deadline = (
-            wait_started + delegation_timeout if delegation_count > 0 and delegation_timeout > 0 else None
-        )
-        if turn_deadline is None and delegation_deadline is None:
+        # Each kind's deadline runs from the start of the wait whether or not that kind is live yet:
+        # admission stays open, so a turn or delegation that starts mid-wait is waited for inside
+        # what is left of its budget, and the wait never outlasts the longer of the two budgets.
+        turn_deadline = wait_started + turn_timeout if turn_timeout > 0 else None
+        delegation_deadline = wait_started + delegation_timeout if delegation_timeout > 0 else None
+        if not ((non_delegation_awaitable > 0 and turn_deadline is not None)
+                or (delegation_count > 0 and delegation_deadline is not None)):
             logger.warning(
                 "Restart requested with %d active work unit(s), but no work has a configured wait budget "
                 "(%d wedged past the inactivity timeout, %d in restart-safe external cron workers that "
@@ -2090,7 +2108,13 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         last_status_at = wait_started - 10.0
         poll_interval = 0.1
         next_poll_at = wait_started + poll_interval
+        # Past the after-turn cap, work still inside its own wait budget (a delegation) is named at
+        # WARNING and keeps the wait: that budget's end or a force stops it, never this notice.
+        next_warn_at = wait_started + turn_timeout if turn_timeout > 0 else None
         while True:
+            if force is not None and force.is_set():
+                logger.warning("Forced restart: stopping now and interrupting: %s", _log_view(self._describe_active_work()))
+                return False
             delegation_count = self._active_async_delegation_count()
             non_delegation_awaitable = max(0, self._awaitable_work_count() - delegation_count)
             now = loop.time()
@@ -2126,10 +2150,18 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     "(%d wedged and excluded, %d restart-safe and excluded; %s); active work: %s",
                     awaitable, self._wedged_agent_count(),
                     self._restart_safe_cron_count(), ", ".join(budgets),
-                    self._describe_active_work(),
+                    # A delegation's goal is user content: it stays out of the log.
+                    [{k: v for k, v in unit.items() if k != "goal"} for unit in self._describe_active_work()],
                 )
                 self._scale_to_zero_status("draining", "restart wait: status mark failed")
                 last_status_at = now
+            if next_warn_at is not None and now >= next_warn_at:
+                logger.warning(
+                    "Restart still waiting after %.0fs: the after-turn cap has passed, and work inside "
+                    "its own wait budget is NOT interrupted until that budget ends or a restart is "
+                    "forced. Active work: %s", now - wait_started, _log_view(self._describe_active_work()),
+                )
+                next_warn_at = now + max(turn_timeout, 30.0)
             next_deadline = min(deadline for deadline, count in (
                 (turn_deadline, turn_waitable), (delegation_deadline, delegation_waitable),
             ) if deadline is not None and count)
@@ -2150,6 +2182,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
 
     def request_restart(self, *, detached: bool = False, via_service: bool = False,
                         reason: Optional[str] = None) -> bool:
+        """Restart when idle, inside the wait budgets: the gateway keeps serving (admission open)
+        until ``_await_active_work_before_restart`` returns, then closes admission and stops."""
         if getattr(self, "_client_owned", False) or self._restart_task_started:
             return False
         self._restart_reason = reason.strip() if isinstance(reason, str) and reason.strip() else None
@@ -2157,16 +2191,23 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         self._restart_detached = detached
         self._restart_via_service = via_service
         self._restart_task_started = True
-        # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
-        self._draining = True
-        from gateway.drain_control import open_restart_wait
-        open_restart_wait(self)  # clients may still answer a turn parked on approval/clarify (#139041)
-        # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
-        # the boundary from the moment new turns are refused, not only once stop() begins (#115133).
-        self._mark_api_runs_shutdown_requested()
+        if getattr(self, "_restart_force_event", None) is None:
+            self._restart_force_event = asyncio.Event()
 
         async def _run_restart() -> None:
             await self._await_active_work_before_restart()
+            # Close admission in the same loop tick the wait ended: a turn admitted during the helper
+            # launch or the yield below would meet stop() with no after-turn wait of its own.
+            self._draining = True
+            # Pollers of GET /v1/runs/{id} see the boundary from the moment new turns are refused,
+            # not only once stop() begins (#115133).
+            self._mark_api_runs_shutdown_requested()
+            if self._restart_force_event.is_set():
+                from gateway.restart_when_idle import force_stop_budgets
+                force_stop_budgets(self)
+            # Read the plan now, not at request time: an update pause that forced or adopted this
+            # restart replaced a /restart's detached relaunch with an exit for the service.
+            detached, via_service = self._restart_detached, self._restart_via_service
             # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
             if detached:
                 with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):

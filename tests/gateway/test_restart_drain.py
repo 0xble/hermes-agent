@@ -187,6 +187,40 @@ async def test_request_restart_defers_stop_until_active_turn_finishes():
 
 
 @pytest.mark.asyncio
+async def test_request_restart_after_turn_timeout_zero_enters_stop_immediately():
+    """restart_after_turn_timeout=0 preserves legacy immediate drain."""
+    runner, _adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._restart_after_turn_timeout = 0.0
+    runner._running_agents["agent:main:telegram:dm:1"] = MagicMock()
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await runner._restart_task
+
+    runner.stop.assert_awaited_once_with(
+        restart=True, detached_restart=False, service_restart=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_request_restart_after_turn_cap_elapsed_still_calls_stop():
+    """Safety valve: wedged turns cannot pin the gateway forever."""
+    runner, _adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._restart_after_turn_timeout = 0.2
+    runner._running_agents["agent:main:telegram:dm:1"] = MagicMock()
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await runner._restart_task
+
+    runner.stop.assert_awaited_once_with(
+        restart=True, detached_restart=False, service_restart=True
+    )
+    # Agent was still present — stop() owns the interrupt path from here.
+    assert runner._running_agents
+
+
+@pytest.mark.asyncio
 async def test_request_restart_waits_for_async_delegation(monkeypatch):
     runner, _adapter = make_restart_runner()
     runner.stop = AsyncMock()
@@ -234,12 +268,15 @@ async def test_restart_wait_never_interrupts_a_delegation_at_the_cap(monkeypatch
 
 @pytest.mark.asyncio
 async def test_request_restart_after_turn_cap_elapsed_keeps_waiting_and_serving():
-    """Ruling 2026-11-13: the cap no longer forces stop(); only a forced restart does."""
-    from gateway.restart_when_idle import force_restart
+    """RECORDED DIVERGENCE from upstream's ruling 2026-11-13 (the cap only warns and the restart
+    keeps waiting): the fork keeps its bounded wait, so the cap ends the wait and stop() takes the
+    turn, with its normal drain. Serving until the cap, and the force, are pinned by the next test.
+    """
     runner, _adapter = make_restart_runner()
     runner.stop = AsyncMock()
     runner._scale_to_zero_status = MagicMock()
     runner._restart_after_turn_timeout = 0.05
+    runner._restart_drain_timeout = 7.0
     runner._running_agents["agent:main:telegram:dm:1"] = MagicMock()
 
     warned = asyncio.Event()
@@ -248,9 +285,31 @@ async def test_request_restart_after_turn_cap_elapsed_keeps_waiting_and_serving(
     idle_mod.logger.warning = lambda msg, *args: (warned.set(), real_warning(msg, *args))
     try:
         assert runner.request_restart(detached=False, via_service=True) is True
+        assert runner._draining is False  # serves until the cap
         await asyncio.wait_for(warned.wait(), timeout=5.0)  # the cap elapsed while the turn ran
     finally:
         idle_mod.logger.warning = real_warning
+
+    await asyncio.wait_for(runner._restart_task, timeout=2.0)
+    runner.stop.assert_awaited_once_with(restart=True, detached_restart=False, service_restart=True)
+    assert runner._draining is True and runner._running_agents
+    assert runner._restart_drain_timeout == 7.0  # a cap is not a force: stop() still drains
+
+
+@pytest.mark.asyncio
+async def test_forced_restart_ends_a_wait_that_is_inside_its_cap():
+    """Inside the cap the gateway keeps serving and stop() is not reached; a force ends the wait at
+    once and stops without a drain."""
+    from gateway.restart_when_idle import force_restart
+    runner, _adapter = make_restart_runner()
+    runner.stop = AsyncMock()
+    runner._scale_to_zero_status = MagicMock()
+    runner._restart_after_turn_timeout = 60.0
+    runner._restart_drain_timeout = 7.0
+    runner._running_agents["agent:main:telegram:dm:1"] = MagicMock()
+
+    assert runner.request_restart(detached=False, via_service=True) is True
+    await asyncio.sleep(0)  # the restart task reaches its wait
     runner.stop.assert_not_awaited()
     assert runner._draining is False and not runner._restart_task.done()
 

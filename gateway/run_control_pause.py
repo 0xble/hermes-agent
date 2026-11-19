@@ -3,6 +3,7 @@
 import logging
 import os
 import threading
+from contextlib import suppress
 
 
 logger = logging.getLogger(__name__)
@@ -21,21 +22,30 @@ def make_update_pause_handler(runner, main_loop):
         except Exception:
             logger.warning("Could not read restart drain timeout", exc_info=True)
             drain = 30.0
-        accepted_box: list = []
+        outcome: dict = {}
         done = threading.Event()
 
         def request() -> None:
             try:
                 from gateway.restart_when_idle import force_restart, request_service_restart
-                accepted_box.append(force_restart(runner) if force else request_service_restart(runner))
-                accepted_box.append(runner._describe_active_work())
+                outcome["accepted"] = force_restart(runner) if force else request_service_restart(runner)
+                describe = getattr(runner, "_describe_active_work", None)
+                if callable(describe):
+                    with suppress(Exception):
+                        outcome["waiting_on"] = list(describe())
             finally:
                 done.set()
 
         main_loop.call_soon_threadsafe(request)
         done.wait(timeout=5.0)
-        accepted = bool(accepted_box and accepted_box[0])
-        return {"pausing": accepted, "already_stopping": not accepted,
-                "pid": os.getpid(), "drain_timeout": drain, "force": force,
-                "waiting_on": accepted_box[1] if len(accepted_box) > 1 else []}
+        accepted = bool(outcome.get("accepted"))
+        ack = {"pausing": accepted, "already_stopping": not accepted,
+               "pid": os.getpid(), "drain_timeout": drain}
+        # Optional keys, present only when they say something: a forced stop, and the live work the
+        # restart is waiting on. An ordinary pause of an idle gateway answers the four keys above.
+        if force:
+            ack["force"] = True
+        if outcome.get("waiting_on"):
+            ack["waiting_on"] = outcome["waiting_on"]
+        return ack
     return pause_for_update
