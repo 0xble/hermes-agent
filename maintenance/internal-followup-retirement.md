@@ -57,6 +57,12 @@ already owns an input but has not dispatched it returns the input to the existin
 shutdown queue. The input keeps its original recovery identity. The task reports
 neither turn success nor a generic handler error when preservation succeeds.
 
+The private spool preserves whether the gateway originally marked an event as
+synthetic. Recovery restores that marker before native admission and still checks
+the current sender and route. A recovery-only identity and stable spool timestamp
+survive native admission, so retrying the same spool reuses its admission without
+inventing a platform message ID.
+
 ## Source surfaces
 
 `gateway/run_pending_recovery.py`, `gateway/run_restart_recovery.py`,

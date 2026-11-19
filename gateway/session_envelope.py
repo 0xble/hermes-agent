@@ -144,7 +144,10 @@ def _adapter_event(event, **changes):
         if projected is event:
             projected = copy(event)
         projected._native_absorbed_synthetic = _absorbed_synthetic(event)
-    return _drop_remote_media(projected)
+    projected = _drop_remote_media(projected)
+    if recovery_id := getattr(event, '_hermes_recovery_id', None):
+        projected._hermes_recovery_id = recovery_id
+    return projected
 
 
 def _drop_remote_media(event):
@@ -340,6 +343,8 @@ def _native_payload(runner, event, provenance, fresh_roles=False, encoded_source
         }
     if event.message_id is None and (receipt_id := getattr(event, '_reply_latency_receipt_id', None)):
         envelope['reply_receipt_id'] = receipt_id
+    if event.message_id is None and (recovery_id := getattr(event, '_hermes_recovery_id', None)):
+        envelope['recovery_id'] = recovery_id
     if event.source.platform.value == 'webhook':
         from gateway.platforms.webhook_delivery import route_digest, snapshot_destination
         adapter = runner._adapter_for_source(event.source)
@@ -467,6 +472,8 @@ def restore_native(payload, runner=None):
         event._attended_activity_received_at = activity['received_at']
         event._attended_activity_marked = activity['marked']
     event._reply_latency_receipt_id = envelope.get('reply_receipt_id')
+    if recovery_id := envelope.get('recovery_id'):
+        event._hermes_recovery_id = recovery_id
     if 'automation' in envelope:
         event.internal = True
         if envelope['automation'].get('heartbeat'):
