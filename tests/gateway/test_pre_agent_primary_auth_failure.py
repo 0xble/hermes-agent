@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from gateway.session import Platform, SessionSource
+from gateway.session_state import SessionState
 from gateway.turn_context import TurnContext
 from hermes_cli.auth import AuthError
 from tests.gateway.test_pre_agent_fallback_notice import _RecordingAgent, _runner_with_real_runtime_resolution
@@ -59,9 +60,10 @@ def test_another_chats_resolution_on_another_thread_keeps_this_turns_primary_fai
     runner = _runner_with_real_runtime_resolution()
     override = {"model": "gpt-5", "provider": "openrouter", "api_key": "k2", "base_url": "u2"}
     # The other chat has a /model override: its resolution takes the fast path, which clears any stash.
+    other_state = SessionState()
+    other_state.conversation.model_override = override
     runner._peek_session_state.side_effect = lambda *a, **k: (
-        SimpleNamespace(conversation=SimpleNamespace(model_override=override))
-        if threading.current_thread().name == "other-chat" else None)
+        other_state if threading.current_thread().name == "other-chat" else None)
     from gateway import run_turn_prepare
 
     real_channel = run_turn_prepare._resolve_channel_runtime

@@ -60,7 +60,9 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
                                             fallback=fallback)
     notice = None
     if fallback_entry is not None:
+        from agent.primary_auth_fallback import RUNTIME_KEY, set_pending_primary_auth_failure
         from hermes_cli.fallback_config import pre_agent_fallback_notice
+        set_pending_primary_auth_failure(runtime.get(RUNTIME_KEY))
         notice = pre_agent_fallback_notice(
             provider or '', model or '',
             runtime.get('provider') or fallback_entry.get('provider') or 'unknown',
@@ -262,8 +264,12 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
         _resolve_gateway_model,
         _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
     )
+    from agent.primary_auth_fallback import (
+        RUNTIME_KEY, failure_for_route, route_snapshot, set_pending_primary_auth_failure,
+    )
     from gateway.run_agent_cache import GatewayAgentCacheMixin
 
+    set_pending_primary_auth_failure(None)
     model = _resolve_gateway_model(user_config)
     selected = resolve_stored_override(override, model)
     if selected is not None:
@@ -288,6 +294,8 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
     # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
     # runner surfaces it through the agent's one-shot fallback notice (#74349).
     notice = runtime_kwargs.pop("_fallback_notice", None)
+    primary_failure = runtime_kwargs.pop(RUNTIME_KEY, None)
+    resolved_route = route_snapshot(runtime_kwargs)
     runtime_model = runtime_kwargs.pop("model", None)
     if runtime_model:
         logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
@@ -304,6 +312,8 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
         model, runtime_kwargs = GatewayAgentCacheMixin._apply_model_override(override, model, runtime_kwargs)
         if override.get("model"):
             runtime_kwargs["model_pinned"] = True
+
+    set_pending_primary_auth_failure(failure_for_route(primary_failure, resolved_route, runtime_kwargs))
 
     # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
     # provider's first catalog model.
@@ -342,8 +352,10 @@ class GatewayTurnPrepareMixin:
         config/env (``_resolve_gateway_model(user_config)`` and default provider resolution).
         ``fallback=False`` keeps a launch-policy session on its own route (see
         ``_resolve_policy_agent_runtime``)."""
+        from agent.primary_auth_fallback import set_pending_primary_auth_failure
         from gateway.attended_model import parse_attended_config
         from gateway.session_policy import policy_for_source
+        set_pending_primary_auth_failure(None)
         self._pre_agent_fallback_notice = None
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
