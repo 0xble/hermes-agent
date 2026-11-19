@@ -17,8 +17,8 @@ is the shared protection against PID reuse. Old `<pid>-<random>` tokens remain
 readable during rolling upgrades. A lock directory with no owner file (a writer
 that died between creating the directory and writing its owner) ages by the
 directory's own mtime and is reclaimed after ten seconds. Stale locks are atomically renamed aside
-before removal, with a post-rename owner check so a concurrent takeover is
-treated as busy.
+before removal. If the owner token changed, preserve the quarantined lock, restore it if possible,
+and retry acquisition within the original wait budget rather than reporting busy immediately.
 
 PID liveness is platform-dependent: zombies are treated as dead by the Python
 gateway helper, and PID namespaces can make a PID visible in one process and

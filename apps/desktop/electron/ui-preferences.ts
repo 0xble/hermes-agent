@@ -247,11 +247,17 @@ async function breakIfStale(lockDir: string): Promise<void> {
   if ((await ownerToken(abandoned)) !== judgedOwner) {
     try {
       await fs.promises.rename(abandoned, lockDir)
-    } catch {
-      // Another contender already owns the original name; either way this write must not proceed.
+    } catch (error) {
+      const { code } = error as NodeJS.ErrnoException
+
+      // Another contender may already have installed its lock at the original path.
+      if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
+        throw error
+      }
     }
 
-    throw new Error('preferences store is busy')
+    // Let the acquisition loop poll again within its existing wait budget.
+    return
   }
 
   await fs.promises.rm(abandoned, { force: true, recursive: true }).catch(() => undefined)

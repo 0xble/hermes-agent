@@ -26,6 +26,7 @@ credentials, grants and per-window state out.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import secrets
@@ -209,14 +210,15 @@ def _break_if_stale(lock_dir: Path) -> None:
     except OSError:
         return
 
-    # A holder can update its owner file between our liveness check and rename. Do not discard
-    # a takeover we did not judge; restore it when possible and make the waiter retry.
+    # The owner token can appear or change between the stale check and rename. Preserve that
+    # lock rather than deleting it, then let the acquisition loop poll within its wait budget.
     if _owner_token(abandoned) != judged_owner:
         try:
             os.rename(abandoned, lock_dir)
-        except FileExistsError:
-            pass
-        raise PreferencesBusy("preferences store is busy")
+        except OSError as exc:
+            if exc.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
+        return
     shutil.rmtree(abandoned, ignore_errors=True)
 
 
