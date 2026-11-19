@@ -487,16 +487,17 @@ class GatewayVoiceMixin:
     async def _echo_stt_transcripts(
         self, adapter, source: SessionSource, transcripts: list[str], *, event: MessageEvent,
         metadata=None, log_context: str = "Transcript",
-    ) -> None:
-        """Echo successful STT without changing quota priority or stream-finalization metadata."""
+    ) -> set[int]:
+        """Echo successful STT and return the indices accepted by the transport."""
         # A user's echo is a direct response, even when a busy background turn spawned its task.
         # Give it answer priority based on the originating event, not the ambient outbound class
         # or trigger. Keep _interim_send metadata: stream sealing and quota priority are separate.
         # Internal producers retain their existing budget classification; this is no blanket STT
         # exemption for background traffic.
         echo_scope = nullcontext() if event.internal else outbound_class(OUTBOUND_FINAL)
+        shown = set()
         with echo_scope:
-            for tx in transcripts:
+            for index, tx in enumerate(transcripts):
                 try:
                     echo_metadata = metadata
                     if source.platform == Platform.SLACK:
@@ -509,8 +510,11 @@ class GatewayVoiceMixin:
                     )
                     if getattr(result, "success", True) is False:
                         logger.warning("%s echo failed (non-fatal): %s", log_context, result.error)
+                    else:
+                        shown.add(index)
                 except Exception as echo_exc:
                     logger.warning("%s echo failed (non-fatal): %s", log_context, echo_exc)
+        return shown
 
     def _should_echo_stt_transcripts(self) -> bool:
         return bool(getattr(self.config, "stt_echo_transcripts", True))

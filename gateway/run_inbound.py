@@ -2944,9 +2944,11 @@ class GatewayInboundMixin(
             return
         already_echoed = int(getattr(event, "_gateway_pending_stt_echoed", 0) or 0)
         event._gateway_pending_stt_echoed = max(already_echoed, len(transcripts))
-        await self._echo_stt_transcripts(
+        accepted = await self._echo_stt_transcripts(
             adapter, source, transcripts[already_echoed:], event=event, metadata=metadata, log_context=log_context,
         )
+        shown = event.__dict__.setdefault("_gateway_pending_stt_shown", set())
+        shown.update(already_echoed + index for index in accepted)
 
     @staticmethod
     def _admitted_voice_key(event) -> Optional[tuple[str, str, str]]:
@@ -3004,8 +3006,18 @@ class GatewayInboundMixin(
         if not hasattr(live, "_gateway_pending_stt_text"):
             return  # STT failed or was cancelled: the turn transcribes as before
         event._gateway_pending_stt_text = live._gateway_pending_stt_text
-        event._gateway_pending_stt_transcripts = list(getattr(live, "_gateway_pending_stt_transcripts", []) or [])
+        transcripts = event._gateway_pending_stt_transcripts = list(
+            getattr(live, "_gateway_pending_stt_transcripts", []) or [])
         event._gateway_pending_stt_echoed = int(getattr(live, "_gateway_pending_stt_echoed", 0) or 0)
+        # The queued echo ledger reserves attempts before sending, but only accepted sends
+        # count as shown. Retry refused echoes on the claimed turn without paying for STT again.
+        shown = getattr(live, "_gateway_pending_stt_shown", ())
+        owed = [text for index, text in enumerate(transcripts) if index not in shown]
+        if owed and self._should_echo_stt_transcripts():
+            source = event.source
+            if adapter := self._delivery_adapter_for(source):
+                metadata = self._thread_metadata_for_source(source, self._reply_anchor_for_event(event))
+                await self._echo_stt_transcripts(adapter, source, owed, event=event, metadata=metadata)
 
     async def _transcribe_and_echo_pending_voice(
         self, event, adapter, source, text: str, *, log_context: str, metadata=_UNSET
