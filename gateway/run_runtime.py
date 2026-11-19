@@ -221,7 +221,7 @@ async def initialize_gateway_runtime(runner):
     _record_parked_profiles(parked_profile_map(runner))
     runner.session_ticket_store = TicketStore(instance_id, registry.profile_ids())
     if claim:
-        release_unknown_turn_markers(runner)
+        await asyncio.to_thread(release_unknown_turn_markers, runner)
 
 
 async def claim_gateway_runtime(runner):
@@ -246,7 +246,7 @@ async def claim_gateway_runtime(runner):
             await _park_live_secondary(runner, authority, exc, 'promotion epoch claim failed')
     runner.session_runtime_descriptor['authority_epoch'] = launch.epoch
     _publish_served_set(runner)
-    release_unknown_turn_markers(runner)
+    await asyncio.to_thread(release_unknown_turn_markers, runner)
     for authority in [a for a in registry if a is not None]:
         await _recover_profile_bot_mailbox(runner, authority)
     # Promotion starts deferred secondaries from the served set recorded at boot: re-record it

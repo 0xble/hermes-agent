@@ -208,6 +208,45 @@ async def test_startup_restore_drain_resolves_keys_off_the_loop():
 
 
 @pytest.mark.asyncio
+async def test_unknown_turn_marker_release_runs_off_the_loop(monkeypatch, tmp_path):
+    from gateway import run_runtime
+    from gateway import runtime_bootstrap, runtime_ownership, session_authorities, zero_cut_standby
+    import gateway.run as gateway_run
+
+    class _Runner:
+        _session_db = None
+
+    class _Registry:
+        launch = SimpleNamespace(epoch=1)
+
+        def profile_ids(self):
+            return frozenset({'default'})
+
+        def served_profiles(self):
+            return []
+
+    runner = _Runner()
+    runner.config = SimpleNamespace(multiplex_profiles=False)
+    runner._client_owned = False
+    threads = []
+    monkeypatch.setattr(run_runtime, 'reserved_profile_homes', lambda _runner: [('default', tmp_path)])
+    monkeypatch.setattr(runtime_ownership.process_ownership, 'owns', lambda _home: True)
+    monkeypatch.setattr(gateway_run, '_write_runtime_status_quiet', lambda **_kwargs: None)
+    monkeypatch.setattr(run_runtime, '_record_parked_profiles', lambda _parked: None)
+    monkeypatch.setattr(run_runtime, '_prewarm_profile_stores', AsyncMock())
+    monkeypatch.setattr(run_runtime, '_build_profile_authority', AsyncMock())
+    monkeypatch.setattr(run_runtime, '_park_reserved_profile', lambda *_args: None)
+    monkeypatch.setattr(session_authorities, 'SessionAuthorities', lambda *_args, **_kwargs: _Registry())
+    monkeypatch.setattr(run_runtime, 'release_unknown_turn_markers',
+                        lambda _runner: threads.append(threading.get_ident()))
+    monkeypatch.setattr(zero_cut_standby, 'is_standby', lambda: False)
+    monkeypatch.setattr(runtime_bootstrap, 'TicketStore', lambda *_args: object())
+    loop_thread = _arm()
+    await run_runtime.initialize_gateway_runtime(runner)
+    assert threads and loop_thread not in threads
+
+
+@pytest.mark.asyncio
 async def test_served_profiles_prime_their_state_db_off_the_loop(tmp_path, monkeypatch):
     from hermes_constants import get_hermes_home
 

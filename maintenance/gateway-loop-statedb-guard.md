@@ -272,7 +272,8 @@ in `gateway/run_turn.py`, `gateway/run_config_loaders.py`, `gateway/slash_comman
 `gateway/delivery.py`, `gateway/telegram_retire*.py`, `gateway/telegram_topic_sessions.py` and
 the Telegram and Slack adapters, and `gateway/session_ingress.py` with
 `gateway/session_ingress_context.py` (admitted-turn adapter reconnect wait), and
-`gateway/session_api.py` (nested deferred API-session restoration stays off the gateway loop).
+`gateway/session_api.py` (nested deferred API-session restoration stays off the gateway loop), and
+`gateway/run_runtime.py` (unknown-turn marker release stays off the gateway loop).
 Proof surface:
 `tests/gateway/test_admission_adapter_reconnect_wait.py`,
 `tests/gateway/test_startup_resume_admission.py`,
@@ -307,4 +308,5 @@ upstream bounds restart replay and cron catch-up itself.
 Contract tests: `tests/tools/test_completed_process_results.py`, `tests/hermes_state/test_active_conversation_replay.py`, `tests/gateway/test_lifecycle_state_db_check.py`, `tests/gateway/test_lifecycle_ledger.py`, `tests/gateway/test_admission_adapter_reconnect_wait.py`, `tests/gateway/test_startup_resume_admission.py`, `tests/gateway/test_reaped_eviction_interrupts_run.py`, `tests/gateway/test_classic_slot_holds_fifo_head.py`, `tests/cron/test_scheduler.py`, `tests/agent/test_turn_facade_lease.py`, `tests/hermes_state/test_wal_checkpoint_strategy.py`, `tests/hermes_state/test_generation_checkpoint_durability.py`, `tests/hermes_state/test_hermes_state.py`, `tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`, `tests/hermes_state/test_archive_compact_off_writer_lock.py`, `tests/agent/test_turn_liveness_watchdog.py`, `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`, `tests/gateway/test_turn_state_db_off_loop.py`, `tests/hermes_cli/test_worktree_pushed_tier.py`, `tests/gateway/test_loop_thread_statedb_sites.py`, `tests/gateway/test_loop_thread_statedb_sweep.py`,
   `tests/gateway/test_routing_save_delta.py`, `tests/gateway/test_api_admission_off_loop.py`,
   `tests/gateway/test_adversarial_responses_eviction.py`, and
-  `tests/gateway/test_responses_idem_replay_record.py`.
+  `tests/gateway/test_responses_idem_replay_record.py`, and
+  `tests/gateway/test_loop_thread_statedb_sites.py`.
