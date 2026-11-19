@@ -219,6 +219,7 @@ async def test_queued_model_echo_of_interrupt_diagnostic_never_sends_before_foll
         _status_thread_metadata=None, event_message_id=None, inbound_message_id="101",
         run_generation=1, _interrupt_depth=0, history=[], context_prompt=None,
         result_holder=[None], _post_delivery_adapter=None,
+        _cleanup_adapter=None, _cleanup_msg_ids=[], _cleanup_progress=False,
     )
     result = {"final_response": "Operation interrupted: retrying API call after error (retry 1/3).",
               "interrupted": False, "failed": False, "messages": []}
