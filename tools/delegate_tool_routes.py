@@ -361,7 +361,10 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
             _check_backend_effort(i, route, config)
             resolved = _route_to_task_route(route, parent_agent, cache, config, provider.name)
             request = {name: task[name] for name in declared if task.get(name) is not None}
-            routes.append(replace(resolved, reasoning_cfg=dict(resolved.routing_cfg), request=request))
+            routing_cfg = dict(resolved.routing_cfg)
+            if route.get("label") != "inherit" and (route.get("model") or route.get("profile")):
+                routing_cfg["_model_pinned"] = True
+            routes.append(replace(resolved, routing_cfg=routing_cfg, reasoning_cfg=dict(resolved.routing_cfg), request=request))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
             routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
     return routes, None

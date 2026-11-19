@@ -224,6 +224,8 @@ class AIAgent(
 ):
     """AI Agent with tool calling capabilities."""
 
+    _preflight_fallback: dict[str, str | None] | None = None
+
     _TOOL_CALL_ARGUMENTS_CORRUPTION_MARKER = (
         "[hermes-agent: tool call arguments were corrupted in this session and "
         "have been dropped to keep the conversation alive. See issue #15236.]"
@@ -277,7 +279,7 @@ class AIAgent(
         skip_memory: bool = False, skip_background_review: bool = False,
         session_db=None, parent_session_id: str | None = None,
         iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
-        fallback_model: dict[str, Any] | None = None, credential_pool=None,
+        fallback_model: dict[str, Any] | None = None, model_pinned: bool = False, credential_pool=None,
         checkpoints_enabled: bool = False, checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500, checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False, requested_provider: str | None = None,

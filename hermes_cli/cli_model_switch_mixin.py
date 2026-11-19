@@ -896,6 +896,12 @@ class CLIModelSwitchMixin:
                 return False
             finally:
                 self._confirmed_switch_warning = None  # this switch's confirmation only
+        if not getattr(self, "_model_switch_one_turn", False):
+            self._explicit_model_override = True
+            if self.agent is not None:
+                self.agent._pinned_fallback_model = self.model
+                self.agent._preflight_fallback = None
+            self._preflight_fallback = None
         return True
 
     def _apply_model_switch_result(

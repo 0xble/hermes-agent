@@ -153,7 +153,8 @@ def one_turn_runtime(override, model, runtime_kwargs, config):
                        api_key=result.api_key, base_url=result.base_url, api_mode=result.api_mode or None,
                        request_overrides=dict(result.request_overrides or {}),
                        capabilities=dict(result.runtime_capabilities or {}))
-    runtime.update(provider=result.target_provider, requested_provider=result.target_provider)
+    runtime.update(provider=result.target_provider, requested_provider=result.target_provider, model_pinned=True)
+    runtime.pop("_preflight_fallback", None)
     return result.new_model, runtime
 
 

@@ -787,6 +787,12 @@ def _resolve_child_runtime(
 
     child_reasoning = _child_reasoning(parent_agent, delegation_cfg, override_reasoning_effort)
     child_reasoning = dict(child_reasoning) if isinstance(child_reasoning, dict) else child_reasoning
+    route_config = delegation_cfg if routing_cfg is None else routing_cfg
+    # The tool passes an authored route separately from its resolved model, so a
+    # provider-only route's default model is not a pin. For direct callers without
+    # an authored route, a supplied model is itself the explicit selection.
+    selected_model = model if routing_cfg is None else routing_cfg.get("model")
+    model_pinned = bool(str(selected_model or "").strip()) or (routing_cfg or {}).get("_model_pinned") is True
 
     kwargs: dict[str, Any] = {
         "base_url": effective_base_url, "api_key": override_api_key or parent_api_key, "model": effective_model,
@@ -799,9 +805,10 @@ def _resolve_child_runtime(
         # The role primary always stays the child's primary, even when another process already cooled
         # it: construction adopts the shared cooldown (``_adopt_shared_primary_cooldown``), which walks
         # this chain through the spare guards and lets the child return to the primary mid-turn.
+        "model_pinned": model_pinned,
         "fallback_model": _resolve_child_fallback_chain(
-            parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
-            pinned=bool(override_provider or override_base_url or model)),
+            parent_agent, route_config,
+            pinned=bool(model_pinned or override_provider or override_base_url or model)),
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},

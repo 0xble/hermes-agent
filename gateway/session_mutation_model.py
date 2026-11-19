@@ -105,6 +105,8 @@ async def prepare_model(authority, live, payload, prepared):
     # and the endpoint-bound credential fields (inline key, key_env/api_key_env) drop on a route change.
     # Off-loop: the context-pin check can do cold-start disk I/O.
     frozen['model'] = await asyncio.to_thread(apply_model_selection, frozen.get('model'), result)
+    from gateway.session_policy import SESSION_PINS
+    frozen[SESSION_PINS] = {**(frozen.get(SESSION_PINS) or {}), 'model': True}
     if 'reasoning' in payload:
         # The level picked with the model lands in the same commit (as prepare_reasoning writes it).
         from gateway.session_policy import pin_reasoning_effort

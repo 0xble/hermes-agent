@@ -277,6 +277,8 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
             logger.warning("In-place model switch failed for TUI agent: %s", exc)
             raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                              f"staying on {getattr(agent, 'model', current_model)}.") from exc
+        agent._pinned_fallback_model = result.new_model
+        agent._preflight_fallback = None
         _restart_slash_worker(sid, session)
         _persist_live_session_runtime(session)
         _persist_live_session_system_prompt(session)
