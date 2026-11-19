@@ -1481,7 +1481,7 @@ class GatewaySlashCommandsMixin(
             pass  # config unreadable — fall through to the .git check below
 
         try:
-            hermes_cmd = _resolve_update_hermes_bin(_hermes_home)
+            hermes_cmd = _resolve_update_hermes_bin(_hermes_home, project_root=project_root)
         except (RuntimeError, OSError, ValueError) as exc:
             return f"✗ {exc}"
         if not hermes_cmd:

@@ -3030,10 +3030,10 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
-def _resolve_update_hermes_bin(home: Path | None = None) -> Optional[list[str]]:
+def _resolve_update_hermes_bin(home: Path | None = None, *, project_root: Path | None = None) -> Optional[list[str]]:
     """Keep release updater code current, with journal-bound source Git authority."""
     from hermes_cli.immutable_releases import resolved_release, update_source_checkout
-    root = Path(__file__).parent.parent.resolve()
+    root = project_root.resolve() if project_root is not None else Path(__file__).parent.parent.resolve()
     if (root / ".git").exists():
         return _resolve_hermes_bin()
     from hermes_constants import get_hermes_home
