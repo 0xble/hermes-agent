@@ -277,11 +277,26 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
             logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
             if override.get("model"):
                 from hermes_cli.fallback_config import get_fallback_chain, same_model_fallbacks
-                from hermes_cli.fallback_config import pre_agent_fallback_notice
+                from hermes_cli.fallback_config import (
+                    effective_runtime_provider, pre_agent_fallback_notice, resolve_entry_api_key,
+                )
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                from gateway.run import _runtime_agent_kwargs
                 for fallback in same_model_fallbacks(get_fallback_chain(user_config), override["model"]):
                     try:
-                        fallback_runtime = _resolve_runtime_agent_kwargs_for_provider(
-                            fallback["provider"], target_model=fallback["model"])
+                        fallback_kwargs = {
+                            "requested": fallback["provider"], "target_model": fallback["model"],
+                        }
+                        if fallback.get("base_url"):
+                            fallback_kwargs["explicit_base_url"] = fallback["base_url"]
+                        if fallback_key := resolve_entry_api_key(fallback):
+                            fallback_kwargs["explicit_api_key"] = fallback_key
+                        resolved_fallback = resolve_runtime_provider(**fallback_kwargs)
+                        resolved_fallback["provider"] = effective_runtime_provider(fallback, resolved_fallback)
+                        fallback_runtime = {
+                            **_runtime_agent_kwargs(resolved_fallback),
+                            "capabilities": dict(resolved_fallback.get("capabilities") or {}),
+                        }
                     except Exception:
                         continue
                     fallback_runtime["model_pinned"] = True
