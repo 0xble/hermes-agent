@@ -19,6 +19,36 @@ def _fallback_entries(fallback_model) -> list[dict[str, Any]]:
     ]
 
 
+def _pin_init_fallbacks(agent, fallback_model, model_pinned):
+    from hermes_cli.fallback_config import same_model_fallbacks
+
+    agent._pinned_fallback_model = agent.model if model_pinned else None
+    return same_model_fallbacks(_fallback_entries(fallback_model), agent.model) if model_pinned else fallback_model
+
+
+def _bind_init_fallback(agent, provider, model, client):
+    """Bind a resolved init route; return (accepted, needs_client_kwargs)."""
+    from agent.fallback_attribution import note_fallback
+    from hermes_cli.fallback_config import same_fallback_model
+
+    pinned = getattr(agent, "_pinned_fallback_model", None)
+    if isinstance(pinned, str) and pinned and not same_fallback_model(pinned, model):
+        return False, False
+    previous_model = agent.model
+    agent._fallback_activated = True
+    is_moa = provider.strip().lower() == "moa"
+    if is_moa:
+        # Resolve checks the preset's aggregator credentials, but the agent uses the MoA facade.
+        from agent.moa_loop import bind_moa_runtime
+        bind_moa_runtime(agent, model)
+    else:
+        agent.provider = agent.requested_provider = provider
+        agent.model = model
+        recompute_init_fallback_api_mode(agent, client)
+    note_fallback(agent, previous_model, agent.model, provider, "credentials_unavailable")
+    return True, not is_moa
+
+
 def _init_fallback_chain(agent, fallback_model):
     # Stable pool-entry identity: OAuth refreshes can replace the token before a failed
     # request is recovered, so the key value alone can't attribute the failure.

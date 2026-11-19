@@ -1,4 +1,4 @@
-"""Local terminal commands run their test suites and CI gates inside the machine-wide heavy-slot."""
+"""Local terminal commands run their test suites and CI gates inside the machine-wide semaphore."""
 
 from __future__ import annotations
 
@@ -12,17 +12,17 @@ from pathlib import Path
 
 import pytest
 
-from tools import terminal_tool_heavy_slot as heavy
-from tools.terminal_tool_heavy_slot import classify_command, wrap_heavy_command
+from tools import terminal_tool_semaphore as semaphore
+from tools.terminal_tool_semaphore import classify_command, wrap_semaphore_command
 
-HELPER = "/opt/heavy/bin/heavy-slot"
+HELPER = "/opt/semaphore/bin/semaphore"
 
 
 @pytest.fixture
 def helper(monkeypatch):
-    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)  # the suite itself may run inside a slot
-    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
-    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _env: HELPER)
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)  # the suite itself may run inside a slot
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _env: HELPER)
 
 
 @pytest.mark.parametrize(("command", "label"), [
@@ -91,9 +91,9 @@ def helper(monkeypatch):
     ("bun test", "test"),
     ("bun test src/", "test"),
 ])
-def test_recognizes_heavy_commands(command, label, helper):
+def test_recognizes_semaphore_commands(command, label, helper):
     assert classify_command(command) == label
-    assert f"hermes {label}" in wrap_heavy_command(command, env_type="local")
+    assert f"hermes {label}" in wrap_semaphore_command(command, env_type="local")
 
 
 @pytest.mark.parametrize("command", [
@@ -178,7 +178,7 @@ def test_leaves_light_commands_alone(command):
 ])
 def test_watch_info_and_non_watch_build_classification(command, label, helper):
     assert classify_command(command) == label
-    wrapped = wrap_heavy_command(command, env_type="local")
+    wrapped = wrap_semaphore_command(command, env_type="local")
     if label is None:
         assert wrapped == command
     else:
@@ -186,23 +186,23 @@ def test_watch_info_and_non_watch_build_classification(command, label, helper):
 
 
 def test_foreground_dispatcher_passes_bounded_queue_wait(helper):
-    wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=30)
+    wrapped = wrap_semaphore_command("pytest -q tests", env_type="local", max_wait_seconds=30)
     dispatcher, body = wrapped.split("\n", 1)
-    assert "HEAVY_SLOT_MAX_WAIT=30" in dispatcher
-    assert body == "_hermes_heavy_slot 'hermes pytest' pytest -q tests"
+    assert "SEMAPHORE_MAX_WAIT=30" in dispatcher
+    assert body == "_hermes_semaphore 'hermes pytest' pytest -q tests"
 
 
-def test_routes_only_the_heavy_simple_command(helper):
-    wrapped = wrap_heavy_command("cd repo && export X=1 && pytest -q tests; echo done", env_type="local")
+def test_routes_only_the_semaphore_simple_command(helper):
+    wrapped = wrap_semaphore_command("cd repo && export X=1 && pytest -q tests; echo done", env_type="local")
     dispatcher, body = wrapped.split("\n", 1)
-    assert dispatcher.startswith("_hermes_heavy_slot() {") and HELPER in dispatcher
-    assert body == "cd repo && export X=1 && _hermes_heavy_slot 'hermes pytest' pytest -q tests; echo done"
+    assert dispatcher.startswith("_hermes_semaphore() {") and HELPER in dispatcher
+    assert body == "cd repo && export X=1 && _hermes_semaphore 'hermes pytest' pytest -q tests; echo done"
 
 
 def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
-    wrapped = wrap_heavy_command("pytest -q tests", env_type="local", max_wait_seconds=None)
+    wrapped = wrap_semaphore_command("pytest -q tests", env_type="local", max_wait_seconds=None)
     dispatcher, _body = wrapped.split("\n", 1)
-    assert "HEAVY_SLOT_MAX_WAIT" not in dispatcher
+    assert "SEMAPHORE_MAX_WAIT" not in dispatcher
 
 
 @pytest.mark.parametrize("origin", ["user", "cron", "unknown"])
@@ -215,11 +215,11 @@ def test_background_dispatcher_keeps_unbounded_queue_wait(helper):
 ])
 def test_terminal_tool_bounds_only_foreground_local_waits(background, env_type, timeout, expected, origin):
     from gateway.session_context import preserved_session_context, set_turn_origin
-    from tools.terminal_tool import _heavy_slot_max_wait_for
+    from tools.terminal_tool import _semaphore_max_wait_for
 
     with preserved_session_context():
         set_turn_origin(origin)
-        assert _heavy_slot_max_wait_for(
+        assert _semaphore_max_wait_for(
             background=background, env_type=env_type, effective_timeout=timeout,
         ) == (None if origin == "cron" else expected)
 
@@ -259,61 +259,61 @@ def test_cron_cell_reserves_cleanup_budget(tmp_path, monkeypatch, remaining, exp
 
 @pytest.mark.parametrize(("command", "expected"), [
     ("env -u FOO PYTHONPATH=. timeout 600 pytest tests",
-     "_hermes_heavy_slot 'hermes pytest' env -u FOO PYTHONPATH=. timeout 600 pytest tests"),
-    ("FOO=1 nice -n 5 pytest", "FOO=1 _hermes_heavy_slot 'hermes pytest' nice -n 5 pytest"),
-    ("nohup pnpm test", "_hermes_heavy_slot 'hermes test' nohup pnpm test"),
-    ("time pytest tests", "time _hermes_heavy_slot 'hermes pytest' pytest tests"),
+     "_hermes_semaphore 'hermes pytest' env -u FOO PYTHONPATH=. timeout 600 pytest tests"),
+    ("FOO=1 nice -n 5 pytest", "FOO=1 _hermes_semaphore 'hermes pytest' nice -n 5 pytest"),
+    ("nohup pnpm test", "_hermes_semaphore 'hermes test' nohup pnpm test"),
+    ("time pytest tests", "time _hermes_semaphore 'hermes pytest' pytest tests"),
 ])
 def test_exec_prefix_utilities_run_inside_the_dispatcher(helper, command, expected):
     """env/nice/timeout/nohup exec their argument and cannot run a shell function."""
-    assert wrap_heavy_command(command, env_type="local").split("\n", 1)[1] == expected
+    assert wrap_semaphore_command(command, env_type="local").split("\n", 1)[1] == expected
 
 
 def test_redirections_stay_on_the_wrapped_command(helper):
-    body = wrap_heavy_command("cd repo && pytest tests 2>&1 | tail -5", env_type="local").split("\n", 1)[1]
-    assert body == "cd repo && _hermes_heavy_slot 'hermes pytest' pytest tests 2>&1 | tail -5"
+    body = wrap_semaphore_command("cd repo && pytest tests 2>&1 | tail -5", env_type="local").split("\n", 1)[1]
+    assert body == "cd repo && _hermes_semaphore 'hermes pytest' pytest tests 2>&1 | tail -5"
 
 
-def test_routes_each_heavy_command_once(helper):
-    body = wrap_heavy_command("pnpm test && ./bin/ci gate abc", env_type="local").split("\n", 1)[1]
-    assert body == "_hermes_heavy_slot 'hermes test' pnpm test && _hermes_heavy_slot 'hermes ci-gate' ./bin/ci gate abc"
+def test_routes_each_semaphore_command_once(helper):
+    body = wrap_semaphore_command("pnpm test && ./bin/ci gate abc", env_type="local").split("\n", 1)[1]
+    assert body == "_hermes_semaphore 'hermes test' pnpm test && _hermes_semaphore 'hermes ci-gate' ./bin/ci gate abc"
 
 
 @pytest.mark.parametrize("env_type", ["docker", "ssh", "modal", "managed_modal", "singularity", "daytona"])
 def test_non_local_backends_are_not_wrapped(helper, env_type):
-    assert wrap_heavy_command("pytest -q tests", env_type=env_type) == "pytest -q tests"
+    assert wrap_semaphore_command("pytest -q tests", env_type=env_type) == "pytest -q tests"
 
 
-@pytest.mark.parametrize("environment", [{"HEAVY_SLOT_HELD": "1"}, {"HERMES_HEAVY_SLOT": "off"},
-                                         {"HERMES_HEAVY_SLOT": "0"}])
+@pytest.mark.parametrize("environment", [{"SEMAPHORE_HELD": "1"}, {"HERMES_SEMAPHORE": "off"},
+                                         {"HERMES_SEMAPHORE": "0"}])
 def test_nested_slot_and_opt_out_are_not_wrapped(helper, environment):
-    assert wrap_heavy_command("pytest -q tests", env_type="local", environment=environment) == "pytest -q tests"
+    assert wrap_semaphore_command("pytest -q tests", env_type="local", environment=environment) == "pytest -q tests"
 
 
 def test_process_env_opt_out_and_missing_helper(helper, monkeypatch):
-    monkeypatch.setenv("HERMES_HEAVY_SLOT", "off")
-    assert wrap_heavy_command("pytest", env_type="local") == "pytest"
-    monkeypatch.delenv("HERMES_HEAVY_SLOT")
-    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _env: None)
-    assert wrap_heavy_command("pytest", env_type="local") == "pytest"
+    monkeypatch.setenv("HERMES_SEMAPHORE", "off")
+    assert wrap_semaphore_command("pytest", env_type="local") == "pytest"
+    monkeypatch.delenv("HERMES_SEMAPHORE")
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _env: None)
+    assert wrap_semaphore_command("pytest", env_type="local") == "pytest"
 
 
 def test_classifier_failure_runs_the_command_unwrapped(helper, monkeypatch):
     def boom(_command):
         raise RuntimeError("parser bug")
-    monkeypatch.setattr(heavy, "_heavy_positions", boom)
-    assert wrap_heavy_command("pytest", env_type="local") == "pytest"
+    monkeypatch.setattr(semaphore, "_heavy_positions", boom)
+    assert wrap_semaphore_command("pytest", env_type="local") == "pytest"
 
 
 def _fake_helper(tmp_path: Path) -> str:
-    """A stand-in heavy-slot: records its argv and runs the command with HEAVY_SLOT_HELD set."""
+    """A stand-in semaphore: records its argv and runs the command with SEMAPHORE_HELD set."""
     log = tmp_path / "helper.log"
-    script = tmp_path / "heavy-slot"
+    script = tmp_path / "semaphore"
     script.write_text(
         "#!/bin/sh\n"
         f"echo \"$@\" >> {log}\n"
         "while [ \"$1\" != -- ]; do shift; done; shift\n"
-        "HEAVY_SLOT_HELD=1 exec \"$@\"\n")
+        "SEMAPHORE_HELD=1 exec \"$@\"\n")
     script.chmod(script.stat().st_mode | stat.S_IXUSR)
     return str(script)
 
@@ -324,14 +324,14 @@ def test_dispatcher_leaves_shell_functions_and_aliases_to_the_shell(tmp_path, mo
     """A user's own pytest function or ./bin/ci alias runs as before; external programs take the slot."""
     if not shutil.which(shell):
         pytest.skip(f"{shell} not installed")
-    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
-    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
     fake = _fake_helper(tmp_path)
-    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _env: fake)
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _env: fake)
     runner = tmp_path / "vitest"
-    runner.write_text("#!/bin/sh\necho \"external $* held=$HEAVY_SLOT_HELD\"\n")
+    runner.write_text("#!/bin/sh\necho \"external $* held=$SEMAPHORE_HELD\"\n")
     runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
-    command = wrap_heavy_command(
+    command = wrap_semaphore_command(
         f"pytest -q 'a b' && FOO=1 tox -e x && {runner} run 'c d' && env BAR=2 timeout 30 {runner} --all",
         env_type="local")
     setup = ("pytest() { echo \"function $* FOO=$FOO\"; }\n"
@@ -347,22 +347,22 @@ def test_dispatcher_leaves_shell_functions_and_aliases_to_the_shell(tmp_path, mo
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell semantics")
 def test_wrapped_command_keeps_shell_state_and_runs_in_slot(tmp_path, monkeypatch):
-    """cd and exports around the heavy command still reach the session shell."""
+    """cd and exports around the semaphore command still reach the session shell."""
     from tools.environments.local import LocalEnvironment
 
-    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
-    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
     fake = _fake_helper(tmp_path)
-    monkeypatch.setattr(heavy, "_heavy_slot_executable", lambda _env: fake)
+    monkeypatch.setattr(semaphore, "_semaphore_executable", lambda _env: fake)
     (tmp_path / "sub").mkdir()
     runner = tmp_path / "pytest"
-    runner.write_text("#!/bin/sh\necho \"held=$HEAVY_SLOT_HELD\"\n")
+    runner.write_text("#!/bin/sh\necho \"held=$SEMAPHORE_HELD\"\n")
     runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
     env = LocalEnvironment(cwd=str(tmp_path), timeout=30)
     try:
         command = f"cd sub && export HS_PROBE=kept && {runner} -q"
-        wrapped = wrap_heavy_command(command, env_type="local", environment=env.env)
+        wrapped = wrap_semaphore_command(command, env_type="local", environment=env.env)
         assert wrapped != command
         result = env.execute(wrapped)
         assert result["returncode"] == 0, result
@@ -375,29 +375,29 @@ def test_wrapped_command_keeps_shell_state_and_runs_in_slot(tmp_path, monkeypatc
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
-@pytest.mark.live_system_guard_bypass  # kills the heavy-slot tree it started itself
+@pytest.mark.live_system_guard_bypass  # kills the semaphore tree it started itself
 def test_background_wrapped_run_is_killable_and_releases_its_slot(tmp_path, monkeypatch):
     """The real helper under the process registry: kill stops the whole tree and frees the slot."""
-    real = Path.home() / ".local" / "bin" / "heavy-slot"
+    real = Path.home() / ".local" / "bin" / "semaphore"
     if not os.access(real, os.X_OK):
-        pytest.skip("heavy-slot helper not installed")
+        pytest.skip("semaphore helper not installed")
     from tools.process_registry import ProcessRegistry
 
-    monkeypatch.delenv("HEAVY_SLOT_HELD", raising=False)
-    monkeypatch.delenv("HERMES_HEAVY_SLOT", raising=False)
+    monkeypatch.delenv("SEMAPHORE_HELD", raising=False)
+    monkeypatch.delenv("HERMES_SEMAPHORE", raising=False)
     slots = tmp_path / "slots"
-    monkeypatch.setenv("HEAVY_SLOT_DIR", str(slots))  # private slots: never touch the host's
-    monkeypatch.setenv("HEAVY_SLOT_STOP_GRACE", "1")
+    monkeypatch.setenv("SEMAPHORE_DIR", str(slots))  # private slots: never touch the host's
+    monkeypatch.setenv("SEMAPHORE_STOP_GRACE", "1")
     monkeypatch.setattr(ProcessRegistry, "_daemon_term_grace_seconds", staticmethod(lambda: 1.0))
     monkeypatch.setattr(ProcessRegistry, "_write_checkpoint", lambda self: None)
     runner = tmp_path / "pytest"
-    runner.write_text("#!/bin/sh\necho started held=$HEAVY_SLOT_HELD\nexec sleep 60\n")
+    runner.write_text("#!/bin/sh\necho started held=$SEMAPHORE_HELD\nexec sleep 60\n")
     runner.chmod(runner.stat().st_mode | stat.S_IXUSR)
 
-    command = wrap_heavy_command(f"{runner} tests/", env_type="local")
+    command = wrap_semaphore_command(f"{runner} tests/", env_type="local")
     assert str(real) in command
     reg = ProcessRegistry()
-    session = reg.spawn_local(command, cwd=str(tmp_path), env_vars={"HEAVY_SLOT_DIR": str(slots)})
+    session = reg.spawn_local(command, cwd=str(tmp_path), env_vars={"SEMAPHORE_DIR": str(slots)})
     try:
         deadline = time.monotonic() + 20
         while "started" not in session.output_buffer and time.monotonic() < deadline:
@@ -424,11 +424,11 @@ def test_helper_lookup_prefers_terminal_path_then_home_bin(tmp_path, monkeypatch
     home_bin = tmp_path / "home" / ".local" / "bin"
     for directory in (on_path, home_bin):
         directory.mkdir(parents=True)
-        helper = directory / "heavy-slot"
+        helper = directory / "semaphore"
         helper.write_text("#!/bin/sh\n")
         helper.chmod(helper.stat().st_mode | stat.S_IXUSR)
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
-    assert heavy._heavy_slot_executable({"PATH": str(on_path)}) == str(on_path / "heavy-slot")
-    assert heavy._heavy_slot_executable({"PATH": str(tmp_path / "empty")}) == str(home_bin / "heavy-slot")
-    (home_bin / "heavy-slot").unlink()
-    assert heavy._heavy_slot_executable({"PATH": str(tmp_path / "empty")}) is None
+    assert semaphore._semaphore_executable({"PATH": str(on_path)}) == str(on_path / "semaphore")
+    assert semaphore._semaphore_executable({"PATH": str(tmp_path / "empty")}) == str(home_bin / "semaphore")
+    (home_bin / "semaphore").unlink()
+    assert semaphore._semaphore_executable({"PATH": str(tmp_path / "empty")}) is None

@@ -647,8 +647,9 @@ def _retry_budget_reason(record: dict[str, Any], now: float, *, check_attempts: 
     return None
 
 
-def _expire_retry(conn, record: dict[str, Any], now: float, *, check_attempts: bool = True) -> Optional[str]:
-    reason = _retry_budget_reason(record, now, check_attempts=check_attempts)
+def _expire_retry(conn, record: dict[str, Any], now: float, *, check_attempts: bool = True,
+                  forced_reason: Optional[str] = None) -> Optional[str]:
+    reason = forced_reason or _retry_budget_reason(record, now, check_attempts=check_attempts)
     if reason:
         conn.execute("""UPDATE async_delegations SET retry_state='terminal', retry_reason=?,
                         retry_due_at=NULL, retry_claim=NULL, retry_claimed_at=NULL, updated_at=?
@@ -809,13 +810,19 @@ def classify_outcome(record: dict[str, Any]) -> tuple[str, str]:
         return "retry", "not started"  # the scheduler rejected it before any child ran
     reasons = {str(r.get("failure_reason") or "") for r in failed} - {""}
     if reasons and reasons <= TRANSIENT_REASONS:
-        return "retry", sorted(reasons)[0]
+        return "retry", min(reasons)
     if reasons - {"unknown"}:
         return RETRY_TERMINAL, ", ".join(sorted(reasons - {"unknown"}))
     if any(p in text.lower() for p in _TRANSIENT_TEXT):
         return "retry", "transient provider error"
     first_line = next((ln.strip() for ln in text.splitlines() if ln.strip()), "error")
     return RETRY_TERMINAL, first_line[:160]
+
+
+def _route_chain(record: dict[str, Any]) -> list[tuple[str, str, str]]:
+    task = record.get("task") or {}
+    return [tuple(route) for route in task.get("route_chain") or []
+            if isinstance(route, (list, tuple)) and len(route) == 3]
 
 
 def _backoff(attempt: int) -> float:
@@ -826,6 +833,15 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
     """Classify one terminal ``armed`` row exactly once. Returns the plan, or None when not applicable."""
     ad = _ad()
     now = time.time() if now is None else now
+    # The route cooldown read loads config and takes a cross-process file lock with no timeout.
+    # Do it before BEGIN IMMEDIATE so it never stretches the ledger's writer transaction.
+    with ad._DB_LOCK, ad._transaction() as conn:
+        preview = _load(conn, delegation_id)
+    routes = _route_chain(preview) if preview is not None and preview["retry_state"] == RETRY_ARMED else []
+    available_at = None
+    if routes:
+        from agent.shared_primary_cooldown import earliest_available
+        _, available_at = earliest_available(routes, now=now)
     with ad._DB_LOCK, ad._transaction(immediate=True) as conn:
         record = _load(conn, delegation_id)
         if (record is None or record["retry_state"] != RETRY_ARMED
@@ -842,7 +858,30 @@ def schedule_retry(delegation_id: str, *, now: Optional[float] = None) -> Option
                 verdict, reason = RETRY_TERMINAL, f"retry budget exhausted: still failing after 24h ({reason})"
             else:
                 verdict = RETRY_SCHEDULED
-                due = now + max(_backoff(record["retry_attempt"]), (_reset_delay(_texts(record), now) or 0) + 30.0)
+                if _route_chain(record) != routes:
+                    available_at = None  # the chain changed after the read: its cooldown is unknown
+                # A route with no record is unknown: the store only records primary-route
+                # outages in production. Combine every recorded active reset with the provider
+                # hint, then apply the normal exponential backoff floor.
+                candidates = []
+                if available_at is not None and 0 < available_at - now <= MAX_LINEAGE_AGE_S:
+                    candidates.append(available_at - now)
+                if reset_delay := _reset_delay(_texts(record), now):
+                    candidates.append(reset_delay)
+                # Avoid racing the provider's reset, but never park beyond the lineage budget.
+                reset_wait = min(candidates) + 30.0 if candidates else 0.0
+                deadline = float(record["retry_root_started_at"] or now) + MAX_LINEAGE_AGE_S
+                wait = max(_backoff(record["retry_attempt"]), reset_wait)
+                if now + wait >= deadline:
+                    # claim_retry_dispatch/_expire_retry treats the deadline as expired. Do not
+                    # create a row that can only become terminal after waiting until that deadline.
+                    verdict = RETRY_TERMINAL
+                    reason = _expire_retry(
+                        conn, record, now,
+                        forced_reason=_retry_budget_reason(record, deadline, check_attempts=False),
+                    )
+                else:
+                    due = now + wait
         conn.execute(
             """UPDATE async_delegations SET retry_state=?, retry_reason=?, retry_due_at=?, updated_at=?
                WHERE delegation_id=? AND retry_state=?""",

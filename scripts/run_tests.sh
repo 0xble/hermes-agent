@@ -173,17 +173,17 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
 # Even targeted runs compile the whole checkout. Acquire host admission before
 # activation or compilation, not through spelling-dependent shell wrappers.
-# The re-exec marker also handles heavy-slot's disabled / ancestor-reuse paths,
-# which can exec the payload without setting HEAVY_SLOT_HELD.
-if [ -z "${HEAVY_SLOT_HELD:-}${__HERMES_TESTS_HEAVY_SLOT:-}" ]; then
+# The re-exec marker also handles semaphore's disabled / ancestor-reuse paths,
+# which can exec the payload without setting SEMAPHORE_HELD.
+if [ -z "${SEMAPHORE_HELD:-}${__HERMES_TESTS_SEMAPHORE:-}" ]; then
   # Match the terminal resolver when a service PATH omits ~/.local/bin.
-  HEAVY_SLOT_BIN="$(command -v heavy-slot || true)"
-  if [ -z "$HEAVY_SLOT_BIN" ] && [ -f "$HOME/.local/bin/heavy-slot" ] && [ -x "$HOME/.local/bin/heavy-slot" ]; then
-    HEAVY_SLOT_BIN="$HOME/.local/bin/heavy-slot"
+  SEMAPHORE_BIN="$(command -v semaphore || true)"
+  if [ -z "$SEMAPHORE_BIN" ] && [ -f "$HOME/.local/bin/semaphore" ] && [ -x "$HOME/.local/bin/semaphore" ]; then
+    SEMAPHORE_BIN="$HOME/.local/bin/semaphore"
   fi
-  if [ -n "$HEAVY_SLOT_BIN" ]; then
-    exec "$HEAVY_SLOT_BIN" --label "scripts/run_tests.sh (in $REPO_ROOT)" -- \
-      env __HERMES_TESTS_HEAVY_SLOT=1 "$BASH" "$SCRIPT_DIR/run_tests.sh" "$@"
+  if [ -n "$SEMAPHORE_BIN" ]; then
+    exec "$SEMAPHORE_BIN" --label "scripts/run_tests.sh (in $REPO_ROOT)" -- \
+      env __HERMES_TESTS_SEMAPHORE=1 "$BASH" "$SCRIPT_DIR/run_tests.sh" "$@"
   fi
 fi
 

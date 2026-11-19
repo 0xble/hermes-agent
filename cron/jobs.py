@@ -34,7 +34,10 @@ from agent.deadline import poll_until
 from hermes_constants import get_hermes_home
 from cron.constants import CLAIM_TTL_INACTIVITY_HEADROOM, FIRE_CLAIM_SKEW_SECONDS, FIRE_CLAIM_TTL_SECONDS
 from cron.env_settings import cron_env_setting
-from cron.jobs_invariants import NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants, validate_schedule_knobs
+from cron.jobs_invariants import (
+    NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants, validate_catch_up_floor,
+    validate_schedule_knobs,
+)
 from cron.jobs_model_pin import _main_model_pin
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
@@ -1990,7 +1993,7 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
     """Spelling-only validation via the shared parser (cron knob never stricter/looser than
     config.yaml); model capability is deliberately NOT checked (model unknowable at create time,
     transports clamp at send time). None for unset, lowercase level, or ValueError."""
-    if value is None:
+    if value is None or value == "":
         return None
     text = str(value).strip().lower()
     if not text:
@@ -2016,6 +2019,20 @@ def _normalize_catch_up(value: Any) -> Optional[bool]:
     raise ValueError("catch_up must be true, false, or null (use the default).")
 
 
+def _normalize_priority(value: Any) -> Optional[str]:
+    """Normalize a business-impact lane; unset (``None`` or ``''``) means the production default."""
+    if value is None:
+        return None
+    text = str(value).strip().lower()
+    if not text:
+        return None
+    if text in {"live", "production", "background"}:
+        return text
+    raise ValueError(
+        "priority must be one of live, production, or background "
+        "(an empty string means unset, which is production).")
+
+
 _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "model": _normalize_job_optional_text,
     "provider": _normalize_job_optional_text,
@@ -2036,6 +2053,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "priority": _normalize_priority,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     # [] is an explicit zero-tool allowlist and must survive the update path as [] too (#82010).
@@ -2054,6 +2072,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "priority": _normalize_priority,
 }
 
 
@@ -2102,6 +2121,7 @@ def create_job(
     reasoning_effort: Optional[str] = None,
     failure_deliver: Optional[str] = None,
     keep_pinned_lane: bool = False,
+    priority: Optional[str] = None,
     review: Optional[dict[str, Any]] = None,
     catch_up: Optional[bool] = None,
     paused: bool = False,
@@ -2157,6 +2177,7 @@ def create_job(
 
     _validate_job_mode_invariants(f["monitor_script"], f["monitor_url"], f["no_agent"], f["script"])
     validate_schedule_knobs(parsed_schedule, f["timezone"], f["grace_minutes"])
+    validate_catch_up_floor(parsed_schedule, f["max_catch_up_lateness_seconds"])
     prompt_text = _coerce_job_text(prompt).strip()
     if not prompt_text and not f["script"] and not normalized_skills:
         raise ValueError(EMPTY_PAYLOAD_ERROR)
@@ -2221,6 +2242,7 @@ def create_job(
         ("attach_to_session", normalized_attach), ("reasoning_effort", normalized_reasoning_effort),
         ("failure_deliver", f["failure_deliver"]),
         ("keep_pinned_lane", bool(keep_pinned_lane)),
+        ("priority", f["priority"]),
         ("review", f["review"]), ("output_local_only", True if f["review"] else None),
         ("interpreter", f["interpreter"]),
         ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),
@@ -2435,6 +2457,8 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
         _normalize_job_updates(job, updates)
         _apply_pin_update(job, updates)
         updated = _apply_skill_fields({**job, **updates})
+        if "priority" in updates and updates["priority"] is None:
+            updated.pop("priority", None)
         apply_review_update(updated, updates)
         _reject_terminal_activation(job, updated, job_id)
         # Re-check on the MERGED record; scoped to changed fields so legacy records keep loading.
@@ -2451,6 +2475,13 @@ def update_job(job_id: str, updates: dict[str, Any]) -> Optional[dict[str, Any]]
                 updated.get("schedule") or {}, updated.get("timezone"),
                 updated.get("grace_minutes"))
             jobs_time.prune_inherited_knobs(updated)
+        if {"schedule", "max_catch_up_lateness_seconds"}.intersection(updates):
+            schedule = updated.get("schedule") or {}
+            schedule = parse_schedule(schedule) if isinstance(schedule, str) else schedule
+            # Recheck only a real change, so re-sending a record's own schedule beside an
+            # unrelated edit never strands a legacy limit that predates the floor.
+            if "max_catch_up_lateness_seconds" in updates or schedule != job.get("schedule"):
+                validate_catch_up_floor(schedule, updated.get("max_catch_up_lateness_seconds"))
         if "schedule" in updates:
             _apply_schedule_update(updated, updates, job_id)
             # next_run_at now follows the new schedule; a stale quota_hold_until would only shield
@@ -3611,10 +3642,12 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
 
 
 def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str]:
-    """Put an occurrence the dispatcher advanced past but never claimed back on the schedule
-    (#107485); returns the restored ``next_run_at`` or None. Restored ONCE: the stamp is dropped
-    here, so the slot then meets the ordinary late / fast-forward / ``cron.catch_up_missed``
-    policy like any other overdue instant — never a replay of every missed slot."""
+    """Evaluate the exact unclaimed occurrence without consuming its durable stamp.
+
+    The scan replaces the stamp when it offers this occurrence again, or clears it
+    when deduplication or miss policy consumes it. An interrupted scan leaves the
+    original stamp recoverable by the next scheduler, not a replay of a backlog.
+    """
     from cron.occurrences import unclaimed_pending_slot
 
     slot = unclaimed_pending_slot(job, scan.now)
@@ -3625,10 +3658,6 @@ def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str
         "(scheduler stopped before dispatch); restoring it as the due instant (was %s).",
         job.get("name", job.get("id")), job.get("id"), slot, job.get("next_run_at"))
     job["next_run_at"] = slot
-    job.pop("pending_slot", None)
-    rj = scan.find(job["id"])
-    if rj is not None:
-        rj.pop("pending_slot", None)
     scan.persist(job["id"], next_run_at=slot)
     return slot
 
@@ -3648,7 +3677,8 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     ):
         return False
 
-    next_run = _restore_unclaimed_slot(job, scan) or job.get("next_run_at") or _recover_missing_next_run(job, scan)
+    restored_slot = _restore_unclaimed_slot(job, scan)
+    next_run = restored_slot or job.get("next_run_at") or _recover_missing_next_run(job, scan)
     if not next_run:
         return False
     # A pinned job's stored instant must be normalized into ITS zone: the cron repair and
@@ -3666,17 +3696,22 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     from cron.jobs_due_scan import completed_occurrence
     from cron.occurrences import scheduled_instant
 
-    if kind == "cron" and not manual_run and _reanchor_future_timezone_shifted_cron(d):
+    # A pending stamp names a concrete occurrence, not civil-time scheduling intent.
+    # In particular a UTC stamp for a PT job is not evidence of a timezone edit.
+    repair_cron = kind == "cron" and not manual_run and restored_slot is None
+    if repair_cron and _reanchor_future_timezone_shifted_cron(d):
         return False
     if not manual_run and completed_occurrence(job, next_run):
         new_next = d.recompute_next() if recurring else None
         if new_next:
             scan.persist(job["id"], next_run_at=new_next)
+            if restored_slot is not None and (record := scan.find(job["id"])) is not None:
+                record.pop("pending_slot", None)
         return False
     # The offset-repair path exists to rescue jobs that FOLLOW the profile zone across a zone
     # change. A pinned job's instant legitimately carries its own offset, so repair can only
     # misfire on it — skip it entirely.
-    if kind == "cron" and not manual_run and zone is None and _repair_timezone_shifted_cron(d):
+    if repair_cron and zone is None and _repair_timezone_shifted_cron(d):
         return False
     d.next_run_dt = _rearm_stale_error_recurring(d)
     if _instant_after(d.next_run_dt, now):
@@ -3698,7 +3733,7 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         scan.needs_save = True
         return False
 
-    if not manual_run and kind == "cron" and _reanchor_stale_cron(d):
+    if repair_cron and _reanchor_stale_cron(d):
         return False
     grace_minutes = job.get("grace_minutes")
     grace = (_compute_grace_seconds(d.schedule, grace_minutes)

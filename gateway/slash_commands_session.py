@@ -821,6 +821,7 @@ class GatewaySessionCommandsMixin:
         runtime_kwargs["reasoning_config"] = self._resolve_session_reasoning_config(
             source=source, model=model, profile_home=profile_home,
         )
+        runtime_kwargs.pop("_preflight_fallback", None)
 
         tmp_agent = await self._build_manual_compression_agent(session_entry.session_id, model, runtime_kwargs)
         try:

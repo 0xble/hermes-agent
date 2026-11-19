@@ -70,7 +70,7 @@ integer-compatible without adding backend-specific conversions to each caller.
 ## Verification
 
 Run in an invocation-owned sandbox home with a prepared test interpreter;
-`scripts/run_tests.sh` acquires machine-wide heavy-slot admission:
+`scripts/run_tests.sh` acquires machine-wide semaphore admission:
 
 ```sh
 scripts/run_tests.sh tests/tools/test_search*.py tests/tools/test_file_operations*.py tests/tools/test_macos_protected_search.py --file-retries 0

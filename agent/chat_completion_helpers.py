@@ -2224,9 +2224,9 @@ def try_activate_fallback(
     shared_adoption = isinstance(_shared_cooldown_record, dict)
     new_fallback_episode = not getattr(agent, "_provider_fallback_active", False)
     if new_fallback_episode and not shared_adoption:
-        # A stale monotonic deadline from an older episode must not authorize
-        # mid-turn recovery for an uncooled fallback.
-        agent._fallback_episode_cooled = False
+        # An older episode's deadline must not authorize recovery; an uncooled one gets a bounded re-check.
+        from agent.fallback_route_recovery_uncooled import begin_uncooled_episode
+        begin_uncooled_episode(agent, reason)
     if switch_deferred_by_reset(agent, reason, reset_at):
         return False
     if shared_adoption:
@@ -2254,7 +2254,16 @@ def try_activate_fallback(
         fb_model = (fb.get("model") or "").strip()
         if _should_skip_fallback_candidate(agent, fb, fb_key, fb_provider, fb_model, unavailable):
             continue
+        reservation = None
+        try:
+            from agent.spare_guards import reserve_fallback_route
+            reservation = reserve_fallback_route(agent, fb)
+            if not reservation:
+                continue
+        except Exception:
+            logger.debug("Spare fallback admission check failed; keeping the route available", exc_info=True)
 
+        reservation_committed = False
         try:
             from agent.route_binding import bind_route_entry
             old_route = resolved_route(agent)
@@ -2262,18 +2271,24 @@ def try_activate_fallback(
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
                 unavailable.add(fb_key)
+                _release_spare_lease(agent, reservation)
                 continue
             old_model, old_provider = bound
             fb_model = agent.model  # normalized by the binder
             if getattr(agent, "_shared_primary_probe_token", None):
                 from agent.shared_primary_cooldown import settle_primary_probe_on_exit
                 settle_primary_probe_on_exit(agent, reason=reason, reset_at=reset_at)
+            from agent.spare_guards import commit_fallback_route
+            commit_fallback_route(agent, reservation)
+            reservation_committed = True
             buffer_fallback_route_notice(
                 agent, reason, shared_adoption, old_model, old_provider, old_route, cooldown_seconds)
             # ``_fallback_activated`` is also reused by `/model --once` restoration; separate
             # provenance so the restore path only emits a recovery notice after a real fallback.
             agent._provider_fallback_active = True
             _finalize_fallback_route(agent, fb_provider)
+            from agent.fallback_attribution import note_fallback
+            note_fallback(agent, old_model, fb_model, fb_provider, reason)
             _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb_provider)
             from hermes_cli.observability.shared_metrics_events import record_fallback
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
@@ -2281,8 +2296,22 @@ def try_activate_fallback(
         except Exception as e:
             if fb_provider == "nous":
                 unavailable.add(fb_key)
+            if not reservation_committed:
+                _release_spare_lease(agent, reservation)
             logger.error("Failed to activate fallback %s: %s", fb_model, e)
             continue  # try next in chain
+
+
+def _release_spare_lease(agent, reservation=None) -> None:
+    """Roll back an admission or release the child's currently held lease."""
+    try:
+        from agent.spare_guards import release_fallback_route
+        if reservation is not None:
+            release_fallback_route(agent, _lease=reservation)
+        else:
+            release_fallback_route(agent)
+    except Exception:
+        logger.debug("Spare lease release failed", exc_info=True)
 
 
 # Keys outside the Chat Completions schema that strict gateways (Fireworks-backed OpenCode

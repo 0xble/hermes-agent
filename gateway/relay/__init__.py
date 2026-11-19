@@ -844,6 +844,7 @@ def register_relay_adapter(force: bool = False, url: Optional[str] = None) -> bo
             name="relay",
             label="Relay",
             adapter_factory=_factory,
+            adapter_class=RelayAdapter,
             check_fn=lambda: True,
             source="builtin",
             emoji="\U0001f50c",

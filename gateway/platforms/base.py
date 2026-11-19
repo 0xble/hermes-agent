@@ -2062,6 +2062,10 @@ _strip_media_directives = _strip_media_tag_directives
 class BasePlatformAdapter(TypingStateMixin, ABC):
     """Base class for platform adapters: connect/auth, receive, send, handle media."""
 
+    # Reaction exposure is derived from this adapter class without constructing an adapter. ``None``
+    # means ``PlatformRegistry`` checks whether ``add_reaction`` is overridden; adapters may set an
+    # explicit bool when their transport capability differs from the method implementation.
+    SUPPORTS_REACTIONS: Optional[bool] = None
     # ``format_message`` renders ``` fences as real code blocks (tool-progress then sends a bare
     # fenced terminal command; plain-text platforms get the preview).
     supports_code_blocks: bool = False

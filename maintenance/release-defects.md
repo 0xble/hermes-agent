@@ -689,9 +689,15 @@ here; move a section into a behavior-specific unit when that unit starts owning 
   the owner enabled background review on 2026-09-24, so `verify-hermes-fork`
   failed every day on a correct config. The key is no longer pinned. The
   remaining expectations guard fork behavior (`memory.write_approval`) or
-  required routing (`delegation.model`, `auxiliary.review.model`).
+  required routing (`auxiliary.review.model`, and a resolvable delegation route:
+  either legacy `delegation.model` or Advanced Delegation's
+  `delegation.backend: model_map` with a non-empty
+  `delegation.backends.model_map.default`).
 - Guard: `tests/scripts/test_candidate_scripts.py`
-  (`test_check_config_does_not_pin_background_review`).
+  (`test_check_config_does_not_pin_background_review`,
+  `test_check_config_accepts_legacy_delegation_model`,
+  `test_check_config_accepts_advanced_delegation_model_map`,
+  `test_check_config_rejects_missing_delegation_routes`).
 
 ## Live vault regression launched the user's branded Chrome
 

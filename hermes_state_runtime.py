@@ -791,13 +791,21 @@ def _worker_assignment(conn, execution_id, session_id, generation):
 
 
 def _linked_worker_admission(conn, session_id, generation, owner_epoch, statuses):
-    placeholders = ','.join('?' for _ in statuses)
+    statuses = tuple(statuses)
+    if statuses == ('started', 'unknown'):
+        # Keep the non-terminal set literal so SQLite can prove the partial-index predicate at prepare time.
+        status_clause = "status IN ('started','unknown')"
+        status_params = ()
+    else:
+        placeholders = ','.join('?' for _ in statuses)
+        status_clause = f"status IN ({placeholders})"
+        status_params = statuses
     rows = conn.execute(f"""SELECT * FROM session_admissions
-        WHERE generation=? AND owner_epoch=? AND status IN ({placeholders})
+        WHERE generation=? AND owner_epoch=? AND {status_clause}
           AND (target_session_id=? OR EXISTS (
               SELECT 1 FROM json_each(session_admissions.lineage_json) WHERE value=?
           )) ORDER BY seq""",
-        (generation, owner_epoch, *statuses, session_id, session_id)).fetchall()
+        (generation, owner_epoch, *status_params, session_id, session_id)).fetchall()
     if len(rows) > 1:
         raise RuntimeStoreError('admission_conflict')
     return rows[0] if rows else None
