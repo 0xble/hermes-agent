@@ -686,10 +686,10 @@ class RestartRecoveryMixin:
                 # Its resume already runs; the pre-claim was handed to the adapter guard, so the
                 # running-session check below cannot see it.
                 continue
-            logical_platform = getattr(entry.origin, "platform", None)
-            if (platform is not None and logical_platform != platform
-                    and not (callable(fronts) and fronts(logical_platform))):
-                continue
+            if platform is not None:  # an unfiltered sweep never reads the origin
+                logical_platform = getattr(entry.origin, "platform", None)
+                if logical_platform != platform and not (callable(fronts) and fronts(logical_platform)):
+                    continue
             if not allow_resume:
                 outcome = "noted" if self._interruption_note_delivered(entry.session_key) else "skipped:restart-loop-breaker"
                 if outcome != "noted" and entry.session_key in getattr(self, "_s2_note_ambiguous_keys", ()):
