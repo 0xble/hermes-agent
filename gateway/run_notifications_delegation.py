@@ -87,25 +87,38 @@ class GatewayNotificationsMixin:
         # The group shares one session_key, hence one profile: scope the pre-checks and sibling claims too.
         # A retirement can move a subset while this batch waits. Re-resolve the
         # durable routes and regroup before taking any delivery claim.
+        from gateway.run_profile_home import completion_event_scope_or_refuse
         from tools.async_delegation import refresh_retirement_route
         buckets = {}
         for evt in group:
-            async with self._completion_event_scope(evt):
+            scope = await completion_event_scope_or_refuse(self, evt, "async delegation")
+            if scope is None:
+                continue
+            async with scope:
                 await asyncio.to_thread(refresh_retirement_route, evt)
             self._enrich_async_delegation_routing(evt)
             route = self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS)
             buckets.setdefault(route, []).append(evt)
+        if not buckets:
+            return None
         if len(buckets) > 1:
             retry = []
             for subgroup in buckets.values():
-                async with self._completion_event_scope(subgroup[0]):
+                scope = await completion_event_scope_or_refuse(self, subgroup[0], "async delegation")
+                if scope is None:
+                    continue
+                async with scope:
                     result = await self._deliver_async_delegation_group_scoped(subgroup)
                 if result is False:
                     retry.extend(subgroup)
             group[:] = retry
             return False if retry else True
+        group[:] = next(iter(buckets.values()))
         original = list(group)
-        async with self._completion_event_scope(group[0]):
+        scope = await completion_event_scope_or_refuse(self, group[0], "async delegation")
+        if scope is None:
+            return None
+        async with scope:
             outcome = await self._deliver_async_delegation_group_scoped(group)
         if outcome is not False:
             group[:] = original  # Only a failed/aborted batch becomes the narrowed retry payload.
