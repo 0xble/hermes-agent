@@ -56,7 +56,7 @@ from gateway.attended_model import (
     is_active, parse_attended_config,
 )
 from gateway.session_transcript import TranscriptReadError
-from gateway.run_turn_bubble_cleanup import register_bubble_cleanup, settle_turn_senders
+from gateway.run_turn_bubble_cleanup import settle_turn_senders
 from gateway.run_turn_final_reconcile import edit_streamed_message, owns_reconcilable_preview
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext, TurnWorker
 from gateway.turn_lease import DEFAULT_LEASE_WAIT
@@ -2820,7 +2820,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
             # Register before first-response delivery: queued/follow-up lanes can return early.
-            register_bubble_cleanup(response, turn_ctx)
+            self._run_agent_schedule_bubble_cleanup(response, turn_ctx._cleanup_adapter, turn_ctx)
             delivered = await self._run_agent_deliver_first_response(
                 turn_ctx, adapter, response, result, stream_task,
             )
@@ -3565,7 +3565,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
             # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             pending_event, pending = defer_review_followup(self, turn_ctx, adapter, pending_event, pending)
@@ -3595,7 +3594,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                     self._release_finished_turn_agent(turn_ctx, worker)
 
         await self._run_agent_mark_streamed_delivery(response, turn_ctx)
-        register_bubble_cleanup(response, turn_ctx)
+        self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
         if isinstance(response, dict):
             # Recovery may be redirected after it starts. The outer silence contract is separate
             # from the inbound message that owns this execution's terminal delivery.
