@@ -29,6 +29,10 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   a chat moves to another conversation without blocking the gateway loop or bypassing its guard.
   The real headless completion contract is in `tests/tools/test_completed_process_results.py`,
   with detached-conversation lifecycle and result coverage in `tests/gateway/`.
+- Cold WebSocket `session.resume` runs route restoration and authorization on the bounded
+  session-store executor. Manual `/compress` resolves persisted reasoning and attended routing
+  on the context-preserving worker before building the compressor. Both paths have regressions
+  that arm the production loop lock guard.
 - 2026-10-25 sweep of the sites the guard named on the live gateway (about 120 active agents,
   writer-lock holds of 3-13 s, two exit-75 kills): attended route resolution takes the durable
   activity stamp and `get_attended_route_active` from the off-loop resolution snapshot; turn
