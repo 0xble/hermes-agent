@@ -849,6 +849,10 @@ class GatewayConfigLoadersMixin:
         if agent is None:
             return
         new_chain = list(chain or [])
+        pinned = getattr(agent, "_pinned_fallback_model", None)
+        if isinstance(pinned, str) and pinned:
+            from hermes_cli.fallback_config import same_model_fallbacks
+            new_chain = same_model_fallbacks(new_chain, pinned)
         rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
         if getattr(agent, "_fallback_activated", False) and rate_limited_until > time.monotonic():
             return

@@ -789,6 +789,12 @@ def finalize_turn(
     if isinstance(final_response, str):
         final_response = _sanitize_surrogates(final_response)
 
+    model_fields = result_model_fields(agent)
+    if model_fields.get("fallback_reason"):
+        if not api_call_count or (failed and not getattr(agent, "last_served_model", None)):
+            model_fields["served_model"] = None
+        logger.info("Model fallback result: requested_model=%s served_model=%s reason=%s",
+                    model_fields["requested_model"], model_fields["served_model"], model_fields["fallback_reason"])
     result = {
         "final_response": final_response,
         "last_reasoning": _last_turn_reasoning(messages),
@@ -807,7 +813,7 @@ def finalize_turn(
         "response_reused": bool(final_response) and final_response == getattr(agent, "_reused_response_text", None),
         "model": agent.model,
         # requested_model / served_model: proxy-reported deployment or Hermes' own fallback route.
-        **result_model_fields(agent),
+        **model_fields,
         "provider": agent.provider,
         "base_url": agent.base_url,
         **{key: getattr(agent, f"session_{key}") for key in _SESSION_TOKEN_KEYS},

@@ -537,7 +537,7 @@ def _tool_lifecycle_required_for_ui(name: str) -> bool:
     """
     return name in _TOOL_LIFECYCLE_UI_TOOLS
 
-def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _RuntimeFallbackResolution:
+def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None, *, pinned_model: str | None = None) -> _RuntimeFallbackResolution:
     """Resolve the primary runtime or one complete provider/model fallback. Provider-only fallback entries
     are skipped so the unavailable primary model can never leak into a different runtime."""
     from hermes_cli.auth import AuthError
@@ -545,7 +545,11 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
     try:
         return _RuntimeFallbackResolution(resolve_runtime_provider(**(resolve_kwargs or {})), None, False)
     except AuthError as primary_exc:
-        for entry in _load_fallback_model() or []:
+        chain = _load_fallback_model() or []
+        if pinned_model:
+            from hermes_cli.fallback_config import same_model_fallbacks
+            chain = same_model_fallbacks(chain, pinned_model)
+        for entry in chain:
             fb_provider = str(entry.get("provider") or "").strip() if isinstance(entry, dict) else ""
             fb_model = str(entry.get("model") or "").strip() if isinstance(entry, dict) else ""
             if not fb_provider or not fb_model:
@@ -562,8 +566,15 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None) -> _Runti
                 runtime["provider"] = effective_runtime_provider(entry, runtime)
                 from hermes_cli.auth import primary_failure_wording
                 logging.getLogger(__name__).warning(
-                    "Primary %s (%s), falling back to %s model %s",
-                    primary_failure_wording(primary_exc)[0], primary_exc, fb_provider, fb_model)
+                    "Primary %s for model %s (%s), falling back to %s model %s",
+                    primary_failure_wording(primary_exc)[0], (resolve_kwargs or {}).get("target_model"),
+                    primary_exc, fb_provider, fb_model)
+                runtime["_preflight_fallback"] = {
+                    "requested_model": (resolve_kwargs or {}).get("target_model"),
+                    "fallback_model": fb_model,
+                    "fallback_reason": "rate_limit" if primary_failure_wording(primary_exc)[0].startswith("rate-limited")
+                    else "credentials_unavailable",
+                }
                 return _RuntimeFallbackResolution(runtime, fb_model, True)
             except Exception:
                 continue
@@ -605,7 +616,8 @@ def _resolve_agent_model_runtime(model_override, provider_override) -> tuple[str
             requested_provider = provider_override
         resolve_kwargs = {"requested": requested_provider, "target_model": model or None}
         overrides = {}
-    resolution = _resolve_runtime_with_fallback(resolve_kwargs)
+    resolution = (_resolve_runtime_with_fallback(resolve_kwargs, pinned_model=model)
+                  if model_override else _resolve_runtime_with_fallback(resolve_kwargs))
     if resolution.used_fallback:
         if not resolution.selected_model:
             raise RuntimeError("Auth fallback resolved without a model")
@@ -688,6 +700,7 @@ def _make_agent(
     system_prompt = _startup_system_prompt(cfg, session_id or key)
     model, runtime = _resolve_agent_model_runtime(model_override, provider_override)
     fallback_notice = runtime.pop("_fallback_notice", None)
+    preflight_fallback = runtime.pop("_preflight_fallback", None)
     _pr = _load_provider_routing()
     platform = _resolve_agent_platform(platform_override)
     ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
@@ -718,12 +731,14 @@ def _make_agent(
         checkpoints_enabled=_resolve_checkpoints_enabled(cfg),
         pass_session_id=is_truthy_value(os.environ.get("HERMES_TUI_PASS_SESSION_ID")),
         skip_context_files=ignore_rules, skip_memory=ignore_rules, fallback_model=_load_fallback_model(),
+        model_pinned=bool(model_override),
         # The resolved provider's request body (a custom entry's extra_body), as the CLI/cron/gateway pass it.
         request_overrides=runtime.get("request_overrides"),
         prefill_messages=_load_prefill_messages() or None, **_agent_cbs(sid))
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
+    agent._preflight_fallback = preflight_fallback
     if fallback_notice:
         # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
         agent._pending_fallback_notice = fallback_notice

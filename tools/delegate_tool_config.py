@@ -764,6 +764,7 @@ def _resolve_child_runtime(
         # The role primary always stays the child's primary, even when another process already cooled
         # it: construction adopts the shared cooldown (``_adopt_shared_primary_cooldown``), which walks
         # this chain through the spare guards and lets the child return to the primary mid-turn.
+        "model_pinned": (routing_cfg or {}).get("_model_pinned") is True,
         "fallback_model": _resolve_child_fallback_chain(
             parent_agent, delegation_cfg if routing_cfg is None else routing_cfg,
             pinned=bool(override_provider or override_base_url or model)),

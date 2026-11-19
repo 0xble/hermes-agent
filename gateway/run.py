@@ -2417,6 +2417,7 @@ def _resolve_runtime_agent_kwargs() -> dict:
         # gateway can surface a user-visible provider switch (#74349); the caller must pop
         # ``_fallback_notice`` before forwarding kwargs to AIAgent.
         return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"],
+                "_preflight_fallback": {**(runtime.get("_preflight_fallback") or {}), "requested_model": _primary_model},
                 "_fallback_notice": pre_agent_fallback_notice(
                     _primary_provider, _primary_model,
                     runtime.get("provider") or fallback_entry.get("provider") or "unknown",

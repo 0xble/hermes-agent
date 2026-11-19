@@ -65,4 +65,10 @@ def result_model_fields(agent: Any) -> dict[str, Optional[str]]:
         primary = str((getattr(agent, "_primary_runtime", None) or {}).get("model") or "").strip()
         if primary and primary != agent.model:
             requested, served = primary, agent.model
-    return {"requested_model": requested, "served_model": served or None}
+    from agent.fallback_attribution import fallback_attribution
+    fallback = fallback_attribution(agent) if getattr(agent, "_fallback_activated", False) is True else {}
+    startup = getattr(agent, "_preflight_fallback", None)
+    if isinstance(startup, dict):
+        fallback = {**startup, **fallback, "requested_model": startup.get("requested_model") or requested}
+    return {**fallback, "requested_model": fallback.get("requested_model") or requested,
+            "served_model": served or fallback.get("fallback_model")}

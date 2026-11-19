@@ -204,6 +204,8 @@ def _try_reclaim_earlier_fallback(agent, before_index):
             continue
         commit_fallback_route(agent, reservation)
         _finalize_fallback_route(agent, provider)
+        from agent.fallback_attribution import note_fallback
+        note_fallback(agent, bound[0], agent.model, provider, "recovery_recheck")
         agent._fallback_index = index + 1
         logger.debug("Returned to earlier fallback %s via %s", agent.model, provider)
         return True

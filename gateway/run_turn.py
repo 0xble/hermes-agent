@@ -716,6 +716,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         from gateway.run_turn_prepare import resolve_stored_override
         selected = resolve_stored_override(override, model)
         if selected is not None:
+            if override.get("model"):
+                selected[1]["model_pinned"] = True
             return *selected, None, False
 
         runtime_kwargs, unavailable_override = None, None
@@ -728,6 +730,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 # endpoint (openai-codex on the Nous URL). Run this turn on the whole default route and say
                 # so; the persisted override is kept, so the next turn retries it.
                 logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
+                if override.get("model"):
+                    raise  # An explicit model cannot move onto the default route.
                 unavailable_override, override = override, None
         if runtime_kwargs is None:
             runtime_kwargs = _resolve_runtime_agent_kwargs()
@@ -779,6 +783,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
 
         if override and skey:
             model, runtime_kwargs = GatewayAgentCacheMixin._apply_model_override(override, model, runtime_kwargs)
+            if override and override.get("model"):
+                runtime_kwargs["model_pinned"] = True
 
         # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
         # provider's first catalog model.

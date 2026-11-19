@@ -49,7 +49,7 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
     so tests that bind the method onto bare namespaces still reach it."""
     from gateway.run import _runtime_agent_kwargs
     from gateway.session_policy import route_launch_key
-    from gateway.session_worker_construct import route_runtime
+    from gateway.session_worker_construct import policy_pins_model, route_runtime
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
     # A follow_profile_config session's route is the profile's current one, model and endpoint from one read.
@@ -66,6 +66,10 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
             fallback_entry.get('model') or 'default')
         model = fallback_entry['model']
     kwargs = _runtime_agent_kwargs(runtime)
+    if runtime.get("_preflight_fallback"):
+        kwargs["_preflight_fallback"] = runtime["_preflight_fallback"]
+    if policy_pins_model(policy, frozen):
+        kwargs["model_pinned"] = True
     if session_key:
         # Use the same session-scoped publication as ordinary resolution. The turn consumes this
         # notice before choosing its model, so a runner-global notice would reapply the primary model
@@ -276,6 +280,8 @@ class GatewayTurnPrepareMixin:
                 "credential_pool", "max_tokens", "capabilities",
             )
         }
+        if runtime_kwargs.get("model_pinned") is True:
+            runtime["model_pinned"] = True
         runtime["args"] = list(runtime["args"] or [])
         runtime["capabilities"] = dict(runtime["capabilities"] or {})
         base_request_overrides = dict(runtime_kwargs.get("request_overrides") or {})

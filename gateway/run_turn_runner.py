@@ -838,7 +838,7 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         runner = self._runner
         ctx = self._ctx
         from gateway.run_turn_runner_attended import attended_switch_exempt
-        if attended_switch_exempt(runner, ctx, agent):
+        if isinstance(getattr(agent, "_pinned_fallback_model", None), str) or attended_switch_exempt(runner, ctx, agent):
             return
         def _handoff(*, conversation=None, runner_state=None):
             handoff = getattr(runner, "_handoff_attended_state", None)
@@ -1943,10 +1943,12 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         reasoning_config = apply_api_request_options(runner, reasoning_config)
         runner._reasoning_config = reasoning_config
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        preflight_fallback = runtime_kwargs.pop("_preflight_fallback", None)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
+        agent._preflight_fallback = preflight_fallback
         if pending_fallback_notice:
             # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
             agent._pending_fallback_notice = pending_fallback_notice

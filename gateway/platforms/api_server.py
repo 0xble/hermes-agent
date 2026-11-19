@@ -2317,6 +2317,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # must not collide with the ``**runtime_kwargs`` spread).
         model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
         runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
+        preflight_fallback = runtime_kwargs.pop("_preflight_fallback", None)
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
         model, session_override, request_model, request_provider = self._select_agent_runtime(
@@ -2363,7 +2364,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "memory_manager": self._memory_sessions.checkout(session_id)}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+        model_pinned = bool(request_model or route or session_model or (session_override or {}).get("model"))
+        if model_pinned:
+            agent_kwargs["model_pinned"] = True
         agent = AIAgent(**agent_kwargs)
+        agent._preflight_fallback = None if model_pinned else preflight_fallback
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
