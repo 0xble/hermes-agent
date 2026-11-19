@@ -273,7 +273,9 @@ class StreamTransportMixin:
         if self._native_stream_abandoned:
             return
         if not self._use_draft_streaming:
-            if self.cfg.cursor and self.cfg.cursor in (self._last_sent_text or ""):
+            # A flood-refused edit is already backing off; do not spend another request
+            # on cosmetic cleanup before final reconciliation or the normal send.
+            if not self._flood_strikes and self.cfg.cursor and self.cfg.cursor in (self._last_sent_text or ""):
                 await self._try_strip_cursor()
             return
         if getattr(type(self.adapter), "abandon_open_draft", None) is None:
