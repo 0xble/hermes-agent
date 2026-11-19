@@ -1012,14 +1012,12 @@ class SignalAdapter(BasePlatformAdapter):
         """Swap 👀 for ✅/❌; on CANCELLED the 👀 stays to keep reflecting "in progress" (matches Telegram).
         Keyed on the 👀 actually sent: the gateway check can flip mid-turn (the message that trips a bot's
         loop-guard budget passes it at start), so re-asking it here would strand that 👀."""
-        if outcome == ProcessingOutcome.CANCELLED or not getattr(event, "_signal_eyes_sent", False):
-            return
         if not (target := self._extract_reaction_target(event)):
             return
         async with reaction_operation(
             self, event.source.chat_id, str(target[1]), author=target[0], complete=True, event=event,
         ) as state:
-            if state.explicit:
+            if outcome == ProcessingOutcome.CANCELLED or not getattr(event, "_signal_eyes_sent", False) or state.explicit:
                 return
             await self.remove_reaction(event.source.chat_id, *target)
             if self._reactions_enabled(event) and (emoji := _OUTCOME_REACTION.get(outcome)):

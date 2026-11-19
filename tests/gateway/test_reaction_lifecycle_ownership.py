@@ -38,6 +38,7 @@ def reaction_transport(request, monkeypatch):
     if platform == "signal":
         adapter.account = "test-bot"
         adapter.dm_allow_from = ["*"]
+        adapter.set_authorization_check(lambda *_args, **_kwargs: True)
 
         async def rpc(method, params):
             ok = await deliver(params["recipient"][0], params["targetTimestamp"], params["emoji"], params["targetAuthor"])
@@ -63,7 +64,7 @@ def reaction_transport(request, monkeypatch):
 
         adapter._sidecar_call = AsyncMock(side_effect=sidecar)
     event = SimpleNamespace(
-        source=SimpleNamespace(chat_id="123", user_id="author"), message_id="456",
+        source=SimpleNamespace(chat_id="123", chat_type="dm", user_id="author"), message_id="456",
         raw_message={"sender": "author", "timestamp_ms": 456},
     )
     return platform, adapter, event, calls, control
