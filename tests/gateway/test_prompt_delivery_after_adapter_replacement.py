@@ -97,10 +97,13 @@ def test_update_prompt_after_reconnect_reaches_the_replacement(tmp_path):
 
     async def scenario():
         with patch("gateway.run._hermes_home", tmp_path):
+            from gateway.update_notifications import read_pending
+
+            _, original = read_pending(tmp_path)
             target = runner._resolve_update_target(runner._update_paths())
             retired.connected = False
             runner.adapters[Platform.TELEGRAM] = live
-            await runner._forward_update_prompt(target, "Restore local changes?", "y")
+            await runner._forward_update_prompt(target, "Restore local changes?", "y", original)
             await target.send("update finished")
 
     asyncio.run(scenario())

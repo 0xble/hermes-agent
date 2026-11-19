@@ -795,13 +795,15 @@ class GatewayNotificationsMixin(
                 platform = Platform(platform_str)
                 # The requester's OWN profile bot (marker ``profile``, else the ``agent:<profile>:`` key
                 # lane); a bare self.adapters lookup is the default bot under multiplex.
-                adapter = self._authorization_adapter(platform, self._marker_profile(pending))
+                profile = self._marker_profile(pending)
+                adapter = self._authorization_adapter(platform, profile)
                 if not adapter:
                     return None
                 metadata = self._pending_marker_metadata(platform, chat_id, pending, adapter)
                 # Fallback session key if not stored (old pending files)
                 return self._UpdateTarget(
                     adapter, chat_id, session_key or f"{platform_str}:{chat_id}", metadata, platform,
+                    resolve_adapter=lambda: self._authorization_adapter(platform, profile),
                 )
         return None
 
