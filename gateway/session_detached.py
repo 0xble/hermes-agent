@@ -174,7 +174,8 @@ def watch_routes(runner, store) -> None:
         if not store._route_is_current(route, version):
             return
         if on_loop:
-            loop.create_task(publish_from_loop())
+            task = runner._retain_background_task(loop.create_task(publish_from_loop()))
+            task.add_done_callback(runner._late_failure_callback("Detached route publication failed"))
         elif not loop.is_closed():
             owner = authority.logical_owner(session_id)
             loop.call_soon_threadsafe(name, owner)

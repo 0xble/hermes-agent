@@ -419,10 +419,10 @@ class SessionRecoveryMixin:
         if listener is not None and entry is not None:
             listener(session_key, entry)
 
-    def _route_is_current(self, session_key: str, version: object) -> bool:
+    def _route_is_current(self, session_key: str, version: int) -> bool:
         """Check a published entry's identity from the owner loop without loading or locking the store."""
         entry = self._entries.get(session_key)
-        return entry is not None and entry._route_version is version
+        return entry is not None and entry._route_version == version
 
     def _row_settled(self, session_id: str) -> None:
         """The route transition that published *session_id* returned (its state.db half done or

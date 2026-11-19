@@ -7,6 +7,7 @@ import logging
 import os
 import json
 import threading
+from itertools import count
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
@@ -27,6 +28,7 @@ from gateway.session_transcript import SessionTranscriptMixin
 from hermes_state_keys import profile_from_session_key_namespace
 
 logger = logging.getLogger(__name__)
+_route_versions = count()
 
 
 # -- PII redaction helpers --------------------------------------------------------------------
@@ -614,7 +616,7 @@ class SessionEntry:
     progress_cards: list[dict[str, Any]] = field(default_factory=list)
     # Metadata copies and compression advances keep this in-memory identity.
     # A conversation switch replaces the entry with a new identity.
-    _route_version: object = field(default_factory=object, compare=False, repr=False)
+    _route_version: int = field(default_factory=_route_versions.__next__, compare=False, repr=False)
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.

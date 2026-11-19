@@ -128,8 +128,8 @@ class SessionIncognitoMixin:
             register_session(session_key, True)
         else:
             saved = SessionEntry.from_dict(entry._incognito_persisted)
-            entry.__dict__.clear()
-            entry.__dict__.update(saved.__dict__)
+            saved._route_version = entry._route_version
+            entry.__dict__ = saved.__dict__
             self._lazy("_incognito_histories", dict).pop(entry.session_id, None)
             register_session(entry.session_id, False)
             register_session(session_key, False)
