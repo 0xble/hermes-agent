@@ -383,22 +383,6 @@ _MDV2_FENCE_RE = re.compile(r'(?m)^((?:(?!```)[^\n])*)(```[^`\n]*\n)([\s\S]*?)(^
 from plugins.platforms.telegram.telegram_markdown import _EXPANDABLE_QUOTE, _escape_bare_bracket, _escape_mdv2
 
 
-def _strip_mdv2(text: str) -> str:
-    """Strip MarkdownV2 escapes and formatting markers for the plain-text fallback."""
-    from gateway.copy_blocks import protect_inline_copy_bodies
-    from gateway.platforms.base import restore_inline_copy_bodies
-    text, bodies = protect_inline_copy_bodies(text)
-    from .copy_quotes import protect_quote_fallback
-    text, quote_bodies = protect_quote_fallback(text)
-    cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)  # escape backslashes
-    cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)  # **bold** BEFORE MarkdownV2 *bold*
-    cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
-    cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)  # italic; word-bounded so snake_case survives
-    cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
-    cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
-    return restore_inline_copy_bodies(cleaned, {**bodies, **quote_bodies})
-
-
 from plugins.platforms.telegram.telegram_chunking import (
     separate_chunk_indicator_from_fence as _separate_chunk_indicator_from_fence, split_formatted_mdv2, split_raw_carrying_emphasis)
 from plugins.platforms.telegram.telegram_split import (
@@ -4714,7 +4698,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             if not is_entity_parse_error(fmt_err):
                 raise
             logger.warning(warn_fmt, self.name, _redact_telegram_error_text(fmt_err))
-            await self._edit_text(chat_id, message_id, plain)
+            from gateway.copy_blocks import render_copy_blocks_inline
+            await self._edit_text(chat_id, message_id, render_copy_blocks_inline(plain))
         return False
 
     @durable_egress("edit_message")
@@ -4907,6 +4892,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         base = {**self._link_preview_kwargs(), **self._notification_kwargs(metadata)}
         from gateway.copy_blocks import _has_copy_markers, render_copy_blocks_inline
         has_copy = _has_copy_markers(chunk)
+        plain = render_copy_blocks_inline(_strip_mdv2(chunk) if finalize else chunk)
         for use_markdown in (True, False) if (finalize or has_copy) else (False,):
             cooldown = self._send_flood_cooldown_remaining(chat_id)
             if cooldown is not None:
@@ -4916,7 +4902,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     text = _separate_chunk_indicator_from_fence(self.format_message(chunk))
                 else:
                     # Degrade to stripped text on finalize (raw ** / ``` would render literally); previews stay raw.
-                    text = _strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk)
+                    text = plain
                 return await _await_with_thread_deadline(
                     self._bot.send_message(
                     chat_id=normalize_telegram_chat_id(chat_id), text=text, parse_mode=ParseMode.MARKDOWN_V2 if use_markdown else None,
@@ -4932,7 +4918,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                     try:
                         return await _await_with_thread_deadline(
                             self._bot.send_message(
-                            chat_id=normalize_telegram_chat_id(chat_id), text=_strip_mdv2(chunk) if finalize else render_copy_blocks_inline(chunk),
+                            chat_id=normalize_telegram_chat_id(chat_id), text=plain,
                             **retry_thread_kwargs, **base),
                             timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
                     except Exception as _retry_err:
