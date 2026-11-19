@@ -587,10 +587,29 @@ def _open_current_db():
     return SessionDB(db_path=get_hermes_home() / "state.db", read_only=True)
 
 
+def _lookup(db, lookup: dict[str, Any], limit: int, link_profile: str | None = None) -> str:
+    """Resolve a session by typed metadata, never by ad-hoc SQL from the caller."""
+    if not isinstance(lookup, dict):
+        return tool_error("lookup must be an object", success=False)
+    try:
+        rows = db.lookup_sessions(
+            title=lookup.get("title"), topic_name=lookup.get("topic_name"),
+            platform=lookup.get("platform"), chat_id=lookup.get("chat_id"),
+            thread_id=lookup.get("thread_id"), limit=_clamp_int(limit, 10, 1, 20),
+        )
+    except (TypeError, ValueError) as exc:
+        return tool_error(str(exc), success=False)
+    results = [{**row, "session_id": row.get("session_id"),
+                "link": _session_link(row.get("session_id", ""), link_profile)} for row in rows]
+    return _ok(mode="lookup", results=results, count=len(results), message=(
+        "Typed session lookup matched the requested title/topic or platform route."
+        if results else "No session matched the typed lookup."))
+
+
 def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
               around_message_id, window, sort, profile, detail,
-              after=None, before=None, exclude_session_ids=None) -> str:
-    """Mode dispatch inside one independent-reader scope; scroll wins with an anchor."""
+              after=None, before=None, exclude_session_ids=None, lookup=None) -> str:
+    """Mode dispatch inside one independent-reader scope; lookup and scroll are typed modes."""
     from contextlib import nullcontext
     from hermes_state import SessionDB
     from hermes_state_search_runtime import search_operation, search_stage
@@ -608,7 +627,11 @@ def _dispatch(query, role_filter, limit, db, current_session_id, session_id,
              if isinstance(db, SessionDB) else nullcontext())
     with scope as operation:
         with search_stage(db, "hydration_ms"):
-            if isinstance(session_id, str) and session_id.strip():
+            if lookup is not None:
+                if operation is not None:
+                    operation.path = "lookup"
+                result = _lookup(db, lookup, _clamp_int(limit, 10, 1, 20), link_profile=profile)
+            elif isinstance(session_id, str) and session_id.strip():
                 mode = "scroll" if around_message_id is not None else "read"
                 if operation is not None:
                     operation.path = mode
@@ -659,7 +682,7 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int |
                    around_message_id: int | None = None, window: int = 5, sort: str | None = None,
                    profile: str | None = None, detail: str = "adaptive", after: str | None = None,
                    before: str | None = None, exclude_session_ids: list[str] | None = None,
-                   platform: str | None = None) -> str:
+                   platform: str | None = None, lookup: dict[str, Any] | None = None) -> str:
     """Run session search, closing DBs opened here. Positional order is frozen for old callers;
     new parameters are appended after ``detail``."""
     from hermes_state import format_session_db_unavailable
@@ -701,7 +724,8 @@ def session_search(query: str = "", role_filter: str | None = None, limit: int |
     try:
         result = _dispatch(query, role_filter, limit, db, current_session_id, session_id,
                            around_message_id, window, sort, profile, detail,
-                           after=after, before=before, exclude_session_ids=exclude_session_ids)
+                           after=after, before=before, exclude_session_ids=exclude_session_ids,
+                           lookup=lookup)
         return _shape_session_links(result, platform)
     except sqlite3.Error as exc:
         return tool_error(f"Search failed: {exc}", success=False)
@@ -726,8 +750,10 @@ def check_session_search_requirements() -> bool:
 SESSION_SEARCH_SCHEMA = {
     "name": "session_search",
     "description": (
-        "Search or read past Hermes conversations (FTS5), or scroll inside one. Four shapes, picked by args: `query` = discovery "
-        "(top-N matching sessions, top result fully hydrated); `session_id` + "
+        "Find Hermes sessions by title, topic, or route. "
+        "A named owner or delegated worker can use typed lookup to resolve the right session before reading or relaying. "
+        "Use `lookup` for deterministic title/topic/platform resolution, including Slack channel+thread_ts "
+        "or Telegram chat+topic/thread; use `query` for discovery (top-N matching sessions, top result fully hydrated); "
         "`around_message_id` = scroll (window of messages around an anchor); "
         "`session_id` alone = read a whole session — how you resolve an "
         "`@session:<profile>/<id>` link (split on '/' into profile + id); no "
@@ -810,6 +836,23 @@ SESSION_SEARCH_SCHEMA = {
                     "explores instead of repeating the same hit. Cap 20."
                 ),
             },
+            "lookup": {
+                "type": "object",
+                "description": (
+                    "Typed read-only session lookup. Use this instead of sqlite3 or direct state.db reads "
+                    "when you need a session by title/topic or routing identity. Supply one or more fields: "
+                    "title (substring), topic_name (exact topic/title), platform (e.g. slack or telegram), "
+                    "chat_id (Slack channel or Telegram chat), and thread_id (Slack thread_ts or Telegram topic/thread)."
+                ),
+                "properties": {
+                    "title": {"type": "string", "description": "Case-insensitive title substring."},
+                    "topic_name": {"type": "string", "description": "Exact topic or display name."},
+                    "platform": {"type": "string", "description": "Transport name, such as slack or telegram."},
+                    "chat_id": {"type": "string", "description": "Slack channel id or Telegram chat id."},
+                    "thread_id": {"type": "string", "description": "Slack thread_ts or Telegram topic/thread id."},
+                },
+                "additionalProperties": False,
+            },
             "session_id": {
                 "type": "string",
                 "description": (
@@ -869,6 +912,6 @@ registry.register(
         detail=args.get("detail", "adaptive"), db=kw.get("db"), current_session_id=kw.get("current_session_id"),
         platform=kw.get("platform"),
         **{k: args.get(k) for k in ("role_filter", "session_id", "around_message_id", "sort", "profile",
-                                    "after", "before", "exclude_session_ids")}),
+                                    "after", "before", "exclude_session_ids", "lookup")}),
     check_fn=check_session_search_requirements,
     emoji="🔍")

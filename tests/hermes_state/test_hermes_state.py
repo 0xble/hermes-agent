@@ -5617,8 +5617,6 @@ def test_find_session_by_origin_matching_rules(db):
 
 
 
-
-
 def test_refresh_compression_lock_requires_holder_and_preserves_reclaimability(db, monkeypatch):
     db.create_session("s1", "cli")
 

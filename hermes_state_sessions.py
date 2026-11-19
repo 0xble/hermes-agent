@@ -465,6 +465,11 @@ class SessionSessionsMixin:
             return None
         return str(rows[0]["id"])
 
+    def lookup_sessions(self, **kwargs: Any) -> list[dict[str, Any]]:
+        """Delegate typed session identity lookup to its topical sibling module."""
+        from hermes_state_session_lookup import lookup_sessions
+        return lookup_sessions(self, **kwargs)
+
     # Orphaned gateway-session repair: widest plausible gap between a keyed predecessor going
     # quiet and its unkeyed successor (incident was ~60s; 15 min without spanning conversations).
     _ORPHAN_ADOPTION_MAX_GAP_S = 900.0
