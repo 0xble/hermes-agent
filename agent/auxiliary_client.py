@@ -147,9 +147,9 @@ from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
 from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 from agent.auxiliary_response_text import (
-    _coerce_llm_message as _coerce_llm_message,
-    _message_field as _message_field,
-    extract_content_or_reasoning as extract_content_or_reasoning,
+    _coerce_llm_message,
+    _message_field,
+    extract_content_or_reasoning,
 )
 
 logger = logging.getLogger(__name__)
@@ -2668,12 +2668,16 @@ def _provider_callback_async(create: Callable[[dict[str, Any]], Any], judged: li
 
 
 def _request_class_provider(client: Any, provider: str | None) -> str:
-    resolved = _effective_provider_for_client(client, provider or "")
-    if resolved == "main":
-        runtime = _normalize_main_runtime(None)
-        return runtime.get("requested_provider") or runtime.get("provider") or _read_main_provider() or ""
-    inherited = getattr(client, "_hermes_aux_main_requested_provider", None)
-    return inherited if resolved == "custom" and isinstance(inherited, str) else resolved
+    try:
+        resolved = _effective_provider_for_client(client, provider or "")
+        if resolved == "main":
+            runtime = _normalize_main_runtime(None)
+            return runtime.get("requested_provider") or runtime.get("provider") or _read_main_provider() or ""
+        inherited = getattr(client, "_hermes_aux_main_requested_provider", None)
+        return inherited if resolved == "custom" and isinstance(inherited, str) else resolved
+    except Exception:
+        logger.debug("Skipping request class: unable to identify auxiliary provider", exc_info=True)
+        return ""
 
 
 def _relay_sync_completion(
@@ -2684,6 +2688,7 @@ def _relay_sync_completion(
 
     kwargs = prepare_aux_request(
         client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+        task=(_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task"),
     )
     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
@@ -2729,6 +2734,7 @@ async def _relay_async_completion(
 
     kwargs = prepare_aux_request(
         client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+        task=(_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task"),
     )
     # Async twin of the seam default above (#98466).
     judged: list[_ClassifiedAttempt] = []
@@ -2764,6 +2770,7 @@ def _relay_sync_stream(
 
     kwargs = prepare_aux_request(
         client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+        task=(_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task"),
     )
     # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
@@ -4788,7 +4795,7 @@ def _resolve_auto_route(
         # provider "custom". Keep its name for request attribution, not routing or health.
         if routed[2] == "custom" and runtime.get("provider") == "custom" and runtime.get("requested_provider"):
             with contextlib.suppress(AttributeError, TypeError):
-                setattr(routed[0], "_hermes_aux_main_requested_provider", runtime["requested_provider"])
+                routed[0]._hermes_aux_main_requested_provider = runtime["requested_provider"]
         return routed
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(

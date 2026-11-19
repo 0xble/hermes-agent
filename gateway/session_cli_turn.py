@@ -12,7 +12,7 @@ from contextvars import ContextVar
 
 from hermes_state_runtime import RuntimeStoreError
 
-_SUBMIT_FIELDS = ('turn_author', 'api_text', 'model_override', 'clarify_batch')
+_SUBMIT_FIELDS = ('turn_author', 'turn_origin', 'api_text', 'model_override', 'clarify_batch')
 _API_TEXT_LIMIT = 1_000_000
 _cli_turn: ContextVar[tuple | None] = ContextVar('cli_turn', default=None)
 
@@ -31,6 +31,9 @@ def admit_cli_turn(params):
         if author is None:
             raise RuntimeStoreError('invalid_params')
         committed['turn_author'] = author
+    if (origin := params.get('turn_origin')) is not None:
+        from gateway.session_context import normalize_turn_origin
+        committed['turn_origin'] = normalize_turn_origin(origin)
     api_text = params.get('api_text')
     if api_text is not None:
         if not isinstance(api_text, str) or len(api_text) > _API_TEXT_LIMIT:

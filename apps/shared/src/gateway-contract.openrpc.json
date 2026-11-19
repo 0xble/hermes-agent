@@ -12082,6 +12082,18 @@
             ],
             "default": null
           },
+          "turn_origin": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Origin"
+          },
           "api_text": {
             "anyOf": [
               {

@@ -81,6 +81,12 @@ def load_config():
     return copy.deepcopy(frozen) if frozen is not None else _config_mod.load_config()
 
 
+def load_runtime_config_readonly():
+    """Read the active route snapshot without copying it or writing config."""
+    frozen = _FROZEN_RUNTIME_CONFIG.get()
+    return frozen if frozen is not None else _config_mod.load_config_readonly()
+
+
 def get_compatible_custom_providers(config=None):
     return _config_mod.get_compatible_custom_providers(config)
 

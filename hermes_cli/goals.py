@@ -2391,9 +2391,6 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
     if not objective:
         return None
     if timeout is None:
-        # The declared default for this path is the config key, not the module constant — see
-        # _goal_judge_timeout (#91022).
-        # Same config-backed default as judge_goal (#91022).
         timeout = _goal_judge_timeout()
 
     try:
@@ -2403,7 +2400,10 @@ def draft_contract(objective: str, *, timeout: Optional[float] = None) -> Option
         return None
 
     try:
-        raw = _call_goal_judge_llm(call_llm, DRAFT_CONTRACT_SYSTEM_PROMPT, f"Objective:\n{_truncate(objective, 4000)}", timeout)
+        from agent.proxy_request_class import bind_aux_request_origin
+
+        with bind_aux_request_origin("user"):
+            raw = _call_goal_judge_llm(call_llm, DRAFT_CONTRACT_SYSTEM_PROMPT, f"Objective:\n{_truncate(objective, 4000)}", timeout)
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)
         return None

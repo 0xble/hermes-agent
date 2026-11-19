@@ -107,7 +107,7 @@ def test_primary_turns_on_wire(mode, endpoint):
 
 
 @pytest.mark.parametrize("overrides", [
-    {"_turn_provenance": "unknown"}, {"_turn_provenance": "relay"}, {"_turn_provenance": "goal_loop"},
+    {"_turn_provenance": "relay"}, {"_turn_provenance": "goal_loop"},
     {"_turn_provenance": "process"}, {"_turn_origin": "background_review"}, {"_delegate_depth": 1},
     {"is_subagent": True},
 ])
@@ -119,13 +119,21 @@ def test_unattended_turns(overrides, monkeypatch):
         assert apply_turn_request_class(agent, {})["extra_headers"] == {HEADER: "background"}
 
 
+@pytest.mark.parametrize("origin", [None, "unknown", "future_origin"])
+def test_unrecognized_primary_provenance_is_interactive(origin):
+    agent = SimpleNamespace(api_mode="chat_completions", provider=NAMED, base_url=PROXY)
+    if origin is not None:
+        agent._turn_provenance = origin
+    with frozen_runtime_config(_config()):
+        assert apply_turn_request_class(agent, {})["extra_headers"] == {HEADER: "interactive"}
+
+
 @pytest.mark.parametrize(("provider", "base_url", "mode", "enabled"), [
     ("openai", "https://api.openai.com/v1", "chat_completions", True),
     ("custom:other", PROXY, "chat_completions", True),
     (NAMED, "https://api.openai.com/v1", "chat_completions", True),
     (NAMED, PROXY + "/other", "chat_completions", True),
     ("custom", PROXY, "chat_completions", True),
-    (NAMED, PROXY, "anthropic_messages", False),
     (NAMED, PROXY, "chat_completions", "true"),
     (NAMED, PROXY, "bedrock_converse", True),
 ])
@@ -161,7 +169,7 @@ def test_named_auxiliary_resolution_and_redirect_on_wire(monkeypatch, async_mode
             result = aux.call_llm(**kwargs)
     assert result.choices[0].message.content == "ok"
     assert [(req.url.host, req.headers.get(HEADER)) for req in sent] == [
-        ("proxy.example.test", "background"), ("elsewhere.example.test", None),
+        ("proxy.example.test", "interactive"), ("elsewhere.example.test", None),
     ]
     assert sent[0].headers["X-Proxy-Option"] == "kept"
 
@@ -185,6 +193,61 @@ def test_auxiliary_main_inherits_named_route(monkeypatch, provider):
         aux.call_llm(task="compression", provider=provider, messages=MESSAGES,
                      main_runtime={**main, "requested_provider": "custom:other"})
     assert [req.headers.get(HEADER) for req in sent] == ["background", None]
+
+
+@pytest.mark.parametrize("origin, expected", [("user", "interactive"), ("unknown", "interactive"),
+                                              ("cron", "background")])
+def test_moa_reference_and_aggregator_follow_parent_on_wire(monkeypatch, origin, expected):
+    from agent import moa_loop
+
+    sent = []
+
+    def handle(request):
+        sent.append(request.headers.get(HEADER))
+        return _chat_response(request)
+
+    monkeypatch.setattr(aux, "_openai_http_client_kwargs", lambda *_a, **_kw: {
+        "http_client": httpx.Client(transport=httpx.MockTransport(handle)),
+    })
+    parent = SimpleNamespace(_turn_provenance=origin)
+    with frozen_runtime_config(_config()):
+        for task in ("moa_reference", "moa_aggregator"):
+            moa_loop._call_slot(parent, task=task, provider=NAMED, model=MODEL, messages=MESSAGES)
+    assert sent == [expected, expected]
+
+
+def test_anthropic_messages_interactive_on_wire():
+    from anthropic import Anthropic
+
+    sent = []
+
+    def handle(request):
+        sent.append((request.url.path, request.headers.get(HEADER)))
+        return httpx.Response(200, json={"id": "msg-test", "type": "message", "role": "assistant",
+                                         "content": [], "model": MODEL, "stop_reason": "end_turn",
+                                         "stop_sequence": None, "usage": {"input_tokens": 1, "output_tokens": 1}})
+
+    agent = SimpleNamespace(api_mode="anthropic_messages", provider=NAMED, base_url=PROXY,
+                            _turn_provenance="user")
+    with frozen_runtime_config(_config(mode="anthropic_messages")), Anthropic(
+        api_key="test", base_url=PROXY.removesuffix("/v1"), http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    ) as client:
+        client.messages.create(**apply_turn_request_class(agent, {"model": MODEL, "messages": MESSAGES, "max_tokens": 32}))
+    assert sent == [("/v1/messages", "interactive")]
+
+
+def test_unexpected_lookup_error_omits_hint(monkeypatch):
+    from hermes_cli import runtime_provider_custom
+
+    def broken_lookup(*args, **kwargs):
+        raise RuntimeError("config unavailable")
+
+    monkeypatch.setattr(runtime_provider_custom, "_get_named_custom_provider", broken_lookup)
+    agent = SimpleNamespace(api_mode="chat_completions", provider=NAMED, base_url=PROXY)
+    kwargs = {"extra_headers": {"X-Existing": "kept"}}
+    assert apply_turn_request_class(agent, kwargs) is kwargs
+    monkeypatch.setattr(aux, "_effective_provider_for_client", broken_lookup)
+    assert aux._request_class_provider(object(), NAMED) == ""
 
 
 def test_redirect_guard_idempotent():

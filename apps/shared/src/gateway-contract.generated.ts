@@ -5401,6 +5401,7 @@ export interface CanonicalSubmitParams {
   display_kind?: 'hidden' | null
   title_preview?: string | null
   turn_author?: CanonicalTurnAuthor | null
+  turn_origin?: string | null
   api_text?: string | null
   model_override?: CanonicalModelOverride | null
   clarify_batch?: boolean

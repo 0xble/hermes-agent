@@ -2253,11 +2253,11 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         return image_paths, audio_paths, audio_file_paths, video_paths
 
     async def _enrich_inbound_images(
-        self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
+        self, event: MessageEvent, source: SessionSource, session_key: str,
+        message_text: str, image_paths: list[str],
     ) -> str:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
-        # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
-        # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
+        # models.dev and Ollama probes can block, so resolve the mode off the event loop.
         _img_mode = await asyncio.to_thread(
             self._decide_image_input_mode, source=source, session_key=session_key,
         )
@@ -2272,8 +2272,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
             _img_mode, len(image_paths),
         )
-        # Vision enrichment runs before AIAgent.run_conversation(), so bind this session's resolved
-        # runtime explicitly rather than consulting process-global compatibility mirrors.
+        # Bind this event and runtime before the agent turn; a queued event may have a different origin.
         vision_runtime = None
         try:
             turn_model, runtime_kwargs = await self._resolve_session_agent_runtime_async(
@@ -2284,8 +2283,8 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
             logger.debug("vision enrichment: session runtime resolution failed", exc_info=True)
 
         from agent.auxiliary_client import scoped_runtime_main
-
-        with scoped_runtime_main(vision_runtime):
+        from agent.proxy_request_class import bind_aux_request_origin
+        with scoped_runtime_main(vision_runtime), bind_aux_request_origin(turn_origin_for_event(event)):
             return await self._enrich_message_with_vision(message_text, image_paths)
 
     async def _enrich_inbound_voice(
@@ -2510,7 +2509,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
         if image_paths:
-            message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
+            message_text = await self._enrich_inbound_images(event, source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         # Keep current media after the recall boundary, not among discarded backfill.

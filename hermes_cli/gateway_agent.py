@@ -671,7 +671,7 @@ class GatewayAgent:
         return accepted
 
     # -- the turn ------------------------------------------------------------------------------
-    def _submit_params(self, user_message, persist_user_message, turn_author):
+    def _submit_params(self, user_message, persist_user_message, turn_author, turn_origin):
         attachments = None
         if isinstance(user_message, list):
             # Main's native image turn: OpenAI content parts built from local files. The gateway takes
@@ -687,6 +687,8 @@ class GatewayAgent:
             params["api_text"] = user_message
         if turn_author:
             params["turn_author"] = turn_author
+        if turn_origin is not None:
+            params["turn_origin"] = turn_origin
         if self._voice_turn_pending:
             params["voice_turn"] = True
         staged = self._pending_cli_user_message
@@ -748,7 +750,7 @@ class GatewayAgent:
         return "\n\n".join(t for t in texts if t), attachments
 
     def run_conversation(self, user_message, conversation_history=None, stream_callback=None,
-                         task_id=None, persist_user_message=None, turn_author=None, **_kw):
+                         task_id=None, persist_user_message=None, turn_author=None, *, turn_origin=None, **_kw):
         turn = self._turn = _Turn(self.session_id)  # first: a turn main gave up on stops consuming
         history = list(conversation_history or [])
         self._turn_ask_index = len(history)  # the staged ask's row in this turn's transcript
@@ -774,7 +776,7 @@ class GatewayAgent:
                 notice = self._prepare_submit(turn)
                 if notice:
                     return self._unadmitted(history, user_message, notice)
-                params = self._submit_params(user_message, persist_user_message, turn_author)
+                params = self._submit_params(user_message, persist_user_message, turn_author, turn_origin)
                 if self._stop(turn)():
                     raise CallStopped("prompt.submit")
                 receipt = self.connection.call("prompt.submit", **{**params, "session_id": turn.session_id})
