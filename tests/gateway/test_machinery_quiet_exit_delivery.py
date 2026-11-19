@@ -28,7 +28,7 @@ def _runner_reply(result):
         message="[IMPORTANT: Background process proc_1 completed normally]", history=[], session_id="sid",
         session_key="key", user_config={}, AIAgent=_Agent, resolve_display_setting=lambda *_a: False,
         _run_still_current=lambda: True, _hooks_ref=SimpleNamespace(loaded_hooks=False))
-    return TurnRunner(_gateway_runner(), ctx).run_sync()["final_response"]
+    return TurnRunner(_gateway_runner(), ctx).run_sync()["delivery_text"]
 
 
 def test_quiet_machinery_exit_reaches_delivery_empty():
