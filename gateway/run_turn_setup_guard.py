@@ -11,6 +11,7 @@ settles the admission and moves on.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import logging
 import traceback
 from contextlib import asynccontextmanager
@@ -127,6 +128,13 @@ async def run_preagent_setup(runner, event, source, quick_key: str, run_generati
             if resolved is None:
                 return None, None
             source, session_entry, session_key = resolved
+            event._hermes_attended_session_key = session_key
+            if not getattr(event, "_attended_activity_marked", False):
+                mark_activity = getattr(runner, "_mark_attended_user_activity", None)
+                if callable(mark_activity):
+                    activity_result = mark_activity(event, source, session_key)
+                    if inspect.isawaitable(activity_result):
+                        await activity_result
             prepared, env_tokens = await runner._hmwa_prepare_turn(
                 event, source, session_entry, session_key, quick_key, run_generation,
             )

@@ -1126,13 +1126,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             self._clear_session_env(_session_env_tokens)
             return None
         history, message_text = prepared.history, prepared.message_text
-        event._hermes_attended_session_key = session_key
-        if not getattr(event, "_attended_activity_marked", False):
-            mark_activity = getattr(self, "_mark_attended_user_activity", None)
-            if callable(mark_activity):
-                activity_result = mark_activity(event, source, session_key)
-                if inspect.isawaitable(activity_result):
-                    await activity_result
         from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
         if (
             isinstance(getattr(event, "metadata", None), dict)
