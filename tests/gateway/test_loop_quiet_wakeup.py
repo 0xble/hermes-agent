@@ -269,6 +269,9 @@ class _ShapeRunner(GatewayTurnMixin, GatewayConfigLoadersMixin):
     async def _clear_restart_failure_count(self, *_args, **_kwargs):
         return None
 
+    def _room_allow_silence(self, _source):
+        return None  # No room ``allow_silence`` policy: tests/gateway/test_room_allow_silence.py owns it.
+
 
 def _stub_gateway_run(monkeypatch):
     module = ModuleType("gateway.run")
@@ -340,7 +343,38 @@ async def test_fired_loop_wakeup_asks_for_silence_and_its_silent_reply_is_not_de
     assert LoopManager(session_id="loop-sid").state.awaiting_response is True
 
     assert await _deliver(event, "[SILENT]", monkeypatch) == ""
+    combo = "[SILENT]" + chr(10) + "LOOP_COMPLETE"
+    assert await _deliver(event, combo, monkeypatch) == ""
+    assert event._agent_final_response == combo
     assert await _deliver(event, "Queue depth changed to 2.", monkeypatch) == "Queue depth changed to 2."
+
+
+@pytest.mark.asyncio
+async def test_loop_wakeup_control_suffix_is_suppressed_but_raw_loop_stop_survives(
+    hermes_home, monkeypatch,
+):
+    event = GatewayRunner._synthetic_prompt_event(
+        SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42"),
+        "[loop wakeup]" + chr(10) + "Check the queue",
+        reply_expected=False,
+    )
+    event.internal = True
+    assert await _deliver(event, "[SILENT]" + chr(10) + "LOOP_COMPLETE", monkeypatch) == ""
+    assert await _deliver(event, "NO_REPLY" + chr(10) + "LOOP_COMPLETE", monkeypatch) == ""
+    assert await _deliver(event, "LOOP_COMPLETE", monkeypatch) == ""
+    assert await _deliver(
+        event, "Queue depth changed to 2." + chr(10) + "LOOP_COMPLETE", monkeypatch,
+    ) == "Queue depth changed to 2."
+
+
+@pytest.mark.asyncio
+async def test_human_loop_complete_silence_gets_existing_fallback(hermes_home, monkeypatch):
+    event = MessageEvent(
+        text="typed request",
+        source=SessionSource(platform=Platform.TELEGRAM, chat_id="42", chat_type="dm", user_id="42"),
+    )
+    reply = await _deliver(event, "[SILENT]" + chr(10) + "LOOP_COMPLETE", monkeypatch)
+    assert "No reply was written" in reply
 
 
 @pytest.mark.asyncio

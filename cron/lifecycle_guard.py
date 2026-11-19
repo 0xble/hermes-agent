@@ -723,6 +723,7 @@ def _valid_semaphore_wait(value: str) -> bool:
 _SEMAPHORE_VALUE_OPTIONS: dict[str, Callable[[str], bool]] = {
     "--label": lambda value: True,
     "--max-wait": _valid_semaphore_wait,
+    "--urgency": lambda value: value in {"incident", "urgent", "normal"},
     "--gate-fd": lambda value: re.fullmatch(r"[0-9]+", value) is not None,
 }
 _SEMAPHORE_FLAG_OPTIONS = frozenset({"-h", "--help"})

@@ -19,6 +19,9 @@ caps, queues, pauses, or chunking:
   existing session hash is never replaced, so the targeted delete is equivalent to
   the previous unbounded cleanup for the hash this call stores. Other orphaned prompts are
   no longer reclaimed here; the maintenance pass and session deletion still sweep them.
+- Prompt and tool-pin updates, including worker receipts, collect only the previous
+  hash when its binding changes. Both reference columns are checked in the same
+  transaction, so one binding cannot remove a prompt still shared by another.
 
 The declarative indexes are created on the first writable open of an existing store
 (`CREATE INDEX IF NOT EXISTS`). The receipt index build parses every
@@ -33,13 +36,16 @@ schema-version bump is required.
 
 The receipt path previously reached a maximum 32.6 s with zero handoffs in 16
 runs. Held-media collection reached 21.2 s. The prompt-cleanup event reached 18.3
-s, but that event was a Python GC pause rather than SQL work; the prompt change is
-tidy-only, not a measured latency fix.
+s, but that event was a Python GC pause rather than SQL work. For prompt replacement,
+a disposable 10,000-row database confirmed that the old delete scanned the prompt
+table and the targeted delete used its hash index. This establishes the amount of SQL
+work removed. Live latency also depends on storage and process scheduling.
 
 ## Source surfaces
 
 `hermes_state_keys.py`, `hermes_state_common.py`, `hermes_state_local.py`,
-`gateway/session_ingress_media.py`, `hermes_state_worker_lifecycle.py`, and
+`gateway/session_ingress_media.py`, `hermes_state.py`, `hermes_state_sessions.py`,
+`hermes_state_worker_context.py`, `hermes_state_worker_lifecycle.py`, and
 `tests/hermes_state/test_lock_hold_indexes.py`.
 
 ## Verification

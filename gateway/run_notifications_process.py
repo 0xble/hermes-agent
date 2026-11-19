@@ -90,7 +90,8 @@ class GatewayProcessNotificationsMixin:
                     if process_registry._claim_survivor_delivery(session):
                         process_registry._mark_survivor_delivered(session)
                 else:
-                    acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
+                    await asyncio.to_thread(acknowledge_survivor_notifications, process_registry,
+                                            (({"session_id": session_id}, ""),))
                 return None
             return False
         if silent:
@@ -100,7 +101,8 @@ class GatewayProcessNotificationsMixin:
                     if process_registry._claim_survivor_delivery(session):
                         process_registry._mark_survivor_delivered(session)
                 else:
-                    acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
+                    await asyncio.to_thread(acknowledge_survivor_notifications, process_registry,
+                                            (({"session_id": session_id}, ""),))
                 return None
             return False
         return True
@@ -165,7 +167,9 @@ class GatewayProcessNotificationsMixin:
                 return False
         # Presented, or deliberately suppressed by the notification mode: either way the
         # claimed survivor completion is settled and must not replay on a successor.
-        acknowledge_survivor_notifications(process_registry, (({"session_id": session_id}, ""),))
+        # The acknowledgement can load retained results, whose ownership check opens state.db.
+        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry,
+                                (({"session_id": session_id}, ""),))
         return True
 
     async def _run_process_watcher(self, watcher: dict) -> None:
@@ -240,7 +244,7 @@ class GatewayProcessNotificationsMixin:
                     completion_evt = self._build_process_completion_event(watcher, session, session_id)
                     synth_text = format_process_notification(completion_evt)
                     if not synth_text:
-                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
                         break
                     # Captured before injection: afterwards the key is busy either way (the injected
                     # turn itself installs the guard).
@@ -260,7 +264,7 @@ class GatewayProcessNotificationsMixin:
                         await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
                     admitted = await delivery
                     if admitted is not False:
-                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
                         break
                     # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
                     # for a few minutes, then fall through to the plain notice instead of dropping it.
@@ -275,7 +279,7 @@ class GatewayProcessNotificationsMixin:
                         continue
                     if await self._process_completion_committed(completion_evt, session_id):
                         # The last refusal was a lost ACK: the turn is committed.
-                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
                         break
                     logger.warning(
                         "Process watcher: completion for %s was refused %d times; falling back to the "

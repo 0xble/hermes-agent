@@ -2482,9 +2482,16 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         try:
             if stream is not None and stream.get("draft_id") != draft_id:
                 # New segment while a prior stream is open: seal the old one so
-                # it doesn't hang with a live-typing indicator.
-                await self._seal_stream(stream_key, stream)
+                # it doesn't hang with a live-typing indicator. Claim it before
+                # awaiting so a concurrent registration survives the seal.
                 self._active_streams.pop(stream_key, None)
+                await self._seal_stream(stream_key, stream)
+                # A replacement draft may have opened while the old stream was
+                # sealing. It owns this thread now, so never overwrite it with
+                # a second startStream call from the stale sender.
+                replacement = self._active_streams.get(stream_key)
+                if replacement is not None:
+                    return SendResult(success=True, message_id=replacement["ts"])
                 stream = None
             if stream is None:
                 return await self._start_stream(client, stream_key, draft_id, text, metadata)
@@ -2494,8 +2501,8 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             if not text.startswith(sent):
                 # Text was rewritten mid-segment: seal the stream, then fail
                 # the frame so the consumer falls back to the edit path.
-                await self._seal_stream(stream_key, stream)
                 self._active_streams.pop(stream_key, None)
+                await self._seal_stream(stream_key, stream)
                 return SendResult(success=False, error="stream prefix mismatch")
             delta = text[len(sent) :]
             try:
@@ -2518,7 +2525,11 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             stream["sent"] = text
             return SendResult(success=True, message_id=stream["ts"])
         except Exception as e:  # pragma: no cover - network/API errors
-            self._active_streams.pop(stream_key, None)
+            # Drop only this draft's stream: another draft may have registered in this
+            # thread while the failed call was in flight.
+            current = self._active_streams.get(stream_key)
+            if current is not None and current.get("draft_id") == draft_id:
+                self._active_streams.pop(stream_key, None)
             err = str(e)
             # Feature-gate errors: remember unsupported so later responses
             # skip the native attempt instead of erroring each time.
@@ -2568,7 +2579,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
     async def _seal_stale_streams(self) -> None:
         cutoff = time.time() - self._STREAM_MAX_AGE_S
         for key, stream in list(self._active_streams.items()):
-            if stream.get("started", 0) < cutoff:
+            # The snapshot goes stale across each seal's await: a key replaced or
+            # removed meanwhile now belongs to whoever changed it.
+            if stream.get("started", 0) < cutoff and self._active_streams.get(key) is stream:
                 self._active_streams.pop(key, None)
                 await self._seal_stream(key, stream)
 
@@ -2631,16 +2644,31 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 "[Slack] chat.stopStream failed for %s/%s: %s", chat_id, stream.get("ts"), e)
             return False
 
+    async def abandon_open_draft(
+        self, chat_id: str, content: str = "", metadata: Optional[dict[str, Any]] = None,
+    ) -> Optional[SendResult]:
+        """Seal only this consumer's orphan and return its editable message identity."""
+        md = metadata or {}
+        key = self._stream_key(chat_id, md)
+        stream = self._active_streams.get(key) if key else None
+        if stream is None or md.get("_draft_id") is None or md["_draft_id"] != stream.get("draft_id"):
+            return None
+        # Claim before awaiting: a replacement draft may open in this thread while
+        # stopStream is in flight, and its registration is not ours to remove.
+        self._active_streams.pop(key, None)
+        if not await self._seal_stream(key, stream):
+            # Keep the unsealed orphan for the stale sweep unless a replacement owns the thread.
+            self._active_streams.setdefault(key, stream)
+            return SendResult(success=False, error="Could not seal orphaned Slack stream")
+        return SendResult(success=True, message_id=stream["ts"])
+
     async def _try_finalize_stream(
         self, chat_id: str, content: str, metadata: Optional[dict[str, Any]] = None
     ) -> Optional[SendResult]:
-        """Seal the active native stream if ``content`` is its final text: SendResult when the
-        stream IS the final message; None when unrelated (interim commentary), leaving it open.
+        """Seal only the owning draft's final, never an unowned or interim send.
 
-        Invariant (duplicate-final class): a successfully streamed answer is NEVER posted a
-        second time. A fresh post happens only when the streamed message is demonstrably
-        uncommittable — the seal failed AND an in-place ``chat.update`` of it failed — or when
-        the content is unrelated to the stream."""
+        A streamed answer is never posted twice unless both sealing and in-place update
+        fail, or the final content cannot reuse the stream."""
         md = metadata or {}
         # Streaming contract: interim sends (commentary, segment-tail flushes) and editable
         # previews are never the turn final, whatever their text looks like.
@@ -2648,7 +2676,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             return None
         key = self._stream_key(chat_id, md)
         stream = self._active_streams.get(key) if key else None
-        if stream is None:
+        if stream is None or md.get("_draft_id") is None or md["_draft_id"] != stream.get("draft_id"):
+            # Thread routing and matching prose are not ownership. Only the consumer
+            # that opened this draft may commit it, never a background or stale send.
             return None
         text = self._strip_stream_cursor(content)
         sent = stream.get("sent", "")

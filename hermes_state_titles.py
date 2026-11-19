@@ -33,15 +33,22 @@ def _auto_title_matches(stored: str, candidate: str) -> bool:
     return stored.casefold() == candidate or _NUMBERED_TITLE_RE.sub(r'\1', stored).casefold() == candidate
 
 
-def _auto_title_collides(conn, title: str, exclude_session_id: str) -> bool:
-    """True when another session holds *title* under the automatic-title equivalence rule."""
+def auto_title_holders(conn, title: str, exclude_session_id: str, columns: str = "id"):
+    """Cursor over every other session holding *title* under the automatic-title equivalence
+    rule. The one predicate for the collision check, the reclaim write that clears those
+    holders, and the privacy projection that must see each holder the reclaim may clear."""
     # SQLite's lower()/NOCASE do not implement Unicode casefolding.
     conn.create_function("auto_title_matches", 2, _auto_title_matches, deterministic=True)
     return conn.execute(
-        "SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL "
-        "AND auto_title_matches(title, ?) LIMIT 1",
+        f"SELECT {columns} FROM sessions WHERE id != ? AND title IS NOT NULL "
+        "AND auto_title_matches(title, ?)",
         (exclude_session_id or "", title.casefold()),
-    ).fetchone() is not None
+    )
+
+
+def _auto_title_collides(conn, title: str, exclude_session_id: str) -> bool:
+    """True when another session holds *title* under the automatic-title equivalence rule."""
+    return auto_title_holders(conn, title, exclude_session_id, "1").fetchone() is not None
 
 
 def next_title_in_lineage(conn, base_title: str) -> str:
@@ -147,7 +154,21 @@ class SessionTitlesMixin:
         if not is_user and current["title"] is not None and self._title_rank(current["title_source"]) >= new_rank:
             return []
         if reject_auto_collision and not is_user and title and _auto_title_collides(conn, title, session_id):
-            return []
+            conflicts = auto_title_holders(
+                conn, title, session_id,
+                f"id, title, archived, auto_archived, hidden, {self._EMPTY_SESSION_WHERE} AS ghost",
+            ).fetchall()
+            # The advisory read above can be stale, and reclaimable holders are not
+            # legitimate automatic-title collisions. Classify every holder before
+            # clearing any of them so a later legitimate holder cannot leave a partial
+            # reclaim behind in this transaction.
+            if any(self._title_conflict_kind(conn, session_id, conflict) == "legitimate"
+                   for conflict in conflicts):
+                return []
+            for conflict in conflicts:
+                cleared = self._resolve_title_conflict(conn, session_id, conflict["title"])
+                if cleared:
+                    affected.append(cleared)
         if title:
             cleared = self._resolve_title_conflict(conn, session_id, title)
             if cleared:
@@ -159,6 +180,19 @@ class SessionTitlesMixin:
             (title, source if title else None, session_id, current["title"], current["title_source"]),
         ).rowcount
         return [*affected, session_id] if changed else affected
+
+    def _title_conflict_kind(self, conn, session_id: str, conflict, title: Optional[str] = None) -> str:
+        """Classify a title holder for the shared reclaim contract."""
+        conflict_id = conflict["id"]
+        if self._is_compression_ancestor(conn, ancestor_id=conflict_id, descendant_id=session_id):
+            return "compression_ancestor"
+        retired = (title or conflict["title"]) == self.CANONICAL_BOT_CHAT_TITLE and bot_chat_title_released(
+            conflict["archived"], conflict["auto_archived"], conn.execute(
+                "SELECT end_reason FROM sessions WHERE id = ?",
+                (self._compression_tip_on(conn, conflict_id),)).fetchone()[0])
+        if retired or (conflict["ghost"] and not conflict["hidden"]):
+            return "reclaimable"
+        return "legitimate"
 
     def _resolve_title_conflict(self, conn, session_id: str, title: str) -> Optional[str]:
         """Free ``title`` for ``session_id`` inside the caller's write transaction, or raise
@@ -172,9 +206,10 @@ class SessionTitlesMixin:
         if not conflict:
             return None
         conflict_id = conflict["id"]
+        kind = self._title_conflict_kind(conn, session_id, conflict, title)
         # A hidden compressed ancestor holding the title cannot be freed by the
         # user, so transfer it onto the tip (uniqueness + lineage kept).
-        if self._is_compression_ancestor(conn, ancestor_id=conflict_id, descendant_id=session_id):
+        if kind == "compression_ancestor":
             conn.execute("UPDATE sessions SET title = NULL WHERE id = ?", (conflict_id,))
             return conflict_id
         # A deliberately archived Bot Chat is a retired registry entry, not a live identity
@@ -185,11 +220,7 @@ class SessionTitlesMixin:
         # out, so the user cannot find it to free the name) yields too (#81888).
         # The full index stays: a ``message_count > 0`` partial index would make
         # the ghost's first append_message fail with IntegrityError.
-        retired = title == self.CANONICAL_BOT_CHAT_TITLE and bot_chat_title_released(
-            conflict["archived"], conflict["auto_archived"], conn.execute(
-                "SELECT end_reason FROM sessions WHERE id = ?",
-                (self._compression_tip_on(conn, conflict_id),)).fetchone()[0])
-        if retired or (conflict["ghost"] and not conflict["hidden"]):
+        if kind == "reclaimable":
             conn.execute(
                 "UPDATE sessions SET title = NULL, title_source = NULL WHERE id = ?",
                 (conflict_id,),

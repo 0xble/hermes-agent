@@ -7,6 +7,43 @@ from types import SimpleNamespace
 import pytest
 
 
+@pytest.mark.asyncio
+async def test_cron_status_restores_before_authorize(monkeypatch):
+    from gateway import session_cron
+
+    sid = 'cron-session'
+    row = {
+        'admission_id': 'admission', 'target_session_id': sid,
+        'principal_id': 'cron-owner', 'status': 'queued', 'generation': 0,
+        'request_id': 'cron:job:fire',
+    }
+    authority = SimpleNamespace(
+        profile_id='profile', sessions={}, retired=False, db=object(), epoch='epoch',
+    )
+    authorize_threads = []
+
+    def authorize(_actor, ref, capability):
+        authorize_threads.append((threading.current_thread().name, ref.session_id, capability))
+        assert ref.session_id in authority.sessions
+
+    authority.authorize = authorize
+    monkeypatch.setattr(session_cron, 'get_session_admission', lambda *_args, **_kwargs: row)
+
+    async def restore(_authority, restored_sid, *, admission_gate):
+        assert restored_sid == sid
+        assert admission_gate is False
+        authority.sessions[sid] = object()
+
+    monkeypatch.setattr(session_cron, '_restore_local_session_for_cron', restore)
+
+    result = await session_cron.operation(authority, 'status', {
+        'session_id': sid, 'admission_id': 'admission',
+    })
+
+    assert result['status'] == 'queued'
+    assert authorize_threads == [(threading.current_thread().name, sid, 'session:submit')]
+
+
 def test_cron_admission_uses_job_model_and_exact_retry(tmp_path, monkeypatch):
     from cron import jobs
     from gateway import run, session_cron
@@ -124,6 +161,8 @@ async def test_cron_recover_adopts_session_published_during_restore(tmp_path, mo
     races = []
 
     async def raced(owner, sid, *, admission_gate=True):
+        if admission_gate:  # submit restoring the session it just created; the race targets recover
+            return await real_restore(owner, sid, admission_gate=admission_gate)
         races.append(admission_gate)
         if len(races) == 1:
             published.append(await real_restore(owner, sid, admission_gate=admission_gate))

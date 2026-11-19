@@ -400,7 +400,7 @@ class CLIAgentSetupMixin:
                 if _fb_api_key:
                     _fb_kwargs["explicit_api_key"] = _fb_api_key
                 runtime = resolve_runtime_provider(**_fb_kwargs)
-            except (RuntimeError, ValueError, OSError) as exc:
+            except Exception as exc:  # health: allow BLE001 -- one unavailable fallback must not stop the ladder
                 logger.debug("Fallback runtime unavailable for %s/%s: %s", _fb_provider, _fb_model, exc)
                 continue
             _why_log, _why = primary_failure_wording(primary_exc)  # #117482: quota is not auth
@@ -748,7 +748,8 @@ class CLIAgentSetupMixin:
                 tool_gen_callback=self._on_tool_gen_start if self.streaming_enabled else None,
                 notice_callback=self._on_notice, notice_clear_callback=self._on_notice_clear,
                 reaction_callback=self._on_reaction)
-            self.agent._preflight_fallback = None if model_override else getattr(self, "_preflight_fallback", None)
+            if not model_override and getattr(self, "_preflight_fallback", None) is not None:
+                self.agent._preflight_fallback = self._preflight_fallback
             # Reference for atexit memory-provider shutdown: ``_run_cleanup`` in cli.py
             # reads ``cli._active_agent_ref``, so this MUST write the ``cli`` module's
             # global — a ``global`` statement here would bind this module's namespace.

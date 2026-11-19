@@ -27,7 +27,7 @@ def blocked_protected_date_pixels(task_id: str) -> Optional[str]:
         from tools.registry import tool_error
         return tool_error(
             "Screenshot unavailable: a protected date was filled in this browser session. "
-            "Use browser_handoff for the user to see it, or browser_close to end the session.",
+            "Use browser_handoff for the user to see it. The protected state clears when the browser task ends.",
             success=False)
     return None
 

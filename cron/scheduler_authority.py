@@ -204,6 +204,8 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
             raise CronExecutionUnknown(
                 f'Cron execution unverified; {identity}; reconcile {journal} '
                 f'{type(exc).__name__}: {exc}') from exc
+        from cron.dependency_timeout import name_gateway_handshake_timeout
+        exc = name_gateway_handshake_timeout(exc)
         error = f'{type(exc).__name__}: {exc}'
         if _handshake_failure(exc):
             # Nothing reached the owner: the firing scheduler may defer this fire, not fail it.

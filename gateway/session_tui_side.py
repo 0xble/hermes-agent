@@ -93,6 +93,8 @@ def _side_agent(authority, policy, live, task_id, **overrides):
     from run_agent import AIAgent
     runner = authority.runner
     model, runtime = _resolve_runtime(authority, policy)
+    runtime.pop("_preflight_fallback", None)
+    runtime.pop("_fallback_notice", None)
     config = policy.config(authority)
     from gateway.session_worker_construct import session_routing
     pr = session_routing(authority, policy)

@@ -3963,7 +3963,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
         "model": "gpt-5.4",
         "provider": "openai-codex",
         "base_url": "https://custom.example/v1",
-        "api_mode": "chat_completions",
+        "api_mode": "chat_completions", "_model_pinned": False,
     }
     assert captured["provider_override"] == "openai-codex"
     assert captured["reasoning_config_override"] == {"enabled": True, "effort": "high"}
@@ -10522,7 +10522,7 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
                     "provider": "custom:new-provider",
                     "base_url": profile_url,
                     "api_mode": "chat_completions",
-                    "reasoning_config": reasoning,
+                    "reasoning_config": reasoning, "model_pinned": True,
                 },
             }
         ]

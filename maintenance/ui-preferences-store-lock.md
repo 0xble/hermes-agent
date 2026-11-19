@@ -11,7 +11,9 @@ A writer waits for a live lock owner to release the directory, with a generous
 30-second overall backstop for a stuck writer. The backstop is not a contention
 retry or flake fix: it preserves the existing poll interval and fails with
 `PreferencesBusy`/`preferences store is busy` rather than waiting forever.
-Stale recovery checks the owner PID while both writers reclaim a
+Stale recovery checks the PID from the sampled owner token and checks that
+token again before moving the directory. A change returns to the wait loop.
+Both writers reclaim a
 live-looking owner whose owner file is older than ten minutes. The age backstop
 is the shared protection against PID reuse. Old `<pid>-<random>` tokens remain
 readable during rolling upgrades. A lock directory with no owner file (a writer
@@ -27,8 +29,9 @@ unavailable or a PID has been recycled.
 
 ## Contract Tests
 
-Contract tests: the live-owner, dead-PID, age-backstop and bounded-wait cases in
-`tests/hermes_cli/test_ui_preferences.py`, plus the matching cases in
+Contract tests: `tests/hermes_cli/test_ui_preferences.py`.
+
+The live-owner, dead-PID, age-backstop and bounded-wait cases also run in
 `apps/desktop/electron/ui-preferences.test.ts`.
 
 ## Verification

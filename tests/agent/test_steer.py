@@ -711,14 +711,13 @@ class TestSteerSurvivesRedirectRebuild:
 
         blob = "\n".join(
             str(m.get("content"))
-            for call in payloads
-            for m in call
+            for m in payloads[-1]
             if isinstance(m, dict)
         )
         # The rebuild reached the wire: the redirect correction is a real user message.
         assert self.REDIRECT_TEXT in blob
-        # The steer accepted just before the redirect must ride the same rebuild
-        # (injected into the newest tool result by the pre-API drain).
+        # Accepted guidance rides this same rebuilt request in its fresh correction
+        # row, without changing a tool receipt or any previously persisted row.
         assert self.STEER_TEXT in blob
         # Fully consumed: nothing left for the finalizer's leftover handoff.
         assert result.get("pending_steer") is None

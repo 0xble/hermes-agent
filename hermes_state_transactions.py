@@ -20,6 +20,12 @@ T = TypeVar("T")
 _ROW_STATE_KEYS = ("_row_id", DB_ROW_SNAPSHOT, "timestamp")
 
 
+def execute_prune_write(db, fn, patience_s, **kwargs):
+    from hermes_state_prune_budget import run_prune_write
+    return run_prune_write(lambda: db._execute_write_marked(fn, patience_s, **kwargs),
+                           label=getattr(fn, "__qualname__", "maintenance"), skip_result=kwargs.get("skip_result"))
+
+
 def execute_transcript_write(
     db: Any, fn: Callable[[sqlite3.Connection], T], messages: list[dict[str, Any]], *,
     session_id: str, patience_s: float | None = None, session_ids: Any = (),
@@ -57,6 +63,28 @@ def execute_transcript_write(
         raise
 
 
+def finish_write_maintenance(db: Any, *, bounded: bool) -> None:
+    """Count committed writes without admitting checkpoint/FTS work during retention."""
+    db._write_count += 1
+    if bounded:
+        return
+    if db._write_count % db._CHECKPOINT_EVERY_N_WRITES == 0:
+        db._try_wal_checkpoint()
+    if db._write_count % db._FTS_MERGE_EVERY_N_WRITES == 0:
+        db._try_incremental_merge_fts()
+
+
+def finish_prune_maintenance(db: Any) -> None:
+    """Pay the deferred FTS cadence once, while the pass still has time."""
+    from hermes_state_prune_budget import PruneBudgetExpired, current_budget
+    budget = current_budget()
+    try:
+        budget.check()
+    except PruneBudgetExpired:
+        return
+    db._try_incremental_merge_fts()
+
+
 def settle_write_transaction(
     conn: sqlite3.Connection, fn: Callable[[sqlite3.Connection], T], *, clock: ModuleType,
     logger: logging.Logger, warn_s: float, acquire_s: float,
@@ -80,7 +108,9 @@ def settle_write_transaction(
     try:
         observe_safely(observation.phase, "callback")
         try:
+            from hermes_state_prune_budget import check_prune_transaction
             result = fn(conn)
+            check_prune_transaction(clock.monotonic() - started)
         finally:
             callback_s = clock.monotonic() - started
             callback_cpu_s = clock.thread_time() - cpu_started

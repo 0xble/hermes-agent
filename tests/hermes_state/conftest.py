@@ -9,6 +9,9 @@ def _open_auto_maintenance_window(monkeypatch):
     import hermes_cli.maintenance_window
 
     monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_open", lambda: True)
+    # Match the admission stub in the SQL deadline calculation too. Deadline tests
+    # install their own real window and clock rather than depending on the host hour.
+    monkeypatch.setattr(hermes_cli.maintenance_window, "deletion_window_spec", lambda: None)
 
 
 @pytest.fixture

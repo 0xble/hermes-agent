@@ -62,3 +62,5 @@ Run the regression against that release without this patch.
 
 **Rollback:** revert this unit's commit. It touches only the two stdio modules, their tests, and
 this record.
+
+Contract tests: `tests/agent/test_thread_scoped_output.py`, `tests/agent/test_run_agent.py`.

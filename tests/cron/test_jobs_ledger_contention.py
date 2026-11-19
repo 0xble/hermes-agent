@@ -222,16 +222,16 @@ def test_concurrent_schedule_edit_is_evaluated_from_current_locked_record(store,
     assert jobs.load_jobs()[0]["next_run_at"] == future
 
 
-@pytest.mark.parametrize("scenario", ["retired", "missed_window", "outage"])
+@pytest.mark.parametrize("scenario", ["retired", "held", "missed_window", "outage"])
 def test_prefetch_preserves_base_notice_save_and_recovery_order(store, monkeypatch, scenario):
     """Differential: the base locked gate without preflight vs the public prefetched gate."""
-    from cron import owner_alerts
+    from cron import jobs_oneshot_diagnostics, owner_alerts
 
     job, now = store
     job["next_run_at"] = (now - timedelta(hours=1)).isoformat()
     if scenario != "missed_window":
         job["schedule"] = {"kind": "once", "run_at": job["next_run_at"]}
-        job["repeat"] = {"times": 1, "completed": 0}
+        job["repeat"] = {"times": 1, "completed": int(scenario == "retired")}
     else:
         job["max_catch_up_lateness_seconds"] = 0
     events = []
@@ -245,8 +245,8 @@ def test_prefetch_preserves_base_notice_save_and_recovery_order(store, monkeypat
         return real_save(*args, **kwargs)
 
     monkeypatch.setattr(jobs, "save_jobs", save)
-    monkeypatch.setattr(jobs, "_write_retired_oneshot_diagnostic", lambda *args: event("retired_notice"))
     monkeypatch.setattr(jobs, "save_job_output", lambda *args: event("output"))
+    monkeypatch.setattr(jobs_oneshot_diagnostics, "write_retired", lambda *args, **kwargs: event("retired_notice"))
     monkeypatch.setattr(owner_alerts, "queue_owner_failure", lambda *args, **kwargs: event("missed_notice"))
     monkeypatch.setattr(jobs.store_health, "outage_covers", lambda *args: scenario == "outage")
     monkeypatch.setattr(jobs.store_health, "end_recovery_window", lambda *args: event("recovery_end"))
@@ -263,6 +263,9 @@ def test_prefetch_preserves_base_notice_save_and_recovery_order(store, monkeypat
 
     assert run(True) == run(False)
     assert all(depth == 1 for _name, depth in events), events
+    if scenario == "retired":
+        names = [name for name, _depth in events]
+        assert names.index("retired_notice") < names.index("save") < names.index("recovery_end")
 
 
 def test_prefetch_reduces_locked_ledger_reads_to_due_jobs(store, monkeypatch, record_property):

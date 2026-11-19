@@ -12,6 +12,7 @@ from gateway.session_ingress_media import _held_media_paths
 from gateway.session_api_media import compact_settled_api_payloads
 from hermes_state import SessionDB
 from hermes_state_local import POLICY_PREFIX, moved_receipts
+from hermes_state_worker_context import worker_prompt
 from hermes_state_worker_lifecycle import insert_session_row_in_transaction
 
 
@@ -71,16 +72,21 @@ def test_moved_receipts_is_indexed_and_matches_not_indexed_for_all_target_modes(
             actual = moved_receipts(recorder, target_ids)
             sql, params = next(call for call in recorder.calls if "FROM state_meta" in call[0])
             assert "INDEXED BY idx_state_meta_local_policy_route" in sql
-            assert "m.key GLOB 'gateway.local_policy.v1:*'" in sql
+            assert "m.key GLOB ?" in sql
+            assert POLICY_PREFIX + "*" in params
             assert ("json_each(?)" in sql) is (target_ids is not None)
-            assert "idx_state_meta_local_policy_route" in " ".join(_plan(db._conn, sql, params))
+            # SQLite cannot plan a forced partial index from a bound GLOB parameter. Keep the
+            # production query parameterized, but use the equivalent literal only for plan proof.
+            plan_sql = sql.replace("m.key GLOB ?", f"m.key GLOB '{POLICY_PREFIX}*'")
+            plan_params = (params[0], *params[2:])
+            assert "idx_state_meta_local_policy_route" in " ".join(_plan(db._conn, plan_sql, plan_params))
 
-            reference_sql = sql.replace(
+            reference_sql = plan_sql.replace(
                 "state_meta m INDEXED BY idx_state_meta_local_policy_route", "state_meta m NOT INDEXED"
             )
             expected = {
                 owner: (target, source)
-                for owner, target, source in db._conn.execute(reference_sql, params).fetchall()
+                for owner, target, source in db._conn.execute(reference_sql, plan_params).fetchall()
             }
             assert actual == expected
 
@@ -177,3 +183,34 @@ def test_targeted_prompt_delete_plan_and_reupsert_behavior(tmp_path):
         assert db._conn.execute("SELECT hash FROM system_prompts WHERE hash=?", (replacement_hash,)).fetchone() is None
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("worker", [False, True])
+def test_prompt_replacement_collects_only_its_previous_reference(tmp_path, monkeypatch, worker):
+    with SessionDB(db_path=tmp_path / "state.db") as db:
+        pins = ["fixture-tool"]
+        original = json.dumps(pins)
+        db.create_session("owner", "cli", system_prompt=original)
+        db.create_session("shared", "cli")
+        db.update_session_tool_names("shared", pins)
+        original_hash = hashlib.sha256(original.encode()).hexdigest()
+        unrelated_hash = db._store_system_prompt(db._conn, "unrelated old orphan")
+        recorder = _RecordingConnection(db._conn)
+
+        if worker:
+            worker_prompt(db, recorder, "owner", {"system_prompt": "updated"})
+        else:
+            monkeypatch.setattr(db, "_execute_write", lambda write, **_kwargs: write(recorder))
+            db.update_system_prompt("owner", "updated")
+
+        deletes = [(sql, params) for sql, params in recorder.calls if sql.startswith("DELETE FROM system_prompts")]
+        assert len(deletes) == 1
+        sql, params = deletes[0]
+        assert params == (original_hash,)
+        assert any(detail.startswith("SEARCH system_prompts") for detail in _plan(db._conn, sql, params))
+        assert db.get_session("owner")["system_prompt"] == "updated"
+        assert db._conn.execute("SELECT hash FROM system_prompts WHERE hash=?", (original_hash,)).fetchone()
+
+        db.update_session_tool_names("shared", None)
+        assert db._conn.execute("SELECT hash FROM system_prompts WHERE hash=?", (original_hash,)).fetchone() is None
+        assert db._conn.execute("SELECT hash FROM system_prompts WHERE hash=?", (unrelated_hash,)).fetchone()

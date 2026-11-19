@@ -121,6 +121,7 @@ class SessionPruneParams(Params):
     never_active_days: float | None = None
     # Delete even outside maintenance.deletion_window (the owner refuses there otherwise).
     now: bool | None = None
+    max_seconds: float | None = None
 
 
 class SessionPruneResult(Result):
