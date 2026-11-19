@@ -178,8 +178,7 @@ async function ownerToken(lockDir: string): Promise<string | null> {
   )
 }
 
-async function ownerPid(lockDir: string): Promise<number | null> {
-  const raw = await ownerToken(lockDir)
+function ownerPid(raw: string | null): number | null {
   const pidField = raw?.split('-', 1)[0] ?? ''
 
   if (!/^\d+$/.test(pidField)) {
@@ -214,7 +213,7 @@ function pidIsAlive(pid: number | null): boolean {
 
 async function breakIfStale(lockDir: string): Promise<void> {
   const judgedOwner = await ownerToken(lockDir)
-  const pid = await ownerPid(lockDir)
+  const pid = ownerPid(judgedOwner)
 
   // Age the owner file, or the lock directory itself when no owner was written: a writer
   // that died between mkdir and the owner write must still age out.
@@ -232,6 +231,10 @@ async function breakIfStale(lockDir: string): Promise<void> {
   }
 
   if (pid === null && (ownerAge === null || ownerAge <= LOCK_STALE_MS)) {
+    return
+  }
+
+  if ((await ownerToken(lockDir)) !== judgedOwner) {
     return
   }
 
