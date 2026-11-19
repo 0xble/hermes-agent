@@ -396,6 +396,11 @@ def _fitting_parts(adapter: Any, content: str) -> Optional[list[str]]:
     paragraph spacer rows, ``\\$`` escapes), so a split whose parts overflow is redone with a
     smaller budget, including raw text under the cap whose sent markdown is over it (one part at
     the full cap). ``None`` when even the smallest budget overflows, or one part already fits."""
+    from gateway.copy_blocks import _has_copy_markers
+
+    if _has_copy_markers(content):
+        # This splitter cannot carry literal-copy boundaries between parts. The legacy path can.
+        return None
     cap = adapter.RICH_MESSAGE_MAX_CHARS
     for budget in (cap, cap * 7 // 8, cap * 3 // 4):
         parts = split_rich_parts(content, budget)
