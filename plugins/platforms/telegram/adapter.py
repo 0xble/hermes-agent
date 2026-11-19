@@ -401,7 +401,8 @@ def _strip_mdv2(text: str) -> str:
 
 from plugins.platforms.telegram.telegram_chunking import (
     separate_chunk_indicator_from_fence as _separate_chunk_indicator_from_fence, split_formatted_mdv2, split_raw_carrying_emphasis)
-from plugins.platforms.telegram.telegram_split import _strip_mdv2, quotable_text, split_reply_anchor
+from plugins.platforms.telegram.telegram_split import (
+    REPLY_FILE_MAX_BYTES, _strip_mdv2, quotable_text, reply_message_count, send_reply_document, split_reply_anchor)
 
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
@@ -867,6 +868,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     _ptb_proxy_url: str | None = None  # set by _build_ptb_requests; error text then shows no detail
 
     MAX_MESSAGE_LENGTH = 4096
+    MAX_SPLIT_MESSAGES = 8  # a reply needing more messages goes out as one .md file instead (#152012)
+    REPLY_FILE_MAX_BYTES = REPLY_FILE_MAX_BYTES
+    reply_message_count, send_reply_document = reply_message_count, send_reply_document
     # Two MarkdownV2 parenthesis escapes and a conservative fence-separation newline.
     CHUNK_INDICATOR_OVERHEAD = 3
     supports_code_blocks = True  # MarkdownV2 renders fenced code blocks
