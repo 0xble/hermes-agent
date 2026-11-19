@@ -538,20 +538,24 @@ _RICH_CURRENCY_PLACEHOLDER = "\x00HERMES_RICH_CURRENCY_{index}\x00"
 
 
 def _protect_rich_currency(text: str) -> str:
-    """Wrap multiple same-line currency amounts in inline code so they cannot pair into ``$…$`` math."""
+    """Escape prose dollars and wrap multiple same-line amounts so they cannot pair as math."""
+    from .telegram_markdown import escape_rich_currency_dollars
+
     stashed: list[str] = []
 
-    def stash(match: "re.Match[str]") -> str:
-        stashed.append(match.group(0))
+    def stash_text(value: str) -> str:
+        stashed.append(value)
         return _RICH_CURRENCY_PLACEHOLDER.format(index=len(stashed) - 1)
 
-    masked = _RICH_CURRENCY_PROTECTED_RE.sub(stash, text)
+    masked = _RICH_CURRENCY_PROTECTED_RE.sub(lambda match: stash_text(match.group(0)), text)
     lines = masked.split("\n")
     for index, line in enumerate(lines):
         if len(_RICH_CURRENCY_AMOUNT_RE.findall(line)) < 2:
             continue
-        lines[index] = _RICH_CURRENCY_AMOUNT_RE.sub(lambda match: f"`{match.group(0)}`", line)
-    protected = "\n".join(lines)
+        lines[index] = _RICH_CURRENCY_AMOUNT_RE.sub(lambda match: stash_text(f"`{match.group(0)}`"), line)
+    # Escape the remaining prose before restoring generated code spans: a stray
+    # backtick in the input can otherwise pair with an inserted opener.
+    protected = escape_rich_currency_dollars("\n".join(lines))
     for index, original in enumerate(stashed):
         protected = protected.replace(_RICH_CURRENCY_PLACEHOLDER.format(index=index), original)
     return protected
@@ -946,6 +950,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         self._update_receipts_dirty: set = set()
         self._update_receipt_flush: Optional[asyncio.Task] = None
         self._bot: Optional[Bot] = None
+        self._standalone_rich_request: Optional[Callable[[dict[str, Any]], Awaitable[Any]]] = None
         self._webhook_mode: bool = False
         self._mention_patterns = self._compile_mention_patterns()
         self._reply_to_mode: str = getattr(config, 'reply_to_mode', 'first') or 'first'
@@ -1860,9 +1865,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         try:
             # Raw Bot API result: return_type=Message would make PTB deserialize a 10.1 shape it doesn't
             # fully model; a post-delivery parse error ≠ send failure.
-            msg = await _await_with_thread_deadline(
-                self._bot.do_api_request("sendRichMessage", api_kwargs=payload),
-                timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
+            request = self._standalone_rich_request or self._request_rich_message
+            msg = await request(payload)
         except Exception as exc:
             if self._rich_rejected(exc, "sendRichMessage", "MarkdownV2"):
                 return None
@@ -1884,6 +1888,14 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             return idless_send_result(self.name, chat_id, "sendRichMessage")
         await self._record_sent_text(chat_id, message_id, content)
         return result
+
+    async def _request_rich_message(self, payload: dict[str, Any]):
+        bot = self._bot
+        if bot is None:
+            raise RuntimeError("Telegram bot unavailable")
+        return await _await_with_thread_deadline(
+            bot.do_api_request("sendRichMessage", api_kwargs=payload),
+            timeout=_TEXT_SEND_DEADLINE, label="telegram-send", dump_on_blocked_loop=False)
 
     def _rich_payload_base(self, chat_id: str, content: str) -> dict[str, Any]:
         payload: dict[str, Any] = {"chat_id": normalize_telegram_chat_id(chat_id), "rich_message": self._rich_message_payload(content)}

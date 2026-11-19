@@ -26,7 +26,6 @@ class _Flood(Exception):
 @pytest.fixture
 def adapter(tmp_path, monkeypatch):
     monkeypatch.setattr(rich_sent_store, "_store_path", lambda: str(tmp_path / "sent.json"))
-    monkeypatch.setattr("plugins.platforms.telegram.adapter.asyncio.sleep", AsyncMock())
     a = TelegramAdapter(PlatformConfig(enabled=True, token="fake-token"))
     a._bot = MagicMock()
     a._bot.edit_message_text = AsyncMock(return_value=True)
