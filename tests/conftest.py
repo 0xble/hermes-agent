@@ -529,7 +529,10 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     forbidden_homes = tuple(checkout_root / name for name in ("owned", "fixture"))
 
     def assert_no_checkout_homes():
-        leaked = [str(path) for path in forbidden_homes if path.exists()]
+        # os.path.lexists, not Path.exists: this also runs at teardown, while a test's own patch of
+        # ``Path.exists`` (the serving-slot probe test pins it to True) is still installed, and the
+        # guard must report what is on disk. lexists also catches a dangling symlink.
+        leaked = [str(path) for path in forbidden_homes if os.path.lexists(path)]
         if leaked:
             raise AssertionError(f"test created a Hermes home in the checkout root: {leaked}")
 
