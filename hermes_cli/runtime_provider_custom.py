@@ -119,6 +119,8 @@ def _lift_common_custom_fields(entry: dict[str, Any], result: dict[str, Any], *,
     if isinstance(extra_body, dict):
         result["extra_body"] = dict(extra_body)
     _lift_extra_headers(entry, result)
+    if entry.get("hermes_request_class") is True:
+        result["hermes_request_class"] = True
     if api_mode:
         result["api_mode"] = api_mode
 

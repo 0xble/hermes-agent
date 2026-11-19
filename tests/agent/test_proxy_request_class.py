@@ -1,0 +1,194 @@
+"""Wire-level coverage using SDK clients pointed at in-process HTTP transports."""
+
+import asyncio
+import json
+from types import SimpleNamespace
+
+import httpx
+import pytest
+from openai import OpenAI
+
+from agent import auxiliary_client as aux
+from agent.proxy_request_class import HEADER, apply_turn_request_class, protect_request_class_redirects
+from hermes_cli.runtime_provider import frozen_runtime_config
+
+
+PROXY = "https://proxy.example.test/v1"
+NAMED = "custom:openai-proxy"
+MODEL = "test-model"
+MESSAGES = [{"role": "user", "content": "Hello"}]
+
+
+def _config(*, opt_in=True, mode="chat_completions"):
+    return {"providers": {
+        "openai-proxy": {"api": PROXY, "api_key": "test", "model": MODEL, "api_mode": mode,
+                         "hermes_request_class": opt_in, "extra_headers": {"X-Proxy-Option": "kept"}},
+        "other": {"api": PROXY, "api_key": "test", "model": MODEL},
+    }}
+
+
+def _chat_response(request):
+    return httpx.Response(200, json={"id": "test", "object": "chat.completion", "created": 1,
+        "model": MODEL, "choices": [{"index": 0, "finish_reason": "stop",
+                                      "message": {"role": "assistant", "content": "ok"}}]})
+
+
+def test_agent_turn_and_route_change_on_wire(monkeypatch):
+    from run_agent import AIAgent
+
+    sent = []
+
+    def handle(request):
+        sent.append((request.url.host, request.headers.get(HEADER)))
+        if json.loads(request.content).get("stream"):
+            chunk = {"id": "test", "object": "chat.completion.chunk", "created": 1, "model": MODEL,
+                     "choices": [{"index": 0, "delta": {"role": "assistant", "content": "ok"},
+                                  "finish_reason": "stop"}]}
+            return httpx.Response(200, text=f"data: {json.dumps(chunk)}\n\ndata: [DONE]\n\n",
+                                  headers={"content-type": "text/event-stream"})
+        return _chat_response(request)
+
+    def http_client(*_args, **_kwargs):
+        return httpx.Client(transport=httpx.MockTransport(handle))
+
+    monkeypatch.setattr(AIAgent, "_build_keepalive_http_client", staticmethod(http_client))
+    with frozen_runtime_config(_config()):
+        agent = AIAgent(provider="custom", requested_provider=NAMED, base_url=PROXY, api_key="test",
+                         model=MODEL, api_mode="chat_completions", enabled_toolsets=[], quiet_mode=True,
+                         skip_context_files=True, skip_memory=True, skip_background_review=True)
+        monkeypatch.setattr(agent, "_disable_streaming", True, raising=False)
+        try:
+            first = agent.run_conversation("Hello", turn_origin="user")
+            assert first["final_response"] == "ok"
+            second = agent.run_conversation("Wake", first["messages"], turn_origin="goal_loop")
+            assert second["final_response"] == "ok"
+            agent.switch_model(MODEL, "custom", api_mode="chat_completions",
+                               base_url="https://direct.example.test/v1", api_key="test")
+            assert agent.run_conversation("Hello again", turn_origin="user")["final_response"] == "ok"
+        finally:
+            agent.close()
+    assert sent == [("proxy.example.test", "interactive"), ("proxy.example.test", "background"),
+                    ("direct.example.test", None)]
+
+
+@pytest.mark.parametrize(("mode", "endpoint"), [("chat_completions", "chat/completions"),
+                                                ("codex_responses", "responses")])
+def test_primary_turns_on_wire(mode, endpoint):
+    sent = []
+
+    def handle(request):
+        sent.append(request)
+        if len(sent) == 1:
+            return httpx.Response(500, json={"error": {"message": "retry"}}, headers={"retry-after-ms": "1"})
+        return _chat_response(request)
+
+    agent = SimpleNamespace(api_mode=mode, provider="custom", requested_provider=NAMED, base_url=PROXY,
+                            _turn_provenance="user", _is_user_initiated_turn=False)
+    kwargs = {"model": MODEL, "extra_headers": {"X-Existing": "kept"}}
+    kwargs.update({"input": MESSAGES} if mode == "codex_responses" else {"messages": MESSAGES})
+    with frozen_runtime_config(_config(mode=mode)), OpenAI(
+        api_key="test", base_url=PROXY, max_retries=1, http_client=httpx.Client(transport=httpx.MockTransport(handle)),
+    ) as client:
+        create = client.responses.create if mode == "codex_responses" else client.chat.completions.create
+        create(**apply_turn_request_class(agent, kwargs))
+        grown = [*MESSAGES, {"role": "assistant", "content": "ok"}, {"role": "user", "content": "Again"}]
+        create(**apply_turn_request_class(agent, {**kwargs, ("input" if mode == "codex_responses" else "messages"): grown}))
+        agent._turn_provenance = "cron"
+        create(**apply_turn_request_class(agent, kwargs))
+
+    assert [req.headers[HEADER] for req in sent] == ["interactive", "interactive", "interactive", "background"]
+    assert [req.url.path for req in sent] == [f"/v1/{endpoint}"] * 4
+    assert all(req.headers["X-Existing"] == "kept" for req in sent)
+    bodies = [json.loads(req.content) for req in sent]
+    assert bodies[0] == bodies[1] == bodies[3]
+    key = "input" if mode == "codex_responses" else "messages"
+    assert bodies[2][key][:len(MESSAGES)] == bodies[0][key] == MESSAGES
+    assert kwargs["extra_headers"] == {"X-Existing": "kept"}
+
+
+@pytest.mark.parametrize("overrides", [
+    {"_turn_provenance": "unknown"}, {"_turn_provenance": "relay"}, {"_turn_provenance": "goal_loop"},
+    {"_turn_provenance": "process"}, {"_turn_origin": "background_review"}, {"_delegate_depth": 1},
+    {"is_subagent": True},
+])
+def test_unattended_turns(overrides, monkeypatch):
+    monkeypatch.setenv("HERMES_TURN_ORIGIN", "user")
+    agent = SimpleNamespace(**{"api_mode": "chat_completions", "provider": NAMED, "base_url": PROXY,
+                               "_turn_provenance": "user", **overrides})
+    with frozen_runtime_config(_config()):
+        assert apply_turn_request_class(agent, {})["extra_headers"] == {HEADER: "background"}
+
+
+@pytest.mark.parametrize(("provider", "base_url", "mode", "enabled"), [
+    ("openai", "https://api.openai.com/v1", "chat_completions", True),
+    ("custom:other", PROXY, "chat_completions", True),
+    (NAMED, "https://api.openai.com/v1", "chat_completions", True),
+    (NAMED, PROXY + "/other", "chat_completions", True),
+    ("custom", PROXY, "chat_completions", True),
+    (NAMED, PROXY, "anthropic_messages", False),
+    (NAMED, PROXY, "chat_completions", "true"),
+    (NAMED, PROXY, "bedrock_converse", True),
+])
+def test_no_implicit_opt_in(provider, base_url, mode, enabled):
+    agent = SimpleNamespace(api_mode=mode, provider=provider, base_url=base_url, _turn_provenance="user")
+    with frozen_runtime_config(_config(opt_in=enabled)):
+        kwargs = {"extra_headers": {"X-Existing": "kept"}}
+        assert apply_turn_request_class(agent, kwargs) is kwargs
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_named_auxiliary_resolution_and_redirect_on_wire(monkeypatch, async_mode):
+    sent = []
+
+    def handle(request):
+        sent.append(request)
+        if request.url.host == "proxy.example.test":
+            return httpx.Response(307, headers={"location": "https://elsewhere.example.test/v1/chat/completions"})
+        return _chat_response(request)
+
+    transport = httpx.MockTransport(handle)
+
+    def http_kwargs(_base, *, async_mode=False, **_kwargs):
+        cls = httpx.AsyncClient if async_mode else httpx.Client
+        return {"http_client": cls(transport=transport, follow_redirects=True)}
+
+    monkeypatch.setattr(aux, "_openai_http_client_kwargs", http_kwargs)
+    with frozen_runtime_config(_config()):
+        kwargs = {"provider": NAMED, "model": MODEL, "messages": MESSAGES}
+        if async_mode:
+            result = asyncio.run(aux.async_call_llm(**kwargs))
+        else:
+            result = aux.call_llm(**kwargs)
+    assert result.choices[0].message.content == "ok"
+    assert [(req.url.host, req.headers.get(HEADER)) for req in sent] == [
+        ("proxy.example.test", "background"), ("elsewhere.example.test", None),
+    ]
+    assert sent[0].headers["X-Proxy-Option"] == "kept"
+
+
+@pytest.mark.parametrize("provider", ["main", "auto"])
+def test_auxiliary_main_inherits_named_route(monkeypatch, provider):
+    sent = []
+
+    def handle(request):
+        sent.append(request)
+        return _chat_response(request)
+
+    monkeypatch.setattr(aux, "_openai_http_client_kwargs", lambda *_a, **_kw: {
+        "http_client": httpx.Client(transport=httpx.MockTransport(handle)),
+    })
+    cfg = {**_config(), "model": {"provider": NAMED, "default": MODEL}}
+    main = {"provider": "custom", "requested_provider": NAMED, "base_url": PROXY,
+            "model": MODEL, "api_key": "test", "api_mode": "chat_completions"}
+    with frozen_runtime_config(cfg):
+        aux.call_llm(task="compression", provider=provider, main_runtime=main, messages=MESSAGES)
+        aux.call_llm(task="compression", provider=provider, messages=MESSAGES,
+                     main_runtime={**main, "requested_provider": "custom:other"})
+    assert [req.headers.get(HEADER) for req in sent] == ["background", None]
+
+
+def test_redirect_guard_idempotent():
+    with OpenAI(api_key="test") as client:
+        protect_request_class_redirects(client)
+        protect_request_class_redirects(client)
+        assert len(client._client.event_hooks["request"]) == 1

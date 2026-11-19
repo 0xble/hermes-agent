@@ -209,7 +209,10 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     # SDK-internal retries by default and let Hermes control the budget; explicit callers can still override
     # via kwargs.
     kwargs.setdefault("max_retries", 0)
-    return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    client = OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    from agent.proxy_request_class import protect_request_class_redirects
+    protect_request_class_redirects(client)
+    return client
 
 
 # Interrupt protection for atomic aux tasks: a compression summary killed by an ordinary
@@ -2658,13 +2661,24 @@ def _provider_callback_async(create: Callable[[dict[str, Any]], Any], judged: li
     return call
 
 
+def _request_class_provider(client: Any, provider: str | None) -> str:
+    resolved = _effective_provider_for_client(client, provider or "")
+    if resolved == "main":
+        runtime = _normalize_main_runtime(None)
+        return runtime.get("requested_provider") or runtime.get("provider") or _read_main_provider() or ""
+    inherited = getattr(client, "_hermes_aux_main_requested_provider", None)
+    return inherited if resolved == "custom" and isinstance(inherited, str) else resolved
+
+
 def _relay_sync_completion(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None,
     api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
+    from agent.auxiliary_wire import prepare_aux_request, relay_chat_metadata
 
-    kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = prepare_aux_request(
+        client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+    )
     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
     # Recovery rungs / credential retries keep the task's ``no_progress_timeout`` window; the
@@ -2705,9 +2719,11 @@ async def _relay_async_completion(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None,
     api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
+    from agent.auxiliary_wire import prepare_aux_request, relay_chat_metadata
 
-    kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = prepare_aux_request(
+        client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+    )
     # Async twin of the seam default above (#98466).
     judged: list[_ClassifiedAttempt] = []
     callback = _provider_callback_async(
@@ -2738,9 +2754,11 @@ async def _relay_async_completion(
 def _relay_sync_stream(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None, api_mode: str | None = None
 ) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
+    from agent.auxiliary_wire import prepare_aux_request, relay_chat_metadata
 
-    kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = prepare_aux_request(
+        client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+    )
     # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
     create = lambda request: client.chat.completions.create(**bypass_chat_sdk_request_transform(request, client))
@@ -4760,6 +4778,11 @@ def _resolve_auto_route(
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
+        # An auto auxiliary call can borrow a named main route represented by the generic
+        # provider "custom". Keep its name for request attribution, not routing or health.
+        if routed[2] == "custom" and runtime.get("provider") == "custom" and runtime.get("requested_provider"):
+            with contextlib.suppress(AttributeError, TypeError):
+                setattr(routed[0], "_hermes_aux_main_requested_provider", runtime["requested_provider"])
         return routed
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
@@ -4877,7 +4900,10 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     # Hermes owns the auxiliary retry/timeout budget; disable SDK-internal retries.
     # See #54465.
     async_kwargs.setdefault("max_retries", 0)
-    return AsyncOpenAI(**async_kwargs), model
+    client = AsyncOpenAI(**async_kwargs)
+    from agent.proxy_request_class import protect_request_class_redirects
+    protect_request_class_redirects(client)
+    return client, model
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -5127,6 +5153,9 @@ def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
             routed_client._hermes_aux_effective_provider = effective_provider
             if routed_client is not client:  # the async rebuild keeps the provider discovery built the client for
                 _tag_backend(routed_client, getattr(client, "_hermes_aux_backend_provider", None))
+                inherited = getattr(client, "_hermes_aux_main_requested_provider", None)
+                if isinstance(inherited, str):
+                    routed_client._hermes_aux_main_requested_provider = inherited
         except (AttributeError, TypeError):
             logger.debug("Auxiliary client %s cannot retain effective provider %s",
                          type(routed_client).__name__, effective_provider)
@@ -5911,7 +5940,12 @@ def _client_cache_key(
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
-    runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
+    # Two named custom routes can share an endpoint and key but differ in proxy opt-in.
+    runtime_key = (
+        tuple(_runtime_cache_discriminator(f, runtime.get(f, ""))
+              for f in (*_MAIN_RUNTIME_FIELDS, "requested_provider"))
+        if provider == "auto" else ()
+    )
     task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
