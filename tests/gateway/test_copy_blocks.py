@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gateway.config import Platform
 from gateway.platforms.base import SendResult
 from gateway.copy_blocks import (
     protect_inline_copy_bodies,
@@ -264,10 +265,10 @@ async def test_streamed_copy_blocks_use_ledgered_delivery(prefix) -> None:
     runner._delivery_adapter_for = lambda _source: adapter
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._event_thread_metadata = lambda *_args: {"thread_id": "t"}
-    async def no_media(*_args):
+    async def no_media(_response, _event, _adapter, *, thread_metadata=None, footer_line="", footer_captioned=None):
         return False
     runner._deliver_media_from_response = no_media
-    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat", platform=Platform.TELEGRAM))
     result = {"already_sent": True, "is_ephemeral_response": True, "ephemeral_ttl": 7}
     returned = await runner._hmwa_deliver_turn_response(
         event, event.source, None, "session", None, result, [], f"{prefix}[[copy]]\nbody\n[[/copy]]", None, False,
@@ -299,10 +300,10 @@ async def test_interrupted_turn_does_not_send_partial_copy_block() -> None:
     runner._delivery_adapter_for = lambda _source: adapter
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._event_thread_metadata = lambda *_args: {"thread_id": "t"}
-    async def no_media(*_args):
+    async def no_media(_response, _event, _adapter, *, thread_metadata=None, footer_line="", footer_captioned=None):
         return False
     runner._deliver_media_from_response = no_media
-    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat", platform=Platform.TELEGRAM))
     returned = await runner._hmwa_deliver_turn_response(
         event, event.source, None, "session", None, {"already_sent": True, "interrupted": True}, [],
         "[[copy]]\npartial", None, False,
@@ -614,11 +615,11 @@ async def test_interrupted_streamed_turn_does_not_repeat_inline_partial_copy_tex
     runner._should_send_voice_reply = lambda *_args, **_kwargs: False
     runner._event_thread_metadata = lambda *_args: {}
 
-    async def no_media(*_args):
+    async def no_media(_response, _event, _adapter, *, thread_metadata=None, footer_line="", footer_captioned=None):
         return False
 
     runner._deliver_media_from_response = no_media
-    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat"))
+    event = SimpleNamespace(source=SimpleNamespace(chat_id="chat", platform=Platform.TELEGRAM))
     returned = await runner._hmwa_deliver_turn_response(
         event, event.source, None, "session", None, {"already_sent": True, "interrupted": True}, [],
         "Before\n[[copy]]\npartial paste text", None, False,
