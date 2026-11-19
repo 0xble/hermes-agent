@@ -2985,8 +2985,9 @@ class GatewayInboundMixin(
         if live is None or live is event or hasattr(event, "_gateway_pending_stt_text"):
             return
         # Restored media is the committed copy (``<sha256>/<name>``) of the same clip.
-        if [os.path.basename(p) for p in self._pending_event_audio_paths(live)] != [
-                os.path.basename(p) for p in self._pending_event_audio_paths(event)]:
+        live_paths = self._pending_event_audio_paths(live)
+        restored_paths = self._pending_event_audio_paths(event)
+        if [os.path.basename(p) for p in live_paths] != [os.path.basename(p) for p in restored_paths]:
             return
         del registry[key]
         prefetch = getattr(live, "_gateway_pending_stt_prefetch", None)
@@ -3000,7 +3001,16 @@ class GatewayInboundMixin(
                 return
         if not hasattr(live, "_gateway_pending_stt_text"):
             return  # STT failed or was cancelled: the turn transcribes as before
-        event._gateway_pending_stt_text = live._gateway_pending_stt_text
+        # Preserve the prefetched words, but point the attachment marker at the durable copy
+        # owned by the claimed turn, not the adapter's temporary recording.
+        enriched = live._gateway_pending_stt_text
+        for old, new in zip(live_paths, restored_paths):
+            if old != new:
+                enriched = enriched.replace(
+                    f"\n[User sent audio: {self._agent_audio_path(old)}]",
+                    f"\n[User sent audio: {self._agent_audio_path(new)}]",
+                )
+        event._gateway_pending_stt_text = enriched
         transcripts = event._gateway_pending_stt_transcripts = list(
             getattr(live, "_gateway_pending_stt_transcripts", []) or [])
         event._gateway_pending_stt_echoed = int(getattr(live, "_gateway_pending_stt_echoed", 0) or 0)
