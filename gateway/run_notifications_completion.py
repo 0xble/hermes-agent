@@ -317,7 +317,12 @@ class GatewayNotificationsMixin:
         True means adapter admission, not model execution; None means deduplicated or
         terminal. False remains retryable. Claims are settled together for every sibling.
         """
-        async with self._completion_event_scope(evt):
+        from gateway.run_profile_home import completion_event_scope_or_refuse
+
+        scope = await completion_event_scope_or_refuse(self, evt, "process completion")
+        if scope is None:
+            return None
+        async with scope:
             return await self._deliver_completion_notification_scoped(
                 synth_text, evt, sibling_claims=sibling_claims, cleanup_state=cleanup_state)
 
@@ -617,7 +622,12 @@ class GatewayNotificationsMixin:
         from gateway.run_notifications import asyncio
         # Filter each event before it can contaminate (or suppress) a foreground batch.
         # The shared queue may be drained outside the owning profile's runtime scope.
-        async with self._completion_event_scope(evt):
+        from gateway.run_profile_home import completion_event_scope_or_refuse
+
+        scope = await completion_event_scope_or_refuse(self, evt, "queued process completion")
+        if scope is None:
+            return None
+        async with scope:
             from tools.process_registry_notifications import should_surface_notification
             if not should_surface_notification(evt):
                 return None
