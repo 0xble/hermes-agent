@@ -147,25 +147,15 @@ _AUTHORIZATION_GATE_LOCK_TIMEOUT_S = 360.0
 
 
 def _authorization_gate_lock_timeout() -> float:
-    """Authorization-lock bound = ``tools.approval_human_wait.human_wait_ceiling`` (approval timeout +
-    margin, capped so it can't overflow Lock.acquire): never break serialization while a
-    prompt is answerable, never let a wedged holder park workers forever. Deliberately NOT
-    min()'d with the fallback so the gate never gives up early.
+    """Resolve the lock bound once per batch from the same ceiling as human-wait deadlines.
 
-    Delegates to ``tools.approval_human_wait.human_wait_ceiling`` — the same bound that clamps a human-wait window's
-    deadline contribution — so the two can't drift. Long enough that serialization is never broken while a
-    legitimate approval prompt is still answerable; short enough that a wedged holder (hanging
-    ``pre_tool_call`` plugin, dead approval client) cannot park other workers forever (#79719). Resolved
-    once per gate (per batch), so a mid-process ``approvals.timeout`` change applies from the next batch.
+    The ceiling protects ``Lock.acquire`` from overflow (#83220) and bounds how long a wedged
+    holder can park workers. The fallback is not a cap: serialization must outlast a still
+    answerable approval prompt even when the configured timeout exceeds 360s (#79719).
     """
     try:
         from tools.approval_human_wait import human_wait_ceiling
 
-        # human_wait_ceiling is platform-safety-capped (agent/deadline.py MAX_SAFE_TIMEOUT_S): a huge
-        # approvals.timeout can no longer overflow Lock.acquire's time_t on macOS (#83220). Deliberately NOT
-        # min()'d with _AUTHORIZATION_GATE_LOCK_TIMEOUT_S — the gate must never give up while a legitimate
-        # approval prompt is still answerable (#79719), so a configured approvals.timeout above 360s must
-        # extend the gate.
         return human_wait_ceiling()
     except Exception:
         return _AUTHORIZATION_GATE_LOCK_TIMEOUT_S

@@ -6,7 +6,14 @@ import time
 
 import pytest
 
-from agent.redact import mask_secret, redact_cdp_url, redact_sensitive_text, RedactingFormatter
+from agent.redact import (
+    RedactingFormatter,
+    mask_secret,
+    redact_cdp_url,
+    redact_for_egress,
+    redact_sensitive_text,
+    redact_terminal_output,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -24,8 +31,6 @@ class TestKnownPrefixes:
         prefix-less Zhipu ``id.secret`` shape must mask at all: on the terminal
         ``cat``/``grep`` path (code_file=True, the reporter's surface) and on the
         file-read path, where the mask must be the non-reusable sentinel."""
-        from agent.redact import redact_terminal_output
-
         dotted_sk = "sk-sp-" + "ABCDEFGH1234567890" + "." + "abcdefgh1234567890_XYZ-0987654321"
         multi_dot_sk = "sk-ws-" + "H.EEPXREE.pFau.MEUCIQC6UnD-jj2a" + "ABCDEFGHIJKLMNOP"
         zhipu = "50aaed1234567890abcdef1234567890" + "." + "ZpSh99AbCdEfGh12"
@@ -49,8 +54,6 @@ class TestKnownPrefixes:
         """The Zhipu matcher is provider-shaped, not a generic dotted-token sweep:
         content-hash filenames (incl. ``<sha>.bundle`` / ``<md5>.sqlite3``), bare
         git shas, short ``sk-`` fragments and a 31-char id must stay byte-identical."""
-        from agent.redact import redact_terminal_output
-
         benign = (
             "blob 0123456789abcdef0123456789abcdef.png\n"
             "git bundle create 0123456789abcdef0123456789abcdef01234567.bundle\n"
@@ -106,7 +109,6 @@ class TestKnownPrefixes:
 
     def test_grafana_token_prefixes(self):
         """Bare Grafana service-account / Cloud tokens redact (#150339); look-alikes stay intact."""
-        from agent.redact import redact_terminal_output
         # NOTE: prefix + suffix CONCATENATION so no contiguous token literal exists in this file.
         sa_body = "Q7zR4Lm9Xc2Vb5Nw8Kd3Hf6JtPa0Sg7Y"
         cloud_body = "eyJvIjoiMTIzNDU2IiwibiI6InN0YWNrLXRva2VuIiwiayI6Ilo3cTRMbTlYYzJWYjVOdzgifQ"
@@ -632,8 +634,6 @@ class TestTelegramTokens:
         terminal-output redaction. The colon is what routes the text through
         the Telegram pass.
         """
-        import time
-
         text = "_typelessdata: " + "0" * 100_000 + "\n"
         t0 = time.perf_counter()
         assert redact_sensitive_text(text, force=True) == text
@@ -1025,8 +1025,6 @@ class TestConfigKeyRedosResistance:
     """
 
     def test_long_dotted_run_completes_fast(self):
-        import time
-
         # 100 dotted segments with no '=' — worst case for the old pattern.
         text = ".".join(["segment"] * 100) + " end"
         t0 = time.perf_counter()
@@ -1041,8 +1039,6 @@ class TestConfigKeyRedosResistance:
         test includes a keyword but no '=' so the regex runs and must still
         complete quickly thanks to the possessive quantifiers.
         """
-        import time
-
         text = ".".join(["segment"] * 100) + ".token end"
         t0 = time.perf_counter()
         assert redact_sensitive_text(text) == text
@@ -1057,8 +1053,6 @@ class TestConfigKeyRedosResistance:
 
     def test_long_opaque_assignment_run_completes_fast(self):
         """Lowercase env scanning stays linear on compaction payload blobs."""
-        import time
-
         # A serialized tool payload can contain a long opaque alphanumeric
         # value followed by '=' without containing a secret-key suffix.  The
         # old unanchored lowercase-env pattern retried its greedy prefix from
@@ -1077,8 +1071,6 @@ class TestConfigKeyRedosResistance:
         run-start lookbehind the sub retries that prefix from every byte of
         the run (quadratic while holding the GIL).
         """
-        import time
-
         text = "password=hunter2\n" + "a." * 15_000 + "=value"
         t0 = time.perf_counter()
         result = redact_sensitive_text(text, force=True)
@@ -1087,8 +1079,6 @@ class TestConfigKeyRedosResistance:
 
     def test_yaml_assign_redos_resistance(self):
         """_YAML_ASSIGN_RE must not backtrack excessively on long inputs."""
-        import time
-
         # 100 lines of a long dotted key with a secret keyword but no
         # matching colon-value form — stresses the regex without matching.
         line = "a." * 50 + "token not_an_assignment"
@@ -1251,7 +1241,6 @@ class TestTerminalOutputRedaction:
 
     def test_cat_env_file_masks_opaque_token(self):
         """cat .env → code_file=False → generic ENV pass redacts opaque keys."""
-        from agent.redact import redact_terminal_output
         out = (
             "MISTRAL_API_KEY=abc123opaqueSecretValue\n"
             "NOUS_API_KEY=xyz789opaqueKey\n"
@@ -1264,21 +1253,18 @@ class TestTerminalOutputRedaction:
 
     def test_cat_env_file_with_flags_masks_opaque_token(self):
         """cat -n .env → still detected as .env read."""
-        from agent.redact import redact_terminal_output
         out = "     1\tMISTRAL_API_KEY=abc123opaqueSecretValue\n"
         red = redact_terminal_output(out, "cat -n .env")
         assert "abc123opaqueSecretValue" not in red
 
     def test_cat_env_file_in_pipeline_masks_opaque_token(self):
         """cat .env | grep KEY → still detected as .env read."""
-        from agent.redact import redact_terminal_output
         out = "MISTRAL_API_KEY=abc123opaqueSecretValue"
         red = redact_terminal_output(out, "cat .env | grep MISTRAL")
         assert "abc123opaqueSecretValue" not in red
 
     def test_cat_env_example_not_redacted_as_env(self):
         """cat .env.example → NOT treated as .env read (template file)."""
-        from agent.redact import redact_terminal_output
         out = "MISTRAL_API_KEY=placeholder_value_here"
         red = redact_terminal_output(out, "cat .env.example")
         # Should NOT be redacted by the ENV-assignment pass (code_file=True).
@@ -1287,14 +1273,12 @@ class TestTerminalOutputRedaction:
 
     def test_cat_env_local_masks_opaque_token(self):
         """cat .env.local → detected as .env read."""
-        from agent.redact import redact_terminal_output
         out = "CUSTOM_API_KEY=opaquecustomkey123456"
         red = redact_terminal_output(out, "cat .env.local")
         assert "opaquecustomkey123456" not in red
 
     def test_cat_env_inline_comment_preserved(self):
         """Inline comments after env values are preserved (issue #61352 review)."""
-        from agent.redact import redact_terminal_output
         out = "MISTRAL_API_KEY=abc123secret # used for tests"
         red = redact_terminal_output(out, "cat .env")
         assert "abc123secret" not in red
@@ -1302,7 +1286,6 @@ class TestTerminalOutputRedaction:
 
     def test_cat_env_export_inline_comment_preserved(self):
         """export KEY=VALUE # comment — comment preserved."""
-        from agent.redact import redact_terminal_output
         out = "export MISTRAL_API_KEY=abc123secret # prod key"
         red = redact_terminal_output(out, "cat .env")
         assert "abc123secret" not in red
@@ -1353,8 +1336,6 @@ class TestTerminalOutputRedaction:
         ],
     )
     def test_secret_bearing_file_commands_mask_assignments(self, command, output, secret):
-        from agent.redact import redact_terminal_output
-
         assert secret not in redact_terminal_output(output, command)
 
     @pytest.mark.parametrize(
@@ -1377,15 +1358,12 @@ class TestTerminalOutputRedaction:
         """Only the known secret-bearing files flip the gate: the same opaque value read
         from project YAML / source code is left alone (code_file path), while the
         identical text under ``cat .env`` is masked."""
-        from agent.redact import redact_terminal_output
-
         output = "SERVICE_TOKEN=3JcQ1UzX9vQ2mL7pR4tY8wA1sD5fG6hJ2kSbn7Q0"
         assert redact_terminal_output(output, command) == output
         assert "3JcQ1UzX9vQ2mL7pR4tY8wA1sD5fG6hJ2kSbn7Q0" not in redact_terminal_output(output, "cat .env")
 
 
     def test_disabled_passes_through(self, monkeypatch):
-        from agent.redact import redact_terminal_output
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
         out = "CUSTOM_TOKEN=zzzopaque1234567890abcdef"
         red = redact_terminal_output(out, "printenv")
@@ -1404,8 +1382,6 @@ class TestTerminalOutputRedaction:
         ],
     )
     def test_pytest_diagnostic_masks_python_repr_secret_field(self, command):
-        from agent.redact import redact_terminal_output
-
         secret = "opaque-brave-value-1234567890"
         out = f"E       kwargs={{'env': {{'BRAVE_API_KEY': '{secret}'}}}}"
 
@@ -1415,8 +1391,6 @@ class TestTerminalOutputRedaction:
         assert "'BRAVE_API_KEY': '***'" in red
 
     def test_exception_line_masks_python_repr_secret_field(self):
-        from agent.redact import redact_terminal_output
-
         secret = "opaque-exception-value-1234567890"
         out = f"RuntimeError: payload={{'API_KEY': '{secret}'}}"
 
@@ -1426,15 +1400,11 @@ class TestTerminalOutputRedaction:
         assert "'API_KEY': '***'" in red
 
     def test_source_dump_preserves_python_repr_fixture(self):
-        from agent.redact import redact_terminal_output
-
         out = "CONFIG = {'BRAVE_API_KEY': 'fixture-value-1234567890'}"
         assert redact_terminal_output(out, "cat config.py", force=True) == out
         assert redact_terminal_output(out, "python dump_source.py", force=True) == out
 
     def test_pytest_source_line_preserves_python_repr_fixture(self):
-        from agent.redact import redact_terminal_output
-
         source = "    CONFIG = {'BRAVE_API_KEY': 'fixture-value-1234567890'}"
         out = source + "\nE       assert False"
 
@@ -1443,8 +1413,6 @@ class TestTerminalOutputRedaction:
         assert source in red
 
     def test_disabled_pytest_diagnostic_passes_through(self, monkeypatch):
-        from agent.redact import redact_terminal_output
-
         monkeypatch.setattr("agent.redact._REDACT_ENABLED", False)
         secret = "opaque-disabled-value-1234567890"
         out = f"E       payload={{'API_KEY': '{secret}'}}"
@@ -1729,13 +1697,11 @@ class TestRedactForEgress:
     calls; there is no second pattern list to keep in sync."""
 
     def test_opaque_bearer_without_vendor_prefix_is_masked(self):
-        from agent.redact import redact_for_egress
         out = redact_for_egress("curl -H 'Authorization: Bearer opaque0123456789abcdef' https://x.example")
         assert "opaque0123456789abcdef" not in out
         assert "https://x.example" in out
 
     def test_bearer_sweep_masks_real_tokens_not_the_english_word(self):
-        from agent.redact import redact_for_egress
         prose = "I'm the bearer of bad news: the deploy failed"
         assert redact_for_egress(prose) == prose
         assert "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9" not in redact_for_egress("Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9")
@@ -1756,16 +1722,12 @@ class TestWebappLaunchLinks:
     CREDENTIAL = "Zq7_" + "k3Lm" * 9 + "x9-"  # the shape secrets.token_urlsafe(32) prints: 43 characters
 
     def test_the_browser_credential_in_a_link_is_masked(self):
-        from agent.redact import redact_terminal_output
-
         link = "http://127.0.0.1:9120/?profile=work#hermes-session=" + self.CREDENTIAL
         out = redact_terminal_output(f"Open this link in your browser:\n  {link}\n", "hermes webapp")
         assert self.CREDENTIAL not in out
         assert "http://127.0.0.1:9120/?profile=work#hermes-session=" in out
 
     def test_a_launch_ticket_is_masked(self):
-        from agent.redact import redact_terminal_output
-
         link = "http://127.0.0.1:9120/webapp/launch#ticket=" + self.CREDENTIAL + "&query=%3Fprofile%3Dwork"
         out = redact_terminal_output(f"Open this one-use link:\n  {link}\n", "hermes webapp --no-open")
         assert self.CREDENTIAL not in out
@@ -1861,8 +1823,6 @@ class TestFlagAndKeyShapedCredentials:
         '{"encryptKey": "true", "private_key": "<your key>"}\nmaster_key: default\nMASTER_KEY=default',
     ])
     def test_help_text_prose_and_paths_after_a_flag_stay_readable(self, text):
-        from agent.redact import redact_for_egress, redact_terminal_output
-
         assert redact_sensitive_text(text, force=True) == text
         assert redact_sensitive_text(text, force=True, file_read=True) == text
         assert redact_terminal_output(text, "cat src.cs", force=True) == text
@@ -1895,8 +1855,6 @@ class TestFlagAndKeyShapedCredentials:
         'tool --password "«redacted:ghp_…» Zq8xR2vT9pL4mN7k"',
     ])
     def test_crlf_ppk_tls_urls_and_yaml_key_names_are_masked(self, text):
-        from agent.redact import redact_for_egress
-
         assert "Zq8xR2vT9pL4mN7k" not in redact_sensitive_text(text, force=True)
         assert "Zq8xR2vT9pL4mN7k" not in redact_for_egress(text)
 
@@ -1911,8 +1869,6 @@ class TestFlagAndKeyShapedCredentials:
             assert "Zq8xR2vT9pL4mN7k" not in out and kept in out
 
     def test_unterminated_quotes_scan_in_linear_time(self):
-        import time
-
         text = ('--password "' + "a" * 600 + "\n") * 160 + "--password '" * 8000
         start = time.perf_counter()
         redact_sensitive_text(text, force=True)
@@ -1955,8 +1911,6 @@ class TestFlagAndKeyShapedCredentials:
         ("AGE-SECRET-KEY-1LQOYBF4KMATERIALAAAABBBBCCCCDDDD", "LQOYBF4KMATERIALAAAABBBBCCCCDDDD"),
     ])
     def test_non_pem_private_key_formats_are_masked_on_every_surface(self, material, body):
-        from agent.redact import redact_for_egress, redact_terminal_output
-
         assert body in material
         for out in (
             redact_sensitive_text(material, force=True),
@@ -1967,8 +1921,6 @@ class TestFlagAndKeyShapedCredentials:
             assert "[REDACTED PRIVATE KEY]" in out
 
     def test_a_base64_pem_key_is_masked_on_every_surface(self):
-        from agent.redact import redact_for_egress, redact_terminal_output
-
         blob = "LS0tLS1CRUdJTiBSU0EgUFJJVkFURSBLRVktLS0tLQpNSUlFcEFJQkFBS0NBUUVB" + "QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVo="
         for text in (
             '"client-key-data": "' + blob + '"',
@@ -1994,8 +1946,6 @@ class TestPasswordOnlyConnStrings:
         "amqp://:" + SECRET + "@rabbit:5672",
     ])
     def test_password_only_connection_strings_are_masked(self, url):
-        from agent.redact import redact_for_egress, redact_terminal_output
-
         for out in (
             redact_sensitive_text(url, force=True),
             redact_for_egress(url),
@@ -2017,8 +1967,6 @@ class TestPasswordOnlyConnStrings:
         assert redact_sensitive_text(text, force=True) == text
 
     def test_repeated_scheme_prefixes_scan_in_linear_time(self):
-        import time
-
         for unit in ("redis://:", "redis://u:"):
             text = unit * (100_000 // len(unit))
             t0 = time.perf_counter()
