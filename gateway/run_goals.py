@@ -1369,7 +1369,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if _turn_owner_exists(include_marker=False):
             return
         # Preserve retired state before compression migration or orphan-tick recovery writes.
-        if not await automatic_route_available(self, source):
+        if not await automatic_route_available(self, source, idle_backoff=True):
             return
 
         # The route may resolve to a different durable session after compression, /resume, a
@@ -1631,7 +1631,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
         from gateway.wake import automatic_route_available
 
-        if not await automatic_route_available(self, source):
+        if not await automatic_route_available(self, source, idle_backoff=True):
             return
         # Recheck after every async eligibility probe. The existing background reservation
         # then fences /incognito through claim/admission without holding a reentrant route lock.

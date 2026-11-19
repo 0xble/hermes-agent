@@ -250,6 +250,10 @@ The `hermes_cli/session_controls.py` core primitive, `GoalManager.replace`, gate
 
 ## Loop Wake Fence
 
+The idle loop and parked-goal watcher defers another exact Telegram lookup for a confirmed missing topic for 120 seconds. This keeps deleted routes from delaying later work in the same sequential scan. Backoff is in memory and scoped to the connector, runtime profile, chat, and topic. Admission still checks the route fresh. Lookup errors and closed topics do not start a backoff.
+
+Contract tests: `tests/gateway/test_goal_continuation_identity.py`.
+
 Every loop tick's wake, prompt or slash command, carries its loop instance (`created_at`) and claimed tick (`ticks_fired`); a command wake is marked `loop_wakeup_command`, because the scheduler completes its tick right after dispatch, so its fence checks instance, tick and active status but not `awaiting_response`. Admission (`run_inbound`, `run_busy`, `wake.admit_internal_event`) and execution (`_hmwa_resolve_session`, the queued follow-up consumer) drop the wake unless the stored loop is still active, awaiting that tick, on the same instance. So a stop or pause approved after the claim never starts the obsolete prompt. An unreadable store admits the wake, because a control is itself a committed write to that store.
 
 ## Replacement Cards
