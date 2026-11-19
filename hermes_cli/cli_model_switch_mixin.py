@@ -903,7 +903,7 @@ class CLIModelSwitchMixin:
                 from hermes_cli.fallback_config import same_model_fallbacks
                 self.agent._pinned_fallback_model = self.model
                 self.agent._fallback_chain = same_model_fallbacks(
-                    _fallback_entries(self._fallback_model), self.model)
+                    _fallback_entries(getattr(self, "_fallback_model", None)), self.model)
                 self.agent._fallback_model = self.agent._fallback_chain[0] if self.agent._fallback_chain else None
                 self.agent._fallback_index = 0
                 self.agent._preflight_fallback = None
