@@ -4395,7 +4395,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         gets one trailing re-arm at the window's end; further requests coalesce into it, and turn cleanup
         or ``pause_typing_for_chat`` cancels it."""
         key = self._typing_retrigger_key(chat_id, metadata)
-        if (metadata or {}).get("notify"):
+        metadata = metadata or {}
+        if metadata.get("notify") or metadata.get("job_id"):
             self._cancel_typing_retrigger(chat_id, metadata)
             return
         if not getattr(getattr(self, "config", None), "typing_indicator", True):
@@ -6723,6 +6724,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
     async def send_typing(self, chat_id: str, metadata: Optional[dict[str, Any]] = None) -> Optional[str]:
         """Send typing indicator. Returns ``_TYPING_SKIPPED_LOCK_BUSY`` when a delivery held the chat lock."""
+        if not getattr(getattr(self, "config", None), "typing_indicator", True):
+            return None
         if not self._bot:
             live = self._replacement_telegram_adapter()
             if live is not None:
