@@ -467,7 +467,7 @@ class TestRunJobScript:
         snapshot = generation / "workspace"
         (snapshot / "cron").mkdir(parents=True)
         (generation / ".lease-managed").touch()
-        monkeypatch.setattr(scheduler_script, "__file__", str(snapshot / "cron" / "scheduler_script.py"))
+        monkeypatch.setattr(scheduler_script, "project_root_str", lambda: str(snapshot))
         monkeypatch.setattr(
             "hermes_cli._launchers.resolve_store_python", lambda repo: Path(sys.executable)
         )
@@ -528,7 +528,7 @@ class TestRunJobScript:
         python = repo / "venv" / "bin" / "python"
         python.parent.mkdir(parents=True)
         python.touch()
-        monkeypatch.setattr(scheduler_script, "__file__", str(repo / "cron" / "scheduler_script.py"))
+        monkeypatch.setattr(scheduler_script, "project_root_str", lambda: str(repo))
         monkeypatch.setattr("hermes_cli._launchers.resolve_store_python", lambda root: Path(sys.executable))
 
         argv, _ = scheduler_script._posix_cron_script_argv(tmp_path / "probe.py")
