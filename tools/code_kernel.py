@@ -374,12 +374,12 @@ def _kill_process_group(proc) -> None:
     def _tree_signal(sig) -> None:
         try:
             agent_deadline.kill_process_tree(proc.pid, sig=sig)
-        except Exception as e:
-            logger.debug("Could not terminate process tree: %s", e, exc_info=True)
+        except Exception:  # health: allow BLE001 -- cleanup is best effort and errors may contain secrets
+            logger.debug("Could not terminate process tree (details omitted)")
             try:
                 proc.kill()
-            except Exception as e2:
-                logger.debug("Could not kill process: %s", e2, exc_info=True)
+            except Exception:  # health: allow BLE001 -- process errors can expose arguments or environment
+                logger.debug("Could not kill process (details omitted)")
     _tree_signal(getattr(signal, "SIGTERM", None))
     try:
         proc.wait(timeout=5)
