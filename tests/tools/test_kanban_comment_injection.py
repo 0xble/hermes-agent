@@ -29,7 +29,7 @@ class FakeAgent:
     def __init__(self):
         self.steers: list[str] = []
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, human: bool = True) -> bool:
         self.steers.append(text)
         return True
 

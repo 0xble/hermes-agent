@@ -302,6 +302,7 @@ class CanonicalControlParams(CanonicalSessionParams):
 
 class CanonicalCorrectionParams(CanonicalControlParams):
     text: str
+    human: bool = True
 
 
 class CanonicalCorrectionAck(Result):

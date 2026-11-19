@@ -12682,7 +12682,7 @@ def test_session_steer_calls_agent_steer_when_agent_supports_it():
     calls = {}
 
     class _Agent:
-        def steer(self, text):
+        def steer(self, text, *, human=True):
             calls["steer_text"] = text
             return True
 
@@ -12712,7 +12712,7 @@ class _RecordingSteerAgent:
     def __init__(self):
         self.steered = []
 
-    def steer(self, text):
+    def steer(self, text, *, human=True):
         self.steered.append(text)
         return True
 
@@ -12768,7 +12768,7 @@ def test_steer_slash_during_live_turn_still_steers():
 
 def test_session_steer_rejects_empty_text():
     server._sessions["sid"] = _session(
-        agent=types.SimpleNamespace(steer=lambda t: True)
+        agent=types.SimpleNamespace(steer=lambda t, **_kwargs: True)
     )
     try:
         resp = server.handle_request(
@@ -12806,7 +12806,7 @@ def test_session_redirect_calls_capable_core_agent(monkeypatch):
     calls = []
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: calls.append(text) or True,
+        redirect=lambda text, **_kwargs: calls.append(text) or True,
     )
     session = _session(agent=agent)
     session["inflight_turn"] = {"user": "original request", "assistant": "partial reply"}
@@ -12848,7 +12848,7 @@ def test_session_redirect_rpc_drops_queued_duplicate_of_inflight_user():
     original = "deepseek released a new flash model — I changed all settings to flash"
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: True,
+        redirect=lambda text, **_kwargs: True,
     )
     session = _session(agent=agent, running=True)
     session["inflight_turn"] = {
@@ -13742,7 +13742,7 @@ def test_prompt_submit_truncation_refuses_redirect_of_live_turn():
     redirect and left the un-edited transcript in place."""
     redirected = []
     agent = types.SimpleNamespace(
-        _supports_active_turn_redirect=True, redirect=lambda text: redirected.append(text) or True)
+        _supports_active_turn_redirect=True, redirect=lambda text, **_kwargs: redirected.append(text) or True)
     server._sessions["sid"] = _session(agent=agent, running=True, history=[{"role": "user", "content": "original"}])
 
     try:

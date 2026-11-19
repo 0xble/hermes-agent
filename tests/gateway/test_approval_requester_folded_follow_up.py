@@ -17,10 +17,10 @@ from tests.gateway.test_approval_requester_binding_shared_turns import (  # _cle
 class _Agent:
     _supports_active_turn_redirect = True
 
-    def redirect(self, text):
+    def redirect(self, text, *, human=True):
         return True
 
-    def steer(self, text):
+    def steer(self, text, *, human=True):
         return True
 
 

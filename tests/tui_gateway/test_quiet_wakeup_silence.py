@@ -123,10 +123,11 @@ def test_tui_forwards_user_origin_only_for_identified_user_turns(monkeypatch):
 
     agent = SimpleNamespace(run_conversation=run_conversation)
     session = {"session_key": "k", "history_lock": contextlib.nullcontext(), "agent": agent}
-    for user_turn in (True, False):
+    for user_turn, origin in ((True, "user"), (False, "goal_loop")):
         st = _TurnRun(agent=agent, one_turn_restore=None, terminal_callback=None, receipt_committed=True)
-        invoke_agent("sid", session, st, LOOP_WAKEUP, LOOP_WAKEUP, None, [], None, None, user_turn=user_turn)
-    assert seen == ["user", "unknown"]
+        invoke_agent("sid", session, st, LOOP_WAKEUP, LOOP_WAKEUP, None, [], None, None,
+                     user_turn=user_turn, turn_origin=origin)
+    assert seen == ["user", "goal_loop"]
 
 
 def test_tui_voice_fallback_speaks_delivered_text_not_the_marker(monkeypatch):

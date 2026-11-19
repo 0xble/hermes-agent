@@ -602,7 +602,7 @@ class GatewayAgent:
     def hard_interrupt(self, message=None, tool_reason=None):
         self.interrupt(message)
 
-    def _correct(self, verb, text):
+    def _correct(self, verb, text, *, human=True):
         """-> ``True`` (accepted), ``False`` (not taken: the caller queues the text), or
         ``"voice_stopped"`` (TUI-26: the owner took a bare stop phrase as the end of this LOCAL
         session's voice chat; the text is consumed and reaches no turn, so it is never re-queued)."""
@@ -611,7 +611,7 @@ class GatewayAgent:
             return False
         try:
             result = self.connection.call(f"session.{verb}", session_id=self.session_id, text=text,
-                                          execution_generation=generation)
+                                          execution_generation=generation, human=human)
         except GatewayClientError:
             return False
         if (result or {}).get("voice_stopped") is True:
@@ -659,11 +659,11 @@ class GatewayAgent:
         return [{k: v for k, v in m.items() if k != "row_id"} for m in after.get("messages") or []
                 if not m.get("archived")], system_message
 
-    def steer(self, text):
-        return self._correct("steer", text)
+    def steer(self, text, *, human=True):
+        return self._correct("steer", text, human=human)
 
-    def redirect(self, text):
-        accepted = self._correct("redirect", text)
+    def redirect(self, text, *, human=True):
+        accepted = self._correct("redirect", text, human=human)
         if accepted is True:
             # Main's turn then answers the redirect row first (the interrupted call has no usage), so
             # its anchor is priced through that row: it, not the original ask, is the turn's ask.

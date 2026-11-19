@@ -17,7 +17,7 @@ class Agent:
     def __init__(self):
         self.steers = []
 
-    def steer(self, text):
+    def steer(self, text, *, human=True):
         self.steers.append(text)
         return True
 
