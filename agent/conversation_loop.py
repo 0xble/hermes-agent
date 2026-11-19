@@ -1898,6 +1898,7 @@ def run_conversation(
     ``{turn_id, current_turn_user_idx}`` pair is stamped beside the exact ``messages`` it
     addresses, after every history rewrite including post-turn micro-compaction.
     """
+    from agent.proxy_request_class import bind_aux_request_turn
     from agent.turn_context import export_current_turn_boundary
     from agent.turn_finalizer import settle_held_final
     from agent.voice_turn_route import end_voice_turn_route
@@ -1912,11 +1913,12 @@ def run_conversation(
     if turn_origin not in {"user", "relay", "process", "goal_loop", "cron", "unknown"}:
         turn_origin = "unknown"
 
-    # Steer / redirect / interrupt set this mid-turn; the result reports whether the turn ran untouched.
+    # Reset both on reused agents; steering alters scheduling without changing the turn origin.
+    agent._turn_provenance = turn_origin
     agent._turn_user_intervened = False
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
-    with native_turn_images(user_message):
+    with bind_aux_request_turn(agent), native_turn_images(user_message):
         try:
             result = _run_conversation_turn(
                 agent,

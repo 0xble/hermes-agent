@@ -32,8 +32,10 @@ def admit_cli_turn(params):
             raise RuntimeStoreError('invalid_params')
         committed['turn_author'] = author
     if (origin := params.get('turn_origin')) is not None:
-        from gateway.session_context import normalize_turn_origin
-        committed['turn_origin'] = normalize_turn_origin(origin)
+        # Only the classic CLI's scheduler origins may override human prompt ingress.
+        committed['turn_origin'] = (
+            origin if isinstance(origin, str) and origin in {'user', 'goal_loop', 'process'} else 'user'
+        )
     api_text = params.get('api_text')
     if api_text is not None:
         if not isinstance(api_text, str) or len(api_text) > _API_TEXT_LIMIT:

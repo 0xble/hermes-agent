@@ -63,6 +63,16 @@ async def test_cli_turn_fields_are_admitted_and_bound_to_their_own_turn(tmp_path
     assert seen[1][:3] == ('plain', {}, {})
 
 
+@pytest.mark.parametrize(("origin", "expected"), [
+    ("user", "user"), ("goal_loop", "goal_loop"), ("process", "process"),
+    ("relay", "user"), ("cron", "user"), ("unknown", "user"), ([], "user"),
+])
+def test_cli_prompt_only_accepts_its_own_turn_origins(origin, expected):
+    from gateway.session_cli_turn import admit_cli_turn
+
+    assert admit_cli_turn({"turn_origin": origin}) == {"cli_turn_v1": {"turn_origin": expected}}
+
+
 class _RecordingAgent:
     built: list = []
 

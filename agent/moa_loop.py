@@ -21,7 +21,7 @@ from types import SimpleNamespace
 from typing import Any
 
 from agent.auxiliary_client import call_llm
-from agent.proxy_request_class import bind_aux_request_class, turn_request_class
+from agent.proxy_request_class import bind_aux_request_turn
 from agent.message_content import flatten_message_text
 from agent.message_metadata import DATA_USE
 from agent.moa_alternation import destination_key, is_role_alternation_rejection, merge_same_role_messages
@@ -397,7 +397,7 @@ def _price_reference_response(
 
 
 def _call_slot(agent: Any, **kwargs: Any) -> Any:
-    with bind_aux_request_class(turn_request_class(agent)):
+    with bind_aux_request_turn(agent):
         return call_llm(**kwargs)
 
 

@@ -347,9 +347,9 @@ class InterruptControlMixin:
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
+            # A consumer must see the intervention flag before it can drain the human text.
+            self._turn_user_intervened = True
             _set_steer_parts(self, _steer_parts(self) + [_SteerPart(ticket, cleaned, on_delivered)])
-        # The turn no longer ran on its own (first-task-done detection reads this off the result).
-        self._turn_user_intervened = True
         return True
 
     def redirect(self, text: str, *, on_delivered: Optional[Callable[[], None]] = None) -> bool:

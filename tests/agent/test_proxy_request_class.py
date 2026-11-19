@@ -71,6 +71,56 @@ def test_agent_turn_and_route_change_on_wire(monkeypatch):
                     ("direct.example.test", None)]
 
 
+@pytest.mark.parametrize("intervention", ["steer", "redirect"])
+def test_human_intervention_promotes_goal_loop_on_wire(monkeypatch, intervention):
+    from run_agent import AIAgent
+
+    primary, auxiliary = [], []
+    correction = "Use the narrower scope"
+
+    def handle_aux(request):
+        auxiliary.append(request.headers.get(HEADER))
+        return _chat_response(request)
+
+    def call_aux():
+        aux.call_llm(task="compression", provider=NAMED, model=MODEL, messages=MESSAGES)
+
+    def handle_primary(request):
+        primary.append((request.headers.get(HEADER), request.content))
+        call_aux()
+        if len(primary) == 1:
+            assert getattr(agent, intervention)(correction)
+            if intervention == "steer":
+                return httpx.Response(200, json={"id": "tool", "object": "chat.completion", "created": 1,
+                    "model": MODEL, "choices": [{"index": 0, "finish_reason": "tool_calls", "message": {
+                        "role": "assistant", "tool_calls": [{"id": "call_1", "type": "function",
+                            "function": {"name": "probe", "arguments": "{}"}}]}}]})
+        return _chat_response(request)
+
+    monkeypatch.setattr(aux, "_openai_http_client_kwargs", lambda *_a, **_kw: {
+        "http_client": httpx.Client(transport=httpx.MockTransport(handle_aux)),
+    })
+    monkeypatch.setattr(AIAgent, "_build_keepalive_http_client", staticmethod(
+        lambda *_a, **_kw: httpx.Client(transport=httpx.MockTransport(handle_primary)),
+    ))
+    with frozen_runtime_config(_config()):
+        agent = AIAgent(provider="custom", requested_provider=NAMED, base_url=PROXY, api_key="test",
+                         model=MODEL, api_mode="chat_completions", enabled_toolsets=[], quiet_mode=True,
+                         skip_context_files=True, skip_memory=True, skip_background_review=True)
+        monkeypatch.setattr(agent, "_disable_streaming", True, raising=False)
+        try:
+            first = agent.run_conversation("Wake", turn_origin="goal_loop")
+            assert first["final_response"] == "ok"
+            assert first["user_intervened"] is True
+            call_aux()  # Outside the turn, compression gets its standalone default again.
+            assert agent.run_conversation("Wake again", turn_origin="goal_loop")["final_response"] == "ok"
+        finally:
+            agent.close()
+    assert [request_class for request_class, _ in primary] == ["background", "interactive", "background"]
+    assert correction.encode() in primary[1][1]
+    assert auxiliary == ["background", "interactive", "background", "background"]
+
+
 @pytest.mark.parametrize(("mode", "endpoint"), [("chat_completions", "chat/completions"),
                                                 ("codex_responses", "responses")])
 def test_primary_turns_on_wire(mode, endpoint):

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable
 from contextlib import contextmanager
 from contextvars import ContextVar
 from typing import Any
@@ -12,9 +13,9 @@ import httpx
 HEADER = "X-Hermes-Request-Class"
 _HTTP_MODES = {"chat_completions", "codex_responses", "anthropic_messages"}
 logger = logging.getLogger(__name__)
-_BACKGROUND_ORIGINS = ("cron", "relay", "process", "goal_loop", "orchestrator", "leaf", "review")
+_BACKGROUND_ORIGINS = ("cron", "relay", "process", "goal_loop")
 _BACKGROUND_TASKS = ("compression", "goal_judge", "review", "title_generation")
-_AUX_REQUEST_CLASS: ContextVar[str | None] = ContextVar("aux_request_class", default=None)
+_AUX_REQUEST_CLASS: ContextVar[str | Callable[[], str] | None] = ContextVar("aux_request_class", default=None)
 
 
 def _class_for_origin(origin: str | None) -> str:
@@ -22,7 +23,7 @@ def _class_for_origin(origin: str | None) -> str:
 
 
 @contextmanager
-def bind_aux_request_class(request_class: str):
+def bind_aux_request_class(request_class: str | Callable[[], str]):
     token = _AUX_REQUEST_CLASS.set(request_class)
     try:
         yield
@@ -35,8 +36,15 @@ def bind_aux_request_origin(origin: str):
     return bind_aux_request_class(_class_for_origin(origin))
 
 
+def bind_aux_request_turn(agent: Any):
+    """Resolve the active turn's class at each auxiliary call, not at turn start."""
+    return bind_aux_request_class(lambda: turn_request_class(agent))
+
+
 def turn_request_class(agent: Any) -> str:
-    """Known autonomous work may be paced; unknown provenance must not be."""
+    """Known autonomous work may be paced until a user intervenes."""
+    if getattr(agent, "_turn_user_intervened", False):
+        return "interactive"
     fork = getattr(agent, "_turn_origin", None)
     if fork == "side_question":
         return "interactive"
@@ -102,21 +110,26 @@ def _with_class(kwargs: dict, request_class: str) -> dict:
 
 
 def apply_turn_request_class(agent: Any, kwargs: dict) -> dict:
-    if agent.api_mode not in _HTTP_MODES:
-        return kwargs
-    provider = agent.provider or ""
-    if provider == "custom":
-        provider = getattr(agent, "requested_provider", "") or ""
-    if not _enabled_for_route(provider, str(agent.base_url or "")):
-        return kwargs
-
-    return _with_class(kwargs, turn_request_class(agent))
+    try:
+        if agent.api_mode in _HTTP_MODES:
+            provider = agent.provider or ""
+            if provider == "custom":
+                provider = getattr(agent, "requested_provider", "") or ""
+            if _enabled_for_route(provider, str(agent.base_url or "")):
+                return _with_class(kwargs, turn_request_class(agent))
+    except Exception:
+        logger.debug("Skipping primary request class", exc_info=True)
+    return kwargs
 
 
 def apply_aux_request_class(client: Any, kwargs: dict, provider: str, api_mode: str | None, task: str | None) -> dict:
-    if api_mode and api_mode not in _HTTP_MODES:
-        return kwargs
-    if _enabled_for_route(provider, str(getattr(client, "base_url", "") or "")):
-        request_class = _AUX_REQUEST_CLASS.get() or ("background" if task in _BACKGROUND_TASKS else "interactive")
-        return _with_class(kwargs, request_class)
+    try:
+        if api_mode and api_mode not in _HTTP_MODES:
+            return kwargs
+        if _enabled_for_route(provider, str(getattr(client, "base_url", "") or "")):
+            bound = _AUX_REQUEST_CLASS.get()
+            request_class = bound() if callable(bound) else bound
+            return _with_class(kwargs, request_class or ("background" if task in _BACKGROUND_TASKS else "interactive"))
+    except Exception:
+        logger.debug("Skipping auxiliary request class", exc_info=True)
     return kwargs
