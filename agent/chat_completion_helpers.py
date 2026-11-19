@@ -2003,9 +2003,11 @@ def _log_fallback_activated(agent, reason, old_model, old_provider, fb_model, fb
 
 def _fallback_chain_exhausted(agent, reason: FailoverReason | None, cooldown_armed: bool = False) -> bool:
     """Always False; briefly cool an exhausted chain if the primary has no cooldown.
-    Gate next-turn restore even when a rate limit or overload came from an active fallback."""
+    A 429 on a distinct fallback route cools that route, not the primary. Other
+    exhaustion reasons still get the short anti-storm window."""
     agent._turn_fallback_chain_exhausted = True
-    if agent._fallback_chain and not cooldown_armed:
+    fallback_throttled = reason == FailoverReason.rate_limit and getattr(agent, "_fallback_activated", False)
+    if agent._fallback_chain and not cooldown_armed and not fallback_throttled:
         agent._rate_limited_until = max(
             getattr(agent, "_rate_limited_until", 0) or 0, time.monotonic() + _FALLBACK_EXHAUSTED_COOLDOWN_S)
         agent._fallback_episode_cooled = True
