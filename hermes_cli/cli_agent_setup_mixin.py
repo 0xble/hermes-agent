@@ -400,7 +400,7 @@ class CLIAgentSetupMixin:
                 if _fb_api_key:
                     _fb_kwargs["explicit_api_key"] = _fb_api_key
                 runtime = resolve_runtime_provider(**_fb_kwargs)
-            except (RuntimeError, ValueError, OSError) as exc:
+            except Exception as exc:  # health: allow BLE001 -- one unavailable fallback must not stop the ladder
                 logger.debug("Fallback runtime unavailable for %s/%s: %s", _fb_provider, _fb_model, exc)
                 continue
             _why_log, _why = primary_failure_wording(primary_exc)  # #117482: quota is not auth
