@@ -291,10 +291,14 @@ in `gateway/run_turn.py`, `gateway/run_config_loaders.py`, `gateway/slash_comman
 the Telegram and Slack adapters, and `gateway/session_ingress.py` with
 `gateway/session_ingress_context.py` (admitted-turn adapter reconnect wait), and
 `gateway/session_api.py` (nested deferred API-session restoration stays off the gateway loop), and
-`gateway/run_runtime.py` (unknown-turn marker release stays off the gateway loop).
+`gateway/run_runtime.py` (unknown-turn marker release stays off the gateway loop), and
+`gateway/session_acp_lifecycle.py` (shutdown bounds idle ACP cleanup to the remaining settle
+budget and tracks any unfinished writer through DB teardown).
 Proof surface:
 `tests/gateway/test_admission_adapter_reconnect_wait.py`,
 `tests/gateway/test_startup_resume_admission.py`,
+`test_acp_shutdown_cleanup_respects_the_settle_budget` in
+`tests/gateway/test_run_runtime_hot_serve_cleanup.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_reaped_classic_slot_is_evicted_so_the_queued_head_runs` in
 `tests/gateway/test_classic_slot_holds_fifo_head.py` (the drain awaits the now-async probe, so a reaped
