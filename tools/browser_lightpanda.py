@@ -149,7 +149,8 @@ def _browser_env() -> dict:
         return _build_browser_env()
     except Exception as e:
         logger.debug("credential-scrubbed browser env unavailable: %s", e)
-        return os.environ.copy()
+        from tools.environments.local import served_profile_child_env
+        return served_profile_child_env(inherit_credentials=False)
 
 
 def _cdp_ready(url: str, timeout: float = 0.2) -> bool:
