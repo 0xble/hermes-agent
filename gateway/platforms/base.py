@@ -5411,11 +5411,18 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
         The pending slot stays visible during backoff for FIFO admission and shutdown.
         Controls retain the existing task cancellation and guard ownership boundaries.
         """
-        assert self._message_handler is not None
         while True:
+            handler = self._message_handler
+            if handler is None:
+                # Hard drain can withdraw ingress after this task took ownership of the event.
+                # Return it to shutdown recovery rather than failing a turn that never ran.
+                runner = self.gateway_runner
+                if runner is not None and runner._draining and runner._preserve_drain_event(session_key, event):
+                    return None
+                raise RuntimeError("Gateway message handler is unavailable")
             token = post_delivery_owner.set((self, event))
             try:
-                response = await self._message_handler(event)
+                response = await handler(event)
             finally:
                 post_delivery_owner.reset(token)
             if (response is not None or not getattr(event, "_gateway_compression_deferred", False)
@@ -5477,7 +5484,7 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
             # The handler can recover source routing (for example, a missing thread id);
             # build final transport metadata from that resolved event.
             _thread_metadata = _thread_metadata_for_event(event)
-            if self._pending_messages.get(session_key) is event and getattr(event, "_drain_deferred", False):
+            if getattr(event, "_drain_deferred", False):
                 return  # Shutdown owns the retained input, not a completed delivery.
             bind_event_turn(event)
             delivery_generation = getattr(interrupt_event, "_hermes_run_generation", None)

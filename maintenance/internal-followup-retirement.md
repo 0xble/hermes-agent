@@ -52,6 +52,11 @@ the note, the spool is retained for a later boot. A stale spool whose note
 remains unavailable is retained for at most 7 days, then deleted with
 `skipped:stale:note-unavailable` and no `.bad` quarantine.
 
+When shutdown withdraws the adapter's message handler, a background task that
+already owns an input but has not dispatched it returns the input to the existing
+shutdown queue. The input keeps its original recovery identity. The task reports
+neither turn success nor a generic handler error when preservation succeeds.
+
 ## Source surfaces
 
 `gateway/run_pending_recovery.py`, `gateway/run_restart_recovery.py`,
@@ -69,6 +74,10 @@ for every id-less spool, legacy duplicate-content decline and quarantine (also w
 in-scope notice translation, spool
 retirement at turn start, the post-retirement turn-failed path, and pending-slot
 successor result propagation.
+
+`tests/gateway/test_drain_silent_recovery.py` holds an accepted adapter message
+before dispatch, withdraws ingress, and checks that shutdown spools the accepted
+message once while refusing new arrivals.
 
 ## Rollback
 
