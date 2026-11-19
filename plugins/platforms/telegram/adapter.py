@@ -387,7 +387,7 @@ from plugins.platforms.telegram.telegram_markdown import _EXPANDABLE_QUOTE, _esc
 from plugins.platforms.telegram.telegram_chunking import (
     separate_chunk_indicator_from_fence as _separate_chunk_indicator_from_fence, split_formatted_mdv2, split_raw_carrying_emphasis)
 from plugins.platforms.telegram.telegram_split import (
-    REPLY_FILE_MAX_BYTES, quotable_text, reply_message_count, send_reply_document, split_reply_anchor)
+    REPLY_FILE_MAX_BYTES, _strip_mdv2, quotable_text, reply_message_count, send_reply_document, split_reply_anchor)
 
 
 # MarkdownV2 has no table syntax, so pipe tables become bullet groups via convert_table_to_bullets().
