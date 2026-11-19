@@ -162,7 +162,8 @@ class TestMissedWindowCatchUp:
         assert slot_env["fires"]() == 1
         assert "pending_slot" not in J.get_job(job_id)
 
-    def test_expired_restored_slot_queues_one_drop_alert(self, slot_env, monkeypatch, caplog):
+    @pytest.mark.parametrize("outbox_available", [True, False], ids=["available", "unavailable"])
+    def test_expired_restored_slot_records_one_skip(self, slot_env, monkeypatch, caplog, outbox_available):
         from datetime import UTC, datetime
         from cron import delivery_queue, owner_alerts
         from hermes_cli.cron import _cron_doctor_issues_for_job
@@ -183,27 +184,33 @@ class TestMissedWindowCatchUp:
         def unavailable(*args):
             raise OSError("outbox unavailable")
 
-        with monkeypatch.context() as patch:
-            patch.setattr(owner_alerts, "queue_owner_failure", unavailable)
-            assert J.get_due_jobs() == []
-        assert J.get_job(job_id)["pending_slot"]["scheduled_at"] == slot
-        assert delivery_queue.get_status(key) is None
+        if not outbox_available:
+            monkeypatch.setattr(owner_alerts, "queue_owner_failure", unavailable)
 
         assert J.get_due_jobs() == []
         assert J.get_due_jobs() == []
         saved = J.get_job(job_id)
         assert "pending_slot" not in saved
-        assert datetime.fromisoformat(saved["next_run_at"]) > now
+        next_run = datetime.fromisoformat(saved["next_run_at"])
+        assert next_run > now
         assert saved["last_run_at"] is None and saved["last_status"] == "skipped"
         receipt = delivery_queue.get_status(key)
-        assert receipt is not None
-        assert receipt["for_failure"] and receipt["status"] == "pending"
-        assert slot in receipt["content"] and "catch-up is off" in receipt["content"]
+        if outbox_available:
+            assert receipt is not None
+            assert receipt["for_failure"] and receipt["status"] == "pending"
+            assert slot in receipt["content"] and "catch-up is off" in receipt["content"]
+        else:
+            assert receipt is None
+            assert "could not queue owner alert for skipped occurrence" in caplog.text
         assert any(slot in issue for issue in _cron_doctor_issues_for_job(saved))
         assert caplog.text.count("cron.occurrence_dropped") == 1
         row, = E.list_executions(job_id=job_id)
         assert row["status"] == "missed" and row["scheduled_instant"] == slot
         assert slot_env["fires"]() == 0
+
+        monkeypatch.setattr(J, "_hermes_now", lambda: next_run)
+        slot_env["S"].tick(verbose=False, sync=True)
+        assert slot_env["fires"]() == 1
 
     def test_fired_slot_is_not_replayed_after_restart(self, slot_env):
         """Contract half two: a slot that DID run before the restart stays run."""
