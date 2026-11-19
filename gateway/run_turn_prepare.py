@@ -207,7 +207,8 @@ def _resolve_channel_runtime(config, source, model, runtime_kwargs) -> tuple[str
 
     # Keep the helper compatible with older internal callers that passed the runner
     # while the turn setup path passes its config snapshot directly.
-    if config is not None and not isinstance(config, dict):
+    if (config is not None and not hasattr(config, "platforms")
+            and hasattr(config, "config")):
         config = getattr(config, "config", None)
     if config and source is not None:
         ch = _get_channel_override(
@@ -242,7 +243,7 @@ def _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice):
                 if provider_model and not attended_route.get("model"):
                     attended_model = provider_model
                 model = attended_model
-            except RuntimeError as exc:
+            except Exception as exc:  # health: allow BLE001 -- preserve the attended fallback boundary for every provider-resolution failure
                 logger.warning("Attended route %s unavailable: %s", attended_provider, exc)
                 notice = ContextNotice(f"⚠️ Attended model unavailable; staying on {model}.")
         else:
