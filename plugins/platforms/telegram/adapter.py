@@ -7668,6 +7668,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # A >4096-char command paste arrives as a near-limit COMMAND chunk plus TEXT continuations; dispatching
         # immediately would orphan them. Near-limit commands go through text batching.
         if len(event.text or "") >= self._SPLIT_THRESHOLD:
+            event._lobby_split_owner = self._root_lobby_key(msg)  # type: ignore[attr-defined]
             await self._prepare_text_event(event)
             return
         await self.handle_message(event)
