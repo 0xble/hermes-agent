@@ -64,7 +64,7 @@ async def test_a_live_agents_refusal_is_not_marked_undelivered(tmp_path, monkeyp
     with db:
         release = await _claim_without_agent(authority, monkeypatch)
         generation = authority._handle(REF).execution_generation
-        _wire_turn_agent(authority, generation, SimpleNamespace(interrupted=0, redirect=lambda text: False))
+        _wire_turn_agent(authority, generation, SimpleNamespace(interrupted=0, redirect=lambda text, human=True: False))
 
         reply = await correct(connection, REF, {'session_id': 's', 'text': 'maybe delivered',
                                                'execution_generation': generation}, verb='redirect')
