@@ -1002,13 +1002,13 @@ async def test_user_message_recovery_turn_keeps_note(tmp_path):
 @pytest.mark.asyncio
 async def test_streamed_resumed_answer_keeps_note_before_marker_clear(tmp_path, monkeypatch):
     from gateway import run_turn
-    from gateway.run_turn import GatewayTurnMixin
+    from gateway.run import GatewayRunner
 
     adapter = NoteAdapter()
     store, entry, _ = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-stream")
-    runner = object.__new__(GatewayTurnMixin)
-    runner._delivery_adapter_for = lambda _source: adapter
+    runner = object.__new__(GatewayRunner)
+    runner._delivery_adapter_for = lambda source: adapter
     runner._should_send_voice_reply = lambda *args, **kwargs: False
     runner._deliver_media_from_response = AsyncMock()
     adapter.gateway_runner = SimpleNamespace(async_session_store=AsyncSessionStore(store))
@@ -1031,13 +1031,13 @@ async def test_streamed_resumed_answer_keeps_note_before_marker_clear(tmp_path, 
 @pytest.mark.parametrize("upload_ok", [True, False])
 async def test_streamed_attachment_only_answer_reconciles_only_after_upload(tmp_path, monkeypatch, upload_ok):
     from gateway import run_turn
-    from gateway.run_turn import GatewayTurnMixin
+    from gateway.run import GatewayRunner
 
     adapter = NoteAdapter()
     store, entry, _ = _pending_store(tmp_path, adapter)
     store.set_restart_note_message_id(entry.session_key, "note-stream-media")
-    runner = object.__new__(GatewayTurnMixin)
-    runner._delivery_adapter_for = lambda _source: adapter
+    runner = object.__new__(GatewayRunner)
+    runner._delivery_adapter_for = lambda source: adapter
     runner._should_send_voice_reply = lambda *args, **kwargs: False
     runner._deliver_media_from_response = AsyncMock(return_value=upload_ok)
     adapter.gateway_runner = SimpleNamespace(async_session_store=AsyncSessionStore(store))
