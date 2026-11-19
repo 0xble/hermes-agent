@@ -1999,7 +1999,6 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         )
         return (
             max(0, non_cron - self._wedged_chat_agent_count())
-            + _active_async_delegation_count()
             + self._restart_wait_cron_counts()["awaitable"]
             # Delegations are waited on under their own budget; the restart wait splits them out.
             + self._active_async_delegation_count()
@@ -2089,6 +2088,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         )
         self._scale_to_zero_status("draining", "restart wait: status mark failed")
         last_status_at = wait_started - 10.0
+        poll_interval = 0.1
+        next_poll_at = wait_started + poll_interval
         while True:
             delegation_count = self._active_async_delegation_count()
             non_delegation_awaitable = max(0, self._awaitable_work_count() - delegation_count)
@@ -2129,7 +2130,12 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                 )
                 self._scale_to_zero_status("draining", "restart wait: status mark failed")
                 last_status_at = now
-            await asyncio.sleep(0.1)
+            next_deadline = min(deadline for deadline, count in (
+                (turn_deadline, turn_waitable), (delegation_deadline, delegation_waitable),
+            ) if deadline is not None and count)
+            if now >= next_poll_at:
+                next_poll_at = now + poll_interval
+            await asyncio.sleep(min(next_poll_at, next_deadline) - now)
         if self._active_work_count() > 0:
             logger.warning(
                 "Restart deferred wait: %d work unit(s) remain outside configured wait budgets "
