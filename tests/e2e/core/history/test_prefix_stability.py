@@ -164,8 +164,12 @@ def run_journey(world: dict, hops: list[Hop]) -> tuple[str, list[tuple[int, str]
     return sid, openings, compaction_idx
 
 
-@pytest.mark.parametrize("journey", list(JOURNEYS))
+@pytest.mark.parametrize("journey", ["tui_gateway_restarts", "oneshot_restarts"])
 def test_request_prefix_is_byte_stable_across_processes(world, journey):
+    assert_request_prefix_is_byte_stable(world, journey)
+
+
+def assert_request_prefix_is_byte_stable(world, journey):
     sid, openings, compaction_idx = run_journey(world, JOURNEYS[journey])
     srv, home = world["srv"], world["hermes_home"]
     main = srv.main_requests()
