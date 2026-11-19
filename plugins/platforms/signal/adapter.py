@@ -1022,7 +1022,7 @@ class SignalAdapter(BasePlatformAdapter):
             if state.explicit:
                 return
             await self.remove_reaction(event.source.chat_id, *target)
-            if emoji := _OUTCOME_REACTION.get(outcome):
+            if self._reactions_enabled(event) and (emoji := _OUTCOME_REACTION.get(outcome)):
                 await self.send_reaction(event.source.chat_id, emoji, *target)
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
