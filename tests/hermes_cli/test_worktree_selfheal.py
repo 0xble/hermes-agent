@@ -49,7 +49,7 @@ def repo(tmp_path):
 
 
 @contextmanager
-def _in_progress_add(repo, env=None, expected_reason="initializing"):
+def _in_progress_add(repo, env=None, expected_reason: str | None = "initializing", *, existing_branch=False):
     """Pause a real checkout in its smudge filter, while git holds index.lock."""
     marker = repo.parent / "checkout-started"
     slow_filter = repo.parent / "slow_filter.py"
@@ -63,9 +63,12 @@ def _in_progress_add(repo, env=None, expected_reason="initializing"):
     _git(repo, "commit", "-qm", "slow checkout")
     wt = repo / ".worktrees" / "hermes-dead00"
     command = f"{shlex.quote(sys.executable)} {shlex.quote(str(slow_filter))}"
+    if existing_branch:
+        _git(repo, "branch", "-f", "hermes/hermes-dead00", "HEAD")
+    branch_args = ["hermes/hermes-dead00"] if existing_branch else ["-b", "hermes/hermes-dead00"]
     proc = subprocess.Popen(
         ["git", "-c", f"filter.slow.smudge={command}", "worktree", "add", str(wt),
-         "-b", "hermes/hermes-dead00"], cwd=repo, start_new_session=True,
+         *branch_args], cwd=repo, start_new_session=True,
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env)
     admin = repo / ".git" / "worktrees" / wt.name
     try:
@@ -279,15 +282,18 @@ class TestCleanupFailedWorktreeAdd:
         reasons = []
 
         def killed_add(add_env):
-            with _in_progress_add(repo, add_env, expected_reason=None) as (_, admin, _):
+            with _in_progress_add(repo, add_env, expected_reason=None, existing_branch=action == "retry") as (_, admin, _):
                 reasons.append((admin / "locked").read_text().strip())
             return admin
 
         if action == "retry":
             git = ops._git
             attempts = []
+            bases = []
 
             def interrupt_first(args, cwd, **kwargs):
+                if "branch" in args and "-D" not in args:
+                    bases.append(args[-1])
                 if "add" in args and "worktree" in args:
                     attempts.append(args[-1])
                     if len(attempts) == 1:
@@ -297,7 +303,8 @@ class TestCleanupFailedWorktreeAdd:
 
             monkeypatch.setattr(ops, "_git", interrupt_first)
             assert ops._worktree_add(str(repo), wt, branch, "main", "main")
-            assert attempts == ["main", "HEAD"]
+            assert attempts == [branch, branch]
+            assert bases == ["main", "HEAD"]
             assert _git(wt, "status", "--porcelain").returncode == 0
         else:
             admin = killed_add(noninteractive_repo_git_env(repo))
@@ -368,6 +375,133 @@ class TestCleanupFailedWorktreeAdd:
         assert not wt.exists()
         assert any("branch already exists" in text.lower() for text in messages)
         assert _git(repo, "show", f"{branch}:unique.txt").stdout == "user's only copy\n"
+
+    def _unreadable_remote_base(self, repo):
+        good = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        (repo / "missing.txt").write_text("remote-only blob\n", encoding="utf-8")
+        _git(repo, "add", "missing.txt")
+        _git(repo, "commit", "-qm", "remote commit")
+        bad = _git(repo, "rev-parse", "HEAD").stdout.strip()
+        blob = _git(repo, "rev-parse", "HEAD:missing.txt").stdout.strip()
+        _git(repo, "reset", "--hard", good)
+        _git(repo, "update-ref", "refs/remotes/origin/main", bad)
+        (repo / ".git" / "objects" / blob[:2] / blob[2:]).unlink()
+        return good, bad
+
+    @pytest.mark.platforms("windows")
+    def test_initializing_checkout_fails_closed_on_windows(self, repo, monkeypatch):
+        from hermes_cli import _early_recovery
+        from hermes_cli import worktree_ops as ops
+
+        wt = repo / ".worktrees" / "windows-initializing"
+        branch = "hermes/windows-initializing"
+        _git(repo, "worktree", "add", str(wt), "-b", branch)
+        _git(repo, "worktree", "lock", "--reason", "initializing", str(wt))
+
+        def unsupported_probe(*args, **kwargs):
+            pytest.fail("Windows must not use the POSIX holder probe")
+
+        monkeypatch.setattr(_early_recovery, "_held_open", unsupported_probe)
+        assert ops._initializing_worktree_is_dead(str(wt)) is False
+        ops._cleanup_failed_worktree_add(str(repo), wt, branch)
+        assert wt.exists()
+        assert (repo / ".git" / "worktrees" / wt.name / "locked").read_text().strip() == "initializing"
+        assert _git(repo, "branch", "--list", branch).stdout.strip()
+
+    @pytest.mark.parametrize("completed", [False, True])
+    def test_named_add_preserves_concurrent_same_base_branch(self, repo, monkeypatch, completed):
+        from hermes_cli import worktree_ops as ops
+
+        wt = repo / ".worktrees" / "loser"
+        winner = repo / ".worktrees" / "winner"
+        branch = "hermes/shared-branch"
+        git = ops._git
+        raced = False
+
+        def create_competing_branch(args, cwd, **kwargs):
+            nonlocal raced
+            creates_branch = "-b" in args or "branch" in args
+            if not raced and creates_branch:
+                raced = True
+                if completed:
+                    _git(repo, "worktree", "add", str(winner), "-b", branch, "HEAD")
+                else:
+                    _git(repo, "branch", branch, "HEAD")
+            return git(args, cwd, **kwargs)
+
+        monkeypatch.setattr(ops, "_git", create_competing_branch)
+        assert ops._worktree_add(str(repo), wt, branch, "HEAD", "HEAD") is None
+        assert raced
+        assert _git(repo, "rev-parse", branch).stdout == _git(repo, "rev-parse", "HEAD").stdout
+        assert not wt.exists()
+        if completed:
+            assert _git(winner, "status", "--porcelain").stdout == ""
+
+    @pytest.mark.parametrize("error", [KeyboardInterrupt, subprocess.TimeoutExpired])
+    def test_add_reap_timeout_preserves_original_exception(self, monkeypatch, error):
+        from hermes_cli import worktree_ops as ops
+
+        original = error() if error is KeyboardInterrupt else error("git", 120)
+
+        class UnreapedProcess:
+            def communicate(self, timeout):
+                raise original
+
+            def wait(self, timeout):
+                raise subprocess.TimeoutExpired("reap", timeout)
+
+        monkeypatch.setattr(subprocess, "Popen", lambda *args, **kwargs: UnreapedProcess())
+        monkeypatch.setattr(ops, "kill_and_drain", lambda *args: None)
+
+        with pytest.raises(error) as raised:
+            ops._git(["worktree", "add"], None, tree_timeout=True)
+        assert raised.value is original
+
+    def test_unreadable_remote_base_falls_back_without_orphan_branch(self, repo, monkeypatch):
+        from hermes_cli import worktree_ops as ops
+
+        good, _ = self._unreadable_remote_base(repo)
+        wt = repo / ".worktrees" / "blob-fallback"
+        branch = "hermes/blob-fallback"
+        git = ops._git
+        failures = []
+
+        def observe(args, cwd, **kwargs):
+            result = git(args, cwd, **kwargs)
+            if "worktree" in args and "add" in args and result.returncode:
+                failures.append(result.stderr)
+                assert not wt.exists(), "Git must have rolled back its own failed checkout"
+                assert not (repo / ".git" / "worktrees" / wt.name).exists()
+            return result
+
+        monkeypatch.setattr(ops, "_git", observe)
+        result = ops._worktree_add(str(repo), wt, branch, "origin/main", "origin/main")
+
+        assert failures, "exercise a real non-zero Git checkout, not a timeout"
+        assert result == ("HEAD", "HEAD (fallback — remote base failed)")
+        assert _git(wt, "rev-parse", "HEAD").stdout.strip() == good
+        assert _git(wt, "status", "--porcelain").stdout == ""
+        assert _git(repo, "for-each-ref", "--format=%(refname)", "refs/heads/hermes/").stdout.splitlines() == [
+            f"refs/heads/{branch}"]
+        assert _git(repo, "reflog", "show", "--format=%gs", branch).stdout.splitlines() == [
+            "branch: Created from HEAD"]
+
+    def test_same_name_retry_after_ordinary_checkout_failure(self, repo):
+        from hermes_cli import worktree_ops as ops
+
+        good, bad = self._unreadable_remote_base(repo)
+        _git(repo, "update-ref", "refs/heads/main", bad)
+        wt = repo / ".worktrees" / "blob-retry"
+        branch = "hermes/blob-retry"
+
+        assert ops._worktree_add(str(repo), wt, branch, "HEAD", "HEAD") is None
+        assert not wt.exists()
+        assert not (repo / ".git" / "worktrees" / wt.name).exists()
+        assert not _git(repo, "branch", "--list", branch).stdout.strip()
+        _git(repo, "update-ref", "refs/heads/main", good)
+
+        assert ops._worktree_add(str(repo), wt, branch, "HEAD", "HEAD") == ("HEAD", "HEAD")
+        assert _git(wt, "status", "--porcelain").stdout == ""
 
     def test_noop_when_nothing_exists(self, repo):
         """Fail-soft on an error path where git never created anything."""
