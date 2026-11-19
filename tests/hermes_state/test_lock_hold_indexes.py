@@ -12,6 +12,7 @@ from gateway.session_ingress_media import _held_media_paths
 from gateway.session_api_media import compact_settled_api_payloads
 from hermes_state import SessionDB
 from hermes_state_local import POLICY_PREFIX, moved_receipts
+from hermes_state_worker_context import worker_prompt
 from hermes_state_worker_lifecycle import insert_session_row_in_transaction
 
 
@@ -182,3 +183,34 @@ def test_targeted_prompt_delete_plan_and_reupsert_behavior(tmp_path):
         assert db._conn.execute("SELECT hash FROM system_prompts WHERE hash=?", (replacement_hash,)).fetchone() is None
     finally:
         db.close()
+
+
+@pytest.mark.parametrize("worker", [False, True])
+def test_prompt_replacement_collects_only_its_previous_reference(tmp_path, monkeypatch, worker):
+    with SessionDB(db_path=tmp_path / "state.db") as db:
+        pins = ["fixture-tool"]
+        original = json.dumps(pins)
+        db.create_session("owner", "cli", system_prompt=original)
+        db.create_session("shared", "cli")
+        db.update_session_tool_names("shared", pins)
+        original_hash = hashlib.sha256(original.encode()).hexdigest()
+        unrelated_hash = db._store_system_prompt(db._conn, "unrelated old orphan")
+        recorder = _RecordingConnection(db._conn)
+
+        if worker:
+            worker_prompt(db, recorder, "owner", {"system_prompt": "updated"})
+        else:
+            monkeypatch.setattr(db, "_execute_write", lambda write, **_kwargs: write(recorder))
+            db.update_system_prompt("owner", "updated")
+
+        deletes = [(sql, params) for sql, params in recorder.calls if sql.startswith("DELETE FROM system_prompts")]
+        assert len(deletes) == 1
+        sql, params = deletes[0]
+        assert params == (original_hash,)
+        assert any(detail.startswith("SEARCH system_prompts") for detail in _plan(db._conn, sql, params))
+        assert db.get_session("owner")["system_prompt"] == "updated"
+        assert db._conn.execute("SELECT hash FROM system_prompts WHERE hash=?", (original_hash,)).fetchone()
+
+        db.update_session_tool_names("shared", None)
+        assert db._conn.execute("SELECT hash FROM system_prompts WHERE hash=?", (original_hash,)).fetchone() is None
+        assert db._conn.execute("SELECT hash FROM system_prompts WHERE hash=?", (unrelated_hash,)).fetchone()

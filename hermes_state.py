@@ -560,6 +560,34 @@ class SessionDB(
         return prompt_hash
 
     @staticmethod
+    def _delete_prompt_if_unreferenced(conn, prompt_hash: str) -> None:
+        conn.execute(
+            "DELETE FROM system_prompts WHERE hash=? AND NOT EXISTS ("
+            "SELECT 1 FROM sessions WHERE system_prompt_hash=system_prompts.hash) AND NOT EXISTS ("
+            "SELECT 1 FROM sessions WHERE tool_names=system_prompts.hash)",
+            (prompt_hash,),
+        )
+
+    def _replace_prompt_reference(self, conn, session_id: str, value: Optional[str], *, tool_names: bool = False) -> None:
+        row = conn.execute(
+            "SELECT system_prompt_hash, tool_names FROM sessions WHERE id = ?", (session_id,),
+        ).fetchone()
+        if row is None:
+            return
+        new_hash = self._store_system_prompt(conn, value)
+        if tool_names:
+            conn.execute("UPDATE sessions SET tool_names = ? WHERE id = ?", (new_hash, session_id))
+            old_hash = row[1]
+        else:
+            conn.execute("UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
+                         (new_hash, session_id))
+            old_hash = row[0]
+        # A binding change can orphan only its previous reference. Bulk
+        # maintenance still collects older orphans left by other paths.
+        if old_hash is not None and old_hash != new_hash:
+            self._delete_prompt_if_unreferenced(conn, old_hash)
+
+    @staticmethod
     def _delete_unreferenced_system_prompts(conn, limit: Optional[int] = None) -> int:
         if limit is None:
             cursor = conn.execute(
