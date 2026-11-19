@@ -872,7 +872,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 try:
                     # The delivered signal rides the cosmetic cleanup chain, which can time out.
                     await asyncio.wait_for(delivered.wait(), POST_TURN_DELIVERY_WAIT_S)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning("post-turn bookkeeping for %s ran without a delivery signal after %.0fs",
                                    session_key, POST_TURN_DELIVERY_WAIT_S)
                 await finish(deferred=True)
@@ -1342,7 +1342,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if _turn_owner_exists(include_marker=False):
             return
         # Preserve retired state before compression migration or orphan-tick recovery writes.
-        if not await automatic_route_available(self, source):
+        if not await automatic_route_available(self, source, idle_backoff=True):
             return
 
         # The route may resolve to a different durable session after compression, /resume, a
@@ -1598,7 +1598,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
         from gateway.wake import automatic_route_available
 
-        if not await automatic_route_available(self, source):
+        if not await automatic_route_available(self, source, idle_backoff=True):
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.
         # The live SessionEntry is the generation fence for that narrow race: defer to the next
