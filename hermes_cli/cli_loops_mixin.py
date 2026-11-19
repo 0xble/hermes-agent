@@ -625,7 +625,7 @@ class CLILoopsMixin:
             _cprint(f"  {t('cli.steer.usage')}")
         elif self._agent_running and self.agent is not None and hasattr(self.agent, "steer"):
             try:
-                accepted = self.agent.steer(payload)
+                accepted = self.agent.steer(payload, human=True)
             except Exception as exc:
                 _cprint(f"  {t('cli.steer.failed', error=exc)}")
             else:

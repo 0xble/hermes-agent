@@ -154,7 +154,7 @@ class SessionAuthority:
         # session -> (generation, [steer text]) accepted before that generation adopted an agent;
         # adopt_agent hands it to that agent (never a later generation's), the drain drops the rest.
         self.pending_steers = {}
-        # session -> (generation, {admission_id: delivered}): queued admissions prompt.steer_queued handed
+        self.pending_steer_human = {}
         # to that running claim (gateway/session_queued_controls.py); its settlement decides each one.
         self.steer_transfers = {}
         self.launch_sources = {}  # session -> its frozen launch source (session_queued_controls)
@@ -1007,7 +1007,7 @@ class SessionAuthority:
         agent = running.get(running_key(self.runner, live.route, ref.session_id))
         return agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
-    def steer_agent(self, ref, generation, text):
+    def steer_agent(self, ref, generation, text, *, human: bool = True):
         """The agent a steer for this running generation reaches; the caller holds the session's
         event_stream.lock after check_approval_generation. Before the turn adopts its agent the
         resident one is the previous turn's cached agent, which this turn may replace, so *text* is
@@ -1021,6 +1021,7 @@ class SessionAuthority:
             return agent, False
         latched, texts = self.pending_steers.get(ref.session_id, (None, []))
         self.pending_steers[ref.session_id] = (generation, [*texts, text] if latched == generation else [text])
+        self.pending_steer_human[ref.session_id] = human
         return None, True
 
     def adopt_agent(self, session_id, generation, agent):
@@ -1041,8 +1042,9 @@ class SessionAuthority:
                 from agent.interrupt_compat import request_hard_interrupt
                 request_hard_interrupt(agent)
             latched, steers = self.pending_steers.pop(session_id, (None, ()))
+            latched_human = self.pending_steer_human.pop(session_id, True)
             for text in steers if latched == generation else ():
-                agent.steer(text)
+                agent.steer(text, human=latched_human)
 
     def check_approval_generation(self, session_id, generation):
         handle = self._handle(SessionRef(self.profile_id, session_id))
@@ -1327,6 +1329,7 @@ class SessionAuthority:
             self.pending_stops.pop(ref.session_id, None)
             self.pending_stop_causes.pop(ref.session_id, None)
             self.pending_steers.pop(ref.session_id, None)
+            self.pending_steer_human.pop(ref.session_id, None)
             self.adopted.pop(ref.session_id, None)
             # An automation turn nobody waits on settles here, at the exit that fenced it (GW-10),
             # so the followers already queued run in this drain; a person's turn still pauses.

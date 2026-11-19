@@ -338,21 +338,26 @@ class InterruptControlMixin:
                 _set_steer_parts(self, [])
         return True
 
-    def steer(self, text: str, *, ticket=None, on_delivered: Optional[Callable[[], None]] = None) -> bool:
-        """Queue user text for delivery as its own user row after the current tool batch finishes (no
-        interrupt); multiple calls concatenate with newlines. Returns False for empty text. ``ticket``
-        names the submission, so ``withdraw_steer`` can settle exactly it, whatever text others carry.
-        ``on_delivered`` runs only when this submission is inserted into the running turn."""
+    def steer(
+        self, text: str, *, ticket=None, on_delivered: Optional[Callable[[], None]] = None,
+        human: bool = True,
+    ) -> bool:
+        """Queue text for delivery as its own user row after the current tool batch finishes (no
+        interrupt); multiple calls concatenate with newlines. ``human`` identifies a real user
+        intervention; unclassified callers default to True so pacing fails open."""
         if not text or not text.strip():
             return False
         cleaned = text.strip()
         with _ic_lock(self, "_pending_steer_lock"):
             # A consumer must see the intervention flag before it can drain the human text.
-            self._turn_user_intervened = True
+            if human:
+                self._turn_user_intervened = True
             _set_steer_parts(self, _steer_parts(self) + [_SteerPart(ticket, cleaned, on_delivered)])
         return True
 
-    def redirect(self, text: str, *, on_delivered: Optional[Callable[[], None]] = None) -> bool:
+    def redirect(
+        self, text: str, *, on_delivered: Optional[Callable[[], None]] = None, human: bool = True,
+    ) -> bool:
         """Redirect the active turn without converting it into a new task: during a model request only that
         request is cancelled (completed messages kept, partial reasoning becomes assistant context, the
         correction is appended as a real user message, the loop retries); during tool execution it degrades
@@ -369,7 +374,8 @@ class InterruptControlMixin:
             try:
                 accepted = bool(_native_steer(cleaned))
                 if accepted:
-                    self._turn_user_intervened = True
+                    if human:
+                        self._turn_user_intervened = True
                     if on_delivered is not None:
                         on_delivered()
                 return accepted
@@ -382,8 +388,8 @@ class InterruptControlMixin:
         # `sleep` poller, a build), so ask the tool workers to YIELD: terminal hands the live
         # process to the background registry and returns; tools that don't yield are unaffected.
         if getattr(self, "_executing_tools", False):
-            accepted = (self.steer(cleaned, on_delivered=on_delivered)
-                        if on_delivered is not None else self.steer(cleaned))
+            accepted = (self.steer(cleaned, on_delivered=on_delivered, human=human)
+                        if on_delivered is not None else self.steer(cleaned, human=human))
             if accepted:
                 tracker = getattr(self, "_tool_worker_threads", None)
                 tracker_lock = getattr(self, "_tool_worker_threads_lock", None)
@@ -406,7 +412,8 @@ class InterruptControlMixin:
             )
             self._interrupt_requested = True
             self._interrupt_message = None
-            self._turn_user_intervened = True
+            if human:
+                self._turn_user_intervened = True
 
         # Interrupt only the model request — no fan-out to tool workers / child agents as interrupt() does.
         _execution_thread_id = getattr(self, "_execution_thread_id", None)

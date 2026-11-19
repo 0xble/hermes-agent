@@ -53,6 +53,62 @@ def test_queued_steer_survives_conversation_start_reset(monkeypatch):
     assert agent._turn_user_intervened is True
 
 
+def test_steer_source_controls_turn_pacing():
+    from tests.agent.test_steer import _bare_agent
+
+    agent = _bare_agent()
+    agent._turn_user_intervened = False
+    assert agent.steer("model note", human=False)
+    assert agent._turn_user_intervened is False
+    assert agent.steer("human note", human=True)
+    assert agent._turn_user_intervened is True
+@pytest.mark.parametrize(("origin", "expected"), [("user", "interactive"), ("goal_loop", "background")])
+def test_detached_hygiene_executor_binds_origin_on_wire(monkeypatch, origin, expected):
+    from gateway.run import GatewayRunner
+
+    sent = []
+    def handle(request):
+        sent.append(request.headers.get(HEADER))
+        return _chat_response(request)
+
+    monkeypatch.setattr(aux, "_openai_http_client_kwargs", lambda *_a, **_kw: {
+        "http_client": httpx.Client(transport=httpx.MockTransport(handle)),
+    })
+
+    def compress(messages, system_message, **_kwargs):
+        aux.call_llm(task="compression", provider=NAMED, model=MODEL, messages=MESSAGES)
+        return messages, system_message
+
+    agent = SimpleNamespace(
+        context_compressor=None, _codex_session=object(), _compress_context=compress,
+    )
+
+    async def drive():
+        async def build(*_args):
+            return agent, None
+        async def wait(attempt, *_args):
+            return await attempt.future
+        async def apply(*_args, **_kwargs):
+            return None
+        async def cleanup(*_args, **_kwargs):
+            return None
+        gateway = SimpleNamespace(
+            _hmwa_hygiene_build_agent=build, _hmwa_hygiene_wait_for_summary=wait,
+            _hmwa_hygiene_apply_result=apply, _track_deferred_agent_worker=lambda *_a: None,
+            _evict_cached_agent=lambda _key: None, _cleanup_agent_resources_off_loop=cleanup,
+        )
+        attempt = GatewayRunner._HygieneAttempt(agent=None, meta=None)
+        await GatewayRunner._hmwa_hygiene_detached_attempt(
+            gateway, attempt, SimpleNamespace(total_ceiling_seconds=60.0),
+            SimpleNamespace(approx_tokens=100_000), MESSAGES, MESSAGES, MODEL, {}, None,
+            SimpleNamespace(session_id="sess-1"), "key", "qk", 0, origin,
+        )
+
+    with frozen_runtime_config(_config()):
+        asyncio.run(drive())
+    assert sent == [expected]
+
+
 @pytest.mark.parametrize(("origin", "expected"), [("user", "interactive"), ("goal_loop", "background")])
 def test_hygiene_binds_the_live_turn_origin(origin, expected):
     from agent.proxy_request_class import apply_aux_request_class, bind_aux_request_origin
@@ -64,7 +120,6 @@ def test_hygiene_binds_the_live_turn_origin(origin, expected):
                 client, {"model": MODEL}, NAMED, "chat_completions", "compression",
             )
     assert result["extra_headers"][HEADER] == expected
-
 
 def test_title_generation_stays_background_in_interactive_turn_on_wire(monkeypatch):
     from contextvars import copy_context
