@@ -146,6 +146,7 @@ class GatewayNotificationsMixin:
         warned = self.__dict__.setdefault("_completion_no_transport_warned", set())
         key = (getattr(source, "profile", None), platform) if source is not None else None
         if adapter is None:
+            evt["_no_transport"] = True  # Durable, but not work this gateway can finish.
             # The watcher requeues silently every tick; say once per outage which lane has no transport.
             if key is not None and key not in warned:
                 warned.add(key)
@@ -153,6 +154,7 @@ class GatewayNotificationsMixin:
                     source, platform, getattr(getattr(self, "config", None), "multiplex_profiles", False)))
             return False
         warned.discard(key)
+        evt.pop("_no_transport", None)
         if not adapter_supports_push(adapter):
             ensure = getattr(adapter, "_ensure_session_db", None)
             try:
