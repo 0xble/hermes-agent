@@ -5041,6 +5041,13 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
             _schedule_outbound_platform_stamp(getattr(self, "_session_store", None), *outbound_stamp)
         return result, delivery_adapter
 
+    async def ledger_attempted_final(self, event: MessageEvent, session_key: str, response: str, *,
+                                     error: str) -> bool:
+        """Record an already attempted, uncertain final for marked redelivery."""
+        text = (await self._extract_response_content(
+            response, event, session_key, is_ephemeral_response=False)).text_content
+        return bool(text) and await ledger_attempted(self, event, session_key, text, error)
+
     async def _release_turn_marker(self, event: MessageEvent) -> None:
         """Clear the crash marker handed to this delivery lifecycle only once the final reply is ledgered or
         nothing more is owed (no kill leaves a persisted reply with neither), then wake the drain. Idempotent."""
