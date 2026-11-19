@@ -1913,9 +1913,14 @@ def run_conversation(
     if turn_origin not in {"user", "relay", "process", "goal_loop", "cron", "unknown"}:
         turn_origin = "unknown"
 
+    # A gateway steer can arrive after this turn was admitted but before its agent enters
+    # run_conversation.  ``steer()`` latches the intervention flag before queuing the text;
+    # preserve that fact across this reset so the first request cannot be paced as background.
+    # Do not carry the prior turn's flag: only an actually buffered steer belongs to this turn.
+    pending_human_steer = bool(getattr(agent, "_pending_steer", None))
     # Reset both on reused agents; steering alters scheduling without changing the turn origin.
     agent._turn_provenance = turn_origin
-    agent._turn_user_intervened = False
+    agent._turn_user_intervened = pending_human_steer
     # Images attached natively to this user turn stay visible to vision_analyze for the turn, so
     # it does not embed the same pixels a second time into the same request (#76411).
     with bind_aux_request_turn(agent), native_turn_images(user_message):

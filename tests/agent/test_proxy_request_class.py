@@ -33,6 +33,39 @@ def _chat_response(request):
                                       "message": {"role": "assistant", "content": "ok"}}]})
 
 
+def test_queued_steer_survives_conversation_start_reset(monkeypatch):
+    """A steer accepted before agent adoption must promote the first provider call."""
+    from agent.conversation_loop import run_conversation
+    from agent.proxy_request_class import turn_request_class
+
+    agent = SimpleNamespace(_pending_steer="human correction", _turn_user_intervened=False)
+
+    def fake_turn(*_args, **kwargs):
+        assert kwargs["turn_origin"] == "goal_loop"
+        assert turn_request_class(agent) == "interactive"
+        return {"final_response": "ok", "messages": []}
+
+    monkeypatch.setattr("agent.conversation_loop._run_conversation_turn", fake_turn)
+    monkeypatch.setattr("agent.turn_context.export_current_turn_boundary", lambda *_a: _a[1])
+    result = run_conversation(agent, "continue", turn_origin="goal_loop")
+
+    assert result["user_intervened"] is True
+    assert agent._turn_user_intervened is True
+
+
+@pytest.mark.parametrize(("origin", "expected"), [("user", "interactive"), ("goal_loop", "background")])
+def test_hygiene_binds_the_live_turn_origin(origin, expected):
+    from agent.proxy_request_class import apply_aux_request_class, bind_aux_request_origin
+
+    client = SimpleNamespace(base_url=PROXY)
+    with frozen_runtime_config(_config()):
+        with bind_aux_request_origin(origin):
+            result = apply_aux_request_class(
+                client, {"model": MODEL}, NAMED, "chat_completions", "compression",
+            )
+    assert result["extra_headers"][HEADER] == expected
+
+
 def test_title_generation_stays_background_in_interactive_turn_on_wire(monkeypatch):
     from contextvars import copy_context
 
