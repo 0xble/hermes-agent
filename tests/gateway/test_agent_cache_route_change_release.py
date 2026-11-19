@@ -6,15 +6,18 @@ import threading
 from collections import OrderedDict
 from types import SimpleNamespace
 
+from gateway.run import GatewayRunner
 from gateway.run_turn_runner import TurnRunner
+from gateway.turn_context import TurnContext
 
 KEY = "agent:main:local:dm:desk"
 
 
 def _lookup(cache, sig):
-    runner = SimpleNamespace(_agent_cache=cache, _agent_cache_lock=threading.Lock(),
-                             _init_cached_agent_for_turn=lambda agent, depth: None)
-    turn = TurnRunner(runner, SimpleNamespace(session_key=KEY, session_id="sid-1", _interrupt_depth=0))
+    runner = GatewayRunner.__new__(GatewayRunner)
+    runner._agent_cache = cache
+    runner._agent_cache_lock = threading.Lock()
+    turn = TurnRunner(runner, TurnContext(session_key=KEY, session_id="sid-1"))
     return turn._lookup_cached_agent(sig, runner._agent_cache_lock, cache, 10, None, False, None)
 
 

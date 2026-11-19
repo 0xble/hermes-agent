@@ -28,11 +28,12 @@ class _ReusedAgent:
 def _turn(runner, chat_id, built):
     from gateway.config import Platform
     from gateway.run_turn_runner import TurnRunner
+    from gateway.turn_context import TurnContext
     turn = TurnRunner.__new__(TurnRunner)
     turn._runner = runner
     source = SimpleNamespace(platform=Platform.LOCAL, chat_id=chat_id, user_id='u', user_id_alt=None,
                              user_name=None, chat_name=None, chat_type='dm', thread_id=None)
-    turn._ctx = SimpleNamespace(source=source, session_key=chat_id, session_id=chat_id, user_config={},
+    turn._ctx = TurnContext(source=source, session_key=chat_id, session_id=chat_id, user_config={},
                                 message='hi', inbound_message_id=None, enabled_toolsets=[], disabled_toolsets=None,
                                 AIAgent=lambda **kw: built.update({chat_id: kw}) or SimpleNamespace(),
                                 progress_callback=None, _voice_ack_guild=[None], _native_slack_task_cards=False,
@@ -48,14 +49,17 @@ def test_overlapping_turns_each_build_their_agent_with_their_own_service_tier(tm
     from gateway import session_policy
     from gateway.run import GatewayRunner
     from gateway.session_policy import build_policy
+    from gateway.session_state import SessionState
     monkeypatch.setattr('hermes_cli.models.resolve_fast_mode_overrides', lambda *a, **k: {})
     policies = {
         'fast': build_policy({'cwd': str(tmp_path), **LAUNCH}, {'agent': {'service_tier': 'fast'}}),
         'normal': build_policy({'cwd': str(tmp_path), **LAUNCH}, {}),
     }
     monkeypatch.setattr(session_policy, 'policy_for_source', lambda runner, source: policies[source.chat_id])
+    states = {chat_id: SessionState() for chat_id in policies}
     runner = SimpleNamespace(
-        _provider_routing={}, _peek_session_state=lambda key: None, _prefill_messages=None, _session_db=None,
+        _provider_routing={}, _peek_session_state=states.get, _session_state=states.__getitem__,
+        _prefill_messages=None, _session_db=None,
         _refresh_fallback_model=lambda: None, session_authority=SimpleNamespace(profile_id=str(tmp_path)),
         _resolve_session_agent_runtime=lambda **kw: ('m', {'provider': 'custom'}))
     runner._resolve_turn_agent_config = lambda *a, **k: GatewayRunner._resolve_turn_agent_config(runner, *a, **k)
