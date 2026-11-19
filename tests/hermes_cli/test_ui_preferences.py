@@ -187,6 +187,40 @@ def test_lock_reclaims_a_live_pid_when_the_owner_age_backstop_expires(tmp_path):
     assert not lock_dir.exists()
 
 
+def test_lock_retries_when_an_owner_appears_during_stale_recovery(tmp_path, monkeypatch):
+    path = tmp_path / "ui-preferences.json"
+    lock_dir = path.with_name(path.name + ".lock")
+    owner = lock_dir / "owner"
+    lock_dir.mkdir()
+    old = time.time() - ui_preferences._LOCK_STALE_S - 1
+    os.utime(lock_dir, (old, old))
+    new_owner = f"{os.getpid()}-holder"
+    rename = os.rename
+
+    def publish_owner_before_quarantine(source, target):
+        if source == lock_dir:
+            # The holder publishes its token after the waiter judged the directory ownerless.
+            owner.write_text(new_owner, encoding="utf-8")
+        rename(source, target)
+
+    def release_on_poll(_seconds):
+        assert owner.read_text(encoding="utf-8") == new_owner
+        assert not path.exists()
+        owner.unlink()
+        lock_dir.rmdir()
+
+    clock = iter((0.0, 0.0, ui_preferences._LOCK_WAIT_S))
+    monkeypatch.setattr(os, "rename", publish_owner_before_quarantine)
+    monkeypatch.setattr(ui_preferences, "_monotonic", lambda: next(clock))
+    monkeypatch.setattr(ui_preferences, "_sleep", release_on_poll)
+
+    values = {"hermes.desktop.waiter": "released"}
+    ui_preferences.write_preferences(values, path=path)
+
+    assert ui_preferences.read_preferences(path)["values"] == values
+    assert not list(tmp_path.glob("ui-preferences.json.lock*"))
+
+
 def test_lock_backstop_raises_preferences_busy_without_waiting(tmp_path, monkeypatch):
     path = tmp_path / "ui-preferences.json"
     lock_dir = path.with_name(path.name + ".lock")
