@@ -4,6 +4,10 @@ otherwise live only in the scheduler log. Drives the real ``run_job`` path with 
 ``resolve_runtime_provider`` mocked."""
 from unittest.mock import MagicMock, patch
 
+import logging
+
+import pytest
+
 from hermes_cli.auth import AuthError
 from tests.cron.test_scheduler import _run_owned_job
 
@@ -11,8 +15,9 @@ _JOB = {"id": "fb-test", "name": "fb test", "prompt": "hello", "model": None, "p
         "provider_snapshot": None, "base_url": None}
 
 
-def _run(tmp_path, *, response: str, primary_fails: bool):
+def _run(tmp_path, *, response: str, primary_fails: bool, wrap_response=True):
     (tmp_path / "config.yaml").write_text(
+        f"cron:\n  wrap_response: {str(wrap_response).lower()}\n"
         "model:\n  default: gpt-5.6-sol\n  provider: openai-codex\n"
         "fallback_providers:\n  - provider: anthropic\n    model: claude-sonnet-5\n    api_key: fb-key\n")
 
@@ -56,3 +61,29 @@ def test_primary_run_and_silent_fallback_run_are_untouched(tmp_path):
     # [SILENT] keeps its whole-response contract so the delivery stays suppressed.
     _s, final, _e, _k = _run(tmp_path, response="[SILENT]", primary_fails=True)
     assert final == "[SILENT]"
+
+
+@pytest.mark.parametrize("wrap_response", [False, True])
+@pytest.mark.parametrize("response", [
+    "# Daily Report\n\nExact canonical snapshot. ✓",
+    "[SILENT]", "NO_REPLY", "[CRON_FAILURE]\nunable to finish", "", "   ",
+])
+def test_raw_fallback_output_is_exact_and_normal_notice_is_preserved(
+    tmp_path, caplog, response, wrap_response
+):
+    caplog.set_level(logging.INFO, logger="cron.scheduler")
+    success, final, error, kwargs = _run(
+        tmp_path, response=response, primary_fails=True, wrap_response=wrap_response)
+    assert (success, error) == (True, None)
+    assert (kwargs["provider"], kwargs["model"]) == ("anthropic", "claude-sonnet-5")
+    assert "fallback resolved to anthropic model claude-sonnet-5" in caplog.text
+    if wrap_response and response.startswith("# Daily Report"):
+        notice, _, body = final.partition("\n\n")
+        assert "openai-codex/gpt-5.6-sol" in notice
+        assert "anthropic/claude-sonnet-5" in notice
+        assert body == response
+    else:
+        assert final == response
+        assert len(final.encode("utf-8")) == len(response.encode("utf-8"))
+        if response.startswith("# Daily Report"):
+            assert final.splitlines()[0] == "# Daily Report"

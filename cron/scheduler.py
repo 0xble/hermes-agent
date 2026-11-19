@@ -65,9 +65,10 @@ from hermes_time import now as _hermes_now, safe_strftime
 from agent.interrupt_compat import request_hard_interrupt
 from agent.delegation_context import (
     enter_non_dispatcher_owned_context, exit_non_dispatcher_owned_context)
-from agent.memory_provider import ctx_bound
+from agent.memory_provider import ctx_bound, spawn_context_thread
 from agent.session_activity import AwakeIdleMeter
 from agent.turn_failure_copy import is_max_iteration_handoff
+from hermes_cli._startup_fast import project_root_str
 
 logger = logging.getLogger(__name__)
 
@@ -392,6 +393,9 @@ def _upsert_incident_for_failure(
                           scheduler_failure_copy.agent_failure_type(error) if agent_declared else None))
         incident = get_incident(incident_id)
         state = incident.get("state") if incident else None
+        # A shared dependency outage follows the same rule: only a notice that actually reached
+        # the operator (``alerted``) quiets the other jobs, and only inside the repeat window.
+        # ``detected`` is never withheld, or an undelivered first notice would silence it for good.
         withheld = state == "closed" or (state == "alerted" and _repeat_alert_withheld(incident))
         return withheld, incident_id
     except Exception as exc:
@@ -1919,23 +1923,17 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
             if not fb_provider or not fb_model:
                 continue
             try:
-                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
+                from hermes_cli.fallback_config import effective_runtime_provider, fallback_entry_runtime_kwargs
 
-                fb_kwargs = {"requested": fb_provider, "target_model": fb_model}
-                if entry.get("base_url"):
-                    fb_kwargs["explicit_base_url"] = entry["base_url"]
-                fb_api_key = resolve_entry_api_key(entry)
-                if fb_api_key:
-                    fb_kwargs["explicit_api_key"] = fb_api_key
-                runtime = resolve_runtime_provider(**fb_kwargs)
+                runtime = resolve_runtime_provider(**fallback_entry_runtime_kwargs(entry))
                 # Named custom entries resolve to the bare "custom" billing class; keep the configured
                 # identity so job sessions record the provider name (#98739).
                 runtime["provider"] = effective_runtime_provider(entry, runtime)
                 logger.info(
                     "Job '%s': fallback resolved to %s model %s",
                     job_id, runtime.get("provider"), fb_model)
-                # Delivered with the job output (#74349): a cron agent has no status rail, so the
-                # switch would otherwise stay in the scheduler log only. run_job pops it.
+                # Delivered with wrapped job output (#74349): a cron agent has no status rail.
+                # Raw output opts out of decoration, retaining the scheduler logs. run_job pops it.
                 from hermes_cli.fallback_config import pre_agent_fallback_notice
                 runtime["_fallback_notice"] = pre_agent_fallback_notice(
                     requested or (jc.model_cfg.get("provider") if isinstance(jc.model_cfg, dict) else ""),
@@ -1955,9 +1953,9 @@ def _load_credential_pool(runtime: dict, job_id: str):
     if not runtime_provider:
         return None
     try:
-        from agent.credential_pool import load_pool
-        pool = load_pool(runtime_provider)
-        if pool.has_credentials():
+        from agent.custom_entry_pool import load_route_pool
+        pool = load_route_pool(runtime_provider, runtime.get("base_url"), runtime.get("requested_provider"))
+        if pool is not None and pool.has_credentials():
             logger.info(
                 "Job '%s': loaded credential pool for provider %s with %d entries",
                 job_id, runtime_provider, len(pool.entries()))
@@ -2142,7 +2140,8 @@ def _final_response_from_result(result: dict, job_id: str, job_name: str, AIAgen
     final_response_text = (result.get("final_response") or "").strip()
     max_iteration_summary = is_max_iteration_handoff(result)
     if result.get("failed") is True or (result.get("completed") is False and not max_iteration_summary):
-        raise RuntimeError(result.get("error") or final_response_text or "agent reported failure")
+        from cron.dependency_timeout import agent_reported_failure
+        raise agent_reported_failure(result.get("error") or final_response_text or "agent reported failure")
     if max_iteration_summary:
         logger.warning(
             "Job '%s' reached the iteration limit but produced a final fallback response; "
@@ -2590,6 +2589,7 @@ def run_job(
     _audit: Optional[_FireAudit] = None
     _worker_state: dict = {}
     scope = _CronRunScope(job, job_id, execution_id)
+    _dependency_started = time.monotonic()
     try:
         scope.enter()
         # Gate scripts and monitors can acknowledge work. Acquire first so a store outage
@@ -2621,10 +2621,12 @@ def run_job(
             agent, prompt, job, job_id, job_name, scope.task_id, cancel_event,
             worker_state=_worker_state)
         final_response = _final_response_from_result(result, job_id, job_name, AIAgent)
-        if (setup.fallback_notice and final_response.strip() and not _is_cron_silence_response(final_response)
+        if (setup.fallback_notice and _cfg.get("cron", {}).get("wrap_response", True)
+                and final_response.strip() and not _is_cron_silence_response(final_response)
                 and scheduler_failure_copy.cron_failure_marker_error(final_response) is None):
-            # Pre-agent provider switch (#74349) rides with the delivered report; silence and the
-            # agent-declared failure marker keep their first-line/whole-response contract.
+            # Pre-agent switch notices share the response-wrapper opt-out. Raw reports,
+            # silence, and failure markers retain their exact response contract.
+            # Provider selection and its scheduler logs remain unchanged.
             final_response = f"{setup.fallback_notice}\n\n{final_response}"
         # Keep final_response clean for delivery logic (empty = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -2645,8 +2647,12 @@ def run_job(
     except (Exception, ConfigBackendUnavailable) as e:
         if isinstance(e, CronSessionStoreUnavailable):
             job["_session_store_unavailable"] = True
+        from cron.dependency_timeout import annotate_job_failure
+        named = annotate_job_failure(
+            e, base_url=getattr(agent, "base_url", None) or job.get("base_url"),
+            elapsed=time.monotonic() - _dependency_started)
         error_msg = _merge_script_failure(
-            (False, "", "", f"{type(e).__name__}: {e!s}"), script_error, job=job)[3]
+            (False, "", "", f"{type(named).__name__}: {named!s}"), script_error, job=job)[3]
         logger.exception("Job '%s' failed: %s", job_name, error_msg)
         # Cowork-style unreachable-model re-run (cron/unreachable_retry.py): flag failures where
         # the model was never reached (transient network/DNS, zero API calls) so the bookkeeping
@@ -3700,9 +3706,12 @@ def _run_one_job_body(
         from cron.scheduler_authority import CronExecutionUnknown
         if isinstance(e, CronExecutionUnknown):
             from cron.executions import give_up_execution
+            from cron.jobs_error_text import sanitize_persisted_error
             from cron.scheduler_authority import pause_for_unknown
-            pause_for_unknown(job["id"], execution_id, str(e))
-            give_up_execution(execution_id, reason=str(e))
+            # One sanitized string for both stores: _lift_pause matches the pause by its reason.
+            reason = sanitize_persisted_error(str(e)) or "unverified admission"
+            pause_for_unknown(job["id"], execution_id, reason)
+            give_up_execution(execution_id, reason=reason)
             logger.error("Cron %s paused with unverified admission: %s", job["id"], e)
             return False
         # BaseException, not Exception: CancelledError/KeyboardInterrupt/SystemExit propagate here.
@@ -4408,8 +4417,27 @@ def _run_external_worker_payload(payload_path: Path, ack_path: Path) -> bool:
             old_external_execution = os.environ.get("_HERMES_CRON_EXTERNAL_WORKER")
             os.environ["_HERMES_CRON_EXTERNAL_WORKER"] = execution_id
             try:
-                completed = run_one_job(job, adapters=None, loop=None, verbose=False,
-                                        hard_wall_fence=watchdog_stop)
+                cancel_event = threading.Event()
+                cancel_stop = threading.Event()
+
+                def watch_cancel() -> None:
+                    from cron.detached_authority import _cancel_path
+
+                    while not cancel_stop.wait(.1):
+                        if _cancel_path(job["id"], execution_id).exists():
+                            cancel_event.set()
+                            return
+
+                cancel_watcher = spawn_context_thread(
+                    watch_cancel, name=f"cron-cancel-{execution_id}")
+                cancel_watcher.start()
+                try:
+                    completed = run_one_job(
+                        job, adapters=None, loop=None, verbose=False,
+                        cancel_event=cancel_event, hard_wall_fence=watchdog_stop)
+                finally:
+                    cancel_stop.set()
+                    cancel_watcher.join(timeout=1)
                 with contextlib.suppress(OSError):
                     ack_path.with_suffix(".stderr").unlink(missing_ok=True)
                 return completed
@@ -4530,7 +4558,7 @@ def _worktree_maintenance_repos() -> list[str]:
 
     # Hermes source checkout (git installs only; wheel installs have no .git).
     with contextlib.suppress(Exception):
-        install_root = Path(__file__).resolve().parent.parent
+        install_root = Path(project_root_str())
         if (install_root / ".git").exists():
             repos.add(str(install_root))
 
@@ -4946,4 +4974,7 @@ if __name__ == "__main__":
         raise SystemExit(
             0 if _run_external_worker_payload(args.external_worker_file, args.ack_file) else 1
         )
+    from hermes_agent.compat import install as _install_compat
+
+    _install_compat()
     tick(verbose=True, headless=True)

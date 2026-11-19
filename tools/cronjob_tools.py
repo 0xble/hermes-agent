@@ -42,8 +42,8 @@ from cron.jobs import (
     resume_job,
     trigger_job,
     update_job)
-from tools.cronjob_prompt_scan import _scan_cron_prompt
-from tools.cronjob_job_args import (
+from cron.prompt_scan import _scan_cron_prompt
+from cron.job_args import (
     _apply_continuity,
     _canonical_skills,
     _clean_str_list,
@@ -61,6 +61,7 @@ from tools.cronjob_job_args import (
     _validate_context_from_refs,
     _validate_cron_base_url,
     _validate_cron_script_path)
+from tools.delegate_tool_config import _get_max_async_children
 from tools.registry import registry, tool_error
 
 
@@ -397,10 +398,9 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
             # A credentialless shared-bot satellite borrows the primary's bot for ROUTED targets
             # only — the same grant the ticker's ``tick_adapters_for`` makes, never the full map.
             if getattr(runner, "_is_shared_bot_satellite", lambda _p: False)(profile):
-                from cron.scheduler_preflight import (
-                    SharedRouteAdapters, _primary_profile_routes_for_current_home)
+                from cron.scheduler_preflight import shared_route_adapters_for_current_home
 
-                adapters = SharedRouteAdapters(adapters, _primary_profile_routes_for_current_home())
+                adapters = shared_route_adapters_for_current_home(adapters)
         gateway_loop = getattr(runner, "_gateway_loop", None) if runner is not None else None
         try:
             # run_one_job records last_run_at/last_status via mark_job_run; `job` is the
@@ -599,8 +599,9 @@ def _manual_run_completion(
     ]
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
-    excerpt = (str((execution or {}).get("output") or "")[-4000:] if execution_id else
-               _latest_job_output_excerpt(job_id))
+    reached_nobody = not deliver or deliver == "local" or refreshed.get("last_delivery_reached_none")
+    excerpt = ((str((execution or {}).get("output") or "")[-4000:] if execution_id else
+                _latest_job_output_excerpt(job_id)) if reached_nobody else None)
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {
@@ -680,7 +681,6 @@ def _try_dispatch_background_run(
         return result
 
     try:
-        from tools.delegate_tool import _get_max_async_children
         max_async = _get_max_async_children()
     except Exception:
         max_async = 3
@@ -808,7 +808,7 @@ def _action_create(a: dict[str, Any]) -> str:
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
-            reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]), hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"], max_catch_up_lateness_seconds=a["max_catch_up_lateness_seconds"], failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])), keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False, priority=a["priority"], review=_review_value(a["review_json"], clear=bool(a["clear_review"])), timezone=_normalize_optional_job_value(a["timezone"]), grace_minutes=a["grace_minutes"], catch_up=a["catch_up"], **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
+            reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]), hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"], max_catch_up_lateness_seconds=a["max_catch_up_lateness_seconds"], failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])), keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False, priority=a["priority"], review=_review_value(a["review_json"], clear=bool(a["clear_review"])), timezone=_normalize_optional_job_value(a["timezone"]), grace_minutes=a["grace_minutes"], catch_up=a["catch_up"], wrap_response=_wrap_response_override(a["wrap_response"]), **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
            if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
         _partial = exc.to_dict()
@@ -931,6 +931,18 @@ def _pick(updates: dict[str, Any], job: dict[str, Any], key: str) -> Any:
     return updates[key] if key in updates else job.get(key)
 
 
+# Model-facing tri-state for ``wrap_response``: the tool cannot tell an omitted argument from an
+# explicit null, so "inherit" is the spelled-out reset. Real booleans and None (programmatic
+# callers, the CLI and dashboard lanes) pass through for update_job's strict normaliser to check.
+_WRAP_RESPONSE_MODES = {"on": True, "off": False, "inherit": None}
+
+
+def _wrap_response_override(value: Any) -> Any:
+    if isinstance(value, str) and value.strip().lower() in _WRAP_RESPONSE_MODES:
+        return _WRAP_RESPONSE_MODES[value.strip().lower()]
+    return value
+
+
 def _update_delivery_fields(deliver: Any, a: dict[str, Any], updates: dict[str, Any]) -> Optional[str]:
     """Validate destination changes before applying their cron-context routing."""
     if deliver is not None:
@@ -978,6 +990,8 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
         updates["priority"] = a["priority"]
     if a["catch_up"] is not None:
         updates["catch_up"] = a["catch_up"]
+    if a["wrap_response"] is not None:
+        updates["wrap_response"] = _wrap_response_override(a["wrap_response"])
     if skills is not None or skill is not None:
         canonical_skills = _canonical_skills(skill, skills)
         updates["skills"] = canonical_skills
@@ -1179,7 +1193,7 @@ def cronjob(
     keep_pinned_lane: Optional[bool] = None,
     priority: Optional[str] = None,
     catch_up: Optional[bool] = None,
-    task_id: str | None = None,
+    wrap_response: Optional[bool | str] = None,  # bool, or the tool's on / off / inherit
     session_id: Optional[str] = None,
     paused: bool = False,
     paused_reason: Optional[str] = None,
@@ -1197,7 +1211,6 @@ def cronjob(
     from agent.incognito import is_incognito
     if is_incognito(session_id):
         return tool_error("Durable cron operations are unavailable in incognito mode.", success=False)
-    del a["task_id"]  # unused but kept for handler signature compatibility
     try:
         normalized = (action or "").strip().lower()
         handler = _JOBLESS_ACTIONS.get(normalized)
@@ -1312,15 +1325,20 @@ CRONJOB_SCHEMA = {
                 "type": "boolean",
                 "description": "Runs missed while the machine was off: true = run once on return, false = skip. Omit for the default (recurring run once, one-shots skip)."
             },
+            "wrap_response": {
+                "type": "string",
+                "enum": ["on", "off", "inherit"],
+                "description": "Per-job override for the 'Cronjob Response: <name>' header and 'To stop or manage this job...' footer around delivered output. 'on' wraps; 'off' delivers the raw output verbatim (useful for briefings meant to read clean); 'inherit' removes an override so the job follows the global cron.wrap_response again. Omit to leave it unchanged (a new job inherits)."
+            },
             "priority": {
                 "type": "string",
                 "enum": ["live", "production", "background", ""],
                 "description": "For create/update: business-impact admission lane when due jobs compete for workers. 'live' = a person or customer is waiting on it right now (starts first); 'production' = ordinary business work (default; unset means production); 'background' = housekeeping, personal or best-effort work that may wait behind the others. Affects start order only, never schedules, timeouts or worker counts. On update, '' clears back to production."
             },
             "script": {
-                "type": "string",
-                "description": _script_description("the profile HERMES_HOME")
-            },
+            "type": "string",
+            "description": _script_description("the profile HERMES_HOME")
+        },
             "monitor": {
                 "type": "string",
                 "description": "Optional change-detector that gates the agent: an http(s) URL (fetched each tick) or a script path (same rules as `script`, run each tick) — cheap, no LLM. Output identical to the previous tick skips the agent run entirely; changed output wakes the agent with a diff injected into the prompt. First tick always runs (baseline). Output must be deterministic (no timestamps) or every tick looks changed. Incompatible with no_agent. On update, '' clears."
@@ -1385,7 +1403,7 @@ _HANDLER_FORWARDED_ARGS = (
     "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "keep_pinned_lane", "priority", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
     "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review",
-    "max_catch_up_lateness_seconds", "timezone", "grace_minutes", "catch_up")
+    "max_catch_up_lateness_seconds", "timezone", "grace_minutes", "catch_up", "wrap_response")
 
 
 def _cronjob_handler(args, **kw):
@@ -1397,7 +1415,6 @@ def _cronjob_handler(args, **kw):
         include_disabled=args.get("include_disabled", True),
         monitor_script=_mon_script,
         monitor_url=_mon_url,
-        task_id=kw.get("task_id"),
         session_id=kw.get("session_id"),
         paused=args.get("paused", False),
         **{key: args.get(key) for key in _HANDLER_FORWARDED_ARGS},
@@ -1412,4 +1429,5 @@ registry.register(
     check_fn=check_cronjob_requirements,
     emoji="⏰",
     dynamic_schema_overrides=_cronjob_schema_overrides,
+    compat_args=(*_HANDLER_FORWARDED_ARGS, "include_disabled", "monitor_script", "monitor_url"),
 )

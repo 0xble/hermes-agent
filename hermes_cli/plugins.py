@@ -24,7 +24,7 @@ import threading
 import types
 from contextlib import suppress
 from dataclasses import dataclass, field
-from functools import cached_property, wraps
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Mapping, Optional, Set, Tuple, Union
 
@@ -39,8 +39,7 @@ from hermes_cli.relay_plugin_cutover import RELAY_PLUGINS_CONFIG_ENV, legacy_rel
 # Sibling modules' names are re-exported here (origin) so plugins and tests keep one import path.
 from hermes_cli.plugins_manifest import (
     _CONFIG_SCHEMA_TYPES, SUPPORTED_MANIFEST_VERSION, PluginManifest, _portable_data_namespace,
-    manifest_key, parse_manifest_file, resolve_module_origin, resolve_plugin_load_order,
-    validate_config_schema,
+    manifest_key, parse_manifest_file, resolve_module_origin, resolve_plugin_load_order, validate_config_schema,
 )
 from hermes_cli.plugins_discovery import (
     ENTRY_POINTS_GROUP, _get_disabled_plugins, _get_enabled_plugins, collect_directory_manifests,
@@ -55,7 +54,7 @@ from hermes_cli.plugins_dispatch import (
     DEFAULT_SYSTEM_PROMPT_SECTION_MAX_CHARS, HERMES_EVENT_NAMESPACE, MAX_SYSTEM_PROMPT_SECTION_CHARS,
     MAX_SYSTEM_PROMPT_SECTIONS_TOTAL_CHARS, PLUGIN_SECTIONS_END, PLUGIN_SECTIONS_START,
     SYSTEM_PROMPT_SECTION_POSITIONS, _EVENT_EMIT_DEPTH_CAP, _EVENT_PENDING_CAP,
-    _HOOK_CALLBACK_TIMEOUT_SECS, _HOOK_TIMEOUT_SUPPRESSION_SECONDS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
+    _HOOK_CALLBACK_TIMEOUT_SECS, _MAX_HOOK_CALLBACK_TIMEOUT_SECS,
     _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE, PluginDispatchMixin, PluginDiscoveryIncomplete, PluginSystemPromptSection,
     RenderedPluginSystemPromptSection, _EventSubscription, _PreToolCallDirective,
     _async_delivery_snapshot, _await_foreground_discovery, _delivery_manager,
@@ -71,6 +70,7 @@ from hermes_cli.plugins_state import (
 )
 # PluginContext lives in plugins_context.py; this facade stays its public import path.
 from hermes_cli.plugins_context import PluginContext, _UNSET, _ignore_after_abandoned_load
+from hermes_cli._startup_fast import project_root_str
 
 
 def get_bundled_plugins_dir() -> Path:
@@ -79,7 +79,7 @@ def get_bundled_plugins_dir() -> Path:
     env_override = os.getenv("HERMES_BUNDLED_PLUGINS")
     if env_override:
         return Path(env_override)
-    return Path(__file__).resolve().parent.parent / "plugins"
+    return Path(project_root_str()) / "plugins"
 
 
 class PluginToolOverrideError(PermissionError):
@@ -113,6 +113,8 @@ def _install_plugin_debug_handler(force: bool = False) -> None:
 
 _install_plugin_debug_handler()
 
+# The function that fires each name is listed in website/docs/developer-guide/plugins/index.md
+# ("Where each hook fires"); add a row there when you add a hook.
 VALID_HOOKS: set[str] = {
     "pre_tool_call", "post_tool_call", "transform_terminal_output", "transform_tool_result",
     # transform_llm_output: return a replacement string (first non-None wins) or None.
@@ -330,13 +332,12 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
         self._event_queue: queue.Queue[Any] = queue.Queue(maxsize=_EVENT_PENDING_CAP)
         self._event_worker: Optional[threading.Thread] = None
         self._emit_depth = threading.local()
-        # In-flight / recently-timed-out hook callbacks keyed by (hook_name, id(cb), call_identity)
-        # so a stuck policy hook cannot spawn a new abandoned thread on every fire.
+        # Per-call tokens plus per-callback live/reserved and abandoned worker accounting.
+        # Admission and completion share one lock; timeouts never install a timer cooldown.
         self._hook_running_callbacks: dict[tuple, object] = {}
         self._hook_abandoned: dict[tuple, set] = {}
-        self._hook_timeout_suppressed_until: dict[tuple, float] = {}
+        self._hook_live_workers: dict[tuple, int] = {}
         self._hook_timeout_lock = threading.Lock()
-        self._hook_timeout_suppression_seconds = _HOOK_TIMEOUT_SUPPRESSION_SECONDS
         # (hook_name, id(cb), repr(exc)) already reported at WARNING; identical repeats go to DEBUG.
         self._hook_failures_reported: set = set()
         # Ledger per plugin (ownership) plus global order (reverse teardown across plugins). Process-
@@ -450,6 +451,11 @@ class PluginManager(PluginLoaderMixin, PluginDispatchMixin, PluginLedgerMixin):
                     # Re-register so force-reload is symmetric (#60036; tracking #64178 — salvaged from PR
                     # #64188; outbound webhooks added per #92682 review).
                     self._re_register_config_hooks_after_force()
+                    # Model providers load through providers/ discovery, which this sweep skips: re-scan
+                    # this home's provider plugins too, so an updated one reloads now (#153300). A
+                    # process that never imported providers has nothing stale to reload.
+                    if (providers := sys.modules.get("providers")) is not None:
+                        providers.refresh_bound_home()
                 self._discovery_complete = True
             except BaseException:
                 self._discovered = False
@@ -1046,19 +1052,28 @@ def has_hook(hook_name: str) -> bool:
     return _delivery_manager().has_hook(hook_name)
 
 
-def hook_unused_nowait(hook_name: str) -> bool:
-    """True when this home's plugins are loaded and none handles *hook_name*. Never discovers or
-    waits (an unloaded home, or one whose (re)load is still running on another thread, answers False:
-    unknown, not unused), so it is safe on an event loop."""
+def _loaded_registry_nowait(check: Callable[[PluginManager], bool]) -> bool:
+    """``check(manager)`` when this home's plugins are loaded, else False (unknown). Never discovers or
+    waits. ``_discovered`` is set before a sweep finishes and a force reload clears the registries
+    first, so a held discovery lock is unknown, and ``check`` reads the registry under that lock."""
     manager = get_plugin_manager()
-    # ``_discovered`` is set before a sweep finishes and a force reload clears ``_hooks`` first, so a
-    # sweep in flight could read as "no consumer": treat a held discovery lock as unknown.
     if not manager._discovery_lock.acquire(blocking=False):
         return False
     try:
-        return manager._discovered and not manager.has_hook(hook_name)
+        return manager._discovered and check(manager)
     finally:
         manager._discovery_lock.release()
+
+
+def hook_unused_nowait(hook_name: str) -> bool:
+    """True when this home's plugins are loaded and none handles *hook_name*; safe on an event loop."""
+    return _loaded_registry_nowait(lambda manager: not manager.has_hook(hook_name))
+
+
+def plugin_command_absent_nowait(name: str) -> bool:
+    """True when this home's plugins are loaded and none registered command *name*. Never discovers
+    (discovery runs every plugin's ``register()``, which needs the caller's profile scope)."""
+    return _loaded_registry_nowait(lambda manager: name not in manager._plugin_commands)
 
 
 def iter_hook_callbacks(hook_name: str) -> tuple[Callable, ...]:

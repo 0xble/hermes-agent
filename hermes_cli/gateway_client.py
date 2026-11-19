@@ -66,25 +66,36 @@ class GatewayRPCError(GatewayClientError):
         self.code = code
         self.data = data or {}
 
+    @property
+    def unknown_method(self) -> bool:
+        """The owner has no such method (it predates this client): ``-32601``, or only the reason
+        name from an owner that sends no code."""
+        return self.code == -32601 or str(self) == "unknown_method"
+
 
 def _bounded_reason(value):
     return value if isinstance(value, str) and value.replace("_", "").isalnum() and len(value) <= 80 else None
+
+
+#: What ``error.data`` keeps: strings up to this long, lists and key counts up to ``ERROR_DATA_ITEMS``.
+ERROR_DATA_TEXT, ERROR_DATA_ITEMS = 200, 16
 
 
 def _bounded_error_data(data):
     """At most 16 short keys whose values are bool/int/None, short strings or short lists of them;
     anything else (nested objects, raw remote diagnostics) is dropped, never forwarded."""
     def scalar(value):
-        return value is None or isinstance(value, (bool, int)) or (isinstance(value, str) and len(value) <= 200)
+        return value is None or isinstance(value, (bool, int)) or (
+            isinstance(value, str) and len(value) <= ERROR_DATA_TEXT)
     if not isinstance(data, dict):
         return {}
     out = {}
     for key, value in data.items():
-        if len(out) >= 16 or not isinstance(key, str) or len(key) > 64:
+        if len(out) >= ERROR_DATA_ITEMS or not isinstance(key, str) or len(key) > 64:
             continue
         if scalar(value):
             out[key] = value
-        elif isinstance(value, list) and len(value) <= 16 and all(scalar(item) for item in value):
+        elif isinstance(value, list) and len(value) <= ERROR_DATA_ITEMS and all(scalar(item) for item in value):
             out[key] = list(value)
     return out
 
@@ -251,26 +262,36 @@ class GatewayClient:
 def private_control_query(home: Path, request: bytes, timeout: float = 5) -> bytes:
     """Send one request line to *home*'s gateway control socket as this OS user; the raw answer.
 
-    The socket authenticates the peer (same user only), which is what lets a private verb answer."""
+    The socket authenticates the peer (same user only), which is what lets a private verb answer.
+    A socket timeout is a gateway handshake failure, not a bare ``TimeoutError: timed out``.
+    """
     if os.name == "nt":
         from gateway.runtime_bootstrap_windows import query_runtime_control
-        return query_runtime_control(home, request, timeout)
+        try:
+            return query_runtime_control(home, request, timeout)
+        except TimeoutError as exc:
+            from cron.dependency_timeout import name_gateway_handshake_timeout
+            raise name_gateway_handshake_timeout(exc) from exc
     from hermes_cli.gateway_runtime_discovery import connect_private
     deadline = time.monotonic() + timeout
-    with connect_private(home, timeout) as peer:
-        peer.sendall(request)
-        data = bytearray()
-        while b"\n" not in data:
-            budget = deadline - time.monotonic()
-            if budget <= 0:
-                raise GatewayClientError("Gateway bootstrap timed out")
-            peer.settimeout(budget)
-            chunk = peer.recv(4096)
-            if not chunk:
-                raise GatewayClientError("incomplete_control_response")
-            if len(data) + len(chunk) > 65536:
-                raise GatewayClientError("Invalid gateway bootstrap response")
-            data.extend(chunk)
+    try:
+        with connect_private(home, timeout) as peer:
+            peer.sendall(request)
+            data = bytearray()
+            while b"\n" not in data:
+                budget = deadline - time.monotonic()
+                if budget <= 0:
+                    raise GatewayClientError("Gateway bootstrap timed out")
+                peer.settimeout(budget)
+                chunk = peer.recv(4096)
+                if not chunk:
+                    raise GatewayClientError("incomplete_control_response")
+                if len(data) + len(chunk) > 65536:
+                    raise GatewayClientError("Invalid gateway bootstrap response")
+                data.extend(chunk)
+    except TimeoutError as exc:
+        from cron.dependency_timeout import name_gateway_handshake_timeout
+        raise name_gateway_handshake_timeout(exc) from exc
     return bytes(data)
 
 

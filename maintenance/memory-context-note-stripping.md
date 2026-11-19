@@ -29,3 +29,5 @@ cover exact current and legacy notes, intervening text, and adjacent whitespace.
 Retire when an upstream release preserves same-prefix recalled facts and strips
 these exact fork/legacy notes. Revert only the exact-note matcher and its tests;
 keep the separate durable background-delete gate intact.
+
+Contract tests: `tests/agent/test_memory_provider.py`.

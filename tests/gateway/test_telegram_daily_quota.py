@@ -838,8 +838,9 @@ async def test_normal_budget_keeps_continuations_and_separate_tool_sends(tmp_pat
         await runner._progress_send_or_edit(state, _tool_line(runner, state))
         runner._reset_progress_bubble(state)
         await runner._progress_send_or_edit(state, _tool_line(runner, state, "Running checks"))
-        state._PROGRESS_TEXT_LIMIT = len(state.progress_lines[0])
         _tool_line(runner, state, "Checking another file")
+        # Each line fits alone, but not together; the runner now splits oversized individual items too.
+        state._PROGRESS_TEXT_LIMIT = max(map(len, state.progress_lines))
         assert await runner._roll_progress_overflow_if_needed(state)
         state.can_edit = False
         await runner._progress_send_or_edit(state, _tool_line(runner, state, "Finishing checks"))

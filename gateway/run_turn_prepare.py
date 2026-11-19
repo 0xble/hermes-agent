@@ -46,7 +46,8 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
     """``_resolve_session_agent_runtime`` for a session bound to a launch policy: the route's FROZEN
     config and launch credential, walking its own fallback chain on an AuthError unless
     ``fallback=False`` (a session control asking which route the session itself runs). Module-level
-    so tests that bind the method onto bare namespaces still reach it."""
+    so tests that bind the method onto bare namespaces still reach it. ``record_notice=False``
+    leaves the runner's one-shot fallback notice alone (see ``_resolve_session_agent_runtime``)."""
     from gateway.run import _runtime_agent_kwargs
     from gateway.session_policy import route_launch_key
     from gateway.session_worker_construct import policy_pins_model, route_runtime
@@ -59,7 +60,9 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
                                             fallback=fallback)
     notice = None
     if fallback_entry is not None:
+        from agent.primary_auth_fallback import RUNTIME_KEY, set_pending_primary_auth_failure
         from hermes_cli.fallback_config import pre_agent_fallback_notice
+        set_pending_primary_auth_failure(runtime.get(RUNTIME_KEY))
         notice = pre_agent_fallback_notice(
             provider or '', model or '',
             runtime.get('provider') or fallback_entry.get('provider') or 'unknown',
@@ -246,14 +249,27 @@ def _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice):
     return model, runtime_kwargs, notice
 
 
+def load_runtime_for_source(runner, **kwargs):
+    """``_load_session_agent_runtime`` with the config whose ``channel_overrides`` serve the source:
+    a turn another multiplexed profile serves reads that profile's own config.yaml, never the launch
+    profile's (#136198). Runs with the loader, so that read stays off the event loop."""
+    source = kwargs.get("source")
+    config = runner._serving_channel_config(source) if source is not None else None
+    return runner._load_session_agent_runtime(**kwargs, config=config)
+
+
 def load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route):
     """Resolve a detached route snapshot; the caller owns the session-state commit."""
     from gateway.run import (
         _resolve_gateway_model,
         _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
     )
+    from agent.primary_auth_fallback import (
+        RUNTIME_KEY, failure_for_route, route_snapshot, set_pending_primary_auth_failure,
+    )
     from gateway.run_agent_cache import GatewayAgentCacheMixin
 
+    set_pending_primary_auth_failure(None)
     model = _resolve_gateway_model(user_config)
     selected = resolve_stored_override(override, model)
     if selected is not None:
@@ -278,6 +294,8 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
     # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
     # runner surfaces it through the agent's one-shot fallback notice (#74349).
     notice = runtime_kwargs.pop("_fallback_notice", None)
+    primary_failure = runtime_kwargs.pop(RUNTIME_KEY, None)
+    resolved_route = route_snapshot(runtime_kwargs)
     runtime_model = runtime_kwargs.pop("model", None)
     if runtime_model:
         logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
@@ -294,6 +312,8 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
         model, runtime_kwargs = GatewayAgentCacheMixin._apply_model_override(override, model, runtime_kwargs)
         if override.get("model"):
             runtime_kwargs["model_pinned"] = True
+
+    set_pending_primary_auth_failure(failure_for_route(primary_failure, resolved_route, runtime_kwargs))
 
     # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
     # provider's first catalog model.
@@ -332,8 +352,10 @@ class GatewayTurnPrepareMixin:
         config/env (``_resolve_gateway_model(user_config)`` and default provider resolution).
         ``fallback=False`` keeps a launch-policy session on its own route (see
         ``_resolve_policy_agent_runtime``)."""
+        from agent.primary_auth_fallback import set_pending_primary_auth_failure
         from gateway.attended_model import parse_attended_config
         from gateway.session_policy import policy_for_source
+        set_pending_primary_auth_failure(None)
         self._pre_agent_fallback_notice = None
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
@@ -357,8 +379,8 @@ class GatewayTurnPrepareMixin:
             source=source, session_key=skey, user_config=user_config, override=override,
             last_model=last_model, assignment=assignment,
         )
-        resolved = self._load_session_agent_runtime(
-            source=source, skey=skey, user_config=user_config, config=getattr(self, "config", None),
+        resolved = load_runtime_for_source(
+            self, source=source, skey=skey, user_config=user_config,
             override=override, last_model=last_model, attended_route=attended_route,
         )
         return self._commit_session_agent_runtime(skey, resolved)
@@ -393,6 +415,7 @@ class GatewayTurnPrepareMixin:
         }
         if tier is _TIER_FROM_RUNNER:
             tier = getattr(self, "_service_tier", None)
+        route["service_tier"] = tier  # the tier this turn's agent runs, carried with its overrides
         if tier not in STATIC_TIERS:
             # None / auto / cold: the bounded window is applied per request by agent.fast_mode.
             route["request_overrides"] = base_request_overrides
@@ -440,7 +463,10 @@ class GatewayTurnPrepareMixin:
             if not isinstance(config, dict):
                 config = {}
             gateway_runtime = dict(config.get("gateway_runtime") or {})
-            if row.get("model") == model and all(gateway_runtime.get(k) == v for k, v in runtime.items()):
+            # Off a fallback, the route is the session's own: a stale fallback marker must not undo it (#152333).
+            stale_marker = not runtime["fallback_active"] and config.pop("_fallback_route", None) is not None
+            if (row.get("model") == model and all(gateway_runtime.get(k) == v for k, v in runtime.items())
+                    and not stale_marker):
                 return
             config["gateway_runtime"] = runtime
             db.update_session_meta(session_id, json.dumps(config), model=model)
@@ -593,9 +619,14 @@ class GatewayTurnPrepareMixin:
             # A binding whose sessions row is gone (deleted with foreign_keys OFF, so ON DELETE CASCADE
             # never fired) is stale, not a resume target: switching onto it lets the next peer refresh
             # re-create the row and the topic silently re-adopts an old transcript (#139283).
-            if self._session_db is not None and not await self._session_db.get_session(bound_session_id):
-                logger.warning("Telegram topic binding for %s points at session %s with no sessions row; "
-                               "keeping the current session and rebinding", session_key, bound_session_id)
+            # A binding naming a delegate subagent's row (written while the route was captured by it,
+            # #138210) is not the topic's conversation either: following it hands the user to the worker.
+            bound_row = await self._session_db.get_session(bound_session_id) if self._session_db is not None else None
+            from gateway.session_lifecycle import is_delegate_child_row
+            if self._session_db is not None and (not bound_row or is_delegate_child_row(bound_row)):
+                logger.warning("Telegram topic binding for %s points at session %s with %s; keeping the "
+                               "current session and rebinding", session_key, bound_session_id,
+                               "a delegate subagent's row" if bound_row else "no sessions row")
                 try:  # CAS on the stale id: a /new that rebound the topic during the await wins
                     await asyncio.to_thread(self._record_telegram_topic_binding, source, session_entry,
                                             expected_session_id=stored_session_id)
@@ -706,7 +737,7 @@ class GatewayTurnPrepareMixin:
         """Prepend topic/channel-bound skill payload(s) to ``event.text`` on a new session."""
         _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
         try:
-            from agent.skill_commands import _load_skill_payload, _build_skill_message
+            from agent.skill_commands import _load_skill_payload, _build_skill_message, register_auto_load_scaffold
             _combined_parts: list[str] = []
             _loaded_names: list[str] = []
             for _sname in _skill_names:
@@ -724,8 +755,11 @@ class GatewayTurnPrepareMixin:
                     _combined_parts.append(_part)
                     _loaded_names.append(_sname)
             if _combined_parts:
-                _combined_parts.append(event.text)  # user's original text after the payloads
-                event.text = "\n\n".join(_combined_parts)
+                # The exact boundary, so memory providers keep the typed text even when it
+                # looks like scaffolding (a pasted setup note or footer sentence).
+                _scaffold = "\n\n".join(_combined_parts) + "\n\n"
+                register_auto_load_scaffold(_scaffold)
+                event.text = _scaffold + (event.text or "")  # user's original text after the payloads
                 logger.info("[Gateway] Auto-loaded skill(s) %s for session %s", _loaded_names, session_key)
         except Exception as e:
             logger.warning("[Gateway] Failed to auto-load skill(s) %s: %s", _skill_names, e)
@@ -780,6 +814,11 @@ class GatewayTurnPrepareMixin:
 
         # One-time prompt if no home channel is set (webhooks deliver to configured targets instead).
         if not human_platform:
+            return
+        # Under allow_admin_from gating a non-admin can't run /sethome; on a customer-facing bot
+        # the nudge would only leak operator setup to the customer.
+        from gateway.slash_access import policy_for_runner_source
+        if not policy_for_runner_source(self, source).can_run(source.user_id, "sethome"):
             return
         platform_name = source.platform.value
         env_key = _home_target_env_var(platform_name)
@@ -963,7 +1002,10 @@ class GatewayTurnPrepareMixin:
             self._set_pending_turn_sidecar_notes(session_key, turn_sidecar_notes)
 
         # Bind this run generation to the adapter so deferred post-delivery callbacks are released
-        # by the run that registered them.
+        # by the run that registered them. The turn's own event carries it too: a busy follow-up's
+        # reply is sent by ``dispatch_shared_busy``'s observer, which holds no session guard and
+        # releases the turn's callbacks by this per-turn stamp (``turn_run_generation``).
+        event._hermes_run_generation = run_generation
         self._bind_adapter_run_generation(self._delivery_adapter_for(source), session_key, run_generation)
         # Delivery IDs are only unique in their transport namespace. Keyless turns
         # need their own identity, even when another process writes to this session.

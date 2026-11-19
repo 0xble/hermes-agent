@@ -80,14 +80,15 @@ def build_models_payload(
     capabilities: bool = False, featured: bool = False, force_fresh_nous_tier: bool = False,
     refresh: bool = False, probe_custom_providers: bool = True, probe_current_custom_provider: bool = False,
     for_picker: bool = False, max_models: int | None = None, non_blocking_catalogs: bool = False,
-    fast_custom_probe: bool | None = None,
+    fast_custom_probe: bool | None = None, registry_cache_only: bool = False,
 ) -> dict:
     """Build the ``{providers, model, provider}`` shape every consumer needs. ``explicit_only`` keeps
     only providers the user explicitly configured — hides ambient/auto-seeded credentials from
     desktop chat pickers. ``pricing_cache_only``: with ``pricing``, use only values already resident
     in process caches (normal picker opens, while a background worker warms cold endpoints).
     ``non_blocking_catalogs``: provider catalogs come from the disk cache only — a degraded provider
-    cannot stall the response (GUI picker opens). ``fast_custom_probe`` overrides the
+    cannot stall the response (GUI picker opens). ``registry_cache_only`` also skips models.dev
+    discovery for ACP attachment snapshots. ``fast_custom_probe`` overrides the
     custom-endpoint discovery budget ``for_picker`` otherwise implies (1.5s vs 5s) — ``None`` keeps
     the coupling, ``False`` retains the full 5s budget (#103843)."""
     from hermes_cli.model_switch import list_authenticated_providers
@@ -100,25 +101,10 @@ def build_models_payload(
         probe_current_custom_provider=probe_current_custom_provider, for_picker=for_picker,
         excluded_providers=ctx.excluded_providers or [],
         non_blocking_catalogs=non_blocking_catalogs, fast_custom_probe=fast_custom_probe,
+        registry_cache_only=registry_cache_only,
     )
 
-    # Managed local runtime: staged GGUFs are selectable like any provider's models, but
-    # list_authenticated_providers can't know about them (no credential — reachability is the
-    # credential), so inject the row here where every picker surface inherits it.
-    local_row = _local_runtime_row(ctx)
-    if local_row is not None:
-        rows = _without_slug(rows, "llamacpp") + [local_row]
-        # A live session on the managed server reports provider "custom" (raw base_url label), which
-        # would materialize a duplicate "Custom endpoint" row with the same staged models stealing the
-        # checkmark. The Local row owns the managed server's identity — drop such custom rows.
-        if local_row.get("is_current"):
-            staged = set(local_row["models"])
-
-            def _is_managed_custom(row: dict) -> bool:
-                models = {str(m) for m in (row.get("models") or [])}
-                return _slug(row) == "custom" and bool(models) and models <= staged
-
-            rows = [r for r in rows if not _is_managed_custom(r)]
+    rows, local_row = inject_local_runtime_row(rows, ctx)
 
     moa_row = _moa_provider_row(ctx.current_provider)
     if moa_row is not None:
@@ -137,7 +123,7 @@ def build_models_payload(
 
     # A local proxy serving a model also in an aggregator's catalog would show under both, and picking
     # the aggregator row silently breaks the call — aggregators only list models no specific provider has.
-    _strip_aggregator_overlaps(rows)
+    _strip_aggregator_overlaps(rows, allow_network=not registry_cache_only)
 
     if include_unconfigured:
         rows = list(rows) + _without_slug(_append_unconfigured_rows(rows, ctx), "moa")
@@ -170,7 +156,7 @@ def build_models_payload(
     return {"providers": rows, "model": ctx.current_model, "provider": ctx.current_provider}
 
 
-def _strip_aggregator_overlaps(rows: list[dict]) -> None:
+def _strip_aggregator_overlaps(rows: list[dict], *, allow_network: bool = True) -> None:
     """Drop models from TRUE routing aggregators (OpenRouter, custom:* proxies) that a user-defined
     provider also serves. The is_user_defined guard matters: is_routing_aggregator() is True for every
     custom:* slug, so without it the dedup would empty a user's own custom row. Flat-namespace
@@ -182,7 +168,7 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
 
     builtin_aggregators = {
         _slug(row) for row in rows
-        if not row.get("is_user_defined") and is_routing_aggregator(_slug(row))
+        if not row.get("is_user_defined") and is_routing_aggregator(_slug(row), allow_network=allow_network)
     }
 
     def _duplicates_builtin_aggregator(row: dict) -> bool:
@@ -210,7 +196,7 @@ def _strip_aggregator_overlaps(rows: list[dict]) -> None:
     if not user_models:
         return
     for row in rows:
-        if row.get("is_user_defined") or not is_routing_aggregator(row.get("slug", "")):
+        if row.get("is_user_defined") or not is_routing_aggregator(row.get("slug", ""), allow_network=allow_network):
             continue
         # Only strip overlaps from TRUE routing aggregators (OpenRouter, custom:* proxies). Flat-namespace
         # resellers (opencode-go / opencode-zen) serve every listed model as a first-party model, so their
@@ -1012,6 +998,53 @@ def _apply_pricing(rows: list[dict], *, force_fresh_nous_tier: bool = False, cac
                 row["plan_usage"] = plan_usage.with_pricing({m: raw_pricing.get(m) for m in models}).to_payload()
                 # Window plans: the picker shows the usage word, not per-token prices.
                 row.pop("pricing", None)
+
+
+def inject_local_runtime_row(rows: list[dict], ctx: ConfigContext) -> tuple[list[dict], dict | None]:
+    """Add the managed local runtime's ``llamacpp`` row to authenticated-provider ``rows`` — every
+    picker (desktop/CLI payload and the chat-platform ``/model`` picker) goes through here.
+    ``list_authenticated_providers`` can't know about staged GGUFs (no credential — reachability is
+    the credential). Returns ``(rows, local_row)``; ``local_row`` is ``None`` when nothing is staged."""
+    if _local_runtime_excluded(ctx):
+        return rows, None  # ``model_catalog.excluded_providers`` hides it like any provider row
+    local_row = _local_runtime_row(ctx)
+    if local_row is None:
+        return rows, None
+    rows = _without_slug(rows, "llamacpp") + [local_row]
+    # A live session on the managed server reports provider "custom" (raw base_url label), which
+    # would materialize a duplicate "Custom endpoint" row with the same staged models stealing the
+    # checkmark. The Local row owns the managed server's identity — drop such custom rows, but only
+    # one pointing AT the managed server: a saved endpoint elsewhere that shares model names is a
+    # different provider the user must still be able to switch back to.
+    managed_url = _managed_runtime_url() if local_row.get("is_current") else ""
+    if managed_url:
+        staged = set(local_row["models"])
+
+        def _is_managed_custom(row: dict) -> bool:
+            models = {str(m) for m in (row.get("models") or [])}
+            return (_slug(row) == "custom" and bool(models) and models <= staged
+                    and str(row.get("api_url") or "").strip().rstrip("/") == managed_url)
+
+        rows = [r for r in rows if not _is_managed_custom(r)]
+    return rows, local_row
+
+
+def _local_runtime_excluded(ctx: ConfigContext) -> bool:
+    from hermes_cli.providers import LLAMACPP_ALIASES
+
+    excluded = {str(p).strip().lower() for p in (ctx.excluded_providers or []) if p}
+    return bool(excluded & set(LLAMACPP_ALIASES))
+
+
+def _managed_runtime_url() -> str:
+    """The running managed server's base URL (normalized), ``""`` when none is recorded."""
+    try:
+        from hermes_cli.local_runtime.endpoint import _state_endpoint
+
+        managed = _state_endpoint()
+    except Exception:  # health: allow BLE001 -- a torn/legacy runtime state file must degrade to "no managed server" (as _local_runtime_row does), never break the picker
+        return ""
+    return str((managed or {}).get("base_url") or "").strip().rstrip("/")
 
 
 def _local_runtime_row(ctx: ConfigContext) -> dict | None:

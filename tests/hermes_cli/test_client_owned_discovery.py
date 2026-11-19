@@ -21,13 +21,31 @@ from hermes_cli import gateway_client, gateway_runtime_start
 home = Path(os.environ['HERMES_HOME'])
 real_popen = subprocess_popen = gateway_runtime_start.subprocess.Popen
 GATEWAY = r"""
-import asyncio
+import asyncio, os
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
+from gateway.control_socket import GatewayControlServer
 from gateway.client_lifetime import arm_client_lifetime
 arm_client_lifetime()
 from gateway.config import GatewayConfig
 from gateway.run import GatewayRunner
 from gateway.run_bootstrap import start_gateway
+home = Path(os.environ['HERMES_HOME'])
+real_handle = GatewayControlServer._handle_connection
+async def handle(self, reader, writer):
+    if not (home / 'interrupt-identify').exists():
+        return await real_handle(self, reader, writer)
+    (home / 'interrupt-identify').unlink()
+    try:
+        await reader.readline()
+        writer.write(b'{"protocol":1')
+        await writer.drain()
+        (home / 'identify-mid-read').touch()
+        # Owner release ends the process with identify still awaiting its newline.
+        await asyncio.Future()
+    finally:
+        writer.close()
+GatewayControlServer._handle_connection = handle
 with patch.object(GatewayRunner, '_start_mcp_discovery'), patch.object(GatewayRunner, '_await_mcp_discovery', AsyncMock()):
     asyncio.run(start_gateway(GatewayConfig(), client_owned=True))
 """
@@ -48,7 +66,26 @@ class WS:
 @asynccontextmanager
 async def connect(*args, **kwargs):
     yield WS()
+def arm_interruption():
+    from hermes_cli import gateway_runtime_discovery as discovery
+    real_query = discovery.query_identify
+    armed = False
+    def identify(*args, **kwargs):
+        nonlocal armed
+        try:
+            result = real_query(*args, **kwargs)
+        except discovery.DiscoveryError as exc:
+            if exc.reason == 'incomplete_control_response':
+                (home / 'identify-eof').touch()
+            raise
+        if result.get('client_owned') and not armed:
+            armed = True
+            (home / 'second-observed-owner').touch()
+        return result
+    discovery.query_identify = identify
 async def main():
+    if os.environ.get('INTERRUPT_IDENTIFY'):
+        arm_interruption()
     (home / (os.environ.get('CLIENT_MARKER', 'first') + '-started')).touch()
     with patch.object(gateway_runtime_start.subprocess, 'Popen', spawn), patch('websockets.asyncio.client.connect', connect):
         async with gateway_client.connect_gateway(one_shot=True):
@@ -84,7 +121,8 @@ def test_multiplexer_discovery_requires_the_creators_lease(tmp_path, monkeypatch
 
 
 @pytest.mark.platforms("posix")
-def test_second_finite_client_waits_then_owns_its_gateway(tmp_path, monkeypatch):
+@pytest.mark.parametrize("interrupt_identify", [False, True], ids=["normal", "eof-on-release"])
+def test_second_finite_client_waits_then_owns_its_gateway(tmp_path, monkeypatch, interrupt_identify):
     from hermes_cli.gateway_runtime import ensure_gateway_runtime
 
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
@@ -101,7 +139,8 @@ def test_second_finite_client_waits_then_owns_its_gateway(tmp_path, monkeypatch)
             out, err = first.communicate(timeout=5)
             pytest.fail(f"first finite client failed: {out}\n{err}")
 
-        second = subprocess.Popen([sys.executable, "-c", FIRST_CLIENT], env={**env, "CLIENT_MARKER": "second"},
+        second = subprocess.Popen([sys.executable, "-c", FIRST_CLIENT], env={**env, "CLIENT_MARKER": "second",
+                                        **({"INTERRUPT_IDENTIFY": "1"} if interrupt_identify else {})},
                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, encoding="utf-8")
         assert wait_until(lambda: (tmp_path / "second-started").exists(), timeout=20)
@@ -125,9 +164,15 @@ def test_second_finite_client_waits_then_owns_its_gateway(tmp_path, monkeypatch)
         assert observed.reason_code == "client_owned"
         assert observed.endpoint is None
         assert first.poll() is None
+        if interrupt_identify:
+            assert wait_until(lambda: (tmp_path / "second-observed-owner").exists(), timeout=20)
+            (tmp_path / "interrupt-identify").touch()
+            assert wait_until(lambda: (tmp_path / "identify-mid-read").exists(), timeout=20)
         first.stdin.close()
         first.stdin = None
         assert first.wait(timeout=15) == 0
+        if interrupt_identify:
+            assert wait_until(lambda: (tmp_path / "identify-eof").exists(), timeout=5)
         assert wait_until(lambda: (tmp_path / "second-attached").exists() or second.poll() is not None,
                           timeout=60)
         assert (tmp_path / "second-attached").exists(), second.communicate(timeout=5)

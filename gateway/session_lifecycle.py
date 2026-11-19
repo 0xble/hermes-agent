@@ -56,6 +56,23 @@ def _parse_iso(value) -> Optional[datetime]:
 _AUTO_CONTINUE_FRESHNESS_SECS_DEFAULT = 60 * 60
 
 
+# Set on a delegate subagent's row a user explicitly switched a chat onto (``/resume <child> --all``,
+# handoff). ``_delegate_from`` stays: it is lineage (compression continuations, the running worker's
+# publish check), not a routing flag; this marker alone tells the route guard the user chose the row.
+CHAT_ADOPTED_MARKER = "_chat_adopted"
+
+
+def is_delegate_child_row(row: dict) -> bool:
+    """A delegate subagent's row: never a chat's route or topic-binding target. A row that also carries
+    ``_reset_from`` is a /new continuation of the chat whose config picked up the marker (#109073), and
+    one carrying ``CHAT_ADOPTED_MARKER`` was chosen by the user; both stay routable (same rule as peer
+    recovery's ``_DELEGATE_CHILD_EXCLUSION_SQL``)."""
+    from hermes_state_sessions import _parse_model_config
+    config = _parse_model_config(row.get("model_config"))
+    return (bool(config.get("_delegate_from")) and "_reset_from" not in config
+            and not config.get(CHAT_ADOPTED_MARKER))
+
+
 def auto_continue_freshness_window() -> float:
     """Resume-scheduler freshness window; stale automation never discards the transcript."""
     raw = os.environ.get("HERMES_AUTO_CONTINUE_FRESHNESS")
@@ -69,8 +86,8 @@ class SessionLifecycleMixin:
     """SessionStore explicit boundaries and crash-recovery markers."""
 
     def _is_session_ended_in_db(self, session_id: str, session_key: Optional[str] = None) -> bool:
-        """True iff state.db says the session is gone: ended (non-null end_reason) or hard-deleted
-        (no row in a readable owning DB). No DB or a DB error -> False (same failure mode as
+        """True iff state.db says the session is gone: ended (non-null end_reason), hard-deleted
+        (no row in a readable owning DB), or a delegate subagent's row (never a chat's route). No DB or a DB error -> False (same failure mode as
         ``_prune_stale_sessions_locked``). Lets routing self-heal a session finalized or deleted
         while the gateway stays alive. Store resolved from the owning profile.
 
@@ -103,7 +120,9 @@ class SessionLifecycleMixin:
             row = db.get_session(session_id)
         except Exception:
             return False
-        return row is None or row.get("end_reason") is not None
+        # A delegate subagent's row is never a chat's conversation: a route left naming one (written while
+        # the subagent captured the thread, #138210) is stale, so recovery hands the chat back to its owner.
+        return row is None or row.get("end_reason") is not None or is_delegate_child_row(row)
 
     def _local_receipt_target(self, entry: Optional[SessionEntry]) -> Optional[str]:
         """The physical target the authority's receipt names for *entry*'s local route, else None
@@ -239,6 +258,67 @@ class SessionLifecycleMixin:
                 return False
             self._set_turn_marker_locked(session_key, entry, None, None)
         return True
+
+    def record_progress_card(self, session_key: str, chat_id: str, message_id: str) -> bool:
+        """Durably note a temporary progress card as sent, owned by this process."""
+        card = {"chat_id": str(chat_id), "message_id": str(message_id), "pid": os.getpid()}
+        return self._replace_progress_cards(session_key, lambda cards: cards + [card])
+
+    def forget_progress_cards(self, session_key: str, chat_id: str, message_ids) -> bool:
+        """Drop the record of cards whose cleanup has run (or that a failed run keeps on purpose)."""
+        gone = {(str(chat_id), str(mid)) for mid in message_ids}
+        return self._replace_progress_cards(
+            session_key, lambda cards: [c for c in cards if (c["chat_id"], c["message_id"]) not in gone])
+
+    def settle_swept_progress_cards(self, session_key: str, chat_id: str, outcome: dict, max_attempts: int) -> bool:
+        """Apply one boot delete attempt (``{message_id: deleted}``): drop the deleted cards and count
+        a failed attempt on the rest, dropping a card once ``max_attempts`` deletes have failed. A
+        flood refusal reports every id as not deleted, so a single failure is no reason to forget."""
+        def change(cards):
+            kept = []
+            for card in cards:
+                done = outcome.get(card["message_id"]) if card["chat_id"] == str(chat_id) else None
+                if done is None:
+                    kept.append(card)
+                elif not done and (attempts := int(card.get("attempts") or 0) + 1) < max_attempts:
+                    kept.append({**card, "attempts": attempts})
+            return kept
+        return self._replace_progress_cards(session_key, change)
+
+    def _replace_progress_cards(self, session_key: str, change) -> bool:
+        """Persist ``change(cards)`` before publishing it, through the single-entry fast save."""
+        with self._lock:
+            entry = self._entry_locked(session_key)
+            if entry is None:
+                return False
+            cards = change(list(entry.progress_cards))
+            if cards == entry.progress_cards:
+                return False
+            self._save_entry(session_key, entry_data={**entry.to_dict(), "progress_cards": cards}, lock_held=True)
+            entry.progress_cards = cards
+        return True
+
+    def orphan_progress_cards(self) -> list[tuple[str, SessionSource, str, list[str]]]:
+        """``(session_key, origin, chat_id, message_ids)`` for recorded cards whose owning process
+        is gone. A live owner (this process, or a zero-cut predecessor still finishing its turns)
+        still holds the cleanup callback, so its cards are left to it."""
+        from gateway.status import _pid_exists
+        with self._lock:
+            self._ensure_loaded_locked()
+            recorded = [(key, e.origin, list(e.progress_cards)) for key, e in self._entries.items()
+                        if e.progress_cards and e.origin is not None]
+        live: dict = {}
+        orphans: dict = {}
+        for key, origin, cards in recorded:
+            for card in cards:
+                pid = card.get("pid")
+                if isinstance(pid, int) and pid > 0:
+                    if pid not in live:
+                        live[pid] = _pid_exists(pid)
+                    if live[pid]:
+                        continue
+                orphans.setdefault((key, card["chat_id"]), (origin, []))[1].append(card["message_id"])
+        return [(key, origin, chat_id, mids) for (key, chat_id), (origin, mids) in orphans.items()]
 
     def recover_interrupted_turns(self, max_age_seconds: int = 60 * 60) -> int:
         """Promote crash-left turn markers into ``resume_pending`` (unclean startup only).

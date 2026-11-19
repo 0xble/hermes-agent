@@ -17,7 +17,6 @@ import os
 import socket
 import stat
 import subprocess
-import sys
 import time
 
 import pytest
@@ -27,6 +26,7 @@ import tools.browser_use_cli as bu_cli
 from tools import browser_tool_install as bt_install
 from tools import browser_tool_cloud as bt_cloud
 from tools import browser_tool_session as bt_session
+from tests.waiting import wait_until
 
 
 @pytest.fixture(autouse=True)
@@ -62,6 +62,9 @@ def _fake_supervisor_registry(monkeypatch):
     class _Registry:
         def get_or_start(self, task_id, cdp_url, **kw):
             attached.append((task_id, cdp_url))
+
+        def get(self, task_id):
+            return None  # No live supervisor behind the fixture’s fake endpoint.
 
     monkeypatch.setattr(browser_supervisor, "SUPERVISOR_REGISTRY", _Registry())
     return attached
@@ -185,11 +188,13 @@ class TestSubprocessEnvironment:
         assert "/bin" in parts
 
     @pytest.mark.skipif(os.name == "nt", reason="POSIX PATH-floor semantics")
-    def test_floor_preserves_existing_entries_and_order(self):
+    def test_floor_preserves_existing_entries_and_order(self, monkeypatch):
         """The floor only adds dirs — never drops or reorders what the
         caller's environment already had."""
         original = "/opt/toolchain/bin:/usr/bin:/snap/bin"
-        merged = bu_cli._floor_subprocess_path(original).split(os.pathsep)
+        from tools import browser_tool
+        monkeypatch.setattr(browser_tool, "_build_browser_env", lambda **_kw: {"PATH": original})
+        merged = bu_cli._base_subprocess_env()["PATH"].split(os.pathsep)
 
         assert set(original.split(os.pathsep)) <= set(merged)
         positions = [merged.index(p) for p in original.split(os.pathsep)]
@@ -706,6 +711,19 @@ class TestOwnTabPreamble:
         ast.parse(bu_cli._OWN_TAB_PREAMBLE)
         # and composes with model code
         ast.parse(bu_cli._OWN_TAB_PREAMBLE + "print('x')")
+
+    @pytest.mark.platforms("posix")
+    def test_marker_write_never_follows_a_planted_symlink(self, tmp_path, monkeypatch):
+        """The marker name in the shared temp root is predictable: a planted link must not create its target."""
+        monkeypatch.setenv("BU_NAME", "r7k2")
+        monkeypatch.setitem(sys.modules, "browser_harness", None)  # no daemon pid: marker suffix "0"
+        monkeypatch.setattr("tempfile.gettempdir", lambda: str(tmp_path))
+        victim = tmp_path / "victim"
+        (tmp_path / f"hermes-bu-owntab-{os.getuid()}-r7k2-0").symlink_to(victim)  # windows-footgun: ok — posix-only
+
+        exec(bu_cli._OWN_TAB_PREAMBLE, {"cdp": lambda *a, **k: {}, "switch_tab": lambda _tid: None})
+
+        assert not victim.exists()
 
 
 class TestProviderPickerIntegration:
@@ -1239,7 +1257,7 @@ class TestTimeoutProcessGroupKill:
     blocked forever, and the wedged call's activity heartbeat pins the session at
     "now" in the sidebar indefinitely."""
 
-    @pytest.mark.skipif(sys.platform == "win32", reason="POSIX process groups")
+    @pytest.mark.platforms("posix")
     def test_timeout_kills_grandchild_and_returns_promptly(self, tmp_path, monkeypatch):
         """A grandchild that outlives the direct child and holds the inherited stdout
         pipe must not keep browser_exec blocked past the timeout (it wedged permanently
@@ -1247,13 +1265,29 @@ class TestTimeoutProcessGroupKill:
         monkeypatch.setattr("hermes_cli.config.load_config_readonly", dict)
         pid_file = tmp_path / "grandchild.pid"
         cli = _fake_cli(tmp_path, (
-            "cat > /dev/null\n"
             "sleep 60 &\n"
             "echo $! > \"" + str(pid_file) + "\"\n"
             "sleep 60\n"
         ))
         monkeypatch.setattr(bu_cli, "_find_cli", lambda: [cli])
         monkeypatch.setattr(bu_cli, "_MIN_TIMEOUT_S", 1)
+        real_popen = bu_cli.subprocess.Popen
+
+        def ready_popen(*args, **kwargs):
+            proc = real_popen(*args, **kwargs)
+            try:
+                # Exercise a pipe-holding descendant, not a race against shell startup.
+                wait_until(
+                    lambda: pid_file.exists() and pid_file.read_text(encoding="utf-8-sig").strip(),
+                    timeout=5, what="pipe-holding grandchild started",
+                )
+            except BaseException:
+                bu_cli._kill_cli_process_group(proc)
+                proc.communicate(timeout=5)
+                raise
+            return proc
+
+        monkeypatch.setattr(bu_cli.subprocess, "Popen", ready_popen)
 
         start = time.time()
         result = json.loads(bu_cli.browser_exec("print(1)", timeout_s=1))

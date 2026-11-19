@@ -210,6 +210,9 @@ def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdo
         sig_name = _shutdown_ctx["signal"] if _shutdown_ctx else None
 
         if planned_takeover:
+            # The replacing gateway serves this home on: telling its home chats "shutting down" is
+            # false, and two services fighting over one home would repeat it every few seconds.
+            runner._planned_takeover_shutdown = True
             logger.info("Received %s as a planned --replace takeover — exiting cleanly", sig_name or "SIGTERM")
         elif planned_stop:
             logger.info("Received %s as a planned gateway stop — exiting cleanly", sig_name or "SIGTERM/SIGINT")
@@ -798,6 +801,11 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
     os.environ["HERMES_EXEC_ASK"] = "1"
     from hermes_cli.update_proxy_env import restore_user_proxy_env
     restore_user_proxy_env()  # a gateway an update restarted keeps the user's proxy env, not the update's
+    try:
+        from tools.computer_use.cua_driver_lifetime import sweep_on_startup
+        sweep_on_startup()
+    except ImportError:  # sweep_on_startup itself never raises; only an unimportable module reaches here
+        logger.debug("cua-driver startup sweep unavailable", exc_info=True)
     _start_gateway_resolve_terminal_cwd()
 
     from hermes_cli.resource_limits import apply_nofile_soft_limit

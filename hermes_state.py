@@ -7,6 +7,7 @@ splits sessions via parent_session_id chains; sessions are source-tagged
 
 import asyncio
 import atexit
+import errno
 import hashlib
 import json
 import logging
@@ -50,7 +51,7 @@ from hermes_state_guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
     _register_test_instance, _set_last_init_error, get_last_init_error,
 )
-from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for
+from hermes_state_readpool import _READ_POOL_MAX, _proc_fd_targets, _read_budget_for, note_read_pool_exhausted
 from hermes_state_sessions import SessionSessionsMixin
 from hermes_state_fts import SessionFtsSetupMixin
 from hermes_state_portability import SessionPortabilityMixin
@@ -61,8 +62,13 @@ import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
 from hermes_loop_guard import LoopGuardedLock, check as check_loop_thread
+from hermes_state_write import (
+    WriterMutexTimeout as WriterMutexTimeout, write_site as write_site,
+    writer_mutex_until as writer_mutex_until,
+)
 from hermes_state_dbfile import (
-    _connect_tracked_db, _fd_is_truly_unlinked, _prepare_connection_retirement,
+    _chmod_pinned_inode, _connect_tracked_db, _fd_is_truly_unlinked, _is_operator_store_link,
+    _prepare_connection_retirement,
     _read_sqlite_application_id, _stat_sqlite_sidecar_identity,
     _watched_sqlite_sidecar_paths, has_invalid_sqlite_header_preopen, has_valid_sqlite_header_preopen,
     is_zeroed_state_db, quarantine_cross_process_lock,
@@ -86,7 +92,7 @@ from hermes_state_gateway import SessionGatewayMixin
 from hermes_state_compression import SessionCompressionMixin
 from hermes_state_search import SessionSearchMixin
 from hermes_state_stored_reads import SessionStoredReadsMixin
-from hermes_state_transactions import settle_write_transaction
+from hermes_state_transactions import execute_prune_write, finish_write_maintenance, settle_write_transaction
 from hermes_state_write_stalls import observe_write, write_attempt
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
@@ -257,13 +263,16 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
     the process umask (commonly 0644 under 0022). Read-only SessionDB
     attachments never call this helper and remain observational.
 
-    Existing files are tightened with ``chmod(2)`` on the path: opening the
+    Existing files are tightened without ever (re)opening them: opening the
     file and closing that descriptor would drop every POSIX ``fcntl`` lock the
     process holds on its inode — including the locks of an already-open SQLite
     connection to the same database. A lock-losing close in one process lets a
     sibling's connection take the shared-memory DMS exclusively at its own
     close, checkpoint, and unlink the sidecars while long-lived holders
     (gateway, desktop ``hermes serve``) keep using the deleted inodes.
+    Symlinked state paths fail closed with ``ELOOP`` before the caller's
+    ``sqlite3.connect()`` can follow them (#109857), except a ``state.db``
+    link the operator made to a store of their own (#145075).
     """
     if os.name == "nt":
         return
@@ -293,21 +302,27 @@ def _secure_state_db_files(db_path: Path, *, create_main: bool = False) -> None:
         db_path.with_name(db_path.name + "-wal"),
         db_path.with_name(db_path.name + "-shm"),
     ):
-        # fchmod on an fd of a pre-existing file cannot be used here: close(fd)
-        # would release this process's POSIX locks on that inode, stripping the
-        # locks of any live SQLite connection to the same database. chmod(2)
-        # never opens the file, so it leaves the lock state untouched.
+        # fchmod on an ordinary fd of a pre-existing file cannot be used here:
+        # close(fd) would release this process's POSIX locks on that inode,
+        # stripping the locks of any live SQLite connection to the same database.
+        # _chmod_pinned_inode never takes a lock-bearing descriptor.
         try:
             st = os.lstat(path)
         except FileNotFoundError:
             continue
         if stat.S_ISLNK(st.st_mode):
-            # Refuse a planted symlink exactly like O_NOFOLLOW would.
-            continue
+            if path == main_path and _is_operator_store_link(path, st):
+                # A store moved to other storage and linked back (#145075): SQLite follows the link as
+                # before, and the target keeps the mode its owner gave it.
+                continue
+            # Fail closed exactly like the O_NOFOLLOW create above: silently
+            # skipping the link lets the caller's sqlite3.connect() follow it
+            # and operate on whatever it points at (#109857).
+            raise OSError(errno.ELOOP, os.strerror(errno.ELOOP), str(path))
         if not stat.S_ISREG(st.st_mode):
             continue
         try:
-            os.chmod(path, 0o600)
+            _chmod_pinned_inode(path, 0o600)
         except FileNotFoundError:
             # SQLite's last holder can unlink a sidecar after the lstat.
             continue
@@ -558,6 +573,34 @@ class SessionDB(
             (prompt_hash, system_prompt),
         )
         return prompt_hash
+
+    @staticmethod
+    def _delete_prompt_if_unreferenced(conn, prompt_hash: str) -> None:
+        conn.execute(
+            "DELETE FROM system_prompts WHERE hash=? AND NOT EXISTS ("
+            "SELECT 1 FROM sessions WHERE system_prompt_hash=system_prompts.hash) AND NOT EXISTS ("
+            "SELECT 1 FROM sessions WHERE tool_names=system_prompts.hash)",
+            (prompt_hash,),
+        )
+
+    def _replace_prompt_reference(self, conn, session_id: str, value: Optional[str], *, tool_names: bool = False) -> None:
+        row = conn.execute(
+            "SELECT system_prompt_hash, tool_names FROM sessions WHERE id = ?", (session_id,),
+        ).fetchone()
+        if row is None:
+            return
+        new_hash = self._store_system_prompt(conn, value)
+        if tool_names:
+            conn.execute("UPDATE sessions SET tool_names = ? WHERE id = ?", (new_hash, session_id))
+            old_hash = row[1]
+        else:
+            conn.execute("UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
+                         (new_hash, session_id))
+            old_hash = row[0]
+        # A binding change can orphan only its previous reference. Bulk
+        # maintenance still collects older orphans left by other paths.
+        if old_hash is not None and old_hash != new_hash:
+            self._delete_prompt_if_unreferenced(conn, old_hash)
 
     @staticmethod
     def _delete_unreferenced_system_prompts(conn, limit: Optional[int] = None) -> int:
@@ -872,6 +915,10 @@ class SessionDB(
             # Existing WAL/SHM files may predate the main-file hardening;
             # normalize any sidecars that became visible during WAL setup.
             _secure_state_db_files(self.db_path)
+            if self._wal_active and sys.platform == "darwin":
+                # The periodic PASSIVE checkpoint runs off the writer lock. SQLite's
+                # default auto-checkpoint can otherwise do the same fullfsync work in commit().
+                conn.execute("PRAGMA wal_autocheckpoint=0")
             apply_database_pragmas(conn, db_label="state.db")
             conn.execute("PRAGMA foreign_keys=ON")
         except BaseException:
@@ -935,8 +982,10 @@ class SessionDB(
                 return None
         # Permit BEFORE the open: openers race for permits, not descriptors.
         if not self._read_budget.acquire(self):
-            logger.debug("read pool at capacity (%d) for %s; %s", _READ_POOL_MAX, self.db_path,
-                         "search queued for a reader" if independent else "using locked writer fallback")
+            if independent:
+                logger.debug("read pool at capacity (%d) for %s; search queued for a reader", _READ_POOL_MAX, self.db_path)
+            else:
+                note_read_pool_exhausted(self.db_path)
             return None
         conn = None  # bound before the try so the handlers can close a half-open one
         try:
@@ -1095,8 +1144,8 @@ class SessionDB(
     ) -> T:
         """Run *fn(conn)* in a write transaction; see :meth:`_execute_write_marked`."""
         with observe_write(self.db_path, fn), _storage_write_in_progress(), measure_write():
-            return self._execute_write_marked(
-                fn, patience_s, session_ids=session_ids, skip_result=skip_result, session_id=session_id, input_rows=input_rows)
+            return execute_prune_write(self, fn, patience_s,
+                session_ids=session_ids, skip_result=skip_result, session_id=session_id, input_rows=input_rows)
 
     def _execute_write_marked(
         self, fn: Callable[[sqlite3.Connection], T], patience_s: Optional[float] = None,
@@ -1114,6 +1163,9 @@ class SessionDB(
         if patience_s is None:
             patience_s = self._WRITE_PATIENCE_S
         deadline = time.monotonic() + patience_s
+        from hermes_state_prune_budget import current_budget, prune_sql, write_patience
+        budget = current_budget()
+        patience_s, deadline = write_patience(patience_s, deadline)
         compression_deadline: Optional[float] = None  # set on the first compression-busy collision
         # One retry for SQLITE_IOERR raised by BEGIN IMMEDIATE itself (callback not run: nothing
         # replayed). Once fn has started, an IOERR leaves settlement unknown and must propagate.
@@ -1154,17 +1206,13 @@ class SessionDB(
                     if self._conn is None:  # close() raced this writer
                         self._reopen_after_close_locked(context="write")
                     conn = cast(sqlite3.Connection, self._conn)  # reopen succeeded under the writer guard
-                    conn.execute("BEGIN IMMEDIATE")
-                    fn_started = True
-                    result = settle_write_transaction(conn, fn, clock=time, logger=logger,
-                        warn_s=self._WRITE_LOCK_WARN_S, acquire_s=time.monotonic() - acquisition_started,
-                        session_id=session_id, input_rows=input_rows)
-                # Success — periodic best-effort checkpoint + FTS merge.
-                self._write_count += 1
-                if self._write_count % self._CHECKPOINT_EVERY_N_WRITES == 0:
-                    self._try_wal_checkpoint()
-                if self._write_count % self._FTS_MERGE_EVERY_N_WRITES == 0:
-                    self._try_incremental_merge_fts()
+                    with prune_sql(conn, write=True):
+                        conn.execute("BEGIN IMMEDIATE")
+                        fn_started = True
+                        result = settle_write_transaction(conn, fn, clock=time, logger=logger,
+                            warn_s=self._WRITE_LOCK_WARN_S, acquire_s=time.monotonic() - acquisition_started,
+                            session_id=session_id, input_rows=input_rows)
+                finish_write_maintenance(self, bounded=budget is not None)
                 return result
             except SessionCompressionInProgressError as exc:
                 raise_if_nonretryable_contention(exc)
@@ -1260,8 +1308,10 @@ class SessionDB(
         """``fetchall()`` of one read-only statement via ``_read_ctx``."""
         return self._read_retrying_ioerr(lambda conn: conn.execute(sql, params).fetchall())
 
-    def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T]) -> T:
+    def _read_retrying_ioerr(self, fn: Callable[[sqlite3.Connection], T], *, read_context=None) -> T:
         """Run an idempotent SELECT through ``_read_ctx``, retrying a transient SQLITE_IOERR.
+
+        ``read_context`` selects an independent snapshot reader when writer fallback is deferred.
 
         A warm ``mode=ro`` pooled reader can hit the same millisecond-wide WAL transition window as a
         read-only OPEN (#100436) when its statement executes or steps: a sibling process's checkpoint /
@@ -1272,9 +1322,10 @@ class SessionDB(
         never quarantined (busy is not broken). A persistent IOERR exhausts the budget and propagates."""
         for attempt in range(_READ_ONLY_IOERR_RETRY_ATTEMPTS + 1):
             try:
-                with self._read_ctx() as conn:
+                with (read_context or self._read_ctx)() as conn:
                     from hermes_state_search_runtime import search_stage
-                    with search_stage(self, "sql_ms"):
+                    from hermes_state_prune_budget import prune_sql
+                    with search_stage(self, "sql_ms"), prune_sql(conn):
                         return fn(conn)
             except sqlite3.OperationalError as exc:
                 if attempt >= _READ_ONLY_IOERR_RETRY_ATTEMPTS or _DISK_IO_ERROR_MARKER not in str(exc).lower():
@@ -1672,7 +1723,7 @@ class SessionDB(
         ``self._lock`` so it pairs with the WAL lock guard exactly like a writer reopen."""
         if self._checkpoint_conn is not None and self._checkpoint_conn_writer is self._conn:
             return self._checkpoint_conn
-        with self._lock:
+        with state_lock(self._lock, db_path=self.db_path):
             if self._conn is None or self.read_only:
                 return None
             stale, self._checkpoint_conn = self._checkpoint_conn, None
@@ -1794,9 +1845,11 @@ class SessionDB(
         "api_call_count",
     )
     _TOKEN_DELTA_COST_FIELDS = ("estimated_cost_usd", "actual_cost_usd")
+    # ``prompt_cache_clock`` is keyed like a route field: deltas carrying different cache events
+    # apply in order (the last write wins in the column) rather than merging.
     _TOKEN_DELTA_ROUTE_FIELDS = (
         "model", "cost_status", "cost_source", "pricing_version", "billing_provider", "billing_base_url",
-        "billing_mode", "source", "task",
+        "billing_mode", "source", "task", "prompt_cache_clock",
     )
 
     MAX_TITLE_LENGTH = 100

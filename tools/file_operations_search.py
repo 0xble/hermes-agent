@@ -4,7 +4,6 @@
 (no I/O).
 """
 
-import contextlib
 import os
 import posixpath
 import re
@@ -674,15 +673,11 @@ class SearchMixin:
             diagnostic = f"rg: {exc}"[:4096]
             return ExecuteResult(stdout="" if capture_stderr else diagnostic,
                                  stderr=diagnostic if capture_stderr else "", exit_code=2)
-        # Record the group while the process is certainly alive. The kill path
-        # below is reached through `poll() is None`, so the leader can exit
-        # before it looks the group up, and a group outlives a leader that
-        # forked into it. Without this the lookup fails with nothing to fall
-        # back to, and any surviving member would be left running.
-        with contextlib.suppress(ProcessLookupError):
-            proc._hermes_pgid = os.getpgid(proc.pid)
-            from gateway.status import get_process_start_time
-            proc._hermes_pgid_start = get_process_start_time(proc.pid)
+        # Record the process group as its leader's pid: start_new_session makes this true,
+        # and a getpgid read-back can race with a short-lived rg child.
+        from gateway.status import get_process_start_time
+        proc._hermes_pgid = proc.pid
+        proc._hermes_pgid_start = get_process_start_time(proc.pid)
 
         # Drain on a thread so a silent rg (huge tree, no hits yet) cannot pin the
         # caller past the deadline or past a /stop; the waiter below owns both.
@@ -899,7 +894,7 @@ class SearchMixin:
                       f"Nearest existing parent: {nearest_parent or 'unknown'}"]
         parent_check = self._exec(f"test -d {self._escape_shell_arg(parent)} && echo yes || echo no")
         if "yes" in parent_check.stdout and basename_query:
-            ls_result = self._exec(f"ls -1 {self._escape_shell_arg(parent)} 2>/dev/null | head -20")
+            ls_result = self._exec(f"ls -1 -- {self._escape_shell_arg(parent)} 2>/dev/null | head -20")
             if ls_result.exit_code == 0 and ls_result.stdout.strip():
                 lq = basename_query.lower()
                 candidates = [
@@ -1025,7 +1020,7 @@ class SearchMixin:
             else:
                 glob_expr_probe = glob_expr
             probe_words = [rg, flags, "--count-matches", glob_expr_probe,
-                           self._escape_shell_arg(pattern, translate_path=False), self._escape_native_tool_arg(path)]
+                           "-e", self._escape_shell_arg(pattern, translate_path=False), "--", self._escape_native_tool_arg(path)]
             probe = self._run_rg_bounded(probe_words, 50, timeout=30)
             total, per_file = 0, []
             for line in (probe.stdout or "").strip().splitlines():
@@ -1101,20 +1096,26 @@ class SearchMixin:
     def _filter_gitignored_paths(
         self, paths: list[str], root: str, deadline: float
     ) -> tuple[list[str], Optional[str]]:
-        """Drop gitignored paths without extending the filename search deadline."""
+        """Drop paths ignored by git when *root* is inside a git worktree.
+
+        ``-c core.fsmonitor=false`` is a security override, not a preference: git runs
+        the program named by the searched repo's own ``core.fsmonitor`` config, and a
+        command-line ``-c`` outranks the repo config (#137582). The subprocesses use only
+        the filename search's remaining wall-clock budget.
+        """
         if not paths:
             return paths, None
 
         escaped_root = self._escape_shell_arg(root)
         probe = self._exec_before_deadline(
-            f"git -C {escaped_root} rev-parse --is-inside-work-tree >/dev/null 2>&1",
+            f"git -c core.fsmonitor=false -C {escaped_root} rev-parse --is-inside-work-tree >/dev/null 2>&1",
             deadline, timeout=10,
         )
         if probe.exit_code != 0:
             return paths, "search_timeout" if probe.exit_code == 124 else None
 
         result = self._exec_before_deadline(
-            f"git -C {escaped_root} check-ignore --stdin",
+            f"git -c core.fsmonitor=false -C {escaped_root} check-ignore --stdin",
             deadline, timeout=10, stdin_data="\n".join(paths),
         )
         if result.exit_code == 124:
@@ -1512,7 +1513,8 @@ class SearchMixin:
             cmd_parts.extend(["--glob", self._escape_shell_arg(file_glob)])
         if output_mode in _OUTPUT_MODE_FLAGS:
             cmd_parts.append(_OUTPUT_MODE_FLAGS[output_mode])
-        cmd_parts.append(self._escape_shell_arg(pattern, translate_path=False))
+        # Quoting protects shell syntax, not rg's option parser (also on native argv).
+        cmd_parts.extend(["-e", self._escape_shell_arg(pattern, translate_path=False), "--"])
         # rg is a native Windows binary (winget/cargo/choco): needs C:/... not MSYS /c/...
         cmd_parts.append(self._escape_native_tool_arg(path))
         ml_note = (
@@ -1540,7 +1542,8 @@ class SearchMixin:
             parts.extend(["--include", self._escape_shell_arg(file_glob)])
         if output_mode in _OUTPUT_MODE_FLAGS:
             parts.append(_OUTPUT_MODE_FLAGS[output_mode])
-        parts.append(self._escape_shell_arg(pattern, translate_path=False))
+        # Shared by ordinary recursion and find -exec's pruned search.
+        parts.extend(["-e", self._escape_shell_arg(pattern, translate_path=False), "--"])
         return parts
 
     def _search_with_grep(self, pattern: str, path: str, file_glob: Optional[str],

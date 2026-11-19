@@ -21,6 +21,8 @@ from gateway.session_settlement_recovery import (
 )
 from tui_gateway.contracts.registry import EVENTS
 
+pytestmark = pytest.mark.usefixtures("authority_cwd_in_tmp")  # symbolic profile ids are relative homes
+
 
 def test_restart_drain_timeout_default_stays_zero():
     from gateway.restart import DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT
@@ -193,7 +195,7 @@ def test_managed_worker_turn_settles_with_the_cause_of_the_stop_that_reached_it(
     authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='i'))
     runner.session_authority = authority
-    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
+    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c', profile=None), 'route')
     actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     ref = SessionRef('owned', 's')
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
@@ -317,15 +319,16 @@ def test_restart_after_a_pending_redirect_still_gets_the_restart_notice():
 ])
 def test_automation_turn_the_owner_stop_interrupted_is_never_asked_to_resend(cause, row):
     """#134889 GW-20: nobody sent an unattended turn, so the owner-stop notice is the neutral
-    automation copy (GW-10's rule), never "Send your message again"."""
-    from agent.turn_failure_copy import AUTOMATION_INTERRUPTED_NOTICE
+    automation copy (GW-10's rule) naming the automation, never "Send your message again"."""
+    from gateway.session_unattended_unknown import interrupted_notice
     stream = _Stream()
     live = SimpleNamespace(controls=SimpleNamespace(snapshot=lambda *a: None), event_stream=stream)
     _publish_completion(SimpleNamespace(runner=None), live, SimpleNamespace(session_id='s'),
                         {'admission_id': 'adm-1', 'request_id': 'sub-1', **row},
                         {'outcome': 'interrupted'}, '', _cause(cause))
     (frame,) = stream.frames
-    assert frame['warning'] == AUTOMATION_INTERRUPTED_NOTICE
+    assert frame['warning'] == interrupted_notice({'request_id': 'sub-1', **row})
+    assert 'was interrupted and was not run again' in frame['warning']
     assert 'again' not in frame['warning'].replace('not run again', '')
 
 
@@ -494,7 +497,7 @@ def test_shutdown_stop_before_the_managed_worker_spawned_carries_its_cause(tmp_p
     db.create_session('s', source='test')
     authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='i'))
-    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
+    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c', profile=None), 'route')
     actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     ref = SessionRef('owned', 's')
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)
@@ -558,7 +561,7 @@ def test_a_stop_during_context_reference_expansion_never_spawns_the_worker(tmp_p
     db.create_session('s', source='test')
     authority = SessionAuthority(runner, profile_id='owned', instance_id='i', db=db,
                                  epoch=begin_runtime_epoch(db, instance_id='i'))
-    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c'), 'route')
+    live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='human', chat_id='c', profile=None), 'route')
     actor = SessionActor('human', 'owned', frozenset({'session:submit', 'session:control'}), 'cli')
     ref = SessionRef('owned', 's')
     monkeypatch.setattr(authority, '_schedule', lambda ref: None)

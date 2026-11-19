@@ -6,7 +6,6 @@ import os
 from typing import Optional
 
 from agent.i18n import t
-from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter
 from gateway.session import SessionSource
@@ -64,8 +63,8 @@ class GatewayBackgroundMixin:
             max_iterations = _current_max_iterations()
             reasoning_config = self._resolve_session_reasoning_config(source=source, model=model)
             self._reasoning_config = reasoning_config
-            self._service_tier = self._resolve_session_service_tier(source=source)
-            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            service_tier = self._resolve_session_service_tier(source=source)
+            turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs, tier=service_tier)
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
@@ -93,7 +92,7 @@ class GatewayBackgroundMixin:
                     enabled_toolsets=enabled_toolsets,
                     disabled_toolsets=disabled_toolsets,
                     reasoning_config=reasoning_config,
-                    service_tier=self._service_tier,
+                    service_tier=turn_route.get("service_tier"),
                     request_overrides=turn_route.get("request_overrides"),
                     providers_allowed=pr.get("only"),
                     providers_ignored=pr.get("ignore"),
@@ -136,16 +135,14 @@ class GatewayBackgroundMixin:
             if response:
                 media_files, response = adapter.extract_media(response)
                 media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+                from gateway.platforms.docker_media_paths import hand_back_unreadable_media
+                await hand_back_unreadable_media([p for p, _ in media_files])
                 images, text_content = adapter.extract_images(response)
                 text_content = restore_inline_copy_bodies(text_content, inline_bodies)
             if text_content:
-                content = header + text_content
-                if source.platform == Platform.SLACK and not (result or {}).get("error"):
-                    from agent.notice_style import notice_metadata
-                    await adapter.send(chat_id=source.chat_id, content=header,
-                                       metadata=notice_metadata(_thread_metadata, platform=source.platform, style="context"))
-                    content = text_content
-                await adapter.send(chat_id=source.chat_id, content=content, metadata=_thread_metadata)
+                # Keep attribution and body in one send: concurrent completions must not
+                # interleave headers, and a rejected receipt must not leave a bare result.
+                await adapter.send(chat_id=source.chat_id, content=header + text_content, metadata=_thread_metadata)
             for copy_block in copy_blocks:
                 copy_metadata = dict(_thread_metadata or {})
                 copy_metadata["copy_block"] = True

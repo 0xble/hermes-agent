@@ -148,6 +148,11 @@ def check_api_response(
             return _verdict(_iv.action, _iv.result)
 
     agent._turn_received_provider_response = True
+    # Every row this response becomes (truncation fragments and Codex incomplete interims are built
+    # before record_response_usage runs) is stamped with THIS response's reasoning count, never a
+    # previous response's.
+    from agent.turn_usage import note_response_reasoning_tokens
+    note_response_reasoning_tokens(agent, response)
     finish_reason = _derive_finish_reason(agent, response, messages)
     from hermes_cli.observability.shared_metrics_harness import record_reply_finish
     record_reply_finish(agent, response, finish_reason)
@@ -206,6 +211,8 @@ def check_api_response(
         _preflight_compression_blocked = False
         _last_preflight_pressure = None
 
+    from agent.fallback_cooldown import clear_noninteractive_transient_retry
+    clear_noninteractive_transient_retry(agent)
     _retry.has_retried_429 = False
     # Clearing Nous rate-limit state proves the limit reset so other sessions may resume.
     if agent.provider == "nous":
@@ -218,6 +225,9 @@ def check_api_response(
     from agent import relay_llm
 
     relay_llm.complete_logical_call(api_request_id, outcome="success")
+    # A validated response ends the switch-cap allowance; a tool continuation is a normal request.
+    from agent.fallback_endpoint_domain import settle_independent_attempt
+    settle_independent_attempt(agent)
     agent._touch_activity(f"API call #{api_call_count} completed")
     return _verdict("break")
 

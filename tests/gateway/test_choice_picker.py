@@ -7,9 +7,13 @@ send fails. Selection flows through the same application path as the typed
 command, so picker and typed arguments can never diverge.
 """
 
+import asyncio
+import types
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import hermes_yaml as yaml
 
 import gateway.run as gateway_run
 from gateway.config import Platform
@@ -105,16 +109,96 @@ class TestReasoningChoicePicker:
         override = runner._session_state(session_key).conversation.reasoning_override
         assert override == {"enabled": True, "effort": "ultra"}
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["/reasoning --global", "/reasoning —global"])
+    async def test_reasoning_picker_global_flag_persists_effort(
+        self, tmp_path, monkeypatch, command
+    ):
+        """A flag-only global invocation opens the picker and persists its choice."""
+        monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+        event = _make_event(command)
+        session_key = runner._session_key_for_source(event.source)
+        runner._set_session_reasoning_override(session_key, {"enabled": True, "effort": "low"})
+
+        result = await runner._handle_reasoning_command(event)
+
+        assert result is None
+        # Every button the global picker offers works under --global (a session reset would be refused).
+        assert "reset" not in [c["value"] for c in adapter.calls[0]["choices"]]
+        on_choice = adapter.calls[0]["on_choice_selected"]
+        reply = await on_choice(event.source.chat_id, "ultra")
+
+        assert "ultra" in reply
+        saved = yaml.safe_load((tmp_path / "config.yaml").read_text(encoding="utf-8"))
+        assert saved["agent"]["reasoning_effort"] == "ultra"
+        state = runner._peek_session_state(session_key)
+        assert state is None or state.conversation.reasoning_override is None  # global wins
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("command", ["/reasoning --global", "/reasoning —global"])
+    async def test_multiplex_global_picker_persists_only_named_profile(
+        self, tmp_path, monkeypatch, command
+    ):
+        """A delayed picker tap must retain its originating profile scope."""
+        from agent.secret_scope import set_multiplex_active
+
+        default_home = tmp_path / "default"
+        named_home = tmp_path / "profiles" / "named"
+        default_home.mkdir(parents=True)
+        named_home.mkdir(parents=True)
+        monkeypatch.setattr(Path, "home", lambda: tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(default_home))
+        default_cfg = {"marker": "default"}
+        named_cfg = {"marker": "named"}
+        (default_home / "config.yaml").write_text(
+            yaml.safe_dump(default_cfg), encoding="utf-8"
+        )
+        (named_home / "config.yaml").write_text(
+            yaml.safe_dump(named_cfg), encoding="utf-8"
+        )
+
+        adapter = _PickerAdapter()
+        runner = _make_runner(adapter)
+        runner.config = types.SimpleNamespace(multiplex_profiles=True)
+        runner._resolve_profile_home_for_source = lambda source: named_home
+        monkeypatch.setattr(gateway_run, "_hermes_home", default_home)
+        event = _make_event(command)
+        event.source.profile = "named"
+        session_key = runner._session_key_for_source(event.source)
+        runner._set_session_reasoning_override(session_key, {"enabled": True, "effort": "low"})
+
+        set_multiplex_active(True)
+        try:
+            with gateway_run._profile_runtime_scope(named_home):
+                result = await runner._handle_reasoning_command(event)
+            assert result is None
+            on_choice = adapter.calls[0]["on_choice_selected"]
+            reply = await on_choice(event.source.chat_id, "ultra")
+        finally:
+            set_multiplex_active(False)
+
+        assert "ultra" in reply
+        assert yaml.safe_load(
+            (default_home / "config.yaml").read_text(encoding="utf-8")
+        ) == default_cfg
+        saved = yaml.safe_load((named_home / "config.yaml").read_text(encoding="utf-8"))
+        assert saved["marker"] == "named"
+        assert saved["agent"]["reasoning_effort"] == "ultra"
+        state = runner._peek_session_state(session_key)
+        assert state is None or state.conversation.reasoning_override is None  # global wins
+
 
 class TestFastChoicePicker:
     def _patch_fast_support(self, monkeypatch, tmp_path):
         monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
         monkeypatch.setattr(gateway_run, "_load_gateway_config", dict)
-        monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: "gpt-5.6")
+        monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda cfg=None: "gpt-6-astra")
         # ``/fast`` now resolves the effective session model through
         # ``_resolve_session_agent_runtime``; with no session override that path
         # calls runtime provider resolution, so stub it (no real credentials in CI).
-        monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", dict)
+        monkeypatch.setattr(gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"provider": "openai-api"})
         import hermes_cli.models as models_mod
         monkeypatch.setattr(models_mod, "model_supports_fast_mode", lambda m: True)
 
@@ -148,23 +232,26 @@ class TestFastChoicePicker:
         assert not (tmp_path / "config.yaml").exists()
 
     @pytest.mark.asyncio
-    async def test_fast_picker_title_includes_human_readable_expiry(self, tmp_path, monkeypatch):
+    @pytest.mark.parametrize("word, seconds, remaining", [("fast", 7200, "1h 59m"), ("ultrafast", 300, "4m")])
+    async def test_fast_picker_title_includes_human_readable_expiry(self, tmp_path, monkeypatch, word, seconds, remaining):
         self._patch_fast_support(monkeypatch, tmp_path)
         monkeypatch.setattr(
             gateway_run,
             "_load_gateway_config",
-            lambda: {"agent": {"fast_expiry_seconds": 2 * 60 * 60}},
+            lambda: {"agent": {"fast_expiry_seconds": 7200, "ultrafast_expiry_seconds": 300}},
         )
         clock = {"now": 100.0}
         monkeypatch.setattr("gateway.run_config_loaders.time.time", lambda: clock["now"])
         adapter = _PickerAdapter()
         runner = _make_runner(adapter)
 
-        await runner._handle_fast_command(_make_event("/fast fast"))
+        event = _make_event("/fast")
+        await runner._handle_fast_command(event)
+        assert word in [choice["value"] for choice in adapter.calls[-1]["choices"]]
+        await adapter.calls[-1]["on_choice_selected"](event.source.chat_id, word)
+        assert runner._session_service_tier_expiry(runner._session_key_for_source(event.source)) == (100.0 + seconds, seconds)
         clock["now"] = 101.0
         await runner._handle_fast_command(_make_event("/fast"))
 
-        assert "Expires in: 1h 59m" in adapter.calls[-1]["title"]
+        assert f"Expires in: {remaining}" in adapter.calls[-1]["title"]
         assert "s" not in adapter.calls[-1]["title"].split("Expires in:", 1)[1]
-
-

@@ -30,34 +30,20 @@ from agent.notice_style import ContextNotice, notice_metadata
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import SessionEntry, SessionSource
+from gateway.run_profile_home import completion_event_scope_or_refuse
 from gateway.run_shutdown import _delivery_target_key, _log_suppressed, _notice_target_key, _send_error, _send_failed
 from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
-from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin, _local_completion_card
+from gateway.run_notifications_restart import GatewayRestartNoticeMixin
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
+from gateway.watch_match_coalesce import coalesce_pending_watch_matches
 
 # Log-record parity with the origin module.
 logger = logging.getLogger("gateway.run")
-
-
-def _local_completion_card(evt: dict) -> dict[str, str]:
-    """Build the local async-result card for a completion or liveness notice."""
-    from tools.process_registry_notifications import (
-        PROCESS_COMPLETE_DISPLAY_KIND, async_delegation_display_text, process_completion_display_text)
-    evt_type = evt.get("type", "completion")
-    if evt_type == "completion":
-        return {"display_kind": PROCESS_COMPLETE_DISPLAY_KIND,
-                "display_text": evt.get("_display_text") or process_completion_display_text([evt])}
-    if evt_type == "async_delegation":
-        return {"display_kind": "async_delegation_complete", "display_text": async_delegation_display_text(evt)}
-    if evt_type == "heartbeat":
-        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
-        from tools.process_registry_notifications import heartbeat_display_text
-        return {"display_kind": INTERNAL_NOTIFICATION_DISPLAY_KIND, "display_text": heartbeat_display_text(evt)}
-    return {}
 
 
 def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
@@ -76,9 +62,17 @@ def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
         metadata["automation_identities"] = evt["_automation_identities"]
     if source.platform == Platform.LOCAL:
         metadata.update(_local_completion_card(evt))
+        from tools.process_registry_notifications import completion_resumes_parent, delegation_wakes_parent
+        if delegation_wakes_parent(evt):
+            metadata["completion_wakes_parent"] = True
+        if completion_resumes_parent(evt) and "notification_category" not in metadata:
+            metadata["completion_resumes_parent"] = True
     proven_session_id = str(evt.get("proven_session_id") or "").strip()
     if proven_session_id:
         metadata["gateway_proven_session_id"] = proven_session_id
+    requester_user_id = str(evt.get("user_id") or "").strip()
+    if requester_user_id:
+        metadata["requester_user_id"] = requester_user_id
     if completion_ids := evt.get("completion_ids"):
         metadata["gateway_completion_ids"] = list(completion_ids)
     return metadata
@@ -254,8 +248,8 @@ from gateway.run_notifications_media import GatewayNotificationsMixin as Gateway
 
 class GatewayNotificationsMixin(
     GatewayMediaNotificationsMixin, GatewayCompletionNotificationsMixin, GatewayDelegationNotificationsMixin,
-    GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayProcessEventSourcesMixin,
-    GatewayProcessNotificationsMixin,
+    GatewayUpdateNotificationsMixin, GatewayNotificationOwnershipMixin, GatewayRestartNoticeMixin,
+    GatewayProcessEventSourcesMixin, GatewayProcessNotificationsMixin,
 ):
     """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner."""
 
@@ -459,7 +453,8 @@ class GatewayNotificationsMixin(
         return _media_send_succeeded(result)
 
     async def _deliver_media_from_response(
-        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[dict[str, Any]] = None
+        self, response: str, event: MessageEvent, adapter, thread_metadata: Optional[dict[str, Any]] = None,
+        footer_line: str = "", footer_captioned: Optional[list] = None,
     ) -> bool:
         """Deliver explicit attachments from an already-streamed response (text already delivered).
         EXPLICIT-ONLY, unlike the non-streaming path in ``gateway/platforms/base.py``: a bare local
@@ -469,17 +464,24 @@ class GatewayNotificationsMixin(
 
         Explicit means ``MEDIA:`` directives and markdown/HTML image tags — the two contracts the
         non-streaming chain turns into attachments. See #20834 and #141806.
-        Returns True when at least one upload was confirmed delivered.
+        Returns True when at least one upload was confirmed delivered. ``footer_line`` rides the last
+        photo's caption when the adapter allows it (``runtime_footer``, #74547); a caller passing a
+        ``footer_captioned`` list reads ``[True]`` back only once that send confirmed the caption, so it
+        does not send the footer a second time as its own message.
         """
         from urllib.parse import quote as _quote
         from gateway.checkin_delivery import delivery_metadata
         delivered_any = False
+        from gateway.runtime_footer import caption_landed, caption_with_footer
+        captioned = False
         with _log_suppressed(logging.WARNING, "Post-stream media extraction failed: %s"):
             # Capture [[as_document]] before extract_media strips it: images then go via send_document.
             force_document_attachments = "[[as_document]]" in response
             from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
+            from gateway.platforms.docker_media_paths import hand_back_unreadable_media
+            await hand_back_unreadable_media([p for p, _ in media_files])
             # Strip image URLs (parity with the non-streaming chain); no extract_local_files here.
             # Do NOT deduplicate explicit MEDIA tags against prior turns here (#73771). This rescan is
             # already EXPLICIT-ONLY (see docstring): a MEDIA: directive in the final streamed reply is the
@@ -511,10 +513,11 @@ class GatewayNotificationsMixin(
             if image_paths or url_images:
                 try:
                     images = [(f"file://{_quote(p)}", "") for p in image_paths]
-                    images.extend(url_images)
+                    images, _ = caption_with_footer(adapter, [*images, *url_images], footer_line)
                     _res = await adapter.send_multiple_images(
                         chat_id=chat_id, images=images, metadata=adapter_meta)
                     delivered_any = delivered_any or _media_send_succeeded(_res)
+                    captioned = caption_landed(_res, images)
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:
@@ -533,6 +536,8 @@ class GatewayNotificationsMixin(
                         delivered_any = delivered_any or _media_send_succeeded(_res)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+        if footer_captioned is not None:
+            footer_captioned.append(captioned)
         return delivered_any
 
 
@@ -556,6 +561,13 @@ class GatewayNotificationsMixin(
         must leave the normal completion send as the fallback, or the user gets nothing. A connector
         DECLINE returns True: that destination is not approved and must not be re-sent."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        if text_already_delivered and session_key and getattr(stream_consumer, "delivery_uncertain", False) is True:
+            # The stream counted a timed-out send as shown. The follow-up's result replaces this
+            # turn's, so the completion path never sees the flag: ledger it now under THIS turn's
+            # inbound id, through the same adapter-owned bracket the completion path uses.
+            await self._ledger_uncertain_streamed_final(
+                MessageEvent(text="", source=source, ledger_message_id=inbound_message_id),
+                session_key, response, adapter)
         note_event = MessageEvent(text="", source=source, message_id=event_message_id)
         delivered_confirmed = text_already_delivered
         from gateway.copy_blocks import split_copy_blocks_for
@@ -573,9 +585,14 @@ class GatewayNotificationsMixin(
                     and not getattr(stream_consumer, "_turn_split_delivery", False)
                 ):
                     try:
-                        _edit_res = await adapter.edit_message(
-                            chat_id=source.chat_id, message_id=_sc_msg_id, content=text_content, finalize=True,
-                        )
+                        from gateway.run_turn_final_reconcile import TURN_REPLACED, edit_preview_to_final
+                        _edit_res = await edit_preview_to_final(
+                            adapter, source.chat_id, _sc_msg_id, text_content, metadata,
+                            still_current=getattr(stream_consumer, "_run_still_current", None))
+                        if _edit_res is TURN_REPLACED:
+                            # The turn was replaced (/new, /stop) during a flood wait: nothing more is
+                            # owed, and False would make the caller re-send this stale answer.
+                            return True
                         if getattr(_edit_res, "success", False):
                             from gateway.reply_latency import current_receipt, record_final_reply
                             record_final_reply(current_receipt(), text_content, _edit_res, kind="text_edit")
@@ -610,51 +627,12 @@ class GatewayNotificationsMixin(
                         # its MEDIA: tags), so uploading here would duplicate every file.
                         return False
                     delivered_confirmed = True
-        if copy_blocks and session_key and isinstance(adapter, BasePlatformAdapter):
-            from gateway.reply_latency import current_receipt
-            queued_copy_event = MessageEvent(
-                text="", source=source, message_id=event_message_id, ledger_message_id=inbound_message_id)
-            queued_copy_event._reply_latency_receipt = current_receipt()
-            copy_results = []
-            await adapter._send_copy_blocks(
-                queued_copy_event, session_key, copy_blocks, _mark_notify_metadata(metadata),
-                copy_results.append)
-            if any(getattr(result, "success", False) for result in copy_results):
-                delivered_confirmed = True
-            if any(not getattr(result, "success", False) for result in copy_results):
-                from gateway.delivery_ledger import ledger_enabled
-                if not await asyncio.to_thread(ledger_enabled):
-                    # No ledger owns the refused blocks. With nothing landed, the caller's
-                    # whole-response fallback is the only retry; after a partial delivery it would
-                    # duplicate, so the gap is reported and the turn stops here.
-                    if not delivered_confirmed:
-                        return False
-                    logger.error(
-                        "Queued-lane copy block delivery incomplete for %s and no delivery ledger "
-                        "is enabled; the undelivered blocks are lost.", source.chat_id)
-                else:
-                    # Each block has its own ledger row, so a refused block is redelivered from
-                    # the ledger. A whole-response fallback here would resend delivered parts.
-                    logger.warning(
-                        "Queued-lane copy block delivery incomplete for %s; ledger redelivery owns the rest.",
-                        source.chat_id)
-        else:
-            for copy_block_index, copy_block in enumerate(copy_blocks):
-                copy_metadata = dict(metadata or {})
-                copy_metadata["copy_block"] = True
-                copy_metadata["copy_block_index"] = copy_block_index
-                copy_metadata["plain"] = True
-                _sent = await self._send_queued_final_text(
-                    adapter, source, copy_block, copy_metadata, event_message_id, None, session_key, inbound_message_id)
-                if not getattr(_sent, "success", False):
-                    logger.warning("Queued-lane copy block send failed to %s: %s", source.chat_id,
-                                   getattr(_sent, "error", None) or "no result")
-                    # Only a turn where nothing landed may fall back to the whole-response send;
-                    # after a partial delivery that resend would duplicate what already arrived.
-                    if not delivered_confirmed:
-                        return False
-                    break
-                delivered_confirmed = True
+        from gateway.run_notifications_copy import deliver_queued_copy_blocks
+        delivered_confirmed, may_continue = await deliver_queued_copy_blocks(
+            self, adapter, source, session_key, copy_blocks, metadata, event_message_id,
+            inbound_message_id, delivered_confirmed)
+        if not may_continue:
+            return False
         if (delivered_confirmed and session_key
                 and hasattr(adapter, "_reconcile_restart_note_after_delivery")):
             if not hasattr(note_event, "_restart_note_marker_api_available"):
@@ -817,13 +795,15 @@ class GatewayNotificationsMixin(
                 platform = Platform(platform_str)
                 # The requester's OWN profile bot (marker ``profile``, else the ``agent:<profile>:`` key
                 # lane); a bare self.adapters lookup is the default bot under multiplex.
-                adapter = self._authorization_adapter(platform, self._marker_profile(pending))
+                profile = self._marker_profile(pending)
+                adapter = self._authorization_adapter(platform, profile)
                 if not adapter:
                     return None
                 metadata = self._pending_marker_metadata(platform, chat_id, pending, adapter)
                 # Fallback session key if not stored (old pending files)
                 return self._UpdateTarget(
                     adapter, chat_id, session_key or f"{platform_str}:{chat_id}", metadata, platform,
+                    resolve_adapter=lambda: self._authorization_adapter(platform, profile),
                 )
         return None
 
@@ -1267,60 +1247,6 @@ class GatewayNotificationsMixin(
         finally:
             self._update_final_send_active = False
 
-    async def _send_restart_notification(self) -> Optional[tuple[str, str, Optional[str]]]:
-        """Notify the chat that initiated /restart that the gateway is back."""
-        from gateway.delivery import resolve_delivery_transport
-        from gateway.run import _hermes_home, _non_conversational_metadata
-        notify_path = _hermes_home / ".restart_notify.json"
-        if not notify_path.exists():
-            return None
-        try:
-            data = json.loads(notify_path.read_text(encoding="utf-8-sig"))
-            platform_str = data.get("platform")
-            chat_id = data.get("chat_id")
-            thread_id = data.get("thread_id")
-            if not platform_str or not chat_id:
-                return None
-            platform = Platform(platform_str)
-            # Relay-aware transport over the REQUESTER'S profile adapter map; ``self.adapters`` is the
-            # default profile's, so a secondary's "restarted" notice would leave through the wrong bot.
-            transport = resolve_delivery_transport(
-                platform, self.config, self._adapters_for_profile(self._marker_profile(data)))
-            if transport is None:
-                logger.debug("Restart notification skipped: no live transport for %s", platform_str)
-                return None
-            platform_cfg = self.config.platforms.get(platform)
-            if platform_cfg is not None and not platform_cfg.gateway_restart_notification:
-                logger.info(
-                    "Restart notification suppressed: %s has gateway_restart_notification=false", platform_str
-                )
-                return None
-            metadata = self._pending_marker_metadata(platform, chat_id, data, transport.adapter)
-            if data.get("delivered_via_upstream_relay") is True:
-                metadata = dict(metadata or {})
-                for field in ("user_id", "scope_id"):
-                    if data.get(field):
-                        metadata[field] = str(data[field])
-            result = await transport.send(
-                platform, str(chat_id), t("gateway.startup.restarted"),
-                metadata=notice_metadata(_non_conversational_metadata(metadata, platform=platform),
-                                         platform=platform, style="context"),
-            )
-            # adapter.send() catches provider errors (e.g. "Chat not found") and returns
-            # SendResult(success=False) rather than raising, so inspect the result before claiming success.
-            if _send_failed(result):
-                logger.warning(
-                    "Restart notification to %s:%s was not delivered: %s", platform_str, chat_id, _send_error(result),
-                )
-                return None
-            logger.info("Sent restart notification to %s:%s", platform_str, chat_id)
-            return str(platform_str), str(chat_id), str(thread_id) if thread_id else None
-        except Exception as e:
-            logger.warning("Restart notification failed: %s", e)
-            return None
-        finally:
-            notify_path.unlink(missing_ok=True)
-
     def _home_channel_transports(self):
         """Yield ``(platform, platform_cfg, home, transport)`` for every home channel with a live transport."""
         for platform, platform_cfg in self.config.platforms.items():
@@ -1402,6 +1328,7 @@ class GatewayNotificationsMixin(
         from gateway.run import _planned_restart_notification_path
         from utils import atomic_json_write
 
+        self._note_restart_notice_boot()
         if self._planned_restart_notice_lock is None:
             self._planned_restart_notice_lock = asyncio.Lock()
         async with self._planned_restart_notice_lock:
@@ -1529,7 +1456,7 @@ class GatewayNotificationsMixin(
     async def _drain_watch_notifications(self, completion_queue) -> None:
         """Consume watches in their owning profile, backing off refusals even during drain."""
         from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = _drain_gateway_watch_events(completion_queue)
+        watch_events = coalesce_pending_watch_matches(_drain_gateway_watch_events(completion_queue))
         for evt in watch_events:
             next_retry_at = evt.get("_watch_next_retry_at")
             draining = getattr(self, "_draining", False)
@@ -1539,11 +1466,13 @@ class GatewayNotificationsMixin(
             # Offer a held event once per drain for spooling, not on every refused tick.
             if (next_retry_at is not None and next_retry_at > time.monotonic()
                     and (not draining or drain_offered)):
-                # Backoff between refused injections: hold the event for a later drain tick
-                # instead of re-attempting admission every 2 s (#140899).
+                # Refused injections back off to a later drain tick, not every 2 s (#140899).
                 completion_queue.put(evt)
                 continue
-            async with self._completion_event_scope(evt):
+            scope = await completion_event_scope_or_refuse(self, evt, "watch notification")
+            if scope is None:
+                continue  # only this event: the rest of the batch still delivers
+            async with scope:
                 from tools.process_registry_notifications import should_surface_notification
                 if not should_surface_notification(evt):
                     continue
@@ -1941,6 +1870,24 @@ class GatewayNotificationsMixin(
     # Ledger transitions write state.db: run them off the loop (see ``gateway.run_notifications_ledger``).
     _settle_durable_claim = staticmethod(settle_durable_claim)
 
+    async def _deliver_async_delegation_groups(self, groups: dict, _pr) -> None:
+        """Deliver each route group as one turn; a refused or failed group goes back on the queue."""
+        for group in groups.values():
+            if any(evt.get("_watch_next_retry_at", 0) > time.monotonic() for evt in group):
+                for evt in group:
+                    _pr.completion_queue.put(evt)
+                continue
+            try:
+                delivered = await self._deliver_async_delegation_group(group)
+                if delivered is False:
+                    self._back_off_refused_completions(group)
+                    for evt in group:
+                        _pr.completion_queue.put(evt)
+            except Exception as e:
+                for evt in group:
+                    _pr.completion_queue.put(evt)
+                logger.error("Async delegation injection error: %s", e, exc_info=True)
+
     @staticmethod
     def _back_off_refused_completions(group: list[dict]) -> None:
         """Space out an undelivered async group's retries instead of re-offering it every 2 s pass.
@@ -2079,8 +2026,17 @@ class GatewayNotificationsMixin(
         """Run :meth:`_watch_process` inside the owning profile's scope, start to finish. A watcher starts
         in an empty context (live-armed from a tool thread, or recovered at startup), and the output it
         prepares runs that profile's own ``transform_terminal_output`` hooks before any delivery."""
-        async with self._completion_event_scope(watcher):
-            await self._watch_process(watcher)
+        # A restart waits for these: the process's completion delivers a new turn (restart_when_idle).
+        live = self.__dict__.setdefault("_live_process_watchers", set())
+        live.add(watcher["session_id"])
+        try:
+            scope = await completion_event_scope_or_refuse(self, watcher, "process watcher")
+            if scope is None:
+                return
+            async with scope:
+                await self._watch_process(watcher)
+        finally:
+            live.discard(watcher["session_id"])
 
     async def _process_completion_committed(self, completion_evt: dict, session_id: str) -> bool:
         """Recheck a possibly lost admission ACK before falling back to a plain notice."""
@@ -2179,7 +2135,7 @@ class GatewayNotificationsMixin(
                         await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
                     admitted = await delivery
                     if admitted is not False:
-                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
                         break
                     # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
                     # for a few minutes, then fall through to the plain notice instead of dropping it.
@@ -2194,7 +2150,7 @@ class GatewayNotificationsMixin(
                         continue
                     if await self._process_completion_committed(completion_evt, session_id):
                         # The last refusal was a lost ACK: the turn is committed.
-                        acknowledge_survivor_notifications(process_registry, ((completion_evt, synth_text),))
+                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
                         break
                     logger.warning(
                         "Process watcher: completion for %s was refused %d times; falling back to the "

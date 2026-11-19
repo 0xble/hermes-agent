@@ -241,6 +241,24 @@ hermes cron create "0 9 * * 1-5" --timezone America/New_York "US market open bri
 - An offset-less one-shot timestamp (`2026-06-01T09:00:00`) is also read in the job's zone; a timestamp that carries its own offset is already an instant.
 - Changing the zone recomputes `next_run_at` immediately, so the next fire happens at the new zone's wall clock.
 - An `interval` job has a fixed duration and no wall clock, so a pin has no effect on it.
+- The run-time line the job's prompt carries (`[CURRENT RUN TIME: ...]`) is stated in the pinned zone, so a 09:00 New York job is told 09:00 EST, not the profile's local time. `hermes cron list`, `/cron list` and `cronjob(action="list")` show the pinned zone next to the schedule.
+
+### Pinned and local-time jobs in a shipped profile
+
+A [profile distribution](../profile-distributions.md) can ship both kinds of job in one `cron/jobs.json`. Jobs that pin `timezone` fire on that zone's wall clock for every installer. Jobs without it follow each user's own `timezone:` in their `config.yaml`. Leave `timezone:` out of the shipped `config.yaml` if users should keep their own zone: `hermes profile update` preserves a user's `config.yaml` by default.
+
+```json
+{
+  "jobs": [
+    {"id": "premarket0001", "name": "pre-market", "prompt": "US pre-market update before the 09:30 NYSE open.",
+     "schedule": "0 9 * * 1-5", "timezone": "America/New_York", "deliver": "origin"},
+    {"id": "morningbrf01", "name": "morning-brief", "prompt": "My personal morning brief.",
+     "schedule": "0 7 * * *", "deliver": "origin"}
+  ]
+}
+```
+
+With this file a London user gets the pre-market update at 14:00 (13:00 during the week in between, when the UK has left summer time and the US has not), a Hong Kong user at 21:00 or 22:00, and a Los Angeles user at 06:00. All three get the morning brief at 07:00 their own time. Install and update reject a shipped job whose `timezone` is not an IANA zone and name the job, so a typo cannot silently become each user's local time. Write a job with `hermes cron create ... --timezone America/New_York` in the authoring profile and commit the resulting `cron/jobs.json`, or write it by hand: `schedule` may be the same string `hermes cron create` takes, and the scheduler fills in `next_run_at` and the runtime fields. Give every shipped job a stable `id`, because update matches on it.
 
 ## Catch-up window
 
@@ -663,7 +681,19 @@ Checks per active job:
   gateway down, or a wedged fire-claim),
 - script missing, not a file, or resolving outside `HERMES_HOME/scripts`,
 - `no_agent` job with no script,
-- configured `workdir` that no longer exists.
+- configured `workdir` that no longer exists,
+- a non-empty `enabled_toolsets` allowlist that cannot perform explicit shell or
+  relay-routing steps in the prompt or an attached on-disk skill. This includes
+  Daily Brief `finding add` commands, shell code blocks, and relay's
+  `Pick the Destination` route. Shell steps need terminal access (including
+  composite toolsets that provide it); relay routing can use terminal CLI
+  access or a relay toolset.
+
+The prompt/tool check is an advisory static scan, not proof that every command
+will work. It leaves unrestricted and script-only jobs alone, never widens a
+job's allowlist, and reads attached skills without executing their templates or
+installing dependencies. After changing operational steps, run doctor and
+reconcile the allowlist or remove the incompatible step.
 
 Doctor never mutates jobs or state — it only reports. Pair it with
 `hermes cron incidents` (durable failure records) and `hermes cron runs`
@@ -678,8 +708,9 @@ When scheduling jobs, you specify where the output goes:
 | `"origin"` | Back to where the job was created | Default on messaging platforms |
 | `"local"` | Save to local files only (`~/.hermes/cron/output/`) | Default on CLI |
 | `"telegram"` | Telegram home channel | Uses `TELEGRAM_HOME_CHANNEL` |
-| `"telegram:123456"` | Specific Telegram chat by ID | Direct delivery |
+| `"telegram:123456"` | Specific Telegram chat by ID | Direct delivery; on the job's own origin chat it keeps the topic the job was created in (Telegram and Slack only) |
 | `"telegram:-100123:17585"` | Specific Telegram topic | `chat_id:thread_id` format |
+| `"telegram:-100123:1"` | The forum's General topic | Posts top-level even when the job was created in a topic |
 | `"discord"` | Discord home channel | Uses `DISCORD_HOME_CHANNEL` |
 | `"discord:#engineering"` | Specific Discord channel | By channel name |
 | `"slack"` | Slack home channel | |
@@ -731,9 +762,18 @@ output_local_only: true
 
 Set or replace the declaration with `hermes cron create/edit --review-json '{"contract":"reports/stripe-brief.yaml","subject":"139328"}'`. Clear it with `hermes cron edit <job_id> --clear-review`. Unrelated edits preserve the declaration. Setting review also sets `output_local_only: true`, and clearing it sets that flag to false. The cron tool exposes the same `review_json` and `clear_review` arguments.
 
-The scheduler checks the report, then injects an internal turn into the destination's live agent. Its reply is captured without posting a message or starting a typing indicator. `PRESENT` sends the original. `FIX` sends the full corrected report only if it passes the contract. `RERUN` runs the job at most once, checks the new output, and sends it only if it passes. Invalid corrections, failed reruns, busy sessions, gateway failure, invalid replies, and timeouts fall back to the original. A contract load error also sends the original without review. Original contract violations remain recorded even when the original is sent. Existing silence and failure markers keep their scheduler behavior.
+The scheduler checks the report, then injects an internal turn into the destination's live agent. Its reply is captured without posting a message or starting a typing indicator. `PRESENT` sends the original. `FIX` sends the full corrected report only if it passes the contract. `RERUN` runs the job at most once, checks the new output against the original, and sends it only if it passes. Invalid corrections, failed reruns, busy sessions, gateway failure, invalid replies, and timeouts fall back to the original. A contract load error also sends the original without review. Original contract violations remain recorded even when the original is sent. Existing silence and failure markers keep their scheduler behavior.
 
-The review deadline defaults to 10 minutes from queue admission. A rerun has a separate 20-minute budget, capped by the review deadline plus that budget, so the default total hold is at most 30 minutes before final delivery begins. Set `max_reruns: 0` to disable reruns. Held reports do not occupy cron execution slots or block ordinary queue deliveries. A gateway restart requeues reports still under review without changing their admission deadline, and the agent is never asked about the same report twice. A decision it already gave is reused even after the deadline, so a saved correction that passed the contract is still sent. A restart after the review prompt went out but before its decision was saved sends the original. A report whose review had not started goes out as the original once its deadline has passed. A report never gets a second rerun: a restart during the rerun sends the original. A review turn cut off by a restart is never resumed, so it cannot post a reply. Only a crash after final delivery begins produces an unknown send outcome, which is recorded and never retried. Gateway shutdown terminates tracked rerun process groups.
+Contracts can opt into source fidelity with `preserve_line_patterns`, a non-empty list of Python regular expressions. The checker selects the complete visible lines matching any pattern and requires the same text, count, and order in each FIX or RERUN, including replayed decisions. Fenced and indented code cannot stand in for visible source lines. Invalid rules or rules matching no original lines reject the rewrite and select the original. Contracts without this key keep their existing behavior. Use broad enough selectors for every immutable field and numbered task, including headings when section identity matters, while leaving supporting detail editable:
+
+```yaml
+preserve_line_patterns:
+  - '^\*\*(?:Status|Move|Running):\*\*'
+  - '^\d+\. '
+```
+
+
+The review deadline defaults to 10 minutes from queue admission. A rerun has a separate 20-minute budget, capped by the review deadline plus that budget, so the default total hold is at most 30 minutes before final delivery begins. Set `max_reruns: 0` to disable reruns. Held reports do not occupy cron execution slots or block ordinary queue deliveries. A gateway restart requeues reports still under review without changing their admission deadline, and the agent is never asked about the same report twice. A decision it already gave is reused even after the deadline, but a saved correction is rechecked against the current contract and original report before sending. A restart after the review prompt went out but before its decision was saved sends the original. A report whose review had not started goes out as the original once its deadline has passed. A report never gets a second rerun: a restart during the rerun sends the original. A review turn cut off by a restart is never resumed, so it cannot post a reply. Only a crash after final delivery begins produces an unknown send outcome, which is recorded and never retried. Gateway shutdown terminates tracked rerun process groups.
 
 Final delivery uses the normal bot lane and mirrors a labelled cron delivery as a user turn into the resolved session. The invisible review's assistant decision remains separate from the final report when the transcript is replayed. The visible report omits the optional generic cron wrapper so the contract's envelope survives. Review decisions, candidate checks, selected text, message ID, delivery errors, and elapsed time are recorded in `<HERMES_HOME>/cron/review-receipts.jsonl`. The file rotates at 2 MiB and retains 1 backup, `review-receipts.jsonl.1`.
 
@@ -789,20 +829,41 @@ By default, delivered cron output is wrapped with a header and footer so the rec
 
 ```
 Cronjob Response: Morning feeds
+(job_id: <id>)
 -------------
 
 <agent output here>
 
-Note: The agent cannot see this message, and therefore cannot respond to it.
+To stop or manage this job, send me a new message (e.g. "stop reminder Morning feeds").
 ```
 
-To deliver the raw agent output without the wrapper, set `cron.wrap_response` to `false`:
+When you reply to a wrapped delivery, the agent receives the quoted report marked as a past
+scheduled delivery for reference, so its action items are not treated as a new request unless
+your reply asks for them. A long delivery split into several messages is marked on every part,
+not only the first. Unwrapped deliveries (`wrap_response: false`) carry no marker and are
+quoted like any other message.
+
+To deliver the raw agent output without the wrapper or a pre-agent provider fallback notice, set `cron.wrap_response` to `false`. Provider fallback still runs as configured and remains recorded in scheduler logs:
 
 ```yaml
 # ~/.hermes/config.yaml
 cron:
   wrap_response: false
 ```
+
+#### Per-job override
+
+A single job can override the global setting, for example to get one briefing delivered clean while every other job keeps its header. An override set on the job always wins; a job without one follows `cron.wrap_response`.
+
+From the CLI:
+
+```bash
+hermes cron create "0 8 * * *" "Morning briefing" --no-wrap-response   # deliver raw
+hermes cron edit <job_id> --wrap-response                               # force the wrapper on
+hermes cron edit <job_id> --inherit-wrap-response                       # follow the global setting again
+```
+
+Through the `cronjob` tool, set `wrap_response` to `on`, `off` or `inherit`. Leaving it out keeps the job's current setting, and a new job inherits. The dashboard API accepts `true`, `false` or `null` (inherit); any other value, including the string `"false"`, is rejected rather than stored.
 
 ### Push notifications (`cron.delivery.notify`)
 
@@ -865,6 +926,13 @@ Behaviour is **thread-preferred**, scoped to the job's own conversation:
   thread's session, so a reply in-thread continues with full context. A
   recurring job (e.g. a daily brief) opens a fresh thread per run, keeping each
   delivery's follow-up discussion isolated.
+  A job created *inside* a Telegram topic (or another thread) keeps delivering to
+  that topic instead, since its origin pins it. To give such jobs a fresh thread
+  per run too, set `platforms.telegram.extra.cron_fresh_thread_per_run: true`
+  (Telegram forum topics; Discord cannot nest a thread inside the job's thread,
+  so a Discord job created in a thread keeps delivering there). It only affects
+  deliveries back to the job's own topic; an explicit `chat_id:thread_id` target
+  is never overridden.
 - **DM-only platforms** (WhatsApp, Signal, SMS): no threads exist, so the brief
   is mirrored into the target DM session instead (the origin DM, or the home DM
   for fallback and bare-platform jobs) — the DM itself is the continuation surface.
@@ -1011,7 +1079,7 @@ cron:
   media_send_timeout_seconds: 600   # 10 minutes per attachment
 ```
 
-Or set the `HERMES_CRON_MEDIA_SEND_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 300s default. A timed-out attachment is recorded in the job's run status as a partial delivery failure (the text still delivers).
+Or set the `HERMES_CRON_MEDIA_SEND_TIMEOUT` environment variable. The resolution order is: env var → config.yaml → 300s default. Each attachment's timeout then grows by 1.5x the time the file takes to upload at 128 KB/s (at most one hour), because a platform answers an upload only once the whole file has arrived. A timed-out attachment is recorded in the job's run status as a partial delivery failure (the text still delivers).
 
 ## Bot Chat delivery completion
 
@@ -1026,6 +1094,8 @@ When the live gateway adapter cannot deliver (or no gateway is running), a targe
 cron:
   standalone_send_timeout_seconds: 120
 ```
+
+A delivery that carries attachments gets that timeout plus 1.5x the time its files take to upload at 128 KB/s (at most one hour), so a large file on a slow link is not reported as failed while it is still uploading. Text-only sends keep the configured value.
 
 A timed-out send is recorded in `last_delivery_error` as `standalone send to <target> timed out after Ns`; the message may still land if the adapter had already accepted it.
 
@@ -1440,8 +1510,11 @@ For `update`, pass `skills=[]` to remove all attached skills.
 
 `cronjob(action="run")` fires the job immediately **in the background** (like
 `delegate_task`): the tool call returns at once with a handle, and the job's
-outcome — success/failure, delivery target, next scheduled run, and an output
-excerpt — re-enters the conversation as a new message when the run finishes.
+outcome — success/failure, delivery target and next scheduled run — re-enters
+the conversation as a new message when the run finishes. The output excerpt is
+included only for `deliver: local` jobs and for runs whose delivery failed on every target: a
+job that delivered to a chat already posted its output there, so the excerpt is
+not copied into the conversation that ran it (which may be a different topic).
 The agent (and you) can keep working in the meantime, and a job that is
 already mid-run is refused with "already running" instead of double-firing.
 
@@ -1642,3 +1715,5 @@ Cron jobs run in a completely fresh agent session. The prompt must contain every
 ## Security
 
 Scheduled task prompts are scanned for prompt-injection and credential-exfiltration patterns at creation and update time. Prompts containing invisible Unicode tricks, SSH backdoor attempts, or obvious secret-exfiltration payloads are blocked.
+
+A `curl` that sends an `Authorization` header built from a secret variable is blocked for every host, `api.github.com` included. For GitHub API calls from a scheduled job, have the prompt use `gh api ...` (the `gh` CLI uses its own stored login; with a container or profile `HOME`, log in under that home), or put the request in a [script](#no-agent-mode-script-only-jobs) under `~/.hermes/scripts/` and give it a token through [`terminal.env_passthrough`](#giving-a-script-a-credential) under a name of your own (e.g. `MY_GITHUB_PAT`). `GITHUB_TOKEN` and `GH_TOKEN` are Hermes-managed credentials and are never passed through. Skill bodies attached with `--skill` get the looser assembled-prompt scan, so the bundled GitHub skills' authenticated `curl` examples still load.

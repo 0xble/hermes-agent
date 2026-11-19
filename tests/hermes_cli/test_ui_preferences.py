@@ -238,6 +238,42 @@ def test_lock_backstop_raises_preferences_busy_without_waiting(tmp_path, monkeyp
     assert owner.read_text(encoding="utf-8-sig") == str(os.getpid())
 
 
+def test_stale_recovery_does_not_move_a_successor_observed_before_quarantine(tmp_path, monkeypatch):
+    path = tmp_path / "ui-preferences.json"
+    lock_dir = path.with_name(path.name + ".lock")
+    owner = lock_dir / "owner"
+    lock_dir.mkdir()
+    owner.write_text("2147483647-dead", encoding="utf-8")
+    old = time.time() - ui_preferences._LOCK_MAX_AGE_S - 1
+    os.utime(owner, (old, old))
+    successor = f"{os.getpid()}-successor"
+    owner_age = ui_preferences._owner_age
+    rename = os.rename
+
+    def replace_owner_during_age_check(directory):
+        age = owner_age(directory)
+        owner.write_text(successor, encoding="utf-8")
+        return age
+
+    def check_rename(source, target):
+        assert source != lock_dir, "stale recovery moved the fresh owner's lock"
+        rename(source, target)
+
+    def release_on_poll(_seconds):
+        assert owner.read_text(encoding="utf-8") == successor
+        assert not path.exists()
+        owner.unlink()
+        lock_dir.rmdir()
+
+    monkeypatch.setattr(ui_preferences, "_owner_age", replace_owner_during_age_check)
+    monkeypatch.setattr(os, "rename", check_rename)
+    monkeypatch.setattr(ui_preferences, "_sleep", release_on_poll)
+
+    values = {"hermes.desktop.waiter": "released"}
+    assert ui_preferences.write_preferences(values, path=path)["values"] == values
+    assert not lock_dir.exists()
+
+
 def test_writes_merge_per_key_and_concurrent_writers_keep_each_others_keys(tmp_path):
     path = tmp_path / "ui-preferences.json"
     ui_preferences.write_preferences({"hermes-desktop-mode-v1": "dark", "hermes.desktop.panesFlipped": "true"},

@@ -73,7 +73,7 @@ def _runner(adapter):
 
     runner = object.__new__(TurnRunner)
     runner._ctx = TurnContext(
-        _status_adapter=adapter, _status_chat_id="C1", _status_thread_metadata={"thread_id": "t1"},
+        _status_adapter_pinned=adapter, _status_chat_id="C1", _status_thread_metadata={"thread_id": "t1"},
         session_key=SESSION,
         source=SessionSource(platform=Platform.TELEGRAM, chat_id="C1", thread_id="t1"),
     )

@@ -233,7 +233,7 @@ def _check_directory_structure(should_fix: bool, f: Finding) -> None:
 
 # Cache-root entries at least this big that no pruner covers get a doctor warning.
 _UNPRUNED_CACHE_WARN_BYTES = 1 << 30
-_PRUNED_CACHE_DIRS = frozenset({"scratch", "terminal"})
+_PRUNED_CACHE_DIRS = frozenset({"scratch", ".scratch-trash", "terminal"})
 
 
 def unpruned_cache_hogs(hermes_home: Path, min_bytes: int = _UNPRUNED_CACHE_WARN_BYTES) -> list[tuple[str, int]]:
@@ -265,11 +265,15 @@ def _check_scratch_dir(hermes_home: Path, _DHH: str) -> None:
     check_ok(f"{_DHH}/cache/scratch/ is the scratch dir (TMPDIR; {size}, entries pruned after {SCRATCH_MAX_IDLE_HOURS}h idle)")
     from hermes_constants_scratch_stuck import removal_hint, stuck_entries
     for entry in stuck_entries(scratch):
-        check_warn(f"{_DHH}/cache/scratch/{entry.name}/ holds files you may not delete, so the prune skips it — {removal_hint(entry)}")
+        if entry.is_relative_to(scratch):
+            displayed = f"{_DHH}/cache/scratch/{entry.name}"
+        else:
+            displayed = os.fspath(entry)
+        check_warn(f"{displayed}/ holds files you may not delete, so the prune skips it — {removal_hint(entry)}")
     for name, nbytes in unpruned_cache_hogs(hermes_home):
         check_warn(
             f"{_DHH}/cache/{name}/ is {_human_bytes(nbytes)} and outside every pruner "
-            f"(only cache/scratch/ and cache/terminal/ are reaped) — move task files under "
+            f"(only cache/scratch/, cache/.scratch-trash/, and cache/terminal/ are reaped) — move task files under "
             f"cache/scratch/<task>/ or delete it"
         )
     tmpdir = os.environ.get("TMPDIR", "")
@@ -278,9 +282,9 @@ def _check_scratch_dir(hermes_home: Path, _DHH: str) -> None:
 
 
 def _session_count(state_db_path: Path):
-    import sqlite3
+    from hermes_cli.sqlite_safe_read import connect_tracked
     # mode=ro: doctor is a reader; a writable open of a gateway-held WAL DB is the second-writer class (#103339).
-    conn = sqlite3.connect(read_only_db_uri(state_db_path), uri=True)
+    conn = connect_tracked(read_only_db_uri(state_db_path), uri=True, tracking_path=state_db_path)
     try:
         return conn.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
     finally:
@@ -306,9 +310,10 @@ def _write_health_reason(state_db_path: Path, *, should_fix: bool):
     import tempfile
     with tempfile.TemporaryDirectory() as tmp:
         snapshot = Path(tmp) / "state.db"
-        src = sqlite3.connect(read_only_db_uri(state_db_path), uri=True, timeout=1.0)
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        src = connect_tracked(read_only_db_uri(state_db_path), uri=True, timeout=1.0, tracking_path=state_db_path)
         try:
-            dest = sqlite3.connect(str(snapshot))
+            dest = sqlite3.connect(str(snapshot))  # health: allow HX015 -- temp snapshot this function owns
             try:
                 src.backup(dest)
             finally:

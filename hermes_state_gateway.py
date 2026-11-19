@@ -11,7 +11,7 @@ from hermes_state_deletion import visible_session_sql
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 from hermes_state_common import (
     _RECOVERABLE_END_REASONS_SQL, _RESET_CHILD_SQL, _RESET_END_REASONS_SQL, _sql_json_extract,
@@ -45,6 +45,23 @@ _COMPRESSION_LINEAGE_CTE = f"""
                     )
                 """
 
+# Gateway routing recovery must never land on a delegate child. The create path already refuses to
+# inherit the routing columns into one (#92859/#116322), but a row that predates that guard, a
+# restored/imported DB, or any writer that set them explicitly keeps the poison live, and the
+# recovery query then hands the user's thread to the subagent (#138210). Anchored on the lineage
+# marker, not the ``source`` label: a delegate child built on a gateway turn is stamped with the
+# parent's source. A ``/branch`` child (``_branched_from``) is NOT excluded: it is a user-facing
+# conversation that owns its route, and its routing columns are written at create on purpose so a
+# crash before ``switch_session`` still recovers it.
+# A row that also carries ``_reset_from`` is a /new continuation of the chat whose config picked up a
+# delegate marker (#109073), and one carrying ``_chat_adopted`` is a delegate row the user explicitly
+# switched the chat onto: both ARE the conversation, so they keep their route.
+_DELEGATE_CHILD_EXCLUSION_SQL = (
+    f"AND (COALESCE({_sql_json_extract('s.model_config', '$._delegate_from')}, '') = ''"
+    f" OR {_sql_json_extract('s.model_config', '$._reset_from')} IS NOT NULL"
+    f" OR {_sql_json_extract('s.model_config', '$._chat_adopted')} IS NOT NULL)"
+)
+
 # Projection shared by both peer-recovery queries (exact key, then peer tuple).
 _PEER_SELECT_HEAD = """
                 SELECT s.*,
@@ -55,6 +72,7 @@ _PEER_SELECT_HEAD = """
                        )) AS _has_messages
                 FROM sessions s
                 LEFT JOIN system_prompts sp ON sp.hash = s.system_prompt_hash
+                WHERE 1=1
 """
 # A row a *completed handoff* owns stays recoverable whatever end_reason it carries: the source
 # interface's teardown runs AFTER ownership moved to the destination and can stamp a terminal reason
@@ -64,9 +82,10 @@ _PEER_SELECT_HEAD = """
 # blocks recovery (the NOT EXISTS below). ``pending``/``failed``/NULL handoffs are untouched, so this
 # is strictly "ownership was transferred", never "a handoff was attempted".
 _HANDOFF_OWNED_ROW_SQL = "(s.handoff_state = 'completed')"
-_PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.session_key = ?
+_PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                  AND s.session_key = ?
                   AND {visible_session_sql('s.id')}
                   AND s.source = ?
+                  {_DELEGATE_CHILD_EXCLUSION_SQL}
                   AND (s.ended_at IS NULL OR s.end_reason IN ({_RECOVERABLE_END_REASONS_SQL})
                        OR {_HANDOFF_OWNED_ROW_SQL})
                   AND NOT EXISTS (
@@ -82,12 +101,13 @@ _PEER_BY_KEY_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.session_key = 
                          COALESCE(s.last_activity_at, s.started_at) DESC
                 LIMIT 1
                 """
-_PEER_BY_TUPLE_SQL = f"""{_PEER_SELECT_HEAD}                WHERE s.source = ?
+_PEER_BY_TUPLE_SQL = f"""{_PEER_SELECT_HEAD}                  AND s.source = ?
                   AND {visible_session_sql('s.id')}
                   AND COALESCE(s.user_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_id, '') = COALESCE(?, '')
                   AND COALESCE(s.chat_type, '') = COALESCE(?, '')
                   AND COALESCE(s.thread_id, '') = COALESCE(?, '')
+                  {_DELEGATE_CHILD_EXCLUSION_SQL}
                   AND (? IS NULL OR COALESCE(s.profile_name, ?) = ?)
                   AND (s.ended_at IS NULL OR s.end_reason IN ({_RECOVERABLE_END_REASONS_SQL})
                        OR {_HANDOFF_OWNED_ROW_SQL})
@@ -468,6 +488,67 @@ class SessionGatewayMixin:
                 wanted + "SELECT key FROM wanted WHERE NOT EXISTS ("
                 "SELECT 1 FROM gateway_routing WHERE scope = :scope AND session_key = wanted.key)", write_params)}
         return self._execute_write(_do, skip_result=set())
+
+    def apply_gateway_routing_delta(
+        self, upserts: dict[str, str], removed: Iterable[str], *, scope: str = "",
+        held: Optional[set[str]] = None,
+    ) -> Optional[set[str]]:
+        """Write one routing-index diff the caller computed against the stored rows.
+
+        ``replace_gateway_routing_entries`` parses and checks every route inside the write lock, which
+        held it for seconds on a large index. This touches only *upserts* and *removed*, with the same
+        retired-route skip, and returns the skipped retired keys among *upserts* as replace does.
+
+        During a private interval it applies replace's privacy rules to the diff keys only: a stored
+        private row stays byte-exact, a private entry is never written, and a stored public row whose
+        entry turned private is deleted. Keys left different from the caller's diff go into *held*.
+        Returns None, writing nothing, when the calling turn itself is private.
+        """
+        from hermes_state_mutation_retirement import ROUTE_RETIRED_SQL, route_namespace, route_retired_params
+        upserts = {k: v for k, v in upserts.items() if k and v}
+        removed = [k for k in removed if k and k not in upserts]
+        params = {**route_retired_params("", "", time.time()), "scope": scope}
+        wanted = ("WITH wanted AS (SELECT key, json_extract(value, '$.entry') AS entry, "
+                  "json_extract(value, '$.ns') AS ns FROM json_each(:payload)) ")
+        retired = ROUTE_RETIRED_SQL.replace(":entry", "wanted.entry").replace(":ns", "wanted.ns")
+        held_keys: set[str] = set()
+        private = object()
+
+        def _do(conn):
+            from agent.incognito import any_incognito_sessions
+            from hermes_state_incognito import private_write
+            held_keys.clear()
+            writes, gone = upserts, removed
+            if any_incognito_sessions():
+                stored = conn.execute(
+                    "SELECT session_key, entry_json FROM gateway_routing WHERE scope = ? "
+                    "AND session_key IN (SELECT value FROM json_each(?))", (scope, json.dumps([*upserts, *removed])))
+                protected = {row[0] for row in stored if private_write((row[0], row[1]))}
+                hidden = {k for k, v in upserts.items() if k not in protected and private_write((k, v))}
+                held_keys.update(protected, hidden)
+                writes = {k: v for k, v in upserts.items() if k not in held_keys}
+                gone = [k for k in [*removed, *hidden] if k not in protected]
+            payload = json.dumps({k: {"entry": v, "ns": route_namespace(k)} for k, v in writes.items()},
+                                 ensure_ascii=False)
+            write_params = {**params, "payload": payload, "gone": json.dumps(gone, ensure_ascii=False)}
+            if gone:
+                conn.execute("DELETE FROM gateway_routing WHERE scope = :scope "
+                             "AND session_key IN (SELECT value FROM json_each(:gone))", write_params)
+            if not writes:
+                return set()
+            conn.execute(
+                wanted + "INSERT INTO gateway_routing (scope, session_key, entry_json, updated_at) "
+                "SELECT :scope, key, entry, :now FROM wanted WHERE NOT " + retired +
+                " ON CONFLICT(scope, session_key) DO UPDATE SET "
+                "entry_json=excluded.entry_json, updated_at=excluded.updated_at "
+                "WHERE gateway_routing.entry_json IS NOT excluded.entry_json", write_params)
+            return {row[0] for row in conn.execute(
+                wanted + "SELECT key FROM wanted WHERE NOT EXISTS ("
+                "SELECT 1 FROM gateway_routing WHERE scope = :scope AND session_key = wanted.key)", write_params)}
+        result = self._execute_write(_do, skip_result=private)
+        if held is not None:
+            held.update(held_keys)
+        return None if result is private else result
 
     def unbind_gateway_session_peer(self, session_key: str, expected_session_id: str) -> bool:
         """Finish a partial routing unbind without deleting transcript history."""
@@ -1097,13 +1178,21 @@ class SessionGatewayMixin:
             " ORDER BY last_heartbeat DESC")
         return [dict(r) for r in rows]
 
-    def request_handoff(self, session_id: str, platform: str) -> bool:
-        """Mark a session pending handoff to *platform*; False if a handoff is already in flight."""
-        return self._write_rowcount(
-            "UPDATE sessions SET handoff_state = 'pending',     handoff_platform = ?, "
-            "    handoff_error = NULL WHERE id = ? AND (handoff_state IS NULL "
-            "                  OR handoff_state IN ('completed', 'failed'))",
-            (platform, session_id), session_ids=(session_id,)) > 0
+    def request_handoff(self, session_id: str, platform: str, *, _guard=None) -> bool:
+        """Mark a session pending handoff to *platform*; False if a handoff is already in flight.
+        ``_guard(conn)`` raises to refuse inside the same write transaction (the owner's durable
+        execution fence, ``gateway.session_handoff.require_settled``)."""
+        def _do(conn):
+            if _guard is not None:
+                _guard(conn)
+            rowcount = conn.execute(
+                "UPDATE sessions SET handoff_state = 'pending', handoff_platform = ?, handoff_error = NULL "
+                "WHERE id = ? AND (handoff_state IS NULL OR handoff_state IN ('completed', 'failed'))",
+                (platform, session_id)).rowcount
+            if rowcount is None or rowcount < 0:
+                rowcount = conn.execute("SELECT changes()").fetchone()[0]
+            return rowcount
+        return self._execute_write(_do, session_ids=(session_id, platform), skip_result=0) > 0
 
     def get_handoff_state(self, session_id: str) -> Optional[dict[str, Any]]:
         """Return ``{"state", "platform", "error"}`` or None if the session has no handoff record."""

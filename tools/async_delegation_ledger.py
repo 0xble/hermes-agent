@@ -2,15 +2,30 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 import os
 import sqlite3
+import threading
 from typing import Any, Callable, Optional
 
 
 logger = logging.getLogger('tools.async_delegation')
 
-_SCHEMA_RECONCILED: dict[str, tuple[int, int, int, Optional[str]]] = {}
+# Database path -> (device, inode, schema_version, ledger DDL) last reconciled by this process.
+# The stored DDL is the fork's extra content signal for an in-place restore that reuses both the
+# inode and schema cookie; the lock and pre-open identity check are upstream's replacement guards.
+_SCHEMA_READY: dict[str, tuple[int, int, int, Optional[str]]] = {}
+_SCHEMA_READY_LOCK = threading.Lock()
+
+
+def _db_identity(path) -> tuple[int, int] | None:
+    """Stat only: opening/closing another fd would release SQLite's POSIX locks."""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_dev, st.st_ino) if st.st_ino else None
 
 
 def _schema_state(
@@ -40,25 +55,19 @@ def _connect() -> sqlite3.Connection:
     from agent.runtime_session_store import WorkerPersistenceError, is_worker_process
     if is_worker_process():
         raise WorkerPersistenceError('worker_delegation_ledger_unavailable')
-    from hermes_cli.sqlite_util import open_db
-    # Same state.db as hermes_state.SessionDB -- reuse its owner-only (0600)
-    # hardening so this writer doesn't create/leave the file (and its WAL
-    # sidecars) at the process umask. See hermes_state._secure_state_db_files.
-    from hermes_constants import mkdir_under_hermes_home
-    from hermes_state import _secure_state_db_files
-
+    from hermes_cli.sqlite_util import open_shared_state_db
+    # The ledger shares state.db with SessionDB: use its startup lock and tracked
+    # connector, rather than exposing an unprotected empty first-open inode.
+    # wal=False: SessionDB owns the journal mode (_initialize_schema applies the barriers).
     path = _db_path()
-    # A late replay or writer must not resurrect a removed named profile (#123265).
-    mkdir_under_hermes_home(path.parent)
-    _secure_state_db_files(path, create_main=True)
-    # wal=False: SessionDB owns state.db's journal mode (_initialize_schema applies the barriers).
-    conn = open_db(path, db_label="state.db (async_delegation)", busy_timeout_ms=10_000,
-                   wal=False, row_factory=None, initialize=_initialize_schema)
-    _secure_state_db_files(path)
-    return conn
+    # None while the file does not exist yet: the opener creates it under the startup lock, and a
+    # first open has no earlier file to tell apart, so the initializer runs as it does on live.
+    identity = _db_identity(path)
+    initialize = _initialize_schema if identity is None else functools.partial(_initialize_schema, identity=identity)
+    return open_shared_state_db(path, db_label="state.db (async_delegation)", wal=False, initialize=initialize)
 
 
-def _initialize_schema(conn: sqlite3.Connection) -> None:
+def _initialize_schema(conn: sqlite3.Connection, *, identity: tuple[int, int] | None = None) -> None:
     from hermes_state_repair import apply_durability_barriers
     from hermes_state_schema import reconcile_state_schema
     # Preserve the journal mode SessionDB configured on state.db: forcing WAL from
@@ -76,12 +85,18 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
     # carries the ledger's stored table definition: a cheap content signal that changes with its
     # columns, not with row writes, and needs no second column list to keep in sync with SCHEMA_SQL.
     path, state = _schema_state(conn)
-    if path is not None and _SCHEMA_RECONCILED.get(path) == state:
-        return
+    # A pre-open identity that no longer matches means the path was replaced while opening:
+    # reconcile this connection, but never let its state mark the replacement ready.
+    verified = state is not None and (identity is None or state[:2] == identity)
+    if path is not None and verified:
+        with _SCHEMA_READY_LOCK:
+            if _SCHEMA_READY.get(path) == state:
+                return
     reconcile_state_schema(conn)
     path, state = _schema_state(conn)
-    if path is not None and state is not None:
-        _SCHEMA_RECONCILED[path] = state
+    if path is not None and state is not None and (identity is None or state[:2] == identity):
+        with _SCHEMA_READY_LOCK:
+            _SCHEMA_READY[path] = state
 
 
 def _transaction(*, immediate: bool = False):

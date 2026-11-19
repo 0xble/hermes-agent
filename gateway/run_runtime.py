@@ -221,7 +221,7 @@ async def initialize_gateway_runtime(runner):
     _record_parked_profiles(parked_profile_map(runner))
     runner.session_ticket_store = TicketStore(instance_id, registry.profile_ids())
     if claim:
-        release_unknown_turn_markers(runner)
+        await asyncio.to_thread(release_unknown_turn_markers, runner)
 
 
 async def claim_gateway_runtime(runner):
@@ -246,7 +246,7 @@ async def claim_gateway_runtime(runner):
             await _park_live_secondary(runner, authority, exc, 'promotion epoch claim failed')
     runner.session_runtime_descriptor['authority_epoch'] = launch.epoch
     _publish_served_set(runner)
-    release_unknown_turn_markers(runner)
+    await asyncio.to_thread(release_unknown_turn_markers, runner)
     for authority in [a for a in registry if a is not None]:
         await _recover_profile_bot_mailbox(runner, authority)
     # Promotion starts deferred secondaries from the served set recorded at boot: re-record it
@@ -732,17 +732,32 @@ async def recover_gateway_native_sessions(runner):
     return results
 
 
+def _prime_recovered_egress(bindings):
+    """Warm a Relay's per-chat egress routing for every session recovery may run. Those caches fill
+    only on live inbound, so after a restart a recovered turn's reply would leave without the
+    scope/user discriminators the connector requires (or on the primary's platform) and be declined."""
+    from gateway.platforms.event import MessageEvent
+    for _sid, origin, adapter in bindings:
+        prime = getattr(adapter, 'prime_routing_cache', None)
+        if callable(prime):
+            # Verified provenance restores the relay marker too, but no live inbound warmed this chat.
+            prime(MessageEvent(text='', source=origin))
+
+
 async def recover_profile_native_sessions(runner, authority):
     """Bind one authority's queued native rows to the adapters connected now."""
     from gateway.session_authorities import owner_scope
+    from gateway.session_native_recovery_routes import recovered_native_source
     with owner_scope(authority):
         pending_rows = await asyncio.to_thread(authority.db._read_all,
             "SELECT DISTINCT target_session_id FROM session_admissions WHERE status IN ('queued','unknown')")
         pending = {row['target_session_id'] for row in pending_rows}
         entries = await asyncio.to_thread(runner.session_store.list_sessions)
-        bindings = [(owner, entry.origin, runner._adapter_for_source(entry.origin))
+        bindings = [(owner, origin, runner._adapter_for_source(origin))
                     for entry in entries if entry.origin is not None
-                    for owner in [authority.logical_owner(entry.session_id)] if owner in pending]
+                    for owner in [authority.logical_owner(entry.session_id)] if owner in pending
+                    for origin in [recovered_native_source(runner, authority, entry, owner)]]
+        _prime_recovered_egress(bindings)
         outcome = await authority.recover_native_sessions(bindings)
         from gateway.session_detached import recover_detached_sessions
         outcome.update(dict.fromkeys(recover_detached_sessions(authority, pending - set(outcome)), 'detached'))
@@ -783,6 +798,27 @@ async def wait_gateway_runtime(runner):
         await asyncio.gather(shutdown, return_exceptions=True)
 
 
+# Shared bound for the drain's concurrent inbound stops (all adapters, all profiles).
+INBOUND_STOP_SECONDS = 10.0
+
+
+async def _stop_adapters_inbound(runner):
+    adapters = [adapter for group in (runner.adapters, *getattr(runner, '_profile_adapters', {}).values())
+                for adapter in list(group.values()) if getattr(adapter, 'stop_inbound', None) is not None]
+    if not adapters:
+        return
+    tasks = {asyncio.ensure_future(adapter.stop_inbound()): adapter for adapter in adapters}
+    done, pending = await asyncio.wait(tasks, timeout=INBOUND_STOP_SECONDS)
+    for task in done:
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning('stop_inbound(%s) failed during drain', tasks[task].name, exc_info=task.exception())
+    for task in pending:
+        task.cancel()  # the adapter's disconnect retries the stop
+        logger.warning('stop_inbound(%s) missed %.0fs during drain', tasks[task].name, INBOUND_STOP_SECONDS)
+    if pending:
+        await asyncio.wait(pending, timeout=1.0)
+
+
 async def drain_gateway_runtime(runner):
     """Withdraw admission before any await; close sockets before DB teardown."""
     descriptor = getattr(runner, 'session_runtime_descriptor', None)
@@ -795,6 +831,12 @@ async def drain_gateway_runtime(runner):
         del descriptor['drain_reason']  # stopping now: no client attaches to answer anymore
     from gateway.session_hosted_service import stop_hosted_service
     await stop_hosted_service(runner)
+    # Stop fetching (long-poll / socket) BEFORE withdrawing the handlers: an update a fetcher acks
+    # after the withdrawal is dropped and never redelivered (#143122); one never fetched stays on
+    # the platform for the next boot. Egress stays up for admitted work; the disconnect retries a
+    # failed stop. Only fetching adapters implement the seam; they stop together under one bound so
+    # a wedged fetcher cannot eat the leash the turn settle needs.
+    await _stop_adapters_inbound(runner)
     # Withdraw the public ingress callback without disconnecting egress needed
     # by already admitted work. Base adapters refuse before stamping acceptance.
     for adapter in runner.adapters.values():
@@ -842,12 +884,14 @@ async def settle_gateway_runtime(runner, budget=None, reason=None):
     from gateway.session_acp_lifecycle import end_idle_acp_sessions
     for authority in _authorities(runner):
         try:
-            end_idle_acp_sessions(authority)
+            await end_idle_acp_sessions(authority, deadline)
+        except TimeoutError:
+            logger.warning('ACP shutdown cleanup for %s exceeded the settle budget',
+                           getattr(authority, 'profile_id', '?'))
         except Exception:
             # Best-effort bookkeeping: a store that cannot answer must not abort the stop sequence.
-            import logging
-            logging.getLogger(__name__).warning('ACP sessions of %s not ended at shutdown',
-                                                getattr(authority, 'profile_id', '?'), exc_info=True)
+            logger.warning('ACP sessions of %s not ended at shutdown',
+                           getattr(authority, 'profile_id', '?'), exc_info=True)
     from gateway.run_api import stop_gateway_api
     store = getattr(runner, 'session_ticket_store', None)
     if store is not None:

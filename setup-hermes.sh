@@ -18,10 +18,12 @@ set -e
 # Setup and activation prepare the isolated test environment. Installers call
 # pm.cli directly and never select it.
 runtime_only=false
+bootstrap_python=""
 test_environment="--test-environment"
 for option in "$@"; do
     case "$option" in
         --runtime-only) runtime_only=true ;;
+        --bootstrap-python=*) bootstrap_python="${option#*=}" ;;
         --test-environment|--test-environment=*) test_environment="$option" ;;
         *) printf 'Unknown setup option: %s\n' "$option" >&2; exit 2 ;;
     esac
@@ -136,7 +138,8 @@ else
   mkdir -p "$tmp/tree"
   case "$archive" in
     *.zip) unzip -q "$archive" -d "$tmp/tree" ;;
-    *) tar -xzf "$archive" -C "$tmp/tree" ;;
+    # -o: never adopt the archive's recorded uid (1001) when run as root.
+    *) tar -o -xzf "$archive" -C "$tmp/tree" ;;
   esac
   # flatten a single wrapping dir (uv tarballs ship uv-<triple>/uv).
   # BSD find lacks GNU's -mindepth/-maxdepth flags, so enumerate children in
@@ -170,9 +173,23 @@ if [ "$os" = win32 ]; then
   case "$arch" in arm64) py_request="cpython-$py_version-windows-aarch64-none" ;;
                   *) py_request="cpython-$py_version-windows-x86_64-none" ;; esac
 fi
-"$uv" python install --no-bin --no-registry "$py_request"
-boot_py="$("$uv" python find --managed-python "$py_request")"
-boot_py="${boot_py%$'\r'}"
+boot_py="$bootstrap_python"
+if [ -n "$boot_py" ]; then
+    [ -x "$boot_py" ] || { echo "bootstrap Python unavailable: $boot_py" >&2; exit 1; }
+    boot_version="$("$boot_py" -I -c 'import sys; print("%d.%d" % sys.version_info[:2])')" || boot_version=""
+    [ "${boot_version%$'\r'}" = "$py_version" ] || boot_py=""
+fi
+if [ -z "$boot_py" ]; then
+    "$uv" python install --no-bin --no-registry "$py_request"
+    boot_py="$("$uv" python find --managed-python "$py_request")"
+    boot_py="${boot_py%$'\r'}"
+    if [ -n "$bootstrap_python" ]; then
+        # Recheck admission with the interpreter that will actually run PM.
+        # shellcheck source=scripts/_setup_guard.sh
+        . "$SCRIPT_DIR/scripts/_setup_guard.sh"
+        hermes_require_safe_setup "$SCRIPT_DIR" "$boot_py"
+    fi
+fi
 # Activation trusts the recorded tool digest; a direct setup re-checks it
 # (setup-hermes.ps1 draws the same line).
 pm_args=("$test_environment")

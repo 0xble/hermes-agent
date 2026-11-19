@@ -122,8 +122,9 @@ class TurnExplainersMixin:
         failure time. A later success on the same identity (any spelling) removes the entry.
         No-op when the per-turn state dict is not initialised (tool dispatched outside ``run_conversation``).
         """
-        if tool_name not in _FILE_MUTATING_TOOLS:
-            return
+        from tools.hosted_tool_policy import host_feature_enabled
+        if tool_name not in _FILE_MUTATING_TOOLS or not host_feature_enabled("file_mutation_bookkeeping"):
+            return  # hosted: the target is in the agent's sandbox; it is never resolved or stat'd here
         state = getattr(self, "_turn_failed_file_mutations", None)
         if state is None:
             return
@@ -233,6 +234,7 @@ class TurnExplainersMixin:
     @staticmethod
     def _format_turn_completion_explanation(
         turn_exit_reason: str, persistence_cause: Optional[str] = None, db_path=None, model: str = "",
+        routes: str = "",
     ) -> str:
         """User-facing explanation for an abnormal turn ending, or "" for normal / unknown reasons.
 
@@ -251,7 +253,8 @@ class TurnExplainersMixin:
                     key = prefix_key
                     break
         if key is not None:
-            body = t(key, model=model or t("explainer.shared.the_model"))
+            body = t(key, model=model or t("explainer.shared.the_model"),
+                     routes=routes or t("explainer.shared.no_routes_requested"))
         elif reason == "session_persistence_failed":
             from hermes_constants import display_hermes_home, profile_cli_selector
             from hermes_state_errors import STORAGE_RECOVERY_DOCS_URL

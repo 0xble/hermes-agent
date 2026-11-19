@@ -19,7 +19,7 @@ from tools.process_registry import ProcessRegistry
 def test_unrecorded_checkpoint_preserves_pid_and_scope_safety(tmp_path, monkeypatch, kind, fate, scope_ok):
     checkpoint = tmp_path / "processes.json"
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", checkpoint)
+    monkeypatch.setattr("tools.process_registry._checkpoint_path", lambda _p=checkpoint: _p)
     monkeypatch.setattr("tools.process_registry.restart_safe_gateway_child_argv",
                         lambda argv, **kwargs: SimpleNamespace(argv=argv, mode="direct"))
     producer = ProcessRegistry()
@@ -70,7 +70,7 @@ def test_unrecorded_checkpoint_preserves_pid_and_scope_safety(tmp_path, monkeypa
 @pytest.mark.platforms("posix")
 def test_ordinary_signalled_command_keeps_negative_wait_status(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr("tools.process_registry._checkpoint_path", lambda _p=tmp_path / "processes.json": _p)
     registry = ProcessRegistry()
     command = f"exec {shlex.quote(sys.executable)} -c 'import os, signal; os.kill(os.getpid(), signal.SIGKILL)'"  # windows-footgun: ok — POSIX-only
     session = registry.spawn_local(command, cwd=str(tmp_path))

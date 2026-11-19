@@ -10,7 +10,8 @@ from hermes_state_runtime import RuntimeStoreError
 # model_config sidecars a worker may patch: every key the agent persists via
 # ``patch_session_model_config`` (``_anthropic_rejected_thinking``: main's rejected-signature
 # fingerprints, agent/anthropic_thinking_replay.py) or a compaction ``model_config_patch``.
-SIDECAR_KEYS = frozenset({'_usage_anchor', '_proactive_prune_rearm_tokens', '_anthropic_rejected_thinking'})
+# _fallback_route: a worker's provider fallback marks its route turn-scoped on the row (#152333).
+SIDECAR_KEYS = frozenset({'_usage_anchor', '_proactive_prune_rearm_tokens', '_anthropic_rejected_thinking', '_fallback_route'})
 
 
 def worker_context(db, conn, session_id, payload):
@@ -30,9 +31,7 @@ def worker_prompt(db, conn, session_id, payload):
     if set(payload) != {'system_prompt'} or not (
             payload['system_prompt'] is None or isinstance(payload['system_prompt'], str)):
         raise RuntimeStoreError('invalid_params')
-    conn.execute('UPDATE sessions SET system_prompt_hash=?, system_prompt=NULL WHERE id=?',
-                 (db._store_system_prompt(conn, payload['system_prompt']), session_id))
-    db._delete_unreferenced_system_prompts(conn)
+    db._replace_prompt_reference(conn, session_id, payload['system_prompt'])
     return {'value': None}
 
 
@@ -65,9 +64,7 @@ def worker_tool_names(db, conn, session_id, payload):
     encoded = None if pin is None else json.dumps(pin)
     if encoded is not None and len(encoded) > 4 * 1024 * 1024:
         raise RuntimeStoreError('invalid_params')
-    conn.execute('UPDATE sessions SET tool_names=? WHERE id=?',
-                 (db._store_system_prompt(conn, encoded), session_id))
-    db._delete_unreferenced_system_prompts(conn)
+    db._replace_prompt_reference(conn, session_id, encoded, tool_names=True)
     return {'value': None}
 
 
@@ -87,3 +84,19 @@ def worker_row_role(db, conn, session_id, payload):
     row = conn.execute('SELECT role FROM messages WHERE id=? AND session_id=? AND active=1',
                        (payload['row_id'], session_id)).fetchone()
     return {'value': row[0] if row else None}
+
+
+def stamp_cache_generation(conn, session_id, clock):
+    """A worker's prompt-cache event with the owner's durable context generation, stamped in the
+    usage receipt that carries it. The worker cannot read that count without an extra RPC through
+    its write journal (whose failure is sticky), and the worker holds the turn, so the count at
+    commit is the count its request saw. A column this build cannot parse is stored as sent."""
+    from hermes_state_usage import _ARCHIVED_ROWS_SQL
+    try:
+        event = json.loads(clock)
+    except ValueError:
+        return clock
+    if not isinstance(event, dict):
+        return clock
+    event['generation'] = int(conn.execute(_ARCHIVED_ROWS_SQL, (session_id,)).fetchone()[0])
+    return json.dumps(event, separators=(',', ':'))

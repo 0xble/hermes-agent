@@ -87,25 +87,38 @@ class GatewayNotificationsMixin:
         # The group shares one session_key, hence one profile: scope the pre-checks and sibling claims too.
         # A retirement can move a subset while this batch waits. Re-resolve the
         # durable routes and regroup before taking any delivery claim.
+        from gateway.run_profile_home import completion_event_scope_or_refuse
         from tools.async_delegation import refresh_retirement_route
         buckets = {}
         for evt in group:
-            async with self._completion_event_scope(evt):
+            scope = await completion_event_scope_or_refuse(self, evt, "async delegation")
+            if scope is None:
+                continue
+            async with scope:
                 await asyncio.to_thread(refresh_retirement_route, evt)
             self._enrich_async_delegation_routing(evt)
             route = self._event_route_key(evt, self._ASYNC_GROUP_KEY_FIELDS)
             buckets.setdefault(route, []).append(evt)
+        if not buckets:
+            return None
         if len(buckets) > 1:
             retry = []
             for subgroup in buckets.values():
-                async with self._completion_event_scope(subgroup[0]):
+                scope = await completion_event_scope_or_refuse(self, subgroup[0], "async delegation")
+                if scope is None:
+                    continue
+                async with scope:
                     result = await self._deliver_async_delegation_group_scoped(subgroup)
                 if result is False:
                     retry.extend(subgroup)
             group[:] = retry
             return False if retry else True
+        group[:] = next(iter(buckets.values()))
         original = list(group)
-        async with self._completion_event_scope(group[0]):
+        scope = await completion_event_scope_or_refuse(self, group[0], "async delegation")
+        if scope is None:
+            return None
+        async with scope:
             outcome = await self._deliver_async_delegation_group_scoped(group)
         if outcome is not False:
             group[:] = original  # Only a failed/aborted batch becomes the narrowed retry payload.
@@ -226,8 +239,12 @@ class GatewayNotificationsMixin:
         admission_evt = primary_evt
         if getattr(self, 'session_authority', None) is not None:
             from gateway.session_automation import producer_identity
+            from tools.process_registry_notifications import completion_resumes_parent, delegation_wakes_parent
+            events = [primary_evt, *(e for e, _ in siblings)]
             admission_evt = dict(primary_evt, _automation_identities=[
-                producer_identity(self, event) for event in [primary_evt, *(e for e, _ in siblings)]])
+                producer_identity(self, event) for event in events],
+                **({"_sibling_failed": True} if any(delegation_wakes_parent(e) for e in events) else {}),
+                **({"_sibling_resumes": True} if any(completion_resumes_parent(e) for e in events) else {}))
         delivered = await self._deliver_completion_with_sibling_cleanup(consolidated, admission_evt, siblings)
         if delivered is not False:
             forget(primary_evt)
@@ -286,29 +303,74 @@ class GatewayNotificationsMixin:
                 logger.info("%s %d undelivered async completion(s) for profile %r", verb, count, profile_name)
 
 
+    def _collect_profile_retry_actions(self, profile: str) -> list:
+        """One profile's due retry actions. A busy ledger defers only this profile's atomic claims:
+        the claim transaction never began, so nothing is held, and the deferral turns into a
+        warning once it has lasted a full claim TTL."""
+        import math
+        import sqlite3
+        from hermes_constants import hermes_home_key
+        from tools.async_delegation import ORPHAN_SWEEP_INTERVAL_S
+        from tools.delegation_resume import RETRY_CLAIM_TTL_S, RetrySweepDeferred, sweep_retries
+
+        key = hermes_home_key()
+        busy = getattr(self, "_delegation_retry_busy_sweeps", None)
+        if busy is None:
+            busy = self._delegation_retry_busy_sweeps = {}
+        try:
+            actions = sweep_retries()
+            if isinstance(actions, RetrySweepDeferred):
+                count = busy[key] = busy.get(key, 0) + 1
+                threshold = max(1, math.ceil(RETRY_CLAIM_TTL_S / ORPHAN_SWEEP_INTERVAL_S))
+                logger.log(
+                    logging.WARNING if count >= threshold else logging.INFO,
+                    "Delegation retry sweep deferred: database busy; retrying next sweep "
+                    "(profile=%s consecutive=%d warning_after=%d)", profile, count, threshold)
+                return []
+        except sqlite3.OperationalError as exc:
+            # Extended BUSY codes share the primary low byte. Other storage
+            # errors are failures, not an expected competing-writer deferral.
+            if getattr(exc, "sqlite_errorcode", 0) & 0xFF != sqlite3.SQLITE_BUSY:
+                busy.pop(key, None)
+                raise
+            count = busy[key] = busy.get(key, 0) + 1
+            threshold = max(1, math.ceil(RETRY_CLAIM_TTL_S / ORPHAN_SWEEP_INTERVAL_S))
+            logger.log(
+                logging.WARNING if count >= threshold else logging.INFO,
+                "Delegation retry sweep deferred: database busy; retrying next sweep "
+                "(profile=%s consecutive=%d warning_after=%d)", profile, count, threshold)
+            return []
+        except Exception:
+            busy.pop(key, None)
+            raise
+        if count := busy.pop(key, 0):
+            logger.info("Delegation retry sweep recovered for profile %s after %d busy sweeps", profile, count)
+        return [{**action, "profile": profile} for action in actions]
+
+
     def _collect_delegation_retry_actions(self) -> list:
-        """Claim due retry notices / terminal settlements from every served profile's ledger (atomic claims)."""
-        from gateway.run_notifications import Path, _log_suppressed, logging
-        from tools.delegation_resume import sweep_retries
-        from hermes_cli.profiles import get_active_profile_name
-        actions = []
-        with _log_suppressed(logging.WARNING, "Delegation retry sweep failed: %s"):
-            primary = get_active_profile_name() or "default"
-            actions += [{**a, "profile": primary} for a in sweep_retries()]
-        profile_homes = (getattr(self, "_served_profile_homes", None) or {}).items()
-
-        def _one(name):
-            found = sweep_retries()
-            actions.extend({**a, "profile": name} for a in found)
-            return len(found)
-
+        """Claim due retry notices / terminal settlements from every served profile's ledger (atomic
+        claims). One profile's failure, including entering its scope, never skips the others."""
+        from gateway.run_notifications import Path
         from gateway.run import _profile_runtime_scope
-        for profile_name, profile_home in profile_homes:
-            if profile_name in {primary, getattr(self, "_primary_profile_name", None)}:
+        from hermes_cli.profiles import get_active_profile_name
+
+        def _collect(profile: str, home=None) -> list:
+            try:
+                if home is None:
+                    return self._collect_profile_retry_actions(profile)
+                with _profile_runtime_scope(Path(home), {}):
+                    return self._collect_profile_retry_actions(profile)
+            except Exception:
+                logger.warning("Delegation retry sweep failed for profile %s", profile, exc_info=True)
+                return []
+
+        primary = get_active_profile_name() or "default"
+        actions = _collect(primary)
+        for profile, home in (getattr(self, "_served_profile_homes", None) or {}).items():
+            if profile in {primary, getattr(self, "_primary_profile_name", None)}:
                 continue
-            with _log_suppressed(logging.WARNING, "Delegation retry sweep failed: %s"):
-                with _profile_runtime_scope(Path(profile_home), {}):
-                    _one(profile_name)
+            actions.extend(_collect(profile, home))
         return actions
 
 

@@ -42,7 +42,7 @@ def script_run(tmp_path, monkeypatch):
             db=SimpleNamespace(db_path=str(tmp_path / "owner.sqlite")), pending_results={},
             sessions={"script-test-session": SimpleNamespace(source=SimpleNamespace(user_id="cron-owner"))})
         row = {"admission_id": "script-test", "request_id": execution_id,
-               "principal_id": "cron-owner", "payload": {"text": extra_prompt or ""}}
+               "principal_id": "cron-owner", "owner_epoch": 1, "generation": 1, "payload": {"text": extra_prompt or ""}}
         policy = SimpleNamespace(request_json=json.dumps({
             "cron_job": job, "request_id": execution_id, "extra_prompt": extra_prompt}))
         try:

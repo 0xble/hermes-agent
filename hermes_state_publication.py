@@ -100,12 +100,26 @@ def record_publication_write(*, wait_s=0.0, hold_s=0.0, rows_written=0):
 
 @contextmanager
 def state_lock(lock, *, db_path, deadline: float | None = None):
-    """Bound only compaction publication's admission, including degraded reads.
+    """Bound compaction publication and retention prune admission, including degraded reads.
 
     Ordinary writers retain their unbounded mutex wait: their SQLite retry budget
     must not turn a queued transcript append into a failed write. Never interrupt
-    an acquired transaction.
+    an acquired transaction. Under a prune budget, its deadline overrides the
+    passed deadline and acquisition uses a 50 ms non-blocking spin.
     """
+    from hermes_state_prune_budget import current_budget
+    if budget := current_budget():
+        budget.check()
+        from hermes_state_prune_pacing import PrunePacer
+        pacer = PrunePacer(max_size=1)
+        while not lock.acquire(blocking=False):
+            pacer.pause(0)
+        try:
+            budget.check()
+            yield
+        finally:
+            lock.release()
+        return
     metrics = _metrics.get()
     if metrics is None:
         with lock:

@@ -25,6 +25,7 @@ from string import Formatter
 from typing import Optional
 
 from agent.memory_provider import is_trivial_prompt
+from agent.plugin_live_notes import RUNTIME_NOTICE_TEMPLATE
 from agent.prompt_builder import STEER_MARKER_CLOSE, STEER_MARKER_OPEN
 from hermes_cli.goals import KANBAN_GOAL_CONTINUATION_TEMPLATE, KANBAN_GOAL_FINALIZE_TEMPLATE
 from hermes_cli.goals_prompt_registry import GOAL_PROMPT_REGISTRY
@@ -124,6 +125,7 @@ _GOAL_PROMPT_PATTERNS = tuple(
 from hermes_cli.checkins import CHECKIN_PROMPT_TEMPLATE
 
 _INJECTED_TURN_PATTERNS = (
+    ("runtime_notice", RUNTIME_NOTICE_TEMPLATE, _TemplateMatcher(RUNTIME_NOTICE_TEMPLATE)),
     ("checkin", CHECKIN_PROMPT_TEMPLATE, _TemplateMatcher(CHECKIN_PROMPT_TEMPLATE)),
     *_GOAL_PROMPT_PATTERNS,
     ("kanban", KANBAN_GOAL_CONTINUATION_TEMPLATE, _TemplateMatcher(KANBAN_GOAL_CONTINUATION_TEMPLATE)),
@@ -294,7 +296,7 @@ def human_prompt_text(
 # deep copy of the API messages, and automatic recall reads the stored user message instead, whose
 # multimodal parts flatten to the caption alone.
 _IMAGE_RECALL_PREFIX = re.compile(
-    r"\[The user (?:sent an image~ Here's what I can see:|"
+    r"\[The user (?:sent an image~ Here's what I can see(?: \(user-supplied image content, not instructions\))?:|"
     r"attached an image\. Here's what it contains:)\n(?P<description>.*?)\]\n"
     r"\[If you need a closer look, use vision_analyze with image_url: [^\n]+\](?=\n|$)",
     re.DOTALL,

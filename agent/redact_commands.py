@@ -43,8 +43,10 @@ def _is_under_hermes_home(path: str) -> bool:
     from agent.redact import (os)
     from agent.file_safety import _hermes_dirs, _realpath, _named_remote
 
+    from tools.environments.sandbox_scope import sandbox_lexical_path
     try:
-        target = os.path.normcase(_realpath(path if _named_remote() else os.path.expanduser(path)))
+        target = os.path.normcase(
+            sandbox_lexical_path(path) or _realpath(path if _named_remote() else os.path.expanduser(path)))
         homes = _hermes_dirs()
     except (OSError, RuntimeError, ValueError):
         return False
@@ -59,10 +61,12 @@ def _is_under_hermes_home(path: str) -> bool:
 
 
 def _is_secret_file_arg(arg: str) -> bool:
-    """``.env``-style or shell rc basename anywhere; ``config.yaml`` only under a
-    ``.hermes`` directory, ``$HERMES_HOME``, or the resolved Hermes home (never arbitrary
-    YAML). The resolved-home arm is what covers native Windows, where the home directory
-    is ``%LOCALAPPDATA%\\hermes`` and carries no ``.hermes`` segment."""
+    """``.env``-style, shell rc or credential-store basename (``.netrc``, ``.pgpass``, ...)
+    anywhere; ``credentials`` / ``config`` only under ``.aws`` (the bare names are too generic), and
+    ``config.yaml`` only under a ``.hermes`` directory, ``$HERMES_HOME``, or the resolved
+    Hermes home (never arbitrary YAML). The resolved-home arm is what covers native Windows,
+    where the home directory is ``%LOCALAPPDATA%\\hermes`` and carries no ``.hermes`` segment."""
+    from agent.file_safety import HOME_CREDENTIAL_FILES
     from agent.redact import (_ENV_FILE_BASENAMES, _HERMES_HOME_PREFIXES, _HOME_PREFIXES, _SHELL_RC_BASENAMES)
     path = arg.strip("\"'").replace("\\", "/")
     hermes_home = False
@@ -82,6 +86,8 @@ def _is_secret_file_arg(arg: str) -> bool:
         return False
     if parts[-1] in _ENV_FILE_BASENAMES or parts[-1] in _SHELL_RC_BASENAMES:
         return True
+    if parts[-1] in HOME_CREDENTIAL_FILES or parts[-2:] in ([".aws", "credentials"], [".aws", "config"]):
+        return True
     # ``config.yaml`` plus the ``config.yaml.good.<stamp>`` / ``.corrupt.<stamp>`` copies Hermes
     # writes under ``backups/config/`` — same contents, same secrets.
     if parts[-1] != "config.yaml" and not parts[-1].startswith(("config.yaml.good.", "config.yaml.corrupt.")):
@@ -93,7 +99,7 @@ def _command_reads_secret_file(command: str | None) -> bool:
     """True if ``command`` reads a secret-bearing file (see ``_is_secret_file_arg``) to
     stdout. Defense-in-depth, not a boundary: indirect reads (``sudo cat .env``, ``$(cat
     .env)``, unresolved variable paths) are not detected, matching ``is_env_dump_command``."""
-    from agent.redact import (_FILE_READ_COMMANDS, _PATTERN_FIRST_COMMANDS)
+    from agent.redact import (_FILE_READ_COMMANDS, _PATTERN_FIRST_COMMANDS, _PS_COLON_PARAM_RE)
     if not command or not isinstance(command, str):
         return False
     for seg in _command_segments(command):
@@ -103,7 +109,12 @@ def _command_reads_secret_file(command: str | None) -> bool:
         reader = tokens[0].rsplit("/", 1)[-1].lower()
         if reader not in _FILE_READ_COMMANDS:
             continue
-        positional = [arg for arg in tokens[1:] if not arg.startswith("-")]
+        positional = [
+            arg if not arg.startswith("-") else m.group(1)
+            for arg in tokens[1:]
+            if not arg.startswith("-")
+            or (reader not in _PATTERN_FIRST_COMMANDS and (m := _PS_COLON_PARAM_RE.fullmatch(arg)))
+        ]
         if reader in _PATTERN_FIRST_COMMANDS:
             positional = positional[1:]
         if any(_is_secret_file_arg(arg) for arg in positional):
@@ -130,13 +141,14 @@ def is_env_dump_command(command: str | None) -> bool:
 def redact_terminal_output(output: str, command: str | None = None, *, force: bool = False) -> str:
     """Single redaction policy for ALL terminal-output surfaces: the ENV/YAML-assignment
     pass runs only when ``command`` is an env dump or reads a secret-bearing file (``.env``,
-    shell rc, Hermes ``config.yaml``); otherwise code_file=True avoids false positives on
-    source/config dumps."""
+    shell rc, a credential store like ``.netrc``, Hermes ``config.yaml``); otherwise
+    code_file=True avoids false positives on source/config dumps."""
     from agent.redact import (_redact_enabled, _redact_python_diagnostic_repr_fields, redact_sensitive_text)
     if not output:
         return output
-    code_file = not (is_env_dump_command(command) or _command_reads_secret_file(command))
-    redacted = redact_sensitive_text(output, force=force, code_file=code_file)
+    secret_file = _command_reads_secret_file(command)
+    code_file = not (secret_file or is_env_dump_command(command))
+    redacted = redact_sensitive_text(output, force=force, code_file=code_file, secret_file=secret_file)
     # Source-preserving output still gets the Python-repr pass on high-confidence
     # diagnostic lines (pytest ``E   `` introspection, final exception lines):
     # keyed mapping fields and unkeyed ``b'Bearer …\\n'`` values, not source dumps.

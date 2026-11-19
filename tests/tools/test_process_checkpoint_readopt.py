@@ -163,7 +163,7 @@ class TestCheckpointReadopt:
                 "notify_on_complete": True,
             }]))
             monkeypatch.setattr(
-                "tools.process_registry.CHECKPOINT_PATH", checkpoint
+                "tools.process_registry._checkpoint_path", lambda: checkpoint
             )
             monkeypatch.setattr(
                 ProcessRegistry, "_safe_host_start_time", staticmethod(lambda _pid: None)
@@ -199,7 +199,7 @@ class TestCheckpointReadopt:
             }]))
             stopped = []
             monkeypatch.setattr(
-                "tools.process_registry.CHECKPOINT_PATH", checkpoint
+                "tools.process_registry._checkpoint_path", lambda: checkpoint
             )
             monkeypatch.setattr(
                 "tools.process_registry._stop_systemd_unit",

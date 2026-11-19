@@ -1,7 +1,7 @@
 """Per-request API reasoning and service-tier overrides for gateway turns."""
 
 
-def apply_api_request_options(runner, reasoning_config):
+def apply_api_request_options(reasoning_config, service_tier):
     """Apply explicit API options after session defaults have been resolved."""
     from gateway.session_api_turn import api_execution
     api = api_execution.get()
@@ -12,8 +12,8 @@ def apply_api_request_options(runner, reasoning_config):
             reasoning_config = requested_reasoning
         tier = _request_service_tier(api['settings'].get('model_options'))
         if tier is not _REQUEST_OPTION_MISSING:
-            runner._service_tier = tier
-    return reasoning_config
+            service_tier = tier
+    return reasoning_config, service_tier
 
 
 def attach_preflight_fallback(agent, attribution, notice):

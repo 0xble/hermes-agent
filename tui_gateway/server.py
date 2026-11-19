@@ -57,6 +57,7 @@ from tui_gateway.user_messages import (
     resume_failed_message, turn_error_text)
 from tui_gateway.transport import (FanoutTransport, StdioTransport, Transport, bind_transport,
                                    current_transport, reset_transport)
+from hermes_cli._startup_fast import project_root_str
 
 logger = logging.getLogger(__name__)
 
@@ -75,7 +76,7 @@ def _bootstrap_served_profile_store(db_path: Path) -> None:
     release_or_close(acquire(db_path))
 
 _hermes_home = _HERMES_HOME_AT_IMPORT = get_hermes_home()
-load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(__file__).parent.parent / ".env")
+load_hermes_dotenv(hermes_home=_hermes_home, project_env=Path(project_root_str()) / ".env")
 
 
 # ── Panic logger: crashes otherwise leave no forensics (stdout is the JSON-RPC pipe, stderr doesn't
@@ -735,13 +736,6 @@ def _status_update(sid: str, kind: str, text: str | None = None):
     if not (body := (text if text is not None else kind).strip()):
         return
     out_kind = kind if text is not None else "status"
-    # Auto-compaction arrives as a generic "lifecycle" status; re-tag so drivers can show a
-    # summarizing indicator — otherwise idle/preflight compaction looks like a hung turn.
-    # See #97239.
-    if out_kind == "lifecycle":
-        from agent.conversation_compression import is_compaction_progress_status
-        if is_compaction_progress_status(body):
-            out_kind = "compacting"
     _emit("status.update", sid, {"kind": out_kind, "text": body})
 
 
@@ -1529,12 +1523,12 @@ def _row_follows_profile(row: dict | None) -> bool:
 
 
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
-    """Runtime fields persisted with a stored session (model column, ``billing_provider``, JSON ``model_config``):
-    resume restores the model/provider/reasoning THAT chat used, not the global pick. Plugin-owned Bot-Mode
+    """Runtime fields persisted with a stored session (model column, ``billing_provider``, JSON ``model_config``): resume restores the model/provider/reasoning THAT chat used, not the global pick. Plugin-owned Bot-Mode
     sessions normally rebuild from the member profile's CURRENT config (a stale provider pin left room bots
     "out of Nous credits" after a profile switch). A canonical Bot Chat may instead restore an explicit
-    composer pick while the profile model it diverged from remains unchanged."""
-    if not row:
+    composer pick while the profile model it diverged from remains unchanged. A fallback's route is turn-scoped (#152333)."""
+    from agent.fallback_session_route import fallback_restored_row
+    if not (row := fallback_restored_row(row)):
         return {}
     model_config = _parse_model_config(row.get("model_config"), quiet=True)
     _row_title = str(row.get("title") or "").strip()
@@ -1755,7 +1749,7 @@ def _write_config_changes(sets: dict, unsets: tuple = ()) -> None:
     applied when it raises. The file backend keeps its raw round-trip (callers branch on
     ``supports_file_tooling()``)."""
     try:
-        _config_backend.get_config_backend().write_changes(_active_config_path().parent, Changes(set=dict(sets), unset=tuple(unsets)))
+        _config_backend.write_changes(_active_config_path(), Changes(set=dict(sets), unset=tuple(unsets)))
     finally:
         _drop_cfg_cache()
 
@@ -2290,7 +2284,7 @@ def _session_info(agent, session: dict | None = None) -> dict:
     reasoning_effort_wire = ""
     if reasoning_effort and reasoning_effort != "none":
         reasoning_effort_wire = str(clamp_effort(reasoning_effort, route_supported_efforts(
-            pending_provider or provider, model, getattr(agent, "api_mode", None))) or "")
+            pending_provider or provider, model, getattr(agent, "api_mode", None), getattr(agent, "base_url", None))) or "")
     info: dict = {
         "model": model,
         "provider": pending_provider or provider,

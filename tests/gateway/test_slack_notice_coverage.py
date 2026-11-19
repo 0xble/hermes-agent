@@ -143,7 +143,7 @@ async def test_cached_attended_unavailable_is_one_context_diagnostic(home, monke
 
     adapter.send = observe
     ctx = TurnContext(source=source, session_key="cached-session", user_config=config,
-        _run_still_current=lambda: True, _status_adapter=adapter, _status_chat_id="C1",
+        _run_still_current=lambda: True, _status_adapter_pinned=adapter, _status_chat_id="C1",
         _status_thread_metadata={"thread_id": "123.0"}, _loop_for_step=asyncio.get_running_loop())
     turn = TurnRunner(runner, ctx)
     statuses = []
@@ -206,7 +206,7 @@ async def test_cached_action_needed_diagnostics_remain_full(home, message):
 
     adapter.send = observe
     ctx = TurnContext(source=source, session_key="cached-session", user_config={},
-        _run_still_current=lambda: True, _status_adapter=adapter, _status_chat_id="C1",
+        _run_still_current=lambda: True, _status_adapter_pinned=adapter, _status_chat_id="C1",
         _status_thread_metadata={"thread_id": "123.0"}, _loop_for_step=asyncio.get_running_loop())
     turn = TurnRunner(runner, ctx)
     agent = _BoundaryAgent(turn._status_callback_sync)
@@ -555,7 +555,7 @@ async def test_credit_notice_callback_uses_only_producer_marker(home, platform, 
         return result
     adapter.send = observe
     ctx = TurnContext(source=event.source, user_config={}, _run_still_current=lambda: True,
-        _status_adapter=adapter, _loop_for_step=asyncio.get_running_loop())
+        _status_adapter_pinned=adapter, _loop_for_step=asyncio.get_running_loop())
     turn = TurnRunner(runner, ctx)
     try:
         await asyncio.to_thread(turn._notice_callback_sync, notice)

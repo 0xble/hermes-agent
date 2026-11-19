@@ -299,6 +299,7 @@ class PluginLedgerMixin:
         from gateway.platform_registry import platform_registry
         for platform_name in tuple(self._plugin_platform_names):
             platform_registry.unregister(platform_name)
+        platform_registry.forget_failed_loads(self.scope_key)
         # Ledger-owned tool names are excluded: their handles already restored the previous entry, and blanket
         # deregistration would remove what the ledger just restored.
         ledger_tool_names = {r.key for r in registrations if r.kind == "tool"}
@@ -331,6 +332,6 @@ class PluginLedgerMixin:
         with self._hook_timeout_lock:
             self._hook_running_callbacks.clear()
             self._hook_abandoned.clear()
-            self._hook_timeout_suppressed_until.clear()
+            self._hook_live_workers.clear()
         self._hook_failures_reported.clear()
         self._discovered = False

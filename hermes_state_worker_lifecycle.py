@@ -114,17 +114,13 @@ def worker_next_title(db, conn, session_id, payload):
 
 
 def worker_title_collision(db, conn, session_id, payload):
-    from hermes_state_titles import _auto_title_matches
+    from hermes_state_titles import _auto_title_collides
     if (set(payload) != {'title', 'exclude_session_id'} or not isinstance(payload['title'], str)
             or payload['exclude_session_id'] not in (None, session_id)):
         raise RuntimeStoreError('invalid_params')
     if not payload['title']:
         return {'value': False}
-    conn.create_function('auto_title_matches', 2, _auto_title_matches, deterministic=True)
-    return {'value': conn.execute(
-        'SELECT 1 FROM sessions WHERE id != ? AND title IS NOT NULL '
-        'AND auto_title_matches(title, ?) LIMIT 1',
-        (payload['exclude_session_id'] or '', payload['title'].casefold())).fetchone() is not None}
+    return {'value': _auto_title_collides(conn, payload['title'], payload['exclude_session_id'])}
 
 
 def worker_activity(db, conn, session_id, payload):
@@ -247,6 +243,12 @@ def insert_session_row_in_transaction(
         raise RuntimeStoreError('not_found')
     if not (profile_name or "").strip():
         profile_name = self._own_profile_name()
+    # A newly inserted /new continuation must be visible immediately; schema-open repair
+    # only heals rows already on disk (#109073).
+    if (session_key and isinstance(model_config, dict)
+            and model_config.get("_reset_from") is not None
+            and model_config.get("_delegate_from") is not None):
+        model_config = {key: value for key, value in model_config.items() if key != "_delegate_from"}
     system_prompt_hash = self._store_system_prompt(conn, system_prompt)
     conn.execute(
         """INSERT INTO sessions (
@@ -272,7 +274,9 @@ def insert_session_row_in_transaction(
                             sessions.model_config, '$._reset_from'
                         ) = '{}'
                    THEN json_set(
-                       excluded.model_config,
+                       -- a reset row is the chat itself: a delegate marker riding the incoming
+                       -- config would hide it from every list while it keeps the route (#109073)
+                       json_remove(excluded.model_config, '$._delegate_from'),
                        '$._reset_from',
                        json_extract(
                            sessions.model_config, '$._reset_from'
@@ -301,12 +305,7 @@ def insert_session_row_in_transaction(
         ),
     )
     if system_prompt_hash is not None:
-        conn.execute(
-            "DELETE FROM system_prompts WHERE hash=? AND NOT EXISTS ("
-            "SELECT 1 FROM sessions WHERE system_prompt_hash=system_prompts.hash) AND NOT EXISTS ("
-            "SELECT 1 FROM sessions WHERE tool_names=system_prompts.hash)",
-            (system_prompt_hash,),
-        )
+        self._delete_prompt_if_unreferenced(conn, system_prompt_hash)
     if parent_session_id:
         self._inherit_parent_session_metadata(conn, session_id)
     # The upsert may have just filled a compression tip's created_source (update_token_counts).

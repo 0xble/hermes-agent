@@ -99,6 +99,7 @@ _PROFILE_IMPLICIT = frozenset({'session.create', 'session.list', 'session.info',
                                'prompt.submit', 'prompt.receipt', 'prompt.cancel', 'prompt.resolve_unknown',
                                'prompt.steer_queued', 'prompt.replace_queued',
                                'session.interrupt', 'session.events.since', 'session.mutate', 'session.stats',
+                               'session.account_usage',
                                'approval.respond', 'clarify.respond'})
 
 
@@ -267,8 +268,9 @@ class AuthorityConnection:
         handlers['complete.path'] = partial(complete_path, self)
         from gateway.session_prune import prune
         handlers['session.prune'] = partial(prune, self)
-        from gateway.session_usage import stats
+        from gateway.session_usage import account_usage, stats
         handlers['session.stats'] = partial(stats, self)
+        handlers['session.account_usage'] = partial(account_usage, self)
         from gateway.session_active_list import active_list
         handlers['session.active_list'] = partial(active_list, self)
         from gateway.session_viewer_automation import automation
@@ -279,6 +281,8 @@ class AuthorityConnection:
         handlers['clarify.lock'] = partial(clarify_lock, self)
         from gateway.session_connections import handlers as connection_handlers
         handlers.update(connection_handlers(self))
+        from gateway.session_handoff import handlers as handoff_handlers
+        handlers.update(handoff_handlers(self))
         from gateway.session_control_actions import control
         handlers['session.control'] = partial(control, self)
         from gateway.session_onboarding import handlers as onboarding_handlers
@@ -560,7 +564,8 @@ class AuthorityConnection:
         return {'instance_id': self.authority.instance_id, 'profile_id': self.authority.profile_id,
                 'authority_epoch': self.authority.epoch,
                 'capabilities': ['durable-admission-v1', 'event-replay-v1', 'local-cli-create-v1', 'acp-editor-policy-v1',
-                                 'acp-session-mcp-v1', 'clarify-batch-v1', 'plugin-rpc-v1', 'session-client-v1', 'session-transcript-v1', 'session-list-picker-v1'],
+                                 'acp-session-mcp-v1', 'clarify-batch-v1', 'plugin-rpc-v1', 'session-client-v1', 'session-transcript-v1', 'session-list-picker-v1',
+                                 'session-list-cursor-v1'],
                 'session_create': {'sources': sorted(SURFACES),
                                    'parameters': sorted(CREATE_FIELDS | {'title'})},
                 # Main's ``gateway.ready.skin``: the canonical client's own ready carries it.
@@ -577,17 +582,20 @@ class AuthorityConnection:
         if 'session:read' not in self.actor.capabilities:
             raise RuntimeStoreError('permission_denied')
         limit, workspace, picker = params.get('limit', 200), params.get('workspace'), params.get('picker', False)
-        if (set(params) - {'limit', 'title', 'include_hidden', 'scope', 'workspace', 'picker'} or type(limit) is not int
-                or not 1 <= limit <= 200 or (workspace is not None and not (isinstance(workspace, str) and workspace))
+        if (set(params) - {'limit', 'title', 'include_hidden', 'scope', 'workspace', 'picker', 'query', 'cursor'}
+                or type(limit) is not int or not 1 <= limit <= 200
+                or (workspace is not None and not (isinstance(workspace, str) and workspace))
                 or type(picker) is not bool):
             raise RuntimeStoreError('invalid_params')
         if (params.get('scope', 'live') not in {'live', 'stored'}
                 or ('title' in params and ('scope' in params or workspace is not None or picker))):
             raise RuntimeStoreError('invalid_params')
+        from gateway.session_listing import check_page_params, stored_picker_sessions
+        check_page_params(params)
         if params.get('scope') == 'stored':
-            from gateway.session_listing import stored_picker_sessions
             return await asyncio.to_thread(stored_picker_sessions, self.authority, self.actor,
-                limit=limit, include_hidden=params.get('include_hidden', False), workspace=workspace, picker=picker)
+                limit=limit, include_hidden=params.get('include_hidden', False), workspace=workspace, picker=picker,
+                query=params.get('query'), cursor=params.get('cursor'))
         if 'title' in params:
             # Title-as-identity lookup (the Bots roster's forever-chat registry): the same
             # resolver `session.resume title=` uses, so a hidden canonical chat answers here
@@ -627,6 +635,17 @@ class AuthorityConnection:
         from gateway.session_picker_fields import live_picker_page
         return {'sessions': await asyncio.to_thread(live_picker_page, self.authority, sessions, limit, workspace, picker),
                 'scope': 'live'}
+
+    async def _authorize_resume(self, ref, capability):
+        if ref.session_id in self.authority.sessions:
+            self.authority.authorize(self.actor, ref, capability)
+            return
+        from gateway.session_store_async import run_store_call
+        # A cold authorization can mount a routed conversation and read its
+        # persisted route under the session-store lock.
+        await run_store_call(self.authority.authorize, self.actor, ref, capability)
+        if ref.session_id not in self.authority.sessions:
+            raise RuntimeStoreError('not_found')
 
     async def resume(self, ref, params):
         from gateway.session_local_inventory import snapshot_info
@@ -671,18 +690,18 @@ class AuthorityConnection:
                 from gateway.session_route_recovery import messaging_owner_ref
                 ref = messaging_owner_ref(self.authority, ref)
         if params.get('editor') is not None:
-            self.authority.authorize(self.actor, ref, 'session:control')
+            await self._authorize_resume(ref, 'session:control')
             from gateway.session_local_mcp import resume_editor_mcp
             resume_editor_mcp(self.authority, ref, params['editor'])
         if 'api_key' in params:
             # A launch-only key re-supplied after a restart (`--resume <id> --api-key`).
-            self.authority.authorize(self.actor, ref, 'session:control')
+            await self._authorize_resume(ref, 'session:control')
             from gateway.session_policy import rebind_launch_key
             rebind_launch_key(self.authority, ref, params['api_key'])
         # Read-only mount (#85303): an ended row stays ended until the first admitted turn
         # reopens it (``reopen_local_session`` in the drain), so opening a finished chat
         # never re-lights DB-derived liveness with no new activity.
-        self.authority.authorize(self.actor, ref, 'session:read')
+        await self._authorize_resume(ref, 'session:read')
         mounted = self.authority.sessions[ref.session_id].source
         # Only a local route has a stored creation policy to refresh; a platform lane's turns read the profile.
         if 'session:control' in self.actor.capabilities and getattr(mounted, 'platform', None) == Platform.LOCAL:

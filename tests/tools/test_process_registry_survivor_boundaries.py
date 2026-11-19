@@ -12,7 +12,7 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 
 def _checkpoint(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr("tools.process_registry._checkpoint_path", lambda _p=tmp_path / "processes.json": _p)
 
 
 @pytest.mark.platforms("posix")

@@ -56,7 +56,7 @@ class RecordedSSH:
 def registry(monkeypatch, tmp_path):
     result = pr.ProcessRegistry()
     monkeypatch.setattr(pr, "process_registry", result)
-    monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr(pr, "_checkpoint_path", lambda _p=tmp_path / "processes.json": _p)
     monkeypatch.setattr(result, "_start_ssh_poller", lambda session: None)
     return result
 
@@ -89,7 +89,7 @@ def test_spawn_binds_immutable_connection_and_raw_notification_owner(spawn, regi
     assert session.session_key == "chat-route"
     with pytest.raises(FrozenInstanceError):
         session.ssh_binding.ssh = "different-host"
-    entry, = json.loads(pr.CHECKPOINT_PATH.read_text())
+    entry, = json.loads(pr._checkpoint_path().read_text())
     assert entry["ssh_binding"] == binding_record(session.ssh_binding)
     assert entry["pid_scope"] == "ssh"
     assert [call["action"] for call in peer.calls] == ["launch"]
@@ -103,7 +103,7 @@ def test_ambiguous_launch_is_persisted_and_never_replayed(spawn, registry, node)
         spawn(peer)
     session, = registry._running.values()
     assert session.id in str(error.value)
-    assert session.id in pr.CHECKPOINT_PATH.read_text()
+    assert session.id in pr._checkpoint_path().read_text()
     assert not session.exited
     peer.error = None
     peer.state = "exited"
@@ -278,7 +278,7 @@ def test_foreign_ssh_handoff_survives_unrelated_checkpoint_writer(spawn):
     session = spawn()
     unrelated = pr.ProcessRegistry()
     unrelated._write_checkpoint()
-    entry, = json.loads(pr.CHECKPOINT_PATH.read_text())
+    entry, = json.loads(pr._checkpoint_path().read_text())
     assert entry["session_id"] == session.id
     assert entry["ssh_binding"] == binding_record(session.ssh_binding)
 

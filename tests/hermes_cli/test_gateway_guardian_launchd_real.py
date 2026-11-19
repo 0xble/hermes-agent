@@ -2,6 +2,7 @@
 import json
 import os
 import plistlib
+import shlex
 import subprocess
 import sys
 import time
@@ -19,6 +20,14 @@ def _sweep(request):
     sweep_prior_sessions(request)
 
 
+def release_interpreter(release: Path) -> None:
+    """Give a fake release the ``.venv/bin/python`` the guardian plist runs, backed by this interpreter."""
+    python = release / ".venv/bin/python"
+    python.parent.mkdir(parents=True)
+    python.write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)} "$@"\n', encoding="utf-8")
+    python.chmod(0o755)
+
+
 @pytest.mark.platforms("macos")
 def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_path, request, monkeypatch):
     home = tmp_path / "profile"
@@ -28,6 +37,7 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
     release.mkdir(parents=True)
     for name in (".release-ready", ".hermes_build_sha"):
         (release / name).write_text(sha + "\n", encoding="utf-8")
+    release_interpreter(release)
     (home / "current").symlink_to(release)
     (home / "previous").symlink_to(release)
     (home / "config.yaml").write_text("gateway:\n  guardian:\n    enabled: true\n", encoding="utf-8")
@@ -51,14 +61,13 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
     monkeypatch.setattr(guardian, "GUARDIAN_LABEL", guardian_label)
     agent_plist = tmp_path / f"{guardian_label}.plist"
     repo = Path(__file__).resolve().parents[2]
-    agent_plist.write_bytes(plistlib.dumps({"Label": guardian_label, "RunAtLoad": True,
-        "StartInterval": 2,
-        "ProgramArguments": [sys.executable, "-m", "hermes_cli.gateway_guardian", "run",
-            "--gateway-plist", str(gw_plist), "--gateway-label", label, "--domain", domain],
-        "WorkingDirectory": str(repo),
-        "EnvironmentVariables": {"HERMES_HOME": str(home), "PYTHONPATH": str(repo)},
-        "StandardOutPath": str(tmp_path / "guardian-out.log"),
-        "StandardErrorPath": str(tmp_path / "guardian-err.log")}))
+    # The installer's own definition, so launchd runs the production osascript launch path.
+    definition = plistlib.loads(guardian.guardian_plist(home, gw_plist, label, domain=domain))
+    definition["StartInterval"] = 2
+    definition["EnvironmentVariables"]["PYTHONPATH"] = str(repo)
+    agent_plist.write_bytes(plistlib.dumps(definition))
+    (home / "logs/guardian").mkdir(parents=True)
+    guardian_out = home / "logs/guardian/stdout.log"
     register_disposable_label(request, label, gw_plist)
     register_disposable_label(request, guardian_label, agent_plist)
     gw_target = f"{domain}/{label}"
@@ -86,7 +95,7 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
                    for p in (home / "logs/guardian").glob("*.json")))
         guardian.set_intent(home, stopped=True)
         subprocess.run(["launchctl", "bootout", gw_target], check=True, timeout=15)
-        assert wait_for(lambda: "stopped" in (tmp_path / "guardian-out.log").read_text(encoding="utf-8"))
+        assert wait_for(lambda: guardian_out.exists() and "stopped" in guardian_out.read_text(encoding="utf-8"))
         assert not loaded()
         # Reproduce a completed forward switch whose new process never acknowledges.
         guardian.set_intent(home, stopped=False)
@@ -94,6 +103,7 @@ def test_independent_guardian_bootstraps_unloaded_service_and_honors_stop(tmp_pa
         new.mkdir()
         for name in (".release-ready", ".hermes_build_sha"):
             (new / name).write_text(new.name + "\n", encoding="utf-8")
+        release_interpreter(new)
         (home / "current").unlink()
         (home / "current").symlink_to(new)
         (home / "previous").unlink()

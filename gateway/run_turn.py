@@ -27,6 +27,7 @@ from agent.turn_failure_copy import (
 from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
+from gateway import loop_completion
 from gateway.config import Platform
 from gateway.cron_review import defer_review_followup
 from gateway.media_repair import repair_explicit_computer_use_media_paths
@@ -38,7 +39,7 @@ from gateway.run_turn_hygiene import hygiene_no_commit_reason
 from gateway.run_turn_pending import _drain_leftover_steer
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin, _acp_launch
-from gateway.platforms.helpers import typing_metadata_for_turn
+from gateway.platforms.helpers import hash_for_log, typing_metadata_for_turn
 from gateway.response_filters import (
     display_kind_for_event, display_metadata_for_event, is_machinery_display_kind, persisted_user_metadata_for_event, reply_expected_metadata, silence_allowed,
     strip_edge_silence_markers,
@@ -55,6 +56,8 @@ from gateway.attended_model import (
     is_active, parse_attended_config,
 )
 from gateway.session_transcript import TranscriptReadError
+from gateway.run_turn_bubble_cleanup import settle_turn_senders
+from gateway.run_turn_final_reconcile import edit_streamed_message, owns_reconcilable_preview
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext, TurnWorker
 from gateway.turn_lease import DEFAULT_LEASE_WAIT
 from hermes_constants import get_hermes_home_override
@@ -713,6 +716,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         user_config: Optional[dict] = None,
     ) -> tuple[str, dict]:
         """Off-loop reads/credentials, on-loop snapshots and compare-and-set commits."""
+        # Slash commands such as manual /compress resolve a session without an inbound turn
+        # config snapshot. Role holds are still live persisted routes, so normalize that
+        # omission through the same gateway loader used by ordinary turns before resolving
+        # aliases. An empty config would make a valid stored alias look unavailable.
+        if user_config is None:
+            from gateway.run import _load_gateway_config
+            user_config = _load_gateway_config()
         from gateway.session_policy import policy_for_source
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
@@ -779,10 +789,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                     "durable_activity_stamp", _NO_ATTENDED_ACTIVITY_STAMP),
                 route_active=attended_snapshot.get("route_active", _NO_ATTENDED_ACTIVITY_STAMP),
             )
+            from gateway.run_turn_prepare import load_runtime_for_source
             resolved = await asyncio.to_thread(
-                self._load_session_agent_runtime, source=source, skey=skey, user_config=user_config,
-                config=getattr(self, "config", None), override=override, last_model=last_model,
-                attended_route=attended_route,
+                load_runtime_for_source, self, source=source, skey=skey, user_config=user_config,
+                override=override, last_model=last_model, attended_route=attended_route,
             )
             # Credential resolution can also yield to /model or a boundary. Retry
             # against live memory, not disk, so a pending durable clear cannot revive it.
@@ -964,19 +974,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
 
 
 
-    async def _hmwa_stop_typing_for_turn(self, event, source):
-        """Stop the typing indicator (never raises), with the delivery path's thread/workspace routing
-        metadata (Slack AI status is thread-scoped), on this turn's own message, not the chat's latest."""
-        from gateway.platforms.helpers import typing_metadata_for_turn
-        with suppress(Exception):
-            _typing_adapter = self._delivery_adapter_for(source)
-            _kind = type(_typing_adapter)
-            if _typing_adapter and callable(getattr(_kind, "_stop_typing_with_metadata", None)):
-                await _typing_adapter._stop_typing_with_metadata(source.chat_id, typing_metadata_for_turn(_typing_adapter,
-                    source.chat_id, self._reply_anchor_for_event(event), self._event_thread_metadata(event, source)))
-            elif _typing_adapter and callable(getattr(_kind, "stop_typing", None)):
-                await _typing_adapter.stop_typing(source.chat_id)
-
 
 
     # reasoning_style → (header catalog key, per-line quote prefix for blank / non-blank lines)
@@ -1108,11 +1105,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         logger.info(
-            "inbound message: platform=%s user=%s chat=%s msg=%r reply_to_id=%s reply_to_text=%r",
-            _platform_name, source.user_name or source.user_id or "unknown",
-            source.chat_id or "unknown", (event.text or "")[:80].replace("\n", " "),
-            getattr(event, "reply_to_message_id", None),
-            (getattr(event, "reply_to_text", None) or "")[:80].replace("\n", " "),
+            "inbound message: platform=%s user=%s chat=%s msg_len=%d reply_to_id=%s",
+            _platform_name, hash_for_log(source.user_id), hash_for_log(source.chat_id),
+            len(event.text or ""), getattr(event, "reply_to_message_id", None),
         )
 
         if not await self._prepare_loop_wake_execution(event, source):
@@ -1122,17 +1117,15 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         if _owned_loop_fence is not None:
             run_generation = _owned_loop_fence[2]
 
-        resolved = await self._hmwa_resolve_session(event, source)
-        if resolved is None:
-            return
-        source, session_entry, session_key = resolved
-        event._hermes_attended_session_key = session_key
-        if not getattr(event, "_attended_activity_marked", False):
-            mark_activity = getattr(self, "_mark_attended_user_activity", None)
-            if callable(mark_activity):
-                activity_result = mark_activity(event, source, session_key)
-                if inspect.isawaitable(activity_result):
-                    await activity_result
+        from gateway.run_turn_setup_guard import run_preagent_setup
+        setup, reply = await run_preagent_setup(self, event, source, _quick_key, run_generation)
+        if setup is None:
+            return reply
+        source, session_entry, session_key, prepared, _session_env_tokens, hook_ctx, channel = setup
+        if hook_ctx is None:  # a heartbeat whose owner moved during setup: nothing to run
+            self._clear_session_env(_session_env_tokens)
+            return None
+        history, message_text = prepared.history, prepared.message_text
         from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY
         if (
             isinstance(getattr(event, "metadata", None), dict)
@@ -1164,39 +1157,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 logger.debug("resume marker snapshot unavailable for %s: %s", session_key, _e)
         event._restart_note_marker_api_available = _resume_marker_reader_available
         event._restart_note_expected_marker = _resume_pending_marker if _resume_marker_reader_available else None
-        if not await self._prepare_loop_wake_execution(event, source):
-            self._log_loop_wake_suppressed(event, "superseded before turn preparation")
-            return
-        from gateway.run_checkins import prepare_checkin
-        if not await prepare_checkin(self, event, session_entry):
-            return
-        prepared, _session_env_tokens = await self._hmwa_prepare_turn(
-            event, source, session_entry, session_key, _quick_key, run_generation,
-        )
-        if not isinstance(prepared, self._PreparedTurn):
-            return prepared
-        history, message_text = prepared.history, prepared.message_text
-
         try:
+            # run_preagent_setup already ran history/session preparation (including hygiene).
             if not await self._prepare_loop_wake_execution(event, source):
                 self._log_loop_wake_suppressed(event, "superseded during turn preparation")
                 return
-            hook_ctx = {
-                "platform": source.platform.value if source.platform else "",
-                "user_id": source.user_id,
-                "chat_id": source.chat_id or "",
-                "thread_id": str(source.thread_id) if getattr(source, "thread_id", None) else "",
-                "chat_type": getattr(source, "chat_type", "") or "",
-                "session_id": session_entry.session_id,
-                "message": message_text[:500],
-            }
-            await self.hooks.emit("agent:start", hook_ctx)
-
+            from gateway.run_checkins import prepare_checkin
+            if not await prepare_checkin(self, event, session_entry):
+                return
+            if not await self._prepare_loop_wake_execution(event, source):
+                self._log_loop_wake_suppressed(event, "superseded during turn preparation")
+                return
+            # The setup guard already emitted agent:start and checked heartbeat ownership.
             # Capture the launch session id so post-run compression publication is identity-guarded
             # (a /new may move session_entry.session_id while the old run is still unwinding).
-            from gateway.run_heartbeat_acceptance import heartbeat_owner_is_current
-            if not heartbeat_owner_is_current(self, event, session_key):
-                return
             if self._is_user_turn_event(event):
                 # The user is back: release completions held since their /stop.
                 self._clear_user_stop_latch(session_key)
@@ -1214,15 +1188,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             # Admission/typing is not execution. All routing, authorization and
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
-            # Internal events reuse the last human turn's channel inputs (see _pinned_channel_inputs).
-            _turn_channel_prompt, _turn_source = self._pinned_channel_inputs(
-                session_key, event.channel_prompt, source,
-                internal=event.internal or getattr(event, "inherit_channel_pin", False),
-            )
-            if not event.internal:
-                # Persist the coherent context+channel pair before execution: a crash during the
-                # human turn may be followed by an internal startup-resume on the next process.
-                await self._persist_prompt_pins(session_key, _run_start_session_id)
+            _turn_channel_prompt, _turn_source = channel
+            # The setup guard persists coherent prompt pins before agent:start; no second write here.
             # The last fence before the model, for every gateway wake whatever its internal flag
             # (goal continuations are built with internal=False): a control committed during
             # preparation or the start hooks must not let the obsolete wake run.
@@ -1236,6 +1203,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 return
             if (event.metadata or {}).get("checkin"):
                 message_text = event.text
+            event._loop_completion_identity = await self._run_in_executor_with_context(
+                loop_completion.capture_loop_identity, _run_start_session_id)
             started, agent_result = await self._invoke_loop_wake_effect(
                 event, self._run_agent,
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
@@ -1260,6 +1229,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             if not started:
                 self._log_loop_wake_suppressed(event, "execution fence rejected the model run")
                 return
+            from gateway.session_automation_retry import held_runtime_refusal
+            if held_runtime_refusal(event, agent_result):
+                return None  # The FIFO retries this unexecuted input without a transcript apology.
             _turn_seconds = time.monotonic() - _turn_started_monotonic
 
             # A queued (/queue) chain answered the LAST message of the chain, so the outer final
@@ -1283,9 +1255,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 if isinstance(agent_result.get("queued_terminal_goal_identity"), dict):
                     # Post-turn goal hooks judge the terminal turn: carry its identity on the head.
                     event._post_turn_goal_identity = agent_result["queued_terminal_goal_identity"]
-                if agent_result.get("queued_chain_loop_tick"):
-                    # The latest loop wake the chain ran owns the loop completion.
-                    event._post_turn_loop_tick = agent_result["queued_chain_loop_tick"]
+                loop_completion.carry_response(agent_result, event)
 
             await self._hmwa_stop_typing_for_turn(event, source)
 
@@ -1298,14 +1268,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
+                loop_identity=getattr(event, "_loop_completion_identity", None),
             )
+            if _intentional_silence:
+                self._hmwa_pause_typing_after_silence(event, source)
             response = self._usage_window_chat_wording(agent_result, self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence))
             from gateway.response_filters import strip_trailing_loop_complete_marker
             response = strip_trailing_loop_complete_marker(response)
             _footer_line = self._hmwa_runtime_footer_line(agent_result, source, _turn_seconds)
-            # Streaming already delivered the body: the footer goes out as a trailing send instead.
+            from gateway.runtime_footer import FooteredReply  # streamed: the footer goes out as a trailing send instead
             if _footer_line and response and not agent_result.get("already_sent") and not _intentional_silence:
-                response = f"{response}\n\n{_footer_line}"
+                response = FooteredReply(response, _footer_line)  # its send may put it on a photo caption (#74547)
             _terminal_display_kind = agent_result.get("queued_terminal_display_kind", prepared.persist_user_display_kind)
             if _terminal_display_kind != "supervisor_checkin":
                 await self._hmwa_post_turn_hooks(hook_ctx, agent_result, response)
@@ -1321,7 +1294,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 notice=self._hmwa_failed_turn_notice(agent_result),
             )
             response, session_entry = await self._hmwa_compression_exhaustion_reset(
-                agent_result, response, session_entry, session_key, source,
+                agent_result, response, session_entry, session_key, source, event=event,
             )
             # Normalize supervisor output after generic error/empty-reply shaping, so a provider
             # explainer cannot replace it in either delivery or the captured completion.
@@ -1444,12 +1417,17 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         Call via ``asyncio.to_thread``: resolution can block (credential refresh, context-length
         probes), and the scope is entered here so contextvars behave in the worker thread."""
         with self._profile_scope_for_source(source):
-            return self._format_session_info()
+            return self._format_session_info(source)
 
-    def _format_session_info(self) -> str:
-        """Model / provider / context-length / endpoint block so users can spot bad context detection."""
+    def _format_session_info(self, source: Optional[SessionSource] = None) -> str:
+        """Model / provider / context-length / endpoint block so users can spot bad context detection.
+        With ``source``, the chat's ``channel_overrides`` route is reported (what its turn runs)."""
         from gateway.run import _resolve_gateway_model_context
-        resolved = _resolve_gateway_model_context()
+        from gateway.session_info_route import channel_override_route
+        model, route, force_provider = channel_override_route(source and self._serving_channel_config(source), source)
+        resolved = _resolve_gateway_model_context(model=model, route=route)
+        if force_provider:
+            resolved = dataclasses.replace(resolved, provider=force_provider)
         context_length = resolved.context_length
         ctx_source = {
             "config": "config",
@@ -1488,7 +1466,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             override = adapter.toolsets_for_source(source) if adapter is not None else None
         except Exception:
             override = None
-        if override and isinstance(override, list):
+        if isinstance(override, list):
             pts = dict(user_config.get("platform_toolsets") or {})
             pts[platform_key] = [str(x) for x in override]
             user_config = {**user_config, "platform_toolsets": pts}
@@ -1680,13 +1658,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
     def _proxy_stream_consumer(self, source: SessionSource, event_message_id, _thread_metadata, _run_still_current):
         """Platform stream consumer for the proxy path when streaming is enabled, else ``None``."""
         from gateway.run import _load_gateway_config, _platform_config_key
-        _scfg = getattr(getattr(self, "config", None), "streaming", None)
+        from gateway.run_config_loaders import streaming_config_for_source
+        _scfg = streaming_config_for_source(self, source)
         # #60671 — streaming TTS consumer is created on the outer event-loop thread before run_sync
         # launches.  run_sync only reads it via ``streaming_tts_consumer_holder[0]`` for delta callback
         # wiring.
-        if _scfg is None:
-            from gateway.config import StreamingConfig
-            _scfg = StreamingConfig()
         # Global master switch first: skips the config.yaml re-read on the default (off) path.
         if not _scfg.globally_enabled:
             return None
@@ -2044,7 +2020,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         _voice_ack_guild: list[Optional[int]] = [self._voice_ack_guild_for(source)]
 
         # Auto-cleanup of temporary progress bubbles needs a real ``delete_message`` (getattr on the
-        # type: a fake adapter without it means "can't delete", not a crash).
+        # adapter type, so a fake adapter without it means "can't delete", not a crash).
         _cleanup_progress = bool(
             disp.resolve_display_setting(disp.user_config, disp.platform_key, "cleanup_progress")
         )
@@ -2059,7 +2035,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         # The one-slot progress/holder containers shared with the callbacks are TurnContext defaults.
         turn_ctx = TurnContext(
             source=source, message=message, AIAgent=AIAgent, session_key=session_key,
-            run_generation=run_generation, _cleanup_progress=_cleanup_progress,
+            run_generation=run_generation, _cleanup_progress=_cleanup_progress, _cleanup_adapter=_cleanup_adapter,
             _post_delivery_adapter=_post_delivery_adapter,
             _run_still_current=self._run_still_current_fn(session_key, run_generation),
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
@@ -2077,6 +2053,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                                    if reasoning_override is _NO_ATTENDED_ACTIVITY_STAMP else reasoning_override),
             "reasoning_scope": state.conversation.reasoning_override_scope if state is not None else "session",
         }
+        if _cleanup_progress and session_key:
+            turn_ctx._card_recorder = self._progress_card_recorder(turn_ctx)
         turn_runner = TurnRunner(self, turn_ctx, model_assignment=model_assignment)
         turn_ctx.mute_notification_reply = diagnostic_turn_muted(
             turn_ctx.persist_user_display_metadata, source.platform, turn_ctx.user_config)
@@ -2277,23 +2255,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         _interrupt_detected: asyncio.Event, streaming_tts_consumer_holder: list, *,
         log_context: str, log: Callable[[], None],
     ) -> None:
-        """Peek the adapter's pending event, transcribe voice, then signal the agent + abort streaming TTS.
+        """Peek the adapter's pending event, then signal the agent + abort streaming TTS.
 
         Peek WITHOUT consuming: the event must stay for the post-run ``_dequeue_pending_event()``
-        (popping races the agent finishing). Transcribe BEFORE signaling so voice interrupts carry
-        the real transcript."""
-        from gateway.run import _build_media_placeholder
+        (popping races the agent finishing), which also transcribes a voice note, so the signal
+        never waits for STT (#143961)."""
         _peek_event = adapter._pending_messages.get(session_key)
-        pending_text = None
-        if _peek_event is not None:
-            pending_text = _peek_event.text or ""
-            if self._pending_event_audio_paths(_peek_event):
-                pending_text, _ = await self._transcribe_and_echo_pending_voice(
-                    _peek_event, adapter, source, pending_text, log_context=log_context,
-                    metadata={"thread_id": source.thread_id} if source.thread_id else None,
-                )
-            elif not pending_text and (getattr(_peek_event, "media_urls", None) or []):
-                pending_text = _build_media_placeholder(_peek_event)
+        pending_text = None if _peek_event is None else (self._busy_interrupt_text(_peek_event) or "")
         log()
         agent.interrupt(pending_text)
         _interrupt_detected.set()
@@ -2557,11 +2525,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         if getattr(_agent, "_provider_fallback_active", False) is not True:
             # A LOCAL session runs its frozen launch policy's model, not the gateway's configured one.
             from gateway.session_authorities import active_authority
-            from gateway.session_policy import policy_for_source
+            from gateway.session_policy import policy_for_source, turn_model
             policy = policy_for_source(self, turn_ctx.source)
             _cfg_model = self._fallback_baseline_model(
                 session_key, turn_ctx.source, _agent,
-                policy_model=policy.current_model(active_authority(self)) if policy and policy.model else None,
+                policy_model=turn_model(policy, active_authority(self)) if policy and policy.model else None,
             )
             if _agent.model == _cfg_model or self._is_intentional_model_switch(session_key, _agent, _cfg_model):
                 return
@@ -2844,6 +2812,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
 
         # Interrupted: discard the response ("Operation interrupted." is noise).
         if not result.get("interrupted"):
+            # Register before first-response delivery: queued/follow-up lanes can return early.
+            self._run_agent_schedule_bubble_cleanup(response, turn_ctx._cleanup_adapter, turn_ctx)
             delivered = await self._run_agent_deliver_first_response(
                 turn_ctx, adapter, response, result, stream_task,
             )
@@ -3013,6 +2983,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 actor_scope = (scoped_turn_actor(pending_event, self._session_state(next_session_key).turn)
                                if pending_event is not None else nullcontext())
                 with actor_scope:
+                    loop_completion_identity = await self._run_in_executor_with_context(
+                        loop_completion.capture_loop_identity, session_id)
                     followup_result = await self._run_agent(
                         message=next_message, context_prompt=turn_ctx.context_prompt, history=updated_history,
                         source=next_source, session_id=session_id, session_key=next_session_key,
@@ -3044,11 +3016,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         await _run_followup_processing_hook(
             _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
         merged = _preserve_queued_followup_history_offset(result, followup_result)
-        # The deepest queued loop wake wins (inner recursions fill this first): it is the latest
-        # tick the chain ran, so the chain's single loop completion settles exactly that tick.
-        _pending_loop_tick = self._post_turn_goal_identity(pending_event).get("loop_tick")
-        if isinstance(merged, dict) and _pending_loop_tick and not merged.get("queued_chain_loop_tick"):
-            merged = {**merged, "queued_chain_loop_tick": _pending_loop_tick}
+        merged = loop_completion.carry_followup(
+            merged, loop_completion_identity, self._post_turn_goal_identity(pending_event).get("loop_tick"))
         # The TERMINAL turn of the chain owns the ledger identity for the outer final send, which
         # the adapter brackets against the event that OPENED the chain. Without this the terminal
         # reply is recorded under the first message's id, so a first reply that was refused (flood
@@ -3183,11 +3152,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             return
         _sk = session_key or "?"
         if not _transformed and (_streamed or _content_delivered):
-            logger.info(
-                "Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).",
-                _sk, _streamed, _previewed, _content_delivered,
+            logger.info("Suppressing normal final send for session %s: final delivery already confirmed (streamed=%s previewed=%s content_delivered=%s).", _sk, _streamed, _previewed, _content_delivered)
+            # A stream send counted as shown on a timeout may be lost: the ledger resends it marked.
+            response["already_sent"], response["delivery_uncertain"] = True, getattr(_sc, "delivery_uncertain", False) is True
+        elif _sc is not None and getattr(_sc, "_abandoned_draft_message_id", None):
+            if not turn_ctx._run_still_current() or response.get("interrupted"):
+                return  # Do not fall through to plugin-transformed reconciliation either.
+            # A dead consumer sealed its owned preview: finish that message, never infer
+            # ownership from thread metadata or post a duplicate beside the orphan.
+            await self._run_agent_edit_streamed_message(
+                _sc, source, response, _final, _sk=_sk,
+                ok=("Reconciled abandoned draft for session %s in message %s.", _sk, _sc.message_id),
+                fail_result="Abandoned-draft edit failed for session %s (%s); sending final normally.",
+                fail_exc="Abandoned-draft edit failed for session %s: %s; sending final normally.",
             )
-            response["already_sent"] = True
         elif not _transformed and _stale_finalized and _sc is not None:
             # Stale finalize: edit the streamed message up to the complete response (on failure the
             # normal send delivers). Not for split delivery — message_id is only the LAST chunk.
@@ -3198,8 +3176,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                     _sk,
                 )
             elif _sc_msg_id and _sc_msg_id != "__no_edit__" and getattr(_sc, "adapter", None) is not None:
-                await self._run_agent_edit_streamed_message(
-                    _sc, source, response, _final, _sk=_sk,
+                await edit_streamed_message(
+                    _sc, source, response, _final, sk=_sk,
                     ok=("Reconciled stale streamed finalize for session %s: edited message %s with the complete response (#71643).", _sk, _sc_msg_id),
                     fail_result="Stale-finalize reconciliation edit failed for session %s (%s); sending complete response via normal final send.",
                     fail_exc="Stale-finalize reconciliation edit failed for session %s: %s; sending complete response via normal final send.",
@@ -3212,12 +3190,20 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         elif _transformed and _sc is not None:
             # Transformed after streaming: edit the streamed message instead of sending a duplicate.
             if _sc.message_id:
-                await self._run_agent_edit_streamed_message(
-                    _sc, source, response, response["final_response"], _sk=_sk,
+                await edit_streamed_message(
+                    _sc, source, response, response["final_response"], sk=_sk,
                     ok=("Edited streamed message %s for session %s to include plugin-transformed content.", _sc.message_id, _sk),
                     fail_result="Transformed-final edit failed for session %s (%s); sending transformed response via normal final send.",
                     fail_exc="Failed to edit streamed message for session %s: %s",
                 )
+        elif not _transformed and owns_reconcilable_preview(_sc, getattr(source, "chat_id", ""), _final):
+            # Unconfirmed final, one real preview on screen (a flood-frozen bubble, a cancelled
+            # consumer): finish it in place; a plain final send would post the answer twice.
+            await edit_streamed_message(
+                _sc, source, response, _sc._clean_for_display(_final), sk=_sk,
+                ok=("Finished streamed preview %s in place for session %s (final not confirmed).", _sc.message_id, _sk),
+                fail_result="Unconfirmed-final preview edit failed for session %s (%s); sending normally.",
+                fail_exc="Unconfirmed-final preview edit failed for session %s: %s; sending normally.")
         elif _sc is not None and getattr(_sc, "stream_deltas_enabled", True):
             # DUPLICATE-RISK DIAGNOSTIC: a stream consumer existed but suppression did NOT fire; log
             # the decision inputs ("signal never set" vs "ack-pending race"). Skipped for consumers
@@ -3235,6 +3221,43 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 # Last chunk of a split stream: the surviving message a reaction targets.
                 response["_delivered_platform_message_id"] = str(delivered_id)
 
+    def _progress_card_recorder(self, turn_ctx: TurnContext) -> Callable[[str], None]:
+        """Durably record each temporary card as it is sent: the deletion callback below lives only
+        in memory, and a restart before it fires would strand the card (boot deletes orphans).
+        Tracking sites run on the loop or a worker thread, so the write is handed to the loop and
+        then off it."""
+        loop, pending, forgotten = asyncio.get_running_loop(), turn_ctx._card_writes, turn_ctx._card_forgotten
+        key, chat_id = turn_ctx.session_key, turn_ctx.source.chat_id
+
+        def spawn(message_id: str) -> None:
+            if message_id in forgotten:  # its forget ran while this record was queued: it must not outlive it
+                return
+            task = self._retain_background_task(asyncio.ensure_future(
+                self._persist_progress_cards("record_progress_card", key, chat_id, message_id)))
+            pending.add(task)
+            task.add_done_callback(pending.discard)
+
+        def record(message_id: str) -> None:
+            with suppress(RuntimeError):  # loop already closed: the card just goes unrecorded
+                loop.call_soon_threadsafe(spawn, message_id)
+        return record
+
+    async def _persist_progress_cards(self, method: str, session_key: str, *args: Any) -> None:
+        try:
+            await getattr(self.async_session_store, method)(session_key, *args)
+        except Exception as exc:
+            logger.warning("Progress card %s failed for session %s: %s", method, session_key, exc, exc_info=True)
+
+    async def _forget_turn_progress_cards(self, turn_ctx: TurnContext, message_ids: list[str]) -> None:
+        # A record still in flight would otherwise land after its forget and outlive it: wait for the
+        # spawned ones, and mark the ids first so one still queued for the loop is dropped when it runs.
+        turn_ctx._card_forgotten.update(message_ids)
+        pending = list(turn_ctx._card_writes)
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        await self._persist_progress_cards(
+            "forget_progress_cards", turn_ctx.session_key, turn_ctx.source.chat_id, message_ids)
+
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Register turn-local deletion, awaited after confirmed final delivery."""
         ids, key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
@@ -3250,6 +3273,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         ):
             if turn_ctx._cleanup_progress and ids and isinstance(response, dict) and response.get("failed"):
                 logger.info("Temp bubble cleanup skipped for session %s: failed run", key)
+                if key:  # failed runs keep their cards on purpose, so boot must not delete them either
+                    self._retain_background_task(asyncio.ensure_future(
+                        self._forget_turn_progress_cards(turn_ctx, list(ids))))
             return
         owner = turn_ctx._post_delivery_adapter or _cleanup_adapter
         chat_id = turn_ctx.source.chat_id
@@ -3284,6 +3310,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                     raise
                 except Exception as error:
                     failures.extend(f"{mid}:{type(error).__name__}" for mid in owned)
+            # Settled after one attempt, as before the record existed: a cancelled cleanup (shutdown)
+            # re-raised above and keeps its record, so the next boot finishes it.
+            await self._forget_turn_progress_cards(turn_ctx, snapshot)
             if failures:
                 logger.warning("Temp bubble cleanup failures for session %s: %s", key,
                                ", ".join(failures[:10]))
@@ -3316,7 +3345,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         turn_ctx._step_callback_sync = turn_runner._step_callback_sync
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
-        turn_ctx._status_adapter = self._delivery_adapter_for(source)
+        turn_ctx.bind_status_adapter(lambda: self._delivery_adapter_for(source))
         turn_ctx._status_chat_id = source.chat_id
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata
@@ -3338,8 +3367,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             return
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
         _status_thread_metadata = turn_ctx._status_thread_metadata
-        _notify_adapter = self._delivery_adapter_for(source)
-        if not _notify_adapter:
+        if not (_notify_adapter := self._delivery_adapter_for(source)):
             return
         _heartbeat_msg_id: Optional[str] = None
         while True:
@@ -3348,6 +3376,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 session_key, agent_holder[0], _executor_task_holder[0]
             ):
                 break
+            _notify_adapter = self._delivery_adapter_for(source) or _notify_adapter  # reconnects retire it (#138133)
             _elapsed_mins = int((time.time() - _notify_start) // 60)
             # Terse heartbeat by default; the iteration counter is gated on busy_ack_detail.
             _status_detail = ""
@@ -3392,7 +3421,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):
                         _heartbeat_msg_id = str(_notify_res.message_id)
                         if turn_ctx._cleanup_progress:
-                            turn_ctx._cleanup_msg_ids.append(_heartbeat_msg_id)
+                            turn_ctx.track_cleanup_id(_heartbeat_msg_id)
             except Exception as _ne:
                 logger.debug("Long-running notification error: %s", _ne)
 
@@ -3529,13 +3558,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             result = turn_ctx.result_holder[0]
             adapter = self._delivery_adapter_for(source)
             await self._run_agent_finalize_streaming_tts(turn_ctx, adapter)
-            self._run_agent_schedule_bubble_cleanup(response, _cleanup_adapter, turn_ctx)
             # A queued successor already supplies a fresh turn; drain it before considering recovery.
             pending_event, pending = await self._run_agent_drain_pending(result, adapter, source, session_key)
             pending_event, pending = defer_review_followup(self, turn_ctx, adapter, pending_event, pending)
             from gateway.run_turn_silence_recovery import apply_terminal_reply_metadata, silence_recovery_due
             apply_terminal_reply_metadata(turn_ctx, response, result)
             if pending_event or pending:
+                await settle_turn_senders(progress_task, _notify_task)  # their bubble ids join this turn's cleanup
                 return await self._run_agent_queued_followup(
                     turn_ctx, adapter, pending, pending_event, response, result, stream_task,
                 )

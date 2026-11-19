@@ -265,7 +265,7 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
                      (_BINDING_PREFIX + session_id, _json(receipt)))
     yield partial(authority.db._execute_write, write)
-    return restore_api_session(authority, session_id)
+    return (yield partial(restore_api_session, authority, session_id))
 
 
 def _heal_replacement(conn, caller, holder):

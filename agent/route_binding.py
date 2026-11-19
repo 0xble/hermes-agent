@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, NamedTuple, Optional, Tuple
 
 from utils import base_url_host_matches
 
@@ -28,22 +28,99 @@ def _close_failed_route_client(agent: Any, client: Any) -> None:
         client.close()
 
 
-def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str, *, explicit_switch: bool = False) -> Optional[tuple[str, str]]:
-    """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
-    old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
-    so the next turn's ``restore_primary_runtime`` reverts it; raises on a failed swap."""
-    pinned = getattr(agent, "_pinned_fallback_model", None)
-    if not explicit_switch and isinstance(pinned, str) and pinned:
-        from hermes_cli.fallback_config import same_fallback_model
-        if not same_fallback_model(pinned, model):
-            return None
+def _route_metadata_config() -> dict[str, Any]:
+    """Project before expansion, so an endpoint lookup cannot resolve API keys.
 
+    Raw config is used only as input to this metadata view, not as routing policy:
+    apply the same root normalization, env expansion and managed overlay order.
+    """
+    from hermes_cli import config as cfg
+    from hermes_cli.config_providers import _CAMEL_ALIASES
+    from hermes_cli.runtime_provider_custom import ENTRY_URL_KEYS
+
+    # Every endpoint spelling runtime resolution accepts, including camelCase aliases the legacy
+    # normalizer maps onto them; dropping one leaves the identity empty and the alias unexcluded.
+    endpoint_keys = {*ENTRY_URL_KEYS, *(camel for camel, key in _CAMEL_ALIASES.items() if key in ENTRY_URL_KEYS)}
+
+    def project(source):
+        if not isinstance(source, dict):
+            return {}
+        fields = {'name', 'provider_key', 'enabled', 'api_mode', 'transport', *endpoint_keys}
+        def entry(value):
+            return {k: v for k, v in value.items() if k in fields} if isinstance(value, dict) else value
+        result = {}
+        providers = source.get('providers')
+        if 'providers' in source:
+            result['providers'] = {k: entry(v) for k, v in providers.items()} if isinstance(providers, dict) else providers
+        custom = source.get('custom_providers')
+        if 'custom_providers' in source:
+            result['custom_providers'] = [entry(v) for v in custom] if isinstance(custom, list) else custom
+        normalized = cfg._normalize_root_model_keys(source)
+        model = normalized.get('model')
+        if 'model' in normalized:
+            result['model'] = {'base_url': model.get('base_url', '') if isinstance(model, dict) else ''}
+        return result
+
+    user = cfg._expand_env_vars(project(cfg.read_raw_config_readonly()))
+    managed = cfg.managed_scope.load_managed_config()
+    return cfg._deep_merge(user, cfg._expand_env_vars(project(managed))) if managed else user
+
+
+def resolve_route_identity(entry: dict[str, Any]):
+    """Resolve only non-secret endpoint metadata; never activate a client.
+
+    Explicit route overrides win over named-provider definitions, which win
+    over static provider defaults. Unresolvable/dynamic routes remain unknown
+    rather than guessing a shared domain and skipping a potentially good route.
+    """
+    from agent.backend_identity import BackendIdentity
+    from hermes_cli.runtime_provider import _get_named_custom_provider
+
+    provider = str(entry.get('provider') or '').strip()
+    model = str(entry.get('model') or '').strip()
+    base_url = str(entry.get('base_url') or '').strip()
+    if not base_url:
+        config = _route_metadata_config()
+        named = _get_named_custom_provider(provider, config=config, resolve_credentials=False)
+        if named:
+            base_url = str(named.get('base_url') or '').strip()
+        elif provider in {'custom', 'local/custom'}:
+            from agent.secret_scope import get_secret
+            model_config = config.get('model') or {}
+            base_url = str(model_config.get('base_url') or get_secret('OPENAI_BASE_URL', '') or '')
+        else:
+            from hermes_cli.providers import get_provider
+            definition = get_provider(provider, allow_network=False)
+            if definition:
+                from agent.secret_scope import get_secret
+                base_url = str(get_secret(definition.base_url_env_var, '') or '').strip() \
+                    if definition.base_url_env_var else ''
+                base_url = base_url or definition.base_url
+    return BackendIdentity.build(provider=provider, model=model, base_url=base_url)
+
+
+class RouteEntryClient(NamedTuple):
+    """What the fallback swap builds for an entry. ``client`` is None when the provider has no
+    usable client; ``model`` is normalized for the provider (a MoA entry keeps its preset name)."""
+
+    client: Any
+    model: str
+    api_mode_explicit: bool
+    api_mode: str
+    pool_choice: Any = None  # hermes_cli.runtime_provider.PoolChoice: the pool entry whose key the client carries
+
+
+def resolve_route_entry_client(entry: dict[str, Any], provider: str, model: str, *,
+                               raw_codex: bool = True) -> RouteEntryClient:
+    """The client :func:`bind_route_entry` binds for ``entry``, shared with ``hermes fallback check
+    --live`` so a readiness probe talks to exactly what the swap would. ``raw_codex=False`` returns
+    the chat-completions adapter for Codex/Responses providers. A registry API-key provider's key
+    comes from its credential pool the way a direct pick takes it; the pool is not touched until the
+    caller commits ``pool_choice``."""
     from agent.auxiliary_client import resolve_provider_client
-    from agent.chat_completion_helpers import (
-        _fallback_api_mode_hint, _fallback_api_mode_resolved, _rebind_fallback_credential_pool,
-        _reresolve_fallback_reasoning_config, _rescope_fallback_extra_body, _update_fallback_context_compressor,
-    )
+    from agent.chat_completion_helpers import _fallback_api_mode_hint
     from hermes_cli.fallback_config import resolve_entry_api_key
+    from hermes_cli.runtime_provider import PoolChoice
     # Pass the entry's base_url/api_key so custom endpoints (Ollama Cloud) resolve instead
     # of falling through to OpenRouter defaults.
     base_url_hint = (entry.get("base_url") or "").strip() or None
@@ -54,10 +131,39 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     if base_url_hint and base_url_host_matches(base_url_hint, "ollama.com") and not api_key_hint:
         from agent.secret_scope import get_secret
         api_key_hint = get_secret("OLLAMA_API_KEY") or None
-    # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
+    choice = PoolChoice(model) if provider != "moa" else None  # MoA keys stay with the preset's own resolution
     client, _resolved_model = resolve_provider_client(
-        provider, model=model, raw_codex=True, explicit_base_url=base_url_hint, explicit_api_key=api_key_hint,
-        api_mode=api_mode)
+        provider, model=model, raw_codex=raw_codex, explicit_base_url=base_url_hint, explicit_api_key=api_key_hint,
+        api_mode=api_mode, pool_choice=choice)
+    if client is not None and provider != "moa":
+        try:
+            from hermes_cli.model_normalize import normalize_model_for_provider
+            model = normalize_model_for_provider(model, provider)
+        except Exception as norm_err:  # health: allow BLE001 -- a bad catalog entry keeps the raw id
+            logger.warning("Could not normalize fallback model %r for provider %r: %s", model, provider, norm_err)
+    return RouteEntryClient(client, model, api_mode_explicit, api_mode, choice if client is not None else None)
+
+
+def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str, *,
+                     commit_pool_choice: bool = True, explicit_switch: bool = False) -> Optional[tuple[str, str]]:
+    """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
+    old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
+    so the next turn's ``restore_primary_runtime`` reverts it; raises on a failed swap.
+    ``commit_pool_choice=False`` leaves the pool's pick uncounted in ``agent._route_pool_choice``
+    for a caller that may still refuse the route (it calls ``.commit()`` once it keeps it)."""
+    pinned = getattr(agent, "_pinned_fallback_model", None)
+    if not explicit_switch and isinstance(pinned, str) and pinned:
+        from hermes_cli.fallback_config import same_fallback_model
+        if not same_fallback_model(pinned, model):
+            return None
+
+    from agent.chat_completion_helpers import (
+        _fallback_api_mode_resolved, _rebind_fallback_credential_pool,
+        _reresolve_fallback_reasoning_config, _rescope_fallback_extra_body, _update_fallback_context_compressor,
+    )
+    # raw_codex=True: the main agent needs direct responses.stream() access for Codex providers.
+    route = resolve_route_entry_client(entry, provider, model)
+    client, model, api_mode_explicit, api_mode = route.client, route.model, route.api_mode_explicit, route.api_mode
     if client is None:
         return None
     if provider == "moa":
@@ -66,11 +172,6 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         # same pins every other MoA build site uses (#112525, #112623).
         base_url, api_mode = "moa://local", "chat_completions"
     else:
-        try:
-            from hermes_cli.model_normalize import normalize_model_for_provider
-            model = normalize_model_for_provider(model, provider)
-        except Exception as norm_err:  # health: allow BLE001 -- moved verbatim from try_activate_fallback; a bad catalog entry keeps the raw id
-            logger.warning("Could not normalize fallback model %r for provider %r: %s", model, provider, norm_err)
         base_url = str(client.base_url)
         from hermes_cli.providers import is_actual_route
         if is_actual_route(provider, base_url):
@@ -102,10 +203,11 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     reset_route_verdicts(agent)
     agent._fallback_activated = True
 
+    choice = agent._route_pool_choice = route.pool_choice
     compressor = getattr(agent, "context_compressor", None)
     compressor_state = dict(vars(compressor)) if compressor is not None else None
     try:
-        _rebind_fallback_credential_pool(agent, provider, model)
+        _rebind_fallback_credential_pool(agent, provider, model, choice.pool if choice is not None else None)
         if provider == "moa":
             from agent.moa_loop import bind_moa_runtime
             bind_moa_runtime(agent, model)
@@ -122,6 +224,8 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         _update_fallback_context_compressor(agent)
         _reresolve_fallback_reasoning_config(agent, entry)
         _rescope_fallback_extra_body(agent, old_model, old_provider, old_base_url)
+        if commit_pool_choice and choice is not None:
+            choice.commit()
     except Exception:
         # Restore the pre-bind route (retiring clients the swap installed), and close the resolved
         # client too in case the failure came before it became reachable.

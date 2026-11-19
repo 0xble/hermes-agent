@@ -56,7 +56,7 @@ def supervisor_turn(tmp_path, monkeypatch, request):
     runner._clear_restart_failure_count = AsyncMock()
     runner._hmwa_prepend_reasoning = lambda _, response, *a: response
     runner._hmwa_runtime_footer_line = lambda *a: None
-    async def no_compression(result, response, session_entry, *a):
+    async def no_compression(result, response, session_entry, *a, event=None):
         return response, session_entry
     runner._hmwa_compression_exhaustion_reset = no_compression
     runner._drain_watch_notifications = AsyncMock()
@@ -284,7 +284,7 @@ async def test_supervisor_status_replaces_the_agent_persisted_failed_boundary(tm
     runner._clear_restart_failure_count = AsyncMock()
     runner._hmwa_prepend_reasoning = lambda _, response, *a: response
     runner._hmwa_runtime_footer_line = lambda *a: None
-    async def no_compression(result, response, session_entry, *a):
+    async def no_compression(result, response, session_entry, *a, event=None):
         return response, session_entry
     runner._hmwa_compression_exhaustion_reset = no_compression
     runner._drain_watch_notifications = AsyncMock()

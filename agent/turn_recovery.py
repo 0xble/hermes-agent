@@ -892,6 +892,7 @@ def _welcome_outage_copy(agent: Any, base_url: Any, classified: Any) -> str:
 _NONRETRYABLE_LABELS = {
     FailoverReason.content_policy_blocked: "The provider's safety filter refused this request",
     FailoverReason.upstream_blocked: "A firewall/CDN in front of the provider blocked this request",
+    FailoverReason.guardrail_blocked: "The provider's prompt-injection guardrail rejected this request",
     FailoverReason.ssl_cert_verification: "The provider's security certificate could not be verified",
     # Only reached after the one-shot image shrink ran (recover_after_classification sets the flag first).
     FailoverReason.image_too_large: "Request still exceeded the provider's size limit after shrinking images",
@@ -908,6 +909,14 @@ def _missing_vendor_prefix_suggestion(api_error: Exception, provider: Any, model
         return suggest_prefixed_model_id(str(provider or ""), str(model or ""))
     except Exception:
         return None
+
+
+def _guardrail_matched_patterns(api_error: Any) -> str:
+    """Comma-joined ``metadata.patterns`` from an OpenRouter guardrail 403 body; '' when absent."""
+    # Bodies arrive both as raw JSON ("patterns": [...]) and as the SDK's Python repr
+    # of it ('patterns': [...]) — match either quote style.
+    match = re.search(r"['\"]patterns['\"]\s*:\s*\[([^\]]*)\]", str(api_error))
+    return match.group(1).strip() if match else ""
 
 
 def nonretryable_client_error_result(
@@ -930,10 +939,14 @@ def nonretryable_client_error_result(
     agent._flush_status_buffer()
     # Summarize once: Cloudflare/proxy HTML pages and raw provider bodies must be
     # collapsed here or they leak verbatim via the ``error`` field.
+    from gateway.warning_notifications import TerminalFailureText  # the chat filter drops its copy
     _nonretryable_summary = agent._summarize_api_error(api_error)
+    if classified.reason == FailoverReason.guardrail_blocked and (_matched := _guardrail_matched_patterns(api_error)):
+        # The summary keeps only error.message; the pattern names are what the user allowlists.
+        _nonretryable_summary = f"{_nonretryable_summary} (matched patterns: {_matched})"
     _plabel = provider_label_for(provider)
     _label = _NONRETRYABLE_LABELS.get(classified.reason, f"{_plabel} rejected the request and retrying won't help")
-    agent._emit_diagnostic_status(f"❌ {_label}: {_nonretryable_summary}")
+    agent._emit_diagnostic_status(TerminalFailureText(f"❌ {_label}: {_nonretryable_summary}"))
     # The endpoint/status trace is developer detail: verbose only (the log has it always).
     if getattr(agent, "verbose_logging", False):
         _vlines(
@@ -977,6 +990,17 @@ def nonretryable_client_error_result(
             agent,
             f"   💡 {CONTENT_POLICY_NEXT_STEPS}",
             f"      To route future blocks to another provider, list backups under {fallback_chain_path(agent)}.",
+        )
+    # Prompt-injection guardrail (OpenRouter Guardrails #155460): an account-level content filter
+    # judged the payload before any model ran, so the fix is a dashboard setting — never
+    # key/retry/User-Agent advice.
+    if classified.reason == FailoverReason.guardrail_blocked:
+        _vlines(
+            agent,
+            f"   💡 {_plabel}'s prompt-injection guardrail rejected the request before it reached any",
+            "      model — the key is fine.",
+            "      On OpenRouter: Workspaces → Guardrails → set Prompt injection detection to Redact",
+            "      or Flag, or allowlist the phrase under Settings → Privacy. Retrying won't help.",
         )
     # TLS certificate failures are environment problems — name the knobs for each cause.
     if classified.reason == FailoverReason.ssl_cert_verification:
@@ -1079,6 +1103,7 @@ def max_retries_exhausted_result(
         _print_billing_or_entitlement_guidance,
     )
 
+    from gateway.warning_notifications import TerminalFailureText  # the chat filter drops its copy
     agent._flush_status_buffer()
     _final_summary = agent._summarize_api_error(api_error)
     _billing_guidance = ""
@@ -1086,12 +1111,12 @@ def max_retries_exhausted_result(
     if _is_billing:
         if classified.billing_unverified:
             # Ambiguous body — hedge the terminal line.
-            agent._emit_diagnostic_status(
+            agent._emit_diagnostic_status(TerminalFailureText(
                 "❌ Provider reported usage/credit exhaustion "
                 f"(unverified — may be a content-filter rejection) — {_final_summary}"
-            )
+            ))
         else:
-            agent._emit_diagnostic_status(f"❌ Billing or credits exhausted — {_final_summary}")
+            agent._emit_diagnostic_status(TerminalFailureText(f"❌ Billing or credits exhausted — {_final_summary}"))
         _billing_kw = dict(
             capability="model access", provider=provider, base_url=str(base_url), model=model,
             unverified=classified.billing_unverified,
@@ -1102,12 +1127,12 @@ def max_retries_exhausted_result(
             _print_billing_or_entitlement_guidance(agent, **_billing_kw)
     elif is_rate_limited:
         _reset = reset_hint(api_error)
-        agent._emit_diagnostic_status(
+        agent._emit_diagnostic_status(TerminalFailureText(
             f"❌ Rate limited after {attempts} {'attempt' if attempts == 1 else 'retries'} — {_final_summary}"
             f"{f' (resets in {_reset})' if _reset else ''}"
-        )
+        ))
     else:
-        agent._emit_diagnostic_status(f"❌ API failed after {attempts} retries — {_final_summary}")
+        agent._emit_diagnostic_status(TerminalFailureText(f"❌ API failed after {attempts} retries — {_final_summary}"))
     _vlines(agent, f"   💀 Final error: {_final_summary}")
     _welcome_hint = _welcome_tier_guidance(classified, model=model, in_chat=False)
     if _welcome_hint:
@@ -1183,6 +1208,8 @@ def max_retries_exhausted_result(
             "happens when it writes a very large file in one go. Ask me to write the file in "
             "smaller sections (or via execute_code with Python's open())."
         )
+    from agent.fallback_endpoint_domain import append_attempt_summary
+    _final_response = append_attempt_summary(agent, _final_response)
     result = _failed_turn_result(_final_response, messages, api_call_count, _final_summary)
     result.update({
         # Classified reason so callers (kanban worker in cli.py) can tell a quota wall
@@ -1687,14 +1714,17 @@ def route_classified_error(
     messages: list[dict[str, Any]], api_messages: Any, system_message: Any,
     active_system_prompt: Any, conversation_history: Any, retry_count: int, max_retries: int,
     compression_attempts: int, max_compression_attempts: int, api_call_count: int,
-    effective_task_id: Any,
+    effective_task_id: Any, hold_noninteractive_transient: Optional[bool] = None,
 ) -> ClassifiedErrorVerdict:
     """Ordered (load-bearing) recovery steps between classification and overflow handling:
     compaction-disabled overflow → terminal error (output-cap errors exempt); Anthropic
     long-context tier 429 → cap at 200k and compress; eager fallback for rate-limit/billing
     (immediately) and transport failures (after 1 retry) unless credential-pool rotation may
     still recover (upstream-aggregator 429s always fall back); persistent 401/403 → fallback
-    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once."""
+    chain once; genuine Nous 429 → cross-session breaker + re-enter the loop exactly once.
+
+    ``hold_noninteractive_transient`` (the caller's once-per-error decision; ``None`` computes
+    it) suppresses the eager transient fallbacks while an unattended route's window is open."""
     from agent.conversation_compression import (
         compression_pool_saturated,
         conversation_history_after_compression,
@@ -1702,6 +1732,14 @@ def route_classified_error(
     from agent.conversation_loop import _arm_fallback_restart, _compression_deferred_result, _ra
     from agent.model_metadata import estimate_request_tokens_rough
 
+    if hold_noninteractive_transient is None:
+        from agent.fallback_cooldown import hold_noninteractive_transient_retry
+        hold_noninteractive_transient = hold_noninteractive_transient_retry(
+            agent, classified, error_message=error_msg,
+        )
+    from agent.fallback_endpoint_domain import note_endpoint_failure
+
+    note_endpoint_failure(agent, classified)
     _provider_overflow_recovery_pending = False
     is_rate_limited = False
     _wrapped_output_cap_budget = None
@@ -1858,7 +1896,7 @@ def route_classified_error(
     _is_zai_coding_overload = is_zai_coding_overload_error(base_url=str(base_url), model=model, error=api_error)
     if _is_zai_coding_overload:
         max_retries = max(max_retries, zai_coding_overload_retry_ceiling())
-    _should_fallback = (
+    _should_fallback = not hold_noninteractive_transient and (
         (is_rate_limited and _wrapped_output_cap_budget is None)
         or _provider_wide_overload
         or (_is_transport_failure and retry_count >= 2)
@@ -1889,6 +1927,7 @@ def route_classified_error(
         classified.is_auth
         and classified.should_fallback
         and not _retry.auth_failover_attempted
+        and not hold_noninteractive_transient
         and agent._fallback_index < len(agent._fallback_chain)
     ):
         _retry.auth_failover_attempted = True

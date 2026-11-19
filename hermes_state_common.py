@@ -8,6 +8,7 @@ import logging
 import os
 import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from hermes_cli.timefmt import EPOCH_MAX, EPOCH_MIN
@@ -161,7 +162,7 @@ _PREVIEW_RAW_SELECT = (
     f" THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW)} || '{SKILL_EXCERPT_JOINT}'"
     f" || {_preview_normalized_window_sql(-_PREVIEW_SCAFFOLD_WINDOW, _PREVIEW_SCAFFOLD_WINDOW)}"
     f" WHEN {_PREVIEW_SCAFFOLDED_SQL} THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW * 2)}"
-    f" ELSE {_preview_normalized_window_sql(1, _PREVIEW_HEAD_CHARS)} END")
+    f" ELSE {_sql_ltrim_whitespace(_preview_normalized_window_sql(1, _PREVIEW_HEAD_CHARS))} END")
 
 
 def _shape_preview(raw: Any) -> str:
@@ -442,6 +443,7 @@ def emit_session_deleted(db, deleted_ids, *, reason, primary=None, sessions_dir=
         return
     try:
         from hermes_cli.lifecycle import invoke_hook
+        from hermes_state_prune_budget import current_budget, without_prune_budget
         from hermes_constants import (
             get_hermes_home, profile_name_for_home, reset_hermes_home_override, set_hermes_home_override,
         )
@@ -456,7 +458,8 @@ def emit_session_deleted(db, deleted_ids, *, reason, primary=None, sessions_dir=
         rebind = profile is not None and os.path.realpath(home) != os.path.realpath(get_hermes_home())
         token = set_hermes_home_override(home) if rebind else None
         try:
-            invoke_hook("on_session_delete", **payload)
+            with without_prune_budget() if current_budget() is not None else contextlib.nullcontext():
+                invoke_hook("on_session_delete", **payload)
         finally:
             if token is not None:
                 reset_hermes_home_override(token)
@@ -543,6 +546,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     last_read_at REAL,
     tool_names TEXT,
     transcript_revision INTEGER NOT NULL DEFAULT 0,
+    prompt_cache_clock TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id),
     FOREIGN KEY (system_prompt_hash) REFERENCES system_prompts(hash)
 );
@@ -643,6 +647,14 @@ CREATE INDEX IF NOT EXISTS idx_session_admissions_worker_adoption
 -- The WHERE is built from CRON_PRINCIPAL_ID, the literal the run queries inline, so they cannot drift.
 CREATE INDEX IF NOT EXISTS idx_session_admissions_cron_request
     ON session_admissions(principal_id, request_id, target_session_id) WHERE principal_id = '""" + CRON_PRINCIPAL_ID + """';
+-- Restart recovery (``recover_session_inputs``) settles only the rows a lost owner left in flight.
+-- Without these it scanned the whole wide table at every start (status, outcome and owner_epoch sit
+-- behind the payload and lineage overflow pages), holding the writer ~20 s. Partial: settled history
+-- pays nothing. The query names the same literals, so the planner can prove the index applies.
+CREATE INDEX IF NOT EXISTS idx_session_admissions_started
+    ON session_admissions(owner_epoch) WHERE status = 'started';
+CREATE INDEX IF NOT EXISTS idx_session_admissions_steering
+    ON session_admissions(owner_epoch) WHERE status = 'terminal' AND outcome = 'steering';
 CREATE TABLE IF NOT EXISTS worker_executions (
     execution_id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE RESTRICT,
@@ -657,6 +669,9 @@ CREATE TABLE IF NOT EXISTS worker_executions (
 -- inside the write transaction; without this each probe scanned the whole (only-growing) table.
 CREATE INDEX IF NOT EXISTS idx_worker_executions_session_status
     ON worker_executions(session_id, status);
+-- Restart recovery fences only live executions; terminal history (one per turn) stays out of it.
+CREATE INDEX IF NOT EXISTS idx_worker_executions_live
+    ON worker_executions(owner_epoch) WHERE status != 'terminal';
 CREATE TABLE IF NOT EXISTS worker_receipts (
     execution_id TEXT NOT NULL REFERENCES worker_executions(execution_id) ON DELETE RESTRICT,
     sequence INTEGER NOT NULL CHECK (sequence > 0),
@@ -838,6 +853,21 @@ CREATE TABLE IF NOT EXISTS async_delegation_events (
 
 CREATE INDEX IF NOT EXISTS idx_async_delegation_events_delivery
     ON async_delegation_events(delivery_state, updated_at);
+
+-- Durable subagent records (tools/delegate_tool_resumable.py): what delegate_task(action='continue') rebuilds a
+-- child from after a restart or crash, and the worktree pin the startup sweep honours (``pinned``).
+CREATE TABLE IF NOT EXISTS resumable_subagents (
+    subagent_id TEXT PRIMARY KEY,
+    state TEXT NOT NULL,
+    pinned INTEGER NOT NULL DEFAULT 0,
+    stop_cause TEXT,
+    owner_pid INTEGER,
+    owner_started_at INTEGER,
+    record_json TEXT NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL,
+    expires_at REAL
+);
 
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
@@ -1589,3 +1619,14 @@ def _json_or(raw: Any, fallback: Any, warning: str) -> Any:
     except (json.JSONDecodeError, TypeError):
         logger.warning(warning)
         return fallback
+
+
+def path_is_under(path: Path, root: Path) -> bool:
+    """True when *path* is *root* or a file inside it (normcase, resolved)."""
+    try:
+        path_key = os.path.normcase(str(path.resolve()))
+        root_key = os.path.normcase(str(root.resolve()))
+    except OSError:
+        path_key = os.path.normcase(str(path))
+        root_key = os.path.normcase(str(root))
+    return path_key == root_key or path_key.startswith(root_key + os.sep)

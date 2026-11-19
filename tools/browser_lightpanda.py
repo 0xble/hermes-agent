@@ -61,6 +61,20 @@ def _home_candidates() -> list:
     return candidates
 
 
+# System PATH fallbacks for a minimal service PATH (systemd units, launchd), Homebrew included.
+_SANE_PATH_DIRS = ("/opt/homebrew/bin", "/opt/homebrew/sbin", "/usr/local/sbin", "/usr/local/bin",
+                   "/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
+def merge_sane_path(existing_path: str = "") -> str:
+    """``existing_path`` with the standard system dirs that exist appended (existing order kept);
+    unchanged on Windows, where these POSIX dirs mean nothing."""
+    if os.name == "nt":
+        return existing_path
+    parts = [p for p in (existing_path or "").split(os.pathsep) if p]
+    return os.pathsep.join(parts + [d for d in _SANE_PATH_DIRS if d not in parts and os.path.isdir(d)])
+
+
 def find_lightpanda_binary() -> Optional[str]:
     """Return the lightpanda executable, or None. Order: PATH (with agent-browser's Homebrew/managed-node
     fallbacks), then installer/agent-browser locations, then ``$HERMES_HOME/bin``. No Windows build."""
@@ -129,17 +143,14 @@ def _binary_supports_http_cache(binary: str) -> bool:
         return False
 
 
-def _record_path(session_name: str) -> Path:
-    return _state_dir() / f"{session_name}.json"
-
-
 def _browser_env() -> dict:
     try:
         from tools.browser_tool import _build_browser_env
         return _build_browser_env()
     except Exception as e:
         logger.debug("credential-scrubbed browser env unavailable: %s", e)
-        return os.environ.copy()
+        from tools.environments.local import served_profile_child_env
+        return served_profile_child_env(inherit_credentials=False)
 
 
 def _cdp_ready(url: str, timeout: float = 0.2) -> bool:

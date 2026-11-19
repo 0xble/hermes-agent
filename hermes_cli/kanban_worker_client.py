@@ -11,6 +11,7 @@ import asyncio
 from dataclasses import dataclass
 import os
 from pathlib import Path
+import sqlite3
 import sys
 import time
 from typing import Optional
@@ -22,16 +23,6 @@ from typing import Optional
 # ``OWNER_WAIT_S`` is the longest the owner may stay silent between answers before the worker
 # gives up (the first ``kanban.run`` answer has its own wait, ``admission_answer_budget``).
 OWNER_WAIT_S = 180.0
-_TRANSIENT_OWNER_STATES = frozenset({'draining', 'starting'})
-# In-band owner refusals that leave the attempt intact: a draining owner admits nothing new, and a
-# retired authority's successor holds the admission the next connection reads.
-_TRANSIENT_RPC_REASONS = frozenset({'runtime_draining', 'runtime_retired'})
-# Control-socket answers a restarting owner gives (an ``inaccessible`` owner's reason, from
-# discovery or the ticket fetch): a reset or half-written answer, or a replaced owner refusing a
-# stale instance. Unsafe nodes or peers, a refused authorization, a bad pointer or a failed start
-# stay final.
-_RESTART_CONTROL_REASONS = frozenset({'invalid_control_peer', 'incomplete_control_response',
-                                      'invalid_control_response'})
 # Past the board lock wait: the owner's session setup and receipt before and after the write.
 ADMISSION_ANSWER_MARGIN_S = 60.0
 
@@ -59,6 +50,7 @@ class _Claim:
 async def run(params, board_db):
     from agent.retry_utils import jittered_backoff
     from hermes_cli.gateway_client import connect_gateway, GatewayClientError, outside_restart_wait
+    from hermes_cli.gateway_owner_restart import restartable
     from websockets.exceptions import WebSocketException
     if os.environ.get('HERMES_TUI_GATEWAY_URL'):
         raise GatewayClientError('Kanban requires the assigned local profile owner')
@@ -87,7 +79,7 @@ async def run(params, board_db):
         # A restart also surfaces as a refused or reset dial, a failed handshake, or an answer
         # that never came.
         except (GatewayClientError, WebSocketException, OSError, TimeoutError) as exc:
-            if not _restartable(exc):
+            if not restartable(exc):
                 raise
             if claim.silent_for() >= OWNER_WAIT_S:
                 # WebSocket errors can embed remote bodies; only our own messages are quoted.
@@ -101,16 +93,6 @@ async def run(params, board_db):
         # Jittered (1-2 s first, up to 16 s): workers of one dead owner do not all redial, and so
         # start a replacement, in the same instant.
         await asyncio.sleep(jittered_backoff(failures, base_delay=1.0, max_delay=8.0, jitter_ratio=1.0))
-
-
-def _restartable(exc):
-    """False when *exc* is the owner's own final answer; True for a restarting owner or a lost transport."""
-    from hermes_cli.gateway_client import GatewayRPCError, GatewayUnavailableError
-    if isinstance(exc, GatewayRPCError):
-        return str(exc) in _TRANSIENT_RPC_REASONS
-    if isinstance(exc, GatewayUnavailableError):
-        return exc.state in _TRANSIENT_OWNER_STATES or exc.reason_code in _RESTART_CONTROL_REASONS
-    return True
 
 
 async def _discard(events):
@@ -181,10 +163,16 @@ def _submit():
         # before contacting the owner, so TTL recovery sees its live handle during admission.
         from hermes_cli.kanban_db_connect import connect_closing
         from hermes_cli.kanban_db_dispatch import adopt_worker_pid
-        with connect_closing(Path(board_db)) as conn:
-            if not adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid()):
-                print('Kanban owner refused: stale dispatcher claim', file=sys.stderr)
-                return 1
+        # Lock contention deliberately counts against the card.
+        try:
+            with connect_closing(Path(board_db).resolve(strict=True)) as conn:
+                if not adopt_worker_pid(conn, params['task_id'], params['run_id'], os.getpid()):
+                    print('Kanban owner refused: stale dispatcher claim', file=sys.stderr)
+                    return 1
+        except (sqlite3.Error, OSError, RuntimeError) as exc:
+            print(f'Kanban owner refused: {exc}', file=sys.stderr)
+            return 1
+
         # Owner startup must never inherit this worker's task/tool/goal identity.
         for key in list(os.environ):
             # The busy timeout is a host tuning knob, not task identity: the answer budget reads it.

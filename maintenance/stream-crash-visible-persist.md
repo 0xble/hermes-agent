@@ -122,3 +122,5 @@ alignment, with RED/GREEN proof through the real gateway crash harness.
 
 Stack fit: reused the stream consumer, resume identity, SQLite delivery ledger,
 `RECOVERED_MARKER` and existing pytest crash harness; added no dependencies.
+
+Contract tests: `tests/gateway/test_stream_recovery_fd_leak.py`.

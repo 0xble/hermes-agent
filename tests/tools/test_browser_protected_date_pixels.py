@@ -31,6 +31,8 @@ def test_vision_refuses_pixels_before_any_capture(filled_date, native, lightpand
         result = json.loads(bt.browser_vision("what is here?", task_id="journey"))
     assert result["success"] is False and "screenshot" in result["error"].lower()
     assert "browser_handoff" in result["error"]
+    assert "browser_close" not in result["error"]
+    assert "browser task ends" in result["error"]
     preroute.assert_not_called()
     capture.assert_not_called()
 

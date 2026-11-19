@@ -72,7 +72,7 @@ def _background_parent(monkeypatch, outcomes):
     monkeypatch.setattr(dt, "_load_config", dict)
     monkeypatch.setattr(dt, "_build_child_agent", build)
     monkeypatch.setattr(dt, "_run_single_child", child)
-    monkeypatch.setattr(dt, "_resolve_delegation_credentials", lambda *a, **k: creds)
+    monkeypatch.setattr("tools.delegate_tool_routes._resolve_delegation_credentials", lambda *a, **k: creds)
     return dt, parent
 
 

@@ -30,7 +30,7 @@ from agent.skills_index_delta import stage_skills_index_note
 from agent.prompt_refresh import refresh_warm_prompt
 from agent.message_metadata import (
     PERSISTENCE_ONLY_MESSAGE_FIELDS, PRE_LLM_BLOCK_WITHHELD_PROMPT, append_message, stamp_message_timestamp,
-    TYPED_ASK, stamp_typed_ask, typed_ask_fields, typed_ask_text,
+    TYPED_ASK, stamp_typed_ask, typed_ask_fields, typed_ask_text, REQUEST_REASONING_TOKENS, stamped_reasoning_tokens,
 )
 from agent.model_metadata import (
     estimate_messages_tokens_rough,
@@ -698,6 +698,7 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
     ("_codex_reasoning_only_streak", 0),
     ("last_served_model", None),
     ("_thinking_prefill_retries", 0), ("_post_tool_empty_retried", False),
+    ("_empty_response_retry_hint", None),
     ("_last_content_with_tools", None), ("_last_content_tools_all_housekeeping", False),
     ("_reused_response_text", None),
     ("_mute_post_response", False), ("_unicode_sanitization_passes", 0),
@@ -1289,6 +1290,14 @@ def build_turn_context(
     set_current_write_origin(getattr(agent, "_memory_write_origin", "assistant_tool"))
     from tools.skill_provenance import set_review_attended
     set_review_attended(getattr(agent, "_review_attended", False))
+    # Endpoint failures are turn-local, including the primary-restore selector.
+    agent._turn_failed_endpoints = []
+    agent._turn_attempted_routes = []
+    agent._turn_attempted_route_labels = []
+    agent._turn_independent_attempt_used = False
+    agent._turn_independent_attempt_active = False
+    agent._turn_independent_attempt_requested = False
+    agent._turn_fallback_chain_exhausted = False
     agent._restore_primary_runtime()
     _publish_runtime_main(agent)
     _refresh_mcp_tools_between_turns(agent)
@@ -1541,6 +1550,9 @@ def build_api_messages(
         _api_content = api_msg.pop("api_content", None)
         for key in PERSISTENCE_ONLY_MESSAGE_FIELDS:
             api_msg.pop(key, None)
+        # display_metadata just went; keep its replay price for the request estimate (popped after it).
+        if isinstance(api_msg, dict) and (_replay_tokens := stamped_reasoning_tokens(msg)):
+            api_msg[REQUEST_REASONING_TOKENS] = _replay_tokens
 
         # Inject ephemeral context (memory prefetch + pre_llm_call user hooks)
         # at API time only; `messages` is untouched beyond the api_content stamp.

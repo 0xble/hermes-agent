@@ -1,5 +1,7 @@
 """An explicit Background install owns one label in one domain, including rollback."""
+import json
 import plistlib
+import shlex
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,6 +11,14 @@ import pytest
 from hermes_cli import gateway, gateway_guardian, gateway_launchd
 
 pytestmark = pytest.mark.platforms("linux", "macos")
+
+
+def wrapped_shell_argv(program_arguments):
+    """Decode the shell command the osascript wrapper hands to ``system()`` into its arguments."""
+    script = program_arguments[-1]
+    start = script.index("$.system(") + len("$.system(")
+    shell, _ = json.JSONDecoder().raw_decode(script, start)
+    return shlex.split(shell)
 
 
 def definition(home, label="ai.hermes.gateway", session=None):
@@ -34,7 +44,12 @@ def test_explicit_domain_survives_definition_refresh(tmp_path, monkeypatch, mode
     domain = f"{mode}/{gateway_launchd.os.getuid()}"
     guardian = plistlib.loads(gateway_guardian.guardian_plist(home, path, "ai.hermes.gateway", domain=domain))
     assert guardian["LimitLoadToSessionType"] == session
-    assert guardian["ProgramArguments"][0] == str(home / "current/.venv/bin/python")
+    # Like the gateway, the guardian launches through the fixed osascript wrapper, which runs the
+    # release interpreter as its child.
+    assert guardian["ProgramArguments"][0] == "/usr/bin/osascript"
+    assert wrapped_shell_argv(guardian["ProgramArguments"])[:11] == [
+        "exec", str(home / "current/.venv/bin/python"), "-m", "hermes_cli.gateway_guardian", "run",
+        "--gateway-plist", str(path), "--gateway-label", "ai.hermes.gateway", "--domain", domain]
     assert gateway_launchd.configured_launchd_domain() == domain
 
 

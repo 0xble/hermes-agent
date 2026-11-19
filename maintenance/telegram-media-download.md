@@ -11,3 +11,5 @@ Provenance: upstream [PR #145217](https://github.com/NousResearch/hermes-agent/p
 Proof owners: `tests/gateway/test_telegram_file_retry.py` and `tests/plugins/test_telegram_media_download.py`; the latter requires the optional `telegram` extra. Real PTB over HTTPX MockTransport covers metadata/byte retries on the same client and exactly one actual sendMessage resend notice after exhaustion. Slow-retry cases exercise the real pending-update watchdog during recovery, then verify dispatch progresses without a polling restart after either success or deadline expiry. Permanent errors are not retried and cancellation propagates.
 
 Adopt a compatible upstream fix only after comparing metadata and byte-stage recovery, authored timeouts, total recovery budget, permanent-error/cancellation behavior, notice ownership, and every attachment call site. Retire this unit when upstream owns those properties. Rollback is a source revert; there is no configuration or schema migration.
+
+Contract tests: `tests/gateway/test_telegram_file_retry.py`, `tests/plugins/test_telegram_media_download.py`.

@@ -213,6 +213,20 @@ function pidAlive(pid: number): boolean {
   }
 }
 
+// Synchronous so the spawn stand-in returns only once the real tree exists.
+function waitForPidFile(file: string, timeoutMs = 10_000): void {
+  const deadline: number = Date.now() + timeoutMs
+  const pause = new Int32Array(new SharedArrayBuffer(4))
+
+  while (!/^\d+\s*$/.test(fs.existsSync(file) ? fs.readFileSync(file, 'utf8') : '')) {
+    if (Date.now() >= deadline) {
+      throw new Error(`late script never published its pid to ${file}`)
+    }
+
+    Atomics.wait(pause, 0, 0, 20)
+  }
+}
+
 // MINOR-3: after the 20 s claim wait gives up, the UI says "the updater did
 // not start". A script that starts late must not then run an update anyway:
 // the Desktop withdraws its bridge AND kills the launcher tree it spawned.
@@ -222,7 +236,7 @@ it.skipIf(IS_WINDOWS)('a timed-out hand-off kills the real script tree it spawne
   let launcherPid: number | undefined
   const realSpawn: typeof updaterProcess.spawnUpdaterProcess = updaterProcess.spawnUpdaterProcess
 
-  vi.spyOn(updaterProcess, 'spawnUpdaterProcess').mockImplementation(
+  const spawnSpy = vi.spyOn(updaterProcess, 'spawnUpdaterProcess').mockImplementation(
     (_command: string, _args: string[], options: Parameters<typeof updaterProcess.spawnUpdaterProcess>[2]) => {
       // A real launcher (detached, own process group) whose "script" is slow
       // to start: it would claim the marker 30 s later.
@@ -233,6 +247,10 @@ it.skipIf(IS_WINDOWS)('a timed-out hand-off kills the real script tree it spawne
       ) as ReturnType<typeof spawn>
 
       launcherPid = child.pid
+      // The tree must exist before the claim deadline can kill it. Otherwise a
+      // loaded host lets a correct early group kill beat the PID file, and the
+      // test reads a file that was never written.
+      waitForPidFile(grandchildPidFile)
 
       return child
     }
@@ -241,6 +259,7 @@ it.skipIf(IS_WINDOWS)('a timed-out hand-off kills the real script tree it spawne
   try {
     const result = await createCheckoutStrategy({ ...deps, handoffClaimTimeoutMs: 600 }).apply()
 
+    expect(spawnSpy).toHaveBeenCalledTimes(1)
     expect(result).toMatchObject({ ok: false, error: 'updater-spawn-failed' })
     expect(fs.existsSync(markerPath(deps.hermesHome))).toBe(false)
     const latePid: number = Number(fs.readFileSync(grandchildPidFile, 'utf8').trim())
@@ -289,6 +308,21 @@ function helperCalls(home: string): string[] {
 interface Protocol2Run {
   args: string[]
   bridgeAtSpawn: string | null
+  /** Settles once the claimant has published its adoption (and, for `adopts-then-dies`, been reaped). */
+  claimant: Promise<void>
+}
+
+/**
+ * The claimant publishes to a staging file and is SIGKILLed and reaped before
+ * the adoption is renamed into place, so the Desktop's claim poll can only
+ * ever read a marker whose owner is already dead. Publishing straight to the
+ * marker left a window where the poll saw the claimant alive and acked it.
+ */
+async function adoptThenDie(marker: string, options: Parameters<typeof claimantChild>[1]): Promise<void> {
+  const staged = `${marker}.adopting`
+  const { child } = await claimantChild(staged, options)
+  await killAndReap(child)
+  fs.renameSync(staged, marker)
 }
 
 /**
@@ -309,17 +343,17 @@ function mockProtocol2Spawn(home: string, script: 'adopts' | 'adopts-then-dies' 
         bridgeAtSpawn = null
       }
 
-      runs.push({ args, bridgeAtSpawn })
       const run = argAfter(args, '--handoff-run')
       const startedAt = Number(options.env?.HERMES_UPDATE_STARTED_AT)
 
-      if (script !== 'never') {
-        void claimantChild(markerPath(home), { startedAt, run }).then(async ({ child }) => {
-          if (script === 'adopts-then-dies') {
-            await killAndReap(child)
-          }
-        })
-      }
+      const claimant: Promise<void> =
+        script === 'adopts'
+          ? claimantChild(markerPath(home), { startedAt, run }).then((): void => {})
+          : script === 'adopts-then-dies'
+            ? adoptThenDie(markerPath(home), { startedAt, run })
+            : Promise.resolve()
+
+      runs.push({ args, bridgeAtSpawn, claimant })
 
       return { unref: (): void => {} }
     }
@@ -358,6 +392,7 @@ describe.skipIf(IS_WINDOWS)('protocol 2 hand-off', () => {
 
     try {
       const result = await createCheckoutStrategy({ ...deps, handoffClaimTimeoutMs: 1_500 }).apply()
+      await runs[0]!.claimant
 
       expect(result).toMatchObject({ ok: false, error: 'updater-spawn-failed' })
       expect(deps.quit).not.toHaveBeenCalled()

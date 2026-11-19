@@ -4,14 +4,21 @@ import asyncio
 import logging
 import time
 from contextlib import nullcontext, suppress
+from typing import TYPE_CHECKING
 
 from agent.i18n import t
+from gateway.config import Platform
+from gateway.delivery import prime_revived_egress
 from gateway.platforms.event import MessageEvent, MessageType, turn_origin_for_event
 from gateway.replay_scheduler import REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RESUME, REPLAY_PRIORITY_SYNTHETIC
+
+if TYPE_CHECKING:
+    from gateway.platforms.base import BasePlatformAdapter
 
 logger = logging.getLogger("gateway.run")
 _NOT_SUPPLIED = object()
 _INPUT_DURABLE_POLL_S = 0.25
+_ORPHAN_CARD_DELETE_ATTEMPTS = 3  # boots that may fail to delete a stranded progress card before it is forgotten
 
 
 class ResumeCandidates(list):
@@ -21,6 +28,40 @@ class ResumeCandidates(list):
 
 
 class RestartRecoveryMixin:
+    if TYPE_CHECKING:
+        def _primary_adapters(self) -> dict[Platform, BasePlatformAdapter]: ...
+
+    async def _sweep_orphan_progress_cards(self) -> int:
+        """Delete temporary progress cards a dead process recorded but never cleaned up: their
+        deletion was a post-delivery callback held only in that process's memory. Off the boot path,
+        one batch per chat, through the adapter's budgeted delete. Returns the cards deleted."""
+        try:
+            orphans = await self.async_session_store.orphan_progress_cards()
+        except Exception as exc:
+            logger.warning("Orphan progress-card sweep could not read the session store: %s", exc, exc_info=True)
+            return 0
+        deleted = 0
+        for session_key, origin, chat_id, message_ids in orphans:
+            adapter = self._delivery_adapter_for(origin)
+            if adapter is None:
+                continue  # platform not connected yet: keep the record for a later boot
+            try:
+                outcome = await adapter.delete_messages(chat_id, message_ids)
+            except Exception as exc:
+                logger.warning("Orphan progress-card delete failed for session %s: %s", session_key, exc,
+                               exc_info=True)
+                outcome = {}
+            outcome = {str(mid): bool(outcome.get(str(mid))) for mid in message_ids}
+            deleted += sum(outcome.values())
+            # A False is either final (Telegram: already gone, or past its 48h window) or a flood
+            # refusal that keeps every id for a later retry, so a card is forgotten once deleted or
+            # after a few failed boots, never on its first failure.
+            await self._persist_progress_cards(
+                "settle_swept_progress_cards", session_key, chat_id, outcome, _ORPHAN_CARD_DELETE_ATTEMPTS)
+        if orphans:
+            logger.info("Swept orphan progress cards: chats=%d deleted=%d", len(orphans), deleted)
+        return deleted
+
     def _record_restart_resume_outcome(self, session_key: str, outcome: str) -> None:
         """Emit one terminal decision per session per boot, including reconnect retries."""
         recorded = getattr(self, "_restart_resume_outcomes", None)
@@ -179,6 +220,7 @@ class RestartRecoveryMixin:
         task = None
         try:
             async with slots:
+                prime_revived_egress(adapter, event)
                 await adapter.handle_message(event)
                 session_tasks = getattr(adapter, "_session_tasks", {})
                 task = session_tasks.get(session_key) if isinstance(session_tasks, dict) else None
@@ -631,6 +673,8 @@ class RestartRecoveryMixin:
         if resume_tasks is None:
             resume_tasks = self._replay_resume_tasks = {}
         scheduled = 0
+        relay = self._primary_adapters().get(Platform.RELAY) if platform == Platform.RELAY else None
+        fronts = getattr(relay, "fronts_platform", None)
         allow_resume = (allow_resume and not getattr(candidates, "breaker_tripped", False)
                         and not getattr(self, "_restart_resume_breaker_tripped", False))
         for entry in candidates:
@@ -642,8 +686,10 @@ class RestartRecoveryMixin:
                 # Its resume already runs; the pre-claim was handed to the adapter guard, so the
                 # running-session check below cannot see it.
                 continue
-            if platform is not None and getattr(entry.origin, "platform", None) != platform:
-                continue
+            if platform is not None:  # an unfiltered sweep never reads the origin
+                logical_platform = getattr(entry.origin, "platform", None)
+                if logical_platform != platform and not (callable(fronts) and fronts(logical_platform)):
+                    continue
             if not allow_resume:
                 outcome = "noted" if self._interruption_note_delivered(entry.session_key) else "skipped:restart-loop-breaker"
                 if outcome != "noted" and entry.session_key in getattr(self, "_s2_note_ambiguous_keys", ()):
@@ -657,6 +703,9 @@ class RestartRecoveryMixin:
                 self._record_restart_resume_outcome(entry.session_key, outcome)
                 continue
             adapter, source = ready
+            # A native bot can own a platform the reconnecting Relay also fronts.
+            if platform == Platform.RELAY and adapter is not relay:
+                continue
             inflight = getattr(self, "_startup_resume_inflight", None)
             if inflight is None:
                 inflight = self._startup_resume_inflight = set()

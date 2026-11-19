@@ -58,7 +58,7 @@ def test_real_retry_producers_keep_final_failure_and_persistence(tmp_path, monke
     gateway = object.__new__(GatewayRunner)
     gateway._delivery_adapter_for = lambda source: adapter
     ctx = TurnContext(source=source, user_config=_load_gateway_config(), _run_still_current=lambda: True,
-                      _status_adapter=adapter, _status_chat_id="D1", _status_thread_metadata={})
+                      _status_adapter_pinned=adapter, _status_chat_id="D1", _status_thread_metadata={})
     agent = Agent()
     agent.status_callback = TurnRunner(gateway, ctx)._status_callback_sync
     monkeypatch.setattr(run, "safe_schedule_threadsafe", lambda coro, *a, **k: asyncio.run(coro))

@@ -69,7 +69,6 @@ def _make_runner():
     runner.delivery_router = MagicMock()
     runner._running_agents = {}
     runner._pending_messages = {}
-    runner._pending_approvals = {}
     runner.session_store = MagicMock()
     # A bare MagicMock attribute is os.fspath()-able as the RELATIVE path "MagicMock/<name>/<id>":
     # startup's heartbeat restore treats ``_routing_home`` as the launch home and would build a
@@ -124,7 +123,7 @@ class TestStartupPlatformIsolation:
             ]
         )
 
-        def fake_create_task(coro):
+        def fake_create_task(coro, *, name=None, context=None):
             coro.close()
             return MagicMock()
 
@@ -913,7 +912,7 @@ class TestVoiceInputCallbackWiring:
         adapter = self._make_discord_voice_adapter()
         runner.config.sessions_dir = tmp_path
 
-        def fake_create_task(coro):
+        def fake_create_task(coro, *, name=None, context=None):
             coro.close()
             return MagicMock()
 

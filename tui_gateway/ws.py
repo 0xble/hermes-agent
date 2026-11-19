@@ -101,7 +101,8 @@ _WS_DISPATCH_QUEUE_MAX = 256
 # transcript, so running them through the serial control lane turns an inexpensive interrupt or
 # control read behind them into a client timeout.  Keep the exception deliberately narrow: mutating
 # RPCs still retain arrival order, and no more than two expensive reads consume a connection.
-_WS_CONCURRENT_READ_METHODS = frozenset({"session.context_breakdown", "session.transcript"})
+# ``session.account_usage`` waits on a provider's usage API (a plugin hook up to its deadline).
+_WS_CONCURRENT_READ_METHODS = frozenset({"session.context_breakdown", "session.transcript", "session.account_usage"})
 _WS_CONCURRENT_READ_LIMIT = 2
 # Reads admitted beyond the running ones; one more parks the reader (as the serial lane did).
 _WS_WAITING_READ_LIMIT = 8
@@ -671,8 +672,9 @@ async def handle_ws(ws: Any, *, auth_identity: dict | None = None, subprotocol: 
             server.register_live_transport(transport)
         # Cross-backend liveness: a heartbeat row lets the startup orphan sweep tell "live but idle
         # backend" from "truly orphaned". Idempotent and once-per-process, like the orphan sweep (the
-        # desktop app and web dashboard reach the agent via this sidecar, not entry.main()).
-        _start_backend_liveness()
+        # desktop app and web dashboard reach the agent via this sidecar, not entry.main()). Its first
+        # heartbeat write takes the state.db writer, so it runs off the loop.
+        await asyncio.to_thread(_start_backend_liveness)
         if not ready_ok:
             disconnect_reason = "ready_send_failed"
             send_failures += 1

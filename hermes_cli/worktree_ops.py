@@ -58,7 +58,10 @@ def _git(args, cwd, timeout: float = 10, *, tree_timeout: bool = False, **kwargs
             stdout, stderr = proc.communicate(timeout=timeout)
         except BaseException:
             kill_and_drain(proc, 10)
-            proc.wait(timeout=10)
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                logger.debug("git cleanup reap timed out; preserving original exception")
             raise
         finally:
             release_process_group_once_empty(proc.pid, proc=proc, timeout=0)
@@ -127,7 +130,8 @@ def release_lsp_clients(wt_path: str) -> None:
 
 
 def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str,
-                                 *, branch_existed: bool = False) -> None:
+                                 *, branch_existed: bool = False,
+                                 branch_created: Optional[bool] = None) -> None:
     """Sweep the leftovers of a failed/timed-out ``git worktree add`` (fail-soft).
 
     ``worktree add`` is not transactional: killed mid-checkout it leaves the partial dir, an
@@ -138,10 +142,11 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
         # Unlock first: `worktree remove --force` refuses a locked tree.
         if not _unlock_owned_worktree(repo_root, str(wt_path), timeout=15, failed_add=True):
             return  # Another owner may have claimed this path after the failed add.
-        # An absent-at-admission branch is ours only if the reserved add acquired
-        # it. A competing creator makes git -b fail before this admin HEAD exists.
-        branch_created = False
-        if not branch_existed:
+        # Git can remove its admin HEAD on an ordinary checkout failure. The add
+        # caller supplies a confirmed ref-creation receipt independent of checkout.
+        # Older callers still require the reserved checkout's admin HEAD.
+        if branch_created is None and not branch_existed:
+            branch_created = False
             from hermes_cli._early_recovery import _git_dir
             try:
                 branch_created = (_git_dir(wt_path) / "HEAD").read_text(encoding="utf-8-sig").strip() == f"ref: refs/heads/{branch_name}"
@@ -156,7 +161,7 @@ def _cleanup_failed_worktree_add(repo_root: str, wt_path: Path, branch_name: str
         _git_quiet(["worktree", "prune"], repo_root, timeout=15,
                    stdin=subprocess.DEVNULL, env=noninteractive_git_env())
         # A ref update runs the repository's reference-transaction hook (core.hooksPath).
-        if branch_created:
+        if branch_created and not branch_existed:
             _git_quiet(["branch", "-D", branch_name], repo_root, timeout=15,
                        stdin=subprocess.DEVNULL, env=noninteractive_git_env())
     except Exception as e:
@@ -228,7 +233,7 @@ def _resolve_worktree_base(repo_root: str, fetch_timeout: float = 5,
     def _ref_exists(ref: str) -> bool:
         try:
             return _run(["rev-parse", "--verify", "--quiet", ref + "^{commit}"]).returncode == 0
-        except Exception:
+        except (OSError, subprocess.SubprocessError):
             return False
 
     def _fetch_head_age() -> Optional[float]:
@@ -392,11 +397,13 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
 
     owns_path = False
     branch_existed = True  # fail closed if a ref probe itself fails
+    branch_created = False
 
     def _add(cfg):
-        nonlocal owns_path, branch_existed
+        nonlocal owns_path, branch_existed, branch_created
         owns_path = False
         branch_existed = True
+        branch_created = False
         probe = _git(["show-ref", "--verify", "--quiet", f"refs/heads/{branch_name}"],
                      repo_root, stdin=subprocess.DEVNULL, env=env)
         if probe.returncode not in (0, 1):
@@ -408,8 +415,32 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
         # initializing lock. A losing named launch must never clean this path.
         wt_path.mkdir(parents=True)
         owns_path = True
+        # Separate ref creation from checkout: a clean Git rollback must not erase
+        # ownership proof. Native branch creation preserves tracking setup and
+        # atomically refuses a name acquired by a concurrent launcher.
+        try:
+            result = _git([*cfg, "branch", branch_name, base_ref], repo_root, timeout=120,
+                          stdin=subprocess.DEVNULL, env=env, tree_timeout=True)
+        except (OSError, subprocess.SubprocessError):
+            # Git may have committed the ref before the bounded process wrapper timed out.
+            # Reconcile the ref itself before cleanup, but only claim it when it still points
+            # at the requested base. A failed probe leaves ownership unknown and therefore
+            # preserves the ref for a later operator check.
+            try:
+                created = _git(["rev-parse", "--verify", f"refs/heads/{branch_name}"],
+                               repo_root, timeout=5, stdin=subprocess.DEVNULL, env=env)
+                base = _git(["rev-parse", base_ref], repo_root, timeout=5,
+                            stdin=subprocess.DEVNULL, env=env)
+                branch_created = (created.returncode == 0 and base.returncode == 0
+                                  and created.stdout.strip() == base.stdout.strip())
+            except (OSError, subprocess.SubprocessError):
+                branch_created = False
+            raise
+        if result.returncode != 0:
+            return result
+        branch_created = True
         # 120s: on a multi-agent box the ~10k-file checkout contends for disk (113s measured under load).
-        return _git([*cfg, "worktree", "add", str(wt_path), "-b", branch_name, base_ref], repo_root,
+        return _git([*cfg, "worktree", "add", str(wt_path), branch_name], repo_root,
                     timeout=120, stdin=subprocess.DEVNULL, env=env, tree_timeout=True)
 
     # checkout.workers parallelizes materialization; older git ignores unknown -c keys.
@@ -421,17 +452,20 @@ def _worktree_add(repo_root: str, wt_path: Path, branch_name: str, base_ref: str
                 logger.warning("worktree add from %s failed (%s); retrying from local HEAD",
                                base_ref, result.stderr.strip())
                 if owns_path:
-                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed)
+                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed,
+                                                 branch_created=branch_created)
                 base_ref, base_label = "HEAD", "HEAD (fallback — remote base failed)"
                 result = _add([])
             if result.returncode != 0:
                 if owns_path:
-                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed)
+                    _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed,
+                                                 branch_created=branch_created)
                 _cprint(f"\033[31m✗ Failed to create worktree: {result.stderr.strip()}\033[0m")
                 return None
     except Exception as e:
         if owns_path:
-            _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed)
+            _cleanup_failed_worktree_add(repo_root, wt_path, branch_name, branch_existed=branch_existed,
+                                         branch_created=branch_created)
         _cprint(f"\033[31m✗ Failed to create worktree: {e}\033[0m")
         return None
     return base_ref, base_label
@@ -884,11 +918,13 @@ def _tree_still_served(db_path: str, worktree_path: str) -> Optional[str]:
     import sqlite3
     from urllib.parse import quote
 
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
     path = Path(db_path)
     chats: set = set()
     if path.is_file():
         try:
-            conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=2)
+            conn = connect_tracked(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=2, tracking_path=path)
             try:
                 conn.create_function("hermes_inside_tree", 1, _inside_tree(worktree_path), deterministic=True)
                 if conn.execute(_SERVED_TREE_SQL).fetchone():
@@ -936,12 +972,14 @@ def _retained_tree_is_live(db_path: str, worktree_path: str, *, pending_only: bo
     import sqlite3
     from urllib.parse import quote
 
+    from hermes_cli.sqlite_safe_read import connect_tracked
+
     path = Path(db_path)
     if not path.is_file():
         return False
     inside = _inside_tree(worktree_path)
     try:
-        conn = sqlite3.connect(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=2)
+        conn = connect_tracked(f"file:{quote(str(path))}?mode=ro", uri=True, timeout=2, tracking_path=path)
         try:
             conn.create_function("hermes_inside_tree", 1, inside, deterministic=True)
             row = conn.execute(
@@ -985,6 +1023,10 @@ def _initializing_worktree_is_dead(worktree_path: str, before: Optional[float] =
 
     Call after validating the exact reason and repository identity. A sweep supplies its
     existing age cutoff; failed-add cleanup separately owns its exact in-progress add.
+    Windows deliberately fails closed: this POSIX holder probe cannot establish that
+    all checkout descendants are gone. A timed-out initializing checkout and its
+    branch remain reserved there; the owner must verify processes have exited before
+    explicitly unlocking/removing it and retrying the same name.
     """
     try:
         from hermes_cli._early_recovery import _git_dir, _held_open
@@ -1085,16 +1127,33 @@ def prune_tier_hours(name: str, max_age_hours: float) -> float:
     return max_age_hours if name.startswith(_AUTO_TREE_PREFIXES) else max_age_hours * 3
 
 
-def _prune_candidates(worktrees_dir: Path, max_age_hours: int, now: float) -> list:
+def resumable_pins() -> dict:
+    """``{realpath: reason}`` for trees a resumable subagent still owns (``tools.delegate_tool_resumable``);
+    empty when the records cannot be read (the sweep then behaves as before)."""
+    try:
+        from tools.delegate_tool_resumable import pinned_worktrees
+        return pinned_worktrees()
+    except Exception:
+        logger.debug("resumable subagent pins unreadable", exc_info=True)
+        return {}
+
+
+def _prune_candidates(worktrees_dir: Path, max_age_hours: int, now: float, pins: Optional[dict] = None) -> list:
     """Phase 1, stat-only age filter -> ``[(entry, mtime, force)]`` for trees past their soft cutoff.
 
     Kanban trees (``t_<hex>``) belong to the kanban gc. Hermes-made trees age on *max_age_hours*,
-    deliberately named trees at 3x (``prune_tier_hours``); *force* marks the hard (3x) tier.
+    deliberately named trees at 3x (``prune_tier_hours``); *force* marks the hard (3x) tier. A tree a
+    resumable subagent pins (*pins*, default ``resumable_pins()``) is never a candidate while the pin lasts.
     """
+    from tools.delegate_tool_resumable import pin_reason
     kanban_re = re.compile(r"^t_[0-9a-f]+$")
+    pins = resumable_pins() if pins is None else pins
     candidates: list = []
     for entry in sorted(worktrees_dir.iterdir()):
         if not entry.is_dir() or kanban_re.match(entry.name):
+            continue
+        if pins and (why := pin_reason(str(entry), pins)):
+            logger.info("Keeping worktree %s: %s", entry.name, why)
             continue
         tier_hours = prune_tier_hours(entry.name, max_age_hours)
         try:
@@ -1216,6 +1275,10 @@ def _reap_prune_verdicts(repo_root: str, verdicts: list, stale_work_cutoff: floa
         blocked = removal_blocked(str(entry))
         if blocked:
             preserved_stale.append(f"{entry.name} ({blocked[1]})")
+            continue
+        from hermes_cli.worktree_sweep import pinned_now
+        if pinned := pinned_now(str(entry)):  # a continue pinned it after the plan was made
+            logger.info("Keeping worktree %s: %s", entry.name, pinned)
             continue
 
         cutoff = (initializing_before if initializing_before is not None else

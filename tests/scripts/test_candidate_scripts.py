@@ -378,11 +378,16 @@ def test_check_config_does_not_pin_background_review(tmp_path, monkeypatch):
     """Background review is an owner choice; enabling it must not fail the fork-patch check."""
     mod = _load("check_fork_patches")
     assert "auxiliary.background_review.enabled" not in mod.EXPECTED_CONFIG
-    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m",
+    values = {"memory.write_approval": "false", "delegation.model": "",
+              "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m",
+              "delegation.backends.model_map.options": [{"name": "worker", "model": "worker-model"}],
               "auxiliary.background_review.enabled": "true"}
 
     def fake_run(cmd, **_kwargs):
-        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+        key = cmd[-2] if cmd[-1] == "--json" else cmd[-1]
+        value = json.dumps(values[key]) if cmd[-1] == "--json" else values[key] + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=value, stderr="")
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
     assert mod.check_config(tmp_path) == []
@@ -472,8 +477,6 @@ def test_check_config_rejects_missing_delegation_routes(tmp_path, monkeypatch):
         "config delegation route is not resolvable: set delegation.model or "
         "delegation.backend='model_map' with a non-empty default and declared options"
     ]
-
-
 def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch):
     mod = _load("check_fork_patches")
     release = tmp_path / "releases" / ("b" * 40)
@@ -482,11 +485,16 @@ def test_check_config_uses_the_active_release_interpreter(tmp_path, monkeypatch)
     python.write_text("placeholder", encoding="utf-8")
     (tmp_path / "current").symlink_to(release, target_is_directory=True)
     calls = []
-    values = {"memory.write_approval": "false", "delegation.model": "m", "auxiliary.review.model": "m"}
+    values = {"memory.write_approval": "false", "delegation.model": "",
+              "delegation.backend": "model_map",
+              "delegation.backends.model_map.default": "worker", "auxiliary.review.model": "m",
+              "delegation.backends.model_map.options": [{"name": "worker", "model": "worker-model"}]}
 
     def fake_run(cmd, **kwargs):
         calls.append((cmd, kwargs))
-        return subprocess.CompletedProcess(cmd, 0, stdout=values[cmd[-1]] + "\n", stderr="")
+        key = cmd[-2] if cmd[-1] == "--json" else cmd[-1]
+        value = json.dumps(values[key]) if cmd[-1] == "--json" else values[key] + "\n"
+        return subprocess.CompletedProcess(cmd, 0, stdout=value, stderr="")
 
     monkeypatch.setattr(mod.subprocess, "run", fake_run)
     assert mod.check_config(tmp_path) == []

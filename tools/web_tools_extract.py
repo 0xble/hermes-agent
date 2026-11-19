@@ -489,8 +489,9 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
 
     The disk cache (tools/web_result_cache.py) sits AFTER the secret-URL gate, SSRF gate, and provider
     resolution, and is gated per-URL on the website policy — a hit skips only the vendor call, never a
-    control; policy-blocked URLs are cache misses, judged on both the requested and the cached final URL. Keys include provider and format, so switching either
-    within the TTL never serves the other's content."""
+    control. Policy-blocked URLs are refused outright — never fetched, never served from cache — so the
+    blocklist is a gate on this path like every other control; a cached hit's final URL is re-judged too.
+    Keys include provider and format, so switching either within the TTL never serves the other's content."""
     from tools.web_result_cache import extract_cache_get
     from tools.web_extract_direct import is_html_candidate
     from tools.website_policy import check_website_access as _check_site
@@ -506,15 +507,20 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
             policy_block = _check_site(url)
         except Exception:
             policy_block = None
+        if policy_block is not None:
+            entry = _result_entry(url, policy_block.get("message") or "Blocked by website policy")
+            entry["blocked_by_policy"] = {k: policy_block[k] for k in ("host", "rule", "source")}
+            fixed[position] = entry
+            continue
         allow_html = html_enabled and is_html_candidate(url)
-        if policy_block is None and direct_enabled:
+        if direct_enabled:
             direct = await _try_direct(url, allow_html)
             if direct is not None:
                 fixed[position] = direct
                 continue
             if allow_html:
                 direct_fallbacks.add(url)
-        hit = extract_cache_get(url, format=format, provider=provider.name) if policy_block is None else None
+        hit = extract_cache_get(url, format=format, provider=provider.name)
         if hit is not None and not await _cached_final_url_allowed(hit, url):
             hit = None  # a miss: the live fetch re-checks the redirect and refuses with blocked_by_policy
         if hit is not None:

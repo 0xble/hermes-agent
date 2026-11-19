@@ -122,12 +122,12 @@ def test_two_short_quotes_and_one_expandable_quote_stay_in_place():
 
 @pytest.mark.asyncio
 async def test_interrupted_stream_does_not_send_copy_body_a_second_time():
-    from gateway.run_turn import GatewayTurnMixin
+    from gateway.run import GatewayRunner
 
-    runner = object.__new__(GatewayTurnMixin)
+    runner = object.__new__(GatewayRunner)
     adapter = SimpleNamespace(platform="telegram", send=AsyncMock(),
                               _streaming_tts_turn_completed=lambda *_a: False)
-    runner._delivery_adapter_for = lambda _source: adapter
+    runner._delivery_adapter_for = lambda source: adapter
     runner._should_send_voice_reply = lambda *_a, **_k: False
     runner._deliver_media_from_response = AsyncMock(return_value=False)
     event = SimpleNamespace(source=SimpleNamespace(chat_id="c", platform="telegram"), text="")

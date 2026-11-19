@@ -100,7 +100,11 @@ class TurnContext:
     _LONG_TOOL_THRESHOLD_S: float = 30.0
     _cleanup_progress: bool = False
     _status_delivery: Any = None
+    _cleanup_adapter: Any = None
     _cleanup_msg_ids: list[str] = field(default_factory=list)
+    _card_recorder: Optional[Callable[[str], None]] = None
+    _card_writes: set = field(default_factory=set)
+    _card_forgotten: set = field(default_factory=set)  # ids whose record is forgotten; a late record is dropped
     _bubble_cleanup_registered: bool = False
     _post_delivery_adapter: Any = None
     _progress_metadata: Optional[dict] = None
@@ -156,7 +160,10 @@ class TurnContext:
     # hook / status bridge wiring
     _loop_for_step: Any = None
     _hooks_ref: Any = None
-    _status_adapter: Any = None
+    # Read through the ``_status_adapter`` property: the pinned adapter answers only when the
+    # resolver (the runner's delivery lookup for this turn's source) finds none registered.
+    _status_adapter_pinned: Any = None
+    _status_adapter_resolver: Optional[Callable[[], Any]] = None
     _status_chat_id: Any = None
     _status_thread_metadata: Optional[dict] = None
     # bound TurnRunner callbacks read via ctx
@@ -175,6 +182,30 @@ class TurnContext:
     native_tool_complete_callback: Optional[Callable] = None
     # Current turn worker, assigned before agent resolution so its completion events can bind the agent.
     _worker: Optional[TurnWorker] = None
+
+    def track_cleanup_id(self, message_id: str) -> None:
+        """Remember a temporary progress card for end-of-turn deletion, and record it durably."""
+        self._cleanup_msg_ids.append(message_id)
+        if self._card_recorder is not None:
+            self._card_recorder(message_id)
+
+    @property
+    def _status_adapter(self) -> Any:
+        """The adapter that answers the turn NOW. A reconnect replaces the platform's adapter while a
+        turn runs, and the retired instance has no bot, so an approval card, clarify question or status
+        sent through the adapter pinned at turn start fails "Not connected" and the gated command waits
+        out its full timeout (#138133). The pinned one answers while no adapter is registered (the
+        reconnect gap), where its own send() still waits for the replacement."""
+        live = self._status_adapter_resolver() if self._status_adapter_resolver is not None else None
+        return live if live is not None else self._status_adapter_pinned
+
+    @_status_adapter.setter
+    def _status_adapter(self, adapter: Any) -> None:
+        self._status_adapter_pinned = adapter
+
+    def bind_status_adapter(self, resolve: Callable[[], Any]) -> None:
+        """Pin the adapter that answers the turn now, and keep *resolve* to re-ask at every send."""
+        self._status_adapter_pinned, self._status_adapter_resolver = resolve(), resolve
 
     def bind_agent_lifetime(self, agent: Any) -> None:
         """Keep only drain fences on the agent, never the entire turn context."""

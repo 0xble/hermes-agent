@@ -19,3 +19,5 @@ Run `tests/e2e/core/compaction/`, `tests/agent/test_preflight_compression_timeou
 Managed workers use `RuntimeSessionStore.append_message` through the closed `transcript.append_one` owner operation. Share the single-row serializer and transaction-level insertion with `SessionDB.append_message`, never call a self-committing writer inside a worker receipt or archive row IDs returned by batch adoption. Exact sequence replay returns the original row ID. Keep session assignment, generation, epoch, turn-lease and closed-parent fences, while preserving ordinary append during an active compression watermark lock.
 
 Retire when upstream retains rejected input durably without increasing model history and passes these tests with the write guards unchanged.
+
+Contract tests: `tests/agent/test_preflight_compression_timeout_fail_closed.py`, `tests/agent/test_export_current_turn_boundary.py`, `tests/hermes_state/test_worker_message_archive.py`.

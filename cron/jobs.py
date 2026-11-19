@@ -38,13 +38,17 @@ from cron.jobs_invariants import (
     NO_AGENT_WITHOUT_SCRIPT_ERROR, _validate_job_mode_invariants, validate_catch_up_floor,
     validate_schedule_knobs,
 )
+from cron.jobs_tristate import normalize_catch_up as _normalize_catch_up, normalize_wrap_response
 from cron.jobs_model_pin import _main_model_pin
+from cron.jobs_normalize import (
+    _normalize_base_url, _normalize_context_from, _normalize_failure_deliver, _normalize_job_optional_text,
+)
 from cron import jobs_time
 from cron.scheduler_ownership import _claim_owner_is_dead
 from cron.scheduler_detached_worker import normalize_hard_wall_timeout
 from cron.missed_windows import normalize_max_catch_up_lateness
 from cron.review import apply_review_update, normalize_review, validate_review_delivery
-from cron import extra_fire, store_health
+from cron import extra_fire, jobs_error_text, store_health
 from typing import Optional, Dict, List, Any, Callable, Set, Tuple, Union, Collection
 
 logger = logging.getLogger(__name__)
@@ -1945,23 +1949,6 @@ def _normalize_workdir(workdir: Optional[str]) -> Optional[str]:
     return str(resolved)
 
 
-def _normalize_job_optional_text(
-    value: Any, *, strip_trailing_slash: bool = False
-) -> Optional[str]:
-    if not isinstance(value, str):
-        return None
-    return (value.strip().rstrip("/") if strip_trailing_slash else value.strip()) or None
-
-
-def _normalize_base_url(value: Any) -> Optional[str]:
-    return _normalize_job_optional_text(value, strip_trailing_slash=True)
-
-
-def _normalize_str_list(items: Any) -> Optional[list[str]]:
-    """Non-blank stripped items of *items*, or None when nothing remains."""
-    return [str(j).strip() for j in items if str(j).strip()] or None
-
-
 def _normalize_enabled_toolsets(value: Any) -> Optional[list[str]]:
     """Per-job toolset allowlist. An explicitly-set EMPTY list means 'nothing allowed' and must
     persist as [] — normalizing it to None would read back as 'no restriction' (#82010). Absent
@@ -1971,22 +1958,6 @@ def _normalize_enabled_toolsets(value: Any) -> Optional[list[str]]:
     if not isinstance(value, list):
         raise ValueError("enabled_toolsets must be a list of toolset names (or [] for none).")
     return [str(j).strip() for j in value if str(j).strip()]
-
-
-def _normalize_context_from(value: Any) -> Optional[list[str]]:
-    """Accept a job id or a list of ids; anything else is None."""
-    if isinstance(value, str):
-        value = [value]
-    return _normalize_str_list(value) if isinstance(value, list) else None
-
-
-def _normalize_failure_deliver(value: Any) -> Optional[str]:
-    """failure_deliver shares deliver's value grammar; flatten str/list like the tool layer's
-    _normalize_deliver_param for direct create_job callers. Semantic validation happens at
-    resolution time via the shared deliver path."""
-    if isinstance(value, (list, tuple)):
-        return ",".join(str(p).strip() for p in value if str(p).strip()) or None
-    return _normalize_job_optional_text(value)
 
 
 def _normalize_reasoning_effort(value: Any) -> Optional[str]:
@@ -2012,13 +1983,6 @@ def _normalize_reasoning_effort(value: Any) -> Optional[str]:
 
 # Normalizers for create_job (all fields) / update_job (present fields). Invalid values raise BEFORE
 # storing.
-def _normalize_catch_up(value: Any) -> Optional[bool]:
-    """``catch_up``: True runs one catch-up for missed slots, False skips them, None = default."""
-    if value is None or isinstance(value, bool):
-        return value
-    raise ValueError("catch_up must be true, false, or null (use the default).")
-
-
 def _normalize_priority(value: Any) -> Optional[str]:
     """Normalize a business-impact lane; unset (``None`` or ``''``) means the production default."""
     if value is None:
@@ -2053,6 +2017,7 @@ _CREATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "wrap_response": normalize_wrap_response,
     "priority": _normalize_priority,
 }
 _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
@@ -2072,6 +2037,7 @@ _UPDATE_FIELD_NORMALIZERS: dict[str, Callable[[Any], Any]] = {
     "timezone": jobs_time.normalize_timezone,
     "grace_minutes": jobs_time.normalize_grace_minutes,
     "catch_up": _normalize_catch_up,
+    "wrap_response": normalize_wrap_response,
     "priority": _normalize_priority,
 }
 
@@ -2133,6 +2099,7 @@ def create_job(
     max_catch_up_lateness_seconds: Optional[float | str] = None,
     timezone: Optional[str] = None,
     grace_minutes: Optional[int] = None,
+    wrap_response: Optional[bool] = None,
 ) -> dict[str, Any]:
     """Create a new cron job and return the stored record.
 
@@ -2146,7 +2113,8 @@ def create_job(
     (a venv can be rebuilt or moved after creation). timezone: IANA wall-clock zone
     (None/'' = inherit the profile). grace_minutes: catch-up window (0 = never catch up).
     max_catch_up_lateness_seconds: recurring occurrence deadline (unset is unlimited, 0 permits no lateness);
-    for a one-shot it widens catch-up to max(120s, value), and 0 keeps 120s."""
+    for a one-shot it widens catch-up to max(120s, value), and 0 keeps 120s. wrap_response: None inherits
+    cron.wrap_response, a bool overrides it."""
     if not isinstance(paused, bool):
         raise ValueError("paused must be a boolean.")
     job_timezone = normalize_job_timezone(job_timezone)
@@ -2248,7 +2216,7 @@ def create_job(
         ("hard_wall_timeout_seconds", f["hard_wall_timeout_seconds"]),
         ("max_catch_up_lateness_seconds", f["max_catch_up_lateness_seconds"]),
         ("timezone", f["timezone"]), ("grace_minutes", f["grace_minutes"]),
-        ("catch_up", f["catch_up"]),
+        ("catch_up", f["catch_up"]), ("wrap_response", f["wrap_response"]),
     ):
         if value is not None:
             job[key] = value
@@ -2762,7 +2730,7 @@ def note_fire_forward_failure(job_id: str, detail: str) -> bool:
     clears it."""
     def apply(jobs, _i, job):
         job["last_fire_error"] = {
-            "at": _hermes_now().isoformat(), "detail": str(detail or "")[:500]}
+            "at": _hermes_now().isoformat(), "detail": jobs_error_text.sanitize_persisted_error(str(detail or ""))[:500]}
         save_jobs(jobs)
         return True
 
@@ -2803,7 +2771,7 @@ def _record_run_outcome(
     job["last_status"] = status or (
         "error" if not success else ("delivery_failed" if delivery_failed else "ok"))
     cancelled = status == "cancelled"  # an operator stop is not a failure
-    job["last_error"] = None if success or cancelled else error
+    job["last_error"] = None if success or cancelled else jobs_error_text.sanitize_persisted_error(error)
     if success:
         # Healthy run: drop the alert-once dedup markers so a FUTURE break re-alerts, and clear
         # the forward-failure stamp so it only describes CURRENT auto-fire health.
@@ -2819,8 +2787,8 @@ def _record_run_outcome(
         # a monitor sampling jobs.json then sees a permanently green job. last_failure
         # survives success (latest failure wins); the recency window is the consumer's
         # call. Delivery failures keep their own sticky last_delivery_error.
-        job["last_failure"] = {"at": now, "detail": error or (status or "run failed")}
-    job["last_delivery_error"] = delivery_error
+        job["last_failure"] = {"at": now, "detail": jobs_error_text.sanitize_persisted_error(error) or (status or "run failed")}
+    job["last_delivery_error"] = jobs_error_text.sanitize_persisted_error(delivery_error)
     # Clear both claims: the run is over, so the job is claimable again.
     job["fire_claim"] = None
     job.pop("pending_slot", None)
@@ -2904,6 +2872,9 @@ def mark_job_run(
             quota_hold.plan_hold(job, quota_hold_seconds, recover_consumed_fire=recover_consumed_fire)
         else:
             quota_hold.clear_state(job)
+        # A run rewrites all jobs, including legacy failure stamps on idle siblings.
+        for stored_job in jobs:
+            jobs_error_text.scrub_retained_stamps(stored_job)
         save_jobs(jobs)
         return True
 
@@ -2915,79 +2886,6 @@ def mark_job_run(
         return found
 
     return _under_fire_fence(job_id, locked)
-
-
-def _write_oneshot_diagnostic(job: dict[str, Any], text: str, what: str) -> bool:
-    """Durably queue the owner failure before retirement; save the local trace best-effort."""
-    from cron.oneshot_retirement import queue_retirement_alert
-    queue_retirement_alert(job, text, what, now=_hermes_now())
-    try:
-        save_job_output(job.get("id", ""), text)
-        return True
-    except Exception as e:
-        logger.debug("Failed to write %s diagnostic for job %r: %s", what, job.get("id"), e)
-        return False
-
-
-def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
-    """Trace for a wedged one-shot removal: dispatch was claimed but mark_job_run never ran
-    (interrupted mid-run); removing it silently would leave no output, error, or record.
-
-    A spent dispatch without a current-arm completion may have partial effects. Leave an alert
-    and local trace when recovery retires it, rather than replaying it (#73973).
-    """
-    from cron.jobs_oneshot import occurrence_finished, occurrence_started
-
-    if not occurrence_started(job) or occurrence_finished(job):
-        return  # Only a current-arm interrupted dispatch needs a partial-effects warning.
-    repeat = job.get("repeat") or {}
-    claim = job.get("run_claim") or {}
-    written = _write_oneshot_diagnostic(
-        job,
-        "# Cron job removed without producing output\n\n"
-        f"- job id: {job.get('id')}\n"
-        f"- name: {job.get('name')}\n"
-        f"- dispatch claimed: {repeat.get('completed', '?')}/{repeat.get('times', '?')}\n"
-        f"- run claimed at: {claim.get('at', 'unknown')} by {claim.get('by', 'unknown')}\n"
-        f"- removed at: {_hermes_now().isoformat()}\n\n"
-        "This one-shot job's dispatch was claimed, but the run never "
-        "completed for this occurrence (no current completion stamp) — the scheduler "
-        "process was most likely killed or restarted mid-execution. The "
-        "job has been removed to stop it re-firing; recreate it to run "
-        "again.\n",
-        "wedged-oneshot")
-    if written:
-        logger.warning(
-            "Job '%s': removed without a completed run — diagnostic written to "
-            "its output directory",
-            job.get("name", job.get("id", "?")))
-
-
-def _write_retired_oneshot_diagnostic(
-    job: dict[str, Any], next_run: str, *, dispatch_limit: bool = False,
-) -> None:
-    """Route both retirement gates through the same interrupted-versus-unrun diagnostic."""
-    from cron.jobs_oneshot import occurrence_finished, occurrence_started
-
-    if occurrence_started(job) and not occurrence_finished(job):
-        # A consumed, unfinished dispatch may already have side effects.
-        _write_wedged_oneshot_diagnostic(job)
-        return
-    seconds = oneshot_grace_seconds(job)
-    grace = int(seconds) if seconds.is_integer() else seconds
-    reason = "dispatch limit reached" if dispatch_limit else "run time outside grace window"
-    _write_oneshot_diagnostic(
-        job,
-        f"# Cron job removed before firing ({reason})\n\n"
-        f"- job id: {job.get('id')}\n"
-        f"- name: {job.get('name')}\n"
-        f"- scheduled run time: {next_run}\n"
-        f"- grace window: {grace}s\n"
-        f"- removed at: {_hermes_now().isoformat()}\n\n"
-        f"This one-shot was removed without running: {reason}. "
-        "A re-armed record may have consumed its dispatch budget on a prior run. "
-        "Recreate it (or use the Run button) to schedule it again.\n",
-        "missed-oneshot")
 
 
 def claim_dispatch(job_id: str) -> bool:

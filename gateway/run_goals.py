@@ -19,6 +19,7 @@ from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform
+from gateway.delivery import prime_revived_egress
 from gateway.platforms.event import (
     GOAL_CONTINUATION_METADATA_KEY,
     MessageEvent,
@@ -47,6 +48,24 @@ _GOAL_STOP_PAUSE_REASON = "user-interrupted (/stop)"
 _GOAL_NOTICE_MAX_ATTEMPTS = 3
 # Goal card kinds that mean the goal stopped making progress. Hidden ones wake the session.
 _STALL_KINDS = frozenset({"blocked", "paused", "failed"})
+
+
+def _goal_suspended_while_private(session_entry) -> bool:
+    """A goal neither judges nor changes during a private interval and resumes untouched after it.
+
+    The judge would send the private reply to the auxiliary goal_judge provider, and every goal
+    write is withheld from state.db while private anyway.
+    """
+    return bool(getattr(session_entry, "incognito", False)) or session_private(
+        getattr(session_entry, "session_id", None), getattr(session_entry, "session_key", None),
+    )
+
+
+def session_private(*identities) -> bool:
+    """Suspend background work for private sessions, including an in-flight privacy switch."""
+    from agent.incognito import is_registered
+    from gateway.incognito import transition_pending
+    return any(is_registered(identity) or transition_pending(identity) for identity in identities)
 
 
 def _goal_notice_kind(message: str) -> str:
@@ -284,6 +303,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
         if local and viewer_driven(adapter.authority, source.chat_id, "viewer_heartbeat"):
             return  # the classic CLI's watchdog fires it: that CLI paints only the turns it submits
+        # Both lanes below answer through this adapter: warm a Relay's egress routing first.
+        prime_revived_egress(adapter, MessageEvent(text="", source=source))
         if getattr(self, 'session_authority', None) is not None:
             from gateway.run_heartbeat_acceptance import admit_heartbeat
             await admit_heartbeat(self, adapter, source, session_id, quick_key)
@@ -526,7 +547,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _defer_goal_status_notice_after_delivery(
         self, source: Any, message: str, *, section: str = "goals", stall: Optional[bool] = None,
-    ) -> None:
+        run_generation: int | None = None,) -> None:
         """Send a /goal status line after the main response is delivered.
 
         The adapter sends the agent response after this caller returns, so for reading order use
@@ -552,8 +573,13 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             session_key = self._session_key_for_source(source)
         if session_key and not _post_turn_delivered.get() and hasattr(adapter, "register_post_delivery_callback"):
             try:
-                active = getattr(adapter, "_active_sessions", {}).get(session_key)
-                generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
+                # Authority-run busy follow-ups have no per-turn adapter guard. Their own
+                # event's generation must win over the shared guard (or lack of one), or this
+                # /goal notice turns a generated bubble-cleanup slot into a generationless one.
+                generation = run_generation
+                if generation is None:
+                    active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                    generation = getattr(active, "_hermes_run_generation", None) if active is not None else None
                 adapter.register_post_delivery_callback(session_key, _deliver, generation=generation)
                 return
             except Exception as exc:
@@ -652,7 +678,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             loop_tick = [metadata.get("loop_wakeup_instance"), metadata.get("loop_wakeup_tick")]
         else:
             # Older in-process callers stamped the same exact identity under this name. Keep the
-            # compatibility path strict to a two-part tick; no text-only completion is accepted.
+            # compatibility path strict to a two-part tick; tick settlement still requires its identity.
             legacy_tick = metadata.get("gateway_loop_tick")
             if isinstance(legacy_tick, (list, tuple)) and len(legacy_tick) == 2:
                 loop_tick = list(legacy_tick)
@@ -669,7 +695,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _revive_blocked_goal_for_user_turn(self, session_entry, source, event) -> None:
         """Resume only after turn admission, independently of model success or delivery."""
-        if not self._is_user_turn_event(event):
+        if not self._is_user_turn_event(event) or _goal_suspended_while_private(session_entry):
             return
         from hermes_cli.goals import GoalManager
 
@@ -700,6 +726,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         user_initiated: bool = False, external_event: bool = False,
         goal_instance: Optional[float] = None,
         invalidation_epoch: Optional[int] = None,
+        run_generation: int | None = None,
     ) -> None:
         """Run the goal judge after a gateway turn (AFTER delivery) and, if still active, enqueue a
         continuation through the adapter FIFO so a simultaneous real user message takes priority.
@@ -765,7 +792,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if msg and source is not None:
             notice_kind = _goal_notice_kind(msg)
             if notice_kind in {"achieved", "blocked", "paused", "failed", "resumed"}:
-                await self._defer_goal_status_notice_after_delivery(source, msg)
+                await self._defer_goal_status_notice_after_delivery(
+                    source, msg, run_generation=run_generation)
             else:
                 logger.info("goal continuation: routine status notice suppressed kind=%s message=%s",
                             notice_kind, msg)
@@ -872,7 +900,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 try:
                     # The delivered signal rides the cosmetic cleanup chain, which can time out.
                     await asyncio.wait_for(delivered.wait(), POST_TURN_DELIVERY_WAIT_S)
-                except asyncio.TimeoutError:
+                except TimeoutError:
                     logger.warning("post-turn bookkeeping for %s ran without a delivery signal after %.0fs",
                                    session_key, POST_TURN_DELIVERY_WAIT_S)
                 await finish(deferred=True)
@@ -972,6 +1000,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         """Run goal and loop bookkeeping after an agent turn returns."""
         from gateway.session_authorities import active_authority
         from gateway.session_viewer_automation import viewer_driven
+        from gateway.platforms.base_post_delivery import turn_run_generation
         if viewer_driven(active_authority(self), getattr(source, "chat_id", None)):
             return  # the classic CLI viewer judges and continues through ``session.automation``
         final_text = self._final_text_for_post_turn_hooks(agent_result, event)
@@ -1039,7 +1068,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if not loop_tick and event is not None:
             loop_tick = self._post_turn_goal_identity(event).get("loop_tick")
         hooks = [("loop completion", self._post_turn_loop_completion,
-                  {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None})]
+                  {"loop_tick": tuple(loop_tick) if isinstance(loop_tick, (list, tuple)) else None,
+                   "loop_identity": getattr(event, "_loop_completion_identity", None)})]
         if successful:
             # Any delivery into the session is fresh evidence and pierces a goal wait: process or
             # delegation results, watcher/cron/kanban wakes, plugin injections. Only the goal's own
@@ -1099,17 +1129,21 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 goal_kwargs["goal_instance"] = instance
             if invalidation_epoch is not None:
                 goal_kwargs["invalidation_epoch"] = invalidation_epoch
-            hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
+            if not _goal_suspended_while_private(session_entry):
+                hooks.insert(0, ("goal continuation", self._post_turn_goal_continuation, goal_kwargs))
         for label, hook, hook_kwargs in hooks:
             if hook == self._post_turn_goal_continuation and invalidation_epoch is not None and (
                 self._session_invalidation_epoch(self._session_key_for_source(source))
                 != invalidation_epoch):
                 continue  # a stop/reset supersedes the goal; the delivered loop tick still settles
             try:
+                # Both hooks may defer a notice into this turn's post-delivery slot: each needs
+                # the turn's generation or the chained bubble cleanup loses it.
                 await hook(
-                    session_entry=session_entry, source=source, final_response=final_text if successful else "",
-                    **hook_kwargs,
-                )
+                    session_entry=session_entry, source=source,
+                           final_response=final_text if successful else "",
+                           run_generation=turn_run_generation(event),
+                    **hook_kwargs,)
             except Exception as exc:
                 logger.debug("%s hook failed: %s", label, exc)
         await self._publish_local_control(source, only_if_present=True)
@@ -1186,16 +1220,24 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
 
     async def _post_turn_loop_completion(
         self, *, session_entry: Any, source: Any, final_response: str,
-        loop_tick: Optional[tuple] = None,
+        loop_tick: Optional[tuple] = None, loop_identity: Optional[tuple] = None,
+        run_generation: int | None = None,
     ) -> None:
-        """Complete a /loop wakeup tick after a gateway turn. No-op unless a tick is in flight
-        (``awaiting_response``, set when the wakeup was injected); applies the LOOP_COMPLETE marker
-        / --until judge / caps and schedules the next tick for the idle wakeup watcher.
+        """Honor explicit completion from the observed loop, or settle an exact wake tick.
 
-        A normal user turn has no loop-tick identity. It must not settle a claimed wakeup merely
-        because the session currently has one awaiting response; only the synthetic event carrying
-        the exact ``gateway_loop_tick`` may do that.
+        A successful final marker from any turn may finish its captured loop definition.
+        Other replies only settle the exact tick they answered. Older unstamped callers
+        retain tick-only settlement and cannot stop a replacement loop by accident.
         """
+        if loop_identity is not None and loop_tick is None:
+            from gateway.loop_completion import complete_loop_response
+            message = await self._run_in_executor_with_context(
+                complete_loop_response, session_entry.session_id, loop_identity, final_response,
+            )
+            if message:
+                if source is not None:
+                    await self._defer_goal_status_notice_after_delivery(source, message, section="loops", stall=False)
+                return
         def _load():
             from hermes_cli.loops import LoopManager
             return lambda sid: LoopManager(session_id=sid)
@@ -1223,7 +1265,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             # A tick-budget pause or an unachievable stop condition stalls the loop; a finish does not.
             stall = decision.get("status") == "paused" or (
                 decision.get("status") == "active" and not decision.get("stopped"))
-            await self._defer_goal_status_notice_after_delivery(source, msg, section="loops", stall=stall)
+            await self._defer_goal_status_notice_after_delivery(source, msg, section="loops", stall=stall, run_generation=run_generation)
 
     async def _post_command_loop_completion(self, event: Any, source: Any) -> None:
         """Settle only a command dispatch that completed without falling through to model work."""
@@ -1342,7 +1384,7 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if _turn_owner_exists(include_marker=False):
             return
         # Preserve retired state before compression migration or orphan-tick recovery writes.
-        if not await automatic_route_available(self, source):
+        if not await automatic_route_available(self, source, idle_backoff=True):
             return
 
         # The route may resolve to a different durable session after compression, /resume, a
@@ -1446,12 +1488,16 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         is_run_current = getattr(self, "_is_session_run_current", None)
         if not callable(is_run_current):
             is_run_current = lambda _key, _generation: True
-        wakeup = await self._run_in_executor_with_context(
-            functools.partial(
-                mgr.fire_tick, generation,
-                can_claim=lambda: not _turn_owner_exists() and is_run_current(session_key, generation),
+        try:
+            wakeup = await self._run_in_executor_with_context(
+                functools.partial(
+                    mgr.fire_tick, generation,
+                    can_claim=lambda: not _turn_owner_exists() and is_run_current(session_key, generation),
+                )
             )
-        )
+        except BaseException:
+            self._release_background_turn(reservation)
+            raise
         if not wakeup or _turn_owner_exists() or not is_run_current(session_key, generation):
             self._release_background_turn(reservation)
             # A consumed claim is skipped by recovery after the current owner releases.
@@ -1565,6 +1611,8 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         if entry is None or getattr(entry, "origin", None) is None or getattr(entry, "suspended", False):
             forget_goal_wait(self, sid)
             return  # no live route (reset, compressed away, CLI/TUI-owned): nothing to wake here
+        if _goal_suspended_while_private(entry):
+            return  # the barrier clear is withheld while private, so waking would repeat every scan
         assert store is not None
         source = self._restored_source(entry)
         adapter = self._delivery_adapter_for(source) if source is not None else None
@@ -1598,7 +1646,11 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
             return
         from gateway.wake import automatic_route_available
 
-        if not await automatic_route_available(self, source):
+        if not await automatic_route_available(self, source, idle_backoff=True):
+            return
+        # Recheck after every async eligibility probe. The existing background reservation
+        # then fences /incognito through claim/admission without holding a reentrant route lock.
+        if _goal_suspended_while_private(entry):
             return
         # A marker absent from the initial snapshot may be created while the barrier check runs.
         # The live SessionEntry is the generation fence for that narrow race: defer to the next

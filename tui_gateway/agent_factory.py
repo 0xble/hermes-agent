@@ -157,6 +157,8 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
     composer pick while the profile model it diverged from remains unchanged."""
     if not row:
         return {}
+    from agent.fallback_session_route import fallback_restored_row
+    row = fallback_restored_row(row) or {}  # a fallback's route is turn-scoped, also across a reload (#152333)
     model_config = _parse_model_config(row.get("model_config"), quiet=True)
     _row_title = str(row.get("title") or "").strip()
     room_plumbing = model_config.get("room_plumbing") or (row.get("hidden") and _row_title.startswith("Group:"))
@@ -253,6 +255,10 @@ def _persist_live_session_runtime(session: dict | None) -> None:
     try:
         row = db.get_session(session_key) or {}
         model_config = _runtime_model_config(agent, _parse_model_config(row.get("model_config")))
+        if not getattr(agent, "_provider_fallback_active", False):
+            # The live route is the session's own (a pick, or the restored primary), not a fallback's.
+            from agent.fallback_session_route import clear_fallback_markers
+            clear_fallback_markers(model_config)
         if isinstance(composer_profile := session.get("composer_override_profile"), dict):
             model_config["composer_override_profile"] = composer_profile
         elif "composer_override_profile" in session:
@@ -555,12 +561,8 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None, *, pinned
             if not fb_provider or not fb_model:
                 continue
             try:
-                from hermes_cli.fallback_config import effective_runtime_provider, resolve_entry_api_key
-                fb_kwargs: dict = {"requested": fb_provider, "target_model": fb_model,
-                                   **({"explicit_base_url": entry["base_url"]} if entry.get("base_url") else {})}
-                if fb_api_key := resolve_entry_api_key(entry):
-                    fb_kwargs["explicit_api_key"] = fb_api_key
-                runtime = resolve_runtime_provider(**fb_kwargs)
+                from hermes_cli.fallback_config import effective_runtime_provider, fallback_entry_runtime_kwargs
+                runtime = resolve_runtime_provider(**fallback_entry_runtime_kwargs(entry))
                 # Named custom entries resolve to the bare "custom" billing class; keep the configured
                 # identity so the session/UI shows the provider name, matching the manual-switch path (#98739).
                 runtime["provider"] = effective_runtime_provider(entry, runtime)
@@ -712,7 +714,7 @@ def _make_agent(
     with _sessions_lock:
         session = _sessions.get(sid)
     agent = AIAgent(
-        model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
+        model=model, max_iterations=_cfg_max_turns(cfg), provider=runtime.get("provider"),
         requested_provider=runtime.get("requested_provider"),
         base_url=runtime.get("base_url"), api_key=runtime.get("api_key"), api_mode=runtime.get("api_mode"),
         acp_command=runtime.get("command"), acp_args=runtime.get("args"),

@@ -291,13 +291,46 @@ _CRON_HINT = (
     "context for this run, not as a request to schedule another job.]\n\n"
 )
 
+# ``deliver: local`` jobs are only saved to local output; the shared hint's DELIVERY sentence would
+# be false for them and would forbid relays their own instructions require. Only that sentence
+# differs — SILENT / FAILURE / RECURSION text is reused byte-for-byte.
+_CRON_HINT_DELIVERY = (
+    "DELIVERY: Your final response will be automatically delivered "
+    "to the user — do NOT use send_message or try to deliver "
+    "the output yourself. Just produce your report/output as your "
+    "final response and the system handles the rest. "
+)
+_CRON_HINT_LOCAL = _CRON_HINT.replace(
+    _CRON_HINT_DELIVERY,
+    "DELIVERY: This job delivers locally: your final response is saved to local output only "
+    "and is not sent anywhere (failure notices still follow the job's failure lane). If your task "
+    "instructions say to relay or send the result somewhere, do that yourself with the tool they "
+    "name; otherwise just produce your output as the final response. ",
+)
+if _CRON_HINT_LOCAL == _CRON_HINT:  # pragma: no cover - import-time drift guard
+    raise RuntimeError("cron DELIVERY sentence drifted from _CRON_HINT")
 
-def _run_time_line() -> str:
-    """This fire's wall-clock time in the configured zone. The system prompt is date-only (byte-stable
-    for caching), so without it a 07:00 brief can't tell itself from a 19:00 retry. Kept outside
-    ``_CRON_HINT`` and after it: the hint stays byte-stable, and cron sessions are fresh per fire."""
+
+def _cron_hint_for(job: dict) -> str:
+    """Pick the hint matching the scheduler's own delivery resolution: local-only when every
+    comma-separated ``deliver`` token is ``local`` (missing/empty ``deliver`` resolves to local)."""
+    deliver = _delivery._normalize_deliver_value(_delivery._delivery_lane_value(job))
+    tokens = [t.strip() for t in deliver.split(",") if t.strip()]
+    return _CRON_HINT_LOCAL if all(t == "local" for t in tokens) else _CRON_HINT
+
+
+def _run_time_line(job: Optional[dict] = None) -> str:
+    """This fire's wall-clock time in the job's pinned zone, else the configured one. The system
+    prompt is date-only (byte-stable for caching), so without it a 07:00 brief can't tell itself
+    from a 19:00 retry. Kept outside ``_CRON_HINT`` and after it: the hint stays byte-stable, and
+    cron sessions are fresh per fire. A pinned job reads its schedule in its own zone, so its run
+    time is stated there too (a 09:00 New York job is not told 06:00 from a Los Angeles profile)."""
+    from cron.jobs_time import zone_for_job
     from hermes_time import safe_strftime
     now = _hermes_now()
+    pinned = zone_for_job(job or {})
+    if pinned is not None:
+        now = now.astimezone(pinned)
     offset = now.strftime("%z")
     zone = f" (UTC{offset[:3]}:{offset[3:]})" if offset else ""
     return f"[CURRENT RUN TIME: {safe_strftime(now, '%A, %Y-%m-%d %H:%M %Z').strip()}{zone}]\n\n"
@@ -357,7 +390,7 @@ def _build_job_prompt(
         prompt = f"{notepad_section}{prompt}"
         has_injected_data = True
 
-    prompt = _CRON_HINT + _run_time_line() + prompt
+    prompt = _cron_hint_for(job) + _run_time_line(job) + prompt
     skill_names = _job_skill_names(job)
     if not skill_names:
         return _scan_assembled_cron_prompt(
@@ -403,7 +436,7 @@ def _scan_assembled_cron_prompt(
     payload bypassed every gate. See #3968.
     """
     from tools.cronjob_tools import _scan_cron_prompt
-    from tools.cronjob_prompt_scan import _scan_cron_skill_assembled
+    from cron.prompt_scan import _scan_cron_skill_assembled
     if has_skills or has_injected_data:
         # The cleaned (sanitized) prompt is what actually runs.
         assembled, scan_error = _scan_cron_skill_assembled(assembled)
@@ -531,13 +564,13 @@ def _prepare_job_prompt(
             f"**Job ID:** {job_id}\n"
             f"**Run Time:** {_sched._hermes_now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"**Status:** BLOCKED\n\n"
-            "The assembled prompt (user prompt + loaded skill content) tripped "
-            "the cron injection scanner and the agent was NOT run.\n\n"
+            "The assembled prompt (job prompt, plus any skill content or run data) "
+            "tripped the cron injection scanner and the agent was NOT run.\n\n"
             f"**Scanner result:** {block_exc}\n\n"
-            "Audit the skill(s) attached to this job for prompt-injection "
-            "payloads or invisible-unicode markers. If the skill is legitimate "
-            "and the match is a false positive, rephrase the content to avoid "
-            "the threat pattern (`tools/cronjob_tools.py::_CRON_THREAT_PATTERNS`)."
+            "Edit the job prompt, or audit the skill(s) attached to this job, for "
+            "the pattern named above or invisible-unicode markers. If the content is "
+            "legitimate and the match is a false positive, rephrase it to avoid the "
+            "threat pattern (`cron/prompt_scan.py`)."
         )
         return (False, blocked_doc, "", str(block_exc)), None, script_error
     if prompt is None:
