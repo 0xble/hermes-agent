@@ -309,6 +309,7 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
     if snapshot is None:
         from agent.agent_init_fallback import _fallback_entries
         from hermes_cli.fallback_config import same_model_fallbacks
+        session["model_pinned"] = True
         agent._pinned_fallback_model = result.new_model
         agent._fallback_chain = same_model_fallbacks(
             _fallback_entries(_load_fallback_model()), result.new_model)
