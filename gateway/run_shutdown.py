@@ -2390,6 +2390,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             logger.warning("Shutdown notices exceeded 3s total; continuing teardown")
         else:
             await notice_task
+        with _log_suppressed(logging.DEBUG, "Failed to settle home online notice: %s"):
+            settle_home_online_notice_debt(self)
         ctx.notice_elapsed = time.monotonic() - notice_started
         logger.info("Shutdown phase: notify_active_sessions done at +%.2fs", ctx.elapsed())
 
@@ -2927,7 +2929,8 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
                     # Stamp restart intent after the drain.
                     from gateway.restart_loop_guard import record_planned_exit
                     record_planned_exit()
-            if self._restart_requested and self._restart_command_source is None:
+            if (self._restart_requested and self._restart_command_source is None
+                    and self._home_shutdown_notice != HOME_NOTICE_MUTED):
                 from gateway.zero_cut_standby import is_standby
                 if not is_standby():
                     # One writer for the marker (gateway/restart_notice.py): the CLI restart stamps the same
