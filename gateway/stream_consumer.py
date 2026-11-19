@@ -1239,13 +1239,13 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if isinstance(item, tuple) and len(item) == 2 and item[0] is _FLUSH:
                     self._signal_flush(item[1])
 
-    @staticmethod
+    @classmethod
     # Strip MEDIA:<path> tags before display. Uses the shared anchored MEDIA_TAG_CLEANUP_RE from
     # gateway/platforms/base.py — only tags whose path ends in a deliverable extension are removed, so an
     # unknown-extension path stays visible instead of being silently dropped (issue #34517). Streaming and
     # non-streaming paths share the same regex, so a tag is treated identically whichever path delivered the
     # text.
-    def _clean_for_display(text: str) -> str:
+    def _clean_for_display(cls, text: str) -> str:
         """Hide MEDIA:<path> / [[audio_as_voice]] directives and markdown/HTML image tags; both are
         delivered post-stream as native attachments.
 
@@ -1255,7 +1255,7 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         around it, so interim frames stay prefix-stable. Control markers are handled separately
         at segment and final boundaries, preserving machine-output lanes that opt out.
         """
-        return redact_to_fixpoint(GatewayStreamConsumer._display_text(text))
+        return redact_to_fixpoint(cls._display_text(text))
 
     @staticmethod
     def _display_text(text: str) -> str:
