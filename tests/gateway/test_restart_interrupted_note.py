@@ -1549,9 +1549,12 @@ async def test_ledger_clear_without_resume_marker_is_sendable_on_reconnect(tmp_p
 
 def _post_delivery_turn_runner(store, source, entry):
     """A real ``_handle_message_with_agent`` around stubbed turn stages that answer "done"."""
+    from typing import Any
     from gateway.run_turn import GatewayTurnMixin
 
-    runner = object.__new__(GatewayTurnMixin)
+    runner: Any = object.__new__(GatewayTurnMixin)
+    runner._sessions_map = GatewayRunner._sessions_map.__get__(runner)
+    runner._session_state = GatewayRunner._session_state.__get__(runner)
     runner._run_in_executor_with_context = GatewayRunner._run_in_executor_with_context.__get__(runner)
     runner._get_executor = lambda: None
     runner.async_session_store = AsyncSessionStore(store)
