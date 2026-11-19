@@ -141,6 +141,11 @@ async def automatic_event_is_current(runner: Any, event: Any) -> bool:
     metadata = getattr(event, "metadata", None) or {}
     if not (is_goal_continuation_event(event) or metadata.get(LOOP_WAKE_METADATA_KEY)):
         return True
+    # A restart marker is already durable and must get one recovery turn. The exact-topic
+    # absence probe is useful for recurring wakes, but a false negative here strands the
+    # interrupted turn forever; outbound Telegram delivery still applies its thread fallback.
+    if metadata.get("restart_auto_resume"):
+        return True
     return await automatic_route_available(runner, event.source)
 
 

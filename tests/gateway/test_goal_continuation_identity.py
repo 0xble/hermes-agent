@@ -1354,6 +1354,20 @@ async def test_retired_topic_loop_defers_before_claiming_tick(state, monkeypatch
 
 
 @pytest.mark.asyncio
+async def test_restart_resume_is_not_stranded_by_missing_topic_lookup(state, monkeypatch):
+    """A durable restart marker must receive a turn even when Telegram topic lookup is stale."""
+    from gateway.wake import automatic_event_is_current
+
+    runner = _runner(state)
+    event = await _queued_wake(runner, "goal", False)
+    event.metadata["restart_auto_resume"] = True
+    lookup = _topic_lookup(runner, monkeypatch, [])
+
+    assert await automatic_event_is_current(runner, event)
+    lookup.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("kind", ["goal", "loop"])
 @pytest.mark.parametrize("exists", [False, True], ids=["deleted", "live"])
 async def test_topic_availability_rechecked_at_inbound_without_changing_state(state, monkeypatch, kind, exists):
