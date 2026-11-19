@@ -2439,12 +2439,11 @@ class GatewayInboundMixin(
             # it's disambiguation (*which* prior message), not deduplication.
             # Adapters resolve the original message (or the user's native partial quote).
             # A preview here silently loses later list items and code; keep that context intact.
-            # JSON quoting preserves the complete resolved text without allowing its quotes or
-            # paragraph breaks to collide with the pointer's closing delimiter.
-            reply_text = json.dumps(event.reply_to_text, ensure_ascii=False)
             own = bool(getattr(event, "reply_to_is_own_message", False))
-            replied_to = (source.platform, source.chat_id, event.reply_to_message_id)
-            message_text = f"{reply_pointer(str(reply_text), own_message=own, replied_to=replied_to)}\n\n{message_text}"
+            chat_id = getattr(source, "chat_id", None)
+            replied_to = (source.platform, chat_id, event.reply_to_message_id) if chat_id else None
+            pointer = reply_pointer(str(event.reply_to_text), own_message=own, replied_to=replied_to)
+            message_text = f"{pointer}\n\n{message_text}"
 
         # Discord: the triggering message id goes on the per-turn user message, never the cached
         # system prompt — it changes every turn and would bust the agent-cache signature. It is
