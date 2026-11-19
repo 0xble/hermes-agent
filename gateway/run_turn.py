@@ -61,6 +61,7 @@ from gateway.session_transcript import TranscriptReadError
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext, TurnWorker
 from gateway.turn_lease import DEFAULT_LEASE_WAIT
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from pathlib import Path
 from utils import base_url_hostname
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)

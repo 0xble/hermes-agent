@@ -33,7 +33,6 @@ from gateway.startup_timeouts import startup_restore_drain_timeout_secs
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
 
-
 def _prefix_names_served_profile(profile: str) -> bool:
     """True when a /p/<profile>/ prefix names the profile this gateway serves. Fail closed: a
     single-profile gateway answering /p/<x>/ served the owner's toolsets under another URL."""

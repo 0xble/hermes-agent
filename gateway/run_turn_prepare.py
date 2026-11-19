@@ -297,7 +297,8 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
                             **_runtime_agent_kwargs(resolved_fallback),
                             "capabilities": dict(resolved_fallback.get("capabilities") or {}),
                         }
-                    except Exception:
+                    except Exception as exc:  # health: allow BLE001 -- malformed or unavailable fallback entries are skipped
+                        logger.debug("Pinned same-model fallback entry unavailable: %s", exc)
                         continue
                     fallback_runtime["model_pinned"] = True
                     fallback_runtime["_preflight_fallback"] = {
