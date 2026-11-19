@@ -3645,6 +3645,11 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
     def set_topic_transfer_fn(self, fn: Optional[TopicTransferFn]) -> None:
         self._topic_transfer_fn = fn
 
+    async def _handle_dice_message(self, update, context):
+        from plugins.platforms.telegram.telegram_dice import handle_dice_message
+
+        await handle_dice_message(self, update, context)
+
     def _register_handlers(self, app) -> None:
         """Register every PTB handler on ``app`` (initial connect and the transient-init rebuild)."""
         table = getattr(app, "handlers", None)
@@ -3652,8 +3657,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         app.add_handler(TelegramMessageHandler(filters.TEXT & ~filters.COMMAND, self._handle_text_message))
         app.add_handler(TelegramMessageHandler(filters.COMMAND, self._handle_command))
         app.add_handler(TelegramMessageHandler(filters.LOCATION | getattr(filters, "VENUE", filters.LOCATION), self._handle_location_message))
-        from plugins.platforms.telegram.telegram_dice import handle_dice_message  # #78719
-        app.add_handler(TelegramMessageHandler(filters.Dice.ALL, lambda u, c: handle_dice_message(self, u, c)))
+        app.add_handler(TelegramMessageHandler(filters.Dice.ALL, self._handle_dice_message))  # #78719
         app.add_handler(TelegramMessageHandler(filters.CONTACT, self._handle_contact_message))  # #98598
         media = filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.AUDIO | filters.VOICE | filters.Document.ALL | filters.Sticker.ALL
         app.add_handler(TelegramMessageHandler(media, self._handle_media_message))
