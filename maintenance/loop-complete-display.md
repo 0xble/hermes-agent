@@ -13,3 +13,6 @@ Focused tests cover fence-aware filtering, gateway streaming and final delivery,
 ## Upstream disposition and retirement
 
 Prepare the same behavior for upstream contribution without fork-only maintenance artifacts. Retire this fork record when equivalent upstream behavior is released and the fork no longer carries the display-boundary adaptation.
+
+
+Contract tests: `tests/agent/test_interim_loop_complete.py`, `tests/gateway/test_loop_command.py`, `tests/gateway/test_trailing_silence_marker.py`.

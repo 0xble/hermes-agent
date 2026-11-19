@@ -55,3 +55,5 @@ Main's foreign-owner and zero-cut successor checks remain additional refusal
 conditions, not permission to skip this reservation. Keep new test fixtures on
 the same real temporary-home helper, and retain `HERMES_TEST_ISOLATION` across
 peer launch allowlists so asynchronous authority startup can reserve its home.
+
+Contract tests: `tests/hermes_state/test_runtime_epoch_ownership.py`.

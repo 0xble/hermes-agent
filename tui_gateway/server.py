@@ -1529,12 +1529,12 @@ def _row_follows_profile(row: dict | None) -> bool:
 
 
 def _stored_session_runtime_overrides(row: dict | None) -> dict:
-    """Runtime fields persisted with a stored session (model column, ``billing_provider``, JSON ``model_config``):
-    resume restores the model/provider/reasoning THAT chat used, not the global pick. Plugin-owned Bot-Mode
+    """Runtime fields persisted with a stored session (model column, ``billing_provider``, JSON ``model_config``): resume restores the model/provider/reasoning THAT chat used, not the global pick. Plugin-owned Bot-Mode
     sessions normally rebuild from the member profile's CURRENT config (a stale provider pin left room bots
     "out of Nous credits" after a profile switch). A canonical Bot Chat may instead restore an explicit
-    composer pick while the profile model it diverged from remains unchanged."""
-    if not row:
+    composer pick while the profile model it diverged from remains unchanged. A fallback's route is turn-scoped (#152333)."""
+    from agent.fallback_session_route import fallback_restored_row
+    if not (row := fallback_restored_row(row)):
         return {}
     model_config = _parse_model_config(row.get("model_config"), quiet=True)
     _row_title = str(row.get("title") or "").strip()
@@ -1583,7 +1583,9 @@ def _stored_session_runtime_overrides(row: dict | None) -> dict:
         # Same dict-shaped override live /model switches use, so a DB-restored session keeps custom endpoint
         # metadata across resume and rebuilds (/new). Raw api_key is never persisted/restored.
         overrides["model_override"] = {
-            "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None}
+            "model": model, "provider": provider or None, "base_url": base_url or None, "api_mode": api_mode or None,
+            "_model_pinned": bool(model_config.get("model_pinned", False)),
+        }
     if provider and provider.lower() not in _BARE_BILLING_PROVIDERS:
         overrides["provider_override"] = provider
     if isinstance(reasoning_config, dict):
@@ -1638,6 +1640,8 @@ def _persist_live_session_runtime(session: dict | None) -> None:
         if (tier_override := session.get("create_service_tier_override")) is not None:
             # agent.service_tier is None for explicit normal; without this the distinction is erased on every persist.
             model_config["service_tier"] = tier_override or "normal"
+        if "model_pinned" in session:
+            model_config["model_pinned"] = bool(session["model_pinned"])
         model = str(model_config.get("model") or "").strip()
         if hasattr(db, "update_session_meta"):
             db.update_session_meta(session_key, json.dumps(model_config), model or None)
@@ -2455,6 +2459,8 @@ def _resolve_runtime_with_fallback(resolve_kwargs: dict | None = None, *, pinned
 
 
 def _has_model_pin(model_override: dict | str | None) -> bool:
+    if isinstance(model_override, dict) and "_model_pinned" in model_override:
+        return bool(model_override["_model_pinned"])
     explicit_model = model_override.get("model") if isinstance(model_override, dict) else model_override
     return bool(str(explicit_model or "").strip() or _env_model_seed())
 
@@ -2595,6 +2601,8 @@ def _make_agent(
     ignore_rules = is_truthy_value(os.environ.get("HERMES_IGNORE_RULES"))
     with _sessions_lock:
         session = _sessions.get(sid)
+        if session is not None and _has_model_pin(model_override):
+            session["model_pinned"] = True
     agent = AIAgent(
         model=model, max_iterations=_cfg_max_turns(cfg, 500), provider=runtime.get("provider"),
         requested_provider=runtime.get("requested_provider"),
@@ -2626,7 +2634,8 @@ def _make_agent(
     if context_cwd_is_launch_artifact is None:
         context_cwd_is_launch_artifact = _context_cwd_is_launch_artifact(session)
     agent._context_cwd_is_launch_artifact = bool(context_cwd_is_launch_artifact)
-    agent._preflight_fallback = preflight_fallback
+    if preflight_fallback is not None:
+        agent._preflight_fallback = preflight_fallback
     if fallback_notice:
         # Emitted once on the first successful reply via _emit_pending_fallback_notice -> status_callback.
         agent._pending_fallback_notice = fallback_notice

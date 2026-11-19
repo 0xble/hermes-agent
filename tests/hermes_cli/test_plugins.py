@@ -1461,68 +1461,52 @@ class TestForceReloadSymmetry:
         hold.set()
         first.join(5.0)
 
-    def test_hung_worker_caps_new_call_identities_after_suppression(self, monkeypatch, caplog):
-        """Workers abandoned on timeout still occupy their callback: once the suppression window
-        has passed, later calls with fresh ids may start a replacement, but only up to
-        ``_HOOK_MAX_ABANDONED_WORKERS`` live ones — a hung plugin leaks a bounded few threads,
-        never one per call (#98382), and past the cap it is skipped with a warning that names
-        the callback (#105223)."""
+    def test_hung_worker_caps_new_call_identities_until_completion(self, monkeypatch, caplog):
+        """Only still-running abandoned workers count against the hung threshold."""
         import hermes_cli.plugins_dispatch as dispatch
 
-        monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
-        )
-
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1)
         hold = threading.Event()
         starts = []
 
         def blocker(**_kwargs):
             starts.append(1)
-            hold.wait(timeout=10.0)
+            hold.wait()
             return "late"
 
         mgr = PluginManager()
-        mgr._hook_timeout_suppression_seconds = 0.0  # isolate the gate from suppression
         mgr._hooks["post_tool_call"] = [blocker]
+        try:
+            with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
+                for i in range(dispatch._HOOK_ABANDONED_LIMIT + 3):
+                    assert mgr.invoke_hook("post_tool_call", tool_name="read_file", tool_call_id=f"call-{i}") == []
+            assert len(starts) == dispatch._HOOK_ABANDONED_LIMIT
+            assert "blocker" in caplog.text and "callback_hung" in caplog.text
+        finally:
+            hold.set()
 
-        with caplog.at_level(logging.WARNING, logger="hermes_cli.plugins"):
-            for i in range(dispatch._HOOK_MAX_ABANDONED_WORKERS + 3):
-                assert mgr.invoke_hook("post_tool_call", tool_name="read_file", tool_call_id=f"call-{i}") == []
-
-        assert len(starts) == dispatch._HOOK_MAX_ABANDONED_WORKERS
-        assert "blocker" in caplog.text and "abandoned worker(s) still running" in caplog.text
-        hold.set()
-
-    def test_hung_worker_does_not_fail_closed_forever(self, monkeypatch):
-        """One never-returning pre_tool_call guard must not block every later tool call until
-        restart: after the suppression window a fresh call id runs a new worker, so a callback
-        that has recovered decides again (#105223)."""
-        import time
-
+    def test_one_abandoned_worker_does_not_fail_closed_other_calls(self, monkeypatch):
+        """A fresh call evaluates immediately, even while one prior worker is abandoned."""
         from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
 
-        monkeypatch.setattr(
-            "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1
-        )
+        monkeypatch.setattr("hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 0.1)
         hold = threading.Event()
         starts = []
 
         def guard(**_kwargs):
             starts.append(1)
             if len(starts) == 1:
-                hold.wait(timeout=10.0)  # the first fire hangs for good
+                hold.wait()
 
         mgr = PluginManager()
-        mgr._hook_timeout_suppression_seconds = 0.2
         mgr._hooks["pre_tool_call"] = [guard]
-
-        blocked = [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
-        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-a") == blocked
-        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-b") == blocked  # in window
-        time.sleep(0.3)  # suppression window passes; the first worker is still hung
-        assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-c") == []
-        assert len(starts) == 2
-        hold.set()
+        try:
+            blocked = [{"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}]
+            assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-a") == blocked
+            assert mgr.invoke_hook("pre_tool_call", tool_name="read_file", tool_call_id="call-b") == []
+            assert len(starts) == 2
+        finally:
+            hold.set()
 
     def test_worker_finishing_at_timeout_does_not_leave_phantom_abandoned_entry(self, monkeypatch):
         """If the worker completes between the wait expiring and the timeout branch taking the
@@ -1552,7 +1536,6 @@ class TestForceReloadSymmetry:
             return "done"
 
         mgr = PluginManager()
-        mgr._hook_timeout_suppression_seconds = 0.0  # isolate the gate from suppression
         mgr._hooks["post_tool_call"] = [quick]
 
         assert mgr.invoke_hook("post_tool_call", tool_name="read_file", tool_call_id="call-a") == []
@@ -1593,7 +1576,7 @@ class TestForceReloadSymmetry:
         assert msg == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
         assert elapsed < 5.0
 
-        # Still-running / suppression window must also fail closed.
+        # The same still-running invocation must also fail closed.
         msg2 = resolve_pre_tool_block("web_search", {"query": "y"})
         assert msg2 == _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
         hold.set()
@@ -1602,7 +1585,6 @@ class TestForceReloadSymmetry:
         self, monkeypatch
     ):
         """A transient worker-start failure must not poison later hook calls."""
-        from hermes_cli.plugins import _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE
 
         monkeypatch.setattr(
             "hermes_cli.plugins._resolve_hook_callback_timeout", lambda: 1.0
@@ -1628,9 +1610,9 @@ class TestForceReloadSymmetry:
         mgr = PluginManager()
         mgr._hooks["pre_tool_call"] = [policy]
 
-        assert mgr.invoke_hook("pre_tool_call") == [
-            {"action": "block", "message": _PRE_TOOL_CALL_TIMEOUT_BLOCK_MESSAGE}
-        ]
+        refused = mgr.invoke_hook("pre_tool_call")
+        assert refused[0]["action"] == "block"
+        assert "callback_worker_start_failed" in refused[0]["message"]
         assert mgr.invoke_hook("pre_tool_call") == []
         assert calls == [1]
 

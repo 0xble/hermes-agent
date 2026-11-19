@@ -926,7 +926,9 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         claimed generation: a turn still constructing its agent latches the Stop for adopt_agent."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        sid = self._hm_mounted_owner(authority, _quick_key) if authority else None
+        # SessionStore's routing map is guarded by a blocking lock. Keep the probe and any
+        # recovery mount off the gateway event-loop thread while a busy command stops a turn.
+        sid = await asyncio.to_thread(self._hm_mounted_owner, authority, _quick_key) if authority else None
         if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
@@ -1049,9 +1051,19 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         state = self._peek_session_state(_quick_key)
         running_agent = state.turn.agent if state else None
         adapter = self._delivery_adapter_for(source)
-        if (self._draining or adapter is None or running_agent is None or running_agent is _AGENT_PENDING_SENTINEL
+        if self._draining or adapter is None or running_agent is None:
+            return False
+        if (running_agent is _AGENT_PENDING_SENTINEL
                 or (event.message_type == MessageType.TEXT and mode != "steer" and not superseded
                     and self._effective_busy_text_mode(source) == "queue")):
+            if self._human_preempts_autonomous_turn(event, state):
+                # A goal, cron-wake or relay turn may run for many minutes. The typed message stays
+                # a queued FIFO row, never a steer: restart recovery replays a queued row, but marks
+                # a steer handed to a lost claim interrupted. Say it was saved instead of nothing.
+                queued = self._BusySteerOutcome(
+                    effective_mode="queue", demoted_for_subagents=False, demoted_for_compression=False,
+                    steered=False, redirected=False)
+                await self._busy_interrupt_and_ack(event, _quick_key, adapter, state, running_agent, queued)
             return False
         outcome = await self._resolve_busy_steer_or_redirect(event, _quick_key, mode, running_agent)
         note_busy_outcome(event, outcome)

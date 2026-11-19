@@ -156,8 +156,7 @@ def _owner_token(lock_dir: Path) -> Optional[str]:
         return None
 
 
-def _owner_pid(lock_dir: Path) -> Optional[int]:
-    raw = _owner_token(lock_dir)
+def _owner_pid(raw: Optional[str]) -> Optional[int]:
     if raw is None:
         return None
     pid_field = raw.split("-", 1)[0]
@@ -177,10 +176,6 @@ def _pid_is_alive(pid: Optional[int]) -> bool:
     return _pid_exists(pid)
 
 
-def _owner_is_live(lock_dir: Path) -> bool:
-    return _pid_is_alive(_owner_pid(lock_dir))
-
-
 def _owner_age(lock_dir: Path) -> Optional[float]:
     """Age of the owner file, or of the lock directory itself when no owner was written:
     a writer that died between mkdir and the owner write must still age out."""
@@ -195,11 +190,13 @@ def _owner_age(lock_dir: Path) -> Optional[float]:
 def _break_if_stale(lock_dir: Path) -> None:
     """Atomically quarantine a lock whose owner is dead or whose age backstop expired."""
     judged_owner = _owner_token(lock_dir)
-    pid = _owner_pid(lock_dir)
+    pid = _owner_pid(judged_owner)
     age = _owner_age(lock_dir)
-    if _owner_is_live(lock_dir) and (age is None or age <= _LOCK_MAX_AGE_S):
+    if _pid_is_alive(pid) and (age is None or age <= _LOCK_MAX_AGE_S):
         return
     if pid is None and (age is None or age <= _LOCK_STALE_S):
+        return
+    if _owner_token(lock_dir) != judged_owner:
         return
 
     abandoned = lock_dir.with_name(f"{lock_dir.name}.stale-{os.getpid()}-{secrets.token_hex(4)}")

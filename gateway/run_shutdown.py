@@ -3077,10 +3077,10 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
             await GatewayRunner._stop_drain_active_work(self, timeout, ctx)
             if ctx.timed_out:
                 await GatewayRunner._stop_interrupt_remaining_work(self, ctx)
+            _persist_shutdown_pending_messages(self)  # save queued inputs before the authority wait
             from gateway.run_runtime import settle_gateway_runtime  # within what the leash has left
             await settle_gateway_runtime(self, _effective_watchdog_leash(self) - ctx.elapsed(), GatewayRunner._shutdown_interrupt_reason(self))
-            # This spool and transcript pass are intentionally outside the cancellable finalization bound:
-            # they are the successor's only durable copies of queued follow-ups and interrupted turns.
+            # Capture follow-ups queued during settlement. Both passes stay outside cancellable finalization.
             _persist_shutdown_pending_messages(self)
             if ctx.timed_out:
                 self._flush_shutdown_agent_transcripts(ctx.active_agents)

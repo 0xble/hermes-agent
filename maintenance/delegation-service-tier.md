@@ -128,3 +128,5 @@ Retire it if upstream ships an equivalent inheritance option, or if the
 profile stops delegating with Fast or reasoning picks. To roll back, revert
 the `delegation-explicit-inheritance` commit first. Then revert `8a7b4a857e0c`
 and remove `inherit_service_tier` from the live config.
+
+Contract tests: `tests/tools/test_delegate_service_tier_inheritance.py`, `tests/tools/test_delegate_explicit_inheritance.py`, `tests/gateway/test_running_agent_session_toggles.py`, `tests/hermes_cli/test_fast_mode_custom_provider_opt_in.py`, `tests/agent/test_voice_turn_route.py`.

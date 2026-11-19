@@ -23,10 +23,20 @@
 # failure cannot exit or half-change the caller's shell and setup never
 # republishes launchers or shell config. Progress goes to stderr.
 hermes_sync() {
-    local repo="$1" test_environment="${2:---test-environment}"
+    local repo="$1" test_environment="${2:---test-environment}" python="" setup_python=()
+    # setup-hermes.sh changes to this directory and sanitizes these variables.
+    # Resolve the interpreter there too, then pass it through: admission and PM
+    # must not silently select different runtimes.
+    repo="$(cd "$repo" && pwd -P)" || return 1
+    # shellcheck source=scripts/_setup_guard.sh
+    . "$repo/scripts/_setup_guard.sh" || return 1
+    python="$(cd "$repo" && hermes_bootstrap_python "$repo")" || python=""
+    hermes_require_safe_setup "$repo" "$python" || return 1
+    [ -z "$python" ] || setup_python=("--bootstrap-python=$python")
     (
+        cd "$repo" || return 1
         unset PYTHONHOME PYTHONPATH VIRTUAL_ENV
-        bash "$repo/setup-hermes.sh" --runtime-only "$test_environment"
+        bash "$repo/setup-hermes.sh" --runtime-only "$test_environment" ${setup_python[@]+"${setup_python[@]}"}
     ) >&2
 }
 

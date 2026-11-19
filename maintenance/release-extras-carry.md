@@ -76,3 +76,5 @@ the active install, or when immutable releases are retired. Rollback reverts
 `prepare_venv` union and the early return, together with the tests. No state
 migration is involved. A PM generation the carry committed stays a normal PM
 generation.
+
+Contract tests: `tests/hermes_cli/test_immutable_releases.py`, `tests/hermes_cli/test_release_ack_environment.py`.

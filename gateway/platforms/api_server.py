@@ -33,7 +33,6 @@ from gateway.startup_timeouts import startup_restore_drain_timeout_secs
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
 
-
 def _prefix_names_served_profile(profile: str) -> bool:
     """True when a /p/<profile>/ prefix names the profile this gateway serves. Fail closed: a
     single-profile gateway answering /p/<x>/ served the owner's toolsets under another URL."""
@@ -1904,9 +1903,9 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         return self._model_routes.get(model_alias) if isinstance(model_alias, str) else None
 
     def _stored_session_model(self, session: Any) -> Optional[str]:
-        """The model persisted on a session row, minus the virtual alias (replaying
-        "hermes-agent" upstream as a provider model id 400s)."""
-        stored = session.get("model") if isinstance(session, dict) else None
+        """The persisted model minus the virtual alias (upstream 400s on "hermes-agent") and a fallback's (#152333)."""
+        from agent.fallback_session_route import fallback_restored_row
+        stored = fallback_restored_row(session).get("model") if isinstance(session, dict) else None
         if not stored or stored == self._model_name:
             return None
         return stored
@@ -2345,7 +2344,8 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if model_pinned:
             agent_kwargs["model_pinned"] = True
         agent = AIAgent(**agent_kwargs)
-        agent._preflight_fallback = None if model_pinned else preflight_fallback
+        if preflight_fallback is not None and not model_pinned:
+            agent._preflight_fallback = preflight_fallback
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override

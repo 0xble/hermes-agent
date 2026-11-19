@@ -173,7 +173,7 @@ string clears it through the tool; CLI edit supports an explicit clear flag.
 No live job or runtime configuration is part of this source-only patch.
 
 Contract tests: `tests/cron/test_catch_up_lateness.py` and
-`tests/tools/test_cronjob_catch_up_lateness.py`; qualification also covers all
+  `tests/tools/test_cronjob_catch_up_lateness.py`; qualification also covers all
 `tests/cron/` and existing cron tool tests. Retire this patch when the selected
 upstream release preserves both admission/start deadlines and the durable,
 local-lane-independent owner notice. Rollback reverts these source hooks and

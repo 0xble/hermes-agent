@@ -471,6 +471,7 @@ gateway:
     matrix_scope_mode: "  session_scope: {scope}"
     matrix_scope_key: "  session_key: {session_key}"
     session_id: "**ID sessione:** `{session_id}`"
+    incognito: "**Incognito:** {state}"
     title: "**Titolo:** {title}"
     created: "**Creata:** {timestamp}"
     last_activity: "**Ultima attività:** {timestamp}"
@@ -756,6 +757,7 @@ gateway:
     drain_rejected: "⏳ Il gateway è {action} e al momento non accetta un altro turno."
     drain_rejected_new_work: "⏳ Il gateway è {action} e al momento non accetta nuovo lavoro."
     demoted_tail: " — il tuo messaggio è in coda per quando avrà finito (usa /stop per annullare tutto)."
+    deferred_dropped: "⚠️ `/{command}` non è stato eseguito: Hermes si è riavviato o riconnesso prima. Invialo di nuovo se ti serve ancora."
     elapsed_min: "{minutes} min trascorsi"
     running_tool: "in esecuzione: {tool}"
     ack_detail_wrap: " ({detail})"
@@ -890,7 +892,7 @@ gateway:
     interrupted_turn: "↻ Interrotto perché Hermes si è fermato. Continuerò qui automaticamente non appena sarà di nuovo attivo."
   startup:
     handoff_thread_title: "Hermes — {title}"
-    restarted: "♻ Gateway riavviato correttamente. La tua sessione continua."
+    restarted: "♻ Gateway riavviato correttamente."
     online: "♻️ Gateway online — Hermes è tornato ed è pronto."
     db_corrupt: "⚠️ Rilevata corruzione del database delle sessioni. I messaggi potrebbero non essere salvati. Opzioni di ripristino:\n1. Esegui `hermes {profile_arg}doctor --fix`\n2. Ferma il gateway, poi ripristina con:\n   hermes {profile_arg}sessions recover --source {db_path} --inspect-only\n   (se segnala che è recuperabile) hermes {profile_arg}sessions recover --source {db_path} --output recovered-state.db\n   — il ripristino crea prima uno snapshot del file danneggiato; NON eseguire `sqlite3 ... \".recover\"` sullo state.db attivo, una CLI sqlite3 vulnerabile può corromperlo ulteriormente\n3. Ripristina da un backup in {backups_dir}/\nEsegui `hermes {profile_arg}doctor` per una diagnostica sanificata."
     db_fts_corrupt: "⚠️ Il database delle sessioni ha segnalato un errore di corruzione limitato all'indice di ricerca (FTS5); le tabelle dei messaggi non sono danneggiate. I messaggi potrebbero non essere salvati finché non viene riparato: esegui `hermes {profile_arg}doctor --fix`, poi riavvia il gateway. Non eseguire strumenti di ripristino né ripristinare un backup a meno che `hermes {profile_arg}doctor` non confermi il danno."
@@ -3579,7 +3581,7 @@ explainer:
     partial_stream_recovery: "lo streaming si è interrotto in anticipo ed è stata recuperata solo una risposta parziale. Invia `continue` per riprendere dal punto in cui si è fermato."
     fallback_prior_turn_content: "in questo turno non è stato prodotto nuovo contenuto; viene mostrato il contesto precedente recuperato. Invia `continue` per riprovare."
     redirect_restart_limit_exceeded: "la richiesta è stata annullata da una nuova correzione a ogni tentativo, quindi il turno si è fermato invece di riprovare all'infinito. La tua ultima correzione è in coda come prossimo messaggio."
-    rebuilt_restart_limit_exceeded: "ogni provider della catena di fallback ha continuato a cedere il passo al successivo, quindi il turno si è fermato invece di riprovare all'infinito. Invia `continue` oppure cambia provider."
+    rebuilt_restart_limit_exceeded: "è stato raggiunto il limite di cambi di percorso. Percorsi richiesti: {routes}. Altri percorsi configurati potrebbero non essere stati provati. Invia `continue` oppure cambia provider."
     budget_exhausted: "il budget di iterazioni/costo per turno si è esaurito prima di una risposta finale. Invia `continue` per proseguire."
     ollama_runtime_context_too_small: "la finestra di contesto del modello locale era troppo piccola per finire. Aumenta la dimensione del contesto o usa un modello più grande."
     pending_tool_result: "il turno si è fermato mentre il risultato di uno strumento era ancora in attesa e il modello non ha prodotto altro testo. Invia `continue` per farglielo riassumere."
@@ -3606,6 +3608,9 @@ explainer:
     failed: "non riuscito"
   shared:
     and_more: "  • … e altri {count}"
+    no_routes_requested: "nessuno registrato"
+    attempted_routes: "Percorsi richiesti: {routes}."
+    chain_exhausted: "La catena di fallback è esaurita; non resta alcun percorso idoneo."
     the_model: "Il modello"
 tips:
   t001: "/bg <prompt> esegue un'attività in una sessione separata mentre quella corrente resta libera; /btw <question> risponde a una domanda a margine su questa conversazione senza interromperla."

@@ -26,3 +26,5 @@ Rendered-prompt tests establish the guidance and tool-availability contract, not
 ## Retirement And Rollback
 
 Retire this patch when upstream's one-shot matching-skill contract loads task-governing procedural skills without restoring one-shot skill authoring or maintenance coaching. Roll back by reverting the commit carrying `Fork-Patch: oneshot-task-governing-skill-loading`.
+
+Contract tests: `tests/agent/test_oneshot_footprint.py`, `tests/agent/test_prompt_builder.py`.

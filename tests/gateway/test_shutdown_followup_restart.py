@@ -18,7 +18,7 @@ from gateway.platforms.event import MessageEvent, MessageType
 from gateway.run_pending_recovery import _defer_followup, _recovered_followup_event
 from gateway.session import SessionStore
 from gateway.shutdown_flush import flush_pending_to_file, recover_pending_to_db
-from tests.gateway.restart_test_helpers import make_restart_runner, make_restart_source
+from tests.gateway.restart_test_helpers import RestartTestAdapter, make_restart_runner, make_restart_source
 from tests.waiting import async_wait_until
 
 
@@ -55,6 +55,79 @@ def test_recovered_internal_event_keeps_recovery_key_out_of_transport_identity(t
     assert recovered.source.message_id is None
     assert recovered._hermes_recovery_id == "hermes-recovery-test"
     assert _reply_anchor_for_event(recovered) is None
+
+
+@pytest.mark.parametrize("trusted", [True, False])
+def test_shutdown_replay_keeps_native_synthetic_provenance(tmp_path, monkeypatch, trusted):
+    from gateway.session_envelope import restore_native, snapshot_native
+    from gateway.session_synthetic import mark_synthetic
+    from hermes_state_runtime import RuntimeStoreError
+
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    runner._adapter_flag = lambda *_args: False
+    runner._adapter_profile_for_source = lambda _source: None
+    runner._adapter_for_source = lambda _source: adapter
+    authorized = Mock(return_value=True)
+    runner._is_user_authorized_for_source = authorized
+    metadata = {"notification_origin": "process_registry_synthetic", "native_synthetic": True}
+    event = MessageEvent(text="queued notification", source=source, metadata=metadata,
+                         reply_expected=False)
+    if trusted:
+        mark_synthetic(event)
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    spool, = (tmp_path / "pending_messages").glob("*.json")
+    record = json.loads(spool.read_text(encoding="utf-8"))
+    data = {**record["data"], "_recovery_spool_ts": record["ts"]}
+    recovered = _recovered_followup_event(data, source, source.user_id)
+    if not trusted:
+        with pytest.raises(RuntimeStoreError) as exc:
+            snapshot_native(runner, recovered)
+        assert exc.value.reason == "invalid_params" and exc.value.field == "metadata"
+        return
+
+    payload = snapshot_native(runner, recovered)
+    envelope = payload["native_text_v1"]
+    assert envelope["synthetic"]["metadata"] == metadata
+    restored = restore_native(payload)
+    assert restored._hermes_recovery_id == data["recovery_id"]
+    assert restored.message_id is None and restored.source.message_id is None
+    authorized.assert_called_once()
+    second = _recovered_followup_event(data, source, source.user_id)
+    assert snapshot_native(runner, second) == payload
+
+
+@pytest.mark.asyncio
+async def test_recovered_spool_reuses_one_durable_native_admission(monkeypatch):
+    from gateway.run import GatewayRunner
+    from gateway.session_authority import SessionAuthority
+    from gateway.session_ingress_context import native_callback
+    from hermes_constants import get_hermes_home
+    from hermes_state_runtime import list_session_admissions
+    from tests.fakes.runtime_owner import initialize_session_authority
+
+    monkeypatch.setenv("TELEGRAM_ALLOWED_USERS", "42")
+    monkeypatch.setattr(SessionAuthority, "_schedule", lambda self, ref: None)
+    runner = GatewayRunner(GatewayConfig())
+    adapter = RestartTestAdapter()
+    runner.adapters[Platform.TELEGRAM] = adapter
+    authority = await initialize_session_authority(runner, profile_id="default", instance_id="owner")
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id="42", chat_type="dm", user_id="42")
+    data = {
+        "text": "queued notification", "metadata": {"notification_origin": "process_registry_synthetic"},
+        "native_synthetic": True, "recovery_id": "hermes-recovery-replayed", "_recovery_spool_ts": 1_700_000_000,
+    }
+    try:
+        receipts = []
+        for _ in range(2):
+            recovered = _recovered_followup_event(data, source, "42")
+            with native_callback(runner, recovered, get_hermes_home()):
+                receipts.append(await authority.admit_native(recovered))
+        row, = list_session_admissions(authority.db, session_id=receipts[0].ref.session_id)
+        assert row["request_id"] == data["recovery_id"]
+        assert row["payload"]["native_text_v1"]["event"]["message_id"] is None
+    finally:
+        authority.db.close()
 
 
 @pytest.mark.asyncio
@@ -809,6 +882,44 @@ async def test_followup_spool_whose_input_is_already_durable_without_resume_mark
         f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
     assert not list((tmp_path / "pending_messages").glob("*.json"))
     assert list((tmp_path / "pending_messages").glob("*.bad"))
+
+
+@pytest.mark.asyncio
+async def test_followup_already_durable_in_compression_continuation_is_not_replayed(
+        tmp_path, monkeypatch, caplog):
+    """Compression rotated the session after the follow-up's turn admitted it into the continuation.
+
+    The routing map still names the compressed parent (the mapping heals lazily), so recovery
+    resolves the spool to the parent. The durability probe must follow the compression chain;
+    probing only the parent would replay an input whose turn already ran.
+    """
+    runner, adapter, entry, source = _setup(tmp_path, monkeypatch)
+    event = MessageEvent(text="do the side effect", source=source, user_id=source.user_id, message_id="m-tip")
+    assert flush_pending_to_file({entry.session_key: event}, reason="shutdown_follow_up") == 1
+    db = runner.session_store._db_for_session_id(entry.session_id)
+    db.end_session(entry.session_id, "compression")
+    db.create_session("continuation-1", "telegram", parent_session_id=entry.session_id)
+    assert db.get_compression_tip(entry.session_id) == "continuation-1"
+    runner.session_store.append_to_transcript("continuation-1", {
+        "role": "user", "content": event.text, "platform_message_id": event.message_id})
+    assert not db.has_platform_message_id(entry.session_id, event.message_id)
+    claimed = []
+
+    async def handle(recovered):
+        claimed.append(recovered.text)
+        recovered._agent_turn_succeeded = True
+
+    adapter.handle_message = handle
+    with caplog.at_level("INFO", logger="gateway.run"):
+        assert recover_pending_to_db(
+            Mock(), session_resolver=runner.session_store.resolve_session_id_for_key,
+            deferred_followup=partial(_defer_followup, runner, {}, None)) == 1
+        assert await runner._drain_startup_restore_queue() == 0
+        await asyncio.gather(*list(runner._background_tasks))
+    assert claimed == []
+    assert len(adapter.sent) == 1 and "may already have been handled" in adapter.sent[0]
+    assert _outcome_lines(caplog) == [
+        f"Restart recovery outcome: session={entry.session_key} outcome=skipped:possibly-duplicate:noted"]
 
 
 def test_reconnect_followup_with_missing_origin_is_retained_without_attribute_error(tmp_path, monkeypatch):

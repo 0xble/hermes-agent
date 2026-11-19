@@ -103,17 +103,53 @@ def test_memory_watch_skips_access_denied_descendant(monkeypatch, denied_operati
 
     root, denied, allowed = (Mock(pid=pid) for pid in (1, 2, 3))
     root.is_running.return_value = True
-    root.children.return_value = [denied, allowed]
     denied.is_running.return_value = True
     allowed.is_running.return_value = True
     getattr(denied, denied_operation).side_effect = psutil.AccessDenied(denied.pid)
     root.memory_info.return_value = SimpleNamespace(rss=10)
     allowed.memory_info.return_value = SimpleNamespace(rss=10)
     monkeypatch.setattr(memory.psutil, "Process", lambda pid: root)
+    monkeypatch.setattr(memory, "_descendants", lambda process: [denied, allowed] if process is root else [])
     monkeypatch.setattr(memory, "darwin_physical_footprint", lambda pid: 10)
 
     watch = memory.KernelMemoryWatch(123, 15)
     assert watch.exceeded(final=True) == 20
+
+
+@pytest.mark.platforms("macos")  # the libproc child lookup is the macOS path
+def test_macos_tree_sample_never_scans_every_host_process(monkeypatch):
+    """psutil's recursive children() asks every host process for its parent with the GIL held;
+    with thousands of host processes each 1 s sample took seconds and starved the gateway. The
+    sample must find the real tree (grandchildren too) through per-parent lookups only."""
+    import subprocess
+    from tools import code_kernel_memory as memory
+
+    def host_scan(*_args, **_kwargs):
+        raise AssertionError("memory sample enumerated every host process")
+    root = subprocess.Popen(["/bin/sh", "-c", "/bin/sh -c 'sleep 30; exit 0' & sleep 30 & wait"])
+    members = []
+    try:
+        deadline = time.monotonic() + 10
+        while len(memory._descendants(psutil.Process(root.pid))) < 3 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        with monkeypatch.context() as scoped:  # the suite's own teardown still reaps with children()
+            scoped.setattr(memory.psutil.Process, "children", host_scan)
+            scoped.setattr(memory.psutil, "process_iter", host_scan)
+            members = memory._descendants(psutil.Process(root.pid))
+            assert watch_exceeded(memory, root.pid) > 0
+        assert len({member.pid for member in members}) == 3, members  # inner shell, its sleep, outer sleep
+    finally:
+        for member in members:
+            try:
+                member.kill()
+            except psutil.NoSuchProcess:
+                pass
+        root.kill()
+        root.wait(timeout=10)
+
+
+def watch_exceeded(memory, pid):
+    return memory.KernelMemoryWatch(pid, 1).exceeded(final=True)
 
 
 def test_real_process_tree_memory_is_bounded(monkeypatch, tmp_path):

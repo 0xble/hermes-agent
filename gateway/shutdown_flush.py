@@ -256,6 +256,22 @@ def _json_safe(value: Any) -> bool:
         return False
 
 
+def _spooled_event_metadata(event):
+    from gateway.session_synthetic import is_synthetic
+
+    fields: dict[str, Any] = {"native_synthetic": True} if is_synthetic(event) else {}
+    metadata = getattr(event, "metadata", None)
+    if not isinstance(metadata, dict) or not metadata or not _json_safe(metadata):
+        return fields
+    fields["metadata"] = metadata
+    if metadata.get("goal_continuation") is True:
+        from gateway.shutdown_goal_wakes import goal_continuation_only, goal_wake_identities
+        fields["goal_continuation_only"] = goal_continuation_only(event)
+        if fields["goal_continuation_only"]:
+            fields["goal_continuation_wakes"] = goal_wake_identities(event)
+    return fields
+
+
 def _serialise_value(value: Any) -> Optional[dict]:
     """Convert a pending message value to a JSON-serialisable dict."""
     from gateway.cron_review import is_review_event
@@ -295,14 +311,7 @@ def _serialise_value(value: Any) -> Optional[dict]:
         reply_expected = getattr(value, "reply_expected", None)
         if isinstance(reply_expected, bool):
             result["reply_expected"] = reply_expected
-        metadata = getattr(value, "metadata", None)
-        if isinstance(metadata, dict) and metadata and _json_safe(metadata):
-            result["metadata"] = metadata
-            if metadata.get("goal_continuation") is True:
-                from gateway.shutdown_goal_wakes import goal_continuation_only, goal_wake_identities
-                result["goal_continuation_only"] = goal_continuation_only(value)
-                if result["goal_continuation_only"]:
-                    result["goal_continuation_wakes"] = goal_wake_identities(value)
+        result.update(_spooled_event_metadata(value))
         source = getattr(value, "source", None)
         if source is not None:
             for attr in ("user_id", "user_name", "user_id_alt", "is_bot", "role_authorized"):

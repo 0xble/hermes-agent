@@ -61,7 +61,7 @@ def test_activation_real_setup_pm_lifecycle(tmp_path, served):
         "UV_CACHE_DIR": str(home / ".cache" / "uv"), "UV_PYTHON_DOWNLOADS": "never",
     }
     for name in ("activate", "setup-hermes.sh", "hermes_constants.py", "hermes_yaml.py", "utils.py",
-                 "scripts/_activation.sh"):
+                 "scripts/_activation.sh", "scripts/_setup_guard.sh", "scripts/setup_guard.py"):
         (core / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(REPO / name, core / name)
     for name in ("pm", "hermes_cli"):
@@ -161,6 +161,12 @@ def test_activation_real_setup_pm_lifecycle(tmp_path, served):
 
     lock.set_pin("uv", "fixture", {target: {"url": f"{base_url}/uv.tar.gz", "sha256": uv_digest}})
     first_digest = pin_python("first")
+    # Guarded cold activation needs an already runnable interpreter; use an
+    # isolated managed-tool shim, leaving checkout .venv and PM state absent.
+    bootstrap = runtime / "python-guard-bootstrap" / "bin" / "python3"
+    bootstrap.parent.mkdir(parents=True)
+    bootstrap.write_text(python_script, encoding="utf-8")
+    bootstrap.chmod(0o755)
 
     def activate(*, succeeds=True):
         # No `set -e`: inspect source's status and prove the caller survives.
@@ -230,7 +236,9 @@ test "${PYTHONPATH-}" = "$prior_pythonpath" || exit 96
     activate()
     assert selection() == first
     assert operations("sync") == prepared
-    assert len([line for line in operations("python") if line.startswith("python install ")]) == 3
+    # Guarded setup keeps the exact interpreter admission inspected; it must
+    # not select a different bootstrap via a second uv Python lookup.
+    assert operations("python") == []
 
     second_digest = pin_python("second")
     activate()
@@ -252,4 +260,4 @@ test "${PYTHONPATH-}" = "$prior_pythonpath" || exit 96
     assert "CALLER_SURVIVED:" in failed.stdout
     assert selection() == second
     assert len(app_syncs()) == 3
-    assert len([line for line in operations("python") if line.startswith("python install ")]) == 5
+    assert operations("python") == []

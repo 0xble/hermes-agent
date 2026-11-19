@@ -6,12 +6,44 @@ receipt, ended or not, was restored into the live registry on each boot. The tur
 running (#106742); the row ends once it settles, through the epoch-fenced viewer-close path.
 """
 import asyncio
+import threading
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 from tests.waiting import async_wait_until
+
+
+@pytest.mark.asyncio
+async def test_viewer_close_resolves_physical_target_off_loop(monkeypatch):
+    import gateway.session_viewer_close as viewer_close
+    import tools.async_delegation as delegation
+
+    sid = 'session'
+    live = SimpleNamespace(subscribers={}, route='route', source=SimpleNamespace(), detached=False,
+                           history_mount=False)
+    authority = SimpleNamespace(
+        sessions={sid: live}, pending_closes={}, profile_id='profile', retiring=False, retired=False,
+        runner=SimpleNamespace(_draining=False), db=object(),
+    )
+    threads = []
+
+    def physical_target(_authority, _sid):
+        threads.append(threading.current_thread().name)
+        return 'target'
+
+    monkeypatch.setattr(viewer_close, '_physical_target', physical_target)
+    monkeypatch.setattr(delegation, 'refuse_for_session', lambda *args, **kwargs: None)
+    monkeypatch.setattr(delegation, 'interrupt_for_session', lambda *args, **kwargs: None)
+
+    async def settle(*_args):
+        return None
+
+    monkeypatch.setattr(viewer_close, '_store_and_settle', settle)
+    await viewer_close.close_viewer_session(authority, sid, 'new_session')
+
+    assert threads and all(name != threading.current_thread().name for name in threads)
 
 
 async def _owner(tmp_path, monkeypatch):

@@ -52,6 +52,19 @@ the note, the spool is retained for a later boot. A stale spool whose note
 remains unavailable is retained for at most 7 days, then deleted with
 `skipped:stale:note-unavailable` and no `.bad` quarantine.
 
+When shutdown withdraws the adapter's message handler, a background task that
+already owns an input but has not dispatched it returns the input to the existing
+shutdown queue. The input keeps its original recovery identity. The task reports
+neither turn success nor a generic handler error when preservation succeeds.
+The stop sequence persists that queue before waiting for authority settlement and
+persists any arrivals during that wait before cancellable finalization.
+
+The private spool preserves whether the gateway originally marked an event as
+synthetic. Recovery restores that marker before native admission and still checks
+the current sender and route. A recovery-only identity and stable spool timestamp
+survive native admission, so retrying the same spool reuses its admission without
+inventing a platform message ID.
+
 ## Source surfaces
 
 `gateway/run_pending_recovery.py`, `gateway/run_restart_recovery.py`,
@@ -70,6 +83,12 @@ in-scope notice translation, spool
 retirement at turn start, the post-retirement turn-failed path, and pending-slot
 successor result propagation.
 
+`tests/gateway/test_drain_silent_recovery.py` holds an accepted adapter message
+before dispatch, withdraws ingress, and checks that shutdown spools the accepted
+message once while refusing new arrivals.
+
 ## Rollback
 
 Revert the commit carrying `Fork-Patch: internal-followup-retirement`.
+
+Contract tests: `tests/gateway/test_shutdown_followup_restart.py`, `tests/gateway/test_proxy_mode.py`.

@@ -46,6 +46,9 @@ def _bind_init_fallback(agent, provider, model, client):
         agent.model = model
         recompute_init_fallback_api_mode(agent, client)
     note_fallback(agent, previous_model, agent.model, provider, "credentials_unavailable")
+    # Preserve construction-time attribution across the first turn reset so the
+    # result names the original requested model and credential failure.
+    agent._preflight_fallback = dict(agent._fallback_attribution)
     return True, not is_moa
 
 

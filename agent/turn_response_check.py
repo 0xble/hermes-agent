@@ -206,6 +206,8 @@ def check_api_response(
         _preflight_compression_blocked = False
         _last_preflight_pressure = None
 
+    from agent.fallback_cooldown import clear_noninteractive_transient_retry
+    clear_noninteractive_transient_retry(agent)
     _retry.has_retried_429 = False
     # Clearing Nous rate-limit state proves the limit reset so other sessions may resume.
     if agent.provider == "nous":
@@ -218,6 +220,9 @@ def check_api_response(
     from agent import relay_llm
 
     relay_llm.complete_logical_call(api_request_id, outcome="success")
+    # A validated response ends the switch-cap allowance; a tool continuation is a normal request.
+    from agent.fallback_endpoint_domain import settle_independent_attempt
+    settle_independent_attempt(agent)
     agent._touch_activity(f"API call #{api_call_count} completed")
     return _verdict("break")
 

@@ -105,7 +105,6 @@ class _ExecApprovalDeclined(RuntimeError):
 from gateway.run_turn_runner_approval import TurnRunner as TurnRunnerApprovalMixin
 
 
-
 def _observed_turn_persist_message(run_message, override, live_text):
     """Retain the clean native-image input when an observed group wraps its live view."""
     if not isinstance(run_message, list):
@@ -197,7 +196,7 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         """Remember a delivered progress/status message id for end-of-turn cleanup."""
         ctx = self._ctx
         if ctx._cleanup_progress and getattr(result, "success", False) and getattr(result, "message_id", None):
-            ctx._cleanup_msg_ids.append(str(result.message_id))
+            ctx.track_cleanup_id(str(result.message_id))
 
     def _track_future_cleanup_id(self, fut) -> None:
         try:
@@ -1027,7 +1026,8 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         agent.step_callback = ctx._step_callback_sync if (ctx._hooks_ref.loaded_hooks or self._approval_owner is not None) else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
-        from gateway.run_turn_progress import local_viewer_turn
+        agent._gateway_interim_messages_enabled = bool(want_interim_messages)
+        agent._session_interim_assistant_messages_enabled = bool(getattr(ctx, "interim_assistant_messages_enabled", False))
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
             self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)
         agent.reasoning_callback = None
@@ -1916,13 +1916,13 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
                 model, runtime_kwargs.get("provider"), ctx.session_key or "",
             )
         except Exception as exc:
-            # Model/credential resolution failed before the turn began. Keep the raw cause in logs,
-            # but return a failed turn with a stable user-facing recovery message and reason.
+            # Resolution failed before the turn began: raw cause to logs, a stable recovery reply to the user.
             logger.warning("Model resolution failed for session %s: %s", ctx.session_key or "", exc, exc_info=True)
             from agent.turn_failure_copy import stamp_failure
             text, reason, retryable = _resolution_failure_reply(exc, ctx.source.platform)
             return stamp_failure({"final_response": text, "messages": [], "api_calls": 0, "tools": [],
-                                  "failed": True, "completed": False, "error": str(exc)}, reason, retryable)
+                                  "failed": True, "completed": False, "error": str(exc),
+                                  "pre_execution_runtime_refusal": True}, reason, retryable)
         from gateway.session_authorities import active_authority
         from gateway.session_worker_construct import session_routing
         pr = session_routing(active_authority(runner), policy) if policy else runner._provider_routing

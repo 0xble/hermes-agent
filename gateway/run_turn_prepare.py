@@ -205,6 +205,11 @@ def commit_stored_oauth_credentials(override: Optional[dict], runtime: dict) -> 
 def _resolve_channel_runtime(config, source, model, runtime_kwargs) -> tuple[str, dict]:
     from gateway.run import _get_channel_override, _resolve_runtime_agent_kwargs_for_provider
 
+    # Keep the helper compatible with older internal callers that passed the runner
+    # while the turn setup path passes its config snapshot directly.
+    if (config is not None and not hasattr(config, "platforms")
+            and hasattr(config, "config")):
+        config = getattr(config, "config", None)
     if config and source is not None:
         ch = _get_channel_override(
             config, source.platform, str(source.chat_id) if source.chat_id else "",
@@ -238,7 +243,7 @@ def _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice):
                 if provider_model and not attended_route.get("model"):
                     attended_model = provider_model
                 model = attended_model
-            except RuntimeError as exc:
+            except Exception as exc:  # health: allow BLE001 -- preserve the attended fallback boundary for every provider-resolution failure
                 logger.warning("Attended route %s unavailable: %s", attended_provider, exc)
                 notice = ContextNotice(f"⚠️ Attended model unavailable; staying on {model}.")
         else:
@@ -271,7 +276,41 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
             # Never pair an explicitly picked model with the default provider's credentials.
             logger.warning("Session /model override provider %s unavailable: %s", override["provider"], exc)
             if override.get("model"):
-                raise  # An explicit model cannot move onto the default route.
+                from hermes_cli.fallback_config import get_fallback_chain, same_model_fallbacks
+                from hermes_cli.fallback_config import (
+                    effective_runtime_provider, pre_agent_fallback_notice, resolve_entry_api_key,
+                )
+                from hermes_cli.runtime_provider import resolve_runtime_provider
+                from gateway.run import _runtime_agent_kwargs
+                for fallback in same_model_fallbacks(get_fallback_chain(user_config), override["model"]):
+                    try:
+                        fallback_kwargs = {
+                            "requested": fallback["provider"], "target_model": fallback["model"],
+                        }
+                        if fallback.get("base_url"):
+                            fallback_kwargs["explicit_base_url"] = fallback["base_url"]
+                        if fallback_key := resolve_entry_api_key(fallback):
+                            fallback_kwargs["explicit_api_key"] = fallback_key
+                        resolved_fallback = resolve_runtime_provider(**fallback_kwargs)
+                        resolved_fallback["provider"] = effective_runtime_provider(fallback, resolved_fallback)
+                        fallback_runtime = {
+                            **_runtime_agent_kwargs(resolved_fallback),
+                            "capabilities": dict(resolved_fallback.get("capabilities") or {}),
+                        }
+                    except Exception as exc:  # health: allow BLE001 -- malformed or unavailable fallback entries are skipped
+                        logger.debug("Pinned same-model fallback entry unavailable: %s", exc)
+                        continue
+                    fallback_runtime["model_pinned"] = True
+                    fallback_runtime["_preflight_fallback"] = {
+                        "requested_model": override["model"],
+                        "fallback_model": fallback["model"],
+                        "fallback_reason": "credentials_unavailable",
+                    }
+                    notice = pre_agent_fallback_notice(
+                        override.get("provider"), override["model"],
+                        fallback.get("provider"), fallback["model"])
+                    return fallback["model"], fallback_runtime, notice, False
+                raise  # An explicit model has no eligible same-model route.
             unavailable_override, override = override, None
     if runtime_kwargs is None:
         runtime_kwargs = _resolve_runtime_agent_kwargs()
@@ -440,7 +479,10 @@ class GatewayTurnPrepareMixin:
             if not isinstance(config, dict):
                 config = {}
             gateway_runtime = dict(config.get("gateway_runtime") or {})
-            if row.get("model") == model and all(gateway_runtime.get(k) == v for k, v in runtime.items()):
+            # Off a fallback, the route is the session's own: a stale fallback marker must not undo it (#152333).
+            stale_marker = not runtime["fallback_active"] and config.pop("_fallback_route", None) is not None
+            if (row.get("model") == model and all(gateway_runtime.get(k) == v for k, v in runtime.items())
+                    and not stale_marker):
                 return
             config["gateway_runtime"] = runtime
             db.update_session_meta(session_id, json.dumps(config), model=model)
