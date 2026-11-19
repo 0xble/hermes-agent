@@ -481,7 +481,7 @@ def _compress_via_compute_host(rid, params: dict, session: dict) -> dict:
                                      "the transcript will refresh when it finishes")})
     except SessionNotOwned:
         raise  # refused before the host was contacted: the dispatcher answers 4090, not a host failure
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- transport-specific failures become a request-level error, not a dispatcher crash
         return _err(rid, 5019, f"compute-host compress failed: {exc}")
     if (resp := _compute_host_ack_error(rid, ack, 4009, "compute-host compress failed")) is not None:
         return resp
