@@ -1396,6 +1396,8 @@ DEFAULT_CONFIG = {
         # and every compaction is a chance to lose detail, so the default stays off. A token count >= 16000 enables it;
         # other values (true, "200k") are config errors: warned and ignored.
         "compression_threshold_tokens": 0,
+        # Separate opt-in so primary warm-prune settings do not apply to delegated agents.
+        "proactive_prune_tokens": 0,
         # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
         # toolsets=["web"] doesn't strip MCP). false = strict intersection.
         "inherit_mcp_toolsets": True,

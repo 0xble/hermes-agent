@@ -1924,6 +1924,7 @@ code_execution:
 # The delegate_task tool spawns child agents with isolated context.
 # Supports single tasks and batch mode (default 3 parallel, configurable).
 delegation:
+  proactive_prune_tokens: 0  # Separate warm-cache prune opt-in for delegated agents.
   # backend: "default"                        # Strategy routing each delegate_task task: "default" = the keys below,
                                               # else the parent's route. model_map / profile_routes come from the
                                               # advanced-delegation plugin; a backend that is missing, disabled or

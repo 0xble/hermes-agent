@@ -487,6 +487,10 @@ def _proactive_tool_result_prune(
     compressor, also covers engines that override the hook. Suppression, not refusal (it runs per
     tool iteration); the material stays in context for the checkpointed threshold compaction.
     """
+    # The response clock can describe another route, and a fallback episode may be
+    # too short to recoup a warm rewrite. Resume normal pruning on the primary.
+    if getattr(agent, "_provider_fallback_active", False) is True:
+        return messages
     cold_cache = provider_cache_expired(agent, messages)
     if cold_only and not cold_cache:
         return messages

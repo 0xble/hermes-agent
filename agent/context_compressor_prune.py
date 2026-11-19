@@ -61,15 +61,10 @@ class ProactivePruneMixin:
         puts the request over ``threshold_tokens`` (#101889); every no-op taken while over threshold
         is logged once per distinct reason.
 
-        ``_prune_old_tool_results`` runs all deterministic passes: (1) dedup byte-identical tool results —
-        keeps the newest full copy and back-references older exact duplicates ANYWHERE in the list
-        (including the protected tail), so no unique content is ever lost; (2) summarize non-tail tool
-        results larger than ``min_prune_chars``; (3) truncate oversized tool_call arguments on non-tail
-        assistant messages; (3.5) retire image payloads on all but the newest ``_MAX_KEEP_TOOL_IMAGES``
-        image-bearing tool results, except a pending round that fits the hard share (#92699). Only pass (2)'s floor is
-        raised by ``proactive_prune_min_result_chars``; passes (1) and (3) keep their own fixed floors. The
-        recent-tail protection applies to passes (2) and (3); pass (1) is tail-agnostic by design because
-        dedup is lossless.
+        The underlying planner deduplicates identical results, summarizes oversized old result
+        bodies, and retires old tool images. Canonical tool-call arguments stay unchanged.
+        Dedup and image retirement may otherwise touch the protected tail; the running turn and
+        the tool round at the tail boundary are restored whole before counting token savings.
         """
         if self._optional_archive_cooldown_until > time.monotonic():
             return messages, 0

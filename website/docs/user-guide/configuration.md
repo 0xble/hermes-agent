@@ -1158,7 +1158,7 @@ compression:
   hygiene_failure_cooldown_seconds: 300             # First rung of the per-session hygiene-failure backoff (x1/x3/x9, capped at 1h)
   context_timeout_seconds: 120                      # Inactivity budget for in-agent compress_context (loop /compress / preflight) — see below
   context_total_ceiling_seconds: 600                # Absolute cap on the *pre-commit* in-agent compress_context wait even while tokens are still streaming (an already-started SessionDB commit is never abandoned; overruns are logged + surfaced)
-  proactive_prune_tokens: 48000                     # Default tokens trigger for the no-LLM tool-result prune (0 = off; see below)
+  proactive_prune_tokens: 0                         # Warm-cache trigger (off by default; see below)
   proactive_prune_min_result_chars: 8000            # Prune's summarize pass only touches tool results larger than this (clamped >= 200)
   proactive_prune_min_reclaim_tokens: 4096          # Prune only commits when it reclaims at least this many tokens (0 = commit any)
 
@@ -1206,7 +1206,7 @@ The value is the **first rung** of an escalating ladder, not a fixed interval: c
 
 The built-in compressor can prune old tool-result bodies without a model call when the provider's prompt cache is known to have expired. It requires at least 16,000 estimated tokens of savings by default, protects the running turn and recent tail, and preserves tool-call arguments. Checkpoint-gated or storeless sessions skip this prune. Full semantic compaction remains independent.
 
-`proactive_prune_tokens` is the **warm-cache** trigger. It defaults to `0` (off); a positive value opts in. Warm commits also require `proactive_prune_min_reclaim_tokens` (default `4096`) and a regrowth interval so they do not rewrite a live cache on every tool round. When warm pruning is enabled, a lower configured reclaim floor also lowers the cold gate. `proactive_prune_min_result_chars` (default `8000`, clamped to ≥ 200) controls the size floor for shortening old results.
+`proactive_prune_tokens` is the **warm-cache** trigger. It defaults to `0` (off); a positive value opts in. Warm commits also require `proactive_prune_min_reclaim_tokens` (default `4096`) and a regrowth interval so they do not rewrite a live cache on every tool round. When warm pruning is enabled, a lower configured reclaim floor also lowers the cold gate. `proactive_prune_min_result_chars` (default `8000`, clamped to ≥ 200) controls the size floor for shortening old results. Delegated agents use the separate `delegation.proactive_prune_tokens` threshold (also off by default). While provider fallback is active, proactive pruning is skipped; full compaction still runs when needed.
 
 :::tip Gateway hot-reload of compression and context length
 As of recent releases, editing `model.context_length` or any `compression.*` key in `config.yaml` on a running gateway takes effect on the next message — no gateway restart, no `/reset`, no session rotation required. The cached-agent signature includes these keys, so the gateway transparently rebuilds the agent when it sees a change. API keys and tool/skill config still require the usual reload paths.

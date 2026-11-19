@@ -51,3 +51,15 @@ def test_config_values_are_validated_not_coerced():
     child = _child()
     _apply_child_compression_cap(child, {"compression_threshold_tokens": True})
     assert child.context_compressor.threshold_tokens == 500_000
+
+
+def test_delegated_warm_prune_requires_an_independent_opt_in():
+    child = _child()
+    child.context_compressor.proactive_prune_tokens = 48_000
+    _apply_child_compression_cap(child, {})
+    assert child.context_compressor.proactive_prune_tokens == 0
+    _apply_child_compression_cap(child, {"proactive_prune_tokens": 64_000})
+    assert child.context_compressor.proactive_prune_tokens == 64_000
+    for invalid in (None, True, -1, 5.5, "64000"):
+        _apply_child_compression_cap(child, {"proactive_prune_tokens": invalid})
+        assert child.context_compressor.proactive_prune_tokens == 0

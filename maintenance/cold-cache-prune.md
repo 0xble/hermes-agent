@@ -1,6 +1,6 @@
 # Cold-cache proactive prune
 
-Fork-Patch: cold-cache-prune
+Fork patch identity: `cold-cache-prune`
 
 Backport upstream cold-cache proactive tool-result pruning and the warm-off default without changing the fork's release baseline. Preserve the existing SessionDB archive and rewrite fences. Retire the backport after the accepted release contains equivalent behavior; keep the fork's local request telemetry and role policy until their owners can replace them.
 

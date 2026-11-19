@@ -39,9 +39,9 @@ def test_cold_cache_commits_with_the_warm_gate_off():
     c.proactive_prune_tokens = 0
     msgs = _small_batch()
     warm, n_warm = c.prune_tool_results_only(msgs, current_tokens=100_000)
-    assert n_warm == 0 and warm is msgs  # warm cache: 25K is below 64K, no cache break
+    assert n_warm == 0 and warm is msgs  # warm cache: the warm trigger is off
     cold, n_cold = c.prune_tool_results_only(msgs, current_tokens=100_000, cold_cache=True)
-    assert n_cold >= 5 and cold is not msgs
+    assert n_cold > 0 and cold is not msgs
 
 
 def test_cold_cache_still_needs_the_cold_gate():
@@ -232,3 +232,23 @@ def test_turn_start_compaction_runs_the_cold_prune():
             agent, messages=msgs, system_message=None, active_system_prompt="sys", conversation_history=None,
             current_turn_user_idx=idx, user_message="next question", effective_task_id="t")
     cold.assert_called_once_with(agent, out, "t")
+
+
+@pytest.mark.parametrize("cold", [True, False])
+def test_fallback_bypasses_proactive_prune_and_primary_restores_it(cold):
+    prune, calls = _recording_prune(lambda m, cold: (m, 0))
+    agent = _site_agent(prune, cold=cold)
+    msgs = _history(3, big=set())
+    agent._provider_fallback_active = True
+    assert run_proactive_prune(agent, msgs, 100_000, "t") is msgs
+    assert not calls
+    agent._provider_fallback_active = False
+    run_proactive_prune(agent, msgs, 100_000, "t")
+    assert calls == [cold]
+
+
+@pytest.mark.parametrize("idx", [-1, 0, 4, 100])
+def test_prune_fails_closed_without_a_valid_running_turn_anchor(idx):
+    msgs = _small_batch()
+    cooked, count = _shipped().prune_tool_results_only(msgs, cold_cache=True, turn_start=idx)
+    assert cooked is msgs and count == 0
