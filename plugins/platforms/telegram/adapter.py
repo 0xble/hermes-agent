@@ -222,7 +222,7 @@ from plugins.platforms.telegram.telegram_polling_probe import TelegramPendingPro
 from plugins.platforms.telegram.telegram_intake import effective_update_message
 from plugins.platforms.telegram.telegram_live_gates import env_allowlist_decision, refresh_telegram_gates
 from plugins.platforms.telegram.telegram_media_group import (
-    add_item_note, flush_media_group_event, queue_media_group_event, tracking_album_items)
+    add_item_note, flush_media_group_event, inline_item_text, queue_media_group_event, tracking_album_items)
 from plugins.platforms.telegram.telegram_media_retry import unconfirmed_media_result as _unconfirmed
 from plugins.platforms.telegram.telegram_media_fetch import cache_replied_media, local_root, merged_typed_text, record_typed_text
 from plugins.platforms.telegram.rich_parts import edit_rich_parts, resume_rich_parts, send_rich_parts
@@ -8054,9 +8054,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
                 try:
                     text_content = raw_bytes.decode("utf-8")
                     display_name = re.sub(r'[^\w.\- ]', '_', original_filename or f"document{ext or '.txt'}")
-                    injection = format_document_content(display_name, text_content)
-                    event.text = f"{injection}\n\n{event.text}" if event.text else injection
-                    event.media_text_inlined = [True]
+                    inline_item_text(event, format_document_content(display_name, text_content))
                 except UnicodeDecodeError:
                     pass  # binary — agent has the cached path
         except Exception as e:
