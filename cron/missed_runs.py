@@ -13,6 +13,7 @@ scan's ``on_saved`` hooks so an unwritable store cannot book the same miss every
 from __future__ import annotations
 
 import logging
+import sqlite3
 from datetime import datetime
 from typing import Any, Optional
 
@@ -103,10 +104,14 @@ def fast_forward_missed_recurring(d: Any, grace: int) -> bool:
         message = (f"{d.label} ({job_id}) skipped {count} scheduled occurrence(s) starting at "
                    f"{first}: past the {grace}s grace window and catch-up is off. "
                    f"No job code ran for these occurrences. Next run: {new_next}.")
-        # Commit the occurrence-keyed receipt before advancing. If the outbox is unavailable,
-        # the held instant remains eligible for reevaluation; if jobs.json fails after enqueue,
-        # the same receipt suppresses duplicate delivery on retry.
-        queue_owner_failure(d.job, f"missed-recurring:{job_id}:{first}", message)
+        # If jobs.json fails after enqueue, the occurrence key suppresses duplicate delivery.
+        # An outbox storage failure still leaves the skipped occurrence in the schedule and ledger
+        # records below. Blocking the advance would keep the job from reaching its next valid slot.
+        try:
+            queue_owner_failure(d.job, f"missed-recurring:{job_id}:{first}", message)
+        except (OSError, sqlite3.Error):
+            logger.warning("Job '%s' (%s): could not queue owner alert for skipped occurrence %s",
+                           d.label, job_id, first, exc_info=True)
         d.scan.persist(job_id, next_run_at=new_next, last_status="skipped", last_error=message)
         record = d.scan.find(job_id)
         pending = record.get("pending_slot") if record is not None else None
