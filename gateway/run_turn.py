@@ -1164,13 +1164,14 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 logger.debug("resume marker snapshot unavailable for %s: %s", session_key, _e)
         event._restart_note_marker_api_available = _resume_marker_reader_available
         event._restart_note_expected_marker = _resume_pending_marker if _resume_marker_reader_available else None
-        if not await self._prepare_loop_wake_execution(event, source):
-            self._log_loop_wake_suppressed(event, "superseded before turn preparation")
-            return
-        from gateway.run_checkins import prepare_checkin
-        if not await prepare_checkin(self, event, session_entry):
-            return
         try:
+            # run_preagent_setup already ran history/session preparation (including hygiene).
+            if not await self._prepare_loop_wake_execution(event, source):
+                self._log_loop_wake_suppressed(event, "superseded during turn preparation")
+                return
+            from gateway.run_checkins import prepare_checkin
+            if not await prepare_checkin(self, event, session_entry):
+                return
             if not await self._prepare_loop_wake_execution(event, source):
                 self._log_loop_wake_suppressed(event, "superseded during turn preparation")
                 return
