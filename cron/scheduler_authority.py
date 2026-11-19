@@ -155,7 +155,7 @@ def run_canonical_job(job, *, extra_prompt=None, cancel_event=None, execution_id
                         receipt,
                         state,
                         record,
-                        save,
+                        write_journal,  # run_detached already runs in a worker thread
                         execution_id=request_id,
                         extra_prompt=params['extra_prompt'],
                         cancel_event=cancel_event,
