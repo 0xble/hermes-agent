@@ -3697,7 +3697,7 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackReactionsMixin, SlackThreadSt
         except Exception as e:
             logger.debug("[Slack] assistant.threads.setSuggestedPrompts failed: %s", e)
 
-    def _seed_dm_session(
+    async def _seed_dm_session(
         self, metadata: dict[str, str], *, thread_ts: Optional[str], fail_log: tuple[Any, ...]
     ) -> None:
         """Prime the session store for a DM (optionally thread-scoped); lifecycle only, no agent loop.
@@ -3711,14 +3711,10 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackReactionsMixin, SlackThreadSt
             chat_name=self._channel_name_cache.get((str(metadata.get("team_id") or ""), channel_id), channel_id),
             chat_type="dm", user_id=user_id, thread_id=thread_ts,
             chat_topic=metadata.get("context_channel_id") or None, scope_id=metadata.get("team_id") or None)
-        def seed() -> None:
-            try:
-                session_store.get_or_create_session(source)
-            except Exception:
-                logger.debug(*fail_log, exc_info=True)
-        # The store read can wait seconds behind state.db writes; run inline it froze the event loop
-        # past the liveness watchdog (2026-10-25 10:06 and 10:44 PDT, app_home_opened ack).
-        self.spawn_ingress_reply(asyncio.to_thread(seed), label="dm session seed")
+        try:
+            await asyncio.to_thread(session_store.get_or_create_session, source)
+        except Exception:
+            logger.debug(*fail_log, exc_info=True)
 
     async def _handle_assistant_thread_lifecycle_event(
         self, event: dict, body: Optional[dict] = None) -> None:
@@ -3767,11 +3763,13 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackReactionsMixin, SlackThreadSt
         self._cache_agent_view_context(metadata)
         # ``app_home_opened`` (tab == "messages") replaces ``assistant_thread_started`` in
         # Slack's Agent experience; lifecycle only (no welcome message, no agent loop).
-        await self._seed_dm_session(
-            metadata,
-            thread_ts=None,
-            fail_log=(
-                "[Slack] Failed to seed agent DM session for %s", metadata.get("channel_id", "")))
+        # Priming does not hold up the app-open acknowledgement behind state.db writes.
+        self.spawn_ingress_reply(
+            self._seed_dm_session(
+                metadata, thread_ts=None,
+                fail_log=("[Slack] Failed to seed agent DM session for %s", metadata["channel_id"]),
+            ), label="dm session seed",
+        )
         await self._set_assistant_suggested_prompts(
             metadata["channel_id"], team_id=metadata["team_id"])
 
