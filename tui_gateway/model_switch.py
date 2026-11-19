@@ -306,7 +306,14 @@ def _commit_agent_switch(sid: str, session: dict, agent, result, current_model: 
         logger.warning("In-place model switch failed for TUI agent: %s", exc)
         raise ValueError(f"Model switch to {result.new_model} failed ({exc}); "
                          f"staying on {getattr(agent, 'model', current_model)}.") from exc
-    agent._pinned_fallback_model = result.new_model
+    if snapshot is None:
+        from agent.agent_init_fallback import _fallback_entries
+        from hermes_cli.fallback_config import same_model_fallbacks
+        agent._pinned_fallback_model = result.new_model
+        agent._fallback_chain = same_model_fallbacks(
+            _fallback_entries(_load_fallback_model()), result.new_model)
+        agent._fallback_model = agent._fallback_chain[0] if agent._fallback_chain else None
+        agent._fallback_index = 0
     agent._preflight_fallback = None
     _restart_slash_worker(sid, session)
     _persist_live_session_runtime(session)
