@@ -69,7 +69,7 @@ def _held_over_cap_bubble(bot, content_resets=1):
         loop._progress_absorb(st, f'💻 terminal: "build step {i:03d} running the long command here"')
     for _ in range(content_resets):  # content bubbles land while the window is still open
         loop._reset_progress_bubble(st)
-    st.flood_until = 0.0  # the window closes while the agent keeps working
+    st.defer_until = st.flood_until = 0.0  # the window closes while the agent keeps working
     return loop, st
 
 

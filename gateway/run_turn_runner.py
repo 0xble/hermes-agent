@@ -14,7 +14,6 @@ import asyncio
 import dataclasses
 import json
 import logging
-import re
 import threading
 import time
 from contextlib import suppress
@@ -294,131 +293,6 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
             logger.debug("tool-progress onboarding hint failed: %s", err)
 
     # ── editable progress bubbles (progress-queue drain) ────────────────────────────────────
-
-    @dataclasses.dataclass
-    class _ProgressEditState:
-        """Mutable editable-bubble state shared by ``send_progress_messages`` and its helpers."""
-        adapter: Any
-        progress_lines: list
-        progress_msg_id: Any
-        can_edit: bool
-        _progress_len_fn: Any
-        _PROGRESS_TEXT_LIMIT: int
-        _edit_accepts_metadata: bool
-        # A second failure before the fresh bubble edits successfully means edits are unusable.
-        reanchored: bool = False
-        # Buffer until the monotonic flood deadline, without editing, splitting or sending.
-        defer_until: float = 0.0
-        retry_wait: float = 0.0
-        # Accepted includes durable outbox deferral without a message id. Bubble resets keep this.
-        tool_progress_sent: bool = False
-        skipped_edits: int = 0
-        progress_pause_logged: bool = False
-        dirty: bool = False
-        # (message_id, text) of bubbles a content reset closed while their update was flood-held.
-        owed_bubbles: list[tuple[Any, str]] = dataclasses.field(default_factory=list)
-        owed_fresh: bool = False
-        owed_send_failures: int = 0
-        owed_tail: Any = None
-        owed_tail_failures: int = 0
-
-    # Default minimum seconds between progress edits. An adapter may raise it with
-    # ``PROGRESS_EDIT_INTERVAL`` (Telegram matches its per-chat interim-edit floor,
-    # plugins/platforms/telegram/chat_budget.EDIT_FLOOR_SECS): a producer faster than the
-    # transport delivers no extra updates, it only parks edits inside the chat's send lock.
-    _PROGRESS_EDIT_INTERVAL = 3.0
-
-    @classmethod
-    def _progress_edit_interval(cls, adapter) -> float:
-        try:
-            value = float(getattr(adapter, "PROGRESS_EDIT_INTERVAL", None) or 0.0)
-        except (TypeError, ValueError):
-            value = 0.0
-        return max(cls._PROGRESS_EDIT_INTERVAL, value)
-
-    def _progress_edit_state(self, adapter) -> TurnRunner._ProgressEditState:
-        ctx = self._ctx
-        len_fn = adapter.message_len_fn if isinstance(adapter, BasePlatformAdapter) else len
-        try:
-            raw_limit = int(getattr(adapter, "MAX_MESSAGE_LENGTH", 4000) or 4000)
-        except Exception:
-            raw_limit = 4000
-        # Per-chat resolution (relay adapter fronting N platforms): cap and length unit follow the
-        # chat's underlying platform; native adapters return their scalar/property unchanged.
-        if isinstance(adapter, BasePlatformAdapter):
-            with suppress(Exception):
-                raw_limit = int(adapter.max_message_length_for_chat(ctx.source.chat_id) or 4000)
-                len_fn = adapter.message_len_fn_for_chat(ctx.source.chat_id)
-        return self._ProgressEditState(
-            adapter=adapter, progress_lines=[], progress_msg_id=None,
-            # "separate" = one message per tool (pre-v0.9 behavior)
-            can_edit=ctx.progress_grouping != "separate",
-            _progress_len_fn=len_fn,
-            # Leave room for platform quirks / formatting; tiny test adapters keep a usable limit.
-            _PROGRESS_TEXT_LIMIT=max(1, raw_limit - (64 if raw_limit > 128 else 0)),
-            # Overflow edits pass metadata (Telegram topic/thread routing) only when edit_message takes it.
-            _edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
-        )
-
-    @staticmethod
-    def _progress_text(lines: list) -> str:
-        text = "\n".join(str(line) for line in lines)
-        return _ToolProgressLine(text) if any(isinstance(line, _ToolProgressLine) for line in lines) else text
-
-    @staticmethod
-    def _cap_sized_pieces(st, line) -> list:
-        text = str(line)
-        if st._progress_len_fn(text) <= st._PROGRESS_TEXT_LIMIT:
-            return [line]
-        chunks = BasePlatformAdapter.truncate_message(text, st._PROGRESS_TEXT_LIMIT, len_fn=st._progress_len_fn)
-        return [re.sub(r" \(\d+/\d+\)$", "", chunk) for chunk in chunks]
-
-    def _split_progress_groups(self, st, lines: list) -> list[list]:
-        """Partition progress lines into platform-sized editable bubbles."""
-        groups: list[list] = []
-        current: list = []
-        for line in (piece for item in lines for piece in self._cap_sized_pieces(st, item)):
-            candidate = current + [line]
-            if current and st._progress_len_fn(self._progress_text(candidate)) > st._PROGRESS_TEXT_LIMIT:
-                groups.append(current)
-                candidate = [line]
-            current = candidate
-        return groups + ([current] if current else [])
-
-
-
-    @staticmethod
-    def _is_flood_refusal(result) -> bool:
-        error = (getattr(result, "error", "") or "").lower()
-        return getattr(result, "retry_after", None) is not None or any(w in error for w in ("flood", "retry after"))
-
-    @staticmethod
-    def _progress_deferred(st) -> bool:
-        return time.monotonic() < st.defer_until
-
-    @staticmethod
-    def _abandon_progress_bubble(st) -> bool:
-        """After a permanent edit failure, continue in a fresh bubble (True) unless the previous
-        fresh bubble also failed, which means editing itself is unusable (False, can_edit off)."""
-        if st.reanchored:
-            st.can_edit = False
-            return False
-        logger.info("[%s] Progress bubble no longer editable, starting a fresh one", st.adapter.name)
-        st.reanchored = True
-        st.progress_msg_id = None
-        return True
-
-    @staticmethod
-    def _is_reset_marker(raw) -> bool:
-        return isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__"
-
-    async def _progress_restore_typing(self, st) -> None:
-        ctx = self._ctx
-        await asyncio.sleep(0.3)
-        if ctx._run_still_current():
-            await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
-
-
 
     # ── ID-bearing lifecycle callbacks (agent thread) ───────────────────────────────────────
 
