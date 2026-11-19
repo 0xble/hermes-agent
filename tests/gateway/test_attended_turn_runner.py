@@ -457,7 +457,7 @@ def test_attended_notice_is_a_permanent_message_not_a_cleanup_bubble(monkeypatch
     gateway._thread_metadata_for_source = lambda s: {"thread_id": s.thread_id}
     ctx = TurnContext(
         source=source, _run_still_current=lambda: True, _cleanup_progress=True,
-        _status_adapter=adapter, _status_chat_id="chat",
+        _status_adapter_pinned=adapter, _status_chat_id="chat",
         user_config={"display": {"suppress_warning_notifications": suppressed}},
     )
     turn = TurnRunner(gateway, ctx)

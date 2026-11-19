@@ -88,7 +88,7 @@ class TestApprovalCommandWiring:
                         return SimpleNamespace(success=True)
 
                 ctx = TurnContext(source=SessionSource(platform=Platform.TELEGRAM, chat_id='fixture'),
-                    _status_adapter=Adapter(), _status_chat_id='fixture',
+                    _status_adapter_pinned=Adapter(), _status_chat_id='fixture',
                     _status_thread_metadata=None, session_key='redaction-fixture',
                     _loop_for_step=asyncio.get_running_loop(), stream_consumer_holder=[None])
                 turn = TurnRunner(SimpleNamespace(), ctx)
