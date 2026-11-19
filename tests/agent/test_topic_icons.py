@@ -77,7 +77,7 @@ def test_topic_service_messages_are_routed_to_the_manual_icon_recorder(monkeypat
         TEXT=_Filter(), COMMAND=_Filter(), LOCATION=_Filter(), PHOTO=_Filter(), VIDEO=_Filter(), AUDIO=_Filter(),
         VOICE=_Filter(), VIDEO_NOTE=_Filter(), CONTACT=_Filter(), ALL=_Filter(),
         MessageFilter=_Filter, Document=SimpleNamespace(ALL=_Filter()),
-        Sticker=SimpleNamespace(ALL=_Filter()),
+        Sticker=SimpleNamespace(ALL=_Filter()), Dice=SimpleNamespace(ALL=_Filter()),
         StatusUpdate=SimpleNamespace(FORUM_TOPIC_CREATED=_Filter(), FORUM_TOPIC_EDITED=_Filter()),
     )
     fake_filters.TEXT.__class__.__invert__ = lambda self: _Filter()
