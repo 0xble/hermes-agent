@@ -439,7 +439,10 @@ def restore_native_source(payload, runner=None):
             # namespace is the default profile, so repair only that unambiguous
             # case.  Named namespaces may be shared-bot satellites and remain
             # fail-closed until their receiving profile is known.
+            # Relay receipts seal the exact provenance, including the primary
+            # transport's null profile. Preserve that value for verification.
             if (getattr(getattr(runner, 'config', None), 'multiplex_profiles', False)
+                    and 'relay' not in provenance
                     and provenance.get('transport_profile') is None):
                 from hermes_state_keys import profile_from_session_key
                 if profile_from_session_key(envelope.get('route')) == 'default':
