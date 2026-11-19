@@ -236,7 +236,8 @@ def rich_part_count(adapter: Any, content: str, metadata: Optional[dict[str, Any
     MarkdownV2 path owns it (same gates, nothing sent)."""
     if adapter._should_attempt_rich(content, metadata=metadata):
         return 1
-    if ((metadata or {}).get("expect_edits") or not adapter._needs_rich_rendering(content)
+    if ((metadata or {}).get("expect_edits") or "rich_fallback_content" in (metadata or {})
+            or not adapter._needs_rich_rendering(content)
             or not adapter._rich_delivery_enabled() or getattr(adapter, "_rich_send_disabled", False)):
         return None
     parts = _fitting_parts(adapter, content)
@@ -260,6 +261,7 @@ async def send_rich_parts(
     # an ``expect_edits`` metadata still means "this is a preview, not a new message".
     if (
         (metadata or {}).get("expect_edits")
+        or "rich_fallback_content" in (metadata or {})  # Rich-only decoration must stay in one message.
         or not adapter._needs_rich_rendering(content)
         or not adapter._rich_delivery_enabled()
         or getattr(adapter, "_rich_send_disabled", False)
