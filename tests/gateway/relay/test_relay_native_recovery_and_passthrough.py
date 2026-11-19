@@ -69,7 +69,10 @@ async def _wired_relay(runner, connector, url):
 
 
 def _stub_turns(runner, monkeypatch, turns):
-    async def turn(event, *_args, **_kwargs):
+    async def turn(event, source, *_args, **_kwargs):
+        # Keep real route resolution (including legacy transport backfill). Deferred
+        # post-turn hooks only look up existing routes and cannot do this for the stub.
+        assert await runner._hmwa_resolve_session(event, source) is not None
         turns.append(event.text)
         execution_result.get()['result'] = {'final_response': 'reply ' + event.text, 'messages': []}
         return 'reply ' + event.text
