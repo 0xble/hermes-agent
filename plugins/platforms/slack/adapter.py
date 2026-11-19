@@ -3336,6 +3336,32 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackReactionsMixin, SlackThreadSt
         client = self._get_client(chat_id, team_id=team_id or None) if chat_id else self._app.client
         return _slack_response_payload(await client.users_info(user=user_id))
 
+    async def _resolve_author_team(self, user_id: str, channel_id: str, team_id: str) -> str:
+        """``T…`` home workspace of ``user_id`` via cached ``users.info``, or "" when unknown.
+        Used to stamp synthetic DM events so the _prefilter_inbound external-DM gate can judge
+        them. Lookup failure returns "" — the gate's documented empty-author fail-open."""
+        if not user_id:
+            return ""
+        # Lazily created: tests build adapters via object.__new__.
+        cache = getattr(self, "_user_team_cache", None)
+        if cache is None:
+            cache = self._user_team_cache = {}
+        key = (str(team_id), str(user_id))
+        if key in cache:
+            return cache[key]
+        try:
+            payload = await self._users_info_payload(user_id, channel_id, team_id)
+        except Exception as exc:
+            logger.debug("[Slack] users.info team lookup for %s failed: %s", user_id, exc,
+                         exc_info=exc)
+            return ""
+        user_team = (payload.get("user") or {}).get("team_id")
+        if not (isinstance(user_team, str) and user_team.startswith("T")):
+            return ""
+        cache[key] = user_team
+        self._trim_oldest_dict_entries(cache, self._USER_NAME_CACHE_MAX)
+        return user_team
+
     @staticmethod
     def _parse_users_info(payload: dict, user_id: str) -> tuple[str, bool]:
         """``(display name, is_bot)`` from a users.info payload; name prefers display → real → id."""
