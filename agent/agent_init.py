@@ -794,7 +794,8 @@ def _routed_client_kwargs(agent, fallback_model, _provider_timeout) -> Optional[
             )
             _refused_entries.append((_fb_provider, "no usable credentials"))
             continue
-        next_model = _fb_model or _fb["model"]
+        # A MoA entry names the preset itself; the resolved model is only its aggregator.
+        next_model = _fb["model"] if str(_fb["provider"]).strip().lower() == "moa" else (_fb_model or _fb["model"])
         accepted, needs_client = _bind_init_fallback(agent, _fb["provider"], next_model, _fb_client)
         if accepted:
             return _client_kwargs_from_routed(_fb_client, _provider_timeout) if needs_client else None
