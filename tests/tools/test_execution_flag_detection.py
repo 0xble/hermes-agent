@@ -49,6 +49,18 @@ def test_real_binaries_execute_leading_dash_program_payload(
     """A PATH marker proves these binaries do not reparse '-program' as an option."""
     if shutil.which(tool) is None or (needs_tty and shutil.which("script") is None):
         pytest.skip(f"{tool} or script is not installed")
+    if tool == "sort":
+        # The space-separated leading-dash value premise is GNU coreutils
+        # behavior. Ubuntu 26.04's uutils sort re-parses '-payload-marker'
+        # as its own argument (clap: "unexpected argument '-p'"), and BSD
+        # sort has no --compress-program at all, so only GNU sort can
+        # demonstrate the execution this case proves. The detector's own
+        # handling of the space form is asserted without a real binary below.
+        version = subprocess.run(
+            ["sort", "--version"], capture_output=True, text=True, timeout=10
+        )
+        if "GNU coreutils" not in version.stdout:
+            pytest.skip("real-binary sort payload proof requires GNU coreutils sort")
 
     marker = tmp_path / "executed"
     payload = tmp_path / "-payload-marker"

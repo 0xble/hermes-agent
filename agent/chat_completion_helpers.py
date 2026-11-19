@@ -2661,7 +2661,15 @@ class _StreamingCall(StreamingWaitMonitor):
     def _emit_text(self, text: str) -> None:
         self._fire_first_delta()
         self.agent._fire_stream_delta(text)
+        # Any-consumer delivery clears the cross-turn stale breaker; display-only tracking
+        # remains separate for replay/dedup decisions.
+        if self._visible_text_delivered():
+            _reset_stale_streak(self.agent)
         self.deltas_were_sent["yes"] = True
+
+    def _visible_text_delivered(self) -> bool:
+        """True when visible text reached any consumer (display or TTS)."""
+        return bool((getattr(self.agent, "_current_streamed_assistant_text", "") or "").strip())
 
     def _emit_reasoning(self, text: str) -> None:
         self._fire_first_delta()
