@@ -4,6 +4,8 @@ Fork patch identity: `proxy-request-class`. This fork-only patch supplies the CL
 
 Read [turn-origin provenance](turn-origin-provenance.md) when adapting ingress. Preserve named provider identity across auxiliary resolution and client reuse: two entries may share a URL and credential but have different opt-ins. The scheduling hint is not authorization and does not change local admission, health, or fallback policy. Keep the [provider setup documentation](../website/docs/user-guide/configuring-models.md) and [wire regressions](../tests/agent/test_proxy_request_class.py) in sync with the proxy contract.
 
+In-turn compression follows the parent turn’s class because it blocks the reply; standalone compression is background. Title upgrades remain background even when they inherit the profile and route context of an interactive turn. A human steer or interrupt carried over from a background turn runs interactively.
+
 Retire when upstream can emit the same dynamic, route-scoped header without redirect leakage, or CLIProxyAPI no longer consumes it. Unset `hermes_request_class` to disable without reverting the commit.
 
 ## Verification

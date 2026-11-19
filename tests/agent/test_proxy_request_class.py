@@ -33,6 +33,41 @@ def _chat_response(request):
                                       "message": {"role": "assistant", "content": "ok"}}]})
 
 
+def test_title_generation_stays_background_in_interactive_turn_on_wire(monkeypatch):
+    from contextvars import copy_context
+
+    from agent.proxy_request_class import bind_aux_request_turn
+    from agent.title_generator import generate_title
+
+    sent = []
+
+    def handle(request):
+        sent.append(request.headers.get(HEADER))
+        return _chat_response(request)
+
+    monkeypatch.setattr(aux, "_openai_http_client_kwargs", lambda *_a, **_kw: {
+        "http_client": httpx.Client(transport=httpx.MockTransport(handle)),
+    })
+    monkeypatch.setattr(aux, "_get_auxiliary_task_config", lambda task: (
+        {"provider": NAMED, "model": MODEL} if task == "title_generation" else {}
+    ))
+    agent = SimpleNamespace(api_mode="chat_completions", provider=NAMED, base_url=PROXY,
+                            _turn_provenance="user")
+    with frozen_runtime_config(_config()):
+        with bind_aux_request_turn(agent):
+            # Deferred upgrades capture the turn context and use it after the reply.
+            title_context = copy_context()
+            with OpenAI(api_key="test", base_url=PROXY,
+                        http_client=httpx.Client(transport=httpx.MockTransport(handle))) as client:
+                client.chat.completions.create(**apply_turn_request_class(agent, {
+                    "model": MODEL, "messages": MESSAGES,
+                }))
+            aux.call_llm(task="compression", provider=NAMED, model=MODEL, messages=MESSAGES)
+        title_context.run(generate_title, "Investigate queue latency")
+        aux.call_llm(task="compression", provider=NAMED, model=MODEL, messages=MESSAGES)
+    assert sent == ["interactive", "interactive", "background", "background"]
+
+
 def test_agent_turn_and_route_change_on_wire(monkeypatch):
     from run_agent import AIAgent
 

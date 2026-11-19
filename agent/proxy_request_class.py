@@ -14,7 +14,7 @@ HEADER = "X-Hermes-Request-Class"
 _HTTP_MODES = {"chat_completions", "codex_responses", "anthropic_messages"}
 logger = logging.getLogger(__name__)
 _BACKGROUND_ORIGINS = ("cron", "relay", "process", "goal_loop")
-_BACKGROUND_TASKS = ("compression", "goal_judge", "review", "title_generation")
+_BACKGROUND_TASKS = ("compression", "goal_judge", "review")
 _AUX_REQUEST_CLASS: ContextVar[str | Callable[[], str] | None] = ContextVar("aux_request_class", default=None)
 
 
@@ -127,6 +127,9 @@ def apply_aux_request_class(client: Any, kwargs: dict, provider: str, api_mode: 
         if api_mode and api_mode not in _HTTP_MODES:
             return kwargs
         if _enabled_for_route(provider, str(getattr(client, "base_url", "") or "")):
+            # Deferred titles can inherit the turn context but do not block its reply.
+            if task == "title_generation":
+                return _with_class(kwargs, "background")
             bound = _AUX_REQUEST_CLASS.get()
             request_class = bound() if callable(bound) else bound
             return _with_class(kwargs, request_class or ("background" if task in _BACKGROUND_TASKS else "interactive"))

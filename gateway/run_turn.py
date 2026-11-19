@@ -3086,11 +3086,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                         _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
                     return result
 
-            # Each drained follow-up is its own turn: bind its origin, not the chain head's.
-            # Event-less interrupt/steer text continues the turn it follows, so it keeps that origin.
+            # Eventless follow-ups are human input: the drain discards control interrupts and
+            # carries late steers as text. Only a queued event can supply a background origin.
             _head_origin = bound_turn_origin()
+            set_turn_origin(turn_origin_for_event(pending_event) if pending_event is not None else "user")
             if pending_event is not None:
-                set_turn_origin(turn_origin_for_event(pending_event))
                 # In-band turns bypass the inbound slot claim. Keep the conversation clock on
                 # the latest actual input, like its terminal goal identity; never restore the head.
                 self._session_state(next_session_key).conversation.last_turn_started_at = time.time()
