@@ -99,10 +99,16 @@ def resolve_route_identity(entry: dict[str, Any]):
     return BackendIdentity.build(provider=provider, model=model, base_url=base_url)
 
 
-def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str) -> Optional[tuple[str, str]]:
+def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: str, *, explicit_switch: bool = False) -> Optional[tuple[str, str]]:
     """Swap ``agent`` onto ``entry`` (a fallback-chain-shaped dict). Returns ``(old_model,
     old_provider)``, or None when the provider has no usable client. Sets ``_fallback_activated``
     so the next turn's ``restore_primary_runtime`` reverts it; raises on a failed swap."""
+    pinned = getattr(agent, "_pinned_fallback_model", None)
+    if not explicit_switch and isinstance(pinned, str) and pinned:
+        from hermes_cli.fallback_config import same_fallback_model
+        if not same_fallback_model(pinned, model):
+            return None
+
     from agent.auxiliary_client import resolve_provider_client
     from agent.chat_completion_helpers import (
         _fallback_api_mode_hint, _fallback_api_mode_resolved, _rebind_fallback_credential_pool,
@@ -142,6 +148,11 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
             api_mode = "chat_completions"
         elif not api_mode_explicit and api_mode == "chat_completions":
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
+
+    if not explicit_switch and isinstance(pinned, str) and pinned and not same_fallback_model(pinned, model):
+        if client is not getattr(agent, "client", None):
+            _close_failed_route_client(agent, client)
+        return None
 
     from agent.route_verdicts import reset_route_verdicts, save_primary_route_verdicts
     save_primary_route_verdicts(agent)  # before the swap: stamped with the endpoint that earned them

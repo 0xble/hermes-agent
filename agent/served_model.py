@@ -56,7 +56,9 @@ def install_served_model_capture(agent: Any, client: Any) -> None:
         logger.debug("served-model hook install skipped", exc_info=True)
 
 
-def result_model_fields(agent: Any) -> dict[str, Optional[str]]:
+def result_model_fields(
+    agent: Any, *, api_call_count: Optional[int] = None, failed: bool = False,
+) -> dict[str, Optional[str]]:
     """``requested_model`` / ``served_model`` for the turn result: the proxy header when the
     last response carried one, else Hermes' own fallback route (primary → active model)."""
     served = getattr(agent, "last_served_model", None)
@@ -65,4 +67,16 @@ def result_model_fields(agent: Any) -> dict[str, Optional[str]]:
         primary = str((getattr(agent, "_primary_runtime", None) or {}).get("model") or "").strip()
         if primary and primary != agent.model:
             requested, served = primary, agent.model
-    return {"requested_model": requested, "served_model": served or None}
+    from agent.fallback_attribution import fallback_attribution
+    fallback = fallback_attribution(agent) if getattr(agent, "_fallback_activated", False) is True else {}
+    startup = getattr(agent, "_preflight_fallback", None)
+    if isinstance(startup, dict):
+        fallback = {**startup, **fallback, "requested_model": startup.get("requested_model") or requested}
+    result = {**fallback, "requested_model": fallback.get("requested_model") or requested,
+              "served_model": served or fallback.get("fallback_model")}
+    if result.get("fallback_reason") and api_call_count is not None:
+        if not api_call_count or (failed and not getattr(agent, "last_served_model", None)):
+            result["served_model"] = None
+        logger.info("Model fallback result: requested_model=%s served_model=%s reason=%s",
+                    result["requested_model"], result["served_model"], result["fallback_reason"])
+    return result

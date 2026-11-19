@@ -455,6 +455,12 @@ def _recover_welcome_tier(agent: Any, classified: Any, _retry: TurnRetryState) -
         requested = str(getattr(agent, "model", "") or "")
         target = alternates[0] if alternates else None
         if target and target != requested:
+            pinned = getattr(agent, "_pinned_fallback_model", None)
+            if isinstance(pinned, str):
+                from hermes_cli.fallback_config import same_fallback_model
+                if not same_fallback_model(pinned, target):
+                    logger.info("Explicit model %s refused Nous free-tier fallback to %s", pinned, target)
+                    return False
             try:
                 agent.model = target
                 agent._nous_model_switch = (requested, target)

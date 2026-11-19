@@ -301,7 +301,9 @@ def _clean_request_string(value: Any) -> Optional[str]:
 
 # model_options decoding lives in the topical sibling (line-cap offset);
 # re-exported here so importers are unaffected.
-from gateway.platforms.api_server_request_options import _request_reasoning_config, _request_service_tier
+from gateway.platforms.api_server_request_options import (
+    _request_agent_overrides, _request_reasoning_config, _request_service_tier,
+)
 
 
 def _apply_runtime_agent_overrides(
@@ -330,31 +332,6 @@ def _resolve_request_runtime_agent_kwargs(provider: str, target_model: Optional[
         **{k: runtime.get(k) for k in ("api_key", "base_url", "provider", "api_mode", "command")},
         "args": list(runtime.get("args") or []),
         "credential_pool": runtime.get("credential_pool")}
-
-
-def _request_agent_overrides(
-    body: Any, *, virtual_model: Optional[str] = None, allow_bare_model: bool = True
-) -> dict[str, Any]:
-    """Extract per-request model/provider/options for _run_agent.
-
-    The virtual model (``hermes-agent``) means "gateway default". A bare ``model`` without
-    ``provider`` is honored only when ``allow_bare_model`` (generic clients hardcode "gpt-4o";
-    OpenAI-compatible handlers pass the ``direct_model_requests`` opt-in, Hermes-native
-    endpoints always allow it). An explicit ``provider`` is always honored.
-    """
-    if not isinstance(body, dict):
-        return {}
-    overrides: dict[str, Any] = {}
-    provider = _clean_request_string(body.get("provider"))
-    if provider:
-        overrides["requested_provider"] = provider
-    model = _clean_request_string(body.get("model"))
-    if model and model != virtual_model and (provider or allow_bare_model):
-        overrides["requested_model"] = model
-    model_options = body.get("model_options")
-    if isinstance(model_options, dict):
-        overrides["model_options"] = dict(model_options)
-    return overrides
 
 
 def _request_relay_metadata(body: Any) -> dict[str, Any]:
@@ -2317,6 +2294,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         # must not collide with the ``**runtime_kwargs`` spread).
         model = runtime_kwargs.pop("model", None) or _resolve_gateway_model()
         runtime_kwargs.pop("_fallback_notice", None)  # raw API surface: the switch is already logged
+        preflight_fallback = runtime_kwargs.pop("_preflight_fallback", None)
         request_reasoning_config = _request_reasoning_config(model_options)
         request_service_tier = _request_service_tier(model_options)
         model, session_override, request_model, request_provider = self._select_agent_runtime(
@@ -2363,7 +2341,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             "memory_manager": self._memory_sessions.checkout(session_id)}
         if request_service_tier is not _REQUEST_OPTION_MISSING:
             agent_kwargs["service_tier"] = request_service_tier
+        model_pinned = bool(request_model or route or session_model or (session_override or {}).get("model"))
+        if model_pinned:
+            agent_kwargs["model_pinned"] = True
         agent = AIAgent(**agent_kwargs)
+        agent._preflight_fallback = None if model_pinned else preflight_fallback
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override

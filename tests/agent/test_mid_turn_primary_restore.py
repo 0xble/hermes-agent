@@ -499,9 +499,10 @@ def test_failed_candidate_bind_does_not_leak_into_next_candidate(recovery_runtim
             agent._transport_cache.clear()
             agent._codex_reasoning_replay_rejected = False
             raise RuntimeError("bind failed partway")
+        previous_route = agent.model, agent.provider
         agent.client = good_client
         agent.model, agent.provider = model, provider
-        return True
+        return previous_route
 
     with (
         patch("agent.route_binding.bind_route_entry", side_effect=bind),

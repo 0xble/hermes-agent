@@ -82,14 +82,16 @@ def _route_report(child: Any) -> Optional[dict[str, Any]]:
     (None = the provider's default) and speed tier read off the child when its result is assembled, so a fallback
     provider that took over shows (``fallback_activated``). None for the default backend's unlabelled route."""
     route = getattr(child, "_delegate_route", None)
-    if not isinstance(route, dict):
+    from agent.fallback_attribution import fallback_attribution
+    fallback = fallback_attribution(child) if getattr(child, "_fallback_activated", False) is True else {}
+    if not isinstance(route, dict) and not fallback:
         return None
     from agent.fast_mode import service_tier_word
     reasoning = getattr(child, "reasoning_config", None)
     effort = None
     if isinstance(reasoning, dict):
         effort = reasoning.get("effort") if reasoning.get("enabled", True) else "none"
-    return {**route, "provider": _str_or_none(getattr(child, "provider", None)),
+    return {**(route if isinstance(route, dict) else {}), **fallback, "provider": _str_or_none(getattr(child, "provider", None)),
             "model": _str_or_none(getattr(child, "model", None)), "reasoning_effort": _str_or_none(effort),
             "service_tier": service_tier_word(_tier_in_effect(child)),
             **({"fallback_activated": True} if getattr(child, "_fallback_activated", False) is True else {})}
@@ -707,7 +709,15 @@ def _build_result_entry(
         if isinstance(interrupt_reason, str) and interrupt_reason:
             entry["interrupt_reason"] = interrupt_reason
     _route = _route_report(child)
+    if result.get("fallback_reason"):
+        _route = {**(_route or {}), **{key: result.get(key) for key in (
+            "requested_model", "served_model", "fallback_reason", "fallback_model")}}
     if _route is not None:
+        if _route.get("fallback_reason"):
+            served = result.get("served_model") or (_route.get("model") if status == "completed" else None)
+            _route["served_model"] = served
+            logger.info("Delegation fallback result: requested_model=%s served_model=%s reason=%s",
+                        _route["requested_model"], served, _route["fallback_reason"])
         entry["route"] = _route
     if status == "failed":
         entry["error"] = result.get("error", "Subagent did not produce a response.")

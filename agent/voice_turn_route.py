@@ -169,7 +169,7 @@ def begin_voice_turn_route(agent: Any, messages: list[dict[str, Any]], system_pr
         reason = ""
         try:
             from agent.route_binding import bind_route_entry
-            if bind_route_entry(agent, target, target["provider"], target["model"]) is None:
+            if bind_route_entry(agent, target, target["provider"], target["model"], explicit_switch=True) is None:
                 reason = "provider not configured"
         except Exception as exc:  # health: allow BLE001 -- any bind failure falls back to the main model with a notice
             reason = str(exc).splitlines()[0] if str(exc) else type(exc).__name__

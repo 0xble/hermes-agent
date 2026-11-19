@@ -211,6 +211,24 @@ def _entry_identity(entry: dict[str, Any]) -> tuple[str, str, str]:
     )
 
 
+def same_fallback_model(requested: str, candidate: str) -> bool:
+    """Exact model identity, allowing the conventional Anthropic Claude namespace.
+
+    Don't infer equivalence from a vendor/family prefix, strip version or tier suffixes,
+    or case-fold opaque custom model IDs.
+    """
+    requested, candidate = requested.strip(), candidate.strip()
+    return bool(requested and candidate) and (
+        requested == candidate
+        or (requested.startswith("anthropic/claude-") and requested.removeprefix("anthropic/") == candidate)
+        or (candidate.startswith("anthropic/claude-") and candidate.removeprefix("anthropic/") == requested)
+    )
+
+
+def same_model_fallbacks(chain: list[dict[str, Any]], model: str) -> list[dict[str, Any]]:
+    return [entry for entry in chain if same_fallback_model(model, str(entry.get("model") or ""))]
+
+
 def get_fallback_chain(config: dict[str, Any] | None) -> list[dict[str, Any]]:
     """Return the effective fallback chain merged across old and new config keys.
 

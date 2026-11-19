@@ -696,6 +696,7 @@ _PER_TURN_RESET_STATE: tuple[tuple[str, Any], ...] = (
     # Consecutive Codex reasoning-only (no answer, no tool call) responses, kept apart from
     # the aggregate incomplete count so a visible partial resets it (#67321).
     ("_codex_reasoning_only_streak", 0),
+    ("last_served_model", None),
     ("_thinking_prefill_retries", 0), ("_post_tool_empty_retried", False),
     ("_last_content_with_tools", None), ("_last_content_tools_all_housekeeping", False),
     ("_reused_response_text", None),
@@ -713,6 +714,7 @@ def _reset_per_turn_agent_state(agent: Any) -> None:
     for name, value in _PER_TURN_RESET_STATE:
         setattr(agent, name, value)
     agent._turn_failed_file_mutations = {}
+    agent._fallback_attribution = None
     agent._turn_file_mutation_paths = set()
     agent._tool_guardrails.reset_for_turn()
     _reset_consol = getattr(agent._memory_store, "reset_consolidation_failures", None)
