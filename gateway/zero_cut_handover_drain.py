@@ -84,10 +84,11 @@ def _handover_notification_work_count(runner) -> int:
 
 def _queued_followups(runner) -> int:
     total = 0
-    for values in (getattr(runner, "_pending_messages", {}), getattr(runner, "_queued_events", {})):
-        if isinstance(values, Mapping):
-            total += len(values)
-            total += sum(len(value) for value in values.values() if isinstance(value, (list, tuple)))
+    values = getattr(runner, "_pending_messages", {})
+    if isinstance(values, Mapping):
+        total += len(values)
+        total += sum(len(value) for value in values.values() if isinstance(value, (list, tuple)))
+    total += sum(len(state.conversation.queued_events) for state in (runner.__dict__.get("_sessions") or {}).values())
     # The adapter owns the per-chat session guard and the follow-up merged in mid-turn; the runner's
     # turn count drops before the adapter finishes delivering the final and starting that follow-up.
     # Exiting in that gap flushed the follow-up to disk and left the final unconfirmed, so the

@@ -226,8 +226,12 @@ class GatewayNotificationsMixin:
         admission_evt = primary_evt
         if getattr(self, 'session_authority', None) is not None:
             from gateway.session_automation import producer_identity
+            from tools.process_registry_notifications import completion_resumes_parent, delegation_wakes_parent
+            events = [primary_evt, *(e for e, _ in siblings)]
             admission_evt = dict(primary_evt, _automation_identities=[
-                producer_identity(self, event) for event in [primary_evt, *(e for e, _ in siblings)]])
+                producer_identity(self, event) for event in events],
+                **({"_sibling_failed": True} if any(delegation_wakes_parent(e) for e in events) else {}),
+                **({"_sibling_resumes": True} if any(completion_resumes_parent(e) for e in events) else {}))
         delivered = await self._deliver_completion_with_sibling_cleanup(consolidated, admission_evt, siblings)
         if delivered is not False:
             forget(primary_evt)

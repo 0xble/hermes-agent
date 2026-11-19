@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from contextvars import ContextVar, copy_context
 from pathlib import Path
-from typing import Callable, Dict, List, Optional, Set
+from typing import Callable, Dict, Iterable, List, Optional, Set
 
 from hermes_constants import hermes_home_key, normalize_scope
 
@@ -235,6 +235,17 @@ class ToolEntry:
     execution_timeout: float | None = None
     # Plugin tools share their manifest's content-observation privacy admission.
     incognito_safe: bool = True
+    # Argument names the handler accepts that the schema does not advertise (legacy call
+    # shapes, wrong-tool guards). tools/arg_validation.py never flags them, and a call that
+    # carries one is left for the handler to judge instead of the required-argument check.
+    compat_args: frozenset = frozenset()
+    # Required arguments whose absence the handler answers with its own guidance; the generic
+    # refusal leaves those to it.
+    self_checked_args: frozenset = frozenset()
+    # ``fn(args) -> seconds | None``: how long ONE call may legitimately block, derived from
+    # its own arguments and config. The executor floors its generic tool deadline by this so a
+    # tool's own timeout is the one that fires — see get_deadline_floor.
+    deadline_floor: Optional[Callable] = None
 
 
 class _PluginOverridePolicy:
@@ -612,7 +623,6 @@ class ToolRegistry:
         # remain confined to the profile that loaded them.
         self._plugin_override_policy: dict[tuple[Optional[str], str], _PluginOverridePolicy] = {}
         self._plugin_module_scopes: dict[str, set[Optional[str]]] = {}
-        self._toolset_checks: dict[str, Callable] = {}
         self._toolset_aliases: dict[str, str] = {}
         # MCP refresh mutates while other threads read: serialize writes, snapshot reads.
         self._lock = threading.RLock()
@@ -654,17 +664,9 @@ class ToolRegistry:
     def _toolset_entries(self, toolset: str, scope: Optional[str]) -> list[ToolEntry]:
         return self._grouped(self._merged_tools(scope).values()).get(toolset, [])
 
-    def _snapshot_state(
-        self, scope: Optional[str] = None) -> tuple[list[ToolEntry], dict[str, Callable]]:
-        """Return a coherent snapshot of registry entries and toolset checks."""
-        with self._lock:
-            entries = list(self._merged_tools(scope).values())
-            checks = dict(self._toolset_checks)
-            checks.update({e.toolset: e.check_fn for e in entries if e.check_fn is not None})
-            return entries, checks
-
     def _snapshot_entries(self) -> list[ToolEntry]:
-        return self._snapshot_state()[0]
+        with self._lock:
+            return list(self._merged_tools(None).values())
 
     def _toolset_has_exposable_tools(self, toolset: str, entries: list[ToolEntry]) -> bool:
         """True when at least one tool in *toolset* would be exposed. Mirrors
@@ -782,6 +784,12 @@ class ToolRegistry:
         mod = self._callable_module(handler)
         return self._plugin_namespace_of_module(mod) if mod else None
 
+    def is_builtin(self, entry: ToolEntry) -> bool:
+        """True for a tool Hermes ships: handler defined in the ``tools`` package, and not an
+        MCP server's tool (those handlers live in ``tools`` too, under an ``mcp-*`` toolset)."""
+        return (not entry.toolset.startswith("mcp-")
+                and self._callable_module(entry.handler).partition(".")[0] == "tools")
+
     @staticmethod
     def _callable_module(handler: Callable) -> str:
         """Resolve defining module through wrappers, partials, and objects."""
@@ -857,7 +865,9 @@ class ToolRegistry:
         check_fn: Callable | None = None, requires_env: list | None = None, is_async: bool = False,
         description: str = "", emoji: str = "", max_result_size_chars: float | None = None,
         dynamic_schema_overrides: Callable | None = None, override: bool = False,
-        scope: Optional[str] = None, eager: bool = False, execution_timeout: float | None = None, incognito_safe: bool | None = None):
+        scope: Optional[str] = None, eager: bool = False, execution_timeout: float | None = None, incognito_safe: bool | None = None,
+        compat_args: Iterable[str] = (), self_checked_args: Iterable[str] = (),
+        deadline_floor: Callable | None = None):
         """Register a tool (called at import time by each tool file). ``override=True`` is an
         explicit opt-in for plugins replacing a built-in implementation (e.g. a headed-Chrome
         browser backend); without it, cross-toolset shadowing is rejected."""
@@ -924,13 +934,9 @@ class ToolRegistry:
                 max_result_size_chars=max_result_size_chars,
                 dynamic_schema_overrides=dynamic_schema_overrides, eager=bool(eager),
                 incognito_safe=(owner is None if incognito_safe is None else incognito_safe is True),
-                execution_timeout=execution_timeout)
-            # Availability is derived per-tool (_toolset_has_exposable_tools), so this map no
-            # longer gates a toolset; it still feeds get_toolset_requirements ->
-            # TOOLSET_REQUIREMENTS["check_fn"], which banner.py reads (presence only,
-            # never called) to classify an unavailable toolset as lazy-init vs disabled.
-            if scope is None and check_fn and toolset not in self._toolset_checks:
-                self._toolset_checks[toolset] = check_fn
+                execution_timeout=execution_timeout, compat_args=frozenset(compat_args),
+                self_checked_args=frozenset(self_checked_args),
+                deadline_floor=deadline_floor)
             self._generation += 1
 
     def deregister(self, name: str, *, scope: Optional[str] = None) -> None:
@@ -986,7 +992,6 @@ class ToolRegistry:
             if scope is not None and not target:
                 self._scoped_tools.pop(scope, None)
             if not self._toolset_entries(entry.toolset, scope):
-                self._toolset_checks.pop(entry.toolset, None)
                 self._drop_toolset_aliases(entry.toolset)
             self._generation += 1
         logger.debug("Deregistered tool: %s", name)
@@ -1019,19 +1024,11 @@ class ToolRegistry:
             if scope is not None and not target:
                 self._scoped_tools.pop(scope, None)
 
-            # Rebuild affected toolset checks from survivors: a plugin may have replaced an
-            # entry in the same toolset, so its check_fn would otherwise linger after restore.
             affected_toolsets = {current.toolset}
             if previous is not None:
                 affected_toolsets.add(previous.toolset)
             for toolset in affected_toolsets:
                 surviving = self._toolset_entries(toolset, scope)
-                check_fn = next((entry.check_fn for entry in surviving if entry.check_fn), None)
-                if scope is None:
-                    if check_fn is None:
-                        self._toolset_checks.pop(toolset, None)
-                    else:
-                        self._toolset_checks[toolset] = check_fn
                 in_overlays = (e for m in self._scoped_tools.values() for e in m.values())
                 if not surviving and not any(e.toolset == toolset for e in in_overlays):
                     self._drop_toolset_aliases(toolset)
@@ -1095,6 +1092,9 @@ class ToolRegistry:
         self, name: str, args: dict, *, scope: Optional[str] = None, **kwargs) -> str | dict:
         """Execute a tool handler by name: async handlers bridged via ``_run_async()``,
         results normalized, every exception returned as ``{"error": ...}``."""
+        from tools.hosted_tool_policy import hosted_tool_refusal
+        if refusal := hosted_tool_refusal(name):  # deny-by-default in a hosted scope, before any handler
+            return tool_error(refusal)
         from agent.incognito import tool_refusal
         refusal = tool_refusal(name, args)
         if refusal:
@@ -1106,6 +1106,10 @@ class ToolRegistry:
             from agent.incognito import is_incognito
             if is_incognito(kwargs.get("session_id")):
                 return tool_error("This plugin tool is unavailable in incognito mode.")
+        from tools.arg_validation import check_tool_args, flag_unknown_args
+        refusal, unknown, valid = check_tool_args(entry, args)
+        if refusal is not None:
+            return refusal
         try:
             # Plugin contract (plugins/AGENTS.md): optional context kwargs (task_id, session_id, user_task,
             # parent_agent, ...) are signature-inspected like hook payloads, so a narrow ``handle(args)``
@@ -1116,7 +1120,7 @@ class ToolRegistry:
                 result = _run_async(entry.handler(args, **kwargs))
             else:
                 result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
+            return flag_unknown_args(self._normalize_handler_result(name, result), name, unknown, valid)
         except Exception as e:
             # exc_info already renders the exception, so keep the message copy bounded.
             logger.exception("Tool %s dispatch error: %s", name, _bound_error_text(str(e)))
@@ -1143,6 +1147,23 @@ class ToolRegistry:
             return default
         from tools.budget_config import DEFAULT_RESULT_SIZE_CHARS
         return DEFAULT_RESULT_SIZE_CHARS
+
+    def get_deadline_floor(self, name: str, args: dict) -> Optional[float]:
+        """Seconds this call may legitimately block for, as the tool itself declares it, or
+        ``None`` when it declares nothing. Callers raise their generic deadline to it.
+
+        Plugin tools can declare one too, so a declaration that raises or returns junk degrades
+        to "no floor" instead of taking tool dispatch down.
+        """
+        declare = self._attr(name, "deadline_floor")
+        if declare is None:
+            return None
+        try:
+            value = float(declare(args if isinstance(args, dict) else {}) or 0)
+        except Exception:
+            logger.warning("Tool %s: deadline_floor() failed; ignoring", name, exc_info=True)
+            return None
+        return value if 0 < value < float("inf") else None
 
     def get_all_tool_names(self) -> list[str]:
         return sorted(entry.name for entry in self._snapshot_entries())
@@ -1186,7 +1207,8 @@ class ToolRegistry:
 
     def get_toolset_requirements(self) -> dict[str, dict]:
         """Build a TOOLSET_REQUIREMENTS-compatible dict for backward compat."""
-        entries, toolset_checks = self._snapshot_state()
+        entries = self._snapshot_entries()
+        toolset_checks = {e.toolset: e.check_fn for e in entries if e.check_fn is not None}
         result: dict[str, dict] = {}
         for toolset, members in self._grouped(entries).items():
             result[toolset] = {

@@ -9,6 +9,7 @@ import sys
 from hermes_cli._subprocess_compat import windows_detach_popen_kwargs, _WINDOWS_GATEWAY_BREAKAWAY_ENV
 from hermes_cli.gateway_launchd_runtime import GatewayJob, start_gateway_job
 from hermes_cli.gateway_runtime_service import RuntimeStartError, remaining
+from hermes_cli._startup_fast import project_root_str
 
 
 def unmanaged_spawn_options(deadline, idle_exit, client_lease) -> dict:
@@ -39,6 +40,16 @@ def deadline_verdict(finite_owner):
     return finite_owner or GatewayDiscovery("starting", reason_code="deadline")
 
 
+# A detached gateway claiming any of these believes the service launched it: it skips the
+# supervised-gateway conflict guard and races the unit (#73480).
+SUPERVISOR_MARKER_ENV = (
+    "INVOCATION_ID", "JOURNAL_STREAM",
+    "XPC_SERVICE_NAME", "LAUNCHD_SOCKET", "HERMES_LAUNCHD_LABEL",
+    "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "HERMES_SUPERVISED_CHILD",
+    "NOTIFY_SOCKET", "WATCHDOG_USEC", "WATCHDOG_PID",
+)
+
+
 # One launch's policy and pins, never the shared daemon's: hook consent would become daemon-lifetime
 # auto-approval for messaging/cron, and a Kanban worker's or terminal's pins would retarget every later
 # session's board, cwd and source. The behaviour values main's CLI read per process (ephemeral prompt,
@@ -55,17 +66,24 @@ DAEMON_STRIPPED_ENV = (
     "HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_SINGLE_QUERY_SESSION",
     "HERMES_EPHEMERAL_SYSTEM_PROMPT", "HERMES_PREFILL_MESSAGES_FILE", "HERMES_INFERENCE_PROVIDER",
     "HERMES_ENABLE_PROJECT_PLUGINS", "HERMES_TUI_CLIENT_ENV",
-    # A terminal's shell under a systemd service (gnome-terminal-server, a user unit) carries these; the
-    # unmanaged daemon would then identify as "systemd" and maintenance would refuse it as supervised.
-    "INVOCATION_ID", "JOURNAL_STREAM",
-    # Same for any process below a launchd/--external-supervisor gateway (its agents' tools, scripts they
-    # run): the daemon would identify as "launchd", never arm --idle-exit, and outlive every client.
-    # HERMES_S6_SUPERVISED_CHILD stays: without it `gateway run` in an s6 container redirects to s6.
-    "XPC_SERVICE_NAME", "LAUNCHD_SOCKET", "HERMES_LAUNCHD_LABEL",
-    "HERMES_GATEWAY_EXTERNAL_SUPERVISOR", "HERMES_SUPERVISED_CHILD",
-    # systemd's notify socket and watchdog name the unit's main process: the daemon would feed them.
-    "NOTIFY_SOCKET", "WATCHDOG_USEC", "WATCHDOG_PID",
+    *SUPERVISOR_MARKER_ENV,
 )
+
+
+def strip_supervisor_markers(env: dict) -> dict:
+    """Drop supervisor markers from a detached gateway environment in place."""
+    from tools.environments.local_env_policy import GATEWAY_PROFILE_PIN_ENV, carry_gateway_profile_pin
+    carry_gateway_profile_pin(env)
+    if env.get("INVOCATION_ID"):
+        env[GATEWAY_PROFILE_PIN_ENV] = "1"
+    for key in SUPERVISOR_MARKER_ENV:
+        env.pop(key, None)
+    return env
+
+
+CLIENT_ELEVATED_REMEDY = (
+    "Hermes is running as administrator, and a gateway it started would run as administrator too, "
+    "which locks every normal Hermes window out of it. Start Hermes from a normal (non-administrator) window")
 
 
 def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: bool = False,
@@ -80,8 +98,11 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
     ``force``: a ``gateway restart --force --detach`` replacement keeps the ``--force`` its old owner
     needed (a named profile under a multiplexer), or it exits on the run-side guard.
     """
+    from hermes_dir_acl import TOKEN_ELEVATION_TYPE_DEFAULT, process_elevation_type, process_is_elevated
+    if process_is_elevated() and process_elevation_type() != TOKEN_ELEVATION_TYPE_DEFAULT:
+        raise RuntimeStartError("client_elevated", detail=CLIENT_ELEVATED_REMEDY)
     home = profile_home.resolve()
-    root = Path(__file__).resolve().parent.parent
+    root = Path(project_root_str())
     # A root home is only pinned by an explicit selector: without one the child's
     # _apply_profile_override follows the sticky active_profile and boots the wrong
     # profile's daemon. A <root>/profiles/<name> home is already trusted as-is.
@@ -122,19 +143,31 @@ def spawn_unmanaged_gateway(profile_home: Path, *, deadline: float, idle_exit: b
                                     deadline=deadline):
             return job
     try:
-        with (logs / "gateway-stdio.log").open("ab", buffering=0) as output:
-            remaining(deadline)
+        output = (logs / "gateway-stdio.log").open("ab", buffering=0)
+    except OSError as exc:
+        raise RuntimeStartError("stdio_log_unavailable", detail=os_refusal(exc)) from exc
+    with output:
+        remaining(deadline)
+        try:
             child = subprocess.Popen(command, cwd=root, env=env, close_fds=True,
                                      stdin=subprocess.PIPE if client_lease is not None else subprocess.DEVNULL,
                                      stdout=output, stderr=output,
-                                    # detached-spawn: ok — a gateway daemon launch must outlive its launcher
-                                    **windows_detach_popen_kwargs())
+                                     # detached-spawn: ok — a gateway daemon launch must outlive its launcher
+                                     **windows_detach_popen_kwargs())
             if client_lease is not None:
                 client_lease.own(child)
             return child
-    except OSError as exc:
-        reason = "windows_breakaway_unavailable" if sys.platform == "win32" else "spawn_failed"
-        raise RuntimeStartError(reason) from exc
+        except OSError as exc:
+            reason = "windows_breakaway_unavailable" if sys.platform == "win32" else "spawn_failed"
+            raise RuntimeStartError(reason, detail=os_refusal(exc)) from exc
+
+
+def os_refusal(exc: OSError) -> str | None:
+    """The OS's own code and message, never the profile filename."""
+    winerror = getattr(exc, "winerror", None)
+    code = f"WinError {winerror}" if winerror is not None else (
+        f"errno {exc.errno}" if exc.errno is not None else None)
+    return ": ".join(part for part in (code, exc.strerror) if part) or None
 
 
 def start_detached_replacement(profile_home: Path, *, force: bool = False) -> int:
@@ -145,7 +178,11 @@ def start_detached_replacement(profile_home: Path, *, force: bool = False) -> in
     try:
         spawn_unmanaged_gateway(profile_home, deadline=time.monotonic() + 30, force=force)
     except RuntimeStartError as exc:
-        print(f"✗ Could not start the gateway in the background: {exc}", file=sys.stderr)
+        print(f"✗ Could not start the gateway in the background: {exc}"
+              + (f". {exc.detail}" if exc.detail else ""), file=sys.stderr)
+        return 1
+    except TimeoutError:
+        print("✗ Could not start the gateway in the background: deadline", file=sys.stderr)
         return 1
     print("✓ Started the gateway in the background")
     return 0

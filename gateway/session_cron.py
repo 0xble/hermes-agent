@@ -184,7 +184,7 @@ async def operation(authority, name, params, actor=None):
         request_id = cron_request_id(params['job_id'], params['request_id'])
         sid = local_identity(authority.profile_id, actor.subject, request_id)
         from hermes_state_runtime import list_session_admissions
-        rows = list_session_admissions(authority.db, session_id=sid, pending_only=False)
+        rows = await asyncio.to_thread(list_session_admissions, authority.db, session_id=sid, pending_only=False)
         from gateway.owner_identity import same_owner
         row = next((r for r in rows if r['request_id'] == request_id and same_owner(r['principal_id'], actor.subject)), None)
         if row is None:
@@ -229,7 +229,9 @@ async def operation(authority, name, params, actor=None):
     if ref.session_id not in authority.sessions:
         await _restore_local_session_for_cron(authority, ref.session_id, admission_gate=False)
     authority.authorize(actor, ref, 'session:submit')
-    row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=params['admission_id'])
+    # The firer polls this every <= 2 s per running job: one worker hop reads the row (and a terminal
+    # row's saved result), so slow storage delays the poll, never the owner loop.
+    row, saved = await asyncio.to_thread(_read_admission, authority.db, params['admission_id'], name == 'status')
     from gateway.owner_identity import same_owner
     if row is None or row['target_session_id'] != ref.session_id or not same_owner(row['principal_id'], actor.subject):
         raise RuntimeStoreError('permission_denied')
@@ -246,13 +248,14 @@ async def operation(authority, name, params, actor=None):
     from cron.detached_authority import recover_detached
     if row['status'] in ('started', 'unknown', 'terminal') and await asyncio.to_thread(
             recover_detached, authority.db, authority.epoch, row):
-        row = await asyncio.to_thread(get_session_admission, authority.db, admission_id=row['admission_id'])
+        # Recovery may have just settled this admission: read the row AND its saved result again,
+        # in one worker hop. The result read before recovery is None for a run that was not yet
+        # terminal, and reporting that would book a captured completion as a failure.
+        row, saved = await asyncio.to_thread(_read_admission, authority.db, row['admission_id'], True)
         if row is None:
             raise RuntimeStoreError('not_found')
     result, flags = None, {}
     if row['status'] == 'terminal':
-        from gateway.session_results import admission_result
-        saved = await asyncio.to_thread(admission_result, authority.db, row['admission_id'])
         result = saved['result'].get('cron_result') if saved else None
         flags = (saved['result'].get('cron_job_flags') or {}) if saved else {}
         if result is None:
@@ -261,6 +264,16 @@ async def operation(authority, name, params, actor=None):
     return {'status': row['status'], 'result': result, 'job_flags': flags,
             'generation': row['generation'], 'profile_id': authority.profile_id,
             'progress_at': owner_progress.get(row['request_id'].rsplit(':', 1)[-1])}
+
+
+def _read_admission(db, admission_id, with_result):
+    """``(row, saved result)`` of a cron admission, read in a worker thread; the result only for a
+    terminal row a ``status`` poll asked about (``cancel`` never reads it)."""
+    row = get_session_admission(db, admission_id=admission_id)
+    if not with_result or row is None or row['status'] != 'terminal':
+        return row, None
+    from gateway.session_results import admission_result
+    return row, admission_result(db, admission_id)
 
 
 def _cancellations(authority):
@@ -321,7 +334,8 @@ async def execute(authority, ref, row, policy):
         from cron.cancellation import CancelRequest, _CombinedCancelEvent
 
         db_path = await asyncio.to_thread(Path(authority.db.db_path).resolve)
-        with _profile_runtime_scope(db_path.parent):
+        from agent.runtime_scope import bind_turn, claim_fence
+        with _profile_runtime_scope(db_path.parent), bind_turn(ref.session_id, row['admission_id'], claim_fence(row)):
             from cron.detached_authority import detached_assignment, observe_detached
             if await asyncio.to_thread(detached_assignment, job['id'], execution_id):
                 observed = await observe_detached(row)

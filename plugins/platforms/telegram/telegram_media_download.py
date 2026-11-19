@@ -21,7 +21,7 @@ def _timeouts(attempt: int) -> dict[str, float]:
                                   ("write_timeout", 20.0), ("pool_timeout", 8.0))}
 
 
-async def fetch_telegram_file(source: Any, what: str) -> tuple[Any, bytes]:
+async def fetch_telegram_file(source: Any, what: str, local_root: str | None = None) -> tuple[Any, bytes]:
     """Retry metadata AND bytes at most three times within one wall-clock budget.
 
     The deadline includes both network stages and backoff, even with large authored
@@ -36,7 +36,11 @@ async def fetch_telegram_file(source: Any, what: str) -> tuple[Any, bytes]:
             while True:
                 try:
                     file_obj = await source.get_file(**_timeouts(attempt))
-                    data = bytes(await file_obj.download_as_bytearray(**_timeouts(attempt)))
+                    from plugins.platforms.telegram.telegram_media_fetch import local_bot_api_path
+                    host_path = await asyncio.to_thread(
+                        local_bot_api_path, getattr(file_obj, "file_path", None), local_root) if local_root else None
+                    data = (await asyncio.to_thread(host_path.read_bytes) if host_path else
+                            bytes(await file_obj.download_as_bytearray(**_timeouts(attempt))))
                     if attempt > 1:
                         logger.info("[Telegram] %s: media fetch recovered on attempt %d/3", what, attempt)
                     return file_obj, data

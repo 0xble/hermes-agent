@@ -110,6 +110,36 @@ def test_captured_completion_retires_registered_worker_in_previous_epoch(tmp_pat
         db.close()
 
 
+def test_status_poll_that_recovers_a_detached_completion_reports_its_result(tmp_path, monkeypatch):
+    """The poll reads the admission before recovery settles it. The result it reports must be the
+    one recovery just saved, not the absent pre-recovery read (which books the fire as failed)."""
+    from cron.detached_authority import PREFIX
+    owner, db = _owner(tmp_path, monkeypatch)
+    try:
+        with jobs.use_cron_store(tmp_path):
+            job = jobs.create_job(prompt='inert', schedule='every 1h', deliver='local')
+
+            async def probe():
+                fire = 'captured-then-polled'
+                receipt = await session_cron.operation(owner, 'submit', {
+                    'job_id': job['id'], 'request_id': fire, 'extra_prompt': None})
+                row = claim_session_input(db, epoch=owner.epoch, session_id=receipt['session_id'])
+                register_worker_execution(db, epoch=owner.epoch, kind='cron', execution_id=PREFIX + fire,
+                                          session_id=receipt['session_id'], generation=row['generation'],
+                                          adoption_secret='x' * 32)
+                result = [True, '# Output', 'CAPTURED', None]
+                _journal(job, fire, receipt, result=result)
+                owner.epoch = begin_runtime_epoch(db, instance_id='replacement')
+                recover_session_inputs(db, epoch=owner.epoch)
+                assert get_session_admission(db, admission_id=row['admission_id'])['status'] == 'unknown'
+                polled = await session_cron.operation(owner, 'status', receipt)
+                assert polled['status'] == 'terminal'
+                assert polled['result'] == result
+            asyncio.run(probe())
+    finally:
+        db.close()
+
+
 def test_cancel_before_submit_receipt_reaches_detached_worker(tmp_path, monkeypatch):
     from cron.detached_authority import _cancel_path
     owner, db = _owner(tmp_path, monkeypatch)

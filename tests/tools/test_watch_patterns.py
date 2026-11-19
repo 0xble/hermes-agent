@@ -249,7 +249,7 @@ class TestCheckpointPersistence:
             "notify_on_complete": False,
             "watch_patterns": ["PANIC", "OOM"],
         }]))
-        monkeypatch.setattr(pr_mod, "CHECKPOINT_PATH", checkpoint)
+        monkeypatch.setattr(pr_mod, "_checkpoint_path", lambda: checkpoint)
         count = registry.recover_from_checkpoint()
         recovered = registry._finished["proc_recovered"]
         assert count == 1

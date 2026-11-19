@@ -18,7 +18,10 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from agent.plugin_live_notes import queue_plugin_notice, with_plugin_notices
+from agent.plugin_live_notes import append_continuation_notice, queue_plugin_notice, with_plugin_notices
+from agent.redact_secret_sources import publish_secret_source_values
+from agent.tool_dispatch_helpers import make_tool_result_message
+from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from run_agent import AIAgent
 from tools.budget_config import BudgetConfig
 
@@ -158,3 +161,27 @@ def test_notice_preserves_multimodal_parts_and_null_metadata():
     assert row["content"][1]["type"] == "image_url"
     assert NOTE in row["api_content"][0]["text"]
     assert row["api_content"][1]["type"] == "input_image"
+
+
+@pytest.mark.parametrize("delivery", ["continuation", "user_turn"])
+def test_secret_source_value_in_deferred_note_is_redacted_on_model_egress(tmp_path, delivery):
+    """An LSP/plugin note is delivered AFTER make_tool_result_message redacts tool output: on the
+    continuation row that follows the tool batch, or on the next user turn. Neither may reveal
+    source credentials."""
+    secret = "Zr4kWq8mNp2x"
+    token = set_hermes_home_override(str(tmp_path))
+    try:
+        publish_secret_source_values(tmp_path, {"VENDOR_TOKEN": secret})
+        agent = SimpleNamespace()
+        queue_plugin_notice(agent, "lsp:config.py", f"LSP diagnostic: unexpected value {secret}")
+        if delivery == "continuation":
+            messages = [make_tool_result_message("patch", "edited file", "call_1")]
+            assert append_continuation_notice(agent, messages)
+            emitted = messages[-1]["content"]
+        else:
+            emitted = with_plugin_notices(agent, {"role": "user", "content": "hello"})["content"]
+        assert secret not in emitted
+        assert "«redacted:secret-source»" in emitted
+    finally:
+        publish_secret_source_values(tmp_path, {})
+        reset_hermes_home_override(token)

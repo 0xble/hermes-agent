@@ -21,7 +21,7 @@ from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
-from gateway.platforms.base import BasePlatformAdapter
+from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
@@ -233,24 +233,36 @@ class GatewayTurnPersistenceMixin:
     def _hmwa_prepend_reasoning(self, agent_result, response, source, _intentional_silence):
         """Prepend the last reasoning block when show_reasoning is on for this platform. Mattermost
         requires an explicit per-platform opt-in (scratch text, not final-answer content)."""
+        block = self._hmwa_reasoning_block(agent_result, response, source, _intentional_silence)
+        return f"{block}\n\n{response}" if block else response
+
+    def _show_reasoning_for_source(self, source) -> bool:
+        """Whether ``show_reasoning`` is effectively on for this source's platform.
+
+        LOCAL viewers (Desktop/TUI) read reasoning from their event stream, never the projected
+        block, so they are always False here. The single resolver for the block renderer AND the
+        stream gate that keeps reasoning above a streamed answer (one combined message)."""
         if source.platform == Platform.LOCAL and not _acp_launch(self, source):
-            # Local viewers receive reasoning.delta through their event stream; projecting it into
-            # the final response duplicates it and leaks messaging-platform formatting into Desktop.
-            return response
+            return False
         from gateway.run import _load_gateway_config, _platform_config_key, _resolve_gateway_display_bool
         try:
-            _show_reasoning_effective = _resolve_gateway_display_bool(
+            return _resolve_gateway_display_bool(
                 _load_gateway_config(), _platform_config_key(source.platform), "show_reasoning",
                 default=bool(getattr(self, "_show_reasoning", False)), platform=source.platform,
                 require_platform_override_for={Platform.MATTERMOST},
             )
         except Exception:
-            _show_reasoning_effective = (
-                False if source.platform == Platform.MATTERMOST else getattr(self, "_show_reasoning", False)
+            logger.debug("show_reasoning resolution failed; using the gateway default", exc_info=True)
+            return (
+                False if source.platform == Platform.MATTERMOST else bool(getattr(self, "_show_reasoning", False))
             )
+
+    def _hmwa_reasoning_block(self, agent_result, response, source, _intentional_silence) -> str:
+        """The rendered reasoning block for this turn's reply, or "" when none is shown."""
+        _show_reasoning_effective = self._show_reasoning_for_source(source)
         last_reasoning = agent_result.get("last_reasoning")
         if not (_show_reasoning_effective and response and not _intentional_silence and last_reasoning):
-            return response
+            return ""
         from gateway.stream_consumer_fences import escape_code_fences_for_display
         # Collapse long reasoning to keep messages readable
         lines = last_reasoning.strip().splitlines()
@@ -261,19 +273,21 @@ class GatewayTurnPersistenceMixin:
         # Per-platform render style: Discord defaults to "-# " subtext, others keep the code block.
         try:
             from gateway.display_config import resolve_display_setting
+            from gateway.run import _load_gateway_config, _platform_config_key
             _reasoning_style = resolve_display_setting(
                 _load_gateway_config(), _platform_config_key(source.platform), "reasoning_style", "code",
             )
         except Exception:
+            logger.debug("reasoning_style resolution failed; using code", exc_info=True)
             _reasoning_style = "code"
         _quote = self._REASONING_QUOTE_STYLES.get(_reasoning_style)
         if _quote:
             header_key, prefix, empty = _quote
             _quoted = "\n".join(f"{prefix}{ln}" if ln else empty for ln in display_reasoning.splitlines())
-            return f"{t(header_key)}\n{_quoted}\n\n{response}"
+            return f"{t(header_key)}\n{_quoted}"
         # Escape ``` inside reasoning so inner fences don't break the outer code block.
         display_reasoning = escape_code_fences_for_display(display_reasoning)
-        return t("gateway.reasoning.block", reasoning=display_reasoning, response=response)
+        return t("gateway.reasoning.block", reasoning=display_reasoning, response="").rstrip()
 
     def _hmwa_runtime_footer_line(self, agent_result, source, _turn_seconds):
         """Runtime-metadata footer for the FINAL message of the turn; off by default
@@ -426,7 +440,7 @@ class GatewayTurnPersistenceMixin:
         return agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure
 
     async def _hmwa_compression_exhaustion_reset(
-        self, agent_result, response, session_entry, session_key, source,
+        self, agent_result, response, session_entry, session_key, source, event=None,
     ):
         """Pause compression failures on their original session, never implicitly start /new.
 
@@ -559,9 +573,10 @@ class GatewayTurnPersistenceMixin:
         # the DB write here to prevent the duplicate-write bug (#860 / #42039). This holds for the codex
         # app-server runtime too: although it early-returns and bypasses conversation_loop's per-step
         # flushes, it flushes its own projected assistant/tool messages before returning and reports
-        # agent_persisted=True (see agent/codex_runtime.py). Reading the flag (default = self._session_db is
-        # not None) keeps the persistence contract explicit and lets any future non-persisting runtime opt
-        # into a gateway-side write by returning False.
+        # agent_persisted=True (see agent/codex_runtime.py). The turn runner now always sets the flag from
+        # the handle the turn's agent actually holds; the fallback below (runner's CURRENT handle) only
+        # serves direct callers — reading it here let a mid-turn recovery mask a no-handle turn whose
+        # agent flush silently no-ops, dropping the turn from state.db entirely (#140823).
         agent_persisted = agent_result.get("agent_persisted", self._session_db is not None)
         from agent.incognito import is_incognito
         if is_incognito(sid):
@@ -773,6 +788,49 @@ class GatewayTurnPersistenceMixin:
                                              generation=run_generation)
         return delivered
 
+    async def _ledger_uncertain_streamed_final(self, event, session_key, response, adapter) -> bool:
+        """A stream send of this answer timed out after the request left and was counted as shown: on
+        screen or lost, the wire cannot tell. Sending it again now would be a silent second copy; the
+        adapter ledgers it as a failed row instead, so the timed redelivery sends it once more WITH the
+        may-be-a-duplicate marker and a lost send is not silence. That is what ``send_final_ledgered``
+        gives a timed-out final on a non-streaming platform. Both the completion path and the queued
+        first-response lane (whose result the follow-up replaces) ledger through here; an adapter
+        without the base contract has no ledger and keeps the old behaviour. True only when a
+        redelivery row was saved (``gateway.delivery_ledger: false`` saves none)."""
+        if not callable(getattr(adapter, "ledger_attempted_final", None)):
+            return False
+        return await adapter.ledger_attempted_final(
+            event, session_key, response, error="Timed out: the streamed send may not have landed") is True
+
+    async def _hmwa_stop_typing_for_turn(self, event, source):
+        """Stop the typing indicator (never raises), with the delivery path's thread/workspace routing
+        metadata (Slack AI status is thread-scoped), on this turn's own message, not the chat's latest."""
+        from gateway.platforms.helpers import typing_metadata_for_turn
+        with suppress(Exception):
+            _typing_adapter = self._delivery_adapter_for(source)
+            _kind = type(_typing_adapter)
+            if _typing_adapter and callable(getattr(_kind, "_stop_typing_with_metadata", None)):
+                await _typing_adapter._stop_typing_with_metadata(source.chat_id, typing_metadata_for_turn(_typing_adapter,
+                    source.chat_id, self._reply_anchor_for_event(event), self._event_thread_metadata(event, source)))
+            elif _typing_adapter and callable(getattr(_kind, "stop_typing", None)):
+                await _typing_adapter.stop_typing(source.chat_id)
+
+    def _hmwa_pause_typing_after_silence(self, event, source) -> None:
+        """A turn that ends in intentional silence has nothing left to show: pause the adapter's typing
+        keep-alive now. It refreshes until the handler returns, so hooks and transcript persistence
+        after the agent finished kept "typing" on for a reply that never comes (#149948). Only inside
+        the adapter's turn bracket (``_turn_marker_handoff``), whose ``finally`` lifts the pause; a turn
+        run outside it has no keep-alive, and a pause there would mute the chat's next turn. Keyed on
+        this turn's typing thread, as the adapter's loop computes it: another topic of the same chat
+        is still working and keeps its own "typing"."""
+        from gateway.platforms.helpers import typing_metadata_for_turn, typing_pause_key
+        adapter = self._delivery_adapter_for(source)
+        paused = getattr(adapter, "_typing_paused", None)
+        if getattr(event, "_turn_marker_handoff", False) is True and isinstance(paused, set):
+            metadata = typing_metadata_for_turn(adapter, source.chat_id, self._reply_anchor_for_event(event),
+                                                self._event_thread_metadata(event, event.source))
+            paused.add(typing_pause_key(source.chat_id, metadata))
+
     async def _hmwa_deliver_turn_response(
         self, event, source, session_entry, session_key, run_generation,
         agent_result, agent_messages, response, _footer_line, _intentional_silence,
@@ -799,17 +857,8 @@ class GatewayTurnPersistenceMixin:
             response = ""
 
         adapter = self._delivery_adapter_for(source)
-        from gateway.platforms.base import EphemeralReply
-        is_ephemeral_response = isinstance(response, EphemeralReply) or bool(
-            agent_result.get("is_ephemeral_response", getattr(event, "_is_ephemeral_response", False)))
-        ephemeral_ttl = getattr(response, "ttl_seconds", None)
-        if isinstance(response, EphemeralReply):
-            response = response.text
-        if ephemeral_ttl is None:
-            try:
-                ephemeral_ttl = int(agent_result.get("ephemeral_ttl", getattr(event, "_ephemeral_ttl", 0)) or 0)
-            except (TypeError, ValueError):
-                ephemeral_ttl = 0
+        from gateway.run_turn_ephemeral import ephemeral_reply_options
+        response, is_ephemeral_response, ephemeral_ttl = ephemeral_reply_options(response, agent_result, event)
         from gateway.copy_blocks import render_copy_blocks_inline, split_copy_blocks_for
         response_without_copy, copy_blocks = split_copy_blocks_for(adapter, response) if response else (response, [])
         if agent_result.get("interrupted") and response:
@@ -852,13 +901,32 @@ class GatewayTurnPersistenceMixin:
             if copy_failed:
                 agent_result["failed"] = True
                 agent_result["error"] = "one or more [[copy]] blocks failed to deliver"
+            _footer_captioned: list = []  # the footer rode the last photo's caption (#74547)
             if response_without_copy and adapter and not agent_result.get("media_already_delivered"):
-                # Attachments come only from text outside copy blocks: a body is literal text.
+                # Attachments come only from text outside copy blocks: a body is literal text. This media
+                # completes the user-visible reply: mark it notify-worthy like the non-streamed
+                # attachments (#144897) -- in `important` mode it must still ring.
                 from gateway.copy_blocks import strip_copy_blocks
                 media_delivered = bool(await self._deliver_media_from_response(
-                    strip_copy_blocks(response), event, adapter))
+                    strip_copy_blocks(response), event, adapter,
+                    thread_metadata=_mark_notify_metadata(self._event_thread_metadata(event, source)),
+                    footer_line="" if _intentional_silence else _footer_line,
+                    footer_captioned=_footer_captioned))
+            ledgered = bool(response and adapter and agent_result.get("delivery_uncertain")) and (
+                await self._ledger_uncertain_streamed_final(event, session_key, response, adapter))
+            # The stream showed only the answer: the reasoning block prepended to ``response`` for
+            # show_reasoning never reached the chat, so it follows as its own message (#7251). A
+            # ledgered final already carries it: its redelivery sends reasoning and answer together.
+            reasoning_block = "" if ledgered else self._hmwa_reasoning_block(
+                agent_result, response, source, _intentional_silence)
+            # A bot peer would take a second message as fresh input: gated like the footer line.
+            if reasoning_block and adapter and automatic_notices_allowed(source):
+                try:
+                    await adapter.send(source.chat_id, reasoning_block, metadata=self._event_thread_metadata(event, source))
+                except Exception:
+                    logger.debug("trailing reasoning send failed", exc_info=True)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
-            if _footer_line and adapter and not _intentional_silence:
+            if _footer_line and adapter and not _intentional_silence and not any(_footer_captioned):
                 try:
                     await adapter.send(source.chat_id, _footer_line, metadata=self._event_thread_metadata(event, source))
                 except Exception as _e:

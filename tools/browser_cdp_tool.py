@@ -107,6 +107,17 @@ def _redact_cdp_output(
 def _cdp_field_context(method: str, params: Optional[dict[str, Any]]) -> bool:
     # Arbitrary-code CDP channels use the tab-scoped fail-closed rule.
     return method in {"Runtime.evaluate", "Runtime.callFunctionOn", "Runtime.getProperties"}
+
+
+def _redact_cdp_method_result(method: str, result: Any, *, params: Optional[dict[str, Any]] = None,
+                              task_id: str = "default") -> Any:
+    """Redact a CDP result with ``method``'s binary-path exemptions; every success return goes through here.
+
+    The fork's vault scoping rides along: ``params`` marks arbitrary-code channels as field
+    context and ``task_id`` selects the tab whose registered vault values are scrubbed."""
+    return _redact_cdp_output(result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
+                              flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
+                              field_context=_cdp_field_context(method, params), vault_tab=task_id)
 try:
     import websockets
     from websockets.exceptions import WebSocketException
@@ -375,11 +386,8 @@ def _browser_cdp_via_supervisor(task_id: str, frame_id: str, method: str, params
         return tool_error(f"CDP call via supervisor failed: {type(exc).__name__}: {exc}", cdp_docs=CDP_DOCS_URL)
 
     return json.dumps({"success": True, "method": method, "frame_id": frame_id, "session_id": child_sid,
-                       "result": _redact_cdp_output(result_msg.get("result", {}),
-                           always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
-                           flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
-                           field_context=_cdp_field_context(method, params),
-                           vault_tab=task_id)}, ensure_ascii=False)
+                       "result": _redact_cdp_method_result(method, result_msg.get("result", {}),
+                                                           params=params, task_id=task_id)}, ensure_ascii=False)
 
 
 def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id: Optional[str] = None,
@@ -454,10 +462,8 @@ def browser_cdp(method: str, params: Optional[dict[str, Any]] = None, target_id:
         logger.exception("browser_cdp unexpected error")
         return tool_error(f"Unexpected error: {type(exc).__name__}: {exc}", method=method)
 
-    payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_output(
-        result, always_paths=_CDP_ALWAYS_BINARY_PATHS.get(method, ()),
- flagged_paths=_CDP_FLAGGED_BINARY_PATHS.get(method, ()),
- field_context=_cdp_field_context(method, call_params), vault_tab=effective_task_id)}
+    payload: dict[str, Any] = {"success": True, "method": method, "result": _redact_cdp_method_result(
+        method, result, params=call_params, task_id=effective_task_id)}
     if target_id:
         payload["target_id"] = target_id
     return json.dumps(payload, ensure_ascii=False)

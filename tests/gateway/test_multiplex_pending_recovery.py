@@ -27,7 +27,7 @@ def test_shutdown_spools_real_runner_session_views(tmp_path, monkeypatch):
     key = "agent:main:telegram:dm:real-runner"
     runner._session_state(key)
     runner._pending_messages[key] = "pending"
-    runner._queued_events[key] = ["queued"]
+    runner._session_state(key).conversation.queued_events = ["queued"]
     flushed = []
     monkeypatch.setattr(
         runner, "_flush_owned_pending",
@@ -37,7 +37,7 @@ def test_shutdown_spools_real_runner_session_views(tmp_path, monkeypatch):
     assert runner._persist_shutdown_pending_messages() == 2
     assert [value for _key, value, _kwargs in flushed] == ["pending", ["queued"]]
     assert dict(runner._pending_messages) == {}
-    assert dict(runner._queued_events) == {}
+    assert all(not state.conversation.queued_events for state in runner._sessions.values())
 
 
 def test_startup_recovers_secondary_spool_after_shared_bot_shutdown(tmp_path, monkeypatch):

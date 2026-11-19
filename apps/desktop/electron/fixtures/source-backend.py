@@ -32,7 +32,7 @@ def main() -> None:
     for name in ("pm", "hermes_cli"):
         shutil.copytree(repository / name, root / name,
                         ignore=shutil.ignore_patterns("__pycache__", "*.pyc"))
-    for name in ("hermes_platform", "agent", "tools", "gateway", "tui_gateway", "cron", "plugins"):
+    for name in ("hermes_agent", "hermes_platform", "agent", "tools", "gateway", "tui_gateway", "cron", "plugins", "utils"):
         (root / name).symlink_to(repository / name, target_is_directory=True)
     for source in repository.glob("*.py"):
         shutil.copy2(source, root / source.name)

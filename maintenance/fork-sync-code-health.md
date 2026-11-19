@@ -37,6 +37,22 @@ Contract tests: `tests/hermes_cli/test_profiles.py::TestCreateProfile::test_clon
   `tests/tools/test_browser_vault.py`
   `tests/cron/test_cron_live_bot_delivery.py`
 
+## Semantic re-resolution follow-through
+
+The release-sync re-resolution also splits adapter Markdown split guards, busy restart
+redelivery, interrupt-time plugin dispatch, queued copy delivery, shutdown-note target
+reservation, ephemeral reply coercion, progress-lane admission, turn notice callbacks,
+stream tick updates, browser result projection, environment process readers, and sandbox
+image defaults into topical siblings. Moved methods keep their original qualified
+identities and remain inherited by the original classes; late-bound facade imports
+preserve existing monkeypatch seams. The split adds no cap configuration or waivers.
+
+Standalone and environment delivery boundaries log tracebacks at the catch site.
+Profile config reads use coherent runtime-scope bindings, including the single-profile
+launch lane's deliberate unbound home/terminal state. Duplicate Telegram rich-message
+tests retain the newer superset (including inline-fence and ordered-start assertions),
+not the stale second definitions that shadowed it.
+
 ## Retirement and rollback
 
 Retire when a later frozen upstream baseline includes equivalent decomposition.

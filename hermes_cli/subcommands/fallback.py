@@ -6,6 +6,7 @@ from __future__ import annotations
 def build_fallback_parser(subparsers) -> None:
     """Attach the ``fallback`` subcommand to ``subparsers``."""
     from hermes_cli.fallback_cmd import cmd_fallback
+    from hermes_cli.subcommands._shared import add_json_flag
 
     fallback_parser = subparsers.add_parser(
         "fallback", help="Manage fallback providers (tried when the primary model fails)",
@@ -34,4 +35,9 @@ def build_fallback_parser(subparsers) -> None:
     cooldowns_target.add_argument("--all", action="store_true", help="Clear every shared cooldown")
     cooldowns_target.add_argument(
         "target", nargs="?", help="Exact provider/model, or a model name to clear on every provider")
+    check = fallback_subparsers.add_parser(
+        "check", help="Check each fallback entry is usable, without starting an agent session (exit 1 if not)")
+    check.add_argument("--live", action="store_true",
+                       help="Also send one minimal inference request per entry (on that entry's own provider/model)")
+    add_json_flag(check, "Print the results as JSON")
     fallback_parser.set_defaults(func=cmd_fallback)

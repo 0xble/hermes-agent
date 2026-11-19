@@ -119,7 +119,7 @@ async def _seed_caller(runner, home, thread_id="297206", title="Calling Topic", 
 @pytest.mark.parametrize("immediate", [False, True])
 async def test_retire_tool_preserves_immediate_mode(monkeypatch, immediate):
     import gateway.telegram_retire as retirement
-    import tools.send_message_tool as send_tool
+    import gateway.outbound.send as send_tool
     import tools.telegram_topic_tool as topic_tool
 
     runner, source = object(), _source(thread_id="297206")
@@ -146,7 +146,7 @@ async def test_retire_tool_preserves_immediate_mode(monkeypatch, immediate):
 @pytest.mark.parametrize("supplied", ["", "old-generation", "wrong-generation"])
 async def test_retire_tool_fences_preparation_even_when_the_model_omits_generation(monkeypatch, supplied):
     import gateway.telegram_retire as retirement
-    import tools.send_message_tool as send_tool
+    import gateway.outbound.send as send_tool
     import tools.telegram_topic_tool as topic_tool
 
     source = _source(thread_id="297206")

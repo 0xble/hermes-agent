@@ -17,7 +17,7 @@ from tests.gateway.test_telegram_progress_literals import _telegram
 @pytest.mark.parametrize("path", ["send", "rich", "overflow"])
 async def test_worker_send_to_another_destination_cannot_stamp_turn(caplog, scoped, destination, path):
     from model_tools import _run_async
-    from tools.send_message_tool import _dispatch_on_gateway_loop
+    from gateway.outbound.send import _dispatch_on_gateway_loop
 
     caplog.set_level("INFO", logger="gateway.reply_latency")
     adapter = _telegram("always" if path == "rich" else "never")

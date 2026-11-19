@@ -39,17 +39,21 @@ def nested_tool_call_id(task_id) -> str:
     return f"execute_code:{task_id}:{secrets.token_urlsafe(18)}"
 
 
-def _default_dispatch(task_id):
+def _default_dispatch(task_id, session_id=None, turn_id=None, conversation_id=None):
     from model_tools import handle_function_call
+    from tools.file_tools_read_tracking import programmatic_file_read
     from tools.web_search_attribution import search_call_context
 
     def dispatch(tool_name, tool_args):
-        with search_call_context("execute_code_rpc"):
+        with search_call_context("execute_code_rpc"), programmatic_file_read():
             return handle_function_call(
                 tool_name,
                 tool_args,
                 task_id=task_id,
                 tool_call_id=nested_tool_call_id(task_id),
+                session_id=session_id,
+                turn_id=turn_id,
+                conversation_id=conversation_id,
             )
 
     return dispatch
@@ -232,12 +236,13 @@ def _rpc_server_loop(server_sock: socket.socket, task_id: str, tool_call_log: li
 
 def _rpc_poll_loop(env, rpc_dir: str, task_id: str, tool_call_log: list, tool_call_counter: list,
                    max_tool_calls: int, allowed_tools: frozenset, stop_event: threading.Event,
-                   rpc_token: str, deadline: float | None = None):
+                   rpc_token: str, deadline: float | None = None, session_id=None,
+                   turn_id=None, conversation_id=None):
     """Poll the remote filesystem for request files and answer them. Background thread; each
     ``env.execute()`` is an independent process, so this is safe alongside the script-execution
     thread. Malformed or unauthorized requests are removed without a response."""
     cell_deadline.set(deadline)
-    dispatch = _default_dispatch(task_id)
+    dispatch = _default_dispatch(task_id, session_id, turn_id, conversation_id)
     poll_interval = 0.1
     quoted_rpc_dir = shlex.quote(rpc_dir)
     while not stop_event.is_set():
