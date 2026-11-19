@@ -191,12 +191,11 @@ def test_randomized_incremental_equals_full_fold(tmp_path, monkeypatch, caplog, 
                 db.archive_and_compact(
                     "s", compacted, watermark=watermark, tail_count=5,
                     carried_messages=[live[0]], covered_ids=covered if named else None)
-            expected = "display_incremental=1" if mode == "incremental" else "display_fallback=1"
+            expected = "display_incremental=1" if mode in ("incremental", "retry") else "display_fallback=1"
             assert any(expected in record.message for record in caplog.records)
             if mode == "retry":
-                # Rollback preserves the session proof, while total_changes invalidates the
-                # display hint. The real transaction retry uses the base full-fold fallback.
-                assert attempts == ["_AffectedFold", "_FoldPlan"]
+                # Rollback invalidates total_changes without changing the indexed prefix.
+                assert attempts == ["_AffectedFold", "_AffectedFold"]
                 monkeypatch.setattr(db, "_reconcile_display_orders", reconcile)
             assert [tuple(row) for row in db._read_all("SELECT * FROM messages WHERE session_id = 'foreign'")] == foreign
             assert [tuple(row) for row in db._read_all(
@@ -209,6 +208,10 @@ def test_randomized_incremental_equals_full_fold(tmp_path, monkeypatch, caplog, 
 def _interleaved_write(db, conn, mutation):
     schedules = {
         "append": [("INSERT INTO messages(session_id, role, content, timestamp) VALUES ('s', 'user', 'new', 900)", ())],
+        "duplicate_append": [(
+            "INSERT INTO messages(session_id, role, content, timestamp, display_identity, display_order) "
+            "SELECT session_id, role, content, timestamp, display_identity, id FROM messages WHERE id = 2", (),
+        )],
         "unrelated": [("INSERT INTO messages(session_id, role, content, timestamp) VALUES ('other', 'user', 'unrelated', 901)", ())],
         "payload": [("UPDATE messages SET content = 'changed' WHERE id = 2", ())],
         "non_null": [("UPDATE messages SET display_identity = zeroblob(32), display_order = 999 WHERE id = 2", ())],
@@ -225,8 +228,9 @@ def _interleaved_write(db, conn, mutation):
 
 @pytest.mark.parametrize("named", [False, True])
 @pytest.mark.parametrize("external", [False, True])
-@pytest.mark.parametrize("mutation", ["append", "unrelated", "payload", "non_null", "visibility", "delete", "metadata", "rollback"])
-def test_snapshot_interleaving_falls_back(tmp_path, monkeypatch, caplog, named, external, mutation):
+@pytest.mark.parametrize("mutation", ["append", "duplicate_append", "unrelated", "payload", "non_null",
+                                       "visibility", "delete", "metadata", "rollback"])
+def test_snapshot_interleaving_preserves_correctness(tmp_path, monkeypatch, caplog, named, external, mutation):
     db = SessionDB(tmp_path / "interleaving.sqlite")
     try:
         db.create_session("s", source="test")
@@ -274,10 +278,10 @@ def test_snapshot_interleaving_falls_back(tmp_path, monkeypatch, caplog, named, 
         assert not errors
         warning = next(record.message for record in caplog.records
                        if "archive_and_compact" in record.message and "held the write lock" in record.message)
-        # Another connection's rolled-back transaction makes no visible change and
-        # need not advance data_version. Our connection's total_changes does advance.
-        if external and mutation == "rollback":
-            assert "display_incremental=1" in warning or "display_fallback=1" in warning
+        if mutation in ("append", "duplicate_append", "unrelated", "metadata", "rollback"):
+            assert "display_incremental=1" in warning
+            if mutation != "rollback" or not external:
+                assert "display_prefix_revalidated=1" in warning
         else:
             assert "display_fallback=1" in warning
         _assert_full_equivalent(db)
