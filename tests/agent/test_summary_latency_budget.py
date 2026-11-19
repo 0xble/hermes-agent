@@ -108,7 +108,7 @@ def test_offline_checkpoint_quality_and_aux_usage_overrun(caplog):
 
     def fake_llm(**kwargs):
         captured.update(kwargs)
-        prompt = kwargs["messages"][0]["content"]
+        prompt = "\n".join(m["content"] for m in kwargs["messages"] if m["role"] == "user")
         for fact in facts:
             assert fact in prompt
         # Deterministic extractive fake checks the integration, not model compliance.

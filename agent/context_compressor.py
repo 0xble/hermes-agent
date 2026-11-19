@@ -3782,7 +3782,6 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
                 lambda m: self._is_real_user_turn(m) and not is_user_role_scaffolding(m),
                 self._render_tool_args_for_summary,
             )
-            content_to_summarize = TYPED_TURNS_POINTER
         else:
             typed_turns = []
             content_to_summarize = self._bound_summary_input(self._serialize_for_summary(turns_to_summarize))
@@ -3791,7 +3790,10 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         has_user_turn = getattr(self, "_summary_has_user_turn", None)
         if has_user_turn is None:
             has_user_turn = self._transcript_has_real_user_turn(turns_to_summarize)
-        messages = self._build_summary_prompt(content_to_summarize, summary_budget, focus_topic, memory_context, has_user_turn)
+        messages = self._build_summary_prompt(
+            content_to_summarize, summary_budget, focus_topic, memory_context, has_user_turn,
+            typed=getattr(self, "tail_mode", "lean") == "lean",
+        )
         messages[1:1] = typed_turns
         try:
             content = self._call_summary_llm(messages, prompt_started_at)
@@ -3832,7 +3834,7 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
 
     def _build_summary_prompt(
         self, content_to_summarize: str, summary_budget: int, focus_topic: Optional[str],
-        memory_context: str, has_user_turn: bool,
+        memory_context: str, has_user_turn: bool, *, typed: bool = False,
     ) -> list[dict[str, str]]:
         """Assemble the summarizer request (fresh or iterative-update form) as ``[system, user]``.
 
@@ -3845,6 +3847,8 @@ Summary generation was unavailable, so this is a best-effort deterministic fallb
         auxiliary caller (titles, smart approval, MCP sampling) already sends this shape. Ported
         from OpenHands/software-agent-sdk#5143. Focus guidance goes last so it takes precedence.
         """
+        if typed:
+            content_to_summarize = TYPED_TURNS_POINTER
         _memory_section = _memory_provider_section(memory_context)
         _section = _SECTION_INSTRUCTIONS[bool(has_user_turn)]
         _language_and_provenance_rule = _section["language"]
