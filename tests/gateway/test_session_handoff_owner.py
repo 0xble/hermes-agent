@@ -110,6 +110,7 @@ async def test_handoff_waits_for_durable_work_the_owner_has_no_task_for(tmp_path
     the conversation: the request is refused, and so is the watcher's repoint of a row queued before
     the turn was admitted, so the route never moves while its outcome is unresolved."""
     import hermes_state_runtime as rt
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     from tests.gateway.test_authority_cold_route_recovery import _source
     from tests.gateway.test_handoff_local_receipt import _handoff
     _telegram_home(tmp_path, monkeypatch)
@@ -119,7 +120,7 @@ async def test_handoff_waits_for_durable_work_the_owner_has_no_task_for(tmp_path
     rt.admit_session_input(authority.db, epoch=authority.epoch, principal_id=owner.actor.subject,
                            session_id=ref.session_id, request_id='lost', payload={'text': 'pending work'})
     rt.claim_session_input(authority.db, epoch=authority.epoch, session_id=ref.session_id)
-    authority.epoch = rt.begin_runtime_epoch(authority.db, instance_id='restarted')
+    authority.epoch = begin_runtime_epoch(authority.db, instance_id='restarted')
     rt.recover_session_inputs(authority.db, epoch=authority.epoch)
     with pytest.raises(RuntimeError, match='/discard'):
         await _handoff(authority.runner, authority, ref.session_id, _source())

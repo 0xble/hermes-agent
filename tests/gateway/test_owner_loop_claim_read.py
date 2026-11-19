@@ -23,10 +23,11 @@ async def test_claim_pending_read_keeps_the_owner_loop_ticking(tmp_path, monkeyp
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_contract import SessionRef
     from hermes_state import SessionDB
+    from tests.fakes.runtime_owner import begin_runtime_epoch
     db = SessionDB(tmp_path / 'state.db')
     db.create_session('s', source='cron')
     authority = SessionAuthority(SimpleNamespace(_draining=False, adapters={}), profile_id='p', instance_id='t',
-                                 db=db, epoch=rt.begin_runtime_epoch(db, instance_id='t'))
+                                 db=db, epoch=begin_runtime_epoch(db, instance_id='t'))
     live = authority.sessions['s'] = LiveSession(SimpleNamespace(platform=None, user_id='u'), 'route')
     row = rt.admit_session_input(db, epoch=authority.epoch, principal_id='u', session_id='s',
                                  request_id='r1', payload={'text': 'x'})
