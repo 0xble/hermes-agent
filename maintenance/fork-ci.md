@@ -1,5 +1,13 @@
 # Fork CI reliability
 
+## Prompt-prefix journey isolation
+
+Fork patch identity: `release-qualification`.
+
+The cross-surface prompt-prefix journey runs in its own file so the default 300-second watchdog applies independently of the CLI-only and TUI-only restart journeys. Both files use the same fixture and assertion helper to verify the cached prefix and durable history. Retire the split when the selected upstream suite gives these journeys independent execution bounds.
+
+Contract tests: `tests/e2e/core/history/test_prefix_stability.py`, `tests/e2e/core/history/test_prefix_stability_surface_switch.py`.
+
 ## Reset cleanup fixture scope
 
 The reset resource-cleanup probe has a cached agent but no persisted old
