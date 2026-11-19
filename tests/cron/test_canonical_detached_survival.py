@@ -230,7 +230,10 @@ async def test_cron_worker_registration_still_requires_adoption_capability(tmp_p
     from tests.cron.test_cron_recovery import _owner
 
     owner, db = _owner(tmp_path, monkeypatch)
-    monkeypatch.setattr(session_worker, '_claim', lambda *args: 'producer-claim')
+    async def claim(*_args):
+        return 'producer-claim'
+
+    monkeypatch.setattr(session_worker, '_claim', claim)
     connection = SimpleNamespace(authority=owner, actor=SessionActor(
         'human', str(tmp_path), frozenset({'session:control'}), 'test'))
     params = {'profile_id': str(tmp_path), 'session_id': 'cron-session', 'execution_id': 'cron-worker:fire',

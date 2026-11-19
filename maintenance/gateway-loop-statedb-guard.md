@@ -33,6 +33,9 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   session-store executor. Manual `/compress` resolves persisted reasoning and attended routing
   on the context-preserving worker before building the compressor. Both paths have regressions
   that arm the production loop lock guard.
+- Worker RPCs fence the live producer and its durable identity on the bounded session-store
+  executor. The owner checks that its profile is still serving before proceeding after each
+  read. The same checks cover adoption, persistence, child reservation, and delegation.
 - 2026-10-25 sweep of the sites the guard named on the live gateway (about 120 active agents,
   writer-lock holds of 3-13 s, two exit-75 kills): attended route resolution takes the durable
   activity stamp and `get_attended_route_active` from the off-loop resolution snapshot; turn
