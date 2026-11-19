@@ -1402,6 +1402,8 @@ def _preview_action_request(sid: str, payload: dict) -> str:
     """
     with _sessions_lock:
         session = _sessions.get(sid)
+        if session is not None and _has_model_pin(model_override):
+            session["model_pinned"] = True
         if session is None:
             # detached caller: throwaway record, plain bridge, unprobed ({} is falsy but a REAL record)
             session = {}
