@@ -127,7 +127,7 @@ def test_copy_block_bodies_are_redacted_before_egress():
 
     send = AsyncMock(return_value={"success": True})
     with patch("gateway.config.load_gateway_config", return_value=_telegram_cfg()), \
-         patch("tools.send_message_tool._send_to_platform", new=send), \
+         patch("gateway.outbound.send._send_to_platform", new=send), \
          patch("sys.is_finalizing", return_value=False):
         _deliver_result(_job(), f"{BODY}\n[[copy]]\nexport KEY={FAKE_SECRET}\n[[/copy]]")
     assert send.call_count >= 2, "copy block was not sent separately"
