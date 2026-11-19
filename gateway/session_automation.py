@@ -652,7 +652,12 @@ def snapshot_automation(authority, adapter, event, identity, captured=None):
                                          ref=captured[1] if captured is not None else None)
     from gateway.session_envelope import restore_native
     owner = captured[2] if captured is not None else authority.logical_owner(entry.session_id)
-    envelope = wake_route_envelope(authority, entry, event.metadata.get('requester_user_id'))
+    requester = event.metadata.get('requester_user_id')
+    envelope = wake_route_envelope(authority, entry, requester)
+    if envelope is None and (requester or _reset_predecessor(authority.db, owner, {owner})):
+        # The pre-ledger bridge is not a substitute for a requester's human proof or a
+        # reset lineage with no eligible envelope. A stored origin alone cannot supply either.
+        raise RuntimeStoreError('not_found', field='automation_envelope')
     if envelope is None or route_rebound(entry, envelope):
         # No committed human source on this route yet: revalidate the current origin against the
         # live adapter like native ingress. It mints no proof and refuses relay/role origins.
