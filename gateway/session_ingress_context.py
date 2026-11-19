@@ -264,6 +264,19 @@ def capture_provenance(runner, event):
         owner = (adapter, context[3])
     else:
         owner = runner._transport_owner(event.source)
+        if owner is None:
+            # The callback has already authenticated this event and _binding has resolved the
+            # currently registered adapter for the callback's profile and home.  A source carried
+            # across an adapter reconnect can retain a dead weak reference, though, which makes
+            # _transport_owner return None even while the authenticated callback is live.  Rebind
+            # only an absent/dead reference.  A live reference to another adapter remains a hard
+            # failure so a swapped or forged source cannot borrow the current callback's route.
+            adapter_ref = getattr(event.source, '_transport_adapter_ref', None)
+            prior_adapter = adapter_ref() if callable(adapter_ref) else None
+            if prior_adapter is not None:
+                raise RuntimeStoreError('not_found')
+            event.source._transport_adapter_ref = weakref.ref(adapter)
+            owner = runner._transport_owner(event.source)
     if owner is None or owner[0] is not adapter or home != context[2]:
         raise RuntimeStoreError('not_found')
     return provenance
