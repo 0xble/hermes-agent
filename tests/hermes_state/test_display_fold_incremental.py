@@ -191,11 +191,12 @@ def test_randomized_incremental_equals_full_fold(tmp_path, monkeypatch, caplog, 
                 db.archive_and_compact(
                     "s", compacted, watermark=watermark, tail_count=5,
                     carried_messages=[live[0]], covered_ids=covered if named else None)
-            expected = "display_incremental=1" if mode in ("incremental", "retry") else "display_fallback=1"
+            expected = "display_incremental=1" if mode == "incremental" else "display_fallback=1"
             assert any(expected in record.message for record in caplog.records)
             if mode == "retry":
-                # Rollback invalidates total_changes without changing the indexed prefix.
-                assert attempts == ["_AffectedFold", "_AffectedFold"]
+                # Rollback invalidates total_changes. This legacy fixture has missing
+                # identities, so the original prefix cannot certify a retry.
+                assert attempts == ["_AffectedFold", "_FoldPlan"]
                 monkeypatch.setattr(db, "_reconcile_display_orders", reconcile)
             assert [tuple(row) for row in db._read_all("SELECT * FROM messages WHERE session_id = 'foreign'")] == foreign
             assert [tuple(row) for row in db._read_all(
@@ -214,6 +215,7 @@ def _interleaved_write(db, conn, mutation):
         )],
         "unrelated": [("INSERT INTO messages(session_id, role, content, timestamp) VALUES ('other', 'user', 'unrelated', 901)", ())],
         "payload": [("UPDATE messages SET content = 'changed' WHERE id = 2", ())],
+        "payload_without_identity": [("UPDATE messages SET content = 'changed' WHERE id = 2", ())],
         "non_null": [("UPDATE messages SET display_identity = zeroblob(32), display_order = 999 WHERE id = 2", ())],
         "visibility": [("UPDATE messages SET active = 1 WHERE id = 1", ())],
         "delete": [("DELETE FROM messages WHERE id = 2", ())],
@@ -229,7 +231,7 @@ def _interleaved_write(db, conn, mutation):
 @pytest.mark.parametrize("named", [False, True])
 @pytest.mark.parametrize("external", [False, True])
 @pytest.mark.parametrize("mutation", ["append", "duplicate_append", "unrelated", "payload", "non_null",
-                                       "visibility", "delete", "metadata", "rollback"])
+                                       "visibility", "delete", "metadata", "rollback", "payload_without_identity"])
 def test_snapshot_interleaving_preserves_correctness(tmp_path, monkeypatch, caplog, named, external, mutation):
     db = SessionDB(tmp_path / "interleaving.sqlite")
     try:
@@ -238,6 +240,8 @@ def test_snapshot_interleaving_preserves_correctness(tmp_path, monkeypatch, capl
         db.append_messages_batch("s", [{"role": "assistant", "content": f"row {i}", "timestamp": 100 + i}
                                        for i in range(8)])
         db._write_sql("UPDATE messages SET active = 0, compacted = 0 WHERE id = 1")
+        if mutation == "payload_without_identity":
+            db._write_sql("UPDATE messages SET display_identity = NULL, display_order = NULL WHERE id = 2")
         live = db.get_messages_as_conversation("s", include_row_ids=True)
         entered, release = threading.Event(), threading.Event()
         original_key = db._display_dedupe_key

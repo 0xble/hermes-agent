@@ -83,7 +83,7 @@ identity and order columns of the session's old visible prefix using its
 display indexes. The snapshot and its high-water row ID come from the same
 reader transaction. An equal prefix keeps the affected-group path and includes
 new rows above the high-water ID. Connection replacement, a changed prefix,
-unknown storage types, and read errors retain the full-fold fallback. The
+missing identities, unknown storage types, and read errors retain the full-fold fallback. The
 `display_prefix_revalidated` counter identifies this path in lock warnings.
 
 Independent snapshot reads use the reader pool's IOERR retry and storage-error

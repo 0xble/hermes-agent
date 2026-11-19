@@ -85,14 +85,13 @@ def _display_prefix_signature(conn, session_id: str, anchor: int) -> bytes | Non
         (_DISPLAY_IDENTITY_INDEX_SQL, "display_identity, display_order, id"),
         (_DISPLAY_BACKFILL_INDEX_SQL, "id"),
     ):
-        # Only accept the declared BLOB/INTEGER representations. Historical or
-        # unusual storage classes still use the existing authoritative full fold.
+        # A payload edit can leave a missing identity NULL, so such a row
+        # cannot certify the snapshot. Unexpected storage classes also fall back.
         invalid, encoded = conn.execute(
             "SELECT count(*) != count(cell), group_concat(cell, '|') FROM ("
-            "SELECT CASE WHEN typeof(display_identity) IN ('blob', 'null') "
+            "SELECT CASE WHEN typeof(display_identity) = 'blob' "
             "AND typeof(display_order) IN ('integer', 'null') THEN "
-            "id || ':' || CASE WHEN display_identity IS NULL THEN 'n' ELSE hex(display_identity) END "
-            "|| ':' || coalesce(display_order, 'n') END AS cell "
+            "id || ':' || hex(display_identity) || ':' || coalesce(display_order, 'n') END AS cell "
             f"FROM ({query} AND id <= ? ORDER BY {order}))",
             (session_id, anchor),
         ).fetchone()
