@@ -592,6 +592,15 @@ class SessionAuthority:
         if fingerprint := getattr(event, '_ingress_sha256', None):
             payload['native_text_v1']['ingress_sha256'] = fingerprint  # the delivery before a rewrite
         self._require_admission_open()
+        # The adapter can be reaped after ``prepare_native`` captures the route but before the
+        # source is restored for the durable admission.  Wait for the reconnect watcher to refill
+        # an empty slot before treating that transient gap as a lost message.  Identity and profile
+        # checks still belong to ``restore_native_source`` below.
+        from gateway.session_ingress_context import await_reconnecting_adapter
+        await await_reconnecting_adapter(
+            self.runner, payload['native_text_v1'],
+            lambda: getattr(self.runner, '_draining', False) or self.retiring,
+        )
         source = restore_native_source(payload)  # no re-hash of the just-captured media on the loop
         from gateway.session_runtime_workers import tracked_write
         ref = self._publish_route(source, *await tracked_write(self, partial(self._reserve_route, source)))
