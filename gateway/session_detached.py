@@ -149,29 +149,35 @@ def watch_routes(runner, store) -> None:
     so nothing on the loop sees the new route before the conversation it replaced has left it."""
     loop = asyncio.get_running_loop()
 
-    def route_named(route, session_id, origin):
+    def route_named(route, entry):
         authority = _route_authority(runner, store, route)
+        origin = entry.origin
         if authority is None or origin is None:
             return
 
-        def name():
-            # Writers announce outside the store lock, so announcements can land out of order: one
-            # the store has since moved past (a worker's /resume overtaken by a /new) would hand the
-            # chat back a conversation it left; the newer write announces itself. Compared by logical
-            # owner: a compression repoint since (unannounced) is still the same conversation.
-            current = store.lookup_by_session_key(route)
-            owner = authority.logical_owner(session_id)
-            if current is None or authority.logical_owner(current.session_id) != owner:
-                return
-            authority.name_lane(route, owner, origin)
+        version, session_id = entry._route_version, entry.session_id
+
+        def name(owner):
+            # Writers announce outside the lock and can finish out of order. An
+            # actual conversation switch changes the identity. Compression keeps it.
+            if store._route_is_current(route, version):
+                authority.name_lane(route, owner, origin)
+
+        async def publish_from_loop():
+            from gateway.session_store_async import run_store_call
+            name(await run_store_call(authority.logical_owner, session_id))
+
         try:
             on_loop = asyncio.get_running_loop() is loop
         except RuntimeError:
             on_loop = False
+        if not store._route_is_current(route, version):
+            return
         if on_loop:
-            name()
+            loop.create_task(publish_from_loop())
         elif not loop.is_closed():
-            loop.call_soon_threadsafe(name)
+            owner = authority.logical_owner(session_id)
+            loop.call_soon_threadsafe(name, owner)
     store.route_named = route_named
 
 

@@ -612,6 +612,9 @@ class SessionEntry:
     # deletion is an in-memory post-delivery callback a restart drops, so boot deletes the cards a
     # dead process recorded. Omitted from JSON when empty.
     progress_cards: list[dict[str, Any]] = field(default_factory=list)
+    # Metadata copies and compression advances keep this in-memory identity.
+    # A conversation switch replaces the entry with a new identity.
+    _route_version: object = field(default_factory=object, compare=False, repr=False)
 
     # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
