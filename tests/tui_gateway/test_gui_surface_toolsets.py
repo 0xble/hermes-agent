@@ -25,7 +25,6 @@ GUI_TOOLS = {
     "focus_pane",
     "read_terminal",
     "read_window_below",
-    "react_to_message",
     "setup_mcp",
     "show_tip",
     "gui_tour",
@@ -49,7 +48,9 @@ class TestDesktopUiToolset:
         # (pre-existing ordering flake, surfaced by the #97979 test sweep).
         from tools.registry import discover_builtin_tools
         discover_builtin_tools()
-        assert set(resolve_toolset("desktop_ui")) == GUI_TOOLS | {"apply_layout"}
+        # Reactions are also available to messaging adapters, but desktop_ui
+        # retains its explicit opt-in selection for desktop sessions.
+        assert set(resolve_toolset("desktop_ui")) == GUI_TOOLS | {"apply_layout", "react_to_message"}
 
     def test_stays_off_the_core_tool_list(self):
         """Core ships on every API call — a GUI-only tool must not be there."""

@@ -20,7 +20,7 @@ _HERMES_CORE_TOOLS = [
     "browser_vision", "browser_console", "browser_cdp", "browser_dialog",
     "browser_vault_list", "browser_vault_unlock", "browser_vault_fill", "browser_vault_save_login", "browser_vault_enter_code",  # ride with the browser
     "browser_exec",  # replaces the other browser tools when browser.backend is "browser-use"
-    "text_to_speech",
+    "text_to_speech", "react_to_message",
     "todo_list", "memory",
     "session_search",
     "clarify",
@@ -134,6 +134,7 @@ TOOLSETS = {
     # GUI-renderer affordances, enabled per desktop-sourced SESSION by the GUI
     # gateway (tui_gateway/server.py::_load_enabled_toolsets) — never by a
     # process env var, which is blind to a desktop client on a remote backend.
+    "reactions": _ts("React to a gateway or desktop message", ["react_to_message"]),
     "desktop_ui": _ts(
         "Desktop GUI affordances — in-app terminal/browser panes, pane focus, "
         "reactions (GUI sessions only)",

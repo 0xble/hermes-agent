@@ -3011,6 +3011,9 @@ def _normalize_empty_agent_response(
     (``HTTP 400: {...}``) is rewritten too: returned unchanged, chat sanitizers turn it into a
     generic provider-failed reply and the user never sees /compact. Curated agent text survives.
     """
+    from gateway.response_filters import reaction_answered
+    if not response and reaction_answered(agent_result):
+        return ""
     is_overflow = is_context_overflow_failure_result(agent_result, history_len)
     if response and not (is_overflow and _looks_like_gateway_provider_error(response)):
         return response
