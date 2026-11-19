@@ -1373,7 +1373,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
 
     # busy_handler key (hermes_cli/commands.py CommandDef) → mid-run variant ``_busy_<key>_command``.
     _BUSY_SPECIAL_HANDLERS: dict[str, str] = {
-        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop", "moa")
+        k: f"_busy_{k}_command" for k in ("start", "stop", "new", "queue", "steer", "egress", "goal", "loop")
     }
 
     async def _dispatch_busy_slash_command(self, event: MessageEvent, cmd_def, quick_key: str, source):
@@ -1401,7 +1401,8 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
             if reject_key is not None:
                 return t(reject_key)
         if policy == "defer_until_idle":
-            if name == "moa" and not (event.get_command_args() or "").strip():
+            prompt = (event.get_command_args() or "").strip() if name == "moa" else None
+            if prompt == "":
                 from hermes_cli.moa_config import moa_usage
                 return moa_usage()
             adapter = self._delivery_adapter_for(source)
@@ -1412,6 +1413,11 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
                 # acknowledged once, so wait silently for the turn to release it.
                 adapter.park_deferred_command(quick_key, event)
                 return None
+            if prompt is not None:
+                # Durable messaging routes queue the prompt itself; other routes replay the command.
+                from gateway.session_moa_turn import queue_busy_moa
+                if await queue_busy_moa(self, event, quick_key, source, adapter, prompt):
+                    return None
             depth = adapter.defer_command_until_idle(quick_key, event)
             if depth is None:
                 limit = getattr(adapter, "_MAX_DEFERRED_COMMANDS_PER_SESSION", "the configured limit")
@@ -1522,10 +1528,6 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
             reply_expected=event.reply_expected,
             edit_revision=event.edit_revision,  # an edited /queue is its own input (admission id)
         )
-
-    async def _busy_moa_command(self, event: MessageEvent, quick_key: str, source):
-        from gateway.session_moa_turn import queue_busy_moa
-        return await queue_busy_moa(self, event, quick_key, source)
 
     async def _busy_steer_command(self, event: MessageEvent, quick_key: str, source):
         # /steer lands BETWEEN tool-call iterations of the same run (appended to the last tool
