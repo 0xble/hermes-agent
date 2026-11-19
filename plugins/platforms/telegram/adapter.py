@@ -4703,7 +4703,6 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             await self._edit_text(chat_id, message_id, render_copy_blocks_inline(plain))
         return False
 
-    @durable_egress("edit_message")
     async def _after_legacy_edit(
         self, chat_id: str, message_id: str, content: str, finalize: bool, saturated_preview: bool,
     ) -> None:
@@ -4712,6 +4711,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         if finalize:
             await self._record_sent_text(chat_id, message_id, quotable_text(content))
 
+    @durable_egress("edit_message")
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False, metadata: Optional[dict[str, Any]] = None,
        ) -> SendResult:
