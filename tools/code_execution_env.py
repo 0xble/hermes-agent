@@ -107,16 +107,18 @@ def _scrub_child_env(source_env, is_passthrough=None, is_windows=None, toolchain
     # a process boundary: strip dispatcher-owned Kanban vars AFTER the scrub so an explicit
     # passthrough cannot re-grant a delegated child the parent's board mutation capability.
     from agent.delegation_context import (
-        DELEGATED_CHILD_ENV_MARKER, DELEGATED_PARENT_SESSION_ENV, delegated_child_subprocess_env,
+        DELEGATED_CHILD_ENV_MARKER, DELEGATED_PARENT_SESSION_ENV,
+        KANBAN_HOME_FENCED_ENV, KANBAN_HOME_INJECTED_ENV, delegated_child_subprocess_env,
     )
     from agent.relay_guard import RELAY_PARENT_ADDRESS_ENV
     scoped = delegated_child_subprocess_env(source_env)
     # Preserve location only when carrying the descendant fence, not for arbitrary
     # non-allowlisted HERMES_* values in otherwise ordinary execution environments.
-    if scoped.get(DELEGATED_CHILD_ENV_MARKER):
+    if scoped and scoped.get(DELEGATED_CHILD_ENV_MARKER):
         # The parent identity rides with the fence so the sandbox's own `relay send`
         # to its parent is refused by relay (relay C27).
         for key in (DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD",
+                    "HERMES_KANBAN_HOME", KANBAN_HOME_INJECTED_ENV, KANBAN_HOME_FENCED_ENV,
                     DELEGATED_PARENT_SESSION_ENV, RELAY_PARENT_ADDRESS_ENV):
             if key in scoped:
                 scrubbed[key] = scoped[key]
@@ -158,6 +160,8 @@ def _build_child_env(*, rpc_endpoint: str, rpc_token: str, tmpdir: str,
     if _home_override:
         child_env["HERMES_HOME"] = _home_override
         apply_scratch_tmp_env(child_env)  # TMPDIR follows the routed home, like HOME does
+    from tools.environments.local import _replace_default_profile_home
+    _replace_default_profile_home(child_env)
     # PYTHONPATH: the staging dir (hermes_tools.py) must always be importable even when project
     # mode changes CWD. Hermes's root is added ONLY when the child runs in Hermes's Python env —
     # exposing Hermes's site-packages to an external interpreter can mix incompatible compiled

@@ -102,7 +102,10 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
     safe_names = {name for name in excluded_names if isinstance(name, str) and name}
     extra_unset = "".join(f" {shlex.quote(name)}" for name in sorted(safe_names))
     return (
-        "{ ( unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
+        "{ ( if [ -n \"${HERMES_KANBAN_HOME_INJECTED-}\" ] && "
+        "[ \"${HERMES_KANBAN_HOME-}\" = \"$HERMES_KANBAN_HOME_INJECTED\" ]; then "
+        "unset HERMES_KANBAN_HOME; fi; "
+        "unset ${!HERMES_SESSION_*} ${!HERMES_CRON_AUTO_DELIVER_*} "
         # AI_AGENT / HERMES_AGENT are per-command attribution markers re-exported
         # by every wrapper with ${VAR:-default} semantics; persisting them would
         # let the FIRST command's value override a later outer-harness value.
@@ -118,6 +121,9 @@ def _export_dump_excluding_session_vars(tmp_path: str, excluded_names: Iterable[
         # leaked token in the snapshot would re-export into every later command
         # on the backend and outlive the private dir it protects.
         "${!HERMES_RPC_*} HERMES_KERNEL_DIR ${!HERMES_BROWSER_CONTROL_*} "
+        # The injected Kanban fallback and its provenance are process-boundary
+        # metadata, never persistent user shell state.
+        "HERMES_KANBAN_HOME_INJECTED HERMES_KANBAN_HOME_FENCED "
         f"HERMES_UI_SESSION_ID{extra_unset} 2>/dev/null; "
         "export -p; ) || true; } "
         f"> {tmp_path}")

@@ -105,10 +105,13 @@ def test_shared_snapshot_no_cross_session_leak(tmp_path):
 def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
     """Run the real dump: nothing the gateway bridges per command, nor the
     delegate_task marker, may survive ``export -p``; ordinary exports must."""
-    from agent.delegation_context import DELEGATED_CHILD_ENV_MARKER
+    from agent.delegation_context import (
+        DELEGATED_CHILD_ENV_MARKER, KANBAN_HOME_FENCED_ENV, KANBAN_HOME_INJECTED_ENV,
+    )
     from gateway.session_context import _VAR_MAP
 
-    scoped = [*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER]
+    scoped = [*_VAR_MAP, DELEGATED_CHILD_ENV_MARKER, "HERMES_KANBAN_HOME",
+              KANBAN_HOME_INJECTED_ENV, KANBAN_HOME_FENCED_ENV]
     exports = "; ".join([f'export {n}="x"' for n in scoped] + ['export HERMES_HOME="/h"', 'export MYVAR="keep"'])
     out = subprocess.run(
         ["bash", "-c", f"{exports}; {_export_dump_excluding_session_vars('/dev/stdout')}"],
@@ -117,6 +120,19 @@ def test_export_dump_drops_every_bridged_var_and_the_delegation_marker():
     assert not leaked, f"persisted into the snapshot: {leaked}"
     assert 'declare -x HERMES_HOME="/h"' in out
     assert 'declare -x MYVAR="keep"' in out
+
+
+@pytest.mark.platforms("posix")  # POSIX bash snapshot path
+@pytest.mark.parametrize("home", ["injected", "explicit"])
+def test_snapshot_keeps_only_an_explicit_kanban_home(home):
+    command = (
+        'export HERMES_KANBAN_HOME_INJECTED="injected"; '
+        f'export HERMES_KANBAN_HOME="{home}"; '
+        f"{_export_dump_excluding_session_vars('/dev/stdout')}"
+    )
+    out = subprocess.run(["bash", "-c", command], capture_output=True, text=True, check=True).stdout
+    assert 'declare -x HERMES_KANBAN_HOME_INJECTED=' not in out
+    assert ('declare -x HERMES_KANBAN_HOME=' in out) == (home == "explicit")
 
 
 @pytest.mark.platforms("posix")  # POSIX bash snapshot path
