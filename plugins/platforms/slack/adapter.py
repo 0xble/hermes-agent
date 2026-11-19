@@ -6042,28 +6042,23 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackReactionsMixin, SlackThreadSt
         meta_key = f"slack_thread_watermark:{channel_id}:{thread_ts}"
         return getattr(session_store, method)(session_key, meta_key, *args)
 
-    async def _get_thread_watermark(
+    def _get_thread_watermark(
         self, channel_id: str, thread_ts: str, user_id: str, team_id: str = "") -> str:
-        """Return the last Slack thread ts this session consumed (persisted). Read in a worker: the
-        store's lock is held across its state.db writes, which must not stall the event loop."""
+        """Return the last Slack thread ts this session consumed (persisted)."""
         try:
-            return str(await asyncio.to_thread(
-                self._thread_watermark_io, "get_session_metadata", channel_id, thread_ts, user_id,
-                team_id, "") or "")
+            return str(self._thread_watermark_io(
+                "get_session_metadata", channel_id, thread_ts, user_id, team_id, "") or "")
         except Exception:
             return ""
 
-    async def _set_thread_watermark(
+    def _set_thread_watermark(
         self, channel_id: str, thread_ts: str, user_id: str, watermark_ts: str, team_id: str = ""
     ) -> None:
-        """Persist the latest thread ts seen (session metadata, survives restarts). A full
-        routing-index save (state.db + the fsynced sessions.json mirror): in a worker, never on
-        the event loop."""
+        """Persist the latest thread ts seen (session metadata, survives restarts)."""
         if not watermark_ts:
             return
         try:
-            await asyncio.to_thread(
-                self._thread_watermark_io,
+            self._thread_watermark_io(
                 "set_session_metadata", channel_id, thread_ts, user_id, team_id, watermark_ts)
         except Exception:
             logger.debug("[Slack] Failed to persist thread watermark", exc_info=True)
