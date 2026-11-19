@@ -88,10 +88,15 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
 - Compaction recomputes historical display identities on a pooled-reader snapshot before
   taking `SessionDB._lock`. Under the writer lock it folds from the display indexes and
   recomputes only new or changed rows, including user `display_metadata` edits not watched
-  by the identity trigger. Rows inserted after the snapshot already carry their canonical
-  display identity, so they are reused without a payload decode under the writer lock. A
-  missing reader or display index retains the full-scan fallback.
+  by the identity trigger. Ordinary rows inserted after the snapshot already carry their
+  canonical display identity, so the writer reuses it without decoding their payloads.
+  New summary carriers with a message UID still resolve against the original reply so the
+  display and export fold presents it once. A missing reader or display index retains the
+  full-scan fallback.
   Branch refreshes must preserve this off-lock path and its regression coverage.
+- HTTP admission binds, restores, and checks API sessions through the tracked worker steps.
+  Response retries and the subsequent claim and execution checks also restore off the owner
+  loop, so the session-store lock cannot stall unrelated gateway traffic at those boundaries.
 - Generation stamping checkpoints only until its `application_id` is visible in the main DB file.
   A reader can block the first PASSIVE checkpoint and leave both the header and `state_meta` row
   WAL-only; later warm opens retry until the header is durable. The lock-safe header probe avoids

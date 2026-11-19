@@ -4,6 +4,7 @@ import logging
 from contextvars import ContextVar
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
+from functools import partial
 
 from gateway.platforms.event import MessageEvent, ProcessingOutcome
 from gateway.session_envelope import restore_native
@@ -520,7 +521,8 @@ async def execute_admission(authority, ref, row):
         async with _admission_scope(authority, home, row, event, captured):
             if is_api:
                 # Committed media resolves under the owning profile's home, like admission did.
-                prepared = prepare_api_execution(authority, ref, row['payload'])
+                from gateway.session_runtime_workers import tracked_write
+                prepared = await tracked_write(authority, partial(prepare_api_execution, authority, ref, row['payload']))
                 api_execution.set(prepared)
                 if isinstance(event.text, list):
                     # The durable transcript keeps the committed media references (the same

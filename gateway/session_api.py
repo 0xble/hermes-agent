@@ -98,7 +98,7 @@ def run_steps(steps):
         try:
             write = steps.throw(error) if error is not None else steps.send(result)
         except StopIteration as done:
-            return _restore_value(done.value)
+            return done.value
         try:
             result, error = write(), None
         except Exception as exc:  # health: allow BLE001 -- not swallowed: thrown back into the steps, which re-raise it
@@ -133,8 +133,7 @@ async def run_steps_off_loop(authority, steps, *, orphaned=None):
             return await drive()
     task = track_mutation(authority, serialized())
     try:
-        result = await asyncio.shield(task)
-        return await asyncio.to_thread(_restore_value, result)
+        return await asyncio.shield(task)
     except asyncio.CancelledError:
         if orphaned is not None:
             task.add_done_callback(lambda done: done.cancelled() or done.exception() or orphaned(done.result()))
@@ -266,32 +265,7 @@ def bind_api_steps(authority, session_id, *, hosted_dispatch=None, declared_key=
         conn.execute('INSERT INTO state_meta(key,value) VALUES(?,?)',
                      (_BINDING_PREFIX + session_id, _json(receipt)))
     yield partial(authority.db._execute_write, write)
-    return _RestoreApiSession(authority, session_id)
-
-
-class _RestoreApiSession:
-    """Defer the in-memory route restore until the admission worker is off the gateway loop."""
-
-    def __init__(self, authority, session_id):
-        self.authority = authority
-        self.session_id = session_id
-
-    def __call__(self):
-        return restore_api_session(self.authority, self.session_id)
-
-
-def _restore_value(value):
-    """Resolve deferred API restores wherever a write-step result carries one.
-
-    API admission composes several write-step generators, so ``bind_api_steps``'s
-    deferred restore can be nested inside the tuple returned by the outer
-    admission. Resolve it only after the write drive leaves the gateway loop.
-    """
-    if isinstance(value, _RestoreApiSession):
-        return value()
-    if isinstance(value, tuple):
-        return tuple(_restore_value(item) for item in value)
-    return value
+    return (yield partial(restore_api_session, authority, session_id))
 
 
 def _heal_replacement(conn, caller, holder):
