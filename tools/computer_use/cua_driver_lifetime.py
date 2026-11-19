@@ -38,7 +38,6 @@ except ImportError:  # psutil is optional on some platforms; each probe imports 
 # denied or a zombie (psutil.Error), or an OS-level failure. Each probe treats these as "unknown".
 _PROBE_ERRORS: tuple[type[BaseException], ...] = (ImportError, OSError, _PsutilError)
 
-_OWNER_GRACE_SECONDS = 5.0
 _KILL_WAIT_SECONDS = 0.3
 _SOCKET_PREFIX = "hc-"
 _APP_BINARY = "/Applications/CuaDriver.app/Contents/MacOS/cua-driver"
@@ -171,6 +170,29 @@ def owner_is_alive(socket_path: str) -> bool:
     except (TypeError, ValueError):
         created_f = None
     return pid_alive(pid, created_f)
+
+
+def _recorded_owner_exited(socket_path: str) -> bool:
+    """Authoritatively distinguish an exited owner from an unreadable one."""
+    record = read_owner_record(socket_path)
+    pid = record.get("pid") if record is not None else None
+    if type(pid) is not int or not 1 < pid <= 2_147_483_647:
+        return False
+    try:
+        import psutil
+    except ImportError:
+        return False
+    try:
+        owner = psutil.Process(pid)
+        if owner.status() == psutil.STATUS_ZOMBIE:
+            return True
+        recorded_birth = record.get("create_time")
+        return (isinstance(recorded_birth, (int, float))
+                and abs(owner.create_time() - recorded_birth) > 0.05)
+    except psutil.NoSuchProcess:
+        return True
+    except (psutil.Error, OSError):
+        return False
 
 
 def remove_owner_record(socket_path: str) -> None:
@@ -423,8 +445,6 @@ def sweep_orphaned_embedded_drivers(
     temp_dirs: list[str] | None = None,
     username: str | None = None,
     kill=None,
-    now: float | None = None,
-    grace_seconds: float = _OWNER_GRACE_SECONDS,
 ) -> list[int]:
     """Reap ppid-1 embedded drivers whose owner is dead, and remove stale ``hc-`` sockets.
 
@@ -436,7 +456,6 @@ def sweep_orphaned_embedded_drivers(
         return []
     user = username if username is not None else _current_username()
     procs = list(processes) if processes is not None else scan_processes()
-    moment = time.time() if now is None else now
     signal = kill or kill_process_group
     reaped: list[int] = []
     live_sockets: set[str] = set()
@@ -446,10 +465,13 @@ def sweep_orphaned_embedded_drivers(
             continue
         if user and proc.username and proc.username != user:
             continue
-        if proc.ppid != 1 or owner_is_alive(socket_path) or _live_parent_client(socket_path, procs, proc.pid):
+        if proc.ppid != 1 or _live_parent_client(socket_path, procs, proc.pid):
             live_sockets.add(socket_path)
             continue
-        if read_owner_record(socket_path) is None and moment - proc.create_time < grace_seconds:
+        # Missing ownership is unknown, including drivers created by an older
+        # build or one whose startup record failed. Never kill a live ppid-1
+        # driver without positive evidence that its recorded owner is dead.
+        if not _recorded_owner_exited(socket_path):
             live_sockets.add(socket_path)
             continue
         signal(proc.pid)

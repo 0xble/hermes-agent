@@ -1381,7 +1381,7 @@ def camofox_close_tab(task_id: Optional[str] = None, tab_id: Optional[str] = Non
                     session["tab_id"] = target
                 if was_reserved:
                     session.setdefault("tab_ids", set()).add(target)
-            leases.release(server, user, target)
+            # A restored owned tab must remain fenced across processes until closure is confirmed.
             return tool_error(f"Tab closure was not confirmed: {error}", success=False, closed=False)
         _stale_tab_ids.setdefault(user, set()).add(target)
         _clear_tab_protection(target)
