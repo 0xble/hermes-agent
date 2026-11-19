@@ -49,7 +49,7 @@ def test_handle_sticker_frames_a_fresh_vision_transcript(monkeypatch):
     async def store(*_a):
         return None
 
-    monkeypatch.setattr(tg, "fetch_telegram_file", fetch)
+    monkeypatch.setattr(tg, "_fetch_telegram_file", fetch)
     monkeypatch.setattr(tg, "cache_image_from_bytes_async", cache_image)
     monkeypatch.setattr(vision_tools, "vision_analyze_tool", vision)
     monkeypatch.setattr(sticker_cache, "get_cached_description", lambda _uid: None)
