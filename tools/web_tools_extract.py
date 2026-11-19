@@ -507,15 +507,20 @@ async def _extract_safe_urls(provider, safe_urls: list[str], format: Optional[st
             policy_block = _check_site(url)
         except Exception:
             policy_block = None
+        if policy_block is not None:
+            entry = _result_entry(url, policy_block.get("message") or "Blocked by website policy")
+            entry["blocked_by_policy"] = {k: policy_block[k] for k in ("host", "rule", "source")}
+            fixed[position] = entry
+            continue
         allow_html = html_enabled and is_html_candidate(url)
-        if policy_block is None and direct_enabled:
+        if direct_enabled:
             direct = await _try_direct(url, allow_html)
             if direct is not None:
                 fixed[position] = direct
                 continue
             if allow_html:
                 direct_fallbacks.add(url)
-        hit = extract_cache_get(url, format=format, provider=provider.name) if policy_block is None else None
+        hit = extract_cache_get(url, format=format, provider=provider.name)
         if hit is not None and not await _cached_final_url_allowed(hit, url):
             hit = None  # a miss: the live fetch re-checks the redirect and refuses with blocked_by_policy
         if hit is not None:
