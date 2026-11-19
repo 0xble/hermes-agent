@@ -98,10 +98,7 @@ def run_steps(steps):
         try:
             write = steps.throw(error) if error is not None else steps.send(result)
         except StopIteration as done:
-            value = done.value
-            if isinstance(value, _RestoreApiSession):
-                return value()
-            return value
+            return _restore_value(done.value)
         try:
             result, error = write(), None
         except Exception as exc:  # health: allow BLE001 -- not swallowed: thrown back into the steps, which re-raise it
@@ -137,9 +134,7 @@ async def run_steps_off_loop(authority, steps, *, orphaned=None):
     task = track_mutation(authority, serialized())
     try:
         result = await asyncio.shield(task)
-        if isinstance(result, _RestoreApiSession):
-            return await asyncio.to_thread(result)
-        return result
+        return await asyncio.to_thread(_restore_value, result)
     except asyncio.CancelledError:
         if orphaned is not None:
             task.add_done_callback(lambda done: done.cancelled() or done.exception() or orphaned(done.result()))
@@ -283,6 +278,20 @@ class _RestoreApiSession:
 
     def __call__(self):
         return restore_api_session(self.authority, self.session_id)
+
+
+def _restore_value(value):
+    """Resolve deferred API restores wherever a write-step result carries one.
+
+    API admission composes several write-step generators, so ``bind_api_steps``'s
+    deferred restore can be nested inside the tuple returned by the outer
+    admission. Resolve it only after the write drive leaves the gateway loop.
+    """
+    if isinstance(value, _RestoreApiSession):
+        return value()
+    if isinstance(value, tuple):
+        return tuple(_restore_value(item) for item in value)
+    return value
 
 
 def _heal_replacement(conn, caller, holder):
