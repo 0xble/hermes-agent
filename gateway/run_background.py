@@ -65,6 +65,8 @@ class GatewayBackgroundMixin:
             self._reasoning_config = reasoning_config
             self._service_tier = self._resolve_session_service_tier(source=source)
             turn_route = self._resolve_turn_agent_config(prompt, model, runtime_kwargs)
+            turn_route["runtime"].pop("_preflight_fallback", None)
+            turn_route["runtime"].pop("_fallback_notice", None)
 
             # Enrich the prompt with image descriptions (same as the main flow).
             enriched_prompt = prompt
