@@ -37,9 +37,10 @@ Hardening invariants — each guards a real failure; don't weaken without answer
   distribution strips them.
 - Every recurring occurrence is accounted for: `tick()` advances `next_run_at` BEFORE dispatch
   (at-most-once across a mid-run crash) and stamps `pending_slot` in the same save; a scan that
-  finds the stamp with a dead owner restores the instant ONCE (`cron/occurrences.py`), the
-  executions ledger's `scheduled_instant` blocks a second fire, `cron.catch_up_missed: false`
-  skips past-grace misses with a logged reason. Never drop a slot silently (#107485).
+  finds the stamp with a dead owner evaluates that exact instant (`cron/occurrences.py`) and
+  re-stamps it if still eligible. The executions ledger's `scheduled_instant` blocks a second
+  fire. `cron.catch_up_missed: false` skips past-grace misses with a durable owner notice.
+  Never drop a slot silently (#107485).
 - Per-home tick lock `<home>/cron/.tick.lock` prevents duplicate ticks across processes for
   that profile's store; never a `~/.hermes/...` literal.
 - **Headless ticks refuse, never spawn.** `hermes cron tick` (system crontab / external scheduler)
