@@ -838,7 +838,7 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         runner = self._runner
         ctx = self._ctx
         from gateway.run_turn_runner_attended import attended_switch_exempt
-        if attended_switch_exempt(runner, ctx, agent):
+        if isinstance(getattr(agent, "_pinned_fallback_model", None), str) or attended_switch_exempt(runner, ctx, agent):
             return
         def _handoff(*, conversation=None, runner_state=None):
             handoff = getattr(runner, "_handoff_attended_state", None)
@@ -1908,11 +1908,6 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
                 runner._pre_agent_fallback_notice = None
             from gateway.session_api_turn import prepare_api_runtime
             model, runtime_kwargs = prepare_api_runtime(model, runtime_kwargs)
-            if policy and policy.model and not pending_fallback_notice:
-                # The frozen route's model, unless resolution just fell back: the fallback entry's
-                # model is the one this agent must send (#112600).
-                from gateway.session_authorities import active_authority
-                model = policy.current_model(active_authority(runner))
             # The classic CLI's `/model --once` / `/moa`: this admission only, nothing persisted.
             from gateway.session_cli_turn import one_turn_route
             model, runtime_kwargs = one_turn_route(self, policy, model, runtime_kwargs)
@@ -1939,17 +1934,16 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         reasoning_config = one_turn_reasoning(self, reasoning_config)
         runner._service_tier = (policy.current_service_tier(runner, ctx.session_key) if policy else
             runner._resolve_session_service_tier(source=ctx.source, session_key=ctx.session_key))
-        from gateway.run_turn_runner_runtime import apply_api_request_options
+        from gateway.run_turn_runner_runtime import apply_api_request_options, attach_preflight_fallback
         reasoning_config = apply_api_request_options(runner, reasoning_config)
         runner._reasoning_config = reasoning_config
         stream_consumer, stream_delta_cb, interim_cb, want_interim = self._setup_stream_consumer(platform_key)
+        preflight_fallback = runtime_kwargs.pop("_preflight_fallback", None)
         turn_route = runner._resolve_turn_agent_config(ctx.message, model, runtime_kwargs)
         agent, reused_cached_agent = self._resolve_turn_agent(
             turn_route, platform_key, combined_ephemeral, max_iterations, reasoning_config, pr,
         )
-        if pending_fallback_notice:
-            # Reuse the in-agent one-shot notice so the pre-agent provider switch is user-visible too.
-            agent._pending_fallback_notice = pending_fallback_notice
+        attach_preflight_fallback(agent, preflight_fallback, pending_fallback_notice)
         state = runner._session_state(ctx.session_key) if ctx.session_key else None
         attended_notice = getattr(getattr(state, "conversation", None), "pending_attended_notice", None)
         self._wire_turn_agent_callbacks(agent, turn_route, reasoning_config, stream_delta_cb, interim_cb, want_interim)

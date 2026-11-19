@@ -14,3 +14,9 @@ def apply_api_request_options(runner, reasoning_config):
         if tier is not _REQUEST_OPTION_MISSING:
             runner._service_tier = tier
     return reasoning_config
+
+
+def attach_preflight_fallback(agent, attribution, notice):
+    """Refresh per-turn fallback attribution even when the agent was reused."""
+    agent._preflight_fallback = attribution
+    agent._pending_fallback_notice = notice

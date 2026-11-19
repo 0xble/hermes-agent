@@ -623,4 +623,7 @@ def prepare_api_runtime(model, runtime_kwargs):
         route=route, session_model=options.get('session_model'),
         confirmed_runtime_lock=bool(options.get('confirmed_runtime_lock')),
         gateway_session_key=None, session_id=None)
+    if options.get('requested_model') or route:
+        runtime_kwargs['model_pinned'] = True
+        runtime_kwargs.pop('_preflight_fallback', None)
     return model, runtime_kwargs

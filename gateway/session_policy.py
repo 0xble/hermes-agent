@@ -219,7 +219,10 @@ class LocalSessionPolicy:
                 config['model'] = _held_pick(frozen, config.get('model') or {})
             else:
                 from gateway.run import _resolve_gateway_model
-                model = _resolve_gateway_model(live) or self.model
+                followed_model = _resolve_gateway_model(live)
+                if followed_model:
+                    model = followed_model
+                    config[SESSION_PINS] = {**(config.get(SESSION_PINS) or {}), 'model': False}
             agent, live_agent = config.setdefault('agent', {}), live.get('agent') or {}
             for key in FOLLOW_AGENT_KEYS:
                 if key in pinned:
@@ -463,6 +466,7 @@ def build_policy(params, config, *, private_secrets=None, profile_terminal=True,
         # launch route folds in: it holds while the profile still targets this, and a later profile edit
         # supersedes it. Without it the first turn's followed route replaces the pick.
         config.setdefault('model', {})['selection_profile'] = list(profile_target(config))
+        config[SESSION_PINS] = {**(config.get(SESSION_PINS) or {}), 'model': 'model' in picked_route}
     _apply_launch_overrides(params, config)
     # The posture is opt-in (``session.create`` only) and needs a folder the client named: the daemon's own
     # directory (the fallback above) is no workspace, and ``tool`` is a third-party integration. An explicit

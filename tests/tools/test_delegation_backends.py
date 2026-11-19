@@ -133,6 +133,8 @@ def test_selected_plugin_backend_extends_schema_and_routes_each_task(tmp_path, m
         assert (fast["model"], fast["override_base_url"], fast["override_api_key"]) == (
             "fast-model", "http://127.0.0.1:9/v1", "k-fast")
         assert (deep["model"], deep["override_reasoning_effort"]) == ("deep-model", "high")
+        assert all(k["routing_cfg"]["_model_pinned"] for k in (fast, deep))
+        assert not plain["routing_cfg"].get("_model_pinned")
         # The no-option task falls back to the delegation section, i.e. inherit the parent.
         assert plain["model"] is None and plain["override_provider"] is None and plain["profile_home"] is None
     finally:
