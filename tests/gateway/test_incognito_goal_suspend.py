@@ -141,7 +141,8 @@ async def test_goal_wakeup_defers_if_incognito_begins_during_scan(harness, monke
             await enable()
         return result
 
-    async def route(*args):
+    async def route(_runner, _source, *, idle_backoff=False):
+        assert idle_backoff
         if boundary == "route":
             await enable()
         return True

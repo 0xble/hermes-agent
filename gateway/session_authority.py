@@ -598,8 +598,9 @@ class SessionAuthority:
         from gateway.session_envelope import prepare_native, restore_native_source
         self._require_admission_open()
         payload = await prepare_native(self.runner, event)
+        native = payload['native_text_v1']
         if fingerprint := getattr(event, '_ingress_sha256', None):
-            payload['native_text_v1']['ingress_sha256'] = fingerprint  # the delivery before a rewrite
+            native['ingress_sha256'] = fingerprint  # the delivery before a rewrite
         from gateway.session_moa_turn import stamp_moa_turn
         stamp_moa_turn(event, payload['native_text_v1'])
         self._require_admission_open()
@@ -609,7 +610,7 @@ class SessionAuthority:
         # checks still belong to ``restore_native_source`` below.
         from gateway.session_ingress_context import await_reconnecting_adapter
         await await_reconnecting_adapter(
-            self.runner, payload['native_text_v1'],
+            self.runner, native,
             lambda: getattr(self.runner, '_draining', False) or self.retiring,
         )
         source = restore_native_source(payload)  # no re-hash of the just-captured media on the loop
@@ -617,8 +618,8 @@ class SessionAuthority:
         ref = self._publish_route(source, *await tracked_write(self, partial(self._reserve_route, source)))
         identity = json.dumps([source.profile, source.platform.value, source.chat_id,
                                source.thread_id, source.user_id], separators=(',', ':'))
-        request_id = str(payload['native_text_v1']['event']['message_id'] or uuid.uuid4().hex)
-        if revision := payload['native_text_v1']['event'].get('edit_revision'):
+        request_id = str(native['event']['message_id'] or native.get('recovery_id') or uuid.uuid4().hex)
+        if revision := native['event'].get('edit_revision'):
             request_id += ':edit:' + revision  # an edit is its own input, not a changed replay of the send
         committed = [ref]  # the row's target: the write may retarget a rotated-away reservation
         # A /retry re-send carries its transcript rewrite: it commits in this admission's own write.
@@ -1216,7 +1217,7 @@ class SessionAuthority:
                 from gateway.session_api import reopen_api_session
                 from gateway.session_api_turn import check_api_turn
                 from gateway.session_runtime_workers import tracked_write
-                check_api_turn(self, ref, first['payload'])
+                await tracked_write(self, partial(check_api_turn, self, ref, first['payload']))
                 await tracked_write(self, partial(reopen_api_session, self, ref))
             elif first is not None and live.detached:
                 # The chat's /new ended its row; the app's turn makes it live again, as an API row's

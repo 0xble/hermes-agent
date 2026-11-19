@@ -34,7 +34,7 @@ def _proc(pid, ppid, exe, socket_path, username="tester", create_time=None, extr
 @pytest.fixture
 def short_tmp():
     # macOS AF_UNIX paths must stay under 104 bytes. pytest's tmp_path does not.
-    path = Path(tempfile.mkdtemp(prefix="hct", dir="/tmp"))
+    path = Path(tempfile.mkdtemp(prefix="hct", dir="/tmp" if os.name == "posix" else None))
     try:
         yield path
     finally:
@@ -105,6 +105,7 @@ class TestSweepDecisions:
         _unix_socket(kept)
         plain.write_text("leave me", encoding="utf-8")
         life.write_owner_record(str(live), exe, pid=os.getpid())
+        life.write_owner_record(str(dead), exe, pid=2_147_483_647)
         life.write_owner_record(str(kept), exe, pid=os.getpid())
         killed = []
         processes = [
@@ -112,7 +113,7 @@ class TestSweepDecisions:
             _proc(22, 1, exe, str(dead), create_time=1.0),
             _proc(33, 50, exe, str(short_tmp / "hc-child.sock")),
             _proc(44, 1, "/tmp/not-the-driver", str(short_tmp / "hc-wrong.sock"), create_time=1.0),
-            _proc(55, 1, exe, str(short_tmp / "hc-young.sock")),
+            _proc(55, 1, exe, str(short_tmp / "hc-unrecorded.sock"), create_time=1.0),
         ]
         reaped = life.sweep_orphaned_embedded_drivers(
             executables={exe},
@@ -120,8 +121,6 @@ class TestSweepDecisions:
             temp_dirs=[str(short_tmp)],
             username="tester",
             kill=killed.append,
-            grace_seconds=5.0,
-            now=time.time(),
         )
         assert reaped == [22]
         assert killed == [22]
@@ -144,13 +143,13 @@ class TestSweepDecisions:
             temp_dirs=[],
             username="tester",
             kill=killed.append,
-            grace_seconds=0,
         )
         assert killed == []
 
-    def test_reparented_client_does_not_save_an_orphan(self, short_tmp):
+    def test_reparented_client_does_not_save_an_orphan(self, short_tmp, monkeypatch):
         exe = "/tmp/hct-fake-cua-driver"
         socket_path = str(short_tmp / "hc-orphan.sock")
+        monkeypatch.setattr(life, "_recorded_owner_exited", lambda path: path == socket_path)
         proxy = life.EmbeddedProcess(
             pid=8, ppid=1, username="tester", exe="/usr/bin/python",
             cmdline=("/usr/bin/python", "mcp", "--socket", socket_path), create_time=1.0,
@@ -162,7 +161,6 @@ class TestSweepDecisions:
             temp_dirs=[],
             username="tester",
             kill=killed.append,
-            grace_seconds=0,
         )
         assert killed == [9]
 
@@ -189,7 +187,6 @@ class TestSweepDecisions:
                 temp_dirs=[str(short_tmp)],
                 username="tester",
                 kill=killed.append,
-                grace_seconds=0,
             )
             assert killed == []
             assert by_parent.exists()
@@ -274,13 +271,13 @@ class TestProcessLifetime:
         _unix_socket(owned)
         orphan_pid = _spawn_orphaned(binary, orphan)
         owned_pid = _spawn_orphaned(binary, owned)
+        life.write_owner_record(str(orphan), str(binary), pid=2_147_483_647)
         life.write_owner_record(str(owned), str(binary), pid=os.getpid())
         try:
             assert _wait_until(lambda: _ppid(orphan_pid) == 1 and _ppid(owned_pid) == 1)
             reaped = life.sweep_orphaned_embedded_drivers(
                 executables={str(binary.resolve())},
                 temp_dirs=[str(short_tmp)],
-                grace_seconds=0,
             )
             assert orphan_pid in reaped
             assert _wait_until(lambda: not _alive(orphan_pid))

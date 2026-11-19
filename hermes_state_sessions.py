@@ -688,13 +688,8 @@ class SessionSessionsMixin:
 
     def update_system_prompt(self, session_id: str, system_prompt: Optional[str]) -> None:
         """Store the full assembled system prompt snapshot."""
-        def _do(conn):
-            conn.execute(
-                "UPDATE sessions SET system_prompt_hash = ?, system_prompt = NULL WHERE id = ?",
-                (self._store_system_prompt(conn, system_prompt), session_id),
-            )
-            self._delete_unreferenced_system_prompts(conn)
-        self._execute_write(_do, session_ids=(session_id,))
+        self._execute_write(lambda conn: self._replace_prompt_reference(conn, session_id, system_prompt),
+                            session_ids=(session_id,))
 
     def clear_system_prompt_if_unchanged(
         self, session_id: str, *, expected_prompt: str, expected_tool_names: Optional[str],
@@ -709,11 +704,7 @@ class SessionSessionsMixin:
             ).fetchone()
             if row is None or tuple(row) != (expected_prompt, expected_tool_names):
                 return False
-            conn.execute(
-                "UPDATE sessions SET system_prompt_hash = NULL, system_prompt = NULL WHERE id = ?",
-                (session_id,),
-            )
-            self._delete_unreferenced_system_prompts(conn)
+            self._replace_prompt_reference(conn, session_id, None)
             return True
         return self._execute_write(_do, session_ids=(session_id,), skip_result=False)
 
@@ -723,11 +714,8 @@ class SessionSessionsMixin:
         is stored in the same content-addressed ``system_prompts`` table and the column holds its hash
         (legacy rows: an inline JSON name list); ``get_session`` resolves either."""
         payload = json.dumps(pin) if pin is not None else None
-        def _do(conn):
-            conn.execute("UPDATE sessions SET tool_names = ? WHERE id = ?",
-                         (self._store_system_prompt(conn, payload), session_id))
-            self._delete_unreferenced_system_prompts(conn)
-        self._execute_write(_do, session_ids=(session_id,))
+        self._execute_write(lambda conn: self._replace_prompt_reference(conn, session_id, payload, tool_names=True),
+                            session_ids=(session_id,))
 
     def update_session_model(
         self, session_id: str, model: str, provider: Optional[str] = None, *,

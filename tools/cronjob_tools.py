@@ -808,7 +808,7 @@ def _action_create(a: dict[str, Any]) -> str:
             monitor_script=_normalize_optional_job_value(a["monitor_script"]),
             monitor_url=_normalize_optional_job_value(a["monitor_url"]),
             # CLI-only lane: absent from CRONJOB_SCHEMA and the model dispatch (models don't pick models).
-            reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]), hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"], max_catch_up_lateness_seconds=a["max_catch_up_lateness_seconds"], failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])), keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False, review=_review_value(a["review_json"], clear=bool(a["clear_review"])), timezone=_normalize_optional_job_value(a["timezone"]), grace_minutes=a["grace_minutes"], catch_up=a["catch_up"], wrap_response=_wrap_response_override(a["wrap_response"]), **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
+            reasoning_effort=a["reasoning_effort"], job_timezone=a["job_timezone"], interpreter=a["interpreter"], pinned=bool(a["pinned"]), hard_wall_timeout_seconds=a["hard_wall_timeout_seconds"], max_catch_up_lateness_seconds=a["max_catch_up_lateness_seconds"], failure_deliver=_resolve_cron_context_deliver(_normalize_deliver_param(a["failure_deliver"])), keep_pinned_lane=bool(a["keep_pinned_lane"]) if a["keep_pinned_lane"] is not None else False, priority=a["priority"], review=_review_value(a["review_json"], clear=bool(a["clear_review"])), timezone=_normalize_optional_job_value(a["timezone"]), grace_minutes=a["grace_minutes"], catch_up=a["catch_up"], wrap_response=_wrap_response_override(a["wrap_response"]), **({"paused": a["paused"], "paused_reason": a["paused_reason"]}
            if a["paused"] is not False or a["paused_reason"] is not None else {}))
     except CronSchedulerRegistrationError as exc:
         _partial = exc.to_dict()
@@ -985,6 +985,9 @@ def _update_core_fields(job: dict[str, Any], a: dict[str, Any], updates: dict[st
         return delivery_error
     if a["keep_pinned_lane"] is not None:
         updates["keep_pinned_lane"] = bool(a["keep_pinned_lane"])
+    if a["priority"] is not None:
+        # '' clears (back to the production default); update_job validates the lane name.
+        updates["priority"] = a["priority"]
     if a["catch_up"] is not None:
         updates["catch_up"] = a["catch_up"]
     if a["wrap_response"] is not None:
@@ -1188,6 +1191,7 @@ def cronjob(
     job_timezone: Optional[str] = None,
     failure_deliver: Optional[str | list[str]] = None,
     keep_pinned_lane: Optional[bool] = None,
+    priority: Optional[str] = None,
     catch_up: Optional[bool] = None,
     wrap_response: Optional[bool | str] = None,  # bool, or the tool's on / off / inherit
     session_id: Optional[str] = None,
@@ -1326,10 +1330,15 @@ CRONJOB_SCHEMA = {
                 "enum": ["on", "off", "inherit"],
                 "description": "Per-job override for the 'Cronjob Response: <name>' header and 'To stop or manage this job...' footer around delivered output. 'on' wraps; 'off' delivers the raw output verbatim (useful for briefings meant to read clean); 'inherit' removes an override so the job follows the global cron.wrap_response again. Omit to leave it unchanged (a new job inherits)."
             },
-            "script": {
+            "priority": {
                 "type": "string",
-                "description": _script_description("the profile HERMES_HOME")
+                "enum": ["live", "production", "background", ""],
+                "description": "For create/update: business-impact admission lane when due jobs compete for workers. 'live' = a person or customer is waiting on it right now (starts first); 'production' = ordinary business work (default; unset means production); 'background' = housekeeping, personal or best-effort work that may wait behind the others. Affects start order only, never schedules, timeouts or worker counts. On update, '' clears back to production."
             },
+            "script": {
+            "type": "string",
+            "description": _script_description("the profile HERMES_HOME")
+        },
             "monitor": {
                 "type": "string",
                 "description": "Optional change-detector that gates the agent: an http(s) URL (fetched each tick) or a script path (same rules as `script`, run each tick) — cheap, no LLM. Output identical to the previous tick skips the agent run entirely; changed output wakes the agent with a diff injected into the prompt. First tick always runs (baseline). Output must be deterministic (no timestamps) or every tick looks changed. Incompatible with no_agent. On update, '' clears."
@@ -1391,7 +1400,7 @@ def check_cronjob_requirements() -> bool:
 # create/edit --model`, hand-edited jobs) — the agent must not point unattended spend at a
 # different model. Programmatic callers of cronjob() itself retain the parameters.
 _HANDLER_FORWARDED_ARGS = (
-    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "keep_pinned_lane", "skill", "skills", "reason",
+    "job_id", "prompt", "schedule", "name", "repeat", "deliver", "failure_deliver", "keep_pinned_lane", "priority", "skill", "skills", "reason",
     "script", "context_from", "continuity", "enabled_toolsets", "workdir", "no_agent", "attach_to_session",
     "paused_reason", "pinned", "allow_shrink", "review_json", "clear_review",
     "max_catch_up_lateness_seconds", "timezone", "grace_minutes", "catch_up", "wrap_response")

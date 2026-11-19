@@ -6,10 +6,50 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import threading
+from types import SimpleNamespace
 
 import pytest
 
 from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
+
+
+@pytest.mark.asyncio
+async def test_worker_adoption_checks_durable_identity_off_the_gateway_loop(tmp_path, monkeypatch):
+    import psutil
+
+    from gateway.session_contract import SessionActor, SessionRef
+    from gateway.session_worker import worker_identity_claim, worker_request
+    from hermes_cli.process_identity import worker_birth
+    from hermes_loop_guard import set_loop_thread
+    from hermes_state_runtime import register_worker_execution
+    from tests.gateway.test_profile_retire_stops_turns import _Agent, _authority
+
+    db, authority, _, _ = _authority(tmp_path, _Agent())
+    actor = SessionActor('human', authority.profile_id, frozenset({'worker:adopt'}), 'test')
+    connection = SimpleNamespace(authority=authority, actor=actor)
+    ref = SessionRef(authority.profile_id, 's')
+    worker = await asyncio.create_subprocess_exec(
+        sys.executable, '-c', 'input()', stdin=asyncio.subprocess.PIPE,
+    )
+    with db:
+        try:
+            params = dict(profile_id=authority.profile_id, session_id=ref.session_id, execution_id='test-worker',
+                          generation=0, pid=worker.pid, birth=worker_birth(psutil.Process(worker.pid)),
+                          secret='test-adoption-secret')
+            claim = worker_identity_claim(authority, params, actor.subject)
+            register_worker_execution(db, epoch=authority.epoch, session_id=ref.session_id,
+                                      execution_id='test-worker', generation=0, kind='compute',
+                                      adoption_secret=claim)
+            # When the reader cannot be checked out, the read uses the writer lock.
+            monkeypatch.setattr(db, '_checkout_read_conn', lambda: None)
+            set_loop_thread(threading.get_ident())
+            result = await worker_request(connection, ref, params, operation='adopt')
+            assert result['status'] == 'running'
+        finally:
+            set_loop_thread(None)
+            worker.terminate()
+            await worker.wait()
 
 
 @pytest.mark.platforms("linux")

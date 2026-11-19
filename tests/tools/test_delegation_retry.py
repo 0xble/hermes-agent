@@ -77,6 +77,16 @@ def _row(delegation_id):
     return dict(zip(cols, row)) if row else None
 
 
+def test_retry_sweep_body_error_rolls_back_its_writes():
+    delegation_id = _dispatch("deleg_rollback")
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        with dr._best_effort_retry_transaction(ad) as conn:
+            conn.execute("UPDATE async_delegations SET retry_claim='partial' WHERE delegation_id=?",
+                         (delegation_id,))
+            raise sqlite3.OperationalError("database is locked")
+    assert _row(delegation_id)["retry_claim"] is None
+
+
 @pytest.mark.parametrize("state", ["interrupted", "unknown", "stalled"])
 @pytest.mark.parametrize("metadata", ["event", "result"])
 @pytest.mark.parametrize("cut_reason", ["/stop", "stop_command", "user_stop", "session_reset"])

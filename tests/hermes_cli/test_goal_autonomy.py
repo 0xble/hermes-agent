@@ -166,6 +166,20 @@ def test_model_controls_apply_without_approval(home, action):
         assert result["ok"], result
 
 
+@pytest.mark.parametrize("reason,allowed", [
+    ("handed off to the release session after verified takeover", True),
+    ("obsolete after handoff to the release session", False),
+])
+def test_model_clear_requires_verified_handoff(home, reason, allowed):
+    manager()
+    result = session_controls.apply_control(
+        "goal", "clear", "autonomy", requester_sid="autonomy", reason=reason)
+    assert result["ok"] is allowed, result
+    if not allowed:
+        assert result["error_code"] == "retirement_proof_required"
+        assert goals.load_goal("autonomy").status == "active"
+
+
 @pytest.mark.parametrize("pause", ["slash", "stop", "quoted_resume", "agent"])
 def test_agent_resumes_only_its_own_goal_pause(home, pause):
     _, db = home

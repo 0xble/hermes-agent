@@ -1017,19 +1017,15 @@ def _read_retry_candidate_ids(ad, now: float, limit: int) -> list[str]:
 @contextmanager
 def _best_effort_retry_transaction(ad):
     """Yield no connection when the idle sweep cannot begin under writer contention."""
-    stack = ExitStack()
-    try:
-        conn = stack.enter_context(ad._transaction(immediate=True))
-    except sqlite3.OperationalError as exc:
-        stack.close()
-        if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
-            raise
-        yield None
-        return
-    try:
+    with ExitStack() as stack:
+        try:
+            conn = stack.enter_context(ad._transaction(immediate=True))
+        except sqlite3.OperationalError as exc:
+            if "locked" not in str(exc).lower() and "busy" not in str(exc).lower():
+                raise
+            yield None
+            return
         yield conn
-    finally:
-        stack.close()
 
 def sweep_retries(*, now: Optional[float] = None, limit: int = 32) -> list:
     """Claim due retry work only after the original completion/outbox delivery settles.

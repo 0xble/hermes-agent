@@ -29,6 +29,16 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   a chat moves to another conversation without blocking the gateway loop or bypassing its guard.
   The real headless completion contract is in `tests/tools/test_completed_process_results.py`,
   with detached-conversation lifecycle and result coverage in `tests/gateway/`.
+- Cold WebSocket `session.resume` runs route restoration and authorization on the bounded
+  session-store executor. Manual `/compress` resolves persisted reasoning and attended routing
+  on the context-preserving worker before building the compressor. Both paths have regressions
+  that arm the production loop lock guard.
+- Worker RPCs fence the live producer and its durable identity on the bounded session-store
+  executor. The owner checks that its profile is still serving before proceeding after each
+  read. The same checks cover adoption, persistence, child reservation, and delegation.
+- A chat route announcement resolves its compression lineage on the store writer's thread.
+  The loop publishes only the still-current route identity. Compression and metadata updates
+  keep that identity, and a later conversation switch replaces it.
 - 2026-10-25 sweep of the sites the guard named on the live gateway (about 120 active agents,
   writer-lock holds of 3-13 s, two exit-75 kills): attended route resolution takes the durable
   activity stamp and `get_attended_route_active` from the off-loop resolution snapshot; turn
@@ -85,13 +95,25 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
   merge (`_merge_fts_incrementally`, every `_FTS_MERGE_EVERY_N_WRITES`) runs on the same
   maintenance connection, also outside the writer lock (11:39: 19 turns and 48 writers queued
   behind it); usermerge floor and bounded pages unchanged.
+- Managed macOS WAL connections disable SQLite's default commit-time auto-checkpoint because
+  a writer can copy a reader-blocked backlog as soon as the reader releases its snapshot. The
+  existing periodic PASSIVE checkpoint takes that work outside the process writer guard.
+  An explicit `database.wal_autocheckpoint` still takes precedence. Commits retain
+  `synchronous=FULL` and checkpoints retain `checkpoint_fullfsync=1`.
+  `test_wal_checkpoint_strategy.py` verifies that the first commit after a reader releases a
+  backlog leaves the main file unchanged and that the periodic checkpoint still flushes it.
 - Compaction recomputes historical display identities on a pooled-reader snapshot before
   taking `SessionDB._lock`. Under the writer lock it folds from the display indexes and
   recomputes only new or changed rows, including user `display_metadata` edits not watched
-  by the identity trigger. Rows inserted after the snapshot already carry their canonical
-  display identity, so they are reused without a payload decode under the writer lock. A
-  missing reader or display index retains the full-scan fallback.
+  by the identity trigger. Ordinary rows inserted after the snapshot already carry their
+  canonical display identity, so the writer reuses it without decoding their payloads.
+  New summary carriers with a message UID still resolve against the original reply so the
+  display and export fold presents it once. A missing reader or display index retains the
+  full-scan fallback.
   Branch refreshes must preserve this off-lock path and its regression coverage.
+- HTTP admission binds, restores, and checks API sessions through the tracked worker steps.
+  Response retries and the subsequent claim and execution checks also restore off the owner
+  loop, so the session-store lock cannot stall unrelated gateway traffic at those boundaries.
 - Generation stamping checkpoints only until its `application_id` is visible in the main DB file.
   A reader can block the first PASSIVE checkpoint and leave both the header and `state_meta` row
   WAL-only; later warm opens retry until the header is durable. The lock-safe header probe avoids
@@ -276,10 +298,14 @@ in `gateway/run_turn.py`, `gateway/run_config_loaders.py`, `gateway/slash_comman
 the Telegram and Slack adapters, and `gateway/session_ingress.py` with
 `gateway/session_ingress_context.py` (admitted-turn adapter reconnect wait), and
 `gateway/session_api.py` (nested deferred API-session restoration stays off the gateway loop), and
-`gateway/run_runtime.py` (unknown-turn marker release stays off the gateway loop).
+`gateway/run_runtime.py` (unknown-turn marker release stays off the gateway loop), and
+`gateway/session_acp_lifecycle.py` (shutdown bounds idle ACP cleanup to the remaining settle
+budget and tracks any unfinished writer through DB teardown).
 Proof surface:
 `tests/gateway/test_admission_adapter_reconnect_wait.py`,
 `tests/gateway/test_startup_resume_admission.py`,
+`test_acp_shutdown_cleanup_respects_the_settle_budget` in
+`tests/gateway/test_run_runtime_hot_serve_cleanup.py`,
 `test_reaped_probe_runs_off_the_event_loop` in `tests/gateway/test_reaped_eviction_interrupts_run.py`,
 `test_reaped_classic_slot_is_evicted_so_the_queued_head_runs` in
 `tests/gateway/test_classic_slot_holds_fifo_head.py` (the drain awaits the now-async probe, so a reaped

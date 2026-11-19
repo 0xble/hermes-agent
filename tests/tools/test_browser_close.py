@@ -109,6 +109,8 @@ def test_close_refuses_unowned_scope_without_mutation(camofox, monkeypatch, refu
 
 @pytest.mark.parametrize("failure", ["ignored_delete", "delete_error", "read_error", "malformed"])
 def test_close_never_claims_unverified_absence_and_can_retry(camofox, failure):
+    from tools import browser_camofox_leases as leases
+
     c = camofox
     target = _open(c)
     session = c.cf._sessions["owner"]
@@ -137,8 +139,11 @@ def test_close_never_claims_unverified_absence_and_can_retry(camofox, failure):
     assert session["tab_id"] == target
     assert any(key[3] == target for key in c.cf._owned_tabs)
     assert not c.cf._closing_tabs
+    lease_key = c.server.url, session["user_id"], target
+    assert lease_key in leases._handles or lease_key in leases._local_claims
     retried = _dispatch("browser_close", {}, "owner")
     assert retried.get("success") is True and retried["closed"], retried
+    assert lease_key not in leases._handles and lease_key not in leases._local_claims
 
 
 def test_delete_timeout_after_effect_is_verified(camofox):

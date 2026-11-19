@@ -78,8 +78,13 @@ lock. After 2 optimistic attempts, the final attempt prepares inside the writer
 transaction, preserving the original compaction's progress under contention.
 Each attempt refreshes the display-fold plan outside the lock as well.
 A SQLite transaction retry that rolled back all mutations can reuse the session
-proof. Its writer-wide display hint may be stale, so the existing full-fold
-fallback remains authoritative, with the same output as the incremental path.
+proof. If only the writer-wide display token changed, revalidate the compact
+identity and order columns of the session's old visible prefix using its
+display indexes. The snapshot and its high-water row ID come from the same
+reader transaction. An equal prefix keeps the affected-group path and includes
+new rows above the high-water ID. Connection replacement, a changed prefix,
+missing identities, unknown storage types, and read errors retain the full-fold fallback. The
+`display_prefix_revalidated` counter identifies this path in lock warnings.
 
 Independent snapshot reads use the reader pool's IOERR retry and storage-error
 classification. Reader exhaustion or a persistent read failure falls back to
