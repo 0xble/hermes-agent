@@ -65,8 +65,9 @@ def completed_occurrence(job, instant):
 # scan stamps it with the exact stored instant plus the stamping owner, ``claim_job_for_fire``
 # (the point after which side effects may exist) clears it, and any explicit rewrite of the
 # schedule drops it. A slot still pending once its owner is provably gone (or its lease has
-# expired) was never claimed, so it is restored ONCE as the due instant and then flows through
-# the ordinary late / fast-forward / ``cron.catch_up_missed`` policy — never N replays.
+# expired) was never claimed. Evaluate that one exact instant under the ordinary late /
+# fast-forward / ``cron.catch_up_missed`` policy. If it is still eligible, keep a stamp until
+# it is claimed, even if another scheduler stops before dispatch — never replay a backlog.
 
 def pending_slot_stamp(next_run, now):
     """Store value for a recurring occurrence about to be handed to the dispatcher."""
