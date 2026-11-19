@@ -46,7 +46,7 @@ async def gateway(tmp_path, monkeypatch):
     from gateway.platforms.base import SendResult
     from gateway.relay.adapter import RelayAdapter
     from gateway.relay.ws_transport import WebSocketRelayTransport
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from tests.gateway.relay.test_relay_passthrough import _desc
     from tools import approval
 

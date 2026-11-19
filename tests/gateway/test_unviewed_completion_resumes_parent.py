@@ -154,7 +154,7 @@ async def test_close_pending_across_a_restart_still_decides(tmp_path, monkeypatc
     restarts: recovery re-arms the stored close, but the in-memory dispatch refusal is gone."""
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_local_recovery import recover_local_sessions
     from gateway.session_viewer_close import _PendingClose, _store_and_settle
     from hermes_state import AsyncSessionDB, SessionDB

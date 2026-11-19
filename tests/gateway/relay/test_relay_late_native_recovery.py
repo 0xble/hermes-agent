@@ -5,7 +5,8 @@ import pytest
 
 from gateway.config import GatewayConfig, Platform
 from gateway.run import GatewayRunner
-from gateway.session_authority import SessionAuthority, initialize_session_authority
+from gateway.session_authority import SessionAuthority
+from tests.fakes.runtime_owner import initialize_session_authority
 from tests.gateway.relay.test_relay_native_recovery_and_passthrough import (
     _Connector, _rows, _stub_turns, _wired_relay, websockets,
 )

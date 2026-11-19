@@ -123,7 +123,7 @@ async def test_cron_run_and_inbound_turn_touch_sessiondb_on_the_loop_only_where_
     from gateway.platforms.base import SendResult
     from gateway.platforms.event import MessageEvent
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_ingress_context import register_transport_home
     from tests.gateway.test_command_bypass_active_session import _StubAdapter
 

@@ -86,7 +86,8 @@ def _rows(authority):
 @pytest.mark.asyncio
 async def test_relay_admission_queued_across_a_restart_runs_and_replies_with_egress_routing(tmp_path, monkeypatch):
     from gateway.run_runtime import recover_gateway_native_sessions
-    from gateway.session_authority import SessionAuthority, initialize_session_authority
+    from gateway.session_authority import SessionAuthority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from hermes_state_runtime import list_session_admissions
 
     connector = _Connector('discord')
@@ -230,7 +231,7 @@ async def test_multiplexed_stamped_admission_queued_across_a_restart_runs_in_its
 
 @pytest.mark.asyncio
 async def test_forwarded_discord_component_is_admitted_like_relayed_text(tmp_path, monkeypatch, caplog):
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
 
     from gateway.relay.admitted_authors import note_delivered
     from gateway.session import SessionSource
@@ -268,7 +269,7 @@ async def test_forwarded_discord_component_is_admitted_like_relayed_text(tmp_pat
 async def test_heartbeat_for_a_restored_relay_session_admits_with_warm_egress_routing(tmp_path, monkeypatch):
     """A session whose last input already settled has nothing to recover at boot, so the heartbeat
     is the first thing to reply after a restart: it must not admit with cold egress caches."""
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     import gateway.run_heartbeat_acceptance as acceptance
 
     connector = _Connector('discord')

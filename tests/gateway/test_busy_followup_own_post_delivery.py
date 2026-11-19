@@ -18,7 +18,12 @@ from gateway.platforms.base import BasePlatformAdapter, SendResult
 from gateway.platforms.event import MessageEvent
 from gateway.run_turn_bubble_cleanup import register_bubble_cleanup
 from gateway.session import SessionSource
-from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses, _wait_for
+from tests.gateway.test_shared_busy_receive_loop import Adapter, _statuses
+from tests.waiting import async_wait_until
+
+
+async def _wait_for(predicate, timeout=5):
+    await async_wait_until(predicate, timeout=timeout)
 
 KEY = "agent:main:telegram:group:-1001:7"
 CHAT = "-1001"
@@ -80,7 +85,7 @@ async def test_authority_busy_follow_up_deletes_its_own_progress_bubbles(monkeyp
     this test."""
     from gateway.config import GatewayConfig
     from gateway.run import GatewayRunner
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
 
     monkeypatch.setenv('TELEGRAM_ALLOWED_USERS', 'fixture-user')

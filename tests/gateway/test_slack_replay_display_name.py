@@ -23,7 +23,7 @@ TEXT = 'Show the comparison.'
 
 async def _slack_gateway(home, monkeypatch, display_name, instance):
     from gateway.config import Platform, PlatformConfig
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from plugins.platforms.slack import adapter as slack
 
     runner, _, sent, calls = await _gateway(home, monkeypatch)

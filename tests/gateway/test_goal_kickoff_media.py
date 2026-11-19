@@ -8,7 +8,7 @@ from tests.waiting import async_wait_until
 @pytest.mark.asyncio
 async def test_goal_captioned_photo_kickoff_carries_the_photo(monkeypatch, tmp_path):
     from gateway.platforms.event import MessageEvent, MessageType
-    from gateway.session_authority import initialize_session_authority
+    from tests.fakes.runtime_owner import initialize_session_authority
     from gateway.session_results import execution_result
     from tests.gateway.test_messaging_slash_command_fifo import _owner
 
