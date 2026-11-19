@@ -245,7 +245,8 @@ from plugins.platforms.telegram.telegram_network import (
     parse_fallback_ip_env, proxy_target_hosts, telegram_verify)
 from plugins.platforms.telegram.telegram_outbound import is_visually_empty, resolve_notifications_mode
 from plugins.platforms.telegram.telegram_send_path_recovery import mark_send_path_recovered
-from plugins.platforms.telegram.telegram_flood_cooldown import TelegramFloodCooldownMixin, land_persisted_state
+from plugins.platforms.telegram.telegram_flood_cooldown import (
+    TelegramFloodCooldownMixin, _windows as _seed_flood_windows, land_persisted_state)
 from plugins.platforms.telegram.telegram_vault_code import TelegramVaultCodeMixin
 from plugins.platforms.telegram.telegram_send_errors import LOST, classify_send_exception, explain_username_chat_not_found, is_entity_parse_error, maybe_delivered_result as _maybe_delivered_result, send_error_kind, FLOOD, UNSENT
 from plugins.platforms.telegram.telegram_send_errors import rich_failure_result
@@ -6598,8 +6599,9 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         """A send refused with ``retry_after=wait`` arms a per-chat window during which ``send()`` fails
         closed locally (same ``flood_control:<s>`` result, so ledger recognition and redelivery timing are
         unchanged) instead of firing more requests into a penalty Telegram lengthens while it is hammered."""
-        until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
+        until = _seed_flood_windows(self)
         key = str(normalize_telegram_chat_id(chat_id))
+        store_key = flood_state.storage_key(key, self.config.token)
         now = asyncio.get_running_loop().time()
         wait = float(wait)
         if not math.isfinite(wait) or wait <= 0:
@@ -6610,12 +6612,12 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         profile_dir = getattr(self, "_update_receipt_dir", None)
         if profile_dir is not None:
             try:
-                persisted = flood_state.record_deadline(profile_dir, key, wait)
+                persisted = flood_state.record_deadline(profile_dir, store_key, wait)
                 until[key] = max(until[key], now + max(0.0, persisted - time.time()))
             except (OSError, ValueError, sqlite3.Error):
                 logger.warning("[%s] Could not persist Telegram flood deadline for chat %s", self.name, key, exc_info=True)
                 try:
-                    persisted = flood_state.record_fallback_deadline(profile_dir, key, wait)
+                    persisted = flood_state.record_fallback_deadline(profile_dir, store_key, wait)
                     until[key] = max(until[key], now + max(0.0, persisted - time.time()))
                 except (OSError, ValueError):
                     logger.error("[%s] Telegram flood deadline has no durable copy for chat %s", self.name, key, exc_info=True)
@@ -6630,20 +6632,21 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
     def _send_flood_cooldown_remaining(self, chat_id: Any) -> Optional[float]:
         """Seconds left in this chat's flood window, or ``None`` when sends may go out."""
-        until: dict[str, float] = self.__dict__.setdefault("_telegram_send_cooldown_until", {})
+        until = _seed_flood_windows(self)
         key = str(normalize_telegram_chat_id(chat_id))
+        store_key = flood_state.storage_key(key, self.config.token)
         deadline = until.get(key, 0.0)
         profile_dir = getattr(self, "_update_receipt_dir", None)
         if profile_dir is not None:
             storage_error = False
             try:
-                persisted = flood_state.remaining_seconds(profile_dir, key)
+                persisted = flood_state.remaining_seconds(profile_dir, store_key)
                 deadline = max(deadline, asyncio.get_running_loop().time() + persisted)
             except (OSError, ValueError, sqlite3.Error):
                 logger.warning("[%s] Could not read Telegram flood deadline for chat %s", self.name, key, exc_info=True)
                 storage_error = True
             try:
-                fallback = flood_state.fallback_remaining_seconds(profile_dir, key)
+                fallback = flood_state.fallback_remaining_seconds(profile_dir, store_key)
                 deadline = max(deadline, asyncio.get_running_loop().time() + fallback)
             except (OSError, ValueError):
                 logger.warning("[%s] Could not read Telegram flood fallback for chat %s", self.name, key, exc_info=True)

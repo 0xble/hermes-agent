@@ -14,6 +14,12 @@ import sqlite3
 import time
 
 
+def storage_key(chat_id: str, token: str | None) -> str:
+    """Key durable state by the public bot ID, never by the credential itself."""
+    bot_id, sep, _ = (token or "").partition(":")
+    return f"{bot_id}:{chat_id}" if sep and bot_id.isascii() and bot_id.isdigit() else chat_id
+
+
 def _fallback_dir(profile_dir: Path, chat_id: str) -> Path:
     name = hashlib.sha256(chat_id.encode("utf-8")).hexdigest()
     return Path(profile_dir) / "telegram-flood-deadlines" / name

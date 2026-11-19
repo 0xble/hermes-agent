@@ -122,7 +122,7 @@ def _telegram_fallback_ips(extra):
     return parse_fallback_ip_env(configured) or list(SEED_FALLBACK_IPS)
 
 
-def _standalone_telegram_rate_limiter():
+def _standalone_telegram_rate_limiter(token: str | None = None):
     """Per-chat budget for the standalone lane, tied to the profile's durable flood store: a chat
     under a known server penalty is refused locally and a new ``retry_after`` is persisted, so this
     lane (cron fallback, out-of-gateway sends) cannot extend a ban the gateway is waiting out."""
@@ -132,6 +132,7 @@ def _standalone_telegram_rate_limiter():
     profile_dir = get_hermes_home()
 
     def penalty_remaining(key: str) -> float | None:
+        key = flood_state.storage_key(key, token)
         try:
             remaining = max(flood_state.remaining_seconds(profile_dir, key),
                             flood_state.fallback_remaining_seconds(profile_dir, key))
@@ -141,7 +142,7 @@ def _standalone_telegram_rate_limiter():
         return remaining if remaining > 0 else None
 
     def on_retry_after(key: str, wait: float) -> None:
-        flood_state.record_deadline(profile_dir, key, wait)
+        flood_state.record_deadline(profile_dir, flood_state.storage_key(key, token), wait)
 
     from plugins.platforms.telegram.daily_quota import DailyQuota
     # One-shot lane: persist every call so the gateway's daily ledger sees this lane's volume.
@@ -158,7 +159,7 @@ def _telegram_bot(token, extra=None):
     defaults (same URLs) on failure."""
     from telegram import Bot
     from plugins.platforms.telegram.chat_budget import MeteredBot
-    limiter = _standalone_telegram_rate_limiter()
+    limiter = _standalone_telegram_rate_limiter(token)
     from gateway.platforms.base import describe_proxy_error, resolve_proxy_url, safe_proxy_url_for_log
     proxy = None
     extra = extra or {}
