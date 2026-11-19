@@ -88,10 +88,15 @@ def quotable_text(text: str, *, mdv2: bool = False) -> str:
 
 def _strip_mdv2(text: str) -> str:
     """Strip MarkdownV2 escapes and formatting markers for the plain-text fallback."""
+    from gateway.copy_blocks import protect_inline_copy_bodies, restore_inline_copy_bodies
+    from .copy_quotes import protect_quote_fallback
+
+    text, bodies = protect_inline_copy_bodies(text)
+    text, quote_bodies = protect_quote_fallback(text)
     cleaned = re.sub(r'\\([_*\[\]()~`>#\+\-=|{}.!\\])', r'\1', text)  # escape backslashes
     cleaned = re.sub(r'\*\*([^*]+)\*\*', r'\1', cleaned)  # **bold** BEFORE MarkdownV2 *bold*
     cleaned = re.sub(r'\*([^*]+)\*', r'\1', cleaned)
     cleaned = re.sub(r'(?<!\w)_([^_]+)_(?!\w)', r'\1', cleaned)  # italic; word-bounded so snake_case survives
     cleaned = re.sub(r'~([^~]+)~', r'\1', cleaned)  # strikethrough
     cleaned = re.sub(r'\|\|([^|]+)\|\|', r'\1', cleaned)  # spoiler
-    return cleaned
+    return restore_inline_copy_bodies(cleaned, {**bodies, **quote_bodies})
