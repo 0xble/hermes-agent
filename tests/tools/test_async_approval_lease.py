@@ -69,7 +69,7 @@ def test_cancelled_queued_worker_releases_transport(monkeypatch):
 
     ad._reset_for_tests()
     future = Future()
-    monkeypatch.setattr(ad, "_get_executor", lambda size: SimpleNamespace(submit=lambda fn: future))
+    monkeypatch.setattr(ad, "_get_executor", lambda size: SimpleNamespace(submit=lambda fn, *args: future))
     key = "queued-cancel"
     approval.register_gateway_notify(key, lambda data: None)
     try:

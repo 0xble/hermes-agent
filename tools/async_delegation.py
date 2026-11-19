@@ -1646,6 +1646,7 @@ def _interrupt_records(targets: list[dict[str, Any]], caller: str, reason: str, 
         queued_snapshot = None
         queued_interrupt_fn = None
         persist_wait = None
+        signalled_lease = None
         delegation_id = record.get("delegation_id")
         if not delegation_id:
             continue
@@ -1682,6 +1683,7 @@ def _interrupt_records(targets: list[dict[str, Any]], caller: str, reason: str, 
                 interrupt_fn = None
             else:
                 interrupt_fn = live.get("interrupt_fn")
+                signalled_lease = live.get("_approval_lease")
                 if caller == "interrupt_all":
                     # A signal is only a cut request. A runner that finishes
                     # successfully before returning must keep its completed result.
@@ -1713,6 +1715,10 @@ def _interrupt_records(targets: list[dict[str, Any]], caller: str, reason: str, 
 
             queued_context.copy().run(finalize_queued)
             continue
+        if signalled_lease is not None:
+            # A stopped child can no longer answer: wake its pending approval as cancelled now,
+            # instead of leaving the prompt to run out its timeout. Outside the records lock.
+            signalled_lease.release()
         if _call_interrupt(
             interrupt_fn, "%s: %s interrupt failed: %s", caller, record.get("delegation_id"), reason=reason,
         ):
