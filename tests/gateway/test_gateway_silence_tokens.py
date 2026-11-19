@@ -99,6 +99,16 @@ def test_exact_silence_tokens_are_intentional_silence():
         assert is_intentional_silence_response(token)
 
 
+def test_spaced_silence_marker_is_intentional_silence():
+    assert is_intentional_silence_response("[ S I L E N T ]")
+    assert is_intentional_silence_response("[  S I L E N T  ]")
+
+
+def test_bracketed_prose_is_not_collapsed_into_silence():
+    assert not is_intentional_silence_response("[ S I L E N T ] nothing new")
+    assert not is_intentional_silence_response("[ x ]")
+
+
 def test_blank_and_prose_mentions_are_not_silence():
     assert not is_intentional_silence_response("")
     assert not is_intentional_silence_response("Use NO_REPLY when no answer is needed.")
