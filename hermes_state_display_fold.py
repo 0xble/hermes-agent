@@ -293,8 +293,13 @@ class DisplayFoldMixin:
 
     def _resolve_display_identities(self, conn, visible, plan):
         """Stored equality validates payload reuse, not membership or presentation metadata."""
+        # Rows inserted after the off-lock snapshot already carry the canonical identity from
+        # ``_message_row_params``. They have no plan entry, but decoding their payload under the
+        # writer lock needlessly turns every compaction into a long lock hold. A non-null stored
+        # identity is trusted for those new rows. Existing rows whose snapshot identity changed,
+        # or rows with a missing identity, still take the stale decode path.
         stale = [row_id for row_id, stored, _order in visible
-                 if stored is None or plan.get(row_id, (None,))[0] != stored]
+                 if stored is None or (row_id in plan and plan[row_id][0] != stored)]
         fresh: dict[int, bytes] = {}
         add_write_rows("display_stale", len(stale))
         with write_phase("display_stale_decode"):
@@ -309,8 +314,9 @@ class DisplayFoldMixin:
                     if original is not None:
                         identity = self._display_identity(self._display_dedupe_key(original))
                 fresh[row["id"]] = identity
-        return {row_id: fresh[row_id] if row_id in fresh else plan[row_id][1]
-                for row_id, _stored, _order in visible}
+        return {row_id: fresh[row_id] if row_id in fresh else
+                (plan[row_id][1] if row_id in plan else stored)
+                for row_id, stored, _order in visible}
 
     @timed_write_phase("display_planned_fold")
     def _fold_display_orders(self, conn, visible, plan, identities=None) -> None:

@@ -88,7 +88,9 @@ native active-conversation replay access paths in `hermes_state_messages.py`.
 - Compaction recomputes historical display identities on a pooled-reader snapshot before
   taking `SessionDB._lock`. Under the writer lock it folds from the display indexes and
   recomputes only new or changed rows, including user `display_metadata` edits not watched
-  by the identity trigger. A missing reader or display index retains the full-scan fallback.
+  by the identity trigger. Rows inserted after the snapshot already carry their canonical
+  display identity, so they are reused without a payload decode under the writer lock. A
+  missing reader or display index retains the full-scan fallback.
   Branch refreshes must preserve this off-lock path and its regression coverage.
 - Generation stamping checkpoints only until its `application_id` is visible in the main DB file.
   A reader can block the first PASSIVE checkpoint and leave both the header and `state_meta` row
@@ -267,6 +269,7 @@ disk. Upstream has no matching issue or PR (searched 2026-10-10).
 tolerance), `agent/turn_liveness.py`, `hermes_state.py` (checkpoint connection, write marker),
 `hermes_state_gateway.py` (routing diff), `hermes_state_health.py`,
 `hermes_state_messages.py` (off-lock historical display fold),
+`hermes_state_display_fold.py` (reuse identities on rows inserted after the fold snapshot),
 `cron/scheduler.py` and `hermes_cli/config_defaults.py` (cron bound), and the 2026-10-25 sweep
 in `gateway/run_turn.py`, `gateway/run_config_loaders.py`, `gateway/slash_commands_status.py`,
 `gateway/delivery.py`, `gateway/telegram_retire*.py`, `gateway/telegram_topic_sessions.py` and
@@ -308,5 +311,5 @@ upstream bounds restart replay and cron catch-up itself.
 Contract tests: `tests/tools/test_completed_process_results.py`, `tests/hermes_state/test_active_conversation_replay.py`, `tests/gateway/test_lifecycle_state_db_check.py`, `tests/gateway/test_lifecycle_ledger.py`, `tests/gateway/test_admission_adapter_reconnect_wait.py`, `tests/gateway/test_startup_resume_admission.py`, `tests/gateway/test_reaped_eviction_interrupts_run.py`, `tests/gateway/test_classic_slot_holds_fifo_head.py`, `tests/cron/test_scheduler.py`, `tests/agent/test_turn_facade_lease.py`, `tests/hermes_state/test_wal_checkpoint_strategy.py`, `tests/hermes_state/test_generation_checkpoint_durability.py`, `tests/hermes_state/test_hermes_state.py`, `tests/hermes_state/test_gateway_routing_replace_diff.py`, `tests/hermes_state/test_db_identity_probe_off_lock.py`, `tests/hermes_state/test_archive_compact_off_writer_lock.py`, `tests/agent/test_turn_liveness_watchdog.py`, `tests/hermes_state/test_loop_guard.py`, `tests/hermes_state/test_holder_scan_bounded.py`, `tests/gateway/test_turn_state_db_off_loop.py`, `tests/hermes_cli/test_worktree_pushed_tier.py`, `tests/gateway/test_loop_thread_statedb_sites.py`, `tests/gateway/test_loop_thread_statedb_sweep.py`,
   `tests/gateway/test_routing_save_delta.py`, `tests/gateway/test_api_admission_off_loop.py`,
   `tests/gateway/test_adversarial_responses_eviction.py`, and
-  `tests/gateway/test_responses_idem_replay_record.py`, and
-  `tests/gateway/test_loop_thread_statedb_sites.py`.
+  `tests/gateway/test_responses_idem_replay_record.py`,
+  `tests/hermes_state/test_display_fold_writer_steps.py`.
