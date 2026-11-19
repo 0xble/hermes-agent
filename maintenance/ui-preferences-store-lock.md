@@ -27,8 +27,9 @@ unavailable or a PID has been recycled.
 
 ## Contract Tests
 
-Contract tests: the live-owner, dead-PID, age-backstop and bounded-wait cases in
-`tests/hermes_cli/test_ui_preferences.py`, plus the matching cases in
+Contract tests: `tests/hermes_cli/test_ui_preferences.py`.
+
+The live-owner, dead-PID, age-backstop and bounded-wait cases also run in
 `apps/desktop/electron/ui-preferences.test.ts`.
 
 ## Verification
