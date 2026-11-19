@@ -67,12 +67,16 @@ async def test_stop_flushes_only_nonempty_overflow_and_resets_turn_timestamps():
     runner._session_state("c")
     flushed = []
 
+    def spool(mapping, **_kw):
+        flushed.append(mapping)
+        return sum(map(len, mapping.values()))
+
     with (
         patch("gateway.status.remove_pid_file"),
         patch("gateway.status.publish_runtime_status"),
         patch("agent.auxiliary_client.shutdown_cached_clients"),
         patch("gateway.shutdown_flush.flush_overflow_to_file",
-              side_effect=lambda mapping, **_kw: flushed.append(mapping)),
+              side_effect=spool),
     ):
         await runner.stop()
 
