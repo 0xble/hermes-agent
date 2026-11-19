@@ -25,7 +25,7 @@ class TurnRunner:
             return
         def present():
             if local_viewer_turn(self):
-                self._publish_execution("status.update", {"kind": _viewer_status_kind(event_type, prepared),
+                self._publish_execution("status.update", {"kind": _viewer_status_kind(event_type, message),
                                                           "text": prepared})
                 return
             self._schedule(

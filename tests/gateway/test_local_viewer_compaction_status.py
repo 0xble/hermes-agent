@@ -13,7 +13,7 @@ def _local_turn(published):
     turn = object.__new__(TurnRunner)
     turn._ctx = SimpleNamespace(
         source=SimpleNamespace(platform=Platform.LOCAL, chat_id='chat', chat_type='dm'),
-        mute_notification_reply=False, _status_adapter=object(), _run_still_current=lambda: True,
+        persist_user_display_kind=None, mute_notification_reply=False, _status_adapter=object(), _run_still_current=lambda: True,
         session_key='agent:main:local:dm:chat', run_generation=1, user_config={},
     )
     turn._runner = SimpleNamespace()
