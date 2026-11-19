@@ -7,13 +7,17 @@ cron, API and deferred workers but not the authority's still-running turn, so it
 checkpointed state.db under a live writer.
 """
 import asyncio
+import json
 import time
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
 
 import gateway.run as gw_mod
 from gateway import run_shutdown
+from gateway.platforms.event import MessageEvent
+from tests.gateway.restart_test_helpers import make_restart_source
 from tests.gateway.test_shutdown_executor_quiesce import _FakeGateway
 
 
@@ -37,3 +41,28 @@ async def test_stop_settles_within_the_leash_and_keeps_state_db_open_for_a_live_
         turn.cancel()
     assert time.monotonic() - started < 6, "the settle overran the stop's watchdog leash"
     assert "close:session_db" not in events, f"state.db closed under a live authority turn: {events}"
+
+
+@pytest.mark.asyncio
+async def test_stop_spools_queued_input_before_waiting_for_authority(tmp_path, monkeypatch):
+    gw = _FakeGateway([])
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr("gateway.run_pending_recovery.get_routing_process_hermes_home", lambda: tmp_path)
+    gw._flush_owned_pending = partial(run_shutdown.GatewayShutdownMixin._flush_owned_pending, gw)
+    key = "agent:main:telegram:dm:123456"
+    source = make_restart_source()
+    first = MessageEvent(text="already queued", source=source, message_id="first")
+    gw._pending_messages[key] = first
+
+    def spooled_ids():
+        return sorted(json.loads(path.read_text(encoding="utf-8"))["data"]["message_id"]
+                      for path in (tmp_path / "pending_messages").glob("*.json"))
+
+    async def settle(runner, *_args):
+        assert spooled_ids() == ["first"]
+        runner._pending_messages[key] = MessageEvent(text="queued during settle", source=source, message_id="second")
+
+    monkeypatch.setattr("gateway.run_runtime.settle_gateway_runtime", settle)
+    await gw_mod.GatewayRunner.stop(gw)
+    assert spooled_ids() == ["first", "second"]
+    assert gw._pending_messages == {}

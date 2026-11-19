@@ -56,6 +56,8 @@ When shutdown withdraws the adapter's message handler, a background task that
 already owns an input but has not dispatched it returns the input to the existing
 shutdown queue. The input keeps its original recovery identity. The task reports
 neither turn success nor a generic handler error when preservation succeeds.
+The stop sequence persists that queue before waiting for authority settlement and
+persists any arrivals during that wait before cancellable finalization.
 
 The private spool preserves whether the gateway originally marked an event as
 synthetic. Recovery restores that marker before native admission and still checks
