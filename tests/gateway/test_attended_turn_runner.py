@@ -317,7 +317,7 @@ def test_turn_start_attended_notice_is_delivered_persistently_once(monkeypatch, 
         ),
         _resolve_session_reasoning_config=lambda **_kwargs: None,
         _resolve_session_service_tier=lambda **_kwargs: None,
-        _resolve_turn_agent_config=lambda _message, model, runtime: {"model": model, "runtime": runtime},
+        _resolve_turn_agent_config=lambda _message, model, runtime, **_kw: {"model": model, "runtime": runtime},
         _session_state=lambda _key: state,
     )
     ctx = TurnContext(
