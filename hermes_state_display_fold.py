@@ -183,7 +183,7 @@ class DisplayFoldMixin:
         nulls the stored identity (``messages_display_identity_update``). User handoff keys use
         only the live view's content, not its presentation metadata. Metadata-only edits do
         not invalidate that identity, and display visibility is filtered separately on read.
-        Every changed row and every row the snapshot did not see is recomputed under the lock.
+        Changed rows and summary carriers outside the snapshot are recomputed under the lock.
         Alias/repair discovery is also off-lock. A writer freshness token gates affected-group
         enumeration, but generic/stale-plan callers retain the whole-index fold.
         ``None`` (no WAL reader, a read-only store, any read error) keeps the full in-lock scan."""
@@ -293,13 +293,18 @@ class DisplayFoldMixin:
 
     def _resolve_display_identities(self, conn, visible, plan):
         """Stored equality validates payload reuse, not membership or presentation metadata."""
-        # Rows inserted after the off-lock snapshot already carry the canonical identity from
-        # ``_message_row_params``. They have no plan entry, but decoding their payload under the
-        # writer lock needlessly turns every compaction into a long lock hold. A non-null stored
-        # identity is trusted for those new rows. Existing rows whose snapshot identity changed,
-        # or rows with a missing identity, still take the stale decode path.
+        # Ordinary inserts already carry their canonical identity. A summary carrier with a
+        # message UID may instead inherit an earlier reply's identity. Check only new row IDs
+        # for that marker, without reading their payloads under the writer lock.
         stale = [row_id for row_id, stored, _order in visible
                  if stored is None or (row_id in plan and plan[row_id][0] != stored)]
+        new_ids = [row_id for row_id, stored, _order in visible
+                   if stored is not None and row_id not in plan]
+        for start in range(0, len(new_ids), 500):
+            batch = new_ids[start:start + 500]
+            stale.extend(row[0] for row in conn.execute(
+                f"SELECT id FROM messages WHERE id IN ({_placeholders(batch)}) "
+                "AND _compressed_summary = 1 AND message_uid IS NOT NULL", batch))
         fresh: dict[int, bytes] = {}
         add_write_rows("display_stale", len(stale))
         with write_phase("display_stale_decode"):
