@@ -153,7 +153,7 @@ async def test_busy_follow_up_goal_notice_keeps_its_bubble_cleanup_without_adapt
     async def executor(fn):
         return fn()
 
-    async def notice(_source, message):
+    async def notice(_source, message, **_options):
         notices.append(message)
 
     async def no_loop(**_kwargs):
@@ -207,7 +207,7 @@ async def test_busy_follow_up_loop_notice_keeps_its_bubble_cleanup_without_adapt
     async def executor(fn, *args):
         return fn(*args)
 
-    async def notice(_source, message):
+    async def notice(_source, message, **_options):
         notices.append(message)
 
     monkeypatch.setattr(runner.async_session_store, "get_or_create_session", session)

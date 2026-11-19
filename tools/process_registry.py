@@ -1863,7 +1863,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         session = session if session is not None else self._resolve_prefix(session_id)
         if session is not None and not sandbox_visible(session.sandbox_key):
             return None
-        return self._refresh_detached_session(session)
+        return session  # no backend probe here: get() refreshes, callers that must not probe use this
 
     def _resolve_prefix(self, session_id: str) -> Optional[ProcessSession]:
         """Resolve a unique session-ID prefix (a bare hex tail is normalized to
@@ -3171,7 +3171,9 @@ def _list_processes(task_id, node=None) -> dict:
     return {"processes": [
         _redact_process_result(p)
         for p in process_registry.list_sessions(
-            task_id=task_id, session_key=caller_session_key() or None, include_retained=True)]}
+            task_id=task_id, session_key=caller_session_key() or None, include_retained=True,
+            # An explicit node lists that node's handles only: another node's is never refreshed.
+            **({"node": node} if node is not None else {}))]}
 
 
 # action -> (handler(session_id, args) -> dict, redact output?). Output-bearing
@@ -3196,28 +3198,10 @@ _MAX_HANDOFFS_PER_CHILD = 3
 
 
 def _handle_process(args, **kw):
-    action = args.get("action", "")
-    # Coerce to string — some models send session_id as an integer
-    session_id = str(args.get("session_id", "")) if args.get("session_id") is not None else ""
-    if action == "list":
-        return json.dumps(_list_processes(kw.get("task_id")), ensure_ascii=False)
-    if action == "handoff":
-        if not session_id:
-            return tool_error("session_id is required for handoff")
-        from tools.process_registry_handoff import handoff_process
-        return json.dumps(handoff_process(session_id, args, kw.get("task_id")), ensure_ascii=False)
-    if action in _SESSION_ACTIONS:
-        if not session_id:
-            return tool_error(f"session_id is required for {action}")
-        from tools.process_registry_access import resolve_actionable
-        allowed, session_id = resolve_actionable(session_id, kw.get("task_id"))
-        if not allowed:
-            return json.dumps(_not_found(session_id), ensure_ascii=False)
-        handler, redact = _SESSION_ACTIONS[action]
-        from tools.process_registry_wait_policy import apply_wait_poll_policy
-        result = apply_wait_poll_policy(action, session_id, handler(session_id, args))
-        return json.dumps(_redact_process_result(result) if redact else result, ensure_ascii=False)
-    return tool_error(f"Unknown process action: {action}. Use: list, poll, log, wait, kill, write, submit, close, handoff")
+    # Named-node routing and provenance live with the SSH process code; it applies the
+    # ownership gate (tools.process_registry_access) before any session action.
+    from tools.process_registry_ssh import handle_process
+    return handle_process(args, **kw)
 
 
 registry.register(

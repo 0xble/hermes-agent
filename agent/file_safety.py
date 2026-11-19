@@ -404,8 +404,10 @@ def _approval_paths_by_key(home: str) -> dict[str, str]:
     files run at login. Interactive file tools prompt; callers without a human channel fail closed.
     Each class has its own key so an approve-always answer for ``~/.ssh/config`` never authorizes
     ``~/.bashrc`` (or vice versa)."""
-    paths = {os.path.realpath(os.path.join(home, ".ssh", "config")): "ssh_config_write"}
-    paths.update({os.path.realpath(os.path.join(home, name)): "shell_rc_write" for name in SHELL_RC_FILES})
+    # _realpath, not os.path.realpath: on a named node these are the node's paths and resolve there,
+    # never on the controller's filesystem. With no node selected the two are the same call.
+    paths = {_realpath(os.path.join(home, ".ssh", "config")): "ssh_config_write"}
+    paths.update({_realpath(os.path.join(home, name)): "shell_rc_write" for name in SHELL_RC_FILES})
     return paths
 
 
@@ -457,8 +459,7 @@ def _classify_resolved_write_denial(homes: set[str], resolved: str) -> Optional[
     # prompt. The protected-subpath and HERMES_WRITE_SAFE_ROOT checks below still apply.
     # Both spellings of the config count: the lexical pass hands this an unresolved path.
     key = deny_key(resolved)
-    ssh_configs = {deny_key(os.path.realpath(os.path.join(home, ".ssh", "config"))) for home in homes}
-    ssh_configs.update(deny_key(spelling) for home in homes for spelling in build_write_approval_paths(home))
+    ssh_configs = {deny_key(spelling) for home in homes for spelling in build_write_approval_paths(home)}
     if key not in ssh_configs and any(
         key in map(deny_key, build_write_denied_paths(home))
         or any(key.startswith(deny_key(prefix)) for prefix in build_write_denied_prefixes(home))

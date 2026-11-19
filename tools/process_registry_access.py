@@ -49,7 +49,7 @@ def resolve_actionable(session_id: str, task_id) -> tuple[bool, str]:
     the same way, and an allowed session is acted on by its FULL id, so no prefix the check did
     not resolve can reach another conversation's process."""
     from tools.process_registry import process_registry
-    session = process_registry.get(session_id)
+    session = process_registry._lookup_session(session_id)  # owner fields only: no backend probe
     if session is None:
         return False, session_id
     if not session_action_allowed(session, str(task_id or ""), caller_session_key()):

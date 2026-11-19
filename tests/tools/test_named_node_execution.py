@@ -92,7 +92,7 @@ def peers(monkeypatch, tmp_path):
     monkeypatch.setattr(ssh, "_ensure_ssh_available", lambda: None)
     process_registry = pr.ProcessRegistry()
     monkeypatch.setattr(pr, "process_registry", process_registry)
-    monkeypatch.setattr(pr, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr(pr, "_checkpoint_path", lambda _p=tmp_path / "processes.json": _p)
     monkeypatch.setattr(process_registry, "_start_ssh_poller", lambda session: None)
     yield roots, logical, offline, calls, process_registry, home
     for session in list(process_registry._running.values()):

@@ -35,7 +35,7 @@ class ProcessRegistry:
 
     def get(self, session_id: str):
         """Resolve a handle and refresh its original backend only."""
-        return self._lookup_session(session_id)
+        return self._refresh_detached_session(self._lookup_session(session_id))
 
     def _env_poller_loop(self, session: ProcessSession, env: Any,
                          log_path: str, pid_path: str, exit_path: str):

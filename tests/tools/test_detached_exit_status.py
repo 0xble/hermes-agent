@@ -19,7 +19,7 @@ def test_persistent_local_exit_survives_spawner(tmp_path, monkeypatch):
     home.mkdir()
     monkeypatch.setenv("HERMES_HOME", str(home))
     checkpoint = home / "processes.json"
-    monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", checkpoint)
+    monkeypatch.setattr("tools.process_registry._checkpoint_path", lambda _p=checkpoint: _p)
     script = tmp_path / "spawn.py"
     script.write_text("""
 import os
@@ -68,7 +68,7 @@ def test_killed_wrapper_persists_its_wait_status(tmp_path, monkeypatch):
 def test_legacy_gone_exit_is_retained_and_announced(tmp_path, monkeypatch, recover):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     checkpoint = tmp_path / "processes.json"
-    monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", checkpoint)
+    monkeypatch.setattr("tools.process_registry._checkpoint_path", lambda _p=checkpoint: _p)
     child = subprocess.Popen([sys.executable, "-c", "raise SystemExit(19)"])
     child.wait(timeout=10)
     log = tmp_path / "legacy.log"

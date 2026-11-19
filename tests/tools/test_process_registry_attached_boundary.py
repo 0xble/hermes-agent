@@ -15,7 +15,7 @@ from tools.process_registry import ProcessRegistry, ProcessSession
 @pytest.fixture
 def local_registry(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    monkeypatch.setattr("tools.process_registry.CHECKPOINT_PATH", tmp_path / "processes.json")
+    monkeypatch.setattr("tools.process_registry._checkpoint_path", lambda _p=tmp_path / "processes.json": _p)
     monkeypatch.setattr("tools.process_registry.worker_output_log", lambda _: None)
     # Use the platform's supported shell (macOS's bash 3.2 stays interactive).
     shell = shutil.which("zsh" if sys.platform == "darwin" else "bash")
