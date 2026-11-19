@@ -2265,14 +2265,10 @@ class GatewayInboundMixin(
             logger.debug("Failed to restore one-turn model override", exc_info=True)
 
     def _prefix_inbound_sender_context(self, event: MessageEvent, source: SessionSource, message_text: str) -> str:
-        """Attribute the sender in shared multi-user sessions and prepend history-backfill context."""
-        message_text = label_shared_sender(
+        """Attribute only the current sender; backfill is added after media enrichment."""
+        return label_shared_sender(
             source, message_text, group_sessions_per_user=getattr(self.config, "group_sessions_per_user", True),
             thread_sessions_per_user=getattr(self.config, "thread_sessions_per_user", False))
-        # After the sender-prefix so the prefix applies only to the trigger message, not the backfill.
-        if getattr(event, "channel_context", None):
-            message_text = f"{event.channel_context}\n\n[New message]\n{message_text}"
-        return message_text
 
     @staticmethod
     def _classify_inbound_media(
