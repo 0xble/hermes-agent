@@ -54,7 +54,7 @@ def _enabled_for_route(provider: str, base_url: str) -> bool:
         entry = _get_named_custom_provider(provider, resolve_credentials=False)
         return bool(entry and entry.get("hermes_request_class") is True
                     and _route_key(entry.get("base_url")) == _route_key(base_url))
-    except Exception:
+    except (AttributeError, OSError, TypeError, ValueError):
         # A scheduling hint must not turn an otherwise usable route into a failed request.
         logger.debug("Skipping request class: unable to verify named provider opt-in")
         return False
