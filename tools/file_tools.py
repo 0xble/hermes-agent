@@ -606,7 +606,6 @@ def _record_successful_read(task_data: dict, task_id: str, path: str, resolved_s
     with _read_tracker_lock:
         count, dedup = _note_read_served(task_data, dedup_key, path, offset, limit)
         task_data["read_history"].add((path, offset, limit))
-        count = _bump_consecutive(task_data, ("read", path, offset, limit))
         if read_mtime is not None:
             task_data.setdefault("read_timestamps", {})[resolved_str] = read_mtime
         baselines = task_data["full_write_baselines"]
