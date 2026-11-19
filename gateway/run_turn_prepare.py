@@ -308,7 +308,7 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
                     notice = pre_agent_fallback_notice(
                         override.get("provider"), override["model"],
                         fallback.get("provider"), fallback["model"])
-                    return override["model"], fallback_runtime, notice, False
+                    return fallback["model"], fallback_runtime, notice, False
                 raise  # An explicit model has no eligible same-model route.
             unavailable_override, override = override, None
     if runtime_kwargs is None:
