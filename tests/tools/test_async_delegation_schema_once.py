@@ -121,10 +121,10 @@ def same_version_replacement(home):
     return replacement
 
 
-def _assert_dispatch_persisted():
-    ad._persist_dispatch({"delegation_id": "replacement", "session_key": "session",
+def _assert_dispatch_persisted(delegation_id="replacement"):
+    ad._persist_dispatch({"delegation_id": delegation_id, "session_key": "session",
                           "dispatched_at": time.time()})
-    row = ad.get_durable_delegation("replacement")
+    row = ad.get_durable_delegation(delegation_id)
     assert row is not None
     assert row["origin_session"] == "session"
 
@@ -192,8 +192,8 @@ def test_unnamed_databases_always_reconcile(database, reconcile_calls):
 
 
 def test_data_writes_do_not_reconcile_again(reconcile_calls):
-    for _ in range(3):
-        _assert_dispatch_persisted()
+    for index in range(3):
+        _assert_dispatch_persisted(f"replacement-{index}")
     assert len(reconcile_calls) == 1
 
 

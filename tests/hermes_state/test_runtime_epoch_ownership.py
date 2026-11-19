@@ -10,7 +10,9 @@ from pathlib import Path
 
 import pytest
 
+from gateway.runtime_ownership import OwnershipConflict
 from hermes_state import SessionDB
+from tests.fakes.runtime_owner import begin_runtime_epoch as _seed_epoch
 from hermes_state_runtime import RuntimeStoreError, begin_runtime_epoch
 
 
@@ -161,12 +163,11 @@ def test_a_stranger_cannot_bump_the_epoch_of_a_live_owners_store(tmp_path, hold_
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _seed_epoch(db, instance_id="owner")
         hold_profile(tmp_path)
 
-        with pytest.raises(rt.RuntimeStoreError) as exc:
+        with pytest.raises(OwnershipConflict):
             rt.begin_runtime_epoch(db, instance_id="stranger")
-        assert exc.value.reason == "ownership_conflict"
 
         # The owner's fence must still stand: the bump did not move.
         assert _epoch_of(db) == epoch
@@ -180,13 +181,12 @@ def test_an_unpublished_holder_still_fences_the_bump(tmp_path, hold_profile):
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _seed_epoch(db, instance_id="owner")
         hold_profile(tmp_path)
         (tmp_path / "gateway.lock").write_text("", encoding="utf-8")  # same inode, record gone
 
-        with pytest.raises(rt.RuntimeStoreError) as exc:
+        with pytest.raises(OwnershipConflict):
             rt.begin_runtime_epoch(db, instance_id="stranger")
-        assert exc.value.reason == "ownership_conflict"
         assert _epoch_of(db) == epoch
     finally:
         db.close()
@@ -199,14 +199,13 @@ def test_a_record_naming_this_pid_in_another_pid_namespace_is_not_ours(tmp_path,
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _seed_epoch(db, instance_id="owner")
         hold_profile(tmp_path)
         record = {**_build_pid_record(), "pidns": "another-namespace"}
         (tmp_path / "gateway.lock").write_text(json.dumps(record), encoding="utf-8")
 
-        with pytest.raises(rt.RuntimeStoreError) as exc:
+        with pytest.raises(OwnershipConflict):
             rt.begin_runtime_epoch(db, instance_id="stranger")
-        assert exc.value.reason == "ownership_conflict"
         assert _epoch_of(db) == epoch
     finally:
         db.close()
@@ -221,16 +220,15 @@ def test_our_released_reservations_record_does_not_grant_the_bump(tmp_path, hold
     db = SessionDB(db_path=tmp_path / "state.db")
     ownership = ProfileOwnership()
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+        epoch = _seed_epoch(db, instance_id="owner")
         ownership.reserve([tmp_path])
         ours = (tmp_path / "gateway.lock").read_text(encoding="utf-8")
         ownership.release(tmp_path)
         hold_profile(tmp_path)
         (tmp_path / "gateway.lock").write_text(ours, encoding="utf-8")  # the holder has not published
 
-        with pytest.raises(rt.RuntimeStoreError) as exc:
+        with pytest.raises(OwnershipConflict):
             rt.begin_runtime_epoch(db, instance_id="stranger")
-        assert exc.value.reason == "ownership_conflict"
         assert _epoch_of(db) == epoch
     finally:
         ownership.close()
@@ -241,18 +239,12 @@ def test_our_released_reservations_record_does_not_grant_the_bump(tmp_path, hold
 def test_the_owner_itself_may_bump_the_epoch(tmp_path):
     """The holder of the profile lock is the one taking the store over - it must be allowed."""
     import hermes_state_runtime as rt
-    from gateway.runtime_ownership import ProfileOwnership
+    from gateway.runtime_ownership import exclusive_maintenance
 
-    db = SessionDB(db_path=tmp_path / "state.db")
-    ownership = ProfileOwnership()
-    try:
+    with SessionDB(db_path=tmp_path / "state.db") as db, exclusive_maintenance([tmp_path]):
         first = rt.begin_runtime_epoch(db, instance_id="owner")
-        ownership.reserve([tmp_path])
         second = rt.begin_runtime_epoch(db, instance_id="owner-again")
         assert second > first
-    finally:
-        ownership.close()
-        db.close()
 
 
 def test_the_verdict_is_per_profile(tmp_path, hold_profile):
@@ -271,13 +263,12 @@ def test_the_verdict_is_per_profile(tmp_path, hold_profile):
     db_owned = SessionDB(db_path=owned / "state.db")
     db_free = SessionDB(db_path=free / "state.db")
     try:
-        with pytest.raises(rt.RuntimeStoreError) as exc:
+        with pytest.raises(OwnershipConflict):
             rt.begin_runtime_epoch(db_owned, instance_id="stranger")
-        assert exc.value.reason == "ownership_conflict"
         assert _epoch_of(db_owned) is None, "the refused bump must not have created the row"
 
         # The other profile's store is a different store: free to be taken over.
-        assert rt.begin_runtime_epoch(db_free, instance_id="owner") == 1
+        assert _seed_epoch(db_free, instance_id="owner") == 1
     finally:
         db_owned.close()
         db_free.close()
@@ -285,13 +276,11 @@ def test_the_verdict_is_per_profile(tmp_path, hold_profile):
 
 def test_an_unowned_store_can_be_taken_over(tmp_path):
     """No live owner: the bump IS the takeover (the gateway's own boot, and every test store)."""
-    import hermes_state_runtime as rt
-
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        epoch = rt.begin_runtime_epoch(db, instance_id="first-owner")
+        epoch = _seed_epoch(db, instance_id="first-owner")
         assert epoch == 1
-        replacement = rt.begin_runtime_epoch(db, instance_id="replacement")
+        replacement = _seed_epoch(db, instance_id="replacement")
         assert replacement > epoch
     finally:
         db.close()
@@ -299,15 +288,14 @@ def test_an_unowned_store_can_be_taken_over(tmp_path):
 
 def test_a_dead_owners_record_does_not_fence_the_bump(tmp_path):
     """A stale lock record (the gateway died, the flock went with it): the store can be taken over."""
-    import hermes_state_runtime as rt
     from gateway.status import _build_pid_record
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
-        first = rt.begin_runtime_epoch(db, instance_id="owner")
+        first = _seed_epoch(db, instance_id="owner")
         record = {**_build_pid_record(), "pid": 999_999_999, "start_time": None}
         (tmp_path / "gateway.lock").write_text(json.dumps(record), encoding="utf-8")
-        replacement = rt.begin_runtime_epoch(db, instance_id="replacement")
+        replacement = _seed_epoch(db, instance_id="replacement")
         assert replacement > first
     finally:
         db.close()

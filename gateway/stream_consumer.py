@@ -1250,6 +1250,11 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         around it, so interim frames stay prefix-stable. Control markers are handled separately
         at segment and final boundaries, preserving machine-output lanes that opt out.
         """
+        return redact_to_fixpoint(GatewayStreamConsumer._display_text(text))
+
+    @staticmethod
+    def _display_text(text: str) -> str:
+        """Strip display directives from a frame that was already redacted."""
         from gateway.copy_blocks import map_outside_copy_blocks
         return strip_image_tags_for_display(map_outside_copy_blocks(
             text, _BasePlatformAdapter.strip_media_directives_for_display, keep_markers=True))
