@@ -31,8 +31,10 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 from datetime import datetime, timedelta
+import logging
 
 _SLOT = 'detached'
+logger = logging.getLogger(__name__)
 
 
 def detached_route_of(source) -> str | None:
@@ -149,6 +151,10 @@ def watch_routes(runner, store) -> None:
     so nothing on the loop sees the new route before the conversation it replaced has left it."""
     loop = asyncio.get_running_loop()
 
+    def report_failure(task):
+        if not task.cancelled() and (error := task.exception()) is not None:
+            logger.error("Detached route publication failed", exc_info=error)
+
     def route_named(route, entry):
         authority = _route_authority(runner, store, route)
         origin = entry.origin
@@ -174,8 +180,9 @@ def watch_routes(runner, store) -> None:
         if not store._route_is_current(route, version):
             return
         if on_loop:
-            task = runner._retain_background_task(loop.create_task(publish_from_loop()))
-            task.add_done_callback(runner._late_failure_callback("Detached route publication failed"))
+            from gateway.session_runtime_workers import track_mutation
+            task = track_mutation(authority, publish_from_loop())
+            task.add_done_callback(report_failure)
         elif not loop.is_closed():
             owner = authority.logical_owner(session_id)
             loop.call_soon_threadsafe(name, owner)
