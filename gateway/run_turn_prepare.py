@@ -205,6 +205,10 @@ def commit_stored_oauth_credentials(override: Optional[dict], runtime: dict) -> 
 def _resolve_channel_runtime(config, source, model, runtime_kwargs) -> tuple[str, dict]:
     from gateway.run import _get_channel_override, _resolve_runtime_agent_kwargs_for_provider
 
+    # Keep the helper compatible with older internal callers that passed the runner
+    # while the turn setup path passes its config snapshot directly.
+    if config is not None and not isinstance(config, dict):
+        config = getattr(config, "config", None)
     if config and source is not None:
         ch = _get_channel_override(
             config, source.platform, str(source.chat_id) if source.chat_id else "",
