@@ -33,7 +33,7 @@ async def test_document_frames_survive_adapter_media_batch(platform, caption):
             await adapter._enqueue_media_event(event)
         merged = next(iter(adapter._pending_media_batches.values()))
     elif platform == 'telegram':
-        adapter = object.__new__(cls)
+        adapter = cls(PlatformConfig())
         pending = {}
         for event in events:
             adapter._merge_into_pending(pending, 'album', event)
