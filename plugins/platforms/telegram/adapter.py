@@ -6833,7 +6833,7 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         # path or an intentionally escaped macro), not a Markdown escape. The
         # final MarkdownV2 escape pass doubles each slash once, so double this
         # input run first to preserve both literal slashes in the delivered text.
-        content = map_outside_code(content, lambda prose: prose.replace("\\\\", "\\\\\\\\"))
+        content = map_outside_code(content, lambda prose: re.sub(r"\\\\(?=[A-Za-z])", r"\\\\\\\\", prose))
         # Rewrite GFM-style pipe tables into Telegram-friendly row groups.
         from .copy_quotes import protect_copy_quotes
         text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
