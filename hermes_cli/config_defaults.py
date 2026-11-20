@@ -1378,6 +1378,9 @@ DEFAULT_CONFIG = {
         # Delegated children's fallback chain (top-level entry format). Unpinned child: null = inherit the
         # parent chain, [] = disable. A child pinned by provider, endpoint or model gets none unless declared.
         "fallback_providers": None,
+        # A pinned child normally keeps its selected model. When enabled, a billing/credits
+        # exhaustion may use the declared fallback chain, including a different model.
+        "allow_billing_fallback": False,
         # Subagent/cron/side-agent runs retry transient errors on the same route this long before fallback; 0 = no wait.
         "fallback": {"transient_retry_window_seconds": 180.0},
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
@@ -1901,6 +1904,8 @@ DEFAULT_CONFIG = {
         # null inherits the global fallback chain; [] disables cron fallback.
         # An explicit provider/model list replaces the global chain for cron only.
         "fallback_providers": None,
+        # Pinned cron jobs keep their model except for billing/credits exhaustion when enabled.
+        "allow_billing_fallback": False,
         # Cron SCHEDULER provider (WHEN a due job fires). "" = built-in in-process 60s ticker. Name
         # an installed provider (plugins/cron_providers/<name>/ or $HERMES_HOME/plugins/ <name>/),
         # e.g. "chronos" (NAS-mediated managed cron for scale-to-zero). An unknown or unavailable

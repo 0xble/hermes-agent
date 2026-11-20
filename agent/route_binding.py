@@ -106,7 +106,7 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     pinned = getattr(agent, "_pinned_fallback_model", None)
     if not explicit_switch and isinstance(pinned, str) and pinned:
         from hermes_cli.fallback_config import same_fallback_model
-        if not same_fallback_model(pinned, model):
+        if not same_fallback_model(pinned, model) and not getattr(agent, "_billing_fallback_attempt", False):
             return None
 
     from agent.auxiliary_client import resolve_provider_client
