@@ -164,8 +164,14 @@ def _alias_route(index: int, task: Mapping[str, Any]) -> Optional[dict[str, Any]
     entry = _alias_entry(full, key)
     chain = entry.get("fallback_providers") if isinstance(entry, Mapping) else None
     # The bare alias key is the route's model: `_resolve_route` expands it, as for any stored alias, into the
-    # entry's live model, provider, endpoint and default reasoning_effort.
-    return {"model": key, "label": key, "fallback_providers": list(chain) if isinstance(chain, list) else []}
+    # entry's live model, provider and endpoint. The default effort is read here from the same entry as the chain,
+    # because the alias resolver reads it only from `model_aliases`.
+    route: dict[str, Any] = {"model": key, "label": key,
+                             "fallback_providers": list(chain) if isinstance(chain, list) else []}
+    effort = entry.get("reasoning_effort") if isinstance(entry, Mapping) else None
+    if effort not in (None, ""):
+        route["reasoning_effort"] = effort
+    return route
 
 
 def _alias_entry(full_config: Mapping[str, Any], key: str) -> Optional[Mapping[str, Any]]:
@@ -349,8 +355,10 @@ def _route_to_task_route(route: dict[str, Any], parent_agent: Any, cache: dict[s
                          config: Optional[Mapping[str, Any]] = None, backend: str = "default") -> TaskRoute:
     label = route.get("label") if isinstance(route.get("label"), str) else None
     route = _with_inherited_fallback(route, {} if label == "inherit" else config or {})
-    # The label is display-only: two labels on one route (or one profile) resolve once.
-    key = json.dumps({k: v for k, v in route.items() if k != "label"}, sort_keys=True, default=str)
+    # The label is display-only: two labels on one route (or one profile) resolve once. The backend is part of the
+    # key, so an explicit alias and a role resolving to the same route each keep their own backend.
+    key = json.dumps({"backend": backend, "route": {k: v for k, v in route.items() if k != "label"}},
+                     sort_keys=True, default=str)
     if key not in cache:
         cache[key] = _resolve_route(route, parent_agent, backend)
     return replace(cache[key], label=label)

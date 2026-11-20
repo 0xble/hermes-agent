@@ -82,14 +82,29 @@ def test_alias_without_a_chain_never_borrows_the_delegation_chain(cfg):
     assert (route.creds["model"], route.creds["provider"]) == ("gpt-6.2-astra", "custom:openai-proxy")
 
 
-def test_model_section_alias_keeps_its_own_fallback_chain(cfg):
+def test_model_section_alias_keeps_its_own_fallback_chain_and_effort(cfg):
     chain = [{"provider": "custom:b", "model": "m-1"}]
-    cfg["model"] = {"provider": "custom:a", "aliases": {"quick": {"model": "m-1", "fallback_providers": chain}}}
+    cfg["model"] = {"provider": "custom:a", "aliases": {
+        "quick": {"model": "m-1", "fallback_providers": chain, "reasoning_effort": "high"}}}
     assert "quick" in _task_props()["model"]["enum"]
     (route,), err = routes.resolve_task_routes([{"goal": "g", "model": "quick"}], {}, _parent())
     assert err is None and route.error is None
     assert (route.creds["model"], route.creds["provider"]) == ("m-1", "custom:a")
     assert route.routing_cfg["fallback_providers"] == chain
+    assert _child_reasoning(_parent(), route.reasoning_cfg or {}, route.reasoning_effort) == {
+        "enabled": True, "effort": "high"}
+
+
+@pytest.mark.parametrize("order", [("role", "alias"), ("alias", "role")])
+def test_alias_and_role_on_one_route_keep_their_own_backend(cfg, monkeypatch, order):
+    """A role whose route equals an explicit alias's must not share its cached backend across a batch."""
+    monkeypatch.setattr(_Roles, "route_task",
+                        lambda self, task, config: {"model": "astra", "label": "astra", "fallback_providers": []})
+    tasks = {"role": {"goal": "r", "option": "worker"}, "alias": {"goal": "a", "model": "astra"}}
+    result, err = routes.resolve_task_routes([tasks[o] for o in order], {}, _parent())
+    assert err is None
+    backends = {o: (r.report() or {}).get("backend") for o, r in zip(order, result)}
+    assert backends == {"role": "test-roles", "alias": "model_alias"}
 
 
 def test_explicit_effort_beats_alias_role_and_parent_defaults(cfg):

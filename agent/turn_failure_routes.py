@@ -73,7 +73,8 @@ def fallback_chain_path(agent: Any) -> str:
     config = f"`{display_hermes_home()}/config.yaml`"
     route = getattr(agent, "_delegate_route", None)
     if isinstance(route, dict) and route.get("backend") == "model_alias" and isinstance(route.get("label"), str):
-        return f"`model_aliases.{route['label']}.fallback_providers` in {config}"
+        return (f"`fallback_providers` of the `{route['label']}` model alias (under `model_aliases` or "
+                f"`model.aliases`) in {config}")
     option = getattr(agent, "_delegate_model_map_option", None)
     if isinstance(option, str) and option.strip():
         return (f"`fallback_providers` of the `{option.strip()}` option in "
