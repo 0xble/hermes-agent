@@ -108,18 +108,23 @@ def test_reconnect_discovery_of_registered_server_refreshes_read_only_hint():
     task = _install(_server())
     _reconnect(task, _session(read_only=False))
     assert handlers._tool_is_read_only("srv", "sync") is False
-    assert task._registered_tool_names == ["mcp_srv_sync"]
+    # Fork divergence: a reconnect republishes the listed manifest instead of keeping the old names.
+    assert "mcp__srv__sync" in task._registered_tool_names
 
 
 def test_reconnect_omitted_tool_does_not_reuse_cached_read_only_hint():
-    """A reconnect can omit a tool while Hermes still exposes its registered handler."""
+    """A reconnect can omit a tool while a call to its registered handler is already in flight."""
     task = _install(_server())
     new = _session(read_only=False)
+    # A complete Tool shape: the fork's reconnect converts the listing into registry schemas.
     new.list_tools.return_value = SimpleNamespace(
-        tools=[SimpleNamespace(name="other", annotations={"readOnlyHint": True})], nextCursor=None)
+        tools=[SimpleNamespace(name="other", annotations={"readOnlyHint": True}, inputSchema={}, description="")],
+        nextCursor=None)
     with _recycled_wake_rediscovers(task, new):
         result, asked = _call(answer="decline")
-    assert task._registered_tool_names == ["mcp_srv_sync"]
+    # Fork divergence: the republished manifest drops the omitted tool; the in-flight call is still gated.
+    assert "mcp__srv__other" in task._registered_tool_names
+    assert "mcp__srv__sync" not in task._registered_tool_names
     assert handlers._tool_is_read_only("srv", "sync") is False
     assert len(asked) == 1 and "UNTRUSTED server 'srv'" in asked[0]
     assert "NOT run" in result["error"]
