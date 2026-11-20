@@ -726,7 +726,7 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
                     _override, _last_model, _ = snapshot(ctx.session_key)
                     _override = (assignment or {}).get("override", _override)
                     model, runtime, _notice, _cache_model = runner._load_session_agent_runtime(
-                        source=ctx.source, skey=ctx.session_key, user_config=boundary_config,
+                        runner=runner, source=ctx.source, skey=ctx.session_key, user_config=boundary_config,
                         config=getattr(runner, "config", None), override=_override,
                         last_model=_last_model, attended_route=None,
                     )

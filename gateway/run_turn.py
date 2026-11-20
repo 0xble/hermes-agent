@@ -712,13 +712,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         return notice
 
     @staticmethod
-    def _load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route=None,
-                                    _runner=None):
+    def _load_session_agent_runtime(*, runner=None, source, skey, user_config, config, override, last_model, attended_route=None):
         """Resolve a detached snapshot off-loop; all runner-state commits belong to the caller."""
         from gateway.run_turn_prepare import load_session_agent_runtime
-        return load_session_agent_runtime(source=source, skey=skey, user_config=user_config, config=config,
-                                          override=override, last_model=last_model, attended_route=attended_route,
-                                          runner=_runner)
+        return load_session_agent_runtime(runner=runner, source=source, skey=skey, user_config=user_config, config=config,
+                                          override=override, last_model=last_model, attended_route=attended_route)
 
     async def _resolve_session_agent_runtime_async(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,

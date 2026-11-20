@@ -14,7 +14,6 @@ command first waits until every earlier input of that reader has committed (``bu
 """
 import asyncio
 import contextvars
-from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from functools import partial
 import logging
@@ -80,50 +79,30 @@ def holds_busy_burst(adapter, session_key):
     return any(session_key in adapter.__dict__.get(name, ()) for name in ('_shared_bursts', '_shared_burst_commits'))
 
 
-@asynccontextmanager
-async def hold_burst_for_control(adapter, event, session_key):
-    """Keep this chat's lifecycle burst pending until the command is accepted or refused."""
-    from hermes_cli.commands import is_interrupt_then_dispatch
-
-    bursts = adapter.__dict__.get('_shared_bursts', {})
-    cmd = event.get_command() if bursts and _serial(adapter) else None
-    burst = bursts.get(session_key) if cmd and is_interrupt_then_dispatch(cmd) else None
-    if burst is None:
-        yield False
-        return
-
-    burst.timer.cancel()
-    try:
-        await _wait_for_serial_inputs(adapter, except_burst=burst)
-        yield True
-    finally:
-        # The merged shared-runtime path reaches the command handler after this gate. Refund only
-        # after that handler marks the lifecycle command accepted; a refusal must commit the burst.
-        if bursts.get(session_key) is burst:
-            if getattr(event, '_interrupt_accepted', False) is True:
-                discard_busy_burst(adapter, session_key)
-            else:
-                await asyncio.shield(_flush(adapter, session_key, burst))
-
-
 async def burst_gate(adapter, event, session_key):
-    """Queue shared-runtime input behind an existing burst; wait for commits before a serial command."""
+    """``handle_message``'s entry check. True: a held or committing burst owns the route, so this
+    shared-runtime input must queue behind it. A command on a serial reader first waits for every
+    input that reader already returned on, as main's reader reached it only after their commits:
+    every held burst commits now, and every pending commit lands before the command runs. That
+    includes the chat's own burst under /stop, /new and /reset: the sender is not authorized yet,
+    so an accepted command cancels the queued row (``_hm_stop_owner_turn``), a refused one keeps it."""
     if adapter._shared_runtime_owns_input(event):
         return holds_busy_burst(adapter, session_key)
     if event.get_command() and _serial(adapter):
-        await _wait_for_serial_inputs(adapter)
-    return False
-
-
-async def _wait_for_serial_inputs(adapter, *, except_burst=None):
-    """Settle earlier serial-reader input, except a lifecycle burst awaiting its verdict."""
-    for key, burst in list(adapter.__dict__.get('_shared_bursts', {}).items()):
-        if burst is not except_burst:
+        from hermes_cli.commands import is_interrupt_then_dispatch
+        interrupt = bool(is_interrupt_then_dispatch(event.get_command()))
+        for key, burst in list(adapter.__dict__.get('_shared_bursts', {}).items()):
+            # Destructive lifecycle commands cancel their own held burst rather than first
+            # committing it; otherwise a bot-loop charge would become irreversible before /stop,
+            # /new, or /reset can discard the queued input.
+            if interrupt and key == session_key:
+                continue
             _flush(adapter, key, burst)
-    if pending := list(adapter.__dict__.get('_shared_burst_commits', {}).values()):
-        await asyncio.wait(pending)
-    if held := list(adapter.__dict__.get('_uncommitted_inputs', ())):
-        await asyncio.wait(held)  # a non-burst input released behind an earlier one, not durable yet
+        if pending := list(adapter.__dict__.get('_shared_burst_commits', {}).values()):
+            await asyncio.wait(pending)
+        if held := list(adapter.__dict__.get('_uncommitted_inputs', ())):
+            await asyncio.wait(held)  # a non-burst input released behind an earlier one, not durable yet
+    return False
 
 
 async def dispatch_busy_burst(adapter, event, session_key):

@@ -205,11 +205,10 @@ def commit_stored_oauth_credentials(override: Optional[dict], runtime: dict) -> 
         override.update(api_key=runtime["api_key"], credential_pool=runtime.get("credential_pool"))
 
 
-def _resolve_channel_runtime(runner, source, model, runtime_kwargs, *, config=None) -> tuple[str, dict]:
+def _resolve_channel_runtime(runner, source, model, runtime_kwargs) -> tuple[str, dict]:
     from gateway.run import _get_channel_override, _resolve_runtime_agent_kwargs_for_provider
 
-    if config is None and runner is not None and source is not None:
-        config = runner._serving_channel_config(source)
+    config = runner._serving_channel_config(source) if source is not None else None
     if config and source is not None:
         ch = _get_channel_override(
             config, source.platform, str(source.chat_id) if source.chat_id else "",
@@ -257,11 +256,10 @@ def load_runtime_for_source(runner, **kwargs):
     profile's (#136198). Runs with the loader, so that read stays off the event loop."""
     source = kwargs.get("source")
     config = runner._serving_channel_config(source) if source is not None else None
-    return runner._load_session_agent_runtime(**kwargs, config=config, _runner=runner)
+    return runner._load_session_agent_runtime(runner=runner, **kwargs, config=config)
 
 
-def load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route,
-                               runner=None):
+def load_session_agent_runtime(*, runner, source, skey, user_config, config, override, last_model, attended_route):
     """Resolve a detached route snapshot; the caller owns the session-state commit."""
     from gateway.run import (
         _resolve_gateway_model,
@@ -308,7 +306,7 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
         notice = pre_agent_fallback_notice(
             unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
 
-    model, runtime_kwargs = _resolve_channel_runtime(runner, source, model, runtime_kwargs, config=config)
+    model, runtime_kwargs = _resolve_channel_runtime(runner, source, model, runtime_kwargs)
     model, runtime_kwargs, notice = _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice)
 
     if override and skey:
