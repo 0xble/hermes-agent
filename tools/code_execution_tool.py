@@ -207,10 +207,13 @@ def _sandbox_failure_hint(stderr_text: str, enabled_tools=None) -> Optional[str]
 def generate_hermes_tools_module(enabled_tools: list[str],
                                  transport: str = "uds") -> str:
     """Source of the hermes_tools.py stub module for SANDBOX_ALLOWED_TOOLS ∩ *enabled_tools*.
-    ``transport``: ``"uds"`` (local socket client) or ``"file"`` (file RPC, remote backends)."""
+    ``transport``: ``"uds"`` (local socket client) or ``"file"`` (file RPC, remote backends).
+
+    The tool functions, not ``_call``, raise ``HermesToolError``: ``_call`` is the transport and returns
+    every reply as the server sent it, including the refusal of a tool outside the grant."""
     header = _FILE_TRANSPORT_HEADER if transport == "file" else _UDS_TRANSPORT_HEADER
     return "from __future__ import annotations\n\n" + header + "\n".join(
-        f"def {name}({sig}):\n    {doc}\n    return _call({name!r}, {args_expr})\n"
+        f"def {name}({sig}):\n    {doc}\n    return _parse_tool_result({name!r}, _call({name!r}, {args_expr}))\n"
         for name, (sig, doc, args_expr) in sorted(_TOOL_STUBS.items()) if name in set(enabled_tools)
     )
 
@@ -326,7 +329,7 @@ def _connect():
     return _sock
 
 def _call(tool_name, args):
-    """Send a tool call to the parent process; file-tool errors raise HermesToolError."""
+    """Send a tool call to the parent process and return the parsed result."""
     request = json.dumps({
         "tool": tool_name,
         "args": args,
@@ -361,7 +364,13 @@ def _call(tool_name, args):
                 if _attempt + 1 >= _attempts:
                     raise
     raw = buf.decode().strip()
-    return _parse_tool_result(tool_name, json.loads(raw))
+    result = json.loads(raw)
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    return result
 
 '''
 
@@ -380,7 +389,7 @@ _seq_lock = threading.Lock()
 ''' + _COMMON_HELPERS + '''\
 
 def _call(tool_name, args):
-    """Send a tool call request via file-based RPC; file-tool errors raise HermesToolError."""
+    """Send a tool call request via file-based RPC and wait for response."""
     global _seq
     with _seq_lock:
         _seq += 1
@@ -424,7 +433,13 @@ def _call(tool_name, args):
     except OSError:
         pass
 
-    return _parse_tool_result(tool_name, json.loads(raw))
+    result = json.loads(raw)
+    if isinstance(result, str):
+        try:
+            return json.loads(result)
+        except (json.JSONDecodeError, TypeError):
+            return result
+    return result
 
 '''
 
