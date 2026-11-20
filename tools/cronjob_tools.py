@@ -600,12 +600,8 @@ def _manual_run_completion(
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
     reached_nobody = not deliver or deliver == "local" or refreshed.get("last_delivery_reached_none")
-    excerpt = None
-    if reached_nobody:
-        if execution_id:
-            excerpt = str((execution or {}).get("output") or "")[-4000:] or _latest_job_output_excerpt(job_id)
-        else:
-            excerpt = _latest_job_output_excerpt(job_id)
+    excerpt = ((str((execution or {}).get("output") or "")[-4000:] if execution_id else
+                _latest_job_output_excerpt(job_id)) if reached_nobody else None)
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {
