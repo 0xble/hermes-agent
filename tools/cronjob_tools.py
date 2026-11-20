@@ -411,6 +411,15 @@ def _run_claimed_job(job: dict[str, Any], extra_prompt: Optional[str] = None) ->
             release_running_job(job_id, owner=registration_owner)
         execution_id = job.get("execution_id")
         if execution_id:
+            # run_one_job is synchronous and normally settles its execution before
+            # returning. Keep a mocked or otherwise incomplete runner from leaving
+            # the detached completion waiting forever; do not overwrite a terminal
+            # scheduler result.
+            from cron.executions import _TERMINAL_STATES, finish_execution, get_execution
+            current_execution = get_execution(str(execution_id))
+            if current_execution is not None and current_execution.get("status") not in _TERMINAL_STATES:
+                finish_execution(str(execution_id), success=bool(processed),
+                                 error=None if processed else "Cron runner returned without a terminal outcome.")
             with _run_heartbeat(str(job.get("name") or job_id)):
                 execution = _wait_for_manual_execution(str(execution_id)) or {}
             state = execution.get("status") or "unknown"
@@ -697,6 +706,15 @@ def _try_dispatch_background_run(
             res, job_id, job_name, deliver, started_at,
             execution_id=str((claimed_job or {}).get("execution_id") or "") or None,)
 
+    cron_execution: dict[str, str] = {
+        "cron_execution_id": str((claimed_job or {}).get("execution_id") or ""),
+        "cron_job_id": job_id, "cron_job_name": job_name,
+        "cron_deliver": deliver,
+    }
+    if deliver == "local":
+        cron_output_excerpt = _latest_job_output_excerpt(job_id)
+        if cron_output_excerpt:
+            cron_execution["cron_output_excerpt"] = cron_output_excerpt
     dispatch = dispatch_async_delegation(
         goal=f"Manual run of cron job '{job_name}' ({job_id})",
         context=("Triggered via cronjob(action='run'). The job executed in its own "
@@ -705,12 +723,7 @@ def _try_dispatch_background_run(
         toolsets=None, role="cron_run", model=None, session_key=session_key,
         parent_session_id=str(session_id) if session_id else None, runner=_runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
-        max_async_children=max_async,
-        cron_execution={
-            "cron_execution_id": str((claimed_job or {}).get("execution_id") or ""),
-            "cron_job_id": job_id, "cron_job_name": job_name,
-            "cron_deliver": deliver,
-        })
+        max_async_children=max_async, cron_execution=cron_execution)
     if dispatch.get("status") == "dispatched":
         return {"claimed": True, "dispatched": True, "delegation_id": dispatch.get("delegation_id")}
 
