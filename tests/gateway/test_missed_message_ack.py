@@ -28,6 +28,7 @@ class RecordingAdapter:
         self.fetch_error, self.dispatch_error = fetch_error, dispatch_error
         self.windows, self.dispatched, self.sent, self.recovered = [], [], [], []
         self.live_until: Any = None
+        self.missed_inbound_scan_complete = True
 
     async def fetch_missed_inbound(self, since, until):
         self.windows.append((since, until))
@@ -285,6 +286,17 @@ async def test_errors_are_swallowed_and_startup_is_not_blocked(db):
     recovery.schedule_missed_inbound_recovery(object(), Platform.SLACK)
     recovery.schedule_missed_inbound_recovery(make_runner(None, {Platform.SLACK: adapter}), Platform.SLACK)
     assert await recovery.recover_platform(make_runner(db, {}), Platform.SLACK, until=2000.0) == 0
+
+
+@pytest.mark.asyncio
+async def test_a_partial_scan_keeps_the_watermark_for_retry(db):
+    db.advance_missed_inbound_watermark("slack", 1000.0)
+    adapter = RecordingAdapter([record("D1", "1500.000100")])
+    adapter.missed_inbound_scan_complete = False
+
+    assert await recovery.recover_platform(make_runner(db, {Platform.SLACK: adapter}), Platform.SLACK, until=2000.0) == 1
+    assert db.get_missed_inbound_watermark("slack") == 1000.0
+    assert len(adapter.dispatched) == 1
 
 
 @pytest.mark.asyncio

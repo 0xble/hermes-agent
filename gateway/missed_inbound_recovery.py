@@ -206,6 +206,11 @@ async def _scan(runner: Any, name: str, until: float) -> int:
             records = _in_window(await _maybe_await(adapter.fetch_missed_inbound(since, until)), name, since, until)
             if records:
                 dispatched = await _dispatch(db, adapter, name, records, since, until)
+            if getattr(adapter, "missed_inbound_scan_complete", True) is False:
+                # The adapter may have returned partial results after a rate limit or call-budget
+                # stop. Claims keep dispatched records idempotent, but the interval must be retried.
+                logger.warning("Missed inbound scan incomplete for %s; retaining watermark", name)
+                return dispatched
     except asyncio.CancelledError:
         # Preserve the watermark when shutdown interrupts a scan. The next start must rescan
         # the unfinished interval rather than silently losing messages discovered after it.

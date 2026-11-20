@@ -71,6 +71,7 @@ class _Scan:
         self.stopped = ""
         self.records: list[dict[str, Any]] = []
         self.threads_read: set[tuple[str, str]] = set()
+        self.complete = True
 
     def in_window(self, message: dict[str, Any]) -> bool:
         return self.since < _ts_value(message) <= self.until
@@ -103,6 +104,7 @@ class SlackMissedInboundMixin:
     _MISSED_INBOUND_MAX_THREADS = 40
     _MISSED_INBOUND_THREAD_DAYS = 7
     _missed_inbound_call_spacing_s = 1.2
+    missed_inbound_scan_complete = True
     # Set by gateway.missed_inbound_recovery when recovery is enabled for this adapter.
     missed_inbound_observer: Any = None
     missed_inbound_reconnected: Any = None
@@ -115,9 +117,11 @@ class SlackMissedInboundMixin:
         if not getattr(self, "_app", None):
             return []
         scan = _Scan(since, until, self._MISSED_INBOUND_MAX_CALLS, self._missed_inbound_call_spacing_s)
+        self.missed_inbound_scan_complete = False
         clients = dict(getattr(self, "_team_clients", None) or {}) or {"": self._app.client}
         for team_id, client in clients.items():
             await self._missed_scan_workspace(scan, str(team_id or ""), client)
+        self.missed_inbound_scan_complete = not bool(scan.stopped)
         if scan.stopped:
             logger.warning(
                 "[Slack] Missed inbound scan ended early (%s) after %d calls; conversations not yet "
