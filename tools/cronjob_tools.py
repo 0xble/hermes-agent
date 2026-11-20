@@ -705,7 +705,7 @@ def _try_dispatch_background_run(
         toolsets=None, role="cron_run", model=None, session_key=session_key,
         parent_session_id=str(session_id) if session_id else None, runner=_runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
-        max_async_children=max_async, max_queued_delegations=0,
+        max_async_children=max_async,
         cron_execution={
             "cron_execution_id": str((claimed_job or {}).get("execution_id") or ""),
             "cron_job_id": job_id, "cron_job_name": job_name,
