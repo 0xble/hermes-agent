@@ -1245,7 +1245,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
             children = result.get("results") if isinstance(result, dict) else None
             failed = any(isinstance(child, dict) and str(child.get("status") or "").lower()
                          in {"failed", "error", "interrupted", "unknown"} for child in (children or []))
-            cut_reason = evt.get("cut_reason")
+            cut_reason = evt.get("cut_reason") or record.get("_cut_reason")
             if (cut_reason and cut_reason != "/stop") or str(evt.get("status") or "").lower() in {"failed", "interrupted"} or failed:
                 if cut_reason == "gateway shutdown (restart)":
                     evt["retry_note"] = ("Work was cut before finishing. To continue call "

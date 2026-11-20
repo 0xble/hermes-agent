@@ -389,7 +389,7 @@ def _attach_retry_note(evt: dict[str, Any]) -> None:
     )
     if evt.get("type") != "async_delegation" or evt.get("task_failure_notice"):
         return
-    evt.pop("retry_note", None)  # cancellation may have invalidated a previously persisted promise
+    provisional_note = evt.get("retry_note")
     try:
         from tools.delegation_resume import retry_note, retry_status, schedule_retry
         delegation_id = evt["delegation_id"]
@@ -402,7 +402,11 @@ def _attach_retry_note(evt: dict[str, Any]) -> None:
                         "delegation_id": delegation_id, "cut_reason": record["event"].get("cut_reason")}
         if note := retry_note(plan):
             evt["retry_note"] = note
-    except Exception:  # the retry sweep classifies later if the ledger is unavailable
+        elif provisional_note:
+            evt["retry_note"] = provisional_note
+    except Exception:  # the retry classification deferred; keep the provisional delivery guidance
+        if provisional_note:
+            evt["retry_note"] = provisional_note
         logger.debug("Async delegation %s: retry classification deferred", evt.get("delegation_id"), exc_info=True)
     _stamp_resume_availability(evt)
 
