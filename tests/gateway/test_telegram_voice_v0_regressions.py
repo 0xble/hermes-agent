@@ -272,7 +272,7 @@ async def test_queued_voice_transcribes_immediately_and_drain_reuses_it():
         await event._gateway_pending_stt_prefetch
 
     assert pending_event is event
-    assert pending == '"queued hello"'
+    assert pending == '"queued hello"\n[User sent audio: /tmp/queued-voice.ogg]'
     mock_transcribe.assert_called_once_with("/tmp/queued-voice.ogg", None, "gateway")
     assert [content for _chat, content, _meta in adapter.sent] == ['🎙️ "queued hello"']
     assert adapter.sent[0][2].get("_interim_send") is True  # mid-turn: must not seal a live stream
@@ -334,7 +334,7 @@ async def test_fifo_voice_from_queue_command_prefetches_before_drain():
         await asyncio.wait_for(queued._gateway_pending_stt_prefetch, 3)
         text, _transcripts = await runner._transcribe_pending_audio_event_once(queued)
     assert reply.startswith("⏳ Queued for the next turn")
-    assert text == '"explicit queue"'
+    assert text == '"explicit queue"\n[User sent audio: /tmp/explicit-queue.ogg]'
     transcribe.assert_called_once()
 
 
@@ -409,7 +409,7 @@ async def test_cancelled_prefetch_retains_result_without_second_stt():
         await inner
         await asyncio.sleep(0)
         text, transcripts = await runner._transcribe_pending_audio_event_once(event)
-    assert text == '"retained"'
+    assert text == '"retained"\n[User sent audio: /tmp/cancelled-voice.ogg]'
     assert transcripts == ["retained"]
     assert not hasattr(event, "_gateway_pending_stt_task")
     mock_stt.assert_called_once()
