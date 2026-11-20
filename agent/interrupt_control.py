@@ -39,6 +39,8 @@ SYSTEM_INTERRUPT_MESSAGES = frozenset({
     "gateway restarting",
     "session turn lease lost; stopping to protect the transcript.",
     "session turn lease could not be refreshed; stopping to protect the transcript.",
+    "profile runtime is stopping",
+    "profile stopping",
 })
 
 
@@ -53,7 +55,8 @@ def interrupt_issuer(agent) -> Optional[str]:
     """Slug of the system producer behind the pending interrupt, or ``None`` for a human stop."""
     reason = getattr(agent, "_tool_interrupt_reason", None)
     if not reason or reason in USER_INTERRUPT_REASONS:
-        return None
+        source = getattr(agent, "_interrupt_source", None)
+        return str(source).strip().replace(" ", "_") if source else None
     return str(reason).strip().replace(" ", "_")
 
 
@@ -191,12 +194,15 @@ class InterruptControlMixin:
 
     def interrupt(
         self, message: Optional[str] = None, *, hard_cancel: bool = False,
-        tool_reason: Optional[str] = None, require_generation: Optional[int] = None,
+        tool_reason: Optional[str] = None, interrupt_source: Optional[str] = None,
+        require_generation: Optional[int] = None,
     ) -> bool:
         """Request the agent to interrupt its current tool-calling loop (call from another thread).
 
         ``hard_cancel``: explicit stop; compression may honor it even while ordinary interrupts are masked.
-        ``tool_reason``: trusted fixed category safe for tool output. ``require_generation``: activity-
+        ``tool_reason``: trusted fixed category safe for tool output. ``interrupt_source``: trusted
+        producer class that prevents the message from being replayed as a user follow-up.
+        ``require_generation``: activity-
         generation claim — published only if the turn's generation still matches at the final mutation edge;
         returns False if the turn resumed meanwhile.
         """
@@ -217,6 +223,9 @@ class InterruptControlMixin:
             (tool_reason or _REASON_HARD_STOP) if hard_cancel
             else (tool_reason or (_REASON_NEW_MESSAGE if message else _REASON_USER_INTERRUPT))
         )
+        _interrupt_source = interrupt_source or (
+            "system" if tool_reason is not None and tool_reason not in USER_INTERRUPT_REASONS else None
+        )
 
         def _publish_interrupt_state() -> None:
             # A shutdown stop never relabels a user Stop already pending (the user's Stop wins): the turn
@@ -226,6 +235,7 @@ class InterruptControlMixin:
                     and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS):
                 self._interrupt_message = message
                 self._tool_interrupt_reason = tool_interrupt_reason
+                self._interrupt_source = _interrupt_source
             self._interrupt_requested = True
             self._turn_user_intervened = True
             # The turn record and the log must agree on WHO asked for the stop (#112647).
@@ -291,6 +301,7 @@ class InterruptControlMixin:
                 if hard_cancel:
                     request_hard_interrupt(
                         child, message, tool_reason=tool_interrupt_reason,
+                        interrupt_source=getattr(self, "_interrupt_source", None),
                         delegation_reason=getattr(self, "_delegation_interrupt_reason", None))
                 else:
                     child.interrupt(message)
@@ -300,11 +311,13 @@ class InterruptControlMixin:
             self._safe_print("\n⚡ Interrupt requested" + (f": '{message[:40]}...'" if message and len(message) > 40 else f": '{message}'" if message else ""))
         return True
 
-    def hard_interrupt(self, message: Optional[str] = None, *, tool_reason: Optional[str] = None) -> None:
+    def hard_interrupt(self, message: Optional[str] = None, *, tool_reason: Optional[str] = None,
+                       interrupt_source: Optional[str] = None) -> None:
         """Explicit stop preserving the ``interrupt()`` ABI (frontends feature-detect this and fall back to
         legacy ``interrupt()`` for third-party agents). Bypasses dynamic dispatch: legacy subclasses may
         override interrupt(message=None) without hard_cancel."""
-        InterruptControlMixin.interrupt(self, message, hard_cancel=True, tool_reason=tool_reason)
+        InterruptControlMixin.interrupt(self, message, hard_cancel=True, tool_reason=tool_reason,
+                                        interrupt_source=interrupt_source)
 
     def clear_interrupt(self, *, preserve_redirect: bool = False, hard_cancel: bool = False) -> bool:
         """Clear the interrupt request and per-thread tool signal. ``preserve_redirect`` is only for the
@@ -319,7 +332,7 @@ class InterruptControlMixin:
             if preserve_redirect and not _ic_slot(self, "_pending_redirect_lock", "_pending_redirect"):
                 return False
             self._interrupt_requested = False
-            self._interrupt_message = self._tool_interrupt_reason = None
+            self._interrupt_message = self._tool_interrupt_reason = self._interrupt_source = None
             getattr(self, "_hard_interrupt_requested", threading.Event()).clear()
             if not preserve_redirect:
                 self._pending_redirect = None

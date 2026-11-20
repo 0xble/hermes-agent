@@ -424,6 +424,7 @@ _CONTROL_STATE: dict[str, Any] = {
     # the cause atomic for auxiliary stream pollers.
     "_interrupt_requested": False,
     "_interrupt_message": None,  # optional message that triggered the interrupt
+    "_interrupt_source": None,  # system/user provenance independent of message text
     "_hard_interrupt_requested": threading.Event,
     "_execution_thread_id": None,  # set at run_conversation() start
     "_interrupt_thread_signal_pending": False,

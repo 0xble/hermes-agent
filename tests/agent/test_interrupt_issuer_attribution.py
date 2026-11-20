@@ -20,6 +20,7 @@ def _bare_agent():
     agent = AIAgent.__new__(AIAgent)
     agent._interrupt_requested = False
     agent._interrupt_message = None
+    agent._interrupt_source = None
     agent._tool_interrupt_reason = None
     agent._hard_interrupt_requested = threading.Event()
     agent._execution_thread_id = None
@@ -29,6 +30,21 @@ def _bare_agent():
     agent.quiet_mode = True
     return agent
 
+
+def test_profile_shutdown_messages_are_control_interrupts():
+    from agent.interrupt_control import is_system_interrupt_message
+
+    assert is_system_interrupt_message("Profile runtime is stopping")
+    assert is_system_interrupt_message("Profile stopping")
+
+
+def test_explicit_system_source_survives_interrupt_publication():
+    agent = _bare_agent()
+    try:
+        assert request_hard_interrupt(agent, "arbitrary internal reason", interrupt_source="system")
+        assert interrupt_issuer(agent) == "system"
+    finally:
+        set_interrupt(False)
 
 def test_system_producer_is_recorded_and_logged_at_publication(caplog):
     """The cron/gateway watchdog shape: the issuer survives to ``interrupt_issuer`` and ONE log line
