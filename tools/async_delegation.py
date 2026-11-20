@@ -1237,14 +1237,16 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
                          record.get("delegation_id"))
     record.update(_terminal_state=durable_status(evt, terminal_status), _completion_status=evt["status"])
     if queue_event:
-        if not evt.get(_TERMINAL_OWNERSHIP_KEY):
-            _record_context_run(record, _attach_retry_note, evt)
+        # Publish as soon as the durable terminal transition is owned. Retry-note
+        # classification can contend on the ledger and must not leave the parent
+        # observing a terminal row with no in-process completion event.
         try:
             process_registry.completion_queue.put(evt)
         except Exception as exc:  # pragma: no cover
             logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
                          "result lost: %s", record.get("delegation_id"), exc, exc_info=True)
-
+        if not evt.get(_TERMINAL_OWNERSHIP_KEY):
+            _record_context_run(record, _attach_retry_note, evt)
 
 
 def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -> bool:
