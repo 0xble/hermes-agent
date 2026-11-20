@@ -8,6 +8,8 @@ In-turn compression follows the parent turn’s class because it blocks the repl
 
 Retire when upstream can emit the same dynamic, route-scoped header without redirect leakage, or CLIProxyAPI no longer consumes it. Unset `hermes_request_class` to disable without reverting the commit.
 
+Contract tests: `tests/agent/test_proxy_request_class.py`.
+
 ## Verification
 
 Run `scripts/run_tests.sh tests/agent/test_proxy_request_class.py tests/gateway/test_vision_preprocess.py tests/gateway/test_local_viewer_events_submit.py tests/hermes_cli/test_gateway_agent.py tests/hermes_cli/test_quiet_turn_author.py tests/tui_gateway/test_quiet_wakeup_silence.py tests/acp_adapter/test_server.py`. Check that unknown origins and user-facing calls stay interactive, only opted-in routes receive the header, and redirects do not forward it. Qualify the exact PR head with the Repository gate.
