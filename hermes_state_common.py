@@ -154,6 +154,13 @@ _PREVIEW_ELIGIBLE_SQL = (f"(COALESCE(m.display_kind, '') <> 'hidden'"
     f" OR ({_PREVIEW_MERGED_SUMMARY_SQL}"
     f" AND LENGTH({_sql_trim_whitespace(_PREVIEW_MERGED_PRIOR_UNWRAPPED_SQL)}) > 0)))")
 
+# The plain head drops leading whitespace BEFORE the slice, so that whitespace never shortens the head below the
+# crop length ``_shape_preview`` cuts at (a preview that is cut is what tells its readers a word may be partial).
+# CR/LF -> space keeps character length, so it runs on the slice only.
+_PREVIEW_HEAD_SQL = (
+    f"REPLACE(REPLACE(SUBSTR({_sql_ltrim_whitespace('CAST(m.content AS TEXT)')}, 1, {_PREVIEW_HEAD_CHARS}),"
+    " X'0A', ' '), X'0D', ' ')")
+
 # ``_preview_raw`` SELECT for every listing query (scaffolded rows: head + tail around SKILL_EXCERPT_JOINT).
 _PREVIEW_RAW_SELECT = (
     f"CASE WHEN {_PREVIEW_STANDALONE_SUMMARY_SQL} THEN {_PREVIEW_FORCE_USER_REMAINDER_SQL}"
@@ -162,7 +169,7 @@ _PREVIEW_RAW_SELECT = (
     f" THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW)} || '{SKILL_EXCERPT_JOINT}'"
     f" || {_preview_normalized_window_sql(-_PREVIEW_SCAFFOLD_WINDOW, _PREVIEW_SCAFFOLD_WINDOW)}"
     f" WHEN {_PREVIEW_SCAFFOLDED_SQL} THEN {_preview_normalized_window_sql(1, _PREVIEW_SCAFFOLD_WINDOW * 2)}"
-    f" ELSE {_sql_ltrim_whitespace(_preview_normalized_window_sql(1, _PREVIEW_HEAD_CHARS))} END")
+    f" ELSE {_PREVIEW_HEAD_SQL} END")
 
 
 def _shape_preview(raw: Any) -> str:
