@@ -423,7 +423,7 @@ _CONTROL_STATE: dict[str, Any] = {
     # Interrupts. Hard cancellation is separate from redirect/message state; the Event makes
     # the cause atomic for auxiliary stream pollers.
     "_interrupt_requested": False,
-    "_interrupt_message": None,  # optional message that triggered the interrupt
+    "_interrupt_message": None, "_interrupt_source": None,  # trigger text; system/user provenance
     "_hard_interrupt_requested": threading.Event,
     "_execution_thread_id": None,  # set at run_conversation() start
     "_interrupt_thread_signal_pending": False,

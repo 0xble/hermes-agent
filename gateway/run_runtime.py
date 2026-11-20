@@ -403,7 +403,7 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
             authority.pending_stops[sid] = generation
         else:
-            request_hard_interrupt(agent, 'Profile stopping', tool_reason='gateway shutdown')
+            request_hard_interrupt(agent, 'Profile stopping', tool_reason='gateway shutdown', interrupt_source="system")
         signalled += 1
     return signalled
 

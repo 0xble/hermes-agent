@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from agent.interrupt_compat import request_hard_interrupt
+from agent.interrupt_compat import request_hard_interrupt, request_soft_interrupt
 from agent.interrupt_control import interrupt_issuer, interrupt_skip_wording
 from tools.interrupt import set_interrupt
 
@@ -20,6 +20,7 @@ def _bare_agent():
     agent = AIAgent.__new__(AIAgent)
     agent._interrupt_requested = False
     agent._interrupt_message = None
+    agent._interrupt_source = None
     agent._tool_interrupt_reason = None
     agent._hard_interrupt_requested = threading.Event()
     agent._execution_thread_id = None
@@ -29,6 +30,21 @@ def _bare_agent():
     agent.quiet_mode = True
     return agent
 
+
+def test_profile_shutdown_messages_are_control_interrupts():
+    from agent.interrupt_control import is_system_interrupt_message
+
+    assert is_system_interrupt_message("Profile runtime is stopping")
+    assert is_system_interrupt_message("Profile stopping")
+
+
+def test_explicit_system_source_survives_interrupt_publication():
+    agent = _bare_agent()
+    try:
+        assert request_hard_interrupt(agent, "arbitrary internal reason", interrupt_source="system")
+        assert interrupt_issuer(agent) == "system"
+    finally:
+        set_interrupt(False)
 
 def test_system_producer_is_recorded_and_logged_at_publication(caplog):
     """The cron/gateway watchdog shape: the issuer survives to ``interrupt_issuer`` and ONE log line
@@ -232,3 +248,37 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
         assert interrupt_skip_wording(agent) == "Turn aborted — guard {x}"
     finally:
         set_interrupt(False)
+
+
+def test_codex_turn_result_carries_system_interrupt_source():
+    """The Codex path hands the recorded source to the gateway drain with the message."""
+    from agent.codex_runtime import _consume_user_interrupt
+
+    agent = _bare_agent()
+    agent.clear_interrupt = lambda: None
+    try:
+        request_hard_interrupt(agent, "unregistered internal reason", interrupt_source="system")
+        assert _consume_user_interrupt(agent) == (True, "unregistered internal reason", "system")
+        user = _bare_agent()
+        user.clear_interrupt = lambda: None
+        user.interrupt("please use staging")
+        assert _consume_user_interrupt(user) == (True, "please use staging", None)
+    finally:
+        set_interrupt(False)
+
+
+def test_soft_interrupt_passes_source_only_to_callables_that_accept_it():
+    seen = []
+
+    class Legacy:
+        def interrupt(self, _message=None):
+            seen.append(("legacy", _message))
+
+    class Modern:
+        def interrupt(self, message=None, *, interrupt_source=None):
+            seen.append(("modern", message, interrupt_source))
+
+    assert request_soft_interrupt(Legacy(), "client disconnected", interrupt_source="system")
+    assert request_soft_interrupt(Modern(), "client disconnected", interrupt_source="system")
+    assert request_soft_interrupt(object(), "x", interrupt_source="system") is False
+    assert seen == [("legacy", "client disconnected"), ("modern", "client disconnected", "system")]

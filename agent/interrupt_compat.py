@@ -6,6 +6,9 @@ import inspect
 from typing import Any
 
 
+SYSTEM_INTERRUPT_SOURCE = "system"
+
+
 def _accepts_keyword(callable_obj: Any, name: str) -> bool:
     """Return whether a callable explicitly supports a keyword argument."""
     try:
@@ -19,12 +22,27 @@ def _accepts_keyword(callable_obj: Any, name: str) -> bool:
     )
 
 
+def request_soft_interrupt(
+    agent: Any, message: str | None = None, *, interrupt_source: str | None = None
+) -> bool:
+    """Call ``agent.interrupt``, passing ``interrupt_source`` only when it is accepted."""
+    interrupt = getattr(agent, "interrupt", None)
+    if not callable(interrupt):
+        return False
+    if interrupt_source is not None and _accepts_keyword(interrupt, "interrupt_source"):
+        interrupt(message, interrupt_source=interrupt_source)
+    else:
+        interrupt(message)
+    return True
+
+
 def request_hard_interrupt(
     agent: Any,
     message: str | None = None,
     *,
     tool_reason: str | None = None,
     delegation_reason: str | None = None,
+    interrupt_source: str | None = None,
 ) -> bool:
     """Request an explicit stop, falling back to the legacy interrupt ABI.
 
@@ -33,7 +51,8 @@ def request_hard_interrupt(
     arguments they do not know. ``tool_reason`` is a trusted, fixed category that may be
     exposed in model-visible tool cancellation output, forwarded only when the callable
     explicitly supports it. ``delegation_reason`` is trusted producer metadata stored on
-    the agent for durable delegation classification; when omitted, an explicit direct
+    the agent for durable delegation classification; ``interrupt_source`` marks a system
+    producer independently of its human-readable message. When omitted, an explicit direct
     stop defaults to ``cancel``. Returns ``False`` only when neither callable is available.
     """
     # Static lookup first: a dynamic ``__getattr__`` proxy (unspecced MagicMock, RPC
@@ -48,18 +67,36 @@ def request_hard_interrupt(
         interrupt = getattr(agent, "interrupt", None)
     if not callable(interrupt):
         return False
+    if interrupt_source is None and tool_reason is not None and tool_reason not in {
+        "explicit stop requested", "user sent a new message", "user interrupt",
+    }:
+        interrupt_source = SYSTEM_INTERRUPT_SOURCE
     # Every explicit producer leaves a trusted stop category for delegation results.
     # _signal_child_stop supplies system causes first; do not turn shutdown into a user cancel.
+    accepts_source = _accepts_keyword(interrupt, "interrupt_source")
     try:
         reason = delegation_reason or getattr(agent, "_delegation_interrupt_reason", None)
         if not isinstance(reason, str) or not reason:
             reason = "cancel"
         agent._delegation_interrupt_reason = reason
+        # Let InterruptControlMixin's publication guard decide whether a system stop may
+        # replace a pending user interrupt. Legacy callables have no source parameter, so
+        # preserve the metadata only when no user interrupt is already pending.
+        user_interrupt_pending = (
+            getattr(agent, "_interrupt_requested", False)
+            and getattr(agent, "_tool_interrupt_reason", None) in {
+                "explicit stop requested", "user sent a new message", "user interrupt",
+            }
+        )
+        if interrupt_source and not accepts_source and not user_interrupt_pending:
+            agent._interrupt_source = interrupt_source
     except Exception:
         pass  # metadata must not break legacy/immutable interrupt facades
     kwargs = {}
     if tool_reason is not None and _accepts_keyword(interrupt, "tool_reason"):
         kwargs["tool_reason"] = tool_reason
+    if interrupt_source is not None and accepts_source:
+        kwargs["interrupt_source"] = interrupt_source
     if message is None:
         interrupt(**kwargs)
     else:

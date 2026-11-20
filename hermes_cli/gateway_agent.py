@@ -32,7 +32,7 @@ VOICE_STOPPED = "voice_stopped"
 
 _RESULT_DEFAULTS = {
     "final_response": "", "failed": False, "partial": False, "error": None, "failure_reason": None,
-    "completed": True, "interrupted": False, "interrupt_message": None, "api_calls": 0,
+    "completed": True, "interrupted": False, "interrupt_message": None, "interrupt_source": None, "api_calls": 0,
     "pending_steer": None, "last_reasoning": None, "response_previewed": False,
     "response_transformed": False, "pre_transform_response": None, "billing_block": None,
     "auxiliary_usage": {},

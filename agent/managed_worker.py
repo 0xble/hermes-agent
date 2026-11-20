@@ -180,17 +180,20 @@ class WorkerControls:
         self.channel, self.route = channel, route
         self.agent = None
         self.stopped = threading.Event()
+        self.stop_source = None
         self.finish = threading.Event()
         self.clarifications = {}
         self.lock = threading.Lock()
         self.reader = threading.Thread(target=self.read, name='managed-controls', daemon=True)
         self.reader.start()
 
-    def stop(self):
+    def stop(self, *, interrupt_source=None):
+        if not self.stopped.is_set():
+            self.stop_source = interrupt_source
         self.stopped.set()
         if self.agent is not None:
             from agent.interrupt_compat import request_hard_interrupt
-            request_hard_interrupt(self.agent)  # parity with the canonical Stop (SessionAuthority.interrupt)
+            request_hard_interrupt(self.agent, interrupt_source=interrupt_source)
         with self.lock:
             for state in self.clarifications.values():
                 state['answer'] = _INTERRUPTED
@@ -222,7 +225,7 @@ class WorkerControls:
                             state['answer'] = frame['value']
                             state['event'].set()
         except (EOFError, OSError, ValueError) as exc:
-            self.stop()
+            self.stop(interrupt_source="system")
             self.finish.set()
             if not isinstance(exc, ValueError):
                 _die_with_owner()
@@ -384,7 +387,7 @@ def execute(frame, channel):
             controls.agent = agent
             if controls.stopped.is_set():
                 from agent.interrupt_compat import request_hard_interrupt
-                request_hard_interrupt(agent)
+                request_hard_interrupt(agent, interrupt_source=getattr(controls, 'stop_source', None))
             channel.send('ready', pid=os.getpid())
             history = store.get_messages_as_conversation(scope['session_id'])
             from gateway.session_kanban import run_worker_turns
