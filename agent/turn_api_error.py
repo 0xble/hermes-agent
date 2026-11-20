@@ -167,6 +167,9 @@ def handle_api_error(
         classified.retryable, classified.should_compress,
         classified.should_rotate_credential, classified.should_fallback,
     )
+    if classified.reason == FailoverReason.billing and getattr(agent, "platform", "") in {"subagent", "cron"}:
+        from agent.billing_notice import notify_provider_out_of_credits
+        notify_provider_out_of_credits(getattr(agent, "requested_provider", "") or getattr(agent, "provider", ""))
     agent._invoke_api_request_error_hook(
         task_id=effective_task_id, turn_id=turn_id, api_request_id=api_request_id,
         api_call_count=api_call_count, api_start_time=api_start_time, api_kwargs=api_kwargs,
