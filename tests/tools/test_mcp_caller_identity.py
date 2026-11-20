@@ -55,6 +55,7 @@ def servers(home):
     try:
         with patch.dict(mcp_tool._servers, {"relay": relay, "other": other}), \
              patch.object(mcp_tool, "_caller_identity_servers", {"relay"}), \
+             patch.dict(mcp_tool._server_trust_levels, {"relay": "full", "other": "full"}), \
              patch.dict(mcp_tool._server_error_counts, {}, clear=True):
             yield relay.session.call_tool, other.session.call_tool
     finally:

@@ -31,6 +31,9 @@ import tempfile
 import threading
 from pathlib import Path
 
+# Keep checkout-home guards independent of tests that monkeypatch the process-wide os module.
+_REAL_LSTAT = os.lstat
+
 import pytest
 
 
@@ -532,7 +535,13 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
         # os.path.lexists, not Path.exists: this also runs at teardown, while a test's own patch of
         # ``Path.exists`` (the serving-slot probe test pins it to True) is still installed, and the
         # guard must report what is on disk. lexists also catches a dangling symlink.
-        leaked = [str(path) for path in forbidden_homes if os.path.lexists(path)]
+        leaked = []
+        for path in forbidden_homes:
+            try:
+                _REAL_LSTAT(path)
+            except FileNotFoundError:
+                continue
+            leaked.append(str(path))
         if leaked:
             raise AssertionError(f"test created a Hermes home in the checkout root: {leaked}")
 

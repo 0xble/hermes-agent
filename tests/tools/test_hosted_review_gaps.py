@@ -70,7 +70,7 @@ def test_clear_session_finds_a_hosted_agents_local_kernels():
     torn = []
     key = ("sandbox:acme/agent-a:session-key", "standard", "python3", "/workspace", frozenset())
     stub: Any = type("Stub", (), {"key": key, "owner": key[0], "attached": 0,
-                                  "teardown": lambda self: torn.append(key)})()
+                                  "teardown": lambda self, reason="teardown": torn.append(key)})()
     _KERNELS[key] = stub
     try:
         with bind_state(A):
@@ -106,7 +106,7 @@ def test_local_shutdown_does_not_kill_colon_suffix_owner():
     for owner in ("room", "telegram:room"):
         key = (owner, "probe")
         keys.append(key)
-        _KERNELS[key] = type("Stub", (), {"teardown": lambda self, o=owner: torn.append(o)})()
+        _KERNELS[key] = type("Stub", (), {"teardown": lambda self, reason="teardown", o=owner: torn.append(o)})()
     try:
         shutdown_kernels_for_owner("room")
         assert torn == ["room"], torn

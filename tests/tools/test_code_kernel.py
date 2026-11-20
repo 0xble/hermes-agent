@@ -647,7 +647,8 @@ class TestPerCellRpcAuthority(unittest.TestCase):
 
         seen = {}
 
-        def _handle(tool_name, tool_args, task_id=None, session_id=None, turn_id=None):
+        # Fork divergence: every nested call also carries its own tool_call_id.
+        def _handle(tool_name, tool_args, task_id=None, session_id=None, turn_id=None, tool_call_id=None):
             seen.update(tool=tool_name, task_id=task_id, session_id=session_id, turn_id=turn_id)
             return json.dumps({"ok": True})
 
