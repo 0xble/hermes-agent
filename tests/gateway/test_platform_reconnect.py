@@ -318,6 +318,7 @@ class TestPlatformReconnectWatcher:
         runner = _make_runner()
         runner._sync_voice_mode_state_to_adapter = MagicMock()
         runner._redeliver_failed_obligations_for_platform = AsyncMock(return_value=1)
+        runner._resume_pending_candidates_async = AsyncMock(return_value=[])
         runner._schedule_resume_pending_sessions = MagicMock(return_value=1)
 
         platform_config = PlatformConfig(enabled=True, token="test")
