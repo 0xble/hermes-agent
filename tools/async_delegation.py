@@ -1237,9 +1237,22 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
                          record.get("delegation_id"))
     record.update(_terminal_state=durable_status(evt, terminal_status), _completion_status=evt["status"])
     if queue_event:
-        # Publish as soon as the durable terminal transition is owned. Retry-note
-        # classification can contend on the ledger and must not leave the parent
-        # observing a terminal row with no in-process completion event.
+        # The retry classifier may briefly contend on another ledger writer. Seed the
+        # queued object with the same high-level instruction so delivery is never a
+        # terminal event with a missing retry note; the classifier below replaces it
+        # with the precise schedule and reason before the object is consumed normally.
+        if not evt.get("retry_note") and not evt.get(_TERMINAL_OWNERSHIP_KEY):
+            children = result.get("results") if isinstance(result, dict) else None
+            failed = any(isinstance(child, dict) and str(child.get("status") or "").lower()
+                         in {"failed", "error", "interrupted", "unknown"} for child in (children or []))
+            cut_reason = evt.get("cut_reason")
+            if (cut_reason and cut_reason != "/stop") or str(evt.get("status") or "").lower() in {"failed", "interrupted"} or failed:
+                if cut_reason == "gateway shutdown (restart)":
+                    evt["retry_note"] = ("Work was cut before finishing. To continue call "
+                                         "delegate_task(action='resume', subagent_id='" +
+                                         str(evt.get("delegation_id")) + "'). Hermes will not automatically rerun this cut work.")
+                elif cut_reason != "/stop":
+                    evt["retry_note"] = "Hermes will retry this automatically; you will get a notice then."
         try:
             process_registry.completion_queue.put(evt)
         except Exception as exc:  # pragma: no cover
