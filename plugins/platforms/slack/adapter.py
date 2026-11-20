@@ -1326,6 +1326,10 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             await self._stop_socket_mode_handler()
             try:
                 self._start_socket_mode_handler()
+                runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+                if runner is not None:
+                    from gateway.missed_message_ack import start_missed_message_ack
+                    await start_missed_message_ack(runner, platform=Platform.SLACK)
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error("[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True)
 
@@ -1350,6 +1354,11 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 elif self._socket_ping_pong_stale():
                     # is_connected() can lie on a closed session; staleness catches the zombie.
                     await self._restart_socket_mode("ping/pong stale")
+                else:
+                    runner = getattr(getattr(self, "_message_handler", None), "__self__", None)
+                    if runner is not None:
+                        from gateway.missed_message_ack import schedule_missed_message_ack_connected
+                        schedule_missed_message_ack_connected(runner, Platform.SLACK)
             except asyncio.CancelledError:
                 raise
             except Exception:  # pragma: no cover - defensive logging
