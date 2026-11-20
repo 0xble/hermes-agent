@@ -1086,6 +1086,7 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
             # retained completed one would otherwise pin that turn's agent and history.
             live.pop("_context", None)
             live.pop("_worker_context_runner", None)
+            live.pop("_finished_children", None)
         _prune_completed_locked()
     # A terminal event does not free a submitted slot; only release_slot does.
 
