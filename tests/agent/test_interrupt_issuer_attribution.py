@@ -282,3 +282,51 @@ def test_soft_interrupt_passes_source_only_to_callables_that_accept_it():
     assert request_soft_interrupt(Modern(), "client disconnected", interrupt_source="system")
     assert request_soft_interrupt(object(), "x", interrupt_source="system") is False
     assert seen == [("legacy", "client disconnected"), ("modern", "client disconnected", "system")]
+
+
+def test_system_stop_on_legacy_agent_keeps_a_pending_user_message():
+    class LegacyStateful:
+        def __init__(self):
+            self._interrupt_requested = False
+            self._tool_interrupt_reason = None
+            self._interrupt_message = None
+            self.calls = []
+
+        def interrupt(self, message=None):
+            self.calls.append(message)
+            self._interrupt_requested = True
+            self._interrupt_message = message
+            self._tool_interrupt_reason = "user sent a new message" if message else "user interrupt"
+
+    agent = LegacyStateful()
+    agent.interrupt("please also check the logs")
+    assert request_hard_interrupt(agent, "Profile runtime is stopping",
+                                  tool_reason="gateway shutdown", interrupt_source="system")
+    assert agent.calls == ["please also check the logs", "please also check the logs"]
+    assert agent._interrupt_message == "please also check the logs"
+    assert getattr(agent, "_interrupt_source", None) is None
+
+    idle = LegacyStateful()
+    request_hard_interrupt(idle, "Profile runtime is stopping", interrupt_source="system")
+    assert idle.calls == ["Profile runtime is stopping"]
+    assert idle._interrupt_source == "system"
+
+
+def test_managed_worker_stop_frame_carries_shutdown_source(monkeypatch):
+    import threading
+
+    from agent import managed_worker as worker
+
+    def controls_after(frames):
+        it = iter(frames + [{'type': 'finish'}])
+        monkeypatch.setattr(worker, 'read_frame', lambda stream: next(it))
+        controls = worker.WorkerControls.__new__(worker.WorkerControls)
+        controls.agent, controls.stop_source = None, None
+        controls.stopped, controls.finish = threading.Event(), threading.Event()
+        controls.lock, controls.clarifications = threading.Lock(), {}
+        controls.read()
+        return controls
+
+    assert controls_after([{'type': 'stop', 'source': 'system'}]).stop_source == "system"
+    user = controls_after([{'type': 'stop'}])
+    assert user.stopped.is_set() and user.stop_source is None
