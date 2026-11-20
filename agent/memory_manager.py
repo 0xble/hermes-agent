@@ -464,7 +464,13 @@ class MemoryManager:
 
     def add_provider(self, provider: MemoryProvider) -> None:
         """Register a provider; builtin always accepted, only ONE external allowed."""
-        provider.read_only = self.read_only
+        # Third-party providers are duck-typed.  A slots-only provider may intentionally
+        # expose no privacy flag; it must still be registerable and receive caller-scoped
+        # homes through the normal lifecycle hooks.
+        try:
+            provider.read_only = self.read_only
+        except (AttributeError, TypeError):
+            pass
         if provider.name != "builtin" and self._has_external:
             existing = next((p.name for p in self._providers if p.name != "builtin"), "unknown")
             logger.warning(

@@ -1667,7 +1667,7 @@ def _restart_manual_gateways(out: _GatewayRestartOutcome, _drain_budget) -> None
     # which is the contract already used for gateways with no profile mapping.
     unrestartable_pids = set()
     for pid, proc in profile_processes.items():
-        if leave_client_owned_gateway(pid, home=proc.path):
+        if leave_client_owned_gateway(pid, home=getattr(proc, "path", None)):
             continue
         restart_mode = _prepare_profile_gateway_update_restart(proc.profile, pid)
         if restart_mode is None:

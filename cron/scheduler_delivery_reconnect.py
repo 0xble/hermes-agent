@@ -56,7 +56,11 @@ def queue_for_live_reconnect(
                        t.job.get("id"), t.where, exc_info=True)
         return
     row_count = len(rows)
-    if row_count == 1 and content:
+    if is_reconnect_only(t.live_error) or t.live_retryable is True:
+        row_count = len(rows)
+        row_label = "row" if row_count == 1 else "rows"
+        note = f"queued {row_count} delivery {row_label} for {t.where} for redelivery once the live adapter reconnects"
+    elif row_count == 1 and content:
         note = f"queued text for {t.where} for redelivery once the live adapter reconnects"
     else:
         row_label = "row" if row_count == 1 else "rows"

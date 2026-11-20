@@ -1486,7 +1486,9 @@ def _deliver_standalone(
     err = None
     delivered_text = False
     delivered_copy_count = 0
+    last_is_copy_block = False
     for payload_content, payload_media, is_copy_block in payloads:
+        last_is_copy_block = is_copy_block
         if is_copy_block:
             result, err = _standalone_send(t, payload_content, payload_media, copy_block=True)
         else:
@@ -1512,14 +1514,18 @@ def _deliver_standalone(
         target_errors.append(err)
         delivery_errors.extend(target_errors)
         # A timeout or an exception after request dispatch is ambiguous. The send implementation
-        # marks the target in flight, so treat it as reached and never replay it.
+        # marks the target in flight, so treat it as reached and never replay it. Preserve any
+        # chunk receipts before returning so replies to landed chunks retain cron framing.
+        record_cron_delivery(t.platform_name, t.chat_id, content.strip(), result)
         if t.standalone_in_flight:
             logger.warning("Job '%s': not queueing ambiguous standalone failure for %s", job["id"], t.where)
             return True
         # A definite pre-send failure may be safely handed back to the live reconnect ledger.
-        _queue_for_live_reconnect(
-            t, "" if delivered_text else content, media_files, delivery_errors,
-            copy_blocks=(copy_blocks or [])[delivered_copy_count:])
+        remaining_copy_blocks = (copy_blocks or [])[delivered_copy_count + (1 if err is not None and last_is_copy_block else 0):]
+        if (content and not delivered_text) or remaining_copy_blocks or (media_files and last_is_copy_block):
+            _queue_for_live_reconnect(
+                t, "" if copy_blocks or delivered_text else content, media_files, delivery_errors,
+                copy_blocks=remaining_copy_blocks)
         return False
     _mark_formatting_degraded(t)
     # Standalone senders report per-file attachment failures in ``warnings`` while returning
@@ -1900,7 +1906,13 @@ from cron import scheduler_script as _script
 
 # Late-bound standalone lane: the facade remains the seam used by the cron scheduler, while
 # the delivery implementation owns timeout ambiguity and reconnect admission.
-from cron.scheduler_delivery_standalone import (_queue_for_live_reconnect, _standalone_send)
+from cron.scheduler_delivery_standalone import _standalone_send
+from cron import scheduler_delivery_reconnect as _reconnect
+
+
+def _queue_for_live_reconnect(*args, **kwargs):
+    """Late-bound reconnect hand-off so tests and adapters can replace the reconnect policy."""
+    return _reconnect.queue_for_live_reconnect(*args, **kwargs)
 
 from cron.scheduler_delivery_sessions import (
     _resolve_cron_surface_mode, _resolve_origin, _cron_mirror_delivery_enabled, _target_matches_origin,
