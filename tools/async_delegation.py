@@ -1116,6 +1116,16 @@ def completion_event(record: dict[str, Any], result: dict[str, Any], status: str
             "total_duration_seconds": result.get("total_duration_seconds"),
             **({"group": result["group"]} if result.get("group") is not None else {})}
     else:
+        result = dict(result)
+        if record.get("cron_job_name"):
+            output = result.get("output") or ""
+            if output and result.get("summary") and output not in str(result["summary"]):
+                result["summary"] = f"{result['summary']}\n--- JOB OUTPUT ---\n{output}"
+            elif not result.get("summary"):
+                result["summary"] = output
+            cron_output = record.get("cron_output_excerpt")
+            if cron_output and cron_output not in str(result.get("summary") or ""):
+                result["summary"] = f"{result.get('summary') or ''}\n--- JOB OUTPUT ---\n{cron_output}".strip()
         # A runner with no measured count (a cron run without a session) omits api_calls: never a fake 0.
         payload = {
             "summary": result.get("summary"), "error": result.get("error"),
