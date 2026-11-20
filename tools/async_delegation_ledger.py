@@ -265,6 +265,9 @@ def _prune_durable_records() -> None:
         _transaction, require_ledger_owner, time,
     )
     require_ledger_owner()
+    # The row a waiting child reports on is neither deleted nor counted against a cap: a silent unit is
+    # 'delivered', the first kind the caps delete, and its one give-up failure is routed through that row.
+    from tools.delegate_tool_auto_resume import KEEP_WAITING_UNITS_SQL as keep
     cutoff = time.time() - _DURABLE_RETENTION_SECONDS
     from tools.delegation_resume import classify_armed
     classify_armed()
@@ -272,7 +275,7 @@ def _prune_durable_records() -> None:
         old_ids = [row[0] for row in conn.execute(
             f"""SELECT delegation_id FROM async_delegations
                 WHERE delivery_state IN ('delivered','superseded') AND updated_at < ?
-                  AND NOT {_RETENTION_OWED_SQL}""", (cutoff,))]
+                  AND NOT {_RETENTION_OWED_SQL}{keep}""", (cutoff,))]
         if old_ids:
             marks = ",".join("?" for _ in old_ids)
             conn.execute(f"DELETE FROM async_delegations WHERE delegation_id IN ({marks})", old_ids)
@@ -281,12 +284,12 @@ def _prune_durable_records() -> None:
         ordinary_count = conn.execute(
             f"""SELECT COUNT(*) FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}""", (cutoff,)
+                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}{keep}""", (cutoff,)
         ).fetchone()[0]
         ordinary = [row[0] for row in conn.execute(
             f"""SELECT delegation_id FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}
+                  AND delivery_state != 'pending' AND NOT {_RESUMABLE_RETENTION_SQL}{keep}
                 ORDER BY CASE delivery_state
                            WHEN 'superseded' THEN 0
                            WHEN 'delivered' THEN 1
@@ -303,13 +306,13 @@ def _prune_durable_records() -> None:
         protected_count = conn.execute(
             f"""SELECT COUNT(*) FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
-                  AND {_RESUMABLE_RETENTION_SQL}""", (cutoff,)
+                  AND {_RESUMABLE_RETENTION_SQL}{keep}""", (cutoff,)
         ).fetchone()[0]
         protected = [row[0] for row in conn.execute(
             f"""SELECT delegation_id FROM async_delegations
                 WHERE state NOT IN ('queued','admitted','running','stalling','finalizing')
                   AND {_RESUMABLE_RETENTION_SQL}
-                  AND delivery_state != 'pending' AND NOT {_RETENTION_OWED_SQL}
+                  AND delivery_state != 'pending' AND NOT {_RETENTION_OWED_SQL}{keep}
                 ORDER BY updated_at ASC, delegation_id ASC
                 LIMIT ?""", (cutoff, max(0, protected_count - _MAX_RETAINED_RESUMABLE))
         )]
@@ -324,7 +327,7 @@ def _prune_durable_records() -> None:
             from tools.delegation_resume import RESULT_UNDELIVERABLE, SUCCESS_REASONS
             evict = [r[0] for r in conn.execute(f"""SELECT delegation_id FROM async_delegations
                      WHERE state NOT IN ('queued','admitted','running','stalling','finalizing') AND delivery_state='pending'
-                       AND NOT {_RESUMABLE_RETENTION_SQL}
+                       AND NOT {_RESUMABLE_RETENTION_SQL}{keep}
                      ORDER BY updated_at ASC, delegation_id ASC LIMIT ?""", (cutoff, pending_count - _MAX_DURABLE_PENDING))]
             marks = ",".join("?" for _ in evict)
             if evict:
