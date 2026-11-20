@@ -722,13 +722,14 @@ class GatewayConfig:
     durable_outbox_enabled: bool = False  # gateway.durable_outbox.enabled, opt-in
     durable_outbox_retention_days: int = 7
     zero_cut_handover_enabled: bool = False  # gateway.zero_cut_handover.enabled, opt-in
-    # A real gateway recovers human inbound messages found after a restart; test/eval environments
-    # leave this off by default so mocked histories never dispatch turns.
-    missed_inbound_recovery_enabled: bool = True
+    # A real gateway acknowledges human inbound messages found after a restart; test/eval environments
+    # leave this off by default so mocked histories never produce outbound traffic.
+    missed_message_ack_enabled: bool = True
+    missed_message_ack_text: str = "I was offline when you sent this and missed it. Ask again here if you still need it."
 
     @property
-    def missed_inbound_recovery(self) -> dict[str, Any]:
-        return {"enabled": self.missed_inbound_recovery_enabled}
+    def missed_message_ack(self) -> dict[str, Any]:
+        return {"enabled": self.missed_message_ack_enabled, "text": self.missed_message_ack_text}
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
@@ -793,7 +794,7 @@ class GatewayConfig:
             "durable_outbox": {"enabled": self.durable_outbox_enabled,
                                "retention_days": self.durable_outbox_retention_days},
             "zero_cut_handover": {"enabled": self.zero_cut_handover_enabled},
-            "missed_inbound_recovery": self.missed_inbound_recovery,
+            "missed_message_ack": self.missed_message_ack,
             "profile_routes": [
                 {k: v for k, v in asdict(r).items() if k != "user_id" or v is not None}
                 if is_dataclass(r) and not isinstance(r, type) else r
@@ -894,8 +895,11 @@ class GatewayConfig:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
         retention = validate_outbox_retention_days(outbox.get("retention_days", 7))
         zero_cut_handover = _coerce_dict(pick("zero_cut_handover"))
-        recovery = _coerce_dict(pick("missed_inbound_recovery"))
-        recovery_enabled = _coerce_bool(recovery.get("enabled"), not _test_mode())
+        missed_ack = _coerce_dict(pick("missed_message_ack"))
+        missed_ack_enabled = _coerce_bool(missed_ack.get("enabled"), not _test_mode())
+        missed_ack_text = missed_ack.get("text") or "I was offline when you sent this and missed it. Ask again here if you still need it."
+        if not isinstance(missed_ack_text, str):
+            raise ValueError("gateway.missed_message_ack.text must be a string")
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -926,7 +930,8 @@ class GatewayConfig:
             durable_outbox_enabled=outbox.get("enabled", False),
             durable_outbox_retention_days=retention,
             zero_cut_handover_enabled=_coerce_bool(zero_cut_handover.get("enabled"), False),
-            missed_inbound_recovery_enabled=recovery_enabled,
+            missed_message_ack_enabled=missed_ack_enabled,
+            missed_message_ack_text=missed_ack_text,
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:
