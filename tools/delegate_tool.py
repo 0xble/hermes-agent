@@ -832,11 +832,12 @@ def _build_dynamic_schema_overrides() -> dict:
 
     # The active delegation provider's per-task parameters and guidance (delegation.backend; none for the
     # built-in default). Built from config with the rest of the definition, never per turn.
-    from tools.delegate_tool_routes import schema_extension
+    from tools.delegate_tool_routes import core_task_parameters, schema_extension
     extra_params, addendum = schema_extension(_load_config())
-    if extra_params:
-        tasks = overrides_params["properties"]["tasks"]
-        tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **extra_params}}
+    # Core's explicit per-task model alias and reasoning effort come first, then the backend's (e.g. a role `option`).
+    extra_params = {**core_task_parameters(), **extra_params}
+    tasks = overrides_params["properties"]["tasks"]
+    tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **extra_params}}
     description = _build_top_level_description(independent_completions=independent_completions)
     return {
         "description": f"{description}\n{addendum}" if addendum else description,

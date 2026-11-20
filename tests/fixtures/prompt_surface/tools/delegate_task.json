@@ -46,6 +46,17 @@
               "properties": {},
               "required": [],
               "type": "object"
+            },
+            "reasoning_effort": {
+              "description": "Reasoning effort for this subagent. Omit to use the model alias's or role's default.",
+              "enum": [
+                "none",
+                "low",
+                "medium",
+                "high",
+                "xhigh"
+              ],
+              "type": "string"
             }
           },
           "required": [
