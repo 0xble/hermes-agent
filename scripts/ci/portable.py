@@ -889,7 +889,7 @@ def collect_ci_dependency_generations(env: dict[str, str]) -> None:
             'Path(sys.argv[1]), include_test_environment=True)',
             str(ROOT),
         ], env=env)
-    except Exception as error:
+    except (OSError, subprocess.SubprocessError) as error:
         # Reclaiming disk must never turn a successful dependency publish into a
         # failed CI setup. The collector itself also respects install locks.
         print(f'portable CI: dependency generation cleanup skipped: {error}',
