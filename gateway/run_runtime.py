@@ -381,7 +381,7 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
             continue
         worker.stop_cause = reason
         try:
-            worker.control({'type': 'stop'})
+            worker.control({'type': 'stop', 'source': 'system'})
         except RuntimeStoreError as exc:
             # A full control queue: control() latched worker.stop first, and the owner's read
             # loop escalates on that latch alone (terminate after STOP_ACK_SECONDS).

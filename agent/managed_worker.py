@@ -204,8 +204,9 @@ class WorkerControls:
         try:
             while True:
                 frame = read_frame(sys.stdin.buffer)
-                if frame == {'type': 'stop'}:
-                    self.stop()
+                if frame in ({'type': 'stop'}, {'type': 'stop', 'source': 'system'}):
+                    # The owner's shutdown Stop names its source; a user's Stop carries none.
+                    self.stop(interrupt_source=frame.get('source'))
                     continue
                 if frame == {'type': 'finish'}:
                     self.finish.set()
