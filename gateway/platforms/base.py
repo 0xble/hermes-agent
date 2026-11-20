@@ -4572,14 +4572,15 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, TypingStateMixin, ABC):
                     from gateway.telegram_retire import advance
                     await advance(runner, event.source)
                     return
-        from gateway.session_ingress_burst import burst_gate
-        behind_burst = await burst_gate(self, event, session_key)  # a serial reader's command waits too
-        # On-entry self-heal: clear a guard whose owner task already exited.
-        if session_key in self._active_sessions:
-            self._heal_stale_session_lock(session_key)
-        if session_key in self._active_sessions or behind_burst:
-            await self._handle_message_while_active(event, session_key)
-            return
+        from gateway.session_ingress_burst import burst_gate, hold_burst_for_control
+        async with hold_burst_for_control(self, event, session_key) as held_for_control:
+            behind_burst = held_for_control or await burst_gate(self, event, session_key)  # a serial reader's command waits too
+            # On-entry self-heal: clear a guard whose owner task already exited.
+            if session_key in self._active_sessions:
+                self._heal_stale_session_lock(session_key)
+            if session_key in self._active_sessions or behind_burst:
+                await self._handle_message_while_active(event, session_key)
+                return
         # Guard installed synchronously BEFORE the task spawns so a second message can't race in.
         # Entering session processing is the handoff: a failure after this point must not replay.
         self._on_session_handoff(event)
