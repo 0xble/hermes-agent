@@ -206,9 +206,16 @@ async def _scan(runner: Any, name: str, until: float) -> int:
             records = _in_window(await _maybe_await(adapter.fetch_missed_inbound(since, until)), name, since, until)
             if records:
                 dispatched = await _dispatch(db, adapter, name, records, since, until)
+    except asyncio.CancelledError:
+        # Preserve the watermark when shutdown interrupts a scan. The next start must rescan
+        # the unfinished interval rather than silently losing messages discovered after it.
+        logger.info("Missed inbound scan cancelled for %s", name)
+        raise
     except Exception:
+        # A partial or failed scan must not advance the watermark. The next reconnect can retry
+        # the interval, while durable claims prevent messages already dispatched from repeating.
         logger.warning("Missed inbound scan failed for %s", name, exc_info=True)
-    # Cancellation (shutdown mid-scan) skips this, so the next start scans the interval again.
+        return dispatched
     await asyncio.to_thread(db.advance_missed_inbound_watermark, name, until)
     return dispatched
 
