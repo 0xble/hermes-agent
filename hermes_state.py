@@ -719,6 +719,7 @@ class SessionDB(
         self._db_corrupt, self._db_corrupt_reason = False, ""  # sticky quarantine (StateDbCorruptError)
         self._fts_usermerge_floor_applied = False  # one-shot usermerge-floor write guard
         self._fts_enabled = self._fts_stale = self._trigram_available = False
+        self._fts_automerge_disabled = False
         self._fts_unavailable_warned = False
         self._conn = None
         # Async token accounting; distinct from self._lock so enqueue/flush never contends with writes.

@@ -314,7 +314,7 @@ class SessionFtsSetupMixin:
             # Automatic segment merges run in the row-insert trigger's transaction and can hold
             # the shared state.db writer for seconds on a large index.  The existing bounded
             # maintenance merge path owns this work outside the application writer guard.
-            if table_name in _FTS_AUTOMERGE_TABLES:
+            if table_name in _FTS_AUTOMERGE_TABLES and status is False:
                 cursor.execute(
                     f"INSERT INTO {table_name}({table_name}, rank) VALUES('automerge', 0)"
                 )
@@ -328,6 +328,22 @@ class SessionFtsSetupMixin:
             else:
                 self._warn_fts5_unavailable(exc)
             return False
+
+    def _disable_fts_automerge_for_writer(self, cursor: sqlite3.Cursor) -> None:
+        """Disable FTS5 automatic merges once, inside the first message-write transaction.
+
+        Existing stores must not acquire the main writer lock during a settled open. A store
+        created by an older release therefore receives this setting immediately before its first
+        message insert, while a newly-created table is initialized above without an extra write.
+        """
+        if getattr(self, "_fts_automerge_disabled", False):
+            return
+        for table_name in _FTS_AUTOMERGE_TABLES:
+            if self._fts_table_exists(table_name, conn=cursor.connection):
+                cursor.execute(
+                    f"INSERT INTO {table_name}({table_name}, rank) VALUES('automerge', 0)"
+                )
+        self._fts_automerge_disabled = True
 
     @staticmethod
     def _is_fts_write_corruption_error(exc: sqlite3.DatabaseError) -> bool:

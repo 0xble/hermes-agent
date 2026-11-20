@@ -12,6 +12,6 @@ def test_fts_automerge_is_disabled_for_writer_transactions(tmp_path):
         assert len(present) >= 2
         for table in present:
             value = db._read_one(f"SELECT v FROM {table}_config WHERE k = 'automerge'")[0]
-            assert value == "0"
+            assert str(value) == "0"
     finally:
         db.close()
