@@ -833,7 +833,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         # Serialize the liveness check and enqueue with _move_to_finished so a
         # stale heartbeat cannot arrive after its completion notification.
         with self._lock:
-            if session.exited or session.id not in self._running:
+            if session.exited:
                 return
             session._heartbeat_last = now
             with session._lock:
@@ -858,7 +858,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         # the registry lock. Recheck after transformation because exit can win.
         _redact_process_result(notification)
         with self._lock:
-            if not session.exited and session.id in self._running:
+            if not session.exited:
                 self.completion_queue.put(notification)
 
     @staticmethod

@@ -31,9 +31,10 @@ def session_action_allowed(session, task_id: str, session_key: str) -> bool:
     """
     owner = session.owner_task_id or session.task_id
     if getattr(session, "ssh_binding", None) is not None:
-        # Named-node handles carry immutable profile/node identity. The node-aware dispatcher
-        # validates that binding before acting, so lineage lookup must not open the controller's
-        # state DB for a remote profile that may not have a local state.db.
+        # Named-node handles are profile-scoped capabilities: the binding carries the
+        # original node and profile, and the node-aware dispatcher validates that binding
+        # before acting. Task/session lineage is not available for a recovered SSH handle
+        # after the originating tool turn has ended.
         return True
     if task_id and task_id == owner:
         return True
@@ -42,21 +43,27 @@ def session_action_allowed(session, task_id: str, session_key: str) -> bool:
     from tools.process_registry_results import _owns_result
     # Compression continuations: the CLI and TUI rotate the session key, /v1/runs the task id
     # (its session key is a fresh run id per run), so either lineage ties the caller to its process.
-    if (task_id and _owns_result(task_id, owner)) or (session_key and _owns_result(session_key, session.session_key)):
+    db_path = None
+    binding = getattr(session, "ssh_binding", None)
+    if binding is not None:
+        from pathlib import Path
+        db_path = Path(binding.profile_home) / "state.db"
+    if (task_id and _owns_result(task_id, owner, db_path=db_path)) or (session_key and _owns_result(session_key, session.session_key, db_path=db_path)):
         return True
     return not (task_id or session_key) or not (owner or session.session_key)
 
 
-def resolve_actionable(session_id: str, task_id) -> tuple[bool, str]:
+def resolve_actionable(session_id: str, task_id, session_key: str = "") -> tuple[bool, str]:
     """``(allowed, id_to_act_on)``. A session that exists but belongs to someone else is refused (the
     caller then answers with the same ``not_found`` shape as a miss, so foreign ids are not
     enumerable). An id that resolves to no session (missing, or an ambiguous prefix) is refused
     the same way, and an allowed session is acted on by its FULL id, so no prefix the check did
     not resolve can reach another conversation's process."""
     from tools.process_registry import process_registry
-    session = process_registry._lookup_session(session_id)  # owner fields only: no backend probe
+    session = process_registry.get(session_id)
     if session is None:
         return False, session_id
-    if not session_action_allowed(session, str(task_id or ""), caller_session_key()):
+    caller_key = session_key or caller_session_key()
+    if not session_action_allowed(session, str(task_id or ""), caller_key):
         return False, session_id
     return True, session.id

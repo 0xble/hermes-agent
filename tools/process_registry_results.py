@@ -267,7 +267,7 @@ def prune_completed_results(*, deadline: float | None = None) -> None:
         _RESULT_WRITE_LOCK.release()
 
 
-def _owns_result(owner: str, parent: str | None) -> bool:
+def _owns_result(owner: str, parent: str | None, *, db_path=None) -> bool:
     if not parent:
         return False
     if owner == parent:
@@ -276,7 +276,13 @@ def _owns_result(owner: str, parent: str | None) -> bool:
 
     # Pure lineage read on the hot path of every retained-result load; a writable open here
     # was one more writer handle per call inside the gateway (#100896).
-    db = SessionDB(read_only=True)
+    try:
+        db = SessionDB(db_path=db_path, read_only=True) if db_path is not None else SessionDB(read_only=True)
+    except (OSError, sqlite3.Error):
+        # Ownership checks are advisory when the profile store is unavailable. The direct
+        # owner/session-key checks remain authoritative; an unavailable lineage store must
+        # not turn an otherwise valid process action into a database error.
+        return False
     try:
         return db.get_compression_tip(parent) == owner
     finally:

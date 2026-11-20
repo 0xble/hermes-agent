@@ -325,9 +325,13 @@ def _wait_for_manual_execution(execution_id: str) -> Optional[dict[str, Any]]:
     """
     from cron.executions import _TERMINAL_STATES, get_execution
 
+    deadline = time.monotonic() + 2.0
     while True:
         execution = get_execution(execution_id)
         if execution is None or execution.get("status") in _TERMINAL_STATES:
+            return execution
+        if time.monotonic() >= deadline:
+            logger.warning("Manual cron execution %s did not settle before completion reporting", execution_id)
             return execution
         time.sleep(1.0)
 
@@ -599,8 +603,17 @@ def _manual_run_completion(
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
     reached_nobody = not deliver or deliver == "local" or refreshed.get("last_delivery_reached_none")
-    excerpt = ((str((execution or {}).get("output") or "")[-4000:] if execution_id else
-                _latest_job_output_excerpt(job_id)) if reached_nobody else None)
+    excerpt = None
+    if reached_nobody:
+        output_parts = []
+        if execution_id and (execution_output := str((execution or {}).get("output") or "")[-4000:]):
+            output_parts.append(execution_output)
+        if saved_excerpt := _latest_job_output_excerpt(job_id):
+            if state == "completed" and not (execution or {}).get("id") and saved_excerpt not in output_parts:
+                output_parts.append(saved_excerpt)
+        excerpt = "\n".join(output_parts)
+    else:
+        excerpt = None
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {

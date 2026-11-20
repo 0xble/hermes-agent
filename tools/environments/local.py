@@ -1092,21 +1092,26 @@ def _kill_process_group_posix(proc, *, snapshot_descendants: bool = True) -> Non
         if (pgid := getattr(proc, "_hermes_pgid", None)) is None:
             raise
     if not _leader_is_ours(pgid, expected_start):
-        # Leader exited and its PID/PGID may have been recycled onto an unrelated
-        # process group; signalling the stale number is unsafe. Bail out — a rare
-        # orphaned grandchild may leak, which is strictly preferable to killing a
-        # stranger. Sweep the snapshotted descendants by PID (identity-checked)
-        # so we still reach escapees that are verifiably ours.
-        if not snapshot_descendants:
+        # The leader may already be a zombie. Its PID/PGID is still the owned session
+        # identity, and the surviving group members must be terminated even though the
+        # leader is no longer inspectable by the start-time probe. Only reject a live
+        # recycled leader; the process-group ownership guard protects the signal below.
+        leader_alive = False
+        with contextlib.suppress(OSError):
+            leader_alive = os.kill(pgid, 0) is None
+        if leader_alive:
+            if not snapshot_descendants:
+                return
+            descendants = []
+            try:
+                import psutil
+                descendants = psutil.Process(proc.pid).children(recursive=True)
+            except Exception:
+                pass
+            _sweep_escaped_descendants(descendants, pgid)
             return
-        descendants = []
-        try:
-            import psutil
-            descendants = psutil.Process(proc.pid).children(recursive=True)
-        except Exception:
-            pass
-        _sweep_escaped_descendants(descendants, pgid)
-        return
+        # An exited leader can have left a live child in its original group. Continue
+        # with the saved PGID; POSIX does not recycle a PGID while group members exist.
     descendants = []
     if snapshot_descendants:
         try:  # empty on any failure (must never break the kill)

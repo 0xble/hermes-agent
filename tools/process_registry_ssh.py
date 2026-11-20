@@ -458,7 +458,7 @@ def handle_process(args, **kw):
 def _actionable(session_id, kw):
     """``(allowed, full id)`` for this caller: the ownership gate every session action passes."""
     from tools.process_registry_access import resolve_actionable
-    return resolve_actionable(session_id, kw.get("task_id"))
+    return resolve_actionable(session_id, kw.get("task_id"), kw.get("session_id"))
 
 
 def _resolve_process_node(args):
