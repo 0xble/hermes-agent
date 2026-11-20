@@ -1228,6 +1228,10 @@ class SessionDB(
                 ):
                     continue
                 raise
+            except WriterMutexTimeout:
+                # Local mutex patience is a distinct contention outcome. Preserve its
+                # type so deferred writers (notably token accounting) can requeue safely.
+                raise
             except sqlite3.Error as exc:
                 raise_if_nonretryable_contention(exc)
                 # 'no more rows' is a transient engine error on contended WAL appends (some builds
