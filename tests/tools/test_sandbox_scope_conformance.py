@@ -241,6 +241,9 @@ def test_cleanup_stops_every_long_lived_process(tmp_path):
 
 
 @pytest.mark.platforms("posix")
+# The leader is reaped before the stop, so its surviving child is an orphan of init: the guard cannot
+# prove a leaderless group is this test's, and really signalling that orphan is the point of the test.
+@pytest.mark.live_system_guard_bypass
 def test_stopping_an_exited_leader_still_stops_its_descendants(tmp_path, monkeypatch):
     """The leader exits but leaves a child in its group: stop_process still stops that child and
     releases the group only once it is empty. The leader is let exit before ``start_process``
