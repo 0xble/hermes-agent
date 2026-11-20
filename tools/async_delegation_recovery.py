@@ -873,11 +873,14 @@ def failed_delegations_for_session(
         task, result = _json_object(task_json), redact_child_result(_json_object(result_json))
         goals = task.get("goals") if isinstance(task.get("goals"), list) and task["goals"] else [task.get("goal") or ""]
         tasks = result["results"] if isinstance(result.get("results"), list) else [] if task.get("is_batch") else [result]
+        from tools.delegate_tool_auto_resume import waiting_on_resume
+        if waiting_on_resume(result):  # every child waits on its automatic resume (or its one give-up failure)
+            continue
         if not tasks and str(state).lower() in _FAILED_TASK_STATES:
             tasks = [{"task_index": i, "error": result.get("error")} for i in task.get("task_indexes") or [0]]
         for entry in tasks:
             status = str(entry.get("status") or state or "").lower()
-            if status not in _FAILED_TASK_STATES:
+            if status not in _FAILED_TASK_STATES or waiting_on_resume(entry):
                 continue
             index = entry.get("task_index") if isinstance(entry.get("task_index"), int) else 0
             error = entry.get("error") or result.get("error")
