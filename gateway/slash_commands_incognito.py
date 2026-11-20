@@ -71,7 +71,7 @@ class GatewayIncognitoCommandsMixin:
                     return "Incognito was not changed. Wait for the active turn to finish, then retry."
                 from contextvars import Context
                 entry = await asyncio.to_thread(Context().run, self.session_store.get_or_create_session, source)
-                self._rehydrate_session_model_override(key)
+                await self._rehydrate_session_model_override_async(key)
                 if action == "status":
                     return self._incognito_reply(entry)
                 enabled = not entry.incognito if not action else action == "on"
@@ -142,7 +142,8 @@ class GatewayIncognitoCommandsMixin:
             profile_home = None
             if getattr(getattr(self, "config", None), "multiplex_profiles", False):
                 profile_home = self._resolve_profile_home_for_source(event.source)
-            ctx = self._model_switch_context(event.source, key, profile_home=profile_home, persist_global=False)
+            ctx = self._model_switch_context(event.source, key, profile_home=profile_home,
+                                             rehydrate=False, persist_global=False)
             result, error = await self._perform_model_switch(ctx, request, "", event.source)
             if error is not None:
                 return self._incognito_reply(entry, error)
