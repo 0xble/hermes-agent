@@ -107,8 +107,10 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
             else:
                 assert child.model == "worker-model"
                 assert child.base_url == "https://worker.test/v1"
-                assert pinned_model == "worker-model"
-                assert fallback_chain == [WORKER_SPARE]
+                # The route declares its own chain, so the child owns all of it (cross-model
+                # entries included) rather than filtering it to same-model spares.
+                assert pinned_model is None
+                assert fallback_chain == [*PINNED_CHAIN, WORKER_SPARE]
                 assert child.reasoning_config == {"enabled": True, "effort": "low"}
             for agent in created:
                 agent._ensure_db_session()
