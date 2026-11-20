@@ -9,7 +9,7 @@ from __future__ import annotations
 import logging
 import threading
 
-from agent.interrupt_compat import request_hard_interrupt
+from agent.interrupt_compat import request_hard_interrupt, request_soft_interrupt
 from agent.interrupt_control import interrupt_issuer, interrupt_skip_wording
 from tools.interrupt import set_interrupt
 
@@ -265,3 +265,20 @@ def test_codex_turn_result_carries_system_interrupt_source():
         assert _consume_user_interrupt(user) == (True, "please use staging", None)
     finally:
         set_interrupt(False)
+
+
+def test_soft_interrupt_passes_source_only_to_callables_that_accept_it():
+    seen = []
+
+    class Legacy:
+        def interrupt(self, _message=None):
+            seen.append(("legacy", _message))
+
+    class Modern:
+        def interrupt(self, message=None, *, interrupt_source=None):
+            seen.append(("modern", message, interrupt_source))
+
+    assert request_soft_interrupt(Legacy(), "client disconnected", interrupt_source="system")
+    assert request_soft_interrupt(Modern(), "client disconnected", interrupt_source="system")
+    assert request_soft_interrupt(object(), "x", interrupt_source="system") is False
+    assert seen == [("legacy", "client disconnected"), ("modern", "client disconnected", "system")]

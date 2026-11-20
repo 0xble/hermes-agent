@@ -22,6 +22,20 @@ def _accepts_keyword(callable_obj: Any, name: str) -> bool:
     )
 
 
+def request_soft_interrupt(
+    agent: Any, message: str | None = None, *, interrupt_source: str | None = None
+) -> bool:
+    """Call ``agent.interrupt``, passing ``interrupt_source`` only when it is accepted."""
+    interrupt = getattr(agent, "interrupt", None)
+    if not callable(interrupt):
+        return False
+    if interrupt_source is not None and _accepts_keyword(interrupt, "interrupt_source"):
+        interrupt(message, interrupt_source=interrupt_source)
+    else:
+        interrupt(message)
+    return True
+
+
 def request_hard_interrupt(
     agent: Any,
     message: str | None = None,

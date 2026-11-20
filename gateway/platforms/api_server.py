@@ -149,7 +149,7 @@ from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from gateway.platforms.api_server_response_store import ResponseStore
 from agent.i18n import t
 from agent.redact import redact_sensitive_text
-from agent.interrupt_compat import request_hard_interrupt
+from agent.interrupt_compat import request_hard_interrupt, request_soft_interrupt
 from gateway.readiness import collect_runtime_readiness
 from gateway.browser_control_artifacts import (
     ArtifactError, ArtifactRateLimiter, ArtifactStore, ArtifactTooLarge, DEFAULT_ALLOWED_MIME_TYPES,
@@ -3737,7 +3737,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     await task
             return
         with suppress(Exception):
-            agent.interrupt(interrupt_message, interrupt_source="system")
+            request_soft_interrupt(agent, interrupt_message, interrupt_source="system")
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)
