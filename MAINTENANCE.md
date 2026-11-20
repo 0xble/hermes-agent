@@ -295,6 +295,14 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Go write lint scope | Post-write lint for `.go` files checks syntax with `gofmt -e`, leaving type, vet and lint checks to package-level gates and the Go LSP | Post-write shell linters, Go lint commands, or LSP redundancy rules in `tools/file_operations_lint.py` | [Go write lint scope](maintenance/go-write-lint.md) |
 | Embedded cua-driver lifetime | Keep each `cua-driver serve --embedded` process and its `hc-` socket from outliving the Hermes process that spawned it, including macOS `open` detachment | Embedded daemon spawn, stop, session release, or gateway/CLI startup | [Embedded cua-driver lifetime](maintenance/cua-driver-lifetime.md) |
 
+## Active Patch Record: Release-bound launcher recovery
+
+- **Patch identity:** `release-launcher-stability`.
+- **Behavior:** Recovered commands from immutable releases use the install-bound runtime when the release has no local convenience launcher.
+- **Source surfaces:** `hermes_cli/_launchers.py` and `tests/hermes_cli/test_source_launcher_publication.py`.
+- **Retirement:** Remove when immutable release recovery persists only stable install-bound commands.
+- **Rollback:** Revert the commit carrying `Fork-Patch: release-launcher-stability`.
+
 ## Active Patch Record: Exa Lite Routing
 
 - **Patch identity:** `exa-lite-routing`.
