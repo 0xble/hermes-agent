@@ -53,7 +53,8 @@ def test_empty_final_after_reaction_is_a_clean_stop(monkeypatch, delivered, fini
             assert not any(message.get("_empty_recovery_synthetic") for message in messages)
         else:
             assert verdict.action == "continue"
-            agent._buffer_diagnostic_status.assert_called_once()
+            agent._buffer_diagnostic_status.assert_called_once_with(
+                "⚠️ Model returned empty after tool calls — nudging to continue")
             # The nudge rides the next request (request-only recovery); history gains no synthetic row.
             from agent.conversation_loop import _EMPTY_TOOL_RESPONSE_NUDGE
             assert agent._empty_response_retry_hint == _EMPTY_TOOL_RESPONSE_NUDGE
