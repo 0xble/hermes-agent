@@ -1,4 +1,4 @@
-"""Exercise a pinned real agent against two independent loopback routes."""
+"""Pinned delegation retries pooled-proxy billing errors without changing model."""
 
 from typing import Any
 from unittest.mock import patch
@@ -10,91 +10,94 @@ from tests.tools.test_delegate import _make_mock_parent
 from tools.delegate_tool import _build_child_agent
 
 
-def test_real_delegate_child_keeps_owned_billing_fallback_chain(tmp_path, monkeypatch):
-    """The production child constructor must retain an explicitly scoped cross-model chain.
+_BILLING_BODY = {
+    "error": {
+        "type": "insufficient_quota",
+        "code": "credit_balance_exhausted",
+        "message": "You have no credits remaining",
+    }
+}
 
-    The primary loopback returns the OpenAI-compatible credit-balance 429; the real
-    ``_build_child_agent`` path constructs the child and the second request must land
-    on the configured fallback route.
-    """
+
+def _build_pinned_child(primary, *, failures: int, monkeypatch):
+    """Build a child through the production delegate constructor."""
+    primary.primary_available = True
+    primary.billing_failures = failures
+    monkeypatch.setitem(harness._FAILURE_BODIES, 429, _BILLING_BODY)
+    parent = _make_mock_parent()
+    fallback = [{
+        "provider": "custom", "model": harness.FALLBACK_MODEL,
+        "base_url": primary.url, "api_key": "fixture", "api_mode": "chat_completions",
+    }]
+    routing_cfg = {"model": harness.PRIMARY_MODEL, "fallback_providers": fallback}
+    with patch("tools.delegate_tool._load_config", return_value={}):
+        child: Any = _build_child_agent(
+            task_index=0, goal="say hello", context=None, toolsets=[],
+            model=harness.PRIMARY_MODEL, max_iterations=2, parent_agent=parent, task_count=1,
+            override_provider="custom", override_base_url=primary.url,
+            override_api_key="fixture", override_api_mode="chat_completions",
+            routing_cfg=routing_cfg,
+        )
+    return child, fallback
+
+
+def test_pinned_delegate_retries_pooled_billing_on_same_route(tmp_path, monkeypatch):
+    """A dead pooled credential must not break PR #1355's same-model pin."""
     home = tmp_path / "hermes"
     harness.write_home_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
-    billing_body = {
-        "error": {
-            "type": "insufficient_quota",
-            "code": "credit_balance_exhausted",
-            "message": "You have no credits remaining",
-        }
-    }
     with harness.StubProvider() as primary:
-        monkeypatch.setitem(harness._FAILURE_BODIES, 429, billing_body)
-        parent = _make_mock_parent()
-        fallback = [{
-            "provider": "custom", "model": harness.FALLBACK_MODEL,
-            "base_url": primary.url, "api_key": "fixture", "api_mode": "chat_completions",
-        }]
-        routing_cfg = {"model": harness.PRIMARY_MODEL, "fallback_providers": fallback}
-        with patch("tools.delegate_tool._load_config", return_value=routing_cfg):
-            child: Any = _build_child_agent(
-                task_index=0, goal="say hello", context=None, toolsets=[],
-                model=harness.PRIMARY_MODEL, max_iterations=2, parent_agent=parent, task_count=1,
-                override_provider="custom", override_base_url=primary.url,
-                override_api_key="fixture", override_api_mode="chat_completions",
-                routing_cfg=routing_cfg,
-            )
+        child, fallback = _build_pinned_child(primary, failures=1, monkeypatch=monkeypatch)
+        monkeypatch.setattr("agent.proxy_request_class._enabled_for_route", lambda *_args: True)
         try:
             child._disable_streaming = True
             result = child.run_conversation("hello")
         finally:
             child.close()
 
-    assert child._fallback_chain == fallback
+    assert child._fallback_chain == []  # same_model_fallbacks still filters the cross-model route
     assert result["completed"] is True
-    assert result["final_response"] == f"OK from {harness.FALLBACK_MODEL}"
-    assert [request["model"] for request in primary.requests if request["model"]] == [
-        harness.PRIMARY_MODEL, harness.FALLBACK_MODEL,
+    assert result["final_response"] == f"OK from {harness.PRIMARY_MODEL}"
+    assert [request["model"] for request in primary.requests if request["model"] is not None] == [
+        harness.PRIMARY_MODEL, harness.PRIMARY_MODEL,
     ]
+    assert fallback[0]["model"] == harness.FALLBACK_MODEL
 
 
-@pytest.mark.parametrize("same_model_route", [False, True])
-def test_pinned_model_skips_other_family_on_billing_failure(tmp_path, monkeypatch, same_model_route):
+def test_non_proxy_billing_is_terminal_without_retry(tmp_path, monkeypatch):
+    """The same OpenAI-compatible 429 stays terminal on an unopted-in route."""
     home = tmp_path / "hermes"
     harness.write_home_config(home)
-    monkeypatch.setitem(harness._FAILURE_BODIES, 503, {"error": {"message": (
-        "auth_unavailable: no auth available; last upstream error: "
-        "Your credit balance is too low to access the Anthropic API"
-    )}})
-    with harness.StubProvider() as primary, harness.StubProvider() as other, harness.StubProvider() as alternate:
-        primary.failure_status = 503
-        primary.retry_after = None
-        alternate.primary_available = True
-        alternate_entry = (
-            ', {"provider": "custom", "model": "primary-model", '
-            f'"base_url": {alternate.url!r}, "api_key": "fixture"}}'
-        ) if same_model_route else ""
-        child = harness.CHILD.replace(
-            '"base_url": url, "api_key": "fixture", "api_mode": "chat_completions"}]',
-            f'"base_url": {other.url!r}, "api_key": "fixture"}}{alternate_entry}]',
-        ).replace('fallback_model=fallback,', 'fallback_model=fallback, model_pinned=True,').replace(
-            '"notices": notices,',
-            '"notices": notices, "requested_model": result.get("requested_model"), '
-            '"served_model": result.get("served_model"), '
-            '"reason": result.get("fallback_reason") or result.get("failure_reason"),',
-        )
-        with patch.object(harness, "CHILD", child):
-            result = harness.run_turn(home, primary.url, "nonstream")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setitem(harness._FAILURE_BODIES, 429, _BILLING_BODY)
+    with harness.StubProvider() as primary:
+        primary.primary_available = False
+        primary.billing_failures = 1
+        result = harness.run_turn(home, primary.url, "nonproxy")
 
-        assert primary.requests
-        assert not other.requests
-        assert result["failed"] is not same_model_route
-        assert result["reason"] == "billing"
-        if same_model_route:
-            assert result["requested_model"] == result["served_model"] == "primary-model"
-            assert result["final_response"] == "OK from primary-model"
-            assert [r["model"] for r in alternate.requests if r["model"] is not None] == ["primary-model"]
-        else:
-            assert "credit" in result["final_response"].lower()
+    assert result["failed"] is True
+    assert len([request for request in primary.requests if request["model"] is not None]) == 1
+    assert [request["model"] for request in primary.requests if request["model"] is not None] == [harness.PRIMARY_MODEL]
+
+
+def test_pooled_billing_stops_after_one_retry(tmp_path, monkeypatch):
+    """Two consecutive pool billing failures produce exactly two same-route calls."""
+    home = tmp_path / "hermes"
+    harness.write_home_config(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    with harness.StubProvider() as primary:
+        child, _fallback = _build_pinned_child(primary, failures=2, monkeypatch=monkeypatch)
+        monkeypatch.setattr("agent.proxy_request_class._enabled_for_route", lambda *_args: True)
+        try:
+            child._disable_streaming = True
+            result = child.run_conversation("hello")
+        finally:
+            child.close()
+
+    assert result["failed"] is True
+    assert [request["model"] for request in primary.requests if request["model"] is not None] == [
+        harness.PRIMARY_MODEL, harness.PRIMARY_MODEL,
+    ]
 
 
 @pytest.mark.parametrize("served", ["other-model", None])
