@@ -43,7 +43,7 @@ class _SlowButLiveChild:
         self.interrupted = threading.Event()
         self.steers: list[tuple[float, str]] = []  # (monotonic time, text) of every budget warning received
 
-    def steer(self, text: str) -> bool:
+    def steer(self, text: str, *, human: bool = True) -> bool:
         self.steers.append((time.monotonic(), text))
         return True
 

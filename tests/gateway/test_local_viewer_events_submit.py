@@ -20,11 +20,13 @@ async def test_cli_turn_fields_are_admitted_and_bound_to_their_own_turn(tmp_path
     from gateway.session_cli_turn import cli_turn
     from gateway.session_controls import AuthorityConnection
     from gateway.session_ingress import admission_author
+    from gateway.platforms.event import turn_origin_for_event
     from hermes_state_runtime import list_session_admissions
 
     seen = []
     async def answer(event):
-        seen.append((event.text, cli_turn(event.message_id), cli_turn('another-event'), admission_author.get()))
+        seen.append((event.text, cli_turn(event.message_id), cli_turn('another-event'),
+                     admission_author.get(), turn_origin_for_event(event)))
         return 'ok'
     authority = await _authority(tmp_path, monkeypatch, answer)
     connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
@@ -32,7 +34,7 @@ async def test_cli_turn_fields_are_admitted_and_bound_to_their_own_turn(tmp_path
     try:
         await connection.dispatch({'id': 1, 'method': 'session.resume', 'params': {'session_id': 's'}})
         for rid, extra in (
-                ('full', {'turn_author': author, 'api_text': '[voice] hi', 'clarify_batch': True,
+                ('full', {'turn_author': author, 'turn_origin': 'goal_loop', 'api_text': '[voice] hi', 'clarify_batch': True,
                           'model_override': {'model': ' gpt-x ', 'provider': 'openrouter'}}),
                 ('plain', {})):
             reply = await connection.dispatch({'id': 2, 'method': 'prompt.submit', 'params': {
@@ -52,13 +54,23 @@ async def test_cli_turn_fields_are_admitted_and_bound_to_their_own_turn(tmp_path
 
     rows = {row['request_id']: row for row in list_session_admissions(authority.db, session_id='s', pending_only=False)}
     assert rows['full']['payload']['cli_turn_v1'] == {
-        'turn_author': author, 'api_text': '[voice] hi', 'clarify_batch': True,
+        'turn_author': author, 'turn_origin': 'goal_loop', 'api_text': '[voice] hi', 'clarify_batch': True,
         'model_override': {'model': 'gpt-x', 'provider': 'openrouter'}}
     assert 'cli_turn_v1' not in rows['plain']['payload']
     assert not {'no-model', 'extra-key', 'bad-text', 'bad-author', 'bad-batch'} & set(rows)
-    assert seen[0] == ('full', rows['full']['payload']['cli_turn_v1'], {}, author)
+    assert seen[0] == ('full', rows['full']['payload']['cli_turn_v1'], {}, author, 'goal_loop')
     # The next admission never inherits the previous turn's fields.
     assert seen[1][:3] == ('plain', {}, {})
+
+
+@pytest.mark.parametrize(("origin", "expected"), [
+    ("user", "user"), ("goal_loop", "goal_loop"), ("process", "process"),
+    ("relay", "user"), ("cron", "user"), ("unknown", "user"), ([], "user"),
+])
+def test_cli_prompt_only_accepts_its_own_turn_origins(origin, expected):
+    from gateway.session_cli_turn import admit_cli_turn
+
+    assert admit_cli_turn({"turn_origin": origin}) == {"cli_turn_v1": {"turn_origin": expected}}
 
 
 class _RecordingAgent:

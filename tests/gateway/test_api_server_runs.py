@@ -1006,7 +1006,7 @@ class TestSteerRun:
             "run_id": "run_123",
             "accepted": True,
         }
-        agent.steer.assert_called_once_with("tighten the ending")
+        agent.steer.assert_called_once_with("tighten the ending", human=True)
         assert adapter._run_statuses["run_123"]["last_event"] == "run.steered"
         _, event = stream.backlog[-1]
         assert event["event"] == "run.steered"

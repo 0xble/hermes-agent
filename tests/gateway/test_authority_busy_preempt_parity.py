@@ -18,7 +18,7 @@ class _RunningAgent:
     def __init__(self):
         self.steers, self.interrupts = [], []
 
-    def steer(self, text):
+    def steer(self, text, *, human=True):
         self.steers.append(text)
         return True
 

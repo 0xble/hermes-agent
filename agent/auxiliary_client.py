@@ -146,6 +146,12 @@ from agent.auxiliary_unavailable import (
 from hermes_constants import OPENROUTER_BASE_URL, hermes_home_key
 from utils import base_url_host_matches, base_url_hostname, base_url_origin, base_url_path, env_float, is_truthy_value, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
+from agent.auxiliary_response_text import (
+    _coerce_llm_message,
+    _message_field,
+    extract_content_or_reasoning,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -209,7 +215,10 @@ def _create_openai_client(*, api_key: str, base_url: str, **kwargs: Any) -> Any:
     # SDK-internal retries by default and let Hermes control the budget; explicit callers can still override
     # via kwargs.
     kwargs.setdefault("max_retries", 0)
-    return OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    client = OpenAI(api_key=api_key, base_url=base_url, **kwargs)
+    from agent.proxy_request_class import protect_request_class_redirects
+    protect_request_class_redirects(client)
+    return client
 
 
 # Interrupt protection for atomic aux tasks: a compression summary killed by an ordinary
@@ -2658,13 +2667,29 @@ def _provider_callback_async(create: Callable[[dict[str, Any]], Any], judged: li
     return call
 
 
+def _request_class_provider(client: Any, provider: str | None) -> str:
+    try:
+        resolved = _effective_provider_for_client(client, provider or "")
+        if resolved == "main":
+            runtime = _normalize_main_runtime(None)
+            return runtime.get("requested_provider") or runtime.get("provider") or _read_main_provider() or ""
+        inherited = getattr(client, "_hermes_aux_main_requested_provider", None)
+        return inherited if resolved == "custom" and isinstance(inherited, str) else resolved
+    except Exception:
+        logger.debug("Skipping request class: unable to identify auxiliary provider", exc_info=True)
+        return ""
+
+
 def _relay_sync_completion(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None,
     api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
+    from agent.auxiliary_wire import prepare_aux_request, relay_chat_metadata
 
-    kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = prepare_aux_request(
+        client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+        task=(_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task"),
+    )
     # The progress hook is installed per TASK, so every attempt (retries, recovery rungs, fallbacks)
     # must stream through _create_with_progress or the compression watchdog sees silence (#98466).
     # Recovery rungs / credential retries keep the task's ``no_progress_timeout`` window; the
@@ -2705,9 +2730,12 @@ async def _relay_async_completion(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None,
     api_mode: str | None = None, create: Callable[[dict[str, Any]], Any] | None = None,
 ) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
+    from agent.auxiliary_wire import prepare_aux_request, relay_chat_metadata
 
-    kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = prepare_aux_request(
+        client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+        task=(_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task"),
+    )
     # Async twin of the seam default above (#98466).
     judged: list[_ClassifiedAttempt] = []
     callback = _provider_callback_async(
@@ -2738,9 +2766,12 @@ async def _relay_async_completion(
 def _relay_sync_stream(
     client: Any, kwargs: dict[str, Any], *, provider: str | None = None, api_mode: str | None = None
 ) -> Any:
-    from agent.auxiliary_wire import prepare_chat_messages, relay_chat_metadata
+    from agent.auxiliary_wire import prepare_aux_request, relay_chat_metadata
 
-    kwargs = prepare_chat_messages(client, kwargs)
+    kwargs = prepare_aux_request(
+        client, kwargs, provider=_request_class_provider(client, provider), api_mode=api_mode,
+        task=(_RELAY_AUX_CALL_CONTEXT.get() or {}).get("task"),
+    )
     # The bypass runs inside the provider callback, AFTER Relay has seen (and possibly
     # rewritten) the real conversation; applying it to `kwargs` would hand Relay an empty one.
     create = lambda request: client.chat.completions.create(**bypass_chat_sdk_request_transform(request, client))
@@ -4760,6 +4791,11 @@ def _resolve_auto_route(
     main_provider, main_model, base_url, api_key, api_mode = _main_route_target(runtime, task)
     routed = _try_main_provider_route(main_provider, main_model, base_url, api_key, api_mode)
     if routed is not None:
+        # An auto auxiliary call can borrow a named main route represented by the generic
+        # provider "custom". Keep its name for request attribution, not routing or health.
+        if routed[2] == "custom" and runtime.get("provider") == "custom" and runtime.get("requested_provider"):
+            with contextlib.suppress(AttributeError, TypeError):
+                routed[0]._hermes_aux_main_requested_provider = runtime["requested_provider"]
         return routed
     if task:
         fb_client, fb_model, fb_label = _try_configured_fallback_chain(
@@ -4877,7 +4913,10 @@ def _to_async_client(sync_client, model: str, is_vision: bool = False):
     # Hermes owns the auxiliary retry/timeout budget; disable SDK-internal retries.
     # See #54465.
     async_kwargs.setdefault("max_retries", 0)
-    return AsyncOpenAI(**async_kwargs), model
+    client = AsyncOpenAI(**async_kwargs)
+    from agent.proxy_request_class import protect_request_class_redirects
+    protect_request_class_redirects(client)
+    return client, model
 
 
 def _normalize_resolved_model(model_name: Optional[str], provider: str) -> Optional[str]:
@@ -5127,6 +5166,9 @@ def _resolve_auto_branch(req: _ResolveRequest) -> _ResolveResult:
             routed_client._hermes_aux_effective_provider = effective_provider
             if routed_client is not client:  # the async rebuild keeps the provider discovery built the client for
                 _tag_backend(routed_client, getattr(client, "_hermes_aux_backend_provider", None))
+                inherited = getattr(client, "_hermes_aux_main_requested_provider", None)
+                if isinstance(inherited, str):
+                    routed_client._hermes_aux_main_requested_provider = inherited
         except (AttributeError, TypeError):
             logger.debug("Auxiliary client %s cannot retain effective provider %s",
                          type(routed_client).__name__, effective_provider)
@@ -5911,7 +5953,12 @@ def _client_cache_key(
 ) -> tuple:
     runtime = _normalize_main_runtime(main_runtime)
     # `auto` resolves through the main runtime and task-specific policy, so both join the key.
-    runtime_key = tuple(_runtime_cache_discriminator(f, runtime.get(f, "")) for f in _MAIN_RUNTIME_FIELDS) if provider == "auto" else ()
+    # Two named custom routes can share an endpoint and key but differ in proxy opt-in.
+    runtime_key = (
+        tuple(_runtime_cache_discriminator(f, runtime.get(f, ""))
+              for f in (*_MAIN_RUNTIME_FIELDS, "requested_provider"))
+        if provider == "auto" else ()
+    )
     task_key = (task or "", _task_prefers_fast_model(task)) if provider == "auto" else ""
     pool_hint = _pool_cache_hint(provider, main_runtime=main_runtime)
     # Model MUST be in the key: concurrent calls to the same endpoint with different models would
@@ -8388,74 +8435,6 @@ def _call_llm_impl(
     return _drive_ladder(
         _start_recovery_ladder(failure, req, retry_kwargs, task=task, async_mode=False, route_info=route_info),
         _perform)
-
-
-def _coerce_llm_message(response):
-    """Pull a message (dict, object, or str) out of a response-or-message value: dict-shaped
-    responses/bare messages (compression, proxies) and ChatCompletion objects; MagicMock
-    ``reasoning_*`` attrs are deliberately not strings."""
-    if response is None or isinstance(response, str):
-        return response
-    if isinstance(response, dict):
-        if "choices" not in response:
-            return response
-        choices = response.get("choices") or []
-    else:
-        choices = getattr(response, "choices", None)
-        if not choices:
-            return response
-    return _message_field(choices[0], "message") if choices else None
-
-
-def _message_field(msg, name):
-    return msg.get(name) if isinstance(msg, dict) else getattr(msg, name, None)
-
-
-def extract_content_or_reasoning(response, *, max_reasoning_chars: int | None = None) -> str:
-    """Extract content from an LLM response, falling back to reasoning fields.
-    Order: ``content`` (inline think blocks stripped) → ``reasoning``/``reasoning_content`` →
-    ``reasoning_details`` (OpenRouter array). Accepts a response or bare message;
-    ``max_reasoning_chars`` bounds a reasoning fallback so unbounded chain-of-thought can't
-    become the compaction summary. Returns ``""`` if nothing found."""
-    msg = _coerce_llm_message(response)
-    if msg is None:
-        return ""
-    if isinstance(msg, str):
-        return msg.strip()
-    raw = _message_field(msg, "content")
-    if not isinstance(raw, str):
-        raw = str(raw) if raw else ""
-    content = raw.strip()
-    if content:
-        # Same precompiled closed-pair patterns as strip_think_blocks.
-        from agent.agent_runtime_helpers import _REASONING_BLOCK_PATTERNS
-        cleaned = content
-        for pattern in _REASONING_BLOCK_PATTERNS:
-            cleaned = pattern.sub("", cleaned)
-        cleaned = cleaned.strip()
-        if cleaned:
-            return cleaned
-    # Content is empty or reasoning-only — try structured reasoning fields
-    reasoning_parts: list[str] = []
-    for field in ("reasoning", "reasoning_content"):
-        val = _message_field(msg, field)
-        if val and isinstance(val, str) and val.strip() and val not in reasoning_parts:
-            reasoning_parts.append(val.strip())
-    details = _message_field(msg, "reasoning_details")
-    if details and isinstance(details, list):
-        for detail in details:
-            if isinstance(detail, dict):
-                summary = detail.get("summary") or detail.get("content") or detail.get("text")
-                if summary and summary not in reasoning_parts:
-                    reasoning_parts.append(summary.strip() if isinstance(summary, str) else str(summary))
-    if not reasoning_parts:
-        return ""
-    text = "\n\n".join(reasoning_parts)
-    if max_reasoning_chars is not None and len(text) > max_reasoning_chars:
-        logger.warning("fell back to reasoning fields (%d chars); truncating to %d",
-                       len(text), max_reasoning_chars)
-        return text[:max_reasoning_chars]
-    return text
 
 
 @_relay_auxiliary_call_async

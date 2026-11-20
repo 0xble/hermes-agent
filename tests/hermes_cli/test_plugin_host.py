@@ -304,7 +304,7 @@ def register(ctx):
 '''
     finish, steering = threading.Event(), []
     child = SimpleNamespace(_subagent_id="sa-host-lifecycle", provider="test", model="test-model",
-                            steer=lambda text: steering.append(text) is None)
+                            steer=lambda text, **_kwargs: steering.append(text) is None)
     parent = SimpleNamespace(session_id="parent-host-lifecycle")
 
     def build(**kwargs):
