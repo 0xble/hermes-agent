@@ -68,9 +68,9 @@ def test_make_agent_uses_eligible_fallback_on_auth_error(monkeypatch, pin, same_
     expected_provider = "openrouter" if pin else "deepseek"
     assert len(attempted) == 2
     assert attempted[-1] == {"requested": expected_provider, "target_model": expected_model}
-    assert getattr(agent, "model") == expected_model
+    assert agent.model == expected_model
     assert captured["model"] == expected_model
-    assert getattr(agent, "_preflight_fallback") == {
+    assert agent._preflight_fallback == {
         "requested_model": "gpt-5.5", "fallback_model": expected_model,
         "fallback_reason": "credentials_unavailable",
     }

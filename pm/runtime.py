@@ -136,7 +136,7 @@ def prepare_runtime(uv: Path, python: Path, root: Path, *, offline: bool = False
     """
     from pm.filesystem import lock_fd
     from pm.lock import _write
-    from pm.runtime_stage import stage_runtime
+    from pm.runtime_stage import stage_runtime  # noqa: TID251
     from pm.environments import record_install_use
     from hermes_cli.runtime_state import runtime_lock
     from pm.paths import repo_root

@@ -97,7 +97,7 @@ async def test_typed_message_starts_ahead_of_a_background_flood_and_the_cap_hold
     # End each background turn as it starts until every wake has been admitted.
     for expected in range(1, flood + 1):
         await async_wait_until(lambda: len(adapter.admitted) > expected, timeout=10)
-        adapter.end_turn(sorted(adapter.background)[0])
+        adapter.end_turn(min(adapter.background))
     await asyncio.wait_for(asyncio.gather(*wakes), 5)
     # Every deferred wake still fired, and never more than ``cap`` ran at once.
     assert sorted(key for key in adapter.admitted if key != "typed") == [f"bg{i}" for i in range(flood)]
