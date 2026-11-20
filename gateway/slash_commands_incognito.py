@@ -71,7 +71,7 @@ class GatewayIncognitoCommandsMixin:
                     return "Incognito was not changed. Wait for the active turn to finish, then retry."
                 from contextvars import Context
                 entry = await asyncio.to_thread(Context().run, self.session_store.get_or_create_session, source)
-                await self._rehydrate_session_model_override_async(key)
+                await self._rehydrate_session_model_override_locked_async(key)
                 if action == "status":
                     return self._incognito_reply(entry)
                 enabled = not entry.incognito if not action else action == "on"
