@@ -140,23 +140,25 @@ def record_unit_child(delegation_id: str, entry: dict[str, Any]) -> None:
     from tools import async_delegation as ad
 
     entry = ad.redact_child_result(entry)
-    with ad._records_lock:
-        record = ad._records.get(delegation_id)
-        if isinstance(record, dict):
-            record.setdefault("_finished_children", []).append(dict(entry))
+    if isinstance(entry.get("task_index"), int):
+        # Upstream's in-memory note of a finished child, kept while the unit is active and dropped at finalize.
+        # The terminal result is still reconciled from the durable row written below, never from this copy.
+        with ad._records_lock:
+            if (record := ad._records.get(delegation_id)) is not None and record.get("status") in ad._ACTIVE_STATES:
+                record.setdefault("_finished_children", {})[entry["task_index"]] = entry
     if remote := ad.worker_ledger():
         return remote.child(delegation_id, entry)
     try:
         with ad._DB_LOCK, ad._transaction() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT result_json FROM async_delegations WHERE delegation_id=? AND state IN ('running','finalizing')",
+            row = conn.execute("SELECT result_json FROM async_delegations WHERE delegation_id=? AND state='running'",
                                (delegation_id,)).fetchone()
             if row is None:
                 return
             partial = ad.redact_child_result(json.loads(row[0] or "{}") or {})
             results = [r for r in partial.get("results") or [] if r.get("task_index") != entry.get("task_index")]
             results.append(entry)
-            conn.execute("UPDATE async_delegations SET result_json=?, updated_at=? WHERE delegation_id=? AND state IN ('running','finalizing')",
+            conn.execute("UPDATE async_delegations SET result_json=?, updated_at=? WHERE delegation_id=? AND state='running'",
                          (json.dumps({"results": results, "partial": True}), time.time(), delegation_id))
     except Exception:
         logger.warning("Async delegation %s: could not record finished child %s", delegation_id, entry.get("task_index"), exc_info=True)
