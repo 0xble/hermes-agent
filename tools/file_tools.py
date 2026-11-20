@@ -19,8 +19,8 @@ import time
 from contextlib import ExitStack, contextmanager
 from pathlib import Path, PurePosixPath
 
-from agent.file_safety import get_credential_write_error, get_nt_namespace_error, get_read_block_error
-from agent.file_safety import get_nt_namespace_error, get_read_block_error, is_blocked_device_path
+from agent.file_safety import (
+    get_credential_write_error, get_nt_namespace_error, get_read_block_error, is_blocked_device_path)
 from agent.tool_result_classification import GUARDRAIL_REFUSAL_KEY
 from tools.binary_extensions import has_binary_extension
 from tools.skill_provenance import is_background_review
