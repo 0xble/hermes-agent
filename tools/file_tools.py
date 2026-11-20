@@ -1472,7 +1472,7 @@ def _handle_patch(args, **kw):
     from hermes_cli.observability.shared_metrics_harness import record_file_edit
 
     tid = kw.get("task_id") or "default"
-    mode = args.get("mode", "replace")
+    mode = args.get("mode") or "replace"
     return record_file_edit("patch", mode, lambda: _owned(kw.get("session_id") or tid, patch_tool,
         mode=mode, path=args.get("path"),
         old_string=args.get("old_string"), new_string=args.get("new_string"),

@@ -14,6 +14,7 @@ Covers the three seams the integration relies on:
 import ipaddress
 import json
 import os
+import sys
 import socket
 import stat
 import subprocess

@@ -162,6 +162,7 @@ class KernelMemoryWatch:
 # Linux DATA limits private writable mappings (4.7+); the host watchdog bounds the tree.
 # Do not cap virtual address space: Chromium/JVM reserve far more than their real memory.
 RUNNER_MEMORY_SOURCE = '''\
+import os
 _memory_rlimit_bytes = 0
 if sys.platform.startswith("linux"):
     import resource
