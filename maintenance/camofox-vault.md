@@ -4,6 +4,7 @@ Load this unit when changing named Camofox browser accounts, vault login classif
 the browser vault fill tool, or the 1Password backends.
 
 - Fork patch identity: `vault-origin-aliases`.
+- Fork patch identity: `camofox-1password-account-scope` (named 1Password account identity verification and ambient-token isolation; local fork fix).
 
 ## Native Browser Extraction Boundary
 
