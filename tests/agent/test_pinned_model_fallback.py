@@ -1,10 +1,60 @@
 """Exercise a pinned real agent against two independent loopback routes."""
 
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 
 from tests.agent import _shared_cooldown_stub as harness
+from tests.tools.test_delegate import _make_mock_parent
+from tools.delegate_tool import _build_child_agent
+
+
+def test_real_delegate_child_keeps_owned_billing_fallback_chain(tmp_path, monkeypatch):
+    """The production child constructor must retain an explicitly scoped cross-model chain.
+
+    The primary loopback returns the OpenAI-compatible credit-balance 429; the real
+    ``_build_child_agent`` path constructs the child and the second request must land
+    on the configured fallback route.
+    """
+    home = tmp_path / "hermes"
+    harness.write_home_config(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    billing_body = {
+        "error": {
+            "type": "insufficient_quota",
+            "code": "credit_balance_exhausted",
+            "message": "You have no credits remaining",
+        }
+    }
+    with harness.StubProvider() as primary:
+        monkeypatch.setitem(harness._FAILURE_BODIES, 429, billing_body)
+        parent = _make_mock_parent()
+        fallback = [{
+            "provider": "custom", "model": harness.FALLBACK_MODEL,
+            "base_url": primary.url, "api_key": "fixture", "api_mode": "chat_completions",
+        }]
+        routing_cfg = {"model": harness.PRIMARY_MODEL, "fallback_providers": fallback}
+        with patch("tools.delegate_tool._load_config", return_value=routing_cfg):
+            child: Any = _build_child_agent(
+                task_index=0, goal="say hello", context=None, toolsets=[],
+                model=harness.PRIMARY_MODEL, max_iterations=2, parent_agent=parent, task_count=1,
+                override_provider="custom", override_base_url=primary.url,
+                override_api_key="fixture", override_api_mode="chat_completions",
+                routing_cfg=routing_cfg,
+            )
+        try:
+            child._disable_streaming = True
+            result = child.run_conversation("hello")
+        finally:
+            child.close()
+
+    assert child._fallback_chain == fallback
+    assert result["completed"] is True
+    assert result["final_response"] == f"OK from {harness.FALLBACK_MODEL}"
+    assert [request["model"] for request in primary.requests if request["model"]] == [
+        harness.PRIMARY_MODEL, harness.FALLBACK_MODEL,
+    ]
 
 
 @pytest.mark.parametrize("same_model_route", [False, True])
