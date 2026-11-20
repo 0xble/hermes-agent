@@ -1,11 +1,14 @@
-import asyncio
-import json
 from types import SimpleNamespace
 
 import pytest
 
-from gateway.missed_message_ack import run_missed_message_ack
 from gateway.config import GatewayConfig
+from gateway.missed_message_ack import (
+    _ack_one,
+    _ack_summary,
+    record_missed_message_ack_shutdown,
+    run_missed_message_ack,
+)
 
 
 class DB:
@@ -39,6 +42,7 @@ class Adapter:
         self.sent = []
 
     async def fetch_missed_inbound(self, since, until):
+        self.window = (since, until)
         return list(self.records)
 
     async def send(self, chat_id, content, reply_to=None, metadata=None):
@@ -47,11 +51,11 @@ class Adapter:
 
 
 def runner(adapter, db, enabled=True):
-    db.values[("run",)] = 1000
-    return SimpleNamespace(
-        config=SimpleNamespace(missed_message_ack={"enabled": enabled, "text": "offline"}),
+    runner = SimpleNamespace(
+        config=SimpleNamespace(missed_inbound_recovery={"enabled": enabled}),
         adapters={"slack": adapter}, _session_db=db, _background_tasks=set(),
     )
+    return runner
 
 
 @pytest.fixture(autouse=True)
@@ -61,7 +65,8 @@ def _enable_feature_for_unit_tests(monkeypatch):
 
 def records(count=1, conversation="D1", start=1500):
     return [
-        {"platform": "slack", "conversation": conversation, "ts": str(start + i), "thread_ts": str(start + i)}
+        {"platform": "slack", "conversation": conversation, "ts": str(start + i),
+         "thread_ts": str(start + i), "event": {"ts": str(start + i), "text": "missed"}}
         for i in range(count)
     ]
 
@@ -71,40 +76,52 @@ async def test_missed_dm_ack_once_and_existing_dedupe():
     db = DB()
     adapter = Adapter(records(start=1999))
     gw = runner(adapter, db)
-    await run_missed_message_ack(gw, now=2000)
-    await run_missed_message_ack(gw, now=2001)
+    await _ack_one(db, gw, records(start=1999)[0], "offline")
+    await _ack_one(db, gw, records(start=1999)[0], "offline")
     assert len(adapter.sent) == 1
-    assert adapter.sent[0][0:3] == ("D1", "offline", "1999")
+    assert adapter.sent[0][1] == "offline"
 
 
 @pytest.mark.asyncio
 async def test_cap_posts_one_summary_per_conversation():
     db = DB()
     adapter = Adapter(records(25, conversation="C1"))
-    await run_missed_message_ack(runner(adapter, db), now=2000)
+    gw = runner(adapter, db)
+    for item in records(20, conversation="C1"):
+        await _ack_one(db, gw, item, "offline")
+    await _ack_summary(db, gw, "slack", "C1", records(5, conversation="C1", start=3000))
     assert len(adapter.sent) == 21
-    assert adapter.sent[-1][1] == "I was offline and missed 5 messages here. Ask again here if you still need it."
+    assert "missed 5 messages" in adapter.sent[-1][1]
 
 
 @pytest.mark.asyncio
-async def test_errors_are_swallowed():
+async def test_errors_are_swallowed_and_scan_does_not_advance():
     class Broken(Adapter):
         async def fetch_missed_inbound(self, since, until):
             raise RuntimeError("mock API failure")
 
-    gw = runner(Broken([]), DB())
-    await run_missed_message_ack(gw, now=2000)
+    db = DB()
+    await run_missed_message_ack(runner(Broken([]), db), now=2000)
+    assert ("scan", "slack") not in db.values
 
 
 @pytest.mark.asyncio
-async def test_disabled_does_not_fetch_or_send():
+async def test_disabled_does_not_fetch_or_dispatch():
     adapter = Adapter(records())
     await run_missed_message_ack(runner(adapter, DB(), enabled=False), now=2000)
     assert not adapter.sent
 
 
+@pytest.mark.asyncio
+async def test_shutdown_marker_defines_next_offline_window():
+    db = DB()
+    await record_missed_message_ack_shutdown(SimpleNamespace(_session_db=db), now=1900)
+    adapter = Adapter(records(start=1999))
+    await run_missed_message_ack(runner(adapter, db), now=2000)
+    assert adapter.window == (1900.0, 2000)
+
+
 def test_config_serializes_and_defaults():
-    cfg = GatewayConfig.from_dict({"gateway": {"missed_message_ack": {"enabled": False, "text": "later"}}})
-    assert cfg.missed_message_ack_enabled is False
-    assert cfg.missed_message_ack_text == "later"
-    assert cfg.to_dict()["missed_message_ack"] == {"enabled": False, "text": "later"}
+    cfg = GatewayConfig.from_dict({"gateway": {"missed_inbound_recovery": {"enabled": False}}})
+    assert cfg.missed_inbound_recovery_enabled is False
+    assert cfg.to_dict()["missed_inbound_recovery"] == {"enabled": False}

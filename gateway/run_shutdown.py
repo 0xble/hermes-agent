@@ -2332,10 +2332,11 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         logger.info("Stopping gateway%s...", " for restart" if self._restart_requested else "")
         ctx.started_at = time.monotonic()
         self._running = False
+        from gateway.missed_message_ack import record_missed_message_ack_shutdown
+        await record_missed_message_ack_shutdown(self)
         self._clear_plugin_message_injector()
         self._draining = True
-        # Fence restart-survivor pollers before agent-close/finalize drains can lose a
-        # completion claimed into this gateway's in-memory queue.
+        # Fence restart-survivor pollers before shutdown drains.
         try:
             from tools.process_registry import process_registry
             process_registry.stop_survivor_pollers()
@@ -2363,8 +2364,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         if callable(stop_watchdog):
             await stop_watchdog()
         await self._cancel_secondary_profile_reconnect_tasks()
-        # A timed-out human turn gets the S2 interruption note after the drain. Suppress the
-        # earlier per-session broadcast for those lanes so restart notifications do not duplicate it.
+        # Suppress the earlier per-session broadcast for timed-out human turns.
         self._s2_note_session_keys = set()
         for _session_key in list(getattr(self, "_running_agents", {}).keys()):
             try:

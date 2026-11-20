@@ -8,13 +8,16 @@ import logging
 import os
 import time
 from collections import defaultdict
+from datetime import datetime
 from typing import Any
 
 logger = logging.getLogger(__name__)
 
-_LAST_START_KIND = "run"
+_CONNECTED_KIND = "connected"
+_SHUTDOWN_KIND = "shutdown"
+_SCAN_KIND = "scan"
 _MAX_WINDOW_SECONDS = 24 * 60 * 60
-_MAX_ACKS_PER_PLATFORM = 20
+_MAX_MESSAGES_PER_PLATFORM = 20
 _DEFAULT_TEXT = "I was offline when you sent this and missed it. Ask again here if you still need it."
 
 
@@ -48,9 +51,7 @@ async def _set_state(db: Any, kind: str, value: Any, *parts: str) -> None:
 
 async def _claim(db: Any, platform: str, conversation: str, ts: str) -> bool:
     claim = getattr(db, "claim_missed_message_ack", None)
-    if not callable(claim):
-        return False
-    return bool(await _call(claim(platform, conversation, ts)))
+    return bool(await _call(claim(platform, conversation, ts))) if callable(claim) else False
 
 
 async def _mark_sent(db: Any, platform: str, conversation: str, ts: str) -> None:
@@ -65,92 +66,91 @@ async def _release(db: Any, platform: str, conversation: str, ts: str) -> None:
         await _call(release(platform, conversation, ts))
 
 
-def _config(runner) -> tuple[bool, str]:
+async def _window_start(db: Any, platform: str, now: float) -> float:
+    values = [now - _MAX_WINDOW_SECONDS]
+    for kind, parts in ((_CONNECTED_KIND, (platform,)), (_SHUTDOWN_KIND, ()), (_SCAN_KIND, (platform,))):
+        value = await _state(db, kind, *parts)
+        if isinstance(value, (int, float)):
+            values.append(float(value))
+    return max(values)
+
+
+async def record_missed_message_ack_shutdown(runner: Any, now: float | None = None) -> None:
+    db = getattr(runner, "_session_db", None)
+    if db is None:
+        return
+    try:
+        await _set_state(db, _SHUTDOWN_KIND, time.time() if now is None else float(now))
+    except Exception:
+        logger.warning("Could not persist missed-message shutdown marker", exc_info=True)
+
+
+def _enabled(runner: Any) -> bool:
     config = getattr(runner, "config", None)
-    setting = getattr(config, "missed_message_ack", None)
-    if isinstance(setting, dict):
-        enabled = bool(setting.get("enabled", True))
-        text = str(setting.get("text") or _DEFAULT_TEXT)
-    else:
-        enabled = bool(getattr(config, "missed_message_ack_enabled", True))
-        text = str(getattr(config, "missed_message_ack_text", _DEFAULT_TEXT) or _DEFAULT_TEXT)
-    # Tests and evals must never produce outbound messages, even when a test constructs a config directly.
-    return enabled and not _test_mode(), text
+    setting = getattr(config, "missed_inbound_recovery", None)
+    enabled = bool(setting.get("enabled", True)) if isinstance(setting, dict) else bool(
+        getattr(config, "missed_inbound_recovery_enabled", True))
+    return enabled and not _test_mode()
+
+
+def _adapter_for(runner: Any, platform: str) -> Any:
+    for key, adapter in (getattr(runner, "adapters", {}) or {}).items():
+        if str(getattr(key, "value", key)) == platform:
+            return adapter
+    return None
+
+
+def _late_context(since: float, until: float, message_ts: str) -> str:
+    start = datetime.fromtimestamp(since).astimezone().isoformat(timespec="minutes")
+    sent = datetime.fromtimestamp(float(message_ts)).astimezone().isoformat(timespec="minutes")
+    end = datetime.fromtimestamp(until).astimezone().isoformat(timespec="minutes")
+    return (f"[Delivered late: sent {sent}; the gateway was offline from {start} to {end}. "
+            "Acknowledge the delay, answer what still applies, and confirm before acting on anything time-sensitive.]\n\n")
 
 
 def _key(item: dict[str, Any]) -> tuple[str, str, str]:
     return str(item.get("platform", "")), str(item.get("conversation", "")), str(item.get("ts", ""))
 
 
-async def run_missed_message_ack(runner, *, now: float | None = None) -> None:
-    lock = getattr(runner, "_missed_message_ack_lock", None)
-    if lock is None:
-        lock = runner._missed_message_ack_lock = asyncio.Lock()
-    async with lock:
-        await _run_missed_message_ack(runner, now=now)
+async def _post_ack(runner: Any, item: dict[str, Any], text: str) -> None:
+    adapter = _adapter_for(runner, str(item.get("platform", "")))
+    if adapter is None:
+        raise RuntimeError("adapter unavailable")
+    result = await _call(adapter.send(
+        str(item["conversation"]), text,
+        reply_to=str(item.get("thread_ts") or item["ts"]),
+        metadata={"thread_id": str(item.get("thread_ts") or item["ts"]), **(
+            {"scope_id": str(item["team_id"])} if item.get("team_id") else {})},
+    ))
+    if getattr(result, "success", True) is False:
+        raise RuntimeError(getattr(result, "error", "send failed"))
 
 
-async def _run_missed_message_ack(runner, *, now: float | None = None) -> None:
-    """Fetch and acknowledge missed messages without entering the agent turn path."""
-    enabled, text = _config(runner)
-    if not enabled:
-        return
-    adapters = getattr(runner, "adapters", {}) or {}
-    db = getattr(runner, "_session_db", None)
-    if db is None:
-        return
-    now = time.time() if now is None else now
-    previous = await _state(db, _LAST_START_KIND, default=None)
-    # A first-ever run has no defensible offline interval. The boundary is written after the scan
-    # is assembled so a history failure does not erase the previous window.
-    since = float(previous) if isinstance(previous, (int, float)) else now
-    since = max(since, now - _MAX_WINDOW_SECONDS)
-
-    by_platform: dict[str, list[dict[str, Any]]] = defaultdict(list)
-    for platform, adapter in list(adapters.items()):
-        fetch = getattr(adapter, "fetch_missed_inbound", None)
-        if not callable(fetch):
-            continue
-        name = str(getattr(platform, "value", platform))
-        try:
-            records = await fetch(since, now)
-            for item in records or []:
-                if not isinstance(item, dict):
-                    continue
-                record = {**item, "platform": str(item.get("platform") or name)}
-                try:
-                    message_ts = float(record["ts"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if not since <= message_ts <= now:
-                    continue
-                if record.get("conversation") and record.get("ts"):
-                    by_platform[record["platform"]].append(record)
-        except Exception:
-            logger.warning("Missed-message scan failed for %s", name, exc_info=True)
-
-    await _set_state(db, _LAST_START_KIND, now)
-    for platform, records in by_platform.items():
-        records.sort(key=lambda item: (str(item.get("conversation")), float(item.get("ts", 0))))
-        individual = records[:_MAX_ACKS_PER_PLATFORM]
-        overflow = records[_MAX_ACKS_PER_PLATFORM:]
-        for item in individual:
-            await _ack_one(db, runner, item, text)
-        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        for item in overflow:
-            grouped[str(item["conversation"])].append(item)
-        for conversation, items in grouped.items():
-            await _ack_summary(db, runner, platform, conversation, items)
+async def _ack_one(db: Any, runner: Any, item: dict[str, Any], text: str) -> bool:
+    platform, conversation, ts = _key(item)
+    if not await _claim(db, platform, conversation, ts):
+        return True
+    try:
+        adapter = _adapter_for(runner, platform)
+        dispatch = getattr(adapter, "dispatch_missed_inbound", None) if adapter else None
+        if callable(dispatch):
+            await _call(dispatch(item))
+        else:
+            await _post_ack(runner, item, text)
+    except Exception:
+        await _release(db, platform, conversation, ts)
+        logger.warning("Missed-message acknowledgement failed for %s:%s:%s", platform, conversation, ts, exc_info=True)
+        return False
+    await _mark_sent(db, platform, conversation, ts)
+    return True
 
 
-async def _ack_summary(db: Any, runner: Any, platform: str, conversation: str,
-                       items: list[dict[str, Any]]) -> None:
-    """Claim the deterministic summary and its covered messages before posting it."""
-    first_ts = str(items[0]["ts"])
-    last_ts = str(items[-1]["ts"])
+async def _post_summary(db: Any, runner: Any, platform: str, conversation: str,
+                        items: list[dict[str, Any]]) -> bool:
+    first_ts, last_ts = str(items[0]["ts"]), str(items[-1]["ts"])
     summary_ts = f"summary:{first_ts}:{last_ts}:{len(items)}"
     if not await _claim(db, platform, conversation, summary_ts):
-        return
+        return True
     claimed: list[tuple[str, str, str]] = []
     for item in items:
         key = _key(item)
@@ -158,63 +158,99 @@ async def _ack_summary(db: Any, runner: Any, platform: str, conversation: str,
             claimed.append(key)
     if not claimed:
         await _release(db, platform, conversation, summary_ts)
-        return
-    summary = f"I was offline and missed {len(items)} messages here. Ask again here if you still need it."
+        return True
     try:
-        await _post_ack(
-            runner,
-            {**items[0], "ts": summary_ts, "thread_ts": items[0].get("thread_ts") or first_ts},
-            summary,
-        )
+        await _post_ack(runner, {**items[0], "ts": summary_ts},
+                        f"I was offline and missed {len(items)} messages here. Ask again here if you still need it.")
     except Exception:
         await _release(db, platform, conversation, summary_ts)
         for key in claimed:
             await _release(db, *key)
         logger.warning("Missed-message summary failed for %s:%s", platform, conversation, exc_info=True)
-        return
+        return False
     await _mark_sent(db, platform, conversation, summary_ts)
     for key in claimed:
         await _mark_sent(db, *key)
+    return True
 
 
-async def _ack_one(db: Any, runner: Any, item: dict[str, Any], text: str) -> None:
-    platform, conversation, ts = _key(item)
-    if not await _claim(db, platform, conversation, ts):
+_ack_summary = _post_summary
+
+
+async def run_missed_message_ack(runner, *, now: float | None = None, platform: Any | None = None) -> None:
+    lock = getattr(runner, "_missed_message_ack_lock", None)
+    if lock is None:
+        lock = runner._missed_message_ack_lock = asyncio.Lock()
+    async with lock:
+        try:
+            await _run_missed_message_ack(runner, now=now, platform=platform)
+        except Exception:
+            logger.warning("Missed-message scan failed", exc_info=True)
+
+
+async def _run_missed_message_ack(runner, *, now: float | None = None, platform: Any | None = None) -> None:
+    """Fetch missed inbound records and feed them through normal adapter handlers."""
+    if not _enabled(runner):
         return
-    try:
-        await _post_ack(runner, item, text)
-    except Exception:
-        await _release(db, platform, conversation, ts)
-        logger.warning(
-            "Missed-message acknowledgement failed for %s:%s:%s", platform, conversation, ts, exc_info=True,
-        )
+    db = getattr(runner, "_session_db", None)
+    if db is None:
         return
-    await _mark_sent(db, platform, conversation, ts)
+    now = time.time() if now is None else float(now)
+    candidates = list((getattr(runner, "adapters", {}) or {}).items())
+    platform_name = str(getattr(platform, "value", platform)) if platform is not None else None
+    if platform_name:
+        candidates = [(key, adapter) for key, adapter in candidates if str(getattr(key, "value", key)) == platform_name]
+    by_platform: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    successful: set[str] = set()
+    for key, adapter in candidates:
+        fetch = getattr(adapter, "fetch_missed_inbound", None)
+        if not callable(fetch):
+            continue
+        name = str(getattr(key, "value", key))
+        since = await _window_start(db, name, now)
+        try:
+            records = await _call(fetch(since, now))
+            successful.add(name)
+            for raw in records or []:
+                if not isinstance(raw, dict):
+                    continue
+                item = {**raw, "platform": str(raw.get("platform") or name)}
+                try:
+                    timestamp = float(item["ts"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if since <= timestamp <= now and item.get("conversation") and item.get("ts"):
+                    item["late_context"] = _late_context(since, now, str(item["ts"]))
+                    by_platform[item["platform"]].append(item)
+        except Exception:
+            logger.warning("Missed-message scan failed for %s", name, exc_info=True)
+    for name, records in by_platform.items():
+        records.sort(key=lambda item: (str(item.get("conversation")), float(item.get("ts", 0))))
+        individual, overflow = records[:_MAX_MESSAGES_PER_PLATFORM], records[_MAX_MESSAGES_PER_PLATFORM:]
+        ok = True
+        for item in individual:
+            ok = await _ack_one(db, runner, item, "") and ok
+        grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
+        for item in overflow:
+            grouped[str(item["conversation"])].append(item)
+        for conversation, items in grouped.items():
+            ok = await _post_summary(db, runner, name, conversation, items) and ok
+        if ok:
+            await _set_state(db, _SCAN_KIND, now, name)
+    for name in successful:
+        if name not in by_platform:
+            await _set_state(db, _SCAN_KIND, now, name)
 
 
-async def _post_ack(runner, item: dict[str, Any], text: str) -> None:
-    adapters = getattr(runner, "adapters", {}) or {}
-    adapter = adapters.get(item.get("platform"))
-    if adapter is None:
-        adapter = next((a for p, a in adapters.items() if getattr(p, "value", p) == item.get("platform")), None)
-    if adapter is None:
-        raise RuntimeError("adapter unavailable")
-    result = await adapter.send(
-        str(item["conversation"]), text,
-        reply_to=str(item.get("thread_ts") or item["ts"]),
-        metadata={
-            "thread_id": str(item.get("thread_ts") or item["ts"]),
-            **({"scope_id": str(item["team_id"])} if item.get("team_id") else {}),
-        },
-    )
-    if getattr(result, "success", True) is False:
-        raise RuntimeError(getattr(result, "error", "send failed"))
-
-
-async def start_missed_message_ack(runner) -> None:
-    """Schedule the scan after adapters connect. Startup must not await it."""
+def schedule_missed_message_ack(runner: Any, platform: Any) -> None:
+    """Schedule one platform scan without making adapter publication wait for history."""
     try:
         runner._retain_background_task(asyncio.create_task(
-            run_missed_message_ack(runner), name="missed-message-ack"))
+            run_missed_message_ack(runner, platform=platform), name="missed-message-ack"))
     except Exception:
         logger.warning("Could not start missed-message scan", exc_info=True)
+
+
+async def start_missed_message_ack(runner: Any, *, platform: Any | None = None) -> None:
+    """Schedule recovery after startup or one platform reconnect without blocking either path."""
+    schedule_missed_message_ack(runner, platform)

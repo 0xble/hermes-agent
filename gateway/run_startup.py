@@ -1847,10 +1847,6 @@ class GatewayStartupMixin(GatewayStartupHandoffMixin, GatewayStartupSecretsMixin
         from gateway.run import _planned_restart_notification_pending, _restart_notification_pending
         self._restart_resume_outcomes = set()
         await self._start_post_connect_services(connected_count)
-        # Missed-message acknowledgements are deliberately fire-and-forget: they inspect platform history
-        # and post only a receipt, never dispatching an agent turn or delaying startup.
-        from gateway.missed_message_ack import start_missed_message_ack
-        await start_missed_message_ack(self)
         # Let fresh adapters settle before lifecycle sends (helps Discord thread deliveries).
         if connected_count > 0:
             await asyncio.sleep(1.0)

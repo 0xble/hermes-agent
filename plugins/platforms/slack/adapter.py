@@ -2223,12 +2223,10 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             raise
 
     async def fetch_missed_inbound(self, since: float, until: float) -> list[dict[str, Any]]:
-        """Fetch human DMs and bot mentions from Slack history without waking the agent."""
+        """Fetch human DMs and addressed channel messages for normal late dispatch."""
         if not self._app:
             return []
-        clients = dict(getattr(self, "_team_clients", {}) or {})
-        if not clients:
-            clients = {"": self._app.client}
+        clients = dict(getattr(self, "_team_clients", {}) or {}) or {"": self._app.client}
         records: list[dict[str, Any]] = []
         bot_ids = {str(uid) for uid in (getattr(self, "_team_bot_user_ids", {}) or {}).values() if uid}
         if self._bot_user_id:
@@ -2236,10 +2234,19 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         oldest, latest = str(since), str(until)
         for team_id, client in clients.items():
             try:
-                listed = await client.conversations_list(
-                    types="public_channel,private_channel,im,mpim", limit=200, exclude_archived=True,
-                )
-                channels = (listed or {}).get("channels", [])
+                channels: list[dict[str, Any]] = []
+                cursor = None
+                while True:
+                    kwargs = {"types": "public_channel,private_channel,im,mpim", "limit": 200,
+                              "exclude_archived": True}
+                    if cursor:
+                        kwargs["cursor"] = cursor
+                    list_fn = getattr(client, "users_conversations", None) or client.conversations_list
+                    listed = await list_fn(**kwargs)
+                    channels.extend((listed or {}).get("channels", []))
+                    cursor = str(((listed or {}).get("response_metadata") or {}).get("next_cursor") or "")
+                    if not cursor:
+                        break
                 for channel in channels:
                     channel_id = str(channel.get("id") or "")
                     if not channel_id or (channel.get("is_channel") and not channel.get("is_member", True)):
@@ -2258,31 +2265,47 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                         except (TypeError, ValueError):
                             continue
                         user = str(message.get("user") or "")
-                        if not user or user in bot_ids or message.get("bot_id") or message.get("subtype") in {"bot_message", "me_message"}:
-                            continue
-                        if not is_dm and not any(f"<@{bot_id}>" in str(message.get("text") or "") for bot_id in bot_ids):
+                        if (not user or user in bot_ids or message.get("bot_id")
+                                or message.get("subtype") in {"bot_message", "me_message"}):
                             continue
                         thread_ts = str(message.get("thread_ts") or ts)
-                        # A thread that already contains a bot reply is not a missed message.
+                        mentioned = any(f"<@{bot_id}>" in str(message.get("text") or "") for bot_id in bot_ids)
+                        if not is_dm and not mentioned:
+                            if not message.get("thread_ts") or not await self._should_wake_on_unmentioned_message(
+                                    thread_ts, channel_id, user, True, str(team_id), "group"):
+                                continue
+                        if self._early_reject_unauthorized(user, channel_id, is_dm, thread_id=thread_ts):
+                            continue
                         if message.get("reply_count") or message.get("thread_ts"):
                             replies = await client.conversations_replies(
                                 channel=channel_id, ts=thread_ts, limit=1000, inclusive=True,
                             )
                             if any(
-                                str(reply.get("user") or "") in bot_ids
-                                or reply.get("bot_id")
+                                str(reply.get("user") or "") in bot_ids or reply.get("bot_id")
                                 or reply.get("subtype") in {"bot_message", "me_message"}
                                 for reply in (replies or {}).get("messages", [])[1:]
                             ):
                                 continue
+                        event = {**message, "type": "message", "channel": channel_id,
+                                 "team_id": str(team_id), "channel_type": "im" if is_dm else "channel"}
                         self._remember_channel_team(channel_id, str(team_id))
                         records.append({
                             "platform": "slack", "conversation": channel_id, "ts": ts,
-                            "thread_ts": thread_ts, "team_id": str(team_id),
+                            "thread_ts": thread_ts, "team_id": str(team_id), "event": event,
                         })
             except Exception:
                 logger.warning("[Slack] Missed-message history scan failed for workspace %s", team_id, exc_info=True)
+        records.sort(key=lambda item: float(item["ts"]))
         return records
+
+    async def dispatch_missed_inbound(self, item: dict[str, Any]) -> None:
+        """Re-enter the existing Slack event path for late messages."""
+        event = dict(item.get("event") or {})
+        if not event:
+            raise ValueError("missed inbound record has no Slack event")
+        event["text"] = str(item.get("late_context") or "") + str(event.get("text") or "")
+        event["_hermes_missed_inbound"] = True
+        await self._handle_slack_message(event)
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
