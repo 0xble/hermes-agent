@@ -2190,14 +2190,11 @@ DEFAULT_CONFIG = {
     # Native hosted-room Discussion ceilings, shared by all members per discussion.
     # Positive integers only (no unlimited/0). Read from the root owner's config at service
     # startup for all hosted rooms; restart the owning service after changing them.
-    "hosted_rooms": {
-        "discussion": {
-            "max_rounds": 3,
-            "max_messages": 10,
-        },
-    },
+    "hosted_rooms": {"discussion": {"max_rounds": 3, "max_messages": 10}},
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "zero_cut_handover": {"enabled": False},
+        # Answer messages that arrived while a platform was disconnected (Slack DMs and @-mentions).
+        "missed_inbound_recovery": {"enabled": True},
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
         "guardian": {
             "enabled": False,

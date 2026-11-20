@@ -19,19 +19,10 @@ from gateway.shutdown_watchdog import (
     DEFAULT_LOOP_WATCHDOG_MAX_STRIKES,
     DEFAULT_LOOP_WATCHDOG_TIMEOUT_S,
 )
+from hermes_state_guard import _in_test_context
 from utils import fast_safe_load, is_truthy_value
 
 logger = logging.getLogger(__name__)
-
-
-def _test_mode() -> bool:
-    return bool(
-        os.environ.get("PYTEST_CURRENT_TEST")
-        or os.environ.get("PYTEST_VERSION")
-        or os.environ.get("HERMES_TEST_ISOLATION")
-        or os.environ.get("EVAL_MODE")
-        or os.environ.get("HERMES_EVAL")
-    )
 
 _TRUTHY_STRINGS = frozenset({"1", "true", "yes", "on"})
 _FALSY_STRINGS = frozenset({"0", "false", "no", "off"})
@@ -51,6 +42,11 @@ def _coerce_bool(value: Any, default: bool = True) -> bool:
         parsed = _bool_token(value)
         return default if parsed is None else parsed
     return is_truthy_value(value, default=default)
+
+
+def _missed_inbound_recovery_default() -> bool:
+    """On for a real gateway; off under a test run, which must never replay platform history."""
+    return not _in_test_context()
 
 
 def normalize_telegram_rich_messages(value: Any) -> str:
@@ -722,13 +718,8 @@ class GatewayConfig:
     durable_outbox_enabled: bool = False  # gateway.durable_outbox.enabled, opt-in
     durable_outbox_retention_days: int = 7
     zero_cut_handover_enabled: bool = False  # gateway.zero_cut_handover.enabled, opt-in
-    # A real gateway acknowledges human inbound messages found after a restart; test/eval environments
-    # leave this off by default so mocked histories never produce outbound traffic.
-    missed_inbound_recovery_enabled: bool = True
-
-    @property
-    def missed_inbound_recovery(self) -> dict[str, Any]:
-        return {"enabled": self.missed_inbound_recovery_enabled}
+    # gateway.missed_inbound_recovery.enabled: answer messages missed while a platform was offline.
+    missed_inbound_recovery_enabled: bool = field(default_factory=_missed_inbound_recovery_default)
 
     # Scalar fields serialized verbatim by ``to_dict`` (in output order).
     _SCALAR_DICT_FIELDS = (
@@ -793,7 +784,7 @@ class GatewayConfig:
             "durable_outbox": {"enabled": self.durable_outbox_enabled,
                                "retention_days": self.durable_outbox_retention_days},
             "zero_cut_handover": {"enabled": self.zero_cut_handover_enabled},
-            "missed_inbound_recovery": self.missed_inbound_recovery,
+            "missed_inbound_recovery": {"enabled": self.missed_inbound_recovery_enabled},
             "profile_routes": [
                 {k: v for k, v in asdict(r).items() if k != "user_id" or v is not None}
                 if is_dataclass(r) and not isinstance(r, type) else r
@@ -894,8 +885,6 @@ class GatewayConfig:
             raise ValueError("gateway.durable_outbox.enabled must be a boolean")
         retention = validate_outbox_retention_days(outbox.get("retention_days", 7))
         zero_cut_handover = _coerce_dict(pick("zero_cut_handover"))
-        missed_recovery = _coerce_dict(pick("missed_inbound_recovery"))
-        missed_recovery_enabled = _coerce_bool(missed_recovery.get("enabled"), not _test_mode())
 
         return cls(
             platforms=by_platform("platforms", PlatformConfig.from_dict, dicts_only=True),
@@ -926,7 +915,8 @@ class GatewayConfig:
             durable_outbox_enabled=outbox.get("enabled", False),
             durable_outbox_retention_days=retention,
             zero_cut_handover_enabled=_coerce_bool(zero_cut_handover.get("enabled"), False),
-            missed_inbound_recovery_enabled=missed_recovery_enabled,
+            missed_inbound_recovery_enabled=_coerce_bool(
+                _coerce_dict(pick("missed_inbound_recovery")).get("enabled"), _missed_inbound_recovery_default()),
         )
 
     def _extra_choice(self, platform: Optional[Platform], key: str, choices: set, default: str) -> Optional[str]:

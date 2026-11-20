@@ -1003,9 +1003,11 @@ def _is_transient_transport_error(e: BaseException) -> bool:
 
 from plugins.platforms.slack.adapter_thread_titles import SlackThreadTitlesMixin
 from plugins.platforms.slack.adapter_thread_status import SlackThreadStatusMixin
+from plugins.platforms.slack.adapter_missed_inbound import SlackMissedInboundMixin
 
 
-class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitlesMixin, BasePlatformAdapter):
+class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitlesMixin,
+                   SlackMissedInboundMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1326,6 +1328,7 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             await self._stop_socket_mode_handler()
             try:
                 self._start_socket_mode_handler()
+                self._missed_inbound_transport_restarted()
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error("[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True)
 
@@ -2221,91 +2224,6 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                     "[Slack] Block Kit payload rejected; retrying %s without blocks: %s", verb, e)
                 return await getattr(client_fn(), method)(**retry_kwargs)
             raise
-
-    async def fetch_missed_inbound(self, since: float, until: float) -> list[dict[str, Any]]:
-        """Fetch human DMs and addressed channel messages for normal late dispatch."""
-        if not self._app:
-            return []
-        clients = dict(getattr(self, "_team_clients", {}) or {}) or {"": self._app.client}
-        records: list[dict[str, Any]] = []
-        bot_ids = {str(uid) for uid in (getattr(self, "_team_bot_user_ids", {}) or {}).values() if uid}
-        if self._bot_user_id:
-            bot_ids.add(str(self._bot_user_id))
-        oldest, latest = str(since), str(until)
-        for team_id, client in clients.items():
-            try:
-                channels: list[dict[str, Any]] = []
-                cursor = None
-                while True:
-                    kwargs = {"types": "public_channel,private_channel,im,mpim", "limit": 200,
-                              "exclude_archived": True}
-                    if cursor:
-                        kwargs["cursor"] = cursor
-                    list_fn = getattr(client, "users_conversations", None) or client.conversations_list
-                    listed = await list_fn(**kwargs)
-                    channels.extend((listed or {}).get("channels", []))
-                    cursor = str(((listed or {}).get("response_metadata") or {}).get("next_cursor") or "")
-                    if not cursor:
-                        break
-                for channel in channels:
-                    channel_id = str(channel.get("id") or "")
-                    if not channel_id or (channel.get("is_channel") and not channel.get("is_member", True)):
-                        continue
-                    is_dm = bool(channel.get("is_im") or channel.get("is_mpim") or channel_id.startswith(("D", "G")))
-                    history = await client.conversations_history(
-                        channel=channel_id, oldest=oldest, latest=latest, inclusive=True, limit=1000,
-                    )
-                    for message in (history or {}).get("messages", []):
-                        ts = str(message.get("ts") or "")
-                        if not ts:
-                            continue
-                        try:
-                            if not float(since) <= float(ts) <= float(until):
-                                continue
-                        except (TypeError, ValueError):
-                            continue
-                        user = str(message.get("user") or "")
-                        if (not user or user in bot_ids or message.get("bot_id")
-                                or message.get("subtype") in {"bot_message", "me_message"}):
-                            continue
-                        thread_ts = str(message.get("thread_ts") or ts)
-                        mentioned = any(f"<@{bot_id}>" in str(message.get("text") or "") for bot_id in bot_ids)
-                        if not is_dm and not mentioned:
-                            if not message.get("thread_ts") or not await self._should_wake_on_unmentioned_message(
-                                    thread_ts, channel_id, user, True, str(team_id), "group"):
-                                continue
-                        if self._early_reject_unauthorized(user, channel_id, is_dm, thread_id=thread_ts):
-                            continue
-                        if message.get("reply_count") or message.get("thread_ts"):
-                            replies = await client.conversations_replies(
-                                channel=channel_id, ts=thread_ts, limit=1000, inclusive=True,
-                            )
-                            if any(
-                                str(reply.get("user") or "") in bot_ids or reply.get("bot_id")
-                                or reply.get("subtype") in {"bot_message", "me_message"}
-                                for reply in (replies or {}).get("messages", [])[1:]
-                            ):
-                                continue
-                        event = {**message, "type": "message", "channel": channel_id,
-                                 "team_id": str(team_id), "channel_type": "im" if is_dm else "channel"}
-                        self._remember_channel_team(channel_id, str(team_id))
-                        records.append({
-                            "platform": "slack", "conversation": channel_id, "ts": ts,
-                            "thread_ts": thread_ts, "team_id": str(team_id), "event": event,
-                        })
-            except Exception:
-                logger.warning("[Slack] Missed-message history scan failed for workspace %s", team_id, exc_info=True)
-        records.sort(key=lambda item: float(item["ts"]))
-        return records
-
-    async def dispatch_missed_inbound(self, item: dict[str, Any]) -> None:
-        """Re-enter the existing Slack event path for late messages."""
-        event = dict(item.get("event") or {})
-        if not event:
-            raise ValueError("missed inbound record has no Slack event")
-        event["text"] = str(item.get("late_context") or "") + str(event.get("text") or "")
-        event["_hermes_missed_inbound"] = True
-        await self._handle_slack_message(event)
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
@@ -4320,13 +4238,11 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             if normalized_event is None:
                 return None
             event = normalized_event
-        # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
-        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777) Scope the dedup id by
-        # workspace: Slack event ts values are only unique within one workspace, so two teams' events with
-        # the same ts must not suppress each other.
+        # Socket Mode redelivers after reconnects (#4777). Scope by workspace: ts is only unique per team.
         event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
         dedup_team_id = self._event_team_id(event, payload)
-        if event_ts and self._dedup.is_duplicate(self._workspace_event_id(dedup_team_id, event_ts)):
+        if self._is_recovered_replay(event) or (
+                event_ts and self._dedup.is_duplicate(self._workspace_event_id(dedup_team_id, event_ts))):
             return None
         channel_id = event.get("channel", "")
         if self._is_ignored_channel(channel_id):
@@ -4478,9 +4394,8 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         # ts, so only the `_processed_message_ts` guard stops a duplicate turn, and it must be set
         # before the slow enrichment awaits. Claiming before the filters would let an ignored
         # original block a later "@bot" edit from summoning the bot.
-        _claim_ts = str(event.get("ts") or "")
-        if _claim_ts:
-            self._remember_processed_message_ts(_claim_ts)
+        self._remember_processed_message_ts(str(event.get("ts") or ""))
+        self._note_live_inbound(event, channel_id)
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
@@ -4515,8 +4430,8 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             msg_event.text = (
                 f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
                 f"{msg_event.text}")
-        if ts:
-            self._remember_processed_message_ts(ts)
+        self._remember_processed_message_ts(ts)
+        self._apply_late_note(event, msg_event)
         await self.handle_message(msg_event)
 
     async def _build_message_event(
