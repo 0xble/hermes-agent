@@ -79,6 +79,17 @@ def test_alias_without_a_chain_never_borrows_the_delegation_chain(cfg):
                                              {"fallback_providers": [{"provider": "x", "model": "y"}]}, _parent())
     assert route.routing_cfg["fallback_providers"] == []
     assert route.reasoning_effort == "high"  # the alias's own default effort
+    assert (route.creds["model"], route.creds["provider"]) == ("gpt-6.2-astra", "custom:openai-proxy")
+
+
+def test_model_section_alias_keeps_its_own_fallback_chain(cfg):
+    chain = [{"provider": "custom:b", "model": "m-1"}]
+    cfg["model"] = {"provider": "custom:a", "aliases": {"quick": {"model": "m-1", "fallback_providers": chain}}}
+    assert "quick" in _task_props()["model"]["enum"]
+    (route,), err = routes.resolve_task_routes([{"goal": "g", "model": "quick"}], {}, _parent())
+    assert err is None and route.error is None
+    assert (route.creds["model"], route.creds["provider"]) == ("m-1", "custom:a")
+    assert route.routing_cfg["fallback_providers"] == chain
 
 
 def test_explicit_effort_beats_alias_role_and_parent_defaults(cfg):

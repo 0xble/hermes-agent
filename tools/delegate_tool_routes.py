@@ -161,9 +161,24 @@ def _alias_route(index: int, task: Mapping[str, Any]) -> Optional[dict[str, Any]
         known = f"Use one of: {', '.join(names)}" if names else "No model aliases are configured"
         raise DelegationRouteError(f"Task {index}: unknown model alias {alias!r}. {known} "
                                    f"(model_aliases in config.yaml).")
-    entry = next((v for k, v in (full.get("model_aliases") or {}).items() if str(k).strip().lower() == key), None)
+    entry = _alias_entry(full, key)
     chain = entry.get("fallback_providers") if isinstance(entry, Mapping) else None
+    # The bare alias key is the route's model: `_resolve_route` expands it, as for any stored alias, into the
+    # entry's live model, provider, endpoint and default reasoning_effort.
     return {"model": key, "label": key, "fallback_providers": list(chain) if isinstance(chain, list) else []}
+
+
+def _alias_entry(full_config: Mapping[str, Any], key: str) -> Optional[Mapping[str, Any]]:
+    """The alias's own config entry, from the surface ``/model`` reads it from: ``model_aliases`` first, then
+    dict-shaped ``model.aliases`` (a string entry there carries no fallback chain)."""
+    model_section = full_config.get("model")
+    for section in (full_config.get("model_aliases"),
+                    model_section.get("aliases") if isinstance(model_section, Mapping) else None):
+        if isinstance(section, Mapping):
+            entry = next((v for k, v in section.items() if str(k).strip().lower() == key), None)
+            if isinstance(entry, Mapping):
+                return entry
+    return None
 
 
 def _param_error(index: int, name: str, value: Any, schema: Mapping[str, Any]) -> Optional[str]:
