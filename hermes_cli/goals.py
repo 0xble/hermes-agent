@@ -54,7 +54,7 @@ from hermes_cli.goal_evidence import (
 from hermes_cli.goals_revisions import GoalRevisionsMixin
 from hermes_cli.goals_autonomy import (
     AUTONOMY_CONTINUATION_TEMPLATE, GoalAutonomyMixin, goal_autonomy_enabled, migrate_autonomous_goal,
-    autonomous_verdict,
+    autonomous_verdict, retire_goal,
 )
 from hermes_cli.goals_status import GoalStatusMixin
 from hermes_cli.goals_peers import GoalPeersMixin, parse_pending_peers, validate_peer_completion
@@ -3070,10 +3070,10 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             return False
 
     @snapshot_control
-    def clear(self) -> None:
+    def clear(self, *, reason: str = "", actor: str = "user", authority: str = "") -> None:
         def _apply(state):
             if state is not None:
-                state.status = "cleared"
+                retire_goal(state, reason, actor, authority)
         self._mutate_current(_apply, discard_corrupt=True)
         if self._state is not None:
             self._cleared_instance = self._state.created_at

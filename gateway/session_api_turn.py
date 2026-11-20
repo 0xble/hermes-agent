@@ -46,9 +46,14 @@ def api_settings(authority, ref):
 
 
 def check_api_turn(authority, ref, payload):
-    live = authority.sessions[ref.session_id]
-    if live.source.platform == Platform.API_SERVER:
+    live = authority.sessions.get(ref.session_id)
+    if live is None or live.source.platform == Platform.API_SERVER:
+        # Startup recovery and session reaping can race the off-loop binding restore. Reconcile
+        # the durable API receipt once more before treating the request as a missing session.
         restore_api_session(authority, ref.session_id)
+        live = authority.sessions.get(ref.session_id)
+    if live is None:
+        raise RuntimeStoreError('runtime_draining')
     adapter = authority.runner._adapter_for_source(live.source)
     if adapter is None or getattr(adapter, 'gateway_runner', None) is not authority.runner:
         raise RuntimeStoreError('runtime_draining')
@@ -265,7 +270,7 @@ def _admit_api_payload(authority, adapter, sid, request_id, payload, settings, d
         return authority, SessionRef(authority.profile_id, sid), row
     ref = yield from bind_api_steps(authority, sid, hosted_dispatch=kwargs.get("room_dispatch"), declared_key=declared_key,
                                     caller_key=kwargs.get('gateway_session_key'), walked_from=kwargs.get('walked_from'))
-    check_api_turn(authority, ref, payload)
+    yield partial(check_api_turn, authority, ref, payload)
     row = yield partial(admit_session_input, authority.db, epoch=authority.epoch, principal_id='api',
                         session_id=sid, request_id=request_id, payload=payload,
                         _authorize_write=authority._admission_gate(partial(
@@ -623,4 +628,8 @@ def prepare_api_runtime(model, runtime_kwargs):
         route=route, session_model=options.get('session_model'),
         confirmed_runtime_lock=bool(options.get('confirmed_runtime_lock')),
         gateway_session_key=None, session_id=None)
+    if (options.get('requested_model') or route or options.get('session_model')
+            or (options.get('session_override') or {}).get('model')):
+        runtime_kwargs['model_pinned'] = True
+        runtime_kwargs.pop('_preflight_fallback', None)
     return model, runtime_kwargs

@@ -3963,7 +3963,7 @@ def test_session_resume_passes_stored_runtime_to_agent(monkeypatch):
         "model": "gpt-5.4",
         "provider": "openai-codex",
         "base_url": "https://custom.example/v1",
-        "api_mode": "chat_completions",
+        "api_mode": "chat_completions", "_model_pinned": False,
     }
     assert captured["provider_override"] == "openai-codex"
     assert captured["reasoning_config_override"] == {"enabled": True, "effort": "high"}
@@ -10522,7 +10522,7 @@ def test_config_set_model_recovers_failed_profile_resume_after_build_completes(
                     "provider": "custom:new-provider",
                     "base_url": profile_url,
                     "api_mode": "chat_completions",
-                    "reasoning_config": reasoning,
+                    "reasoning_config": reasoning, "model_pinned": True,
                 },
             }
         ]
@@ -20020,67 +20020,6 @@ class TestResolveRuntimeWithFallback:
         assert resolution.runtime == fallback_runtime
         assert resolution.selected_model == "claude-sonnet-4-6"
         assert resolution.used_fallback is True
-
-    def test_make_agent_uses_fallback_on_auth_error(self, monkeypatch):
-        """Integration: _make_agent falls back to configured fallback
-        provider when the primary provider raises AuthError."""
-        import types
-
-        from hermes_cli.auth import AuthError
-
-        captured = {}
-        fallback_runtime = {
-            "provider": "deepseek",
-            "api_key": "fb-tok",
-            "base_url": "https://fallback.invalid/v1",
-        }
-
-        def fake_resolve(**kwargs):
-            if kwargs.get("requested") in (None, "openai-codex"):
-                raise AuthError("No Codex credentials stored")
-            return fallback_runtime
-
-        def fake_agent(**kwargs):
-            captured.update(kwargs)
-            return types.SimpleNamespace(model=kwargs.get("model"))
-
-        monkeypatch.delenv("HERMES_MODEL", raising=False)
-        monkeypatch.delenv("HERMES_INFERENCE_MODEL", raising=False)
-        monkeypatch.delenv("HERMES_TUI_PROVIDER", raising=False)
-        monkeypatch.setattr(
-            server,
-            "_load_cfg",
-            lambda: {
-                "model": {"default": "gpt-5.5", "provider": "openai-codex"},
-                "fallback_providers": [
-                    {"provider": "deepseek", "model": "deepseek-v4-pro"},
-                ],
-            },
-        )
-        monkeypatch.setattr(
-            "hermes_cli.runtime_provider.resolve_runtime_provider",
-            fake_resolve,
-        )
-        monkeypatch.setattr("run_agent.AIAgent", fake_agent)
-        monkeypatch.setattr(server, "_load_enabled_toolsets", lambda *_a, **_kw: ["file"])
-        monkeypatch.setattr(server, "_get_db", lambda: None)
-
-        agent = server._make_agent(
-            "sid",
-            "session-key",
-            model_override={
-                "model": "gpt-5.5",
-                "provider": "openai-codex",
-                "base_url": "https://chatgpt.com/backend-api/codex",
-                "api_key": "stale-codex-token",
-            },
-        )
-
-        assert agent.model == "deepseek-v4-pro"
-        assert captured["provider"] == "deepseek"
-        assert captured["base_url"] == "https://fallback.invalid/v1"
-        assert captured["api_key"] == "fb-tok"
-
 
 def test_get_usage_does_not_substitute_cumulative_total_for_context_used():
     """An external context engine that does not report last_prompt_tokens must

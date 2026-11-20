@@ -99,11 +99,19 @@ class GatewayTurnPersistenceMixin:
             # the human-turn notice. Live delivery must stay silent rather than become an error.
             logger.warning("Could not record the room silence decision for %s", session_key, exc_info=True)
 
+    async def _loop_completion_reply(self, session_entry, loop_identity, response) -> str:
+        if loop_identity is None or session_entry is None:
+            return ""
+        from gateway.loop_completion import complete_loop_response
+        return await self._run_in_executor_with_context(
+            complete_loop_response, session_entry.session_id, loop_identity, response)
+
     async def _hmwa_shape_agent_response(
         self, agent_result, source, history, session_entry, session_key,
         _quick_key, run_generation, _run_start_session_id, _platform_name, _msg_start_time,
         persist_user_display_kind: Optional[str] = None,
         reply_expected: Optional[bool] = None,
+        loop_identity: Optional[tuple] = None,
     ):
         """Turn the raw agent result into the outbound text: sentinel/silence handling, response
         logging, resume-pending clear, empty-response normalization, and identity-guarded
@@ -139,7 +147,10 @@ class GatewayTurnPersistenceMixin:
                 _platform_name, source.chat_id or "unknown",
             )
             _intentional_silence = False
-            response = _unexpected_silence_reply()
+            # ``[SILENT]`` plus LOOP_COMPLETE finishes the loop this turn observed. That notice is
+            # the turn's one reply; the post-turn hook then finds the loop already stopped.
+            response = await self._loop_completion_reply(session_entry, loop_identity, response) \
+                or _unexpected_silence_reply()
         elif _intentional_silence and not is_machinery_display_kind(_silence_kind):
             logger.debug(
                 "silence marker suppressed on an unaddressed or opted-in turn: platform=%s chat=%s",

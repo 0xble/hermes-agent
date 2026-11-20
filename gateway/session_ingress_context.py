@@ -142,7 +142,10 @@ def _registry_candidates(runner, platform):
 
 
 def _slot_adapter(candidates, profile):
-    return next((adapter for owner, adapter in candidates if owner == profile), None)
+    # The primary adapter is registered under ``None`` while durable routing
+    # records spell its transport profile as ``default``.
+    lookup_profile = None if profile == 'default' else profile
+    return next((adapter for owner, adapter in candidates if owner == lookup_profile), None)
 
 
 # A platform adapter leaves its registry slot when it goes fatal and returns when the reconnect
@@ -186,7 +189,8 @@ def _binding(runner, source, profile):
     adapter = _slot_adapter(candidates, profile)
     if adapter is None or sum(item is adapter for _, item in candidates) != 1:
         raise RuntimeStoreError('not_found')
-    home = getattr(runner, '_native_transport_homes', {}).get(profile)
+    home = getattr(runner, '_native_transport_homes', {}).get(
+        None if profile == 'default' else profile)
     if home is None or not home.is_dir():
         raise RuntimeStoreError('profile_mismatch')
     runtime_home = home
@@ -260,6 +264,19 @@ def capture_provenance(runner, event):
         owner = (adapter, context[3])
     else:
         owner = runner._transport_owner(event.source)
+        if owner is None:
+            # The callback has already authenticated this event and _binding has resolved the
+            # currently registered adapter for the callback's profile and home.  A source carried
+            # across an adapter reconnect can retain a dead weak reference, though, which makes
+            # _transport_owner return None even while the authenticated callback is live.  Rebind
+            # only an absent/dead reference.  A live reference to another adapter remains a hard
+            # failure so a swapped or forged source cannot borrow the current callback's route.
+            adapter_ref = getattr(event.source, '_transport_adapter_ref', None)
+            prior_adapter = adapter_ref() if callable(adapter_ref) else None
+            if prior_adapter is not None:
+                raise RuntimeStoreError('not_found')
+            event.source._transport_adapter_ref = weakref.ref(adapter)
+            owner = runner._transport_owner(event.source)
     if owner is None or owner[0] is not adapter or home != context[2]:
         raise RuntimeStoreError('not_found')
     return provenance
@@ -272,8 +289,30 @@ def restore_provenance(runner, source, provenance):
     candidate = copy(source)
     candidate.delivered_via_upstream_relay = 'relay' in provenance
     adapter, home, runtime_home, expected = _binding(runner, candidate, provenance.get('transport_profile'))
+    # Before multiplexing, primary native envelopes had no transport_profile field.  The
+    # current primary binding spells the same slot as ``None`` (and some durable route
+    # records spell it ``default``).  Accept that legacy omission only after _binding has
+    # proved this is the primary home.  Named secondary profiles keep exact provenance
+    # equality so a missing field cannot cross a profile boundary.
     if provenance != expected:
-        raise RuntimeStoreError('profile_mismatch')
+        stored_profile = provenance.get('transport_profile')
+        expected_profile = expected.get('transport_profile')
+        primary_profile_equivalent = (
+            stored_profile in (None, 'default')
+            and expected_profile in (None, 'default')
+            and (stored_profile is None or 'transport_profile' not in provenance)
+            and (expected_profile is None or candidate.profile in (None, 'default')))
+        if primary_profile_equivalent:
+            stored_without_profile = {
+                key: value for key, value in provenance.items() if key != 'transport_profile'}
+            expected_without_profile = {
+                key: value for key, value in expected.items() if key != 'transport_profile'}
+            if stored_without_profile == expected_without_profile:
+                provenance = expected
+            else:
+                raise RuntimeStoreError('profile_mismatch')
+        else:
+            raise RuntimeStoreError('profile_mismatch')
     source.delivered_via_upstream_relay = candidate.delivered_via_upstream_relay
     source._transport_adapter_ref = weakref.ref(adapter)
     # Re-pin the identity ingress resolved: the drained turn's route records the receiving bot from it

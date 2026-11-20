@@ -44,3 +44,5 @@ Retire when the accepted upstream release implements the listener and subscripti
 and these regressions pass without the fork adaptation. Revert the patch to roll
 back code. The event subscription may remain enabled, but cancellation will no
 longer work until a listener is restored. No data migration is required.
+
+Contract tests: `tests/gateway/test_slack.py`, `tests/gateway/test_slack_native_stop.py`, `tests/gateway/test_stop_chat_scope.py`, `tests/gateway/test_stop_pauses_goal_and_holds_wakes.py`, `tests/hermes_cli/test_slack_cli.py`.

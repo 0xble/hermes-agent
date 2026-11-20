@@ -4,6 +4,7 @@ import logging
 from contextvars import ContextVar
 from contextlib import asynccontextmanager, nullcontext
 from dataclasses import replace
+from functools import partial
 
 from gateway.platforms.event import MessageEvent, ProcessingOutcome
 from gateway.session_envelope import restore_native
@@ -92,8 +93,9 @@ async def admit_message(authority, event):
             del authority.waiters[receipt.admission_id]
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
-        return (None if status == 'terminal' or internal_input(event)
-                else pause_notice(authority, receipt.ref, 'unknown_execution'))
+        if status == 'terminal' or internal_input(event):
+            return None
+        return await _pause_reply(authority, receipt.ref, 'unknown_execution', event)
     if accepted is not None and not accepted.done():
         accepted.set_result(None)
     try:
@@ -109,7 +111,7 @@ async def admit_message(authority, event):
                     'queued for moved, so it was dropped. Send it again to continue.')
         if row is not None:
             note_busy_parked(event)  # still queued (saved): answered after the pause, not dropped
-        return pause_notice(authority, receipt.ref, exc.reason)
+        return await _pause_reply(authority, receipt.ref, exc.reason, event)
     finally:
         if adopters.get(receipt.admission_id) is event:
             del adopters[receipt.admission_id]
@@ -315,14 +317,47 @@ async def _release_turn_marker(authority, event):
         await authority.runner._clear_durable_active_turn(event)
 
 
-def pause_notice(authority, ref, reason):
+async def _pause_reply(authority, ref, reason, event):
+    """``pause_notice`` for ``event``'s reply, once any unprompted notice already being sent to the
+    chat has its outcome: delivered, this reply stays silent; failed, this reply carries it."""
+    from gateway.session_pause_announce import await_announcement_send
+    await await_announcement_send(authority, ref)
+    if ref.session_id not in authority.sessions:
+        return None  # retired while the announcement was sending (a /reset): no pause left to tell
+    return pause_notice(authority, ref, reason, event=event)
+
+
+def settle_pause_notice(event, delivered):
+    """The sender of ``event``'s reply reports whether the ``pause_notice`` it carried reached the
+    chat. Delivered: a lost turn's episode is recorded as told for later boots
+    (``session_pause_announce``). Not delivered: the episode is left untold, so the next message
+    (or the next boot's announcement) carries it instead of the pause staying silent."""
+    claim = getattr(event, '_pause_notice_claim', None)
+    if claim is None:
+        return
+    event._pause_notice_claim = None
+    authority, ref, live, reason = claim
+    if not delivered:
+        if authority.sessions.get(ref.session_id) is live:
+            live.pause_notified = False
+        return
+    if reason == 'unknown_execution':
+        from gateway.session_pause_announce import schedule_remember_told
+        schedule_remember_told(authority, ref)
+
+
+def pause_notice(authority, ref, reason, *, event=None):
     """The committed input stays queued behind a paused FIFO (a turn lost across an owner
     restart, or a head the preflight refused). Tell the platform user once per pause episode
-    through the ordinary reply path; later messages onto the same pause are admitted silently."""
+    through the ordinary reply path; later messages onto the same pause are admitted silently.
+    ``event``: the message whose reply carries the notice. The claim rides it until its sender
+    reports the send (``settle_pause_notice``); the unprompted announcement settles its own."""
     live = authority.sessions[ref.session_id]
     if live.pause_notified:
         return None
     live.pause_notified = True
+    if event is not None:
+        event._pause_notice_claim = (authority, ref, live, reason)
     if reason == 'runtime_draining':
         # Transient: the row runs when the restarted owner drains it, so /reset would be wrong advice.
         return '⏳ Hermes is restarting — your message is saved and will be answered when it is back.'
@@ -486,7 +521,8 @@ async def execute_admission(authority, ref, row):
         async with _admission_scope(authority, home, row, event, captured):
             if is_api:
                 # Committed media resolves under the owning profile's home, like admission did.
-                prepared = prepare_api_execution(authority, ref, row['payload'])
+                from gateway.session_runtime_workers import tracked_write
+                prepared = await tracked_write(authority, partial(prepare_api_execution, authority, ref, row['payload']))
                 api_execution.set(prepared)
                 if isinstance(event.text, list):
                     # The durable transcript keeps the committed media references (the same
@@ -496,6 +532,8 @@ async def execute_admission(authority, ref, row):
                 event.internal = True  # trust comes from the private binding and preclaim, never client JSON
             response = await _handle_compression_deferred_admission(authority, ref, row, event, captured)
             result = captured.get('terminal_result', captured.get('result'))
+            from gateway.session_automation_retry import defer_claimed_refusal
+            await defer_claimed_refusal(authority, ref, row, result)
             if result is None:
                 # No TurnRunner result means the handler answered without executing the turn.
                 # A turn that never ran because it failed (agent initialization raised, history

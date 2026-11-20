@@ -2917,79 +2917,6 @@ def mark_job_run(
     return _under_fire_fence(job_id, locked)
 
 
-def _write_oneshot_diagnostic(job: dict[str, Any], text: str, what: str) -> bool:
-    """Durably queue the owner failure before retirement; save the local trace best-effort."""
-    from cron.oneshot_retirement import queue_retirement_alert
-    queue_retirement_alert(job, text, what, now=_hermes_now())
-    try:
-        save_job_output(job.get("id", ""), text)
-        return True
-    except Exception as e:
-        logger.debug("Failed to write %s diagnostic for job %r: %s", what, job.get("id"), e)
-        return False
-
-
-def _write_wedged_oneshot_diagnostic(job: dict[str, Any]) -> None:
-    """Trace for a wedged one-shot removal: dispatch was claimed but mark_job_run never ran
-    (interrupted mid-run); removing it silently would leave no output, error, or record.
-
-    A spent dispatch without a current-arm completion may have partial effects. Leave an alert
-    and local trace when recovery retires it, rather than replaying it (#73973).
-    """
-    from cron.jobs_oneshot import occurrence_finished, occurrence_started
-
-    if not occurrence_started(job) or occurrence_finished(job):
-        return  # Only a current-arm interrupted dispatch needs a partial-effects warning.
-    repeat = job.get("repeat") or {}
-    claim = job.get("run_claim") or {}
-    written = _write_oneshot_diagnostic(
-        job,
-        "# Cron job removed without producing output\n\n"
-        f"- job id: {job.get('id')}\n"
-        f"- name: {job.get('name')}\n"
-        f"- dispatch claimed: {repeat.get('completed', '?')}/{repeat.get('times', '?')}\n"
-        f"- run claimed at: {claim.get('at', 'unknown')} by {claim.get('by', 'unknown')}\n"
-        f"- removed at: {_hermes_now().isoformat()}\n\n"
-        "This one-shot job's dispatch was claimed, but the run never "
-        "completed for this occurrence (no current completion stamp) — the scheduler "
-        "process was most likely killed or restarted mid-execution. The "
-        "job has been removed to stop it re-firing; recreate it to run "
-        "again.\n",
-        "wedged-oneshot")
-    if written:
-        logger.warning(
-            "Job '%s': removed without a completed run — diagnostic written to "
-            "its output directory",
-            job.get("name", job.get("id", "?")))
-
-
-def _write_retired_oneshot_diagnostic(
-    job: dict[str, Any], next_run: str, *, dispatch_limit: bool = False,
-) -> None:
-    """Route both retirement gates through the same interrupted-versus-unrun diagnostic."""
-    from cron.jobs_oneshot import occurrence_finished, occurrence_started
-
-    if occurrence_started(job) and not occurrence_finished(job):
-        # A consumed, unfinished dispatch may already have side effects.
-        _write_wedged_oneshot_diagnostic(job)
-        return
-    seconds = oneshot_grace_seconds(job)
-    grace = int(seconds) if seconds.is_integer() else seconds
-    reason = "dispatch limit reached" if dispatch_limit else "run time outside grace window"
-    _write_oneshot_diagnostic(
-        job,
-        f"# Cron job removed before firing ({reason})\n\n"
-        f"- job id: {job.get('id')}\n"
-        f"- name: {job.get('name')}\n"
-        f"- scheduled run time: {next_run}\n"
-        f"- grace window: {grace}s\n"
-        f"- removed at: {_hermes_now().isoformat()}\n\n"
-        f"This one-shot was removed without running: {reason}. "
-        "A re-armed record may have consumed its dispatch budget on a prior run. "
-        "Recreate it (or use the Run button) to schedule it again.\n",
-        "missed-oneshot")
-
-
 def claim_dispatch(job_id: str) -> bool:
     """Atomically claim a finite one-shot dispatch BEFORE execution: ``repeat.completed`` is bumped
     and persisted under the jobs lock so a tick dying mid-execution cannot lose the dispatch
@@ -3642,10 +3569,12 @@ def _oneshot_dispatch_limit_reached(job: dict[str, Any], scan: _DueScan) -> bool
 
 
 def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str]:
-    """Put an occurrence the dispatcher advanced past but never claimed back on the schedule
-    (#107485); returns the restored ``next_run_at`` or None. Restored ONCE: the stamp is dropped
-    here, so the slot then meets the ordinary late / fast-forward / ``cron.catch_up_missed``
-    policy like any other overdue instant — never a replay of every missed slot."""
+    """Evaluate the exact unclaimed occurrence without consuming its durable stamp.
+
+    The scan replaces the stamp when it offers this occurrence again, or clears it
+    when deduplication or miss policy consumes it. An interrupted scan leaves the
+    original stamp recoverable by the next scheduler, not a replay of a backlog.
+    """
     from cron.occurrences import unclaimed_pending_slot
 
     slot = unclaimed_pending_slot(job, scan.now)
@@ -3656,10 +3585,6 @@ def _restore_unclaimed_slot(job: dict[str, Any], scan: _DueScan) -> Optional[str
         "(scheduler stopped before dispatch); restoring it as the due instant (was %s).",
         job.get("name", job.get("id")), job.get("id"), slot, job.get("next_run_at"))
     job["next_run_at"] = slot
-    job.pop("pending_slot", None)
-    rj = scan.find(job["id"])
-    if rj is not None:
-        rj.pop("pending_slot", None)
     scan.persist(job["id"], next_run_at=slot)
     return slot
 
@@ -3679,7 +3604,8 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     ):
         return False
 
-    next_run = _restore_unclaimed_slot(job, scan) or job.get("next_run_at") or _recover_missing_next_run(job, scan)
+    restored_slot = _restore_unclaimed_slot(job, scan)
+    next_run = restored_slot or job.get("next_run_at") or _recover_missing_next_run(job, scan)
     if not next_run:
         return False
     # A pinned job's stored instant must be normalized into ITS zone: the cron repair and
@@ -3697,17 +3623,22 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
     from cron.jobs_due_scan import completed_occurrence
     from cron.occurrences import scheduled_instant
 
-    if kind == "cron" and not manual_run and _reanchor_future_timezone_shifted_cron(d):
+    # A pending stamp names a concrete occurrence, not civil-time scheduling intent.
+    # In particular a UTC stamp for a PT job is not evidence of a timezone edit.
+    repair_cron = kind == "cron" and not manual_run and restored_slot is None
+    if repair_cron and _reanchor_future_timezone_shifted_cron(d):
         return False
     if not manual_run and completed_occurrence(job, next_run):
         new_next = d.recompute_next() if recurring else None
         if new_next:
             scan.persist(job["id"], next_run_at=new_next)
+            if restored_slot is not None and (record := scan.find(job["id"])) is not None:
+                record.pop("pending_slot", None)
         return False
     # The offset-repair path exists to rescue jobs that FOLLOW the profile zone across a zone
     # change. A pinned job's instant legitimately carries its own offset, so repair can only
     # misfire on it — skip it entirely.
-    if kind == "cron" and not manual_run and zone is None and _repair_timezone_shifted_cron(d):
+    if repair_cron and zone is None and _repair_timezone_shifted_cron(d):
         return False
     d.next_run_dt = _rearm_stale_error_recurring(d)
     if _instant_after(d.next_run_dt, now):
@@ -3729,7 +3660,7 @@ def _evaluate_due_job(job: dict[str, Any], scan: _DueScan, run_claim_ttl: float)
         scan.needs_save = True
         return False
 
-    if not manual_run and kind == "cron" and _reanchor_stale_cron(d):
+    if repair_cron and _reanchor_stale_cron(d):
         return False
     grace_minutes = job.get("grace_minutes")
     grace = (_compute_grace_seconds(d.schedule, grace_minutes)

@@ -65,6 +65,25 @@ def test_admission_retry_claim_and_restart_are_fenced(tmp_path):
         db.close()
 
 
+def test_incognito_admission_can_claim_and_settle(tmp_path):
+    """Private turn persistence keeps its internal bypass while public writes stay guarded."""
+    import hermes_state_runtime as rt
+    from agent.incognito import incognito_scope
+
+    with store(tmp_path) as db:
+        epoch = _begin_owned_runtime_epoch(db, instance_id='incognito-owner')
+        row = rt.admit_session_input(
+            db, epoch=epoch, principal_id='private', session_id='s', request_id='private',
+            payload={'text': 'private'})
+        claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
+        with incognito_scope(True, 's'):
+            settled = rt.settle_session_input(
+                db, epoch=epoch, admission_id=claimed['admission_id'],
+                generation=claimed['generation'], outcome='completed')
+        assert row['admission_id'] == claimed['admission_id'] == settled['admission_id']
+        assert settled['status'] == 'terminal'
+
+
 def test_native_activity_is_local_only_at_the_admission_envelope_boundary(tmp_path):
     from copy import deepcopy
     import hermes_state_runtime as rt
@@ -97,6 +116,69 @@ def test_native_activity_is_local_only_at_the_admission_envelope_boundary(tmp_pa
     # The helper also identifies non-admission operations. A similarly named field there is semantic.
     fingerprint = rt.admission_fingerprint
     assert fingerprint(canonical_target='s', payload=payload) != fingerprint(canonical_target='s', payload=retry)
+
+
+def _admit_claim_and_die(path, conn):
+    """Admit two inputs, claim the first, report, and exit without closing the store."""
+    import os
+    import hermes_state_runtime as rt
+
+    db = SessionDB(db_path=path)
+    db.create_session('s', source='test')
+    epoch = _begin_owned_runtime_epoch(db, instance_id='boot')
+    args = dict(epoch=epoch, principal_id='human', session_id='s')
+    running = rt.admit_session_input(db, **args, request_id='running', payload={'text': 'long turn'})
+    queued = rt.admit_session_input(db, **args, request_id='queued', payload={'text': 'follow-up'})
+    claimed = rt.claim_session_input(db, epoch=epoch, session_id='s')
+    conn.send({'epoch': epoch, 'running': running['admission_id'], 'queued': queued['admission_id'],
+               'claimed': claimed['admission_id']})
+    conn.close()
+    os._exit(0)  # no close(), drain or WAL checkpoint: the store is left as a crash leaves it
+
+
+def test_queued_input_survives_a_hard_kill_and_runs_after_the_lost_turn_is_resolved(tmp_path):
+    """No shutdown flush: the admitted row is the only copy of queued input when the process dies.
+
+    Recovery fences only the turn that had started; input still waiting behind it stays queued with
+    its exact payload and is the replacement owner's next claim once the lost turn is resolved.
+    """
+    import multiprocessing
+    import hermes_state_runtime as rt
+
+    path = tmp_path / 'state.db'
+    context = multiprocessing.get_context('spawn')
+    receiver, sender = context.Pipe(duplex=False)
+    child = context.Process(target=_admit_claim_and_die, args=(path, sender))
+    child.start()
+    sender.close()
+    try:
+        assert receiver.poll(60), 'owner process never admitted and claimed'
+        ids = receiver.recv()
+        child.join(timeout=20)
+        assert child.exitcode == 0
+    finally:
+        if child.is_alive():
+            child.terminate()
+            child.join(timeout=5)
+    assert ids['claimed'] == ids['running']
+    wal = tmp_path / 'state.db-wal'
+    assert wal.exists() and wal.stat().st_size > 0, 'the killed owner left no uncheckpointed WAL'
+
+    db = SessionDB(db_path=path)
+    try:
+        new_epoch = _begin_owned_runtime_epoch(db, instance_id='replacement')
+        assert new_epoch > ids['epoch']
+        assert rt.recover_session_inputs(db, epoch=new_epoch) == 1
+        survivor = rt.get_session_admission(db, admission_id=ids['queued'])
+        assert survivor['status'] == 'queued' and survivor['payload'] == {'text': 'follow-up'}
+        lost = rt.get_session_admission(db, admission_id=ids['running'])
+        assert lost['status'] == 'unknown'
+        rt.resolve_unknown_session_input(
+            db, epoch=new_epoch, admission_id=lost['admission_id'], generation=lost['generation'])
+        resumed = rt.claim_session_input(db, epoch=new_epoch, session_id='s')
+        assert resumed['admission_id'] == ids['queued'] and resumed['owner_epoch'] == new_epoch
+    finally:
+        db.close()
 
 
 def test_sqlite_failure_never_acknowledges_or_partially_claims(tmp_path):

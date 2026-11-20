@@ -52,3 +52,5 @@ tests/hermes_cli/test_gateway_guardian.py`. One test uses the real `rollback()` 
 To roll back, revert this slice. Existing `restore` transactions in `release-last-txn.json`
 then read as unsupported only while one is pending. Settle or archive a pending `restore`
 before downgrading.
+
+Contract tests: `tests/hermes_cli/test_guardian_rollback_restore.py`, `tests/hermes_cli/test_gateway_guardian.py`.

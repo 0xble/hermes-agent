@@ -178,8 +178,7 @@ async function ownerToken(lockDir: string): Promise<string | null> {
   )
 }
 
-async function ownerPid(lockDir: string): Promise<number | null> {
-  const raw = await ownerToken(lockDir)
+function ownerPid(raw: string | null): number | null {
   const pidField = raw?.split('-', 1)[0] ?? ''
 
   if (!/^\d+$/.test(pidField)) {
@@ -214,7 +213,7 @@ function pidIsAlive(pid: number | null): boolean {
 
 async function breakIfStale(lockDir: string): Promise<void> {
   const judgedOwner = await ownerToken(lockDir)
-  const pid = await ownerPid(lockDir)
+  const pid = ownerPid(judgedOwner)
 
   // Age the owner file, or the lock directory itself when no owner was written: a writer
   // that died between mkdir and the owner write must still age out.
@@ -235,6 +234,10 @@ async function breakIfStale(lockDir: string): Promise<void> {
     return
   }
 
+  if ((await ownerToken(lockDir)) !== judgedOwner) {
+    return
+  }
+
   const abandoned = `${lockDir}.stale-${process.pid}-${randomBytes(4).toString('hex')}`
 
   try {
@@ -247,11 +250,17 @@ async function breakIfStale(lockDir: string): Promise<void> {
   if ((await ownerToken(abandoned)) !== judgedOwner) {
     try {
       await fs.promises.rename(abandoned, lockDir)
-    } catch {
-      // Another contender already owns the original name; either way this write must not proceed.
+    } catch (error) {
+      const { code } = error as NodeJS.ErrnoException
+
+      // Another contender may already have installed its lock at the original path.
+      if (code !== 'EEXIST' && code !== 'ENOTEMPTY') {
+        throw error
+      }
     }
 
-    throw new Error('preferences store is busy')
+    // Let the acquisition loop poll again within its existing wait budget.
+    return
   }
 
   await fs.promises.rm(abandoned, { force: true, recursive: true }).catch(() => undefined)

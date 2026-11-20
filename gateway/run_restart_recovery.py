@@ -12,6 +12,7 @@ from gateway.replay_scheduler import REPLAY_PRIORITY_STARTUP, REPLAY_PRIORITY_RE
 logger = logging.getLogger("gateway.run")
 _NOT_SUPPLIED = object()
 _INPUT_DURABLE_POLL_S = 0.25
+_ORPHAN_CARD_DELETE_ATTEMPTS = 3  # boots that may fail to delete a stranded progress card before it is forgotten
 
 
 class ResumeCandidates(list):
@@ -21,6 +22,37 @@ class ResumeCandidates(list):
 
 
 class RestartRecoveryMixin:
+    async def _sweep_orphan_progress_cards(self) -> int:
+        """Delete temporary progress cards a dead process recorded but never cleaned up: their
+        deletion was a post-delivery callback held only in that process's memory. Off the boot path,
+        one batch per chat, through the adapter's budgeted delete. Returns the cards deleted."""
+        try:
+            orphans = await self.async_session_store.orphan_progress_cards()
+        except Exception as exc:
+            logger.warning("Orphan progress-card sweep could not read the session store: %s", exc, exc_info=True)
+            return 0
+        deleted = 0
+        for session_key, origin, chat_id, message_ids in orphans:
+            adapter = self._delivery_adapter_for(origin)
+            if adapter is None:
+                continue  # platform not connected yet: keep the record for a later boot
+            try:
+                outcome = await adapter.delete_messages(chat_id, message_ids)
+            except Exception as exc:
+                logger.warning("Orphan progress-card delete failed for session %s: %s", session_key, exc,
+                               exc_info=True)
+                outcome = {}
+            outcome = {str(mid): bool(outcome.get(str(mid))) for mid in message_ids}
+            deleted += sum(outcome.values())
+            # A False is either final (Telegram: already gone, or past its 48h window) or a flood
+            # refusal that keeps every id for a later retry, so a card is forgotten once deleted or
+            # after a few failed boots, never on its first failure.
+            await self._persist_progress_cards(
+                "settle_swept_progress_cards", session_key, chat_id, outcome, _ORPHAN_CARD_DELETE_ATTEMPTS)
+        if orphans:
+            logger.info("Swept orphan progress cards: chats=%d deleted=%d", len(orphans), deleted)
+        return deleted
+
     def _record_restart_resume_outcome(self, session_key: str, outcome: str) -> None:
         """Emit one terminal decision per session per boot, including reconnect retries."""
         recorded = getattr(self, "_restart_resume_outcomes", None)

@@ -9,3 +9,5 @@ Reproduction: `prepare_tools(["node", "npm"], out=build_store, target=target)` i
 Proof surfaces: `tests/pm/test_build_dependency_lookup.py` exercises real downloads, lockfiles, facts, archive unpack, and publication for cold and warm stores, both hook phases, explicit lookup roots, and nested failure cleanup. `tests/cron/test_immutable_worker_real.py` exercises real isolated release staging and detached workers. The PM tree at frozen upstream main `484ebdf16a5127894f16ba883e9630968f945c5e` was byte-identical to the failing candidate before this patch.
 
 Retire when upstream binds package dependency lookup to the active installation store and these invariants pass without this implementation. Rollback removes the focused PM context change and its invariant tests, preserving the separate archived web-build preparation patch.
+
+Contract tests: `tests/pm/test_build_dependency_lookup.py`, `tests/cron/test_immutable_worker_real.py`.

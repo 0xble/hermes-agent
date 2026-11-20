@@ -1165,7 +1165,7 @@ def format_runtime_provider_error(error: Exception) -> str:
 
 def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested: Optional[str] = None,
                                   target_model: Optional[str] = None, explicit_base_url: Optional[str] = None,
-                                  explicit_api_key: Optional[str] = None,
+                                  explicit_api_key: Optional[str] = None, model_pinned: bool = False,
                                   ) -> tuple[dict[str, Any], Optional[dict[str, Any]]]:
     """``resolve_runtime_provider`` plus resolution-time fallback: ``(runtime, fallback_entry_or_None)``.
 
@@ -1183,7 +1183,11 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
     except AuthError as primary_exc:
         from hermes_cli.fallback_config import effective_runtime_provider, get_fallback_chain, resolve_entry_api_key
-        for entry in get_fallback_chain(config):
+        from hermes_cli.fallback_config import same_model_fallbacks
+        chain = get_fallback_chain(config)
+        if model_pinned:
+            chain = same_model_fallbacks(chain, target_model or "")
+        for entry in chain:
             provider = (entry.get("provider") or "").strip().lower()
             model = (entry.get("model") or "").strip()
             if not provider or not model:
@@ -1206,7 +1210,10 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
             runtime["provider"] = effective_runtime_provider(entry, runtime)
             # A rate-limit/quota cap is transient (credentials are fine, re-auth cannot help); the log must not
             # mislabel it as an auth failure (#32790).
-            logger.warning("Primary provider %s (%s). Falling back to %s/%s",
-                           primary_failure_wording(primary_exc)[0], primary_exc, provider, model)
+            logger.warning("Primary provider %s for model %s (%s). Falling back to %s/%s",
+                           primary_failure_wording(primary_exc)[0], target_model, primary_exc, provider, model)
+            reason = "rate_limit" if primary_failure_wording(primary_exc)[0].startswith("rate-limited") else "credentials_unavailable"
+            runtime["_preflight_fallback"] = {"requested_model": target_model,
+                                               "fallback_model": model, "fallback_reason": reason}
             return runtime, entry
         raise primary_exc

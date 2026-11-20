@@ -149,6 +149,95 @@ test('an ownerless lock dir is reclaimed once it is stale', async () => {
   assert.equal(fs.existsSync(lockDir), false)
 })
 
+test('a waiter retries when an owner appears during stale recovery', async () => {
+  const root = scratchHome()
+  const file = uiPreferencesPath(root)
+  const lockDir = `${file}.lock`
+  const owner = path.join(lockDir, 'owner')
+  const newOwner = `${process.pid}-holder`
+  fs.mkdirSync(lockDir)
+  const old = new Date(Date.now() - 11_000)
+  fs.utimesSync(lockDir, old, old)
+
+  let restoredOwner: string | undefined
+  let wroteBeforeRelease = false
+  const rename = fs.promises.rename
+
+  const spy = vi.spyOn(fs.promises, 'rename').mockImplementation(async (source, target) => {
+    if (source === lockDir) {
+      // Publish the holder's token after the waiter judged the directory ownerless.
+      fs.writeFileSync(owner, newOwner)
+    }
+
+    await rename(source, target)
+
+    if (target === lockDir) {
+      restoredOwner = fs.readFileSync(owner, 'utf8')
+      wroteBeforeRelease = fs.existsSync(file)
+      fs.rmSync(lockDir, { recursive: true })
+    }
+  })
+
+  const values = { 'hermes.desktop.waiter': 'released' }
+
+  try {
+    await writeUiPreferences(file, { values })
+  } finally {
+    spy.mockRestore()
+  }
+
+  assert.equal(restoredOwner, newOwner)
+  assert.equal(wroteBeforeRelease, false)
+  assert.deepEqual(readUiPreferences(file).values, values)
+  assert.deepEqual(fs.readdirSync(root), [path.basename(file)])
+})
+
+test('stale recovery leaves an observed successor at its lock path', async () => {
+  const root = scratchHome()
+  const file = uiPreferencesPath(root)
+  const lockDir = `${file}.lock`
+  const owner = path.join(lockDir, 'owner')
+  const successor = `${process.pid}-successor`
+  fs.mkdirSync(lockDir)
+  fs.writeFileSync(owner, '2147483647-dead')
+  const old = new Date(Date.now() - 11 * 60_000)
+  fs.utimesSync(owner, old, old)
+
+  let successorReady = false
+  const stat = fs.promises.stat
+  const mkdir = fs.promises.mkdir
+  const statSpy = vi.spyOn(fs.promises, 'stat').mockImplementation(async (...args) => {
+    const observed = await stat(...args)
+
+    if (args[0] === owner && !successorReady) {
+      fs.writeFileSync(owner, successor)
+      successorReady = true
+    }
+
+    return observed
+  })
+  const mkdirSpy = vi.spyOn(fs.promises, 'mkdir').mockImplementation((...args) => {
+    if (args[0] === lockDir && successorReady) {
+      assert.equal(fs.readFileSync(owner, 'utf8'), successor)
+      assert.equal(fs.existsSync(file), false)
+      fs.rmSync(lockDir, { recursive: true })
+    }
+
+    return mkdir(...args)
+  })
+  const renameSpy = vi.spyOn(fs.promises, 'rename')
+
+  try {
+    const values = { 'hermes.desktop.waiter': 'released' }
+    assert.deepEqual((await writeUiPreferences(file, { values })).values, values)
+    assert.equal(renameSpy.mock.calls.some(([source]) => source === lockDir), false)
+  } finally {
+    renameSpy.mockRestore()
+    mkdirSpy.mockRestore()
+    statSpy.mockRestore()
+  }
+})
+
 test('a live owner hits the bounded backstop and does not wedge later writes', async () => {
   // Fake only the wall clock. The lock loop awaits real fs I/O between polls, so faking
   // setTimeout would strand a poll scheduled after the jump; real 20 ms polls keep running.

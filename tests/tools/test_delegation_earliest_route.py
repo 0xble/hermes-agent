@@ -45,13 +45,17 @@ def _failed_delegation(did, now, *, hint="usage window resets in 48h", reason="r
         "origin_session_id": "", "parent_session_id": "sess-owner", "dispatched_at": now - 60,
         **({"route_chain": chain} if chain else {})}
     ad._persist_dispatch(record)
+    return _fail(did, now, hint=hint, reason=reason)
+
+
+def _fail(did, now, *, hint="usage window resets in 48h", reason="rate_limit", state="error"):
     result = {"results": [{"task_index": 0, "status": "failed", "failure_reason": reason,
                            "error": f"HTTP 429: {hint}", "summary": hint}], "error": None}
     event = {"type": "async_delegation", "delegation_id": did, "status": "error", "error": None}
     with ad._DB_LOCK, ad._transaction() as conn:
-        conn.execute("UPDATE async_delegations SET state='error', completed_at=?, updated_at=?, event_json=?, "
+        conn.execute("UPDATE async_delegations SET state=?, completed_at=?, updated_at=?, event_json=?, "
                      "result_json=?, delivery_state='delivered' WHERE delegation_id=?",
-                     (now, now, json.dumps(event), json.dumps(result), did))
+                     (state, now, now, json.dumps(event), json.dumps(result), did))
     return did
 
 
@@ -63,6 +67,37 @@ def test_retry_follows_earliest_route_not_last_fallback():
     plan = dr.schedule_retry(did, now=now)
     assert plan["retry_state"] == "scheduled"
     assert now + 600 <= plan["due_at"] < now + 600 + dr.BASE_BACKOFF_S + 1
+
+
+def test_batch_chain_includes_every_childs_fallbacks():
+    """A sibling on another route (model-map option) must contribute its fallbacks to the retry chain."""
+    from tools.delegate_tool_dispatch import _dispatch_unit
+
+    other = ("anthropic", "https://other.invalid/v1", "claude-other")
+    other_fallback = ("zai", "https://zai.invalid/v1", "glm-recovering")
+
+    def child(route, fallback):
+        return SimpleNamespace(provider=route[0], base_url=route[1], model=route[2], session_id=None,
+                               _fallback_chain=[dict(zip(("provider", "base_url", "model"), fallback))])
+
+    now = time.time()
+    # Only the second child's fallback recovers soon; the first child's routes stay out for hours.
+    _store((PRIMARY, now + 3 * 3600), (other_fallback, now + 600))
+    tasks = [{"goal": "a"}, {"goal": "b"}]
+    unit = SimpleNamespace(task_list=tasks, context=None, top_role="leaf", creds={"model": None}, live_writers=[],
+                           children=[(0, tasks[0], child(PRIMARY, FALLBACK)), (1, tasks[1], child(other, other_fallback))])
+    handle = _dispatch_unit(unit, "deleg_batch_routes", None, {
+        "session_key": "agent:main:telegram:dm:1", "parent_session_id": "sess-owner",
+        "max_async_children": 0, "max_queued_delegations": 1})
+    assert handle["status"] == "queued"
+    with ad._DB_LOCK, ad._transaction() as conn:
+        persisted = dr._route_chain(dr._load(conn, "deleg_batch_routes"))
+    assert persisted == [PRIMARY, other, FALLBACK, other_fallback]
+
+    # Fan-outs retry from lost-owner states (a stalled child waiting out a rate limit).
+    plan = dr.schedule_retry(_fail("deleg_batch_routes", now, hint="", state="stalled"), now=now)
+    assert plan["retry_state"] == dr.RETRY_SCHEDULED
+    assert plan["due_at"] == pytest.approx(now + 630, rel=0, abs=0.001)
 
 
 def test_cooldown_read_runs_outside_the_ledger_writer_transaction(monkeypatch):
@@ -139,7 +174,7 @@ def test_all_routes_ready_uses_minimal_backoff():
     _store((PRIMARY, now - 10))
     did = _failed_delegation("deleg_ready", now)
     plan = dr.schedule_retry(did, now=now)
-    assert plan["due_at"] == pytest.approx(now + dr.BASE_BACKOFF_S)
+    assert plan["due_at"] == pytest.approx(now + dr.BASE_BACKOFF_S, rel=0, abs=0.001)
 
 
 def test_no_store_data_falls_back_to_error_hint():

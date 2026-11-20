@@ -233,9 +233,12 @@ def test_desktop_pick_resolves_a_provider_added_after_the_session_and_freezes_on
             'models': {'switched': {'context_length': 100000}}}}
         assert frozen['model']['provider'] == 'loop' and frozen['model']['key_env'] == 'LOOP_KEY'
         assert frozen['model']['default'] == 'switched'
+        # The pick is an explicit model pin: only its own pin flag changes.
+        pins_before = dict(frozen_before.get('session_pins') or {})
+        assert frozen['session_pins'] == {**pins_before, 'model': True}
         # Nothing else in the frozen config moved.
-        assert {k: v for k, v in frozen.items() if k not in ('model', 'providers')} == \
-            {k: v for k, v in frozen_before.items() if k not in ('model', 'providers')}
+        assert {k: v for k, v in frozen.items() if k not in ('model', 'providers', 'session_pins')} == \
+            {k: v for k, v in frozen_before.items() if k not in ('model', 'providers', 'session_pins')}
         assert 'providers' not in frozen_before
         # The key value never lands in the session store.
         raw = b''.join(path.read_bytes() for path in home.glob('state.db*'))

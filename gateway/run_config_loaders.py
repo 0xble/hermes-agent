@@ -45,6 +45,52 @@ DEFAULT_HUMAN_DELAY_RANGE_MS: tuple[int, int] = (800, 2500)
 _BUSY_INPUT_MODES = {"interrupt", "queue", "steer"}
 
 
+def resolve_default_runtime_agent_kwargs() -> dict:
+    """Resolve provider credentials for gateway-created AIAgent instances.
+    ``resolve_runtime_provider()`` may fall back to env vars; behavioral config is config.yaml only.
+    An ``AuthError`` from the primary walks the configured fallback chain through the shared
+    ``resolve_runtime_with_fallback`` (the gateway keeps no resolver loop of its own)."""
+    from gateway.run import _load_gateway_config, _runtime_agent_kwargs
+    from hermes_cli.fallback_config import pre_agent_fallback_notice
+    from hermes_cli.runtime_provider import (
+        resolve_runtime_with_fallback, format_runtime_provider_error, _get_model_config)
+
+    # Capture primary provider/model from config before the try block so we
+    # can include it in the fallback notice if the primary fails (#74349).
+    from hermes_cli.model_alias_runtime import resolve_default_route
+    _primary_route = resolve_default_route(_load_gateway_config())
+    if not _primary_route.model and not _primary_route.provider:
+        _legacy_route = _get_model_config()
+        _primary_model = str(_legacy_route.get("default") or _legacy_route.get("model") or "").strip()
+        _primary_provider = str(_legacy_route.get("provider") or "").strip()
+    else:
+        _primary_model = _primary_route.model.strip()
+        _primary_provider = _primary_route.provider.strip()
+
+    try:
+        runtime, fallback_entry = resolve_runtime_with_fallback(_load_gateway_config())
+    except Exception as exc:
+        raise RuntimeError(format_runtime_provider_error(exc)) from exc
+
+    if fallback_entry is not None:
+        # The entry's model is the one this agent must send (#112600). Carry the fallback notice so the
+        # gateway can surface a user-visible provider switch (#74349); the caller must pop
+        # ``_fallback_notice`` before forwarding kwargs to AIAgent.
+        return {**_runtime_agent_kwargs(runtime), "model": fallback_entry["model"],
+                "_preflight_fallback": {**(runtime.get("_preflight_fallback") or {}), "requested_model": _primary_model},
+                "_fallback_notice": pre_agent_fallback_notice(
+                    _primary_provider, _primary_model,
+                    runtime.get("provider") or fallback_entry.get("provider") or "unknown",
+                    fallback_entry.get("model") or "default")}
+
+    capabilities = runtime.get("capabilities")
+    capabilities = (
+        {k: v for k, v in capabilities.items() if isinstance(k, str) and isinstance(v, bool)}
+        if isinstance(capabilities, dict) else {})
+
+    return {**_runtime_agent_kwargs(runtime), "capabilities": capabilities}
+
+
 class GatewayConfigLoadersMixin:
     """Config/env loaders (busy modes, reasoning, service tier, timeouts, fallback) for GatewayRunner."""
 
@@ -431,13 +477,13 @@ class GatewayConfigLoadersMixin:
         from agent.fast_mode import STATIC_TIERS
         if not clear and service_tier in STATIC_TIERS:
             if expiry_seconds is None:
-                loader = getattr(self, "_load_fast_expiry_seconds", None)
+                loader = getattr(self, "_load_service_tier_expiry_seconds", None)
                 if not callable(loader):
-                    loader = type(self)._load_fast_expiry_seconds if hasattr(type(self), "_load_fast_expiry_seconds") else None
+                    loader = type(self)._load_service_tier_expiry_seconds if hasattr(type(self), "_load_service_tier_expiry_seconds") else None
                 if not callable(loader):
                     from gateway.run_config_loaders import GatewayConfigLoadersMixin
-                    loader = GatewayConfigLoadersMixin._load_fast_expiry_seconds
-                seconds = float(cast(float, loader()))
+                    loader = GatewayConfigLoadersMixin._load_service_tier_expiry_seconds
+                seconds = float(cast(float, loader(service_tier)))
             else:
                 seconds = expiry_seconds
             if seconds > 0:
@@ -445,10 +491,13 @@ class GatewayConfigLoadersMixin:
                 conversation.service_tier_override_expiry_seconds = seconds
 
     @classmethod
-    def _load_fast_expiry_seconds(cls) -> float:
-        """Read the gateway-only Fast expiry; invalid values warn and disable it."""
+    def _load_service_tier_expiry_seconds(cls, service_tier: str) -> float:
+        """Read a static tier's gateway expiry; invalid values warn and disable it."""
         from gateway.run import _load_gateway_config
-        raw = cfg_get(_load_gateway_config(), "agent", "fast_expiry_seconds", default=0)
+        from hermes_cli.config_defaults import DEFAULT_CONFIG
+
+        key = {"priority": "fast_expiry_seconds", "ultrafast": "ultrafast_expiry_seconds"}[service_tier]
+        raw = cfg_get(_load_gateway_config(), "agent", key, default=DEFAULT_CONFIG["agent"][key])
         try:
             if isinstance(raw, bool):
                 raise ValueError(raw)
@@ -456,7 +505,7 @@ class GatewayConfigLoadersMixin:
             if value < 0 or not math.isfinite(value):
                 raise ValueError(raw)
         except (TypeError, ValueError, OverflowError):
-            logger.warning("agent.fast_expiry_seconds=%r is not a non-negative finite number; using 0", raw)
+            logger.warning("agent.%s=%r is not a non-negative finite number; using 0", key, raw)
             return 0.0
         return value
 
@@ -849,6 +898,10 @@ class GatewayConfigLoadersMixin:
         if agent is None:
             return
         new_chain = list(chain or [])
+        pinned = getattr(agent, "_pinned_fallback_model", None)
+        if isinstance(pinned, str) and pinned:
+            from hermes_cli.fallback_config import same_model_fallbacks
+            new_chain = same_model_fallbacks(new_chain, pinned)
         rate_limited_until = getattr(agent, "_rate_limited_until", 0) or 0
         if getattr(agent, "_fallback_activated", False) and rate_limited_until > time.monotonic():
             return

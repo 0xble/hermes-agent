@@ -202,6 +202,22 @@ def _recover_update_debts_on_startup() -> None:
     _recover_paused_gateways()  # a killed `hermes update` left gateways paused (Windows)
 
 
+def _reap_orphaned_cua_drivers() -> None:
+    """Reap cua-driver serve processes whose Hermes owner died, and stale hc- sockets.
+
+    Runs on every invocation. Never raises and never signals a live owner's driver.
+    """
+    try:
+        from tools.computer_use.cua_driver_lifetime import sweep_on_startup
+    except ImportError:
+        logger.debug("cua-driver startup sweep unavailable", exc_info=True)
+        return
+    try:
+        sweep_on_startup()
+    except Exception:  # a cleanup sweep must never become a global startup outage
+        logger.debug("cua-driver startup sweep failed", exc_info=True)
+
+
 def _cleanup_quarantined_exes(scripts_dir: Path | None = None) -> None:
     """Sweep — and where necessary RESCUE — ``hermes.exe.old.*`` from updates.
 

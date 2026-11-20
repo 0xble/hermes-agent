@@ -75,7 +75,7 @@ class TestCancelDuringSeal:
 
         t.hang_seal = False  # transport recovers for the abandon pass
         r = await adapter.abandon_open_draft(
-            "C1", "partial on screen", metadata=dict(md)
+            "C1", "partial on screen", metadata={**md, "_draft_id": 12}
         )
         assert r.success
         seals = [o for o in t.ops if o[0] == "draft" and o[1]]

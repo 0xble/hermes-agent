@@ -44,3 +44,5 @@ During a rolling restart, records written under `local/custom` by older processe
 ## Retirement and rollback
 
 Retire when upstream ships equivalent cross-process auxiliary route health with endpoint-scoped identity, single-probe recovery, and epoch-deduplicated notices. Roll back by reverting the commit carrying `Fork-Patch: auxiliary-route-health` and deleting `$HERMES_HOME/state/auxiliary_route_health.json`; the in-process unhealthy cache then resumes sole ownership.
+
+Contract tests: `tests/agent/test_auxiliary_health.py`, `tests/agent/test_auxiliary_client.py`, `tests/agent/test_auxiliary_fallback_multihop.py`, `tests/agent/test_auxiliary_concurrency.py`, `tests/agent/test_auxiliary_error_classification.py`.
