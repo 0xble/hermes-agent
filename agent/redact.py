@@ -27,7 +27,7 @@ from urllib.parse import unquote_plus
 # Shared with agent/file_safety's read-block list so the two defenses can't
 # drift: a blocked file_tools read that falls back to ``cat`` is still caught.
 from agent.file_safety import _BLOCKED_PROJECT_ENV_BASENAMES as _ENV_FILE_BASENAMES
-from agent.file_safety import HOME_CREDENTIAL_FILES as HOME_CREDENTIAL_FILES
+from agent.file_safety import HOME_CREDENTIAL_FILES
 from agent.redact_approval_display import sanitize_command_for_display  # re-exported: callers import it from agent.redact
 from agent.redact_connstr import _KV_CONNSTR_GATE_RE, _redact_kv_connection_strings
 from agent.redact_control_split import mask_control_split_tokens, mask_prefix_matches
