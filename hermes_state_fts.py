@@ -14,6 +14,7 @@ from hermes_state_errors import is_fts_scoped_corruption_error, is_sqlite_lock_e
 logger = logging.getLogger("hermes_state")
 
 _FTS_DDL_TABLES = ("messages_fts", "messages_fts_trigram")
+_FTS_AUTOMERGE_TABLES = frozenset(_FTS_DDL_TABLES)
 
 
 def _stored_form(sql: str) -> str:
@@ -310,6 +311,13 @@ class SessionFtsSetupMixin:
         try:
             # Run even when the table exists: recreates triggers a no-FTS5 runtime dropped.
             cursor.executescript(ddl)
+            # Automatic segment merges run in the row-insert trigger's transaction and can hold
+            # the shared state.db writer for seconds on a large index.  The existing bounded
+            # maintenance merge path owns this work outside the application writer guard.
+            if table_name in _FTS_AUTOMERGE_TABLES:
+                cursor.execute(
+                    f"INSERT INTO {table_name}({table_name}, rank) VALUES('automerge', 0)"
+                )
             return True
         except sqlite3.OperationalError as exc:
             if not self._is_fts5_unavailable_error(exc):
