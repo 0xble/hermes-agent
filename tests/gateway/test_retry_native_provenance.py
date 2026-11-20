@@ -14,6 +14,7 @@ re-dispatch raises RuntimeStoreError('invalid_params').
 """
 import weakref
 from pathlib import Path
+from typing import Any, cast
 
 import pytest
 
@@ -72,15 +73,15 @@ async def test_retry_redispatch_admits_natively_under_session_authority(
         await initialize_gateway_runtime(runner)
         register_transport_home(runner, None, root)
         adapter = _FakeAdapter()
-        runner.adapters = {Platform.DISCORD: adapter}
+        runner.adapters = cast(Any, {Platform.DISCORD: adapter})
         runner._is_user_authorized_for_source = lambda *a, **k: True
 
         source = SessionSource(
             platform=Platform.DISCORD, chat_id='probe-chat', chat_type='dm',
             user_id='probe-user', user_name='probe')
-        # build_source stamps this on every inbound event; hand-built sources need it too,
-        # otherwise _transport_owner fail-closes to None (not_found).
-        source._transport_adapter_ref = weakref.ref(adapter)
+        # build_source stamps this on every inbound event; hand-built sources must carry it too,
+        # otherwise the transport-owner check fail-closes to None (not_found).
+        setattr(source, '_transport_adapter_ref', weakref.ref(adapter))
         entry = await runner.async_session_store.get_or_create_session(source)
         sid = entry.session_id
         runner.session_store.append_to_transcript(
@@ -135,14 +136,14 @@ async def test_authenticated_callback_rebinds_dead_transport_reference(
         await initialize_gateway_runtime(runner)
         register_transport_home(runner, None, root)
         adapter = _FakeAdapter()
-        runner.adapters = {Platform.DISCORD: adapter}
+        runner.adapters = cast(Any, {Platform.DISCORD: adapter})
         runner._is_user_authorized_for_source = lambda *a, **k: True
 
         source = SessionSource(
             platform=Platform.DISCORD, chat_id='probe-chat', chat_type='dm',
             user_id='probe-user', user_name='probe')
         dead_adapter = _FakeAdapter()
-        source._transport_adapter_ref = weakref.ref(dead_adapter)
+        setattr(source, '_transport_adapter_ref', weakref.ref(dead_adapter))
         del dead_adapter
         event = MessageEvent(text='probe', source=source, message_id='probe-msg')
 
@@ -151,6 +152,76 @@ async def test_authenticated_callback_rebinds_dead_transport_reference(
 
         assert provenance is not None
         assert runner._transport_owner(source) == (adapter, None)
+    finally:
+        for authority in list(getattr(runner, 'session_authorities', []) or []):
+            authority.db.close()
+        for _, home in homes:
+            process_ownership.release(home)
+
+
+@pytest.mark.asyncio
+async def test_legacy_primary_native_source_restores_after_default_profile_repair(
+        tmp_path, monkeypatch):
+    """A pre-multiplex envelope's null primary profile must restore through the live registry."""
+    root, homes = _reserve_homes(tmp_path, monkeypatch, names=())
+    runner = _runner(root, homes)
+    process_ownership.reserve([home for _, home in homes])
+    try:
+        await initialize_gateway_runtime(runner)
+        register_transport_home(runner, None, root)
+        adapter = _FakeAdapter()
+        runner.adapters = cast(Any, {Platform.DISCORD: adapter})
+        runner._is_user_authorized_for_source = lambda *a, **k: True
+
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id='probe-chat', chat_type='dm',
+            user_id='probe-user', user_name='probe')
+        setattr(source, '_transport_adapter_ref', weakref.ref(adapter))
+        event = MessageEvent(text='probe', source=source, message_id='probe-msg')
+        with native_callback(runner, event, root, None):
+            provenance = capture_provenance(runner, event)
+
+        encoded = source.to_dict()
+        encoded['is_bot'] = source.is_bot
+        payload = {'native_text_v1': {
+            'source': encoded,
+            'route': runner.session_store._generate_session_key(source),
+            'provenance': provenance,
+        }}
+        from gateway.session_envelope import restore_native_source
+        restored = restore_native_source(payload, runner)
+
+        assert restored.profile is None
+        assert runner._adapter_for_source(restored) is adapter
+    finally:
+        for authority in list(getattr(runner, 'session_authorities', []) or []):
+            authority.db.close()
+        for _, home in homes:
+            process_ownership.release(home)
+
+
+@pytest.mark.asyncio
+async def test_authenticated_callback_rejects_missing_transport_reference(
+        tmp_path, monkeypatch):
+    """A callback cannot turn a source without transport proof into a native route."""
+    root, homes = _reserve_homes(tmp_path, monkeypatch, names=())
+    runner = _runner(root, homes)
+    process_ownership.reserve([home for _, home in homes])
+    try:
+        await initialize_gateway_runtime(runner)
+        register_transport_home(runner, None, root)
+        adapter = _FakeAdapter()
+        runner.adapters = cast(Any, {Platform.DISCORD: adapter})
+        runner._is_user_authorized_for_source = lambda *a, **k: True
+
+        source = SessionSource(
+            platform=Platform.DISCORD, chat_id='probe-chat', chat_type='dm',
+            user_id='probe-user', user_name='probe')
+        event = MessageEvent(text='probe', source=source, message_id='probe-msg')
+
+        with native_callback(runner, event, root, None):
+            with pytest.raises(RuntimeStoreError, match='not_found'):
+                capture_provenance(runner, event)
     finally:
         for authority in list(getattr(runner, 'session_authorities', []) or []):
             authority.db.close()
@@ -169,13 +240,13 @@ async def test_authenticated_callback_rejects_live_foreign_transport_reference(
         register_transport_home(runner, None, root)
         adapter = _FakeAdapter()
         foreign = _FakeAdapter()
-        runner.adapters = {Platform.DISCORD: adapter}
+        runner.adapters = cast(Any, {Platform.DISCORD: adapter})
         runner._is_user_authorized_for_source = lambda *a, **k: True
 
         source = SessionSource(
             platform=Platform.DISCORD, chat_id='probe-chat', chat_type='dm',
             user_id='probe-user', user_name='probe')
-        source._transport_adapter_ref = weakref.ref(foreign)
+        setattr(source, '_transport_adapter_ref', weakref.ref(foreign))
         event = MessageEvent(text='probe', source=source, message_id='probe-msg')
 
         with native_callback(runner, event, root, None):
