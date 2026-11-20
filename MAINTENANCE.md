@@ -321,6 +321,17 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream search results carry provider preview images.
 - **Rollback:** Revert the commit carrying `Fork-Patch: exa-result-images`.
 
+Fork-Patch-Backfill: 0f3af0ef0c43ad57eeedc58dd375566f83698699; gateway-transport-rebind
+
+## Active Patch Record: Native transport reference rebind
+
+- **Patch identity:** `gateway-transport-rebind`.
+- **Behavior:** Rebind an absent or dead native transport reference after adapter reconnect while still rejecting a live foreign adapter.
+- **Source surfaces:** `gateway/session_ingress_context.py`, `tests/gateway/test_retry_native_provenance.py`.
+- **Contract tests:** `tests/gateway/test_retry_native_provenance.py`.
+- **Retirement:** Remove when released upstream preserves the same authenticated adapter reconnect invariant.
+- **Rollback:** Revert the commit carrying `Fork-Patch: gateway-transport-rebind`.
+
 ## Active patch record: state.db prune lock batching
 
 - **Patch identity:** `state-prune-lock-batching`.
