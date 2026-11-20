@@ -1553,6 +1553,6 @@ def _patch_schema_overrides():
 
 
 registry.register(name="patch", toolset="file", schema=PATCH_SCHEMA, handler=_handle_patch, check_fn=_check_file_reqs, emoji="🔧", max_result_size_chars=100_000, dynamic_schema_overrides=_patch_schema_overrides,
-                  compat_args=("mode", "patch", "cross_profile"))
+                  compat_args=("mode", "patch", "cross_profile"), self_checked_args=("path",))
 registry.register(name="search_files", toolset="file", schema=SEARCH_FILES_SCHEMA, handler=_handle_search_files, check_fn=_check_file_reqs, emoji="🔎", max_result_size_chars=100_000,
                   self_checked_args=("pattern",))  # a files listing takes none; the handler refuses a content search without one

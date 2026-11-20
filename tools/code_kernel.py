@@ -1140,7 +1140,8 @@ def _sanitize_cell_spill(kernel: SessionKernel, cell_spill: str) -> str:
 
 def _cell_result(kernel: SessionKernel, key: tuple, status: str, payload: dict[str, Any], *,
                  timeout: int, sandbox_tools: frozenset, reused: bool,
-                 state_reset: bool, state_reset_note: Optional[str], exec_start: float) -> dict[str, Any]:
+                 state_reset: bool, exec_start: float,
+                 state_reset_note: Optional[str] = None) -> dict[str, Any]:
     """Assemble the tool result for one settled cell (disposing the kernel where the contract says so)."""
     from tools.code_execution_tool import (
         _sandbox_failure_hint, _sanitize_output_text, _truncate_stdout_text,

@@ -638,8 +638,21 @@ def _oneshot_spawn_budget(parent_agent: Any, requested: int) -> Optional[str]:
 
 
 from agent.incognito_agent import private_delegate
+from functools import wraps
 
 
+def _refused_for_hosted_agent(method):
+    """Refuse a hosted agent before anything reads the parent agent (the incognito scope inside does)."""
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        from tools.hosted_tool_policy import host_feature_refusal
+        if refusal := host_feature_refusal("delegation", "delegate_task"):  # /review reaches here outside a tool call
+            return tool_error(refusal)
+        return method(*args, **kwargs)
+    return wrapped
+
+
+@_refused_for_hosted_agent
 @private_delegate
 def delegate_task(
     goal: Optional[str] = None, context: Optional[str] = None, tasks: Optional[list[dict[str, Any]]] = None,
@@ -654,9 +667,6 @@ def delegate_task(
     dispatch handle when running in the background."""
     if parent_agent is None:
         return tool_error("delegate_task requires a parent agent context.")
-    from tools.hosted_tool_policy import host_feature_refusal
-    if refusal := host_feature_refusal("delegation", "delegate_task"):  # /review reaches here outside a tool call
-        return tool_error(refusal)
 
     from agent.incognito import is_incognito
     private = (getattr(parent_agent, "incognito", False) is True) or is_incognito(getattr(parent_agent, "session_id", None))
