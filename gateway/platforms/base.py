@@ -3042,6 +3042,13 @@ class BasePlatformAdapter(TypingStateMixin, ABC):
     async def disconnect(self) -> None:
         """Disconnect from the platform."""
 
+    async def fetch_missed_inbound(self, since: float, until: float) -> list[dict[str, Any]]:
+        """Return human inbound records received during an offline window, if supported.
+
+        Adapters that already redeliver their backlog need not implement this capability.
+        """
+        return []
+
     @abstractmethod
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None,
                    metadata: Optional[dict[str, Any]] = None) -> SendResult:

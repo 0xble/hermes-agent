@@ -2222,6 +2222,68 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 return await getattr(client_fn(), method)(**retry_kwargs)
             raise
 
+    async def fetch_missed_inbound(self, since: float, until: float) -> list[dict[str, Any]]:
+        """Fetch human DMs and bot mentions from Slack history without waking the agent."""
+        if not self._app:
+            return []
+        clients = dict(getattr(self, "_team_clients", {}) or {})
+        if not clients:
+            clients = {"": self._app.client}
+        records: list[dict[str, Any]] = []
+        bot_ids = {str(uid) for uid in (getattr(self, "_team_bot_user_ids", {}) or {}).values() if uid}
+        if self._bot_user_id:
+            bot_ids.add(str(self._bot_user_id))
+        oldest, latest = str(since), str(until)
+        for team_id, client in clients.items():
+            try:
+                listed = await client.conversations_list(
+                    types="public_channel,private_channel,im,mpim", limit=200, exclude_archived=True,
+                )
+                channels = (listed or {}).get("channels", [])
+                for channel in channels:
+                    channel_id = str(channel.get("id") or "")
+                    if not channel_id or (channel.get("is_channel") and not channel.get("is_member", True)):
+                        continue
+                    is_dm = bool(channel.get("is_im") or channel.get("is_mpim") or channel_id.startswith(("D", "G")))
+                    history = await client.conversations_history(
+                        channel=channel_id, oldest=oldest, latest=latest, inclusive=True, limit=1000,
+                    )
+                    for message in (history or {}).get("messages", []):
+                        ts = str(message.get("ts") or "")
+                        if not ts:
+                            continue
+                        try:
+                            if not float(since) <= float(ts) <= float(until):
+                                continue
+                        except (TypeError, ValueError):
+                            continue
+                        user = str(message.get("user") or "")
+                        if not user or user in bot_ids or message.get("bot_id") or message.get("subtype") in {"bot_message", "me_message"}:
+                            continue
+                        if not is_dm and not any(f"<@{bot_id}>" in str(message.get("text") or "") for bot_id in bot_ids):
+                            continue
+                        thread_ts = str(message.get("thread_ts") or ts)
+                        # A thread that already contains a bot reply is not a missed message.
+                        if message.get("reply_count") or message.get("thread_ts"):
+                            replies = await client.conversations_replies(
+                                channel=channel_id, ts=thread_ts, limit=1000, inclusive=True,
+                            )
+                            if any(
+                                str(reply.get("user") or "") in bot_ids
+                                or reply.get("bot_id")
+                                or reply.get("subtype") in {"bot_message", "me_message"}
+                                for reply in (replies or {}).get("messages", [])[1:]
+                            ):
+                                continue
+                        self._remember_channel_team(channel_id, str(team_id))
+                        records.append({
+                            "platform": "slack", "conversation": channel_id, "ts": ts,
+                            "thread_ts": thread_ts, "team_id": str(team_id),
+                        })
+            except Exception:
+                logger.warning("[Slack] Missed-message history scan failed for workspace %s", team_id, exc_info=True)
+        return records
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None,
         metadata: Optional[dict[str, Any]] = None) -> SendResult:

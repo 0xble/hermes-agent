@@ -1018,6 +1018,10 @@ class GatewayAdapterLifecycleMixin(GatewaySecondaryReconnectMixin):
         """Publish a freshly reconnected primary adapter and replay what it missed while down."""
         self._publish_primary_adapter(platform, adapter)
         self.delivery_router.adapters = self.adapters
+        # A platform can reconnect while the gateway process stays alive; use the same best-effort
+        # receipt path as cold-start recovery without entering the message/agent dispatch lane.
+        from gateway.missed_message_ack import start_missed_message_ack
+        await start_missed_message_ack(self)
         hand_over_held_inbound(self._failed_platforms.pop(platform).get("predecessor"), adapter)
         # connect() returning True does not mean the receive path is confirmed -- Telegram's degraded
         # reconnect returns True so the gateway stays up while its own ladder retries. Stamping "connected"
