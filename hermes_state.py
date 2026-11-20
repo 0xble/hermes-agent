@@ -1191,7 +1191,7 @@ class SessionDB(
             fn_started = False
             try:
                 acquisition_started = time.monotonic()
-                with write_attempt(), state_lock(self._lock, db_path=self.db_path, deadline=deadline), write_admission(session_ids) as admitted:
+                with write_attempt(), state_lock(self._lock, db_path=self.db_path, deadline=deadline, db=self, site=write_site(fn), patience_s=patience_s), write_admission(session_ids) as admitted:
                     if not admitted:
                         return cast(T, skip_result)
                     if generation_clean:
