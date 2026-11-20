@@ -515,7 +515,7 @@ def test_external_interpreter_keeps_its_owned_dependencies(tmp_path, monkeypatch
 
 
 def test_release_root_without_convenience_launcher_uses_runtime_command(tmp_path, monkeypatch):
-    repo, home, _ = fixture_tree(tmp_path, monkeypatch)
+    repo, _home, _ = fixture_tree(tmp_path, monkeypatch)
     launcher = repo / ".hermes" / "bin" / "hermes"
     assert not launcher.exists()
     command = _launchers.installation_command(repo, module="source_probe")
