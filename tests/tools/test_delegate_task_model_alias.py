@@ -135,6 +135,29 @@ def test_unavailable_backend_never_blocks_an_explicit_alias(cfg, monkeypatch):
     assert routes.resolve_task_routes([{"goal": "r"}], {}, _parent()) == ([], "delegation backend 'gone' is not installed")
 
 
+def test_keyed_alias_without_a_url_keeps_its_own_key(cfg, monkeypatch):
+    """A keyed alias with no base_url routes by its provider label with its own key, never a re-resolved or
+    inherited one, through to the runtime provider resolver."""
+    cfg["model_aliases"]["keyed"] = {"model": "m-k", "provider": "openrouter", "api_key": "alias-key"}
+    seen = []
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials",
+                        lambda route, parent: seen.append(dict(route)) or {"model": route["model"],
+                                                                            "provider": route["provider"]})
+    (route,), err = routes.resolve_task_routes([{"goal": "g", "model": "keyed"}], {}, _parent())
+    assert err is None and route.error is None
+    assert (seen[0]["provider"], seen[0]["api_key"]) == ("openrouter", "alias-key") and "base_url" not in seen[0]
+
+    from tools import delegate_tool_config
+    calls = []
+    monkeypatch.setattr("hermes_cli.runtime_provider.resolve_runtime_provider",
+                        lambda **kw: calls.append(kw) or {"api_key": kw.get("explicit_api_key") or "env-key",
+                                                          "base_url": "https://openrouter.ai/api/v1",
+                                                          "provider": "openrouter"})
+    creds = delegate_tool_config._resolve_delegation_credentials(
+        {"model": "m-k", "provider": "openrouter", "api_key": "alias-key"}, _parent())
+    assert calls[0]["explicit_api_key"] == "alias-key" and creds["api_key"] == "alias-key"
+
+
 def test_unset_model_keeps_the_role_route(cfg):
     (route,), _ = routes.resolve_task_routes([{"goal": "g", "option": "critical"}], {}, _parent())
     assert route.creds["model"] == "critical-model" and route.report() == {"backend": "test-roles",

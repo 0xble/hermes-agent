@@ -545,7 +545,9 @@ def _runtime_provider_credentials(v: dict, explicit_request_overrides) -> dict:
     configured_provider = v["provider"]
     try:
         from hermes_cli.runtime_provider import resolve_runtime_provider
-        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"])
+        # A route's own key (an explicit model alias's) wins over the provider's resolved one.
+        explicit = {"explicit_api_key": v["api_key"]} if v["api_key"] else {}
+        runtime = resolve_runtime_provider(requested=configured_provider, target_model=v["model"], **explicit)
     except Exception as exc:
         raise ValueError(
             f"Cannot resolve delegation provider '{configured_provider}': {exc}. "
