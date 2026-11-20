@@ -338,6 +338,11 @@ class SessionFtsSetupMixin:
         """
         if getattr(self, "_fts_automerge_disabled", False):
             return
+        if not self._fts_enabled or self._fts_stale:
+            # Fail-open writes deliberately run with FTS detached. A corrupt or
+            # unavailable index must never be touched by the fallback write path.
+            self._fts_automerge_disabled = True
+            return
         for table_name in _FTS_AUTOMERGE_TABLES:
             if self._fts_table_exists(table_name, conn=cursor.connection):
                 cursor.execute(
