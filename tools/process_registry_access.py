@@ -30,6 +30,11 @@ def session_action_allowed(session, task_id: str, session_key: str) -> bool:
     identity (unowned/detached) has no owner to violate.
     """
     owner = session.owner_task_id or session.task_id
+    if getattr(session, "ssh_binding", None) is not None:
+        # Named-node handles carry immutable profile/node identity. The node-aware dispatcher
+        # validates that binding before acting, so lineage lookup must not open the controller's
+        # state DB for a remote profile that may not have a local state.db.
+        return True
     if task_id and task_id == owner:
         return True
     if session_key and session_key == session.session_key:
