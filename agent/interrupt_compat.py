@@ -7,6 +7,7 @@ from typing import Any
 
 
 SYSTEM_INTERRUPT_SOURCE = "system"
+_USER_REASONS = frozenset({"explicit stop requested", "user sent a new message", "user interrupt"})
 
 
 def _accepts_keyword(callable_obj: Any, name: str) -> bool:
@@ -20,6 +21,11 @@ def _accepts_keyword(callable_obj: Any, name: str) -> bool:
         or (p.name == name and p.kind is not inspect.Parameter.POSITIONAL_ONLY)
         for p in parameters
     )
+
+
+def _user_interrupt_pending(agent: Any) -> bool:
+    return bool(getattr(agent, "_interrupt_requested", False)
+                and getattr(agent, "_tool_interrupt_reason", None) in _USER_REASONS)
 
 
 def request_soft_interrupt(
@@ -67,9 +73,7 @@ def request_hard_interrupt(
         interrupt = getattr(agent, "interrupt", None)
     if not callable(interrupt):
         return False
-    if interrupt_source is None and tool_reason is not None and tool_reason not in {
-        "explicit stop requested", "user sent a new message", "user interrupt",
-    }:
+    if interrupt_source is None and tool_reason is not None and tool_reason not in _USER_REASONS:
         interrupt_source = SYSTEM_INTERRUPT_SOURCE
     # Every explicit producer leaves a trusted stop category for delegation results.
     # _signal_child_stop supplies system causes first; do not turn shutdown into a user cancel.
@@ -82,17 +86,16 @@ def request_hard_interrupt(
         # Let InterruptControlMixin's publication guard decide whether a system stop may
         # replace a pending user interrupt. Legacy callables have no source parameter, so
         # preserve the metadata only when no user interrupt is already pending.
-        user_interrupt_pending = (
-            getattr(agent, "_interrupt_requested", False)
-            and getattr(agent, "_tool_interrupt_reason", None) in {
-                "explicit stop requested", "user sent a new message", "user interrupt",
-            }
-        )
-        if interrupt_source and not accepts_source and not user_interrupt_pending:
+        if interrupt_source and not accepts_source and not _user_interrupt_pending(agent):
             agent._interrupt_source = interrupt_source
     except Exception:
         pass  # metadata must not break legacy/immutable interrupt facades
     kwargs = {}
+    if (interrupt_source == SYSTEM_INTERRUPT_SOURCE and not accepts_source
+            and _user_interrupt_pending(agent)):
+        # A legacy callable cannot apply the publication guard, so re-assert the pending user's
+        # own message: the stop still escalates, but the system cause never replaces the user's.
+        message, tool_reason = getattr(agent, "_interrupt_message", None), None
     if tool_reason is not None and _accepts_keyword(interrupt, "tool_reason"):
         kwargs["tool_reason"] = tool_reason
     if interrupt_source is not None and accepts_source:
