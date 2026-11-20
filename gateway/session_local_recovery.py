@@ -507,6 +507,18 @@ async def restore_completion_route(runner, session_key):
         await restore_local_session_async(authority, parsed['chat_id'])
 
 
+def restore_completion_route_blocking(runner, session_key):
+    """``restore_completion_route`` for a caller that is not a coroutine (the auto-resume scheduler
+    building a parent's stand-in): the same restore through the blocking store path."""
+    from gateway.run import _parse_session_key
+    from gateway.session_authorities import active_authority
+    authority, parsed = active_authority(runner), _parse_session_key(session_key) or {}
+    if authority is None or parsed.get('platform') != Platform.LOCAL.value or parsed['chat_id'] in authority.sessions:
+        return
+    with contextlib.suppress(RuntimeStoreError):
+        restore_local_session(authority, parsed['chat_id'])
+
+
 def release_handed_off_receipts(db, *, epoch):
     """Boot heal for #143286: an older build's ``/handoff`` (or a platform ``/resume``) moved a local
     session onto a messaging lane but kept its local receipt, so every open, pin or rename refused it

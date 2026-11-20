@@ -357,7 +357,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
         reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
         attended_pinned=_NO_ATTENDED_ACTIVITY_STAMP, attended_pin_until=None, allow_switch_back=False, assignment=None,
-        durable_activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, route_active=_NO_ATTENDED_ACTIVITY_STAMP,
+        durable_activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, route_active=_NO_ATTENDED_ACTIVITY_STAMP, record_notice=True,
     ):
         """Return the one authoritative desired route decision for a gateway session.
 
@@ -373,8 +373,9 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         override = assignment.get("override", override)
         if not cfg.enabled and not model_role:
             return None
-        state = state if state is not None else self._session_state(session_key)
-        conversation = state.conversation
+        state = state if state is not None or not record_notice else self._session_state(session_key)
+        from gateway.session_state import ConversationState
+        conversation = state.conversation if state is not None else ConversationState()
         new_session_pending = bool(new_session or getattr(conversation, "attended_new_session", False))
         new_session = new_session_pending and cfg.start_new_sessions
         stamp = conversation.last_user_activity_at
@@ -385,12 +386,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                 durable_stamp = self._load_attended_activity_stamp(session_key, refresh=allow_switch_back)
             if durable_stamp is not None and (stamp is None or durable_stamp > stamp):
                 stamp = durable_stamp
-        if new_session:
+        if new_session and record_notice:
             # Routing is probed repeatedly before the first request (including image preparation).
             # Keep first-turn silence through every probe, not just the first route resolution.
             # Inbound finalization clears the marker on success, failure, and interruption.
             stamp, _ = self._ensure_attended_new_session_activity(session_key, cfg, stamp)
-        self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
+        if record_notice:
+            self._handoff_attended_state(session_key, conversation={"last_user_activity_at": stamp})
         model_scope = assignment.get("model_scope", getattr(conversation, "model_override_scope", "session"))
         if "reasoning_override" in assignment:
             reasoning_value = assignment["reasoning_override"]
@@ -451,6 +453,8 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             decision = dataclasses.replace(
                 decision, new_session=new_session, switched_back=switched_back,
             )
+        if not record_notice:
+            return decision
         if decision is previous_decision:
             log_decision = getattr(self, "_log_attended_decision", None)
             if callable(log_decision):
@@ -475,7 +479,7 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         reasoning_override=_NO_ATTENDED_ACTIVITY_STAMP,
         reasoning_scope=None, default_reasoning=None, attended_reasoning=None,
         attended_pinned=_NO_ATTENDED_ACTIVITY_STAMP, attended_pin_until=None, allow_switch_back=False, assignment=None,
-        durable_activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, route_active=_NO_ATTENDED_ACTIVITY_STAMP,
+        durable_activity_stamp=_NO_ATTENDED_ACTIVITY_STAMP, route_active=_NO_ATTENDED_ACTIVITY_STAMP, record_notice=True,
     ):
         """Build the detached attended route and stage its one-line notice on the session."""
         decision = self._attended_resolution_for_session(
@@ -485,10 +489,13 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
             reasoning_scope=reasoning_scope, default_reasoning=default_reasoning,
             attended_reasoning=attended_reasoning, attended_pinned=attended_pinned, attended_pin_until=attended_pin_until,
             allow_switch_back=allow_switch_back, assignment=assignment,
-            durable_activity_stamp=durable_activity_stamp, route_active=route_active,
+            durable_activity_stamp=durable_activity_stamp, route_active=route_active, record_notice=record_notice,
         )
         if decision is None:
             return None
+        if not record_notice:
+            from gateway.run_session_readback import attended_runtime_route
+            return attended_runtime_route(decision) if decision.reason in {"attended", "role"} else None
         conversation = self._session_state(session_key).conversation
         cfg = parse_attended_config(user_config or {})
         if decision.switched_back and cfg.notices:
@@ -3261,10 +3268,10 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
     def _run_agent_schedule_bubble_cleanup(self, response: Any, _cleanup_adapter: Any, turn_ctx: TurnContext) -> None:
         """Register turn-local deletion, awaited after confirmed final delivery."""
         ids, key = turn_ctx._cleanup_msg_ids, turn_ctx.session_key
-        delivery = turn_ctx._status_delivery
+        delivery = getattr(turn_ctx, "_status_delivery", None)
         if delivery is not None:
             delivery.closed = True
-        if turn_ctx._bubble_cleanup_registered:
+        if getattr(turn_ctx, "_bubble_cleanup_registered", False):
             return
         if not (
             turn_ctx._cleanup_progress and _cleanup_adapter is not None and (ids or delivery is not None) and key

@@ -1069,8 +1069,14 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
             )
             return True  # handled (silently dropped); do not fall through
         # A steered or queued follow-up never reaches _hm_admit_event, so the budget is charged here.
-        if not (self._admit_bot_message_for_source(event.source) and self._admit_bot_chain(event)):
+        charge = object() if event.source.is_bot else None
+        if not self._admit_bot_message_for_source(event.source, charge=charge):
             return True
+        if not self._admit_bot_chain(event):
+            return True
+        if charge is not None:
+            event._busy_bot_loop_charge = (
+                self._bot_loop_guard_instance(), self._bot_loop_guard_conversation(event.source), charge)
         event._bot_loop_admitted = True
 
         # Adapter-owned busy sessions bypass normal inbound and turn-start admission.

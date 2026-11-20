@@ -42,7 +42,7 @@ logger = logging.getLogger("gateway.run")
 _TIER_FROM_RUNNER = object()
 
 
-def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=None) -> tuple[str, dict]:
+def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=None, record_notice=True) -> tuple[str, dict]:
     """``_resolve_session_agent_runtime`` for a session bound to a launch policy: the route's FROZEN
     config and launch credential, walking its own fallback chain on an AuthError unless
     ``fallback=False`` (a session control asking which route the session itself runs). Module-level
@@ -344,7 +344,7 @@ def load_session_agent_runtime(*, source, skey, user_config, config, override, l
 class GatewayTurnPrepareMixin:
     def _resolve_session_agent_runtime(
         self, *, source: Optional[SessionSource] = None, session_key: Optional[str] = None,
-        user_config: Optional[dict] = None, fallback: bool = True, assignment=None,
+        user_config: Optional[dict] = None, fallback: bool = True, assignment=None, record_notice: bool = True,
     ) -> tuple[str, dict]:
         """Resolve model/runtime for a session.
 
@@ -356,17 +356,19 @@ class GatewayTurnPrepareMixin:
         from gateway.attended_model import parse_attended_config
         from gateway.session_policy import policy_for_source
         set_pending_primary_auth_failure(None)
-        self._pre_agent_fallback_notice = None
+        if record_notice:
+            self._pre_agent_fallback_notice = None
         policy = policy_for_source(self, source) if source is not None else None
         if policy is not None:
             from gateway.run_turn_prepare import _resolve_policy_agent_runtime
             return _resolve_policy_agent_runtime(
                 self, policy, fallback=fallback,
-                session_key=self._resolve_session_key_or_none(source, session_key))
+                session_key=self._resolve_session_key_or_none(source, session_key), record_notice=record_notice)
         skey = self._resolve_session_key_or_none(source, session_key)
-        self._last_attended_decision = None
-        self._pre_agent_fallback_notice = None
-        if skey and assignment is None:
+        if record_notice:
+            self._last_attended_decision = None
+            self._pre_agent_fallback_notice = None
+        if record_notice and skey and assignment is None:
             self._rehydrate_session_model_override(skey)
             self._expire_attended_temporary_picks(skey, user_config)
             if parse_attended_config(user_config or {}).enabled:
@@ -383,7 +385,7 @@ class GatewayTurnPrepareMixin:
             self, source=source, skey=skey, user_config=user_config,
             override=override, last_model=last_model, attended_route=attended_route,
         )
-        return self._commit_session_agent_runtime(skey, resolved)
+        return self._commit_session_agent_runtime(skey, resolved) if record_notice else resolved[:2]
 
     def _resolve_turn_agent_config(self, user_message: str, model: str, runtime_kwargs: dict, *,
                                    tier: Any = _TIER_FROM_RUNNER) -> dict:

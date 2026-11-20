@@ -34,6 +34,7 @@ class _Burst:
     timer: asyncio.Task | None = None
     commit: asyncio.Task | None = None
     absorbed: list = field(default_factory=list)
+    charges: list = field(default_factory=list)
     # The head's ingress context, holding its off-loop authorization secrets. The commit runs in
     # it whoever flushes the burst (its timer, a command, an internal completion).
     context: contextvars.Context | None = None
@@ -135,6 +136,8 @@ async def _dispatch_busy_burst(adapter, runner, event, session_key):
                 burst.head, event):
             merge_pending_message_event({session_key: burst.head}, session_key, event, merge_text=kind == 'text')
             burst.absorbed.append(event)
+            if getattr(event, '_busy_bot_loop_charge', None) is not None:
+                burst.charges.append(event._busy_bot_loop_charge)
             note_busy_merged(burst.head, event)
             burst.last_ts = time.monotonic()
             _arm(adapter, session_key, burst)
@@ -151,6 +154,8 @@ async def _dispatch_busy_burst(adapter, runner, event, session_key):
     now = time.monotonic()
     burst = bursts[session_key] = _Burst(event, asyncio.get_running_loop().create_future(), now, now,
                                          context=contextvars.copy_context())
+    if getattr(event, '_busy_bot_loop_charge', None) is not None:
+        burst.charges.append(event._busy_bot_loop_charge)
     _arm(adapter, session_key, burst)
     return await _accepted(adapter, burst, event)
 
@@ -262,11 +267,10 @@ def discard_busy_burst(adapter, session_key):
     burst = adapter.__dict__.get('_shared_bursts', {}).pop(session_key, None)
     if burst is not None:
         burst.timer.cancel()
+        for guard, conversation, charge in burst.charges:
+            guard.refund(conversation, charge)
         for event in (burst.head, *burst.absorbed):
-            receipt = event.__dict__.pop('_busy_bot_loop_charge', None)
-            if receipt is not None:
-                guard, conversation, charge = receipt
-                guard.refund(conversation, charge)
-                event._bot_loop_admitted = False
+            event.__dict__.pop('_busy_bot_loop_charge', None)
+            event._bot_loop_admitted = False
         settle_busy_arrival(burst.head, discarded=True)
         burst.done.done() or burst.done.set_result(None)
