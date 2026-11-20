@@ -6830,11 +6830,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         from .telegram_markdown import normalize_latex_macros
         content = map_outside_code(content, normalize_latex_macros)
         # A doubled literal backslash is data (for example, an escaped Windows
-        # path or an intentionally escaped macro), not a Markdown escape. Keep
-        # it out of the emphasis parser, which otherwise consumes one slash.
-        def _protect_literal_backslashes(prose: str) -> str:
-            return prose.replace("\\\\", _ph(_escape_mdv2("\\\\")))
-        content = map_outside_code(content, _protect_literal_backslashes)
+        # path or an intentionally escaped macro), not a Markdown escape. The
+        # final MarkdownV2 escape pass doubles each slash once, so double this
+        # input run first to preserve both literal slashes in the delivered text.
+        content = map_outside_code(content, lambda prose: prose.replace("\\\\", "\\\\\\\\"))
         # Rewrite GFM-style pipe tables into Telegram-friendly row groups.
         from .copy_quotes import protect_copy_quotes
         text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
