@@ -753,7 +753,7 @@ def _resolve_child_runtime(
     child_reasoning = _child_reasoning(parent_agent, delegation_cfg, override_reasoning_effort)
     child_reasoning = dict(child_reasoning) if isinstance(child_reasoning, dict) else child_reasoning
     route_config = delegation_cfg if routing_cfg is None else routing_cfg
-    fallback_chain_owned = isinstance(route_config, dict) and "fallback_providers" in route_config
+    fallback_chain_owned = isinstance(route_config, dict) and route_config.get("fallback_providers") is not None
     # The tool passes an authored route separately from its resolved model, so a
     # provider-only route's default model is not a pin. For direct callers without
     # an authored route, a supplied model is itself the explicit selection.
