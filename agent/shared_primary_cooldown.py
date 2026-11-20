@@ -949,7 +949,22 @@ def complete_primary_recovery(agent) -> bool:
         return True
     record = getattr(agent, "_shared_primary_cooldown_record", None)
     if not isinstance(record, dict):
-        return False
+        pending = getattr(agent, "_pending_primary_restore_notice", None)
+        if not isinstance(pending, dict):
+            return False
+        if (str(getattr(agent, "model", "") or "") != str(pending.get("model") or "")
+                or str(getattr(agent, "provider", "") or "") != str(pending.get("provider") or "")):
+            agent._pending_primary_restore_notice = None
+            return False
+        agent._pending_primary_restore_notice = None
+        with contextlib.suppress(Exception):
+            agent._emit_diagnostic_status(
+                ContextNotice(
+                    f"✅ Primary model restored: {pending['model']} via {pending['provider']}; "
+                    f"fallback {pending['previous_model']} via {pending['previous_provider']} is no longer active."
+                )
+            )
+        return True
     if getattr(agent, "_fallback_activated", False):
         return False
     route = route_from_record(record)
