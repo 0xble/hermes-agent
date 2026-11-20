@@ -59,19 +59,29 @@ def request_hard_interrupt(
         interrupt_source = SYSTEM_INTERRUPT_SOURCE
     # Every explicit producer leaves a trusted stop category for delegation results.
     # _signal_child_stop supplies system causes first; do not turn shutdown into a user cancel.
+    accepts_source = _accepts_keyword(interrupt, "interrupt_source")
     try:
         reason = delegation_reason or getattr(agent, "_delegation_interrupt_reason", None)
         if not isinstance(reason, str) or not reason:
             reason = "cancel"
         agent._delegation_interrupt_reason = reason
-        if interrupt_source:
+        # Let InterruptControlMixin's publication guard decide whether a system stop may
+        # replace a pending user interrupt. Legacy callables have no source parameter, so
+        # preserve the metadata only when no user interrupt is already pending.
+        user_interrupt_pending = (
+            getattr(agent, "_interrupt_requested", False)
+            and getattr(agent, "_tool_interrupt_reason", None) in {
+                "explicit stop requested", "user sent a new message", "user interrupt",
+            }
+        )
+        if interrupt_source and not accepts_source and not user_interrupt_pending:
             agent._interrupt_source = interrupt_source
     except Exception:
         pass  # metadata must not break legacy/immutable interrupt facades
     kwargs = {}
     if tool_reason is not None and _accepts_keyword(interrupt, "tool_reason"):
         kwargs["tool_reason"] = tool_reason
-    if interrupt_source is not None and _accepts_keyword(interrupt, "interrupt_source"):
+    if interrupt_source is not None and accepts_source:
         kwargs["interrupt_source"] = interrupt_source
     if message is None:
         interrupt(**kwargs)

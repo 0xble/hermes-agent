@@ -228,10 +228,10 @@ class InterruptControlMixin:
         )
 
         def _publish_interrupt_state() -> None:
-            # A shutdown stop never relabels a user Stop already pending (the user's Stop wins): the turn
-            # records the first cause, so it is not announced as interrupted by the restart. A pending
-            # redirect (a mid-request correction) is not a Stop: the restart drops it and is the cause.
-            if not (tool_reason == _REASON_GATEWAY_SHUTDOWN and getattr(self, "_interrupt_requested", False)
+            # A shutdown or other system stop never relabels a pending user Stop or message (the user
+            # wins): the turn records the first cause, so the user's text stays a durable follow-up.
+            if not ((tool_reason == _REASON_GATEWAY_SHUTDOWN or _interrupt_source == "system")
+                    and getattr(self, "_interrupt_requested", False)
                     and getattr(self, "_tool_interrupt_reason", None) in USER_INTERRUPT_REASONS):
                 self._interrupt_message = message
                 self._tool_interrupt_reason = tool_interrupt_reason

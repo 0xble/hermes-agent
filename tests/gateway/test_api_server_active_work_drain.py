@@ -322,6 +322,19 @@ def _make_async_noop():
     return _noop
 
 
+
+@pytest.mark.asyncio
+async def test_session_stream_disconnect_uses_soft_system_interrupt():
+    adapter = APIServerAdapter(PlatformConfig(enabled=True))
+    agent = MagicMock()
+    task = asyncio.create_task(asyncio.sleep(0))
+    await asyncio.sleep(0)
+    adapter._active_run_agents = {"run-1": agent}
+    await adapter._drain_session_stream_task_on_disconnect(
+        "run-1", task, interrupt_message="SSE client disconnected", shield_wait=False)
+    agent.interrupt.assert_called_once_with("SSE client disconnected", interrupt_source="system")
+
+
 class TestRunAgentRegistersForShutdownInterrupt:
     @pytest.mark.asyncio
     async def test_run_agent_registers_and_unregisters_the_agent(self):

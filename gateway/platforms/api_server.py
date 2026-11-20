@@ -3737,7 +3737,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     await task
             return
         with suppress(Exception):
-            request_hard_interrupt(agent, interrupt_message, interrupt_source="system")
+            agent.interrupt(interrupt_message, interrupt_source="system")
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)

@@ -246,7 +246,7 @@ class _SideQuestionStop:
             fork = self._fork
         if fork is not None:
             from agent.interrupt_compat import request_hard_interrupt
-            request_hard_interrupt(fork, message, interrupt_source=interrupt_source or "system")
+            request_hard_interrupt(fork, message, interrupt_source=interrupt_source)
 
     def abandoned(self):
         """Stopped with no fork running: what is left publishes nothing and writes nothing."""

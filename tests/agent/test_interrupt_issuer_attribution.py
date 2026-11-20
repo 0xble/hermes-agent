@@ -248,3 +248,20 @@ def test_soft_interrupt_with_tool_reason_is_attributed_to_the_system():
         assert interrupt_skip_wording(agent) == "Turn aborted — guard {x}"
     finally:
         set_interrupt(False)
+
+
+def test_codex_turn_result_carries_system_interrupt_source():
+    """The Codex path hands the recorded source to the gateway drain with the message."""
+    from agent.codex_runtime import _consume_user_interrupt
+
+    agent = _bare_agent()
+    agent.clear_interrupt = lambda: None
+    try:
+        request_hard_interrupt(agent, "unregistered internal reason", interrupt_source="system")
+        assert _consume_user_interrupt(agent) == (True, "unregistered internal reason", "system")
+        user = _bare_agent()
+        user.clear_interrupt = lambda: None
+        user.interrupt("please use staging")
+        assert _consume_user_interrupt(user) == (True, "please use staging", None)
+    finally:
+        set_interrupt(False)
