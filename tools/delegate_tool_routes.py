@@ -427,19 +427,29 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
     from agent.delegation_backends import pinned_backend
     if pinned := pinned_backend(parent_agent):
         config = {**config, "backend": pinned}
-    try:
-        provider = _active_provider(config)
-    except DelegationRouteError as exc:
-        return [], str(exc)
-    declared = _declared_parameters(provider, config)
+    # A task naming a model alias never consults the backend, so only tasks without one need it to be runnable.
+    needs_backend = [not task.get("model") for task in task_list]
+    provider: Optional[DelegationProvider] = None
+    backend_error: Optional[str] = None
+    declared: dict[str, dict[str, Any]] = {}
+    if any(needs_backend):
+        try:
+            provider = _active_provider(config)
+            declared = _declared_parameters(provider, config)
+        except DelegationRouteError as exc:
+            if all(needs_backend):
+                return [], str(exc)
+            backend_error = str(exc)
     cache: dict[str, TaskRoute] = {}
     routes: list[TaskRoute] = []
     for i, task in enumerate(task_list):
+        backend = ALIAS_BACKEND if not needs_backend[i] else provider.name if provider else "unavailable"
         try:
             effort = _task_effort(i, task)
-            route, backend = _alias_route(i, task), ALIAS_BACKEND
+            route = _alias_route(i, task)
             if route is None:
-                backend = provider.name
+                if provider is None:
+                    raise DelegationRouteError(f"Task {i}: {backend_error}")
                 if provider.name == "model_map" and not task.get("option"):
                     default = provider.settings(config).get("default")
                     options = declared.get("option", {}).get("enum", [])
@@ -454,7 +464,7 @@ def resolve_task_routes(task_list: list[dict[str, Any]], config: Mapping[str, An
             resolved = replace(resolved, routing_cfg=routing_cfg, reasoning_cfg=dict(resolved.routing_cfg))
             routes.append(resolved if effort is None else replace(resolved, reasoning_effort=effort))
         except ValueError as exc:  # DelegationRouteError, the credential resolver's and the tier check's refusals
-            routes.append(TaskRoute({}, {}, backend=provider.name, error=str(exc)))
+            routes.append(TaskRoute({}, {}, backend=backend, error=str(exc)))
     return routes, None
 
 

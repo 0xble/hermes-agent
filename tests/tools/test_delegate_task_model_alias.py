@@ -122,6 +122,19 @@ def test_explicit_effort_beats_alias_role_and_parent_defaults(cfg):
     assert result[2].creds["model"] == "critical-model"
 
 
+def test_unavailable_backend_never_blocks_an_explicit_alias(cfg, monkeypatch):
+    """The backend is consulted only for tasks without `model`: when it cannot run, alias tasks still route,
+    role tasks are refused alone, and an all-role batch fails closed as before."""
+    def unavailable(_cfg):
+        raise routes.DelegationRouteError("delegation backend 'gone' is not installed")
+
+    monkeypatch.setattr(routes, "_active_provider", unavailable)
+    (alias, role), err = routes.resolve_task_routes([{"goal": "a", "model": "fable"}, {"goal": "r"}], {}, _parent())
+    assert err is None and alias.error is None and alias.creds["model"] == "claude-fable-5-2"
+    assert role.error and "not installed" in role.error
+    assert routes.resolve_task_routes([{"goal": "r"}], {}, _parent()) == ([], "delegation backend 'gone' is not installed")
+
+
 def test_unset_model_keeps_the_role_route(cfg):
     (route,), _ = routes.resolve_task_routes([{"goal": "g", "option": "critical"}], {}, _parent())
     assert route.creds["model"] == "critical-model" and route.report() == {"backend": "test-roles",
