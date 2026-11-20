@@ -1420,7 +1420,7 @@ class SessionAuthority:
                 if live.rescan:
                     continue
                 from gateway.session_retirement import retire_at_idle
-                retire_at_idle(self, ref, live)
+                await retire_at_idle(self, ref, live)
                 return
             admission_id = row['admission_id']
             try:
