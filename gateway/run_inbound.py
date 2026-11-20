@@ -37,7 +37,12 @@ from gateway.run_inbound_media import rehome_inbound_media
 from gateway.run_inbound_hooks import GatewayInboundHooksMixin
 from gateway.run_loop_wake import GatewayLoopWakeMixin, _CommandDispatch, _CommandHandled
 from gateway.run_inbound_moa import GatewayInboundMoaMixin
-from gateway.run_inbound_transcription import GatewayInboundTranscriptionMixin
+from gateway.run_inbound_transcription import (
+    GatewayInboundTranscriptionMixin,
+    _dedupe_audio_paths,
+    stt_enabled_for_turn,
+    transcript_note,
+)
 from gateway.run_plugin_injection import GatewayPluginInjectionMixin
 from gateway.run_turn_setup_guard import cancel_preagent_setup, pending_setup_busy_notice
 from gateway.run_inbound_unauthorized import (
@@ -2772,18 +2777,15 @@ class GatewayInboundMixin(
             )
         # Plain quoted line: a "The user sent a voice message..." wrapper read as a meta-instruction
         # and made the LLM comment on voice mode instead.
-        return transcript, f'"{transcript}"'
+        return transcript, transcript_note(transcript, path)
 
     async def _enrich_message_with_transcription(
         self, user_text: str, audio_paths: list[str], clip_memo: dict | None = None
     ) -> tuple[str, list[str]]:
-        """Transcribe voice clips with the configured STT provider and prepend the transcripts →
-        ``(enriched_text, successful_transcripts)``; the transcripts (input order; empty if every clip
-        failed or STT is disabled) let callers echo them back before the agent loop. ``clip_memo``
-        (path → ``_transcribe_one_clip`` result) skips clips an earlier pass already transcribed."""
+        """Transcribe voice clips once, retaining media markers for every successful clip."""
         from gateway.run import _probe_audio_duration
-        audio_paths = list(dict.fromkeys(audio_paths))
-        if not getattr(self.config, "stt_enabled", True):
+        audio_paths = await asyncio.to_thread(_dedupe_audio_paths, audio_paths)
+        if not stt_enabled_for_turn(self):
             notes = []
             for path in audio_paths:
                 abs_path = os.path.abspath(path)
@@ -2791,31 +2793,24 @@ class GatewayInboundMixin(
                 suffix = f" (duration: {duration_str})" if duration_str else ""
                 notes.append(f"[The user sent a voice message: {abs_path}{suffix}]")
             return (self._prepend_media_prefix("\n\n".join(notes), user_text) if notes else user_text), []
-
         try:
-            from tools.transcription_tools import (
-                transcribe_audio, transcribe_audio_local_fallback
-            )
+            from tools.transcription_tools import transcribe_audio, transcribe_audio_local_fallback
         except ModuleNotFoundError as e:
             logger.error("Transcription module unavailable: %s", e)
             return self._prepend_media_prefix("[voice message could not be transcribed]", user_text), []
-
         enriched_parts = []
         successful_transcripts: list[str] = []
         for path in audio_paths:
-            if clip_memo is not None and path in clip_memo:
-                transcript, note = clip_memo[path]
-                if transcript is not None:
-                    successful_transcripts.append(transcript)
-                enriched_parts.append(note)
-                continue
             try:
-                logger.debug("Transcribing user voice: %s", path)
-                transcript, note = await self._transcribe_one_clip(
-                    path, transcribe_audio, transcribe_audio_local_fallback,
-                )
-                if clip_memo is not None:
-                    clip_memo[path] = (transcript, note)
+                if clip_memo is not None and path in clip_memo:
+                    transcript, note = clip_memo[path]
+                else:
+                    logger.info("Transcribing user voice: %s", path)
+                    transcript, note = await self._transcribe_one_clip(
+                        path, transcribe_audio, transcribe_audio_local_fallback,
+                    )
+                    if clip_memo is not None:
+                        clip_memo[path] = (transcript, note)
                 if transcript is not None:
                     successful_transcripts.append(transcript)
                 enriched_parts.append(note)
@@ -2825,7 +2820,6 @@ class GatewayInboundMixin(
                 if clip_memo is not None:
                     clip_memo[path] = (None, note)
                 enriched_parts.append(note)
-
         if enriched_parts:
             user_text = self._prepend_media_prefix("\n\n".join(enriched_parts), user_text)
         return user_text, successful_transcripts
