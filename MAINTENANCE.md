@@ -195,6 +195,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Background turn admission | Cap running turns nobody typed (restart resumes, goal/loop wakes, completions) gateway-wide, never gate typed input, and refuse rather than drop queued wakes on drain | Wake admission, restart resume scheduling, the replay scheduler, or `gateway.background_turn_concurrency` | [Background turn admission](maintenance/background-turn-admission.md) |
 | Restart notices | Scope shutdown notices to conversation lanes, preserve interim streams, and describe the actual resume policy | Shutdown advisories, home-channel broadcast, or restart notice wording | [Restart notices](maintenance/restart-notices.md) |
 | Bounded restart shutdown | Retain unverifiable survivors, signal active workers before scope cleanup, and refresh escaped descendants before escalation | Process-registry bounded shutdown, detached identity, or systemd scope cleanup changes | [Bounded terminal shutdown](maintenance/seamless-restart.md) |
+| Missed inbound recovery | Slack DMs and @-mentions sent while the platform was disconnected are answered late through the live inbound handler, once, behind `gateway.missed_inbound_recovery.enabled` | The recovery module, its `state_meta` watermark or claims, the Slack scan, or the Slack inbound prefilter, accept point or Socket Mode restart | [Missed inbound recovery](maintenance/missed-inbound-recovery.md) |
 | Zero-cut gateway handover | Design-only two-slot launchd handover behind `gateway.zero_cut_handover.enabled` (off); with the switch off, restart and shutdown behavior is unchanged | The handover flag, second launchd slot labels, standby readiness, or this design record | [Zero-cut gateway handover](maintenance/zero-cut-handover.md) |
 | Restart verification truth | Cover cron drain in the bounded observer wait, preserve outgoing inventory PIDs, and treat saved obligations as history | CLI update/restart wait, fleet snapshot, or pending warning changes | [Restart verification truth](maintenance/restart-verification-truth.md) |
 | Delegation restart drain | Planned restarts wait for live background delegations, and interrupted children report why they stopped | Restart wait, shutdown drain accounting, CLI exit-wait budget, or child interrupt reporting | [Delegation restart drain](maintenance/delegation-restart.md) |
@@ -515,6 +516,16 @@ Fork-Patch-Backfill: 0f3af0ef0c43ad57eeedc58dd375566f83698699; gateway-transport
 - **Focused regression:** `scripts/run_tests.sh tests/plugins/test_telegram_first_poll_fast_ptb.py tests/plugins/test_telegram_polling_progress_ptb.py tests/gateway/test_telegram_polling_progress.py`.
 - **Retirement:** Remove when upstream or PTB proves first-poll health without an idle long poll. Review on any PTB 23+ upgrade (private `RequestParameter`).
 - **Rollback:** Revert the commit carrying `Fork-Patch: telegram-first-poll-health`.
+
+## Active patch record: missed inbound recovery
+
+- **Patch identity:** `missed-inbound-recovery`.
+- **Behavior:** When a platform connects, the messages people sent it during the offline interval are fetched and handed to the adapter's own inbound handler with a late note, so authorization, mention rules, gating, session routing and threading are those of a live message. The interval runs from a per-platform last-connected watermark to the reconnect, capped at 24 hours. Each message is claimed in `state_meta` before dispatch and the claim is never released. At most 20 messages are dispatched per scan. Overflow gets 1 summary line per conversation. Slack is the only adapter that implements the scan.
+- **Source surfaces:** `gateway/missed_inbound_recovery.py`, `hermes_state_missed_inbound.py`, `plugins/platforms/slack/adapter_missed_inbound.py`, the 4 hooks in `plugins/platforms/slack/adapter.py` (`_restart_socket_mode`, `_prefilter_inbound`, the accept point and the `handle_message` call in `_handle_slack_message`), `GatewayConfig.missed_inbound_recovery_enabled`, `_publish_primary_adapter` in `gateway/run_adapters.py`, and [Missed inbound recovery](maintenance/missed-inbound-recovery.md).
+- **Upstream status:** Upstream has no recovery of messages missed while a Socket Mode app was disconnected. No equivalent upstream fix found.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_missed_message_ack.py tests/plugins/platforms/slack/test_missed_message_ack.py`.
+- **Retirement:** Remove when upstream answers messages missed during a disconnect, or when Slack queues events for a disconnected Socket Mode app.
+- **Rollback:** Set `gateway.missed_inbound_recovery.enabled: false`, or revert the commit carrying `Fork-Patch: missed-inbound-recovery`. The `missed_inbound:*` rows in `state_meta` are inert without the code.
 
 ## Active patch record: update post-swap claim
 
