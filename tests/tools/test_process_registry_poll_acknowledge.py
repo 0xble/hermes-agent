@@ -26,7 +26,7 @@ def _watcher_turns(session_id: str) -> list:
     runner = object.__new__(GatewayRunner)
     turns = []
 
-    async def _enqueue(synth_text, evt):
+    async def _enqueue(synth_text, evt, **_kwargs):
         turns.append(synth_text)
         return True
 

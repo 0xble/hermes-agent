@@ -600,8 +600,12 @@ def _manual_run_completion(
     if refreshed.get("next_run_at"):
         lines.append(f"Next scheduled run: {refreshed['next_run_at']}")
     reached_nobody = not deliver or deliver == "local" or refreshed.get("last_delivery_reached_none")
-    excerpt = ((str((execution or {}).get("output") or "")[-4000:] if execution_id else
-                _latest_job_output_excerpt(job_id)) if reached_nobody else None)
+    excerpt = None
+    if reached_nobody:
+        if execution_id:
+            excerpt = str((execution or {}).get("output") or "")[-4000:] or _latest_job_output_excerpt(job_id)
+        else:
+            excerpt = _latest_job_output_excerpt(job_id)
     if excerpt:
         lines += ["--- JOB OUTPUT ---", excerpt]
     return {
@@ -705,7 +709,7 @@ def _try_dispatch_background_run(
         toolsets=None, role="cron_run", model=None, session_key=session_key,
         parent_session_id=str(session_id) if session_id else None, runner=_runner,
         origin_ui_session_id=origin_ui_session_id, origin_session_id=origin_session_id,
-        max_async_children=max_async,
+        max_async_children=max_async, max_queued_delegations=0,
         cron_execution={
             "cron_execution_id": str((claimed_job or {}).get("execution_id") or ""),
             "cron_job_id": job_id, "cron_job_name": job_name,

@@ -709,6 +709,8 @@ def _routine_process_stop(evt: dict) -> bool:
 
 def _completion_status(evt: dict) -> str:
     reason = evt.get("completion_reason") or "exited"
+    if reason == "failed_start":
+        return "failed to start"
     if reason == "killed":
         if _routine_process_stop(evt):
             return "stopped before it finished"

@@ -1993,6 +1993,10 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             # A preview taken before the reader's final drain is partial and must not suppress the completion.
             if not finalizing:
                 self._poll_observed.add(session_id)
+                self._poll_observed.add(session.id)
+                if acknowledge:
+                    self._completion_consumed.add(session_id)
+                    self._completion_consumed.add(session.id)
         if session.detached and session.pid_scope == "host" and not session.output_log:
             result["detached"] = True
             if not self._file_backed(session):
@@ -2105,8 +2109,9 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             **ProcessRegistry._exit_fields(session), **_completion_output(session), **process_provenance(session)}
 
     def _uncollected_gone(self, session: Optional[ProcessSession]) -> bool:
-        """True when a detached entry was closed without a collected exit status
-        and the PID is no longer alive. List/poll must not report that as exited."""
+        """True when a detached entry was closed without a collected exit status and the PID is no
+        longer alive. Such a record is still retained and listed: callers need to see the unknown
+        outcome and can then poll it."""
         return bool(
             session is not None and session.exited and session.exit_code is None
             and session.detached and session.pid_scope == "host"
@@ -2408,7 +2413,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
         all_sessions = [
             refreshed for refreshed in (
                 self._refresh_detached_session(s) for s in selected
-            ) if refreshed is not None and not self._uncollected_gone(refreshed)
+            ) if refreshed is not None
         ]
         if task_id or session_key:
             all_sessions = [
