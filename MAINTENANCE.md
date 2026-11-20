@@ -180,6 +180,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | State.db prune lock batching | Automatic and operator session prunes delete only in the deletion window (operator override `--now`), one pass per store, in short paced transactions without full receipt scans, with actionable long-lock diagnostics | Session auto-prune, retention maintenance, SQLite write-lock diagnostics, or pruning regressions | [State.db prune lock batching](maintenance/state-db-prune-lock-batching.md) |
 | Session admission adoption index | Worker adoption probes only `started`/`unknown` admissions through a partial index, keeping terminal admission history out of the write transaction's candidate scan | `adopt_worker_execution`, `_linked_worker_admission`, session-admission schema indexes, or adoption-plan regressions | [Session admission adoption index](maintenance/session-admission-adoption-index.md) |
 | State write-lock hold indexes | Receipt handoff and held-media writer scans use plan-pinned indexes, while session-row prompt cleanup targets only the newly inserted hash | Local receipt handoff, held-media collection, prompt cleanup, or state.db write-lock plan regressions | [State write-lock hold indexes](maintenance/state-write-lock-hold-indexes.md) |
+| FTS writer-side automatic merge | Keep SQLite FTS5 segment merges off response-critical message-trigger writes while bounded maintenance merges preserve eventual index maintenance | FTS schema setup, FTS5 merge policy, or state.db writer-lock regressions | [FTS writer-side automatic merge](maintenance/fts-writer-automerge.md) |
 | Desktop idle session refresh cost | Bound metadata serialization and preview projection without changing polling or session-list semantics | Change watcher signatures, preview SQL or recent session-list queries | [Desktop idle CPU](maintenance/desktop-idle-cpu.md) |
 | Gateway scan poll | Reuse skills-tree signatures for a few seconds instead of walking them on every prompt or lookup. config.yaml stays signature-checked on every load | Skills manifest walks or catalog signatures on a hot path | [Gateway scan poll](maintenance/gateway-scan-poll.md) |
 | Desktop core completion recovery | Preserve local completion admission and live subscriptions across socket replacement | Local-source admission, canonical replay/attach or Desktop active-list settlement changes | [Desktop core recovery](maintenance/desktop-core-completion-recovery.md) |
@@ -320,6 +321,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `tests/tools/test_web_exa_lite_routing.py::test_search_hits_carry_exa_preview_images`.
 - **Retirement:** Remove when upstream search results carry provider preview images.
 - **Rollback:** Revert the commit carrying `Fork-Patch: exa-result-images`.
+
+## Active Patch Record: FTS writer-side automatic merge
+
+- **Patch identity:** `fts-writer-automerge`.
+- **Behavior:** Disable SQLite FTS5 automatic segment merges for the shipped word and trigram indexes during message-trigger writes. The existing bounded maintenance merge path remains responsible for eventual segment maintenance outside the application writer guard.
+- **Source surfaces:** `hermes_state_fts.py`, `tests/hermes_state/test_hermes_state.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_state/test_hermes_state.py -k 'fts_automerge_is_disabled_for_writer_transactions or incremental_merge_bounded_commands_per_present_index'`.
+- **Contract tests:** `tests/hermes_state/test_fts_automerge.py`.
+- **Retirement:** Remove when upstream prevents automatic FTS5 merge work from running in the response-critical insert path while retaining bounded maintenance merges.
+- **Rollback:** Revert the commit carrying `Fork-Patch: fts-writer-automerge`.
 
 Fork-Patch-Backfill: 0f3af0ef0c43ad57eeedc58dd375566f83698699; gateway-transport-rebind
 

@@ -17,8 +17,10 @@ _metrics: ContextVar[dict | None] = ContextVar("compaction_publication_metrics",
 
 
 class _PublicationCursor(sqlite3.Cursor):
-    completed_rows = 0
-    closed = False
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.completed_rows = 0
+        self.closed = False
 
     def _complete(self):
         self.completed_rows = self.written_rows()
