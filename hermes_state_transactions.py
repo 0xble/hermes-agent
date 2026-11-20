@@ -146,7 +146,11 @@ def settle_write_transaction(
         held_s = clock.monotonic() - started
         if cursors is not None:
             conn.publication_cursors = None
-        record_publication_write(hold_s=held_s, rows_written=sum(cursor.written_rows() for cursor in cursors or ()))
+        # Publication telemetry follows the attempt-local logical row ledger. SQLite's
+        # direct cursor rowcounts also include maintenance updates performed by the
+        # callback, while the write metrics already exclude trigger and FTS work and
+        # preserve rolled-back attempt scope.
+        record_publication_write(hold_s=held_s, rows_written=sum(metrics.rows.values()))
         if held_s >= warn_s or acquire_s >= warn_s:
             name = getattr(fn, "__qualname__", type(fn).__qualname__)[:160]
             observe_safely(observation.warn, logger,
