@@ -37,6 +37,14 @@ from hermes_cli.config_backend import require_file_tooling, supports_file_toolin
 from hermes_cli.home_data_layout import PM_RUNTIME_ROOT_DIRS, SECRET_CACHE_FILES, profile_root_entry
 from hermes_cli.sizefmt import format_bytes as _format_size
 from hermes_cli.backup_snapshot_integrity import payload_digest, payload_matches
+from hermes_cli.backup_filesystem import (
+    device_number as _device_number,
+    is_mount_or_foreign_filesystem as _is_mount_or_foreign_filesystem,
+    iter_external_files as _iter_external_files,
+    iter_quick_snapshot_candidates as _quick_snapshot_candidates,
+    _is_link_path,
+    record_skipped_mount as _record_skipped_mount,
+)
 
 def _prune_incomplete_zips(backup_dir: Path, prefix: str, what: str) -> int:
     """Keep only the newest ``<prefix>*.incomplete.zip`` salvage archive; return count deleted.
@@ -297,21 +305,6 @@ def _collect_memory_provider_external_paths() -> list[Path]:
     return list(out.values())
 
 
-def _iter_external_files(base: Path) -> list[Path]:
-    """Regular files under *base* (a file or a directory), skipping symlinks, caches, and pyc."""
-    if base.is_file() and not base.is_symlink():
-        return [base]
-    if not base.is_dir():
-        return []
-    files: list[Path] = []
-    for dirpath, dirnames, filenames in os.walk(base, followlinks=False):
-        dirnames[:] = [d for d in dirnames if d not in _EXCLUDED_DIRS]
-        files.extend(fp for fp in (Path(dirpath) / f for f in filenames)
-                     if not (_is_non_regular_path(fp) or fp.name in _EXCLUDED_NAMES
-                             or fp.name.endswith(_EXCLUDED_SUFFIXES)))
-    return files
-
-
 def _is_non_regular_path(path: Path) -> bool:
     """True for symlinks, sockets, devices, and other non-regular filesystem entries.
 
@@ -322,19 +315,6 @@ def _is_non_regular_path(path: Path) -> bool:
         return not stat.S_ISREG(path.lstat().st_mode)
     except OSError:
         return False
-
-
-def _is_link_path(path: Path) -> bool:
-    """True for symlinks and Windows junctions/reparse points — the only
-    directory entries a strict walk must never descend (os.walk already
-    refuses POSIX dir symlinks; this also covers junctions, which it follows)."""
-    try:
-        info = path.lstat()
-    except OSError:
-        return False
-    if stat.S_ISLNK(info.st_mode):
-        return True
-    return os.name == "nt" and bool(getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
 
 
 def _should_exclude(rel_path: Path) -> bool:
@@ -356,15 +336,24 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
     excluded tree, the root-only ``hermes-agent`` carve-out, root runtime trees, per-file rules),
     shared by ``hermes backup`` and the pre-update path so they can never drift.
     """
+    root_device = _device_number(hermes_root)
+    if root_device is None:
+        return
     for dirpath, dirnames, filenames in os.walk(hermes_root, followlinks=False):
         rel_dir = Path(dirpath).relative_to(hermes_root)
         is_root = rel_dir == Path(".")
-        kept = [
-            d for d in dirnames
-            if (d not in _EXCLUDED_DIRS or (d == "hermes-agent" and not is_root))
-            and not _in_excluded_root_dir(rel_dir / d)]
+        kept = []
+        for name in dirnames:
+            candidate = Path(dirpath) / name
+            if _is_mount_or_foreign_filesystem(candidate, root_device):
+                _record_skipped_mount(candidate, hermes_root, skipped_dirs)
+                continue
+            if ((name not in _EXCLUDED_DIRS or (name == "hermes-agent" and not is_root))
+                    and not _in_excluded_root_dir(rel_dir / name)):
+                kept.append(name)
         if skipped_dirs is not None:
-            skipped_dirs.update(str(rel_dir / d) for d in set(dirnames) - set(kept))
+            skipped_dirs.update(str(rel_dir / d) for d in set(dirnames) - set(kept)
+                                if str(rel_dir / d) not in skipped_dirs)
         # No walk may follow a junction.
         dirnames[:] = [name for name in kept if not _is_link_path(Path(dirpath) / name)]
         for fname in filenames:
@@ -699,23 +688,32 @@ def _resolve_backup_output_path(output: Optional[str]) -> Path:
     return out_path
 
 
-def _collect_external_entries() -> tuple[list[tuple[Path, str]], list[str]]:
-    """``([(abs_path, arcname)], [skipped])`` for the memory provider's external state, arc-named
-    ``_external/<home-relative>``; paths outside home are skipped (security + portability)."""
+def _collect_external_entries() -> tuple[list[tuple[Path, str]], list[str], list[str]]:
+    """``([(abs_path, arcname)], [skipped], [skipped_mounts])`` for the memory provider's
+    external state, arc-named ``_external/<home-relative>``; paths outside home are skipped
+    (security + portability)."""
     home_dir = Path.home().resolve()
+    home_device = _device_number(home_dir)
     external_to_add: list[tuple[Path, str]] = []
     skipped_external: list[str] = []
+    skipped_mounts: list[str] = []
     for base in _collect_memory_provider_external_paths():
         try:
-            base.resolve().relative_to(home_dir)
+            resolved_base = base.resolve()
+            rel_base = resolved_base.relative_to(home_dir)
         except (ValueError, OSError):
             skipped_external.append(str(base))
             continue
-        for fpath in _iter_external_files(base):
+        if home_device is None or _is_mount_or_foreign_filesystem(base, home_device):
+            skipped_mounts.append(rel_base.as_posix())
+            _record_skipped_mount(base, home_dir, None)
+            continue
+        for fpath in _iter_external_files(base, _EXCLUDED_DIRS, _EXCLUDED_NAMES, _EXCLUDED_SUFFIXES,
+                                           home_dir):
             with suppress(ValueError, OSError):
                 rel_to_home = fpath.resolve().relative_to(home_dir)
                 external_to_add.append((fpath, _EXTERNAL_PREFIX + rel_to_home.as_posix()))
-    return external_to_add, skipped_external
+    return external_to_add, skipped_external, skipped_mounts
 
 
 def run_backup(args) -> bool:
@@ -749,7 +747,8 @@ def _run_backup_locked(args, hermes_root: Path) -> bool:
     print(f"Scanning {display_hermes_home()} ...")
     skipped_dirs: set = set()
     files_to_add: list[tuple[Path, Path]] = list(_iter_backup_files(hermes_root, out_path, skipped_dirs))
-    external_to_add, skipped_external = _collect_external_entries()
+    external_to_add, skipped_external, skipped_external_mounts = _collect_external_entries()
+    skipped_dirs.update(skipped_external_mounts)
     if not files_to_add and not external_to_add:
         logger.info("backup phase=scan status=empty duration_ms=%.1f", (time.monotonic() - scan_started) * 1000)
         print("No files to back up.")
@@ -1264,34 +1263,21 @@ def create_quick_snapshot(
         return _create_quick_snapshot_locked(label, home, keep, max_file_size)
 
 
-def _quick_snapshot_candidates(home: Path):
-    """Yield ``(src, rel_posix, in_dir)`` for every regular file a quick snapshot captures; heavy
-    regenerable per-board subtrees (workspaces, attachments) are skipped."""
-    for rel in _QUICK_STATE_FILES:
-        src = home / rel
-        if src.is_dir():
-            for sub in filter(Path.is_file, src.rglob("*")):
-                sub_rel = sub.relative_to(home).as_posix()
-                if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
-                    continue
-                yield sub, sub_rel, True
-        elif src.is_file():
-            yield src, rel, False
-
-
 def _copy_quick_snapshot_files(
     home: Path, staging_dir: Path, max_file_size: Optional[int]
-) -> tuple[dict[str, int], list[str], list[str], list[str]]:
+) -> tuple[dict[str, int], list[str], list[str], list[str], list[str]]:
     """Copy every quick-snapshot candidate into *staging_dir*.
 
-    Returns ``(manifest {rel: size}, failed_dbs, oversized_skipped, failed_files)``.
-    Every omission must reach retention so older verified recovery copies survive.
+    Returns ``(manifest {rel: size}, failed_dbs, oversized_skipped, failed_files,
+    skipped_mounts)``. Every omission must reach retention so older verified recovery
+    copies survive.
     """
     manifest: dict[str, int] = {}
     failed_dbs: list[str] = []
     oversized_skipped: list[str] = []
     failed_files: list[str] = []
-    for src, rel, in_dir in _quick_snapshot_candidates(home):
+    skipped_mounts: set[str] = set()
+    for src, rel, in_dir in _quick_snapshot_candidates(home, _QUICK_STATE_FILES, skipped_mounts):
         if max_file_size is not None:
             try:
                 size = src.stat().st_size
@@ -1333,7 +1319,7 @@ def _copy_quick_snapshot_files(
             failed_files.append(rel)
             print(f"  ⚠ Snapshot: could not snapshot {rel} — file omitted: {exc}")
             logger.warning("Could not snapshot %s: %s", rel, exc)
-    return manifest, failed_dbs, oversized_skipped, failed_files
+    return manifest, failed_dbs, oversized_skipped, failed_files, sorted(skipped_mounts)
 
 
 def _secure_quick_snapshot_tree(root: Path, snapshot_dir: Path) -> None:
@@ -1389,7 +1375,7 @@ def _create_quick_snapshot_locked(
             logger.warning("Removed abandoned snapshot staging %s", stale.name)
     staging_dir.mkdir(mode=0o700, exist_ok=False)
     logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
-    manifest, failed_dbs, oversized_skipped, failed_files = _copy_quick_snapshot_files(
+    manifest, failed_dbs, oversized_skipped, failed_files, skipped_mounts = _copy_quick_snapshot_files(
         home, staging_dir, max_file_size)
     if failed_dbs:
         # Surface on stdout: a log-and-continue made a missing state.db backup look like a
@@ -1409,7 +1395,7 @@ def _create_quick_snapshot_locked(
         "id": snap_id, "timestamp": ts, "label": label, "file_count": len(manifest),
         "total_size": sum(manifest.values()), "files": manifest,
         "failed_dbs": failed_dbs, "oversized_skipped": oversized_skipped,
-        "failed_files": failed_files,
+        "failed_files": failed_files, "skipped_mounts": skipped_mounts,
     }
     with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -1430,6 +1416,8 @@ def _create_quick_snapshot_locked(
     if oversized_skipped:
         print("  ⚠ Snapshot omits oversized file(s): " + ", ".join(oversized_skipped))
         logger.warning("Quick snapshot skipped oversized file(s): %s", ", ".join(oversized_skipped))
+    if skipped_mounts:
+        print("  ⚠ Snapshot skipped mount point(s): " + ", ".join(skipped_mounts))
     _prune_quick_snapshots(
         root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep,
         namespace="pre-update" if label == "pre-update" else "manual",
@@ -2328,14 +2316,15 @@ def _prune_quick_snapshots(
         failed = meta.get("failed_dbs") or []
         oversized = meta.get("oversized_skipped") or []
         failed_files = meta.get("failed_files") or []
-        if not all(isinstance(paths, list) for paths in (failed, oversized, failed_files)):
+        skipped_mounts = meta.get("skipped_mounts") or []
+        if not all(isinstance(paths, list) for paths in (failed, oversized, failed_files, skipped_mounts)):
             continue
-        omissions.update(rel for rel in failed + oversized + failed_files if isinstance(rel, str))
+        omissions.update(rel for rel in failed + oversized + failed_files + skipped_mounts if isinstance(rel, str))
         # Prove one complete anchor, newest first. Once it exists, discarded
         # generations need no payload reads. A retained database is checked
         # only until its path has a verified anchor. Same-size corruption is
         # an omission too, but restore validates every payload independently.
-        if not found_complete and not failed and not oversized and not failed_files and all(
+        if not found_complete and not failed and not oversized and not failed_files and not skipped_mounts and all(
                 isinstance(rel, str) and usable(directory, rel, size, meta)
                 for rel, size in files.items()):
             retained.add(directory)
