@@ -298,7 +298,12 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Go write lint scope | Post-write lint for `.go` files checks syntax with `gofmt -e`, leaving type, vet and lint checks to package-level gates and the Go LSP | Post-write shell linters, Go lint commands, or LSP redundancy rules in `tools/file_operations_lint.py` | [Go write lint scope](maintenance/go-write-lint.md) |
 | Embedded cua-driver lifetime | Keep each `cua-driver serve --embedded` process and its `hc-` socket from outliving the Hermes process that spawned it, including macOS `open` detachment | Embedded daemon spawn, stop, session release, or gateway/CLI startup | [Embedded cua-driver lifetime](maintenance/cua-driver-lifetime.md) |
 
-Patch identity: `async-delegation-origin-route`
+## Active Patch Record: Async delegation origin route
+
+- **Patch identity:** `async-delegation-origin-route`.
+- **Behavior:** Detached delegation captures the complete originating message route, including an explicit empty thread for top-level messages, so restored completions stay in the asking thread without inheriting stale topic state.
+- **Source surfaces:** `tools/async_delegation.py`, `tools/async_delegation_ledger.py`, `gateway/run_notifications_sources.py`.
+- **Rollback:** Revert commits carrying `Fork-Patch: async-delegation-origin-route`.
 
 ## Active Patch Record: Release-bound launcher recovery
 

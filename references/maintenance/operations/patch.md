@@ -3,7 +3,7 @@
 ## async-delegation-origin-route
 
 - **Contract:** Detached delegation events persist the originating platform, chat, thread and message route before child construction. Completion turns and replies therefore stay in the asking Slack thread, while top-level messages remain top-level and Telegram topics retain their thread.
-- **Source:** `tools/async_delegation.py`, `gateway/run_notifications_sources.py`; regression `tests/tools/test_async_delegation_routing.py`.
+- **Source:** `tools/async_delegation.py`, `tools/async_delegation_ledger.py`, `gateway/run_notifications_sources.py`; regressions `tests/tools/test_async_delegation_routing.py`, `tests/gateway/test_process_event_source_recovery.py`.
 - **Verification:** `scripts/run_tests.sh tests/tools/test_async_delegation_routing.py tests/gateway/test_process_event_source_recovery.py -q --file-retries 0`, plus the existing async delegation and gateway completion suites.
 - **Rollback:** Revert the routing-key expansion and regression file. No schema migration because the envelope is stored in existing JSON fields.
 - **Retirement:** Remove when upstream persists the complete originating message route for detached completions.
