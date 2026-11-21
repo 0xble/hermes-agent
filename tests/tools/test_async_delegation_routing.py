@@ -25,7 +25,7 @@ def test_slack_thread_route_is_persisted_on_completion(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     q = queue.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", q)
-    tokens = set_session_vars(
+    set_session_vars(
         platform="slack", chat_type="dm", chat_id="D0TEST", thread_id="1795210800.890719",
         message_id="1795210800.890719", scope_id="TTEST",
     )
@@ -46,7 +46,7 @@ def test_top_level_route_keeps_thread_empty(tmp_path, monkeypatch):
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     q = queue.Queue()
     monkeypatch.setattr(process_registry, "completion_queue", q)
-    tokens = set_session_vars(platform="slack", chat_type="dm", chat_id="D0TEST", thread_id="")
+    set_session_vars(platform="slack", chat_type="dm", chat_id="D0TEST", thread_id="")
     try:
         record = _record()
         record.update(delegation._capture_routing_origin())
