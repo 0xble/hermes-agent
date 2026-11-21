@@ -24,7 +24,14 @@ def notify_provider_out_of_credits(provider: str) -> None:
 
     def _send() -> None:
         try:
-            subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10)
+            subprocess.run(
+                args,
+                check=False,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+            )
         except (OSError, subprocess.SubprocessError):
             logger.debug("Provider credit notice could not be sent", exc_info=True)
 
