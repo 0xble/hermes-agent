@@ -39,8 +39,19 @@ async def fetch_telegram_file(source: Any, what: str, local_root: str | None = N
                     from plugins.platforms.telegram.telegram_media_fetch import local_bot_api_path
                     host_path = await asyncio.to_thread(
                         local_bot_api_path, getattr(file_obj, "file_path", None), local_root) if local_root else None
-                    data = (await asyncio.to_thread(host_path.read_bytes) if host_path else
-                            bytes(await file_obj.download_as_bytearray(**_timeouts(attempt))))
+                    if local_root:
+                        assert host_path is not None
+                        data = await asyncio.to_thread(host_path.read_bytes)
+                    else:
+                        try:
+                            downloaded = await file_obj.download_as_bytearray(**_timeouts(attempt))
+                        except TypeError as exc:
+                            # Small PTB-compatible test doubles and older wrappers may expose
+                            # download_as_bytearray() without timeout keywords.
+                            if "unexpected keyword argument" not in str(exc):
+                                raise
+                            downloaded = await file_obj.download_as_bytearray()
+                        data = bytes(downloaded)
                     if attempt > 1:
                         logger.info("[Telegram] %s: media fetch recovered on attempt %d/3", what, attempt)
                     return file_obj, data
