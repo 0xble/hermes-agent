@@ -362,13 +362,25 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # readers. Keep their real initialization (including SOUL.md) inside this test,
     # rather than materializing those profiles in the checkout shared by workers.
     set_home_override = hermes_constants.set_hermes_home_override
+    get_home_override = hermes_constants.get_hermes_home_override
 
     def isolated_home_override(value):
         if value is not None and not Path(value).is_absolute():
             value = fake_hermes_home / "profile-scopes" / value
         return set_home_override(value)
 
+    def isolated_get_home_override():
+        # Some profile-scope modules import set_hermes_home_override before this
+        # fixture patches the module attribute. Normalize those aliases at the
+        # read boundary too; otherwise a symbolic authority id such as "owned"
+        # can still become a relative HERMES_HOME.
+        value = get_home_override()
+        if value is not None and not Path(value).is_absolute():
+            return str(fake_hermes_home / "profile-scopes" / value)
+        return value
+
     monkeypatch.setattr(hermes_constants, "set_hermes_home_override", isolated_home_override)
+    monkeypatch.setattr(hermes_constants, "get_hermes_home_override", isolated_get_home_override)
     # A test that pins the process home (hermes_constants.pin_process_hermes_home) must not
     # leak that module-global into the next test's routed-profile decisions.
     try:
@@ -506,6 +518,22 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
+
+    # A symbolic authority profile must never materialize a home in the checkout
+    # that runs the suite. Keep this guard narrow: tests may create arbitrary
+    # temporary directories, but top-level ``owned``/``fixture`` are synthetic
+    # profile ids, not repository artifacts.
+    checkout_root = Path(__file__).resolve().parent.parent
+    forbidden_homes = tuple(checkout_root / name for name in ("owned", "fixture"))
+
+    def assert_no_checkout_homes():
+        leaked = [str(path) for path in forbidden_homes if path.exists()]
+        if leaked:
+            raise AssertionError(f"test created a Hermes home in the checkout root: {leaked}")
+
+    assert_no_checkout_homes()
+    yield
+    assert_no_checkout_homes()
 
 
 # Backward-compat alias — old tests reference this fixture name. Keep it
@@ -979,6 +1007,16 @@ def _reset_tui_gateway_server_state():
 def tmp_dir(tmp_path):
     """Provide a temporary directory that is cleaned up automatically."""
     return tmp_path
+
+
+@pytest.fixture
+def authority_cwd_in_tmp(tmp_path, monkeypatch):
+    """Run in ``tmp_path`` for tests whose authority has a symbolic ``profile_id`` ('owned',
+    'fixture', ...). Production passes the profile's absolute home; a symbolic id is a RELATIVE
+    path, so the authority's profile-scoped work (an ``on_session_open`` delivery loading config)
+    created ``<cwd>/<id>/`` in the checkout. Opt-in (``usefixtures``), never autouse: most tests rely
+    on the checkout as cwd."""
+    monkeypatch.chdir(tmp_path)
 
 
 @pytest.fixture()
