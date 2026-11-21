@@ -987,7 +987,7 @@ def static(env: dict[str, str]) -> None:
 
 # Hermes picks DELETE journal mode on a SQLite with the WAL-reset bug, and the WAL test arms skip
 # there, so a vulnerable interpreter would pass every lane without exercising WAL. Fail closed.
-SQLITE_WAL_PROBE = ("import sqlite3, sys, hermes_state_wal as w; v = w.is_sqlite_wal_reset_vulnerable(); "
+SQLITE_WAL_PROBE = ("import sqlite3, sys, sqlite_support as w; v = w.is_sqlite_wal_reset_vulnerable(); "
                     "print(f'SQLite {sqlite3.sqlite_version}, WAL-reset vulnerable: {v}'); sys.exit(1 if v else 0)")
 
 
