@@ -79,7 +79,12 @@ async def send_rich_standalone(bot, extra: dict, chat_id, content: str, *, threa
     try:
         adapter = _standalone_adapter(bot, extra)
         content = _normalize_dollar_entities(content)
-        if not adapter._should_attempt_rich(content):
+        if (
+            not adapter._rich_delivery_enabled()
+            or getattr(adapter, "_rich_send_disabled", False)
+            or not adapter._needs_rich_rendering(content)
+            or not adapter._rich_content_ok(content, check_size=False)
+        ):
             return None
     except Exception as exc:  # health: allow BLE001 -- no request has started; safe legacy fallback
         logger.warning("Telegram rich adapter unavailable, falling back to legacy: %s", _redact_telegram_error_text(exc))
