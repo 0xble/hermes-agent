@@ -2485,6 +2485,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
+    cron_cfg = _cfg.get("cron") if isinstance(_cfg.get("cron"), dict) else {}
     return AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
@@ -2501,10 +2502,9 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         fallback_model=setup.fallback_model,
         model_pinned=_job_route_pinned(job),
         fallback_chain_owned=(
-            isinstance(_cfg.get("cron"), dict)
-            and (_cfg.get("cron") or {}).get("fallback_providers") is not None
+            cron_cfg.get("fallback_providers") is not None
         ),
-        allow_billing_fallback=bool((_cfg.get("cron") or {}).get("allow_billing_fallback", False)),
+        allow_billing_fallback=bool(cron_cfg.get("allow_billing_fallback", False)),
         credential_pool=setup.credential_pool,
         providers_allowed=pr.get("only"),
         providers_ignored=pr.get("ignore"),

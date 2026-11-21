@@ -19,7 +19,7 @@ _BILLING_BODY = {
 }
 
 
-def _build_pinned_child(primary, *, failures: int, monkeypatch, allow_billing_fallback=True):
+def _build_pinned_child(primary, *, failures: int, monkeypatch, allow_billing_fallback=False):
     """Build a child through the production delegate constructor."""
     primary.primary_available = True
     primary.billing_failures = failures
@@ -146,7 +146,7 @@ def test_pinned_child_keeps_cross_model_chain_only_when_billing_fallback_enabled
     assert enabled._pinned_fallback_model == enabled.model
 
 
-def test_owned_chain_keeps_pin_until_billing_attempt():
+def test_owned_chain_never_pins():
     from types import SimpleNamespace
     from agent.agent_init_fallback import _pin_init_fallbacks
 
@@ -156,7 +156,7 @@ def test_owned_chain_keeps_pin_until_billing_attempt():
     assert _pin_init_fallbacks(disabled, chain, True, fallback_chain_owned=True) == chain
     assert _pin_init_fallbacks(enabled, chain, True, fallback_chain_owned=True) == chain
     assert disabled._pinned_fallback_model is None
-    assert enabled._pinned_fallback_model == enabled.model
+    assert enabled._pinned_fallback_model is None
 
 
 
