@@ -341,6 +341,10 @@ def _resolve_route(route: dict[str, Any], parent_agent: Any, backend: str) -> Ta
                 route.pop(key, None)
             if alias.base_url:
                 route.update(base_url=alias.base_url, api_key=alias.api_key)
+                if not alias.api_key:
+                    # This alias owns the endpoint but has no credential. Do not let child construction
+                    # inherit the parent's key across an endpoint boundary.
+                    route["_no_parent_api_key"] = True
             elif alias.api_key:
                 # A keyed alias with no URL routes by its provider label, as /model does, with its own key.
                 route["api_key"] = alias.api_key

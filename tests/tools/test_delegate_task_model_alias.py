@@ -158,6 +158,35 @@ def test_keyed_alias_without_a_url_keeps_its_own_key(cfg, monkeypatch):
     assert calls[0]["explicit_api_key"] == "alias-key" and creds["api_key"] == "alias-key"
 
 
+def test_endpoint_alias_without_a_key_cannot_inherit_parent_key(cfg, monkeypatch):
+    cfg["model_aliases"]["remote"] = {"model": "m-remote", "provider": "custom:remote",
+                                         "base_url": "https://remote.example/v1"}
+    captured = []
+    monkeypatch.setattr("tools.delegate_tool._resolve_delegation_credentials",
+                        lambda route, parent: captured.append(dict(route)) or {
+                            "model": route["model"], "provider": route["provider"], "base_url": route["base_url"],
+                            "api_key": None, "api_mode": "chat_completions", "request_overrides": {},
+                            "no_parent_api_key": route.get("_no_parent_api_key", False),
+                        })
+    (route,), err = routes.resolve_task_routes([{"goal": "g", "model": "remote"}], {}, _parent())
+    assert err is None and route.error is None
+    assert captured[0]["_no_parent_api_key"] is True
+    from tools.delegate_tool import _credential_overrides
+    overrides = _credential_overrides(route.creds, route.routing_cfg)
+    assert overrides["prevent_parent_api_key"] is True
+
+    from tools.delegate_tool_config import _resolve_child_runtime
+    parent = SimpleNamespace(model="parent", provider="custom:parent", base_url="https://parent.example/v1",
+                             api_mode="chat_completions", api_key="parent-secret", acp_command=None,
+                             acp_args=[], reasoning_config={"enabled": True, "effort": "medium"},
+                             requested_provider="custom:parent")
+    runtime = _resolve_child_runtime(parent, {}, "parent-secret", model="m-remote",
+                                     override_provider="custom:remote", override_base_url="https://remote.example/v1",
+                                     override_api_key=None, prevent_parent_api_key=True, override_api_mode="chat_completions",
+                                     override_acp_command=None, override_acp_args=[], routing_cfg={})
+    assert runtime["api_key"] is None
+
+
 def test_unset_model_keeps_the_role_route(cfg):
     (route,), _ = routes.resolve_task_routes([{"goal": "g", "option": "critical"}], {}, _parent())
     assert route.creds["model"] == "critical-model" and route.report() == {"backend": "test-roles",
