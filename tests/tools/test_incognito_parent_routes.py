@@ -32,7 +32,8 @@ def test_live_parent_private_route_builds_real_private_child_and_grandchild(
     else:
         raw["delegation"].update(model="worker-model", provider="custom:worker",
                                  base_url="https://worker.test/v1", reasoning_effort="low",
-                                 fallback_providers=[*PINNED_CHAIN, WORKER_SPARE])
+                                 fallback_providers=[*PINNED_CHAIN, WORKER_SPARE],
+                                 allow_billing_fallback=True)
     raw["context_file_max_chars"] = 256
     config_file(raw)
     workspace = tmp_path / "workspace"
