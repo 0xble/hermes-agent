@@ -159,6 +159,8 @@ class OnePasswordLoginBackend(LoginBackend):
         # A get_meta call authorizes the browser page, then the same thread's immediately
         # following secret read consumes this item metadata. It is never a general-purpose cache.
         self._fill_metadata = threading.local()
+        self._identity_lock = threading.Lock()
+        self._verified_identity: Optional[tuple[str, str]] = None
 
     @classmethod
     def additional_accounts(cls, cfg: dict) -> list[OnePasswordLoginBackend]:
@@ -200,6 +202,9 @@ class OnePasswordLoginBackend(LoginBackend):
     def _env(self, session_token: Optional[str]) -> dict[str, str]:
         from agent.secret_scope import get_secret
         env = {k: os.environ[k] for k in _OP_ENV_ALLOWLIST if k in os.environ and not k.startswith("OP_CONNECT_")}
+        # A named backend must never inherit the process-wide service token. It may
+        # belong to another account and `op` gives it precedence over OP_ACCOUNT.
+        env.pop("OP_SERVICE_ACCOUNT_TOKEN", None)
         # Connect credentials outrank OP_SERVICE_ACCOUNT_TOKEN inside op, so they must come from the
         # profile's own secret scope like the service token does — never from the launch environment.
         # An additional account never gets them: Connect would answer for a different account.
@@ -217,6 +222,54 @@ class OnePasswordLoginBackend(LoginBackend):
             # which op also accepts as plain OP_SESSION for the default account.
             env[f"OP_SESSION_{account}" if account else "OP_SESSION"] = session_token
         return env
+
+    @staticmethod
+    def _account_host(value: str) -> str:
+        from urllib.parse import urlsplit
+        raw = value.strip().lower().rstrip("/")
+        parsed = urlsplit(raw if "://" in raw else "//" + raw)
+        return (parsed.hostname or raw).rstrip(".")
+
+    def _verify_account(self, token: Optional[str]) -> None:
+        """Prove the selected token authenticates the configured account.
+
+        ``op`` can otherwise accept a named account while an ambient service token
+        determines the identity that actually answers. A successful item lookup is
+        not evidence of the requested account, so every named backend verifies
+        ``whoami`` before its first result and fails closed on any disagreement.
+        """
+        requested = str(self.cfg.get("account") or "").strip()
+        if not requested:
+            return
+        credential = self._service_token or token or ""
+        cache_key = (self._account_host(requested), _fingerprint(credential))
+        with self._identity_lock:
+            if self._verified_identity == cache_key:
+                return
+        try:
+            proc = run_cli([str(self._op()), "whoami", "--format", "json"],
+                           env=self._env(token), timeout=_TIMEOUT, label="op",
+                           timeout_message="op timed out", stdin=subprocess.DEVNULL)
+        except RuntimeError as exc:
+            raise RuntimeError(f"{self.display_name} account authentication failed for {requested}: {exc}") from None
+        if proc.returncode != 0:
+            err = _scrub(proc.stderr or "")
+            raise RuntimeError(f"{self.display_name} account authentication failed for {requested}: "
+                               f"{err[:200] or 'whoami failed'}")
+        try:
+            identity = json.loads(proc.stdout or "{}")
+        except (TypeError, ValueError):
+            raise RuntimeError(f"{self.display_name} account authentication failed for {requested}: "
+                               "whoami returned invalid identity") from None
+        authenticated = identity.get("url") if isinstance(identity, dict) else None
+        if not isinstance(authenticated, str) or not authenticated.strip():
+            raise RuntimeError(f"{self.display_name} account authentication failed for {requested}: "
+                               "whoami returned no account URL")
+        if self._account_host(authenticated) != self._account_host(requested):
+            raise RuntimeError(f"{self.display_name} account mismatch: requested {requested}, "
+                               f"authenticated {authenticated}")
+        with self._identity_lock:
+            self._verified_identity = cache_key
 
     def _connect_credentials(self):
         if self.alias:
@@ -341,6 +394,7 @@ class OnePasswordLoginBackend(LoginBackend):
         token = None if self._service_token else _unlock.get_session_token(self.name)
         if not self._service_token and not token:
             raise UnlockRequired(self)
+        self._verify_account(token)
         proc = run_cli([str(self._op()), *args], env=self._env(token), timeout=_TIMEOUT, label="op",
                        timeout_message="op timed out", stdin=subprocess.DEVNULL)
         if proc.returncode != 0:

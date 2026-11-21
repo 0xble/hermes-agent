@@ -34,6 +34,9 @@ with (root / "audit.jsonl").open("a") as stream:
 if (root / "fail").exists() or account is None:
     print("synthetic failure", file=sys.stderr)
     sys.exit(1)
+if args == ["whoami", "--format", "json"]:
+    print(json.dumps({"url": f"https://{account}.example.com"}))
+    sys.exit(0)
 delay = root / "delay"
 if delay.exists():
     time.sleep(float(delay.read_text()))
@@ -126,7 +129,7 @@ def test_one_vault_list_over_two_accounts_lists_each_once_then_reuses(env, clock
     assert sorted(c["account"] for c in calls("list")) == ["business", "personal"]
     clock[0] += 5 * 60  # (a) five minutes later, still inside the display TTL
     browser_vault_list()
-    assert len(calls()) == 2
+    assert len(calls("list")) == 2
 
 
 def test_one_fill_reads_fresh_item_metadata_without_listing(env):
@@ -256,12 +259,13 @@ def test_accounts_and_credentials_never_share_listings(env, monkeypatch):
     assert [m.id for m in business.list_items()] == ["op@business:item-b"]  # (f) other account
     assert personal.get_meta("op:item-p") and business.get_meta("op@business:item-b")
     assert len(calls("list")) == 2
-    # A rotated token is a new identity even for the same backend and account.
+    # A rotated token for another account must fail before listing or reading.
     monkeypatch.setenv("OP_SERVICE_ACCOUNT_TOKEN_BUSINESS", "dummy-personal-token")
     rotated = backend_for_handle("op@business:item-b")
-    assert [m.id for m in rotated.list_items()] == ["op@business:item-p"]
-    assert rotated.get_meta("op@business:item-p") is not None
-    assert len(calls("list")) == 3
+    assert rotated is not None
+    with pytest.raises(RuntimeError, match=r"account mismatch.*business\.example\.com"):
+        rotated.list_items()
+    assert len(calls("list")) == 2
 
 
 def test_invalidation_forgets_listings_and_drops_a_fetch_in_flight(env):
