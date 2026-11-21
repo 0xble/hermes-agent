@@ -1,5 +1,13 @@
 # Maintained fork patch register
 
+## delegated-billing-fallback (candidate)
+
+- **Contract:** With `delegation.allow_billing_fallback` or `cron.allow_billing_fallback` enabled, a billing/credits exhaustion may use the configured fallback chain even when the primary is pinned. Other failure reasons keep the model pin. Unattended `subagent` and `cron` billing failures send one provider/day priority-0 notice through `notify`.
+- **Source:** `agent/agent_init.py`, `agent/agent_init_fallback.py`, `agent/chat_completion_helpers.py`, `agent/route_binding.py`, `agent/billing_notice.py`, `tools/delegate_tool_config.py`, `cron/scheduler.py`, `hermes_cli/config_defaults.py`; regressions in `tests/agent/test_billing_notice.py`, `tests/agent/test_pinned_model_fallback.py`, `tests/tools/test_delegate_fallback_matrix.py`.
+- **Verification:** Focused delegation, billing-notice and fallback-matrix tests pass with scratch homes. Full exact-head gate remains required before publication.
+- **Rollback:** Revert the source/config-key changes and matching tests. No state migration or dependency change.
+- **Retirement:** Remove when a released upstream implementation preserves cross-model billing fallback and provider/day notification behavior.
+
 ## fts-writer-automerge
 
 See [FTS writer-side automatic merge](../../../maintenance/fts-writer-automerge.md)

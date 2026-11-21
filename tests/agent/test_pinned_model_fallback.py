@@ -19,7 +19,7 @@ _BILLING_BODY = {
 }
 
 
-def _build_pinned_child(primary, *, failures: int, monkeypatch):
+def _build_pinned_child(primary, *, failures: int, monkeypatch, allow_billing_fallback=True):
     """Build a child through the production delegate constructor."""
     primary.primary_available = True
     primary.billing_failures = failures
@@ -29,7 +29,11 @@ def _build_pinned_child(primary, *, failures: int, monkeypatch):
         "provider": "custom", "model": harness.FALLBACK_MODEL,
         "base_url": primary.url, "api_key": "fixture", "api_mode": "chat_completions",
     }]
-    routing_cfg = {"model": harness.PRIMARY_MODEL, "fallback_providers": fallback}
+    routing_cfg = {
+        "model": harness.PRIMARY_MODEL,
+        "fallback_providers": fallback,
+        "allow_billing_fallback": allow_billing_fallback,
+    }
     with patch("tools.delegate_tool._load_config", return_value={}):
         child: Any = _build_child_agent(
             task_index=0, goal="say hello", context=None, toolsets=[],
@@ -127,6 +131,21 @@ def test_pinned_delegate_falls_back_after_proxy_503(tmp_path, monkeypatch):
     assert [request["model"] for request in primary.requests if request["model"] is not None] == [
         harness.PRIMARY_MODEL, harness.FALLBACK_MODEL,
     ]
+
+
+def test_pinned_child_keeps_cross_model_chain_only_when_billing_fallback_enabled():
+    from types import SimpleNamespace
+    from agent.agent_init_fallback import _pin_init_fallbacks
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"}]
+    disabled = SimpleNamespace(model="gpt-6.2-sol", allow_billing_fallback=False)
+    enabled = SimpleNamespace(model="gpt-6.2-sol", allow_billing_fallback=True)
+    assert _pin_init_fallbacks(disabled, chain, True) == []
+    assert _pin_init_fallbacks(enabled, chain, True) == chain
+    assert disabled._pinned_fallback_model == disabled.model
+    assert enabled._pinned_fallback_model == enabled.model
+
+
 
 
 @pytest.mark.parametrize("served", ["other-model", None])

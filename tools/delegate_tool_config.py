@@ -773,6 +773,9 @@ def _resolve_child_runtime(
         # this chain through the spare guards and lets the child return to the primary mid-turn.
         "model_pinned": model_pinned,
         "fallback_chain_owned": fallback_chain_owned,
+        "allow_billing_fallback": bool(
+            (route_config or {}).get("allow_billing_fallback", delegation_cfg.get("allow_billing_fallback", False))
+        ),
         "fallback_model": _resolve_child_fallback_chain(
             parent_agent, route_config,
             pinned=bool(model_pinned or override_provider or override_base_url or model)),
