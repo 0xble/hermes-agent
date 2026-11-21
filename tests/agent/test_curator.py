@@ -858,6 +858,9 @@ def test_review_fork_forwards_runtime_pool_and_overrides(curator_env, monkeypatc
             self._session_messages = []
 
         def run_conversation(self, user_message=None, **kwargs):
+            from agent.proxy_request_class import turn_request_class
+
+            captured["request_class"] = turn_request_class(self)
             return {"final_response": "ok"}
 
         def close(self):
@@ -882,6 +885,7 @@ def test_review_fork_forwards_runtime_pool_and_overrides(curator_env, monkeypatc
     assert meta.get("error") is None, meta.get("error")
     assert captured["kwargs"]["credential_pool"] is fake_pool
     assert captured["kwargs"]["request_overrides"] == fake_overrides
+    assert captured["request_class"] == "background"
 
 
 def test_review_fork_receives_configured_reasoning(curator_env, monkeypatch):

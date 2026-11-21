@@ -189,6 +189,7 @@ class DurableTurnLease:
                 return
             agent._interrupt_requested = False
             agent._interrupt_message = None
+            agent._interrupt_source = None
             getattr(agent, "_hard_interrupt_requested", threading.Event()).clear()
             agent._interrupt_thread_signal_pending = False
             if agent._execution_thread_id is not None:

@@ -381,7 +381,7 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
             continue
         worker.stop_cause = reason
         try:
-            worker.control({'type': 'stop'})
+            worker.control({'type': 'stop', 'source': 'system'})
         except RuntimeStoreError as exc:
             # A full control queue: control() latched worker.stop first, and the owner's read
             # loop escalates on that latch alone (terminate after STOP_ACK_SECONDS).
@@ -403,7 +403,7 @@ def stop_authority_turns(authority, *, in_process=False, reason=None):
         if agent is None or agent is _AGENT_PENDING_SENTINEL:
             authority.pending_stops[sid] = generation
         else:
-            request_hard_interrupt(agent, 'Profile stopping', tool_reason='gateway shutdown')
+            request_hard_interrupt(agent, 'Profile stopping', tool_reason='gateway shutdown', interrupt_source="system")
         signalled += 1
     return signalled
 

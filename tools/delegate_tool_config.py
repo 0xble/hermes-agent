@@ -753,6 +753,7 @@ def _resolve_child_runtime(
     child_reasoning = _child_reasoning(parent_agent, delegation_cfg, override_reasoning_effort)
     child_reasoning = dict(child_reasoning) if isinstance(child_reasoning, dict) else child_reasoning
     route_config = delegation_cfg if routing_cfg is None else routing_cfg
+    fallback_chain_owned = isinstance(route_config, dict) and route_config.get("fallback_providers") is not None
     # The tool passes an authored route separately from its resolved model, so a
     # provider-only route's default model is not a pin. For direct callers without
     # an authored route, a supplied model is itself the explicit selection.
@@ -771,6 +772,7 @@ def _resolve_child_runtime(
         # it: construction adopts the shared cooldown (``_adopt_shared_primary_cooldown``), which walks
         # this chain through the spare guards and lets the child return to the primary mid-turn.
         "model_pinned": model_pinned,
+        "fallback_chain_owned": fallback_chain_owned,
         "fallback_model": _resolve_child_fallback_chain(
             parent_agent, route_config,
             pinned=bool(model_pinned or override_provider or override_base_url or model)),

@@ -12,7 +12,7 @@ from contextvars import ContextVar
 
 from hermes_state_runtime import RuntimeStoreError
 
-_SUBMIT_FIELDS = ('turn_author', 'api_text', 'model_override', 'clarify_batch')
+_SUBMIT_FIELDS = ('turn_author', 'turn_origin', 'api_text', 'model_override', 'clarify_batch')
 _API_TEXT_LIMIT = 1_000_000
 _cli_turn: ContextVar[tuple | None] = ContextVar('cli_turn', default=None)
 
@@ -31,6 +31,11 @@ def admit_cli_turn(params):
         if author is None:
             raise RuntimeStoreError('invalid_params')
         committed['turn_author'] = author
+    if (origin := params.get('turn_origin')) is not None:
+        # Only the classic CLI's scheduler origins may override human prompt ingress.
+        committed['turn_origin'] = (
+            origin if isinstance(origin, str) and origin in {'user', 'goal_loop', 'process'} else 'user'
+        )
     api_text = params.get('api_text')
     if api_text is not None:
         if not isinstance(api_text, str) or len(api_text) > _API_TEXT_LIMIT:

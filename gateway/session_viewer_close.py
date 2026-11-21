@@ -321,7 +321,7 @@ async def settle_viewer_close(authority, session_id):
     if not live.subscribers:  # ended: no viewer is left to replay to; a resume refetches history
         live.event_stream.release()
     from gateway.session_retirement import retire_closed
-    retire_closed(authority, session_id, live, target, idle_stamp)
+    await retire_closed(authority, session_id, live, target, idle_stamp)
 
 
 async def _resolve_abandoned_unknown(authority, session_id, live, close):

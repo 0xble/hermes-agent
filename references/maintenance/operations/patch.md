@@ -1,5 +1,10 @@
 # Maintained fork patch register
 
+## fts-writer-automerge
+
+See [FTS writer-side automatic merge](../../../maintenance/fts-writer-automerge.md)
+for the live evidence, contract, verification, rollback and retirement condition.
+
 ## kanban-submit-registration (candidate; activation held)
 
 Harden the existing submitter registration before owner admission: resolve

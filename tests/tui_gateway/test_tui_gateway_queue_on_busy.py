@@ -62,7 +62,7 @@ def test_busy_interrupt_mode_redirects_active_turn(monkeypatch):
     seen = []
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: seen.append(text) or True,
+        redirect=lambda text, **_kwargs: seen.append(text) or True,
         interrupt=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("redirect must not hard-interrupt")
         ),
@@ -92,7 +92,7 @@ def test_successful_redirect_drops_queued_duplicate_of_inflight_user(monkeypatch
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: True,
+        redirect=lambda text, **_kwargs: True,
         interrupt=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("redirect must not hard-interrupt")
         ),
@@ -130,7 +130,7 @@ def test_successful_redirect_preserves_unrelated_queued_followups(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: True,
+        redirect=lambda text, **_kwargs: True,
         interrupt=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("redirect must not hard-interrupt")
         ),
@@ -237,7 +237,7 @@ def test_hard_interrupt_queue_path_scrubs_stale_inflight_self_duplicate(monkeypa
     interrupts = []
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: False,  # force hard-interrupt fallback
+        redirect=lambda text, **_kwargs: False,  # force hard-interrupt fallback
         interrupt=lambda *a, **k: interrupts.append(True),
     )
     session = _session(agent=agent, running=True)
@@ -263,7 +263,7 @@ def test_redirect_then_drain_does_not_re_fire_original_p(monkeypatch):
     fired = []
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: True,
+        redirect=lambda text, **_kwargs: True,
         interrupt=lambda *a, **k: (_ for _ in ()).throw(
             AssertionError("redirect must not hard-interrupt")
         ),
@@ -373,7 +373,7 @@ def test_busy_interrupt_mode_ignores_completed_background_delegation(monkeypatch
 
 def test_busy_steer_mode_injects_when_accepted(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
-    agent = types.SimpleNamespace(steer=lambda text: True, interrupt=lambda *a, **k: None)
+    agent = types.SimpleNamespace(steer=lambda text, **_kwargs: True, interrupt=lambda *a, **k: None)
     session = _session(agent=agent, running=True)
 
     resp = server._handle_busy_submit("r1", "sid", session, "nudge", "ws-1")
@@ -394,7 +394,7 @@ def test_busy_steer_fallthrough_queues_without_interrupting(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
     interrupted = threading.Event()
     agent = types.SimpleNamespace(
-        steer=lambda text: False,  # steer rejected → falls through to queue
+        steer=lambda text, **_kwargs: False,  # steer rejected → falls through to queue
         interrupt=lambda *a, **k: interrupted.set(),
     )
     session = _session(agent=agent, running=True)
@@ -411,7 +411,7 @@ def test_busy_steer_exception_falls_back_to_queue_without_interrupting(monkeypat
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
     interrupted = threading.Event()
     agent = types.SimpleNamespace(
-        steer=lambda text: (_ for _ in ()).throw(RuntimeError("boom")),
+        steer=lambda text, **_kwargs: (_ for _ in ()).throw(RuntimeError("boom")),
         interrupt=lambda *a, **k: interrupted.set(),
     )
     session = _session(agent=agent, running=True)
@@ -433,7 +433,7 @@ def test_busy_steer_mode_multimodal_payload_queues_without_interrupting(monkeypa
     steered = []
     interrupted = threading.Event()
     agent = types.SimpleNamespace(
-        steer=lambda text: steered.append(text) or True,
+        steer=lambda text, **_kwargs: steered.append(text) or True,
         interrupt=lambda *a, **k: interrupted.set(),
     )
     session = _session(agent=agent, running=True)
@@ -461,7 +461,7 @@ def test_busy_steer_burst_mix_preserves_accepted_steers_and_queue(monkeypatch):
             self.accept = True
             self.interrupted = threading.Event()
 
-        def steer(self, text):
+        def steer(self, text, *, human=True):
             if not self.accept:
                 return False
             self._pending_steer = (
@@ -498,7 +498,7 @@ def test_busy_steer_fallthrough_burst_drains_all_texts_fifo(monkeypatch):
     monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "steer")
     interrupted = threading.Event()
     agent = types.SimpleNamespace(
-        steer=lambda text: False,
+        steer=lambda text, **_kwargs: False,
         interrupt=lambda *a, **k: interrupted.set(),
     )
     session = _session(agent=agent, running=True)
@@ -549,7 +549,7 @@ def test_busy_interrupt_mode_queues_multimodal_payload_instead_of_redirect(monke
     ]
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: seen.append(text) or True,
+        redirect=lambda text, **_kwargs: seen.append(text) or True,
         interrupt=lambda *a, **k: None,
     )
     session = _session(agent=agent, running=True)
@@ -568,7 +568,7 @@ def test_busy_submit_claims_attached_image_for_queued_turn(monkeypatch):
     interrupted = threading.Event()
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda text: redirected.append(text) or True,
+        redirect=lambda text, **_kwargs: redirected.append(text) or True,
         interrupt=interrupted.set,
     )
     session = _session(agent=agent, running=True, attached_images=["/tmp/b.png"])
@@ -601,7 +601,7 @@ def test_busy_image_prompts_keep_b_and_c_attachments_in_submission_order(monkeyp
     )
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
-        redirect=lambda _text: (_ for _ in ()).throw(AssertionError("images must queue")),
+        redirect=lambda _text, **_kwargs: (_ for _ in ()).throw(AssertionError("images must queue")),
         interrupt=lambda: None,
     )
     session = _session(agent=agent, running=True, attached_images=["/tmp/b.png"])

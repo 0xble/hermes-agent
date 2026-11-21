@@ -1003,9 +1003,11 @@ def _is_transient_transport_error(e: BaseException) -> bool:
 
 from plugins.platforms.slack.adapter_thread_titles import SlackThreadTitlesMixin
 from plugins.platforms.slack.adapter_thread_status import SlackThreadStatusMixin
+from plugins.platforms.slack.adapter_missed_inbound import SlackMissedInboundMixin
 
 
-class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitlesMixin, BasePlatformAdapter):
+class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitlesMixin,
+                   SlackMissedInboundMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1326,6 +1328,7 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             await self._stop_socket_mode_handler()
             try:
                 self._start_socket_mode_handler()
+                self._missed_inbound_transport_restarted()
             except Exception as exc:  # pragma: no cover - defensive logging
                 logger.error("[Slack] Socket Mode reconnect failed: %s", exc, exc_info=True)
 
@@ -4235,13 +4238,11 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             if normalized_event is None:
                 return None
             event = normalized_event
-        # Socket Mode redelivers after reconnects. Scope by workspace: ts is only unique per team.
-        # Dedup: Slack Socket Mode can redeliver events after reconnects (#4777) Scope the dedup id by
-        # workspace: Slack event ts values are only unique within one workspace, so two teams' events with
-        # the same ts must not suppress each other.
+        # Socket Mode redelivers after reconnects (#4777). Scope by workspace: ts is only unique per team.
         event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
         dedup_team_id = self._event_team_id(event, payload)
-        if event_ts and self._dedup.is_duplicate(self._workspace_event_id(dedup_team_id, event_ts)):
+        if self._is_recovered_replay(event) or (
+                event_ts and self._dedup.is_duplicate(self._workspace_event_id(dedup_team_id, event_ts))):
             return None
         channel_id = event.get("channel", "")
         if self._is_ignored_channel(channel_id):
@@ -4393,9 +4394,8 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         # ts, so only the `_processed_message_ts` guard stops a duplicate turn, and it must be set
         # before the slow enrichment awaits. Claiming before the filters would let an ignored
         # original block a later "@bot" edit from summoning the bot.
-        _claim_ts = str(event.get("ts") or "")
-        if _claim_ts:
-            self._remember_processed_message_ts(_claim_ts)
+        self._remember_processed_message_ts(str(event.get("ts") or ""))
+        self._note_live_inbound(event, channel_id)
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
                 text, original_text, command_probe_text, is_command_text, bot_uid, thread_ts,
@@ -4430,8 +4430,8 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             msg_event.text = (
                 f"[Slack app context: user is viewing channel {context_channel_id}]\n\n"
                 f"{msg_event.text}")
-        if ts:
-            self._remember_processed_message_ts(ts)
+        self._remember_processed_message_ts(ts)
+        self._apply_late_note(event, msg_event)
         await self.handle_message(msg_event)
 
     async def _build_message_event(

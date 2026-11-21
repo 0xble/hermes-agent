@@ -30,6 +30,23 @@ from agent.turn_recovery import (
 logger = logging.getLogger("agent.conversation_loop")
 
 
+def _is_pooled_proxy_route(agent: Any) -> bool:
+    """Return true only for a named, explicitly opted-in CLIProxyAPI route.
+
+    ``proxy_request_class`` owns the existing route detection used for the
+    CLIProxyAPI scheduling header. Reusing it avoids treating arbitrary custom
+    gateways or direct provider URLs as credential pools.
+    """
+    try:
+        from agent.proxy_request_class import _enabled_for_route
+        provider = getattr(agent, "requested_provider", "") or getattr(agent, "provider", "") or ""
+        base_url = str(getattr(agent, "base_url", "") or "")
+        return bool(_enabled_for_route(provider, base_url))
+    except (ImportError, AttributeError, TypeError, ValueError):
+        logger.debug("Unable to identify pooled proxy route", exc_info=True)
+        return False
+
+
 @dataclass
 class ApiErrorVerdict:
     """``action``: ``"continue"`` (retry the API call), ``"break"`` (leave the retry loop:
@@ -157,6 +174,18 @@ def handle_api_error(
         retry_count=retry_count, max_retries=max_retries, retryable=classified.retryable,
         reason=classified.reason.value,
     )
+
+    # A CLIProxyAPI pool may select a healthy credential on the next request. Retry
+    # the exact route once before the normal billing/fallback path; this does not
+    # relax the same-model pin and is deliberately excluded for direct providers.
+    if (
+        classified.reason == FailoverReason.billing
+        and not _retry.pooled_proxy_billing_retry_attempted
+        and _is_pooled_proxy_route(agent)
+    ):
+        _retry.pooled_proxy_billing_retry_attempted = True
+        logger.info("billing error from pooled proxy, retrying once on same route")
+        return _verdict("continue")
 
     if getattr(agent, "_turn_independent_attempt_active", False) is True:
         from agent.fallback_endpoint_domain import note_endpoint_failure
