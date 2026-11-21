@@ -777,8 +777,8 @@ def _resolve_child_runtime(
             (route_config or {}).get("allow_billing_fallback", delegation_cfg.get("allow_billing_fallback", False))
         ),
         "fallback_model": _resolve_child_fallback_chain(
-        parent_agent, route_config,
-        pinned=bool(model_pinned or override_provider or override_base_url or model)),
+            parent_agent, route_config,
+            pinned=bool(model_pinned or override_provider or override_base_url or model)),
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},

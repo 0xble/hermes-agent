@@ -19,7 +19,7 @@ _BILLING_BODY = {
 }
 
 
-def _build_pinned_child(primary, *, failures: int, monkeypatch):
+def _build_pinned_child(primary, *, failures: int, monkeypatch, allow_billing_fallback=True):
     """Build a child through the production delegate constructor."""
     primary.primary_available = True
     primary.billing_failures = failures
@@ -29,7 +29,11 @@ def _build_pinned_child(primary, *, failures: int, monkeypatch):
         "provider": "custom", "model": harness.FALLBACK_MODEL,
         "base_url": primary.url, "api_key": "fixture", "api_mode": "chat_completions",
     }]
-    routing_cfg = {"model": harness.PRIMARY_MODEL, "fallback_providers": fallback}
+    routing_cfg = {
+        "model": harness.PRIMARY_MODEL,
+        "fallback_providers": fallback,
+        "allow_billing_fallback": allow_billing_fallback,
+    }
     with patch("tools.delegate_tool._load_config", return_value={}):
         child: Any = _build_child_agent(
             task_index=0, goal="say hello", context=None, toolsets=[],
