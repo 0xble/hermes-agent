@@ -75,7 +75,7 @@ class GatewayProcessEventSourcesMixin:
                 return source
             try:
                 return dataclasses.replace(source, thread_id=thread_id)
-            except Exception:
+            except (TypeError, ValueError):
                 return source
 
         derived = {}
