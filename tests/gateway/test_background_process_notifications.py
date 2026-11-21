@@ -12,7 +12,7 @@ import contextlib
 import queue
 import threading
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -233,6 +233,29 @@ async def test_consumed_completion_skips_raw_notification(monkeypatch, tmp_path)
 
     adapter.send.assert_not_awaited()
     adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_launching_turn_active_resolves_routes_off_gateway_loop(monkeypatch, tmp_path):
+    """Process-watcher route probes must not take the session-store lock on the loop."""
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+    session_key = "agent:main:telegram:dm:123:42"
+    source = SimpleNamespace()
+    adapter = SimpleNamespace(_active_sessions={session_key: object()})
+    runner._build_process_event_source = Mock(return_value=source)
+    loop_thread = threading.current_thread()
+    observed_threads = []
+
+    def resolve(_platform_name, _source):
+        observed_threads.append(threading.current_thread())
+        return adapter
+
+    runner._resolve_injection_adapter = resolve
+
+    assert await runner._launching_turn_active(
+        "telegram", {"session_key": session_key}
+    ) is True
+    assert observed_threads and observed_threads[0] is not loop_thread
 
 
 @pytest.mark.asyncio
