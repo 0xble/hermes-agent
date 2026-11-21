@@ -393,6 +393,14 @@ Fork-Patch-Backfill: 0f3af0ef0c43ad57eeedc58dd375566f83698699; gateway-transport
 - **Retirement:** Remove this patch when upstream preserves resumable delegation rows through pruning and suppresses stale auto-resume notices at injection time.
 - **Rollback:** Revert the resumable-delegation-retention fix commit.
 
+## Active patch record: delegated billing fallback
+
+- **Patch identity:** `delegated-billing-fallback`.
+- **Behavior:** Pinned delegated and cron runs may use configured cross-model fallbacks on billing exhaustion, with one provider/day notice after retries and fallback activation are exhausted. Other failure reasons preserve the model pin.
+- **Source surfaces:** `agent/agent_init.py`, `agent/agent_init_fallback.py`, `agent/chat_completion_helpers.py`, `agent/route_binding.py`, `agent/billing_notice.py`, `tools/delegate_tool_config.py`, `cron/scheduler.py`, and `hermes_cli/config_defaults.py`.
+- **Retirement:** Remove when a released upstream implementation preserves cross-model billing fallback and provider/day notification behavior.
+- **Rollback:** Revert the commits carrying `Fork-Patch: delegated-billing-fallback`.
+
 ## Active patch record: edge silence markers (S1)
 
 - **Patch identity:** `trailing-silence-marker`.
