@@ -18,8 +18,11 @@ def uncounted_runtime_work(runner):
     authorities = all_authorities(runner)
     managed = sum(not worker.closed.is_set() for authority in authorities
                   for worker in getattr(authority, '_managed_workers', {}).values())
-    return (managed + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
-                for authority in authorities for sid, live, _ in executing_sessions(authority))
+    # Stream execution stamps clear before outbound delivery. The existing FIFO
+    # drain task still owns that send, so count it through its final await.
+    return (managed + sum(live.task is not None and not live.task.done()
+                and live.route not in running and sid not in getattr(authority, '_managed_workers', {})
+                for authority in authorities for sid, live in authority.sessions.items())
             + sum(len(mutation_tasks(authority)) + len(side_agents(authority)) for authority in authorities))
 
 

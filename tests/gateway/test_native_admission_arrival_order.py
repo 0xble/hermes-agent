@@ -206,13 +206,13 @@ async def test_stop_owner_session_probe_runs_off_gateway_loop(tmp_path, monkeypa
     runner = authority.runner
     loop_thread = threading.get_ident()
     probed_on: list[int] = []
-    real_probe = runner._hm_mounted_owner
+    real_probe = runner._hm_mounted_owner_probe
 
     def probe(*args):
         probed_on.append(threading.get_ident())
         return real_probe(*args)
 
-    runner._hm_mounted_owner = probe
+    runner._hm_mounted_owner_probe = probe
     try:
         await admit(X, 'x0-text')
         await runner._hm_stop_owner_turn(route(X))
