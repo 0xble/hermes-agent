@@ -165,6 +165,34 @@ def normalize_origin(url_or_origin: str) -> str:
     return f"{scheme}://{host}:{port}"
 
 
+def origin_matches_lookup(saved_origin: str | None, lookup_origin: str | None) -> bool:
+    """Return whether a saved origin is a candidate for an origin lookup.
+
+    Lookups preserve exact-origin matching, with one discovery-only compatibility
+    rule: an HTTPS lookup may find an HTTP item for the same normalized host and
+    port. The comparison is deliberately asymmetric; it never lets an HTTP
+    lookup find an HTTPS item or crosses hosts/subdomains. Callers must still
+    enforce the item's allowed origins before filling.
+    """
+    if not saved_origin or not lookup_origin:
+        return False
+    try:
+        saved = normalize_origin(saved_origin)
+        lookup = normalize_origin(lookup_origin)
+    except VaultError:
+        return False
+    if saved == lookup:
+        return True
+    saved_parts = urlsplit(saved)
+    lookup_parts = urlsplit(lookup)
+    return (
+        saved_parts.scheme == "http"
+        and lookup_parts.scheme == "https"
+        and saved_parts.hostname == lookup_parts.hostname
+        and saved_parts.port == lookup_parts.port
+    )
+
+
 @dataclass(frozen=True)
 class VaultItemMeta:
     """Metadata-only view of a vault item. Never contains secret values.

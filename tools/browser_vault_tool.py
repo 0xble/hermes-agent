@@ -450,7 +450,7 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
     """
     from agent.vault_backends import enabled_backends
     from agent.vault_backends.unlock import can_prompt_here
-    from agent.vault_store import VaultError, normalize_origin
+    from agent.vault_store import VaultError, normalize_origin, origin_matches_lookup
 
     if kind is not None and kind not in ("login", "payment", "address", "protected_field"):
         return json.dumps({"success": False, "error_type": "invalid_kind", "error": "Unknown vault item kind."})
@@ -474,8 +474,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
             # matching cached logins, other filters, and unfiltered listings keep the quota-saving path.
             if (origin is not None and kind in (None, "login")
                     and (backend.name == "onepassword" or backend.name.startswith("onepassword@"))
-                    and not any(meta.kind == "login" and origin in (meta.allowed_origins or (meta.origin,))
-                                for meta in metas)):
+                    and not any(meta.kind == "login" and any(
+                        origin_matches_lookup(saved_origin, origin)
+                        for saved_origin in (meta.allowed_origins or (meta.origin,))
+                    ) for meta in metas)):
                 from agent.vault_backends.onepassword import OnePasswordLoginBackend
                 if isinstance(backend, OnePasswordLoginBackend):
                     metas = apply_origin_aliases(backend.list_items(fresh=True))
@@ -485,6 +487,9 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
         metas = [meta for meta in metas
                  if (kind is None or meta.kind == kind)
                  and (origin is None or not (meta.origin or meta.allowed_origins)
+                      or (meta.kind == "login"
+                          and any(origin_matches_lookup(saved_origin, origin)
+                                  for saved_origin in (meta.allowed_origins or (meta.origin,))))
                       or origin in (meta.allowed_origins or (meta.origin,)))]
         # One origin-selected login may need a detail lookup. An unfiltered or
         # ambiguous listing must not turn into account-wide field reads.

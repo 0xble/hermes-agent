@@ -37,6 +37,7 @@ from agent.vault_store import (
     VaultError,
     VaultStore,
     normalize_origin,
+    origin_matches_lookup,
     scrub_secret_from_text,
 )
 
@@ -150,6 +151,21 @@ class TestVaultStore:
         out = scrub_secret_from_text("boom hunter22x at me@x.io", secret)
         assert "hunter22x" not in out
         assert "me@x.io" not in out
+
+    def test_origin_lookup_allows_https_for_same_http_host_and_port(self):
+        assert origin_matches_lookup("http://example.com", "https://example.com")
+        assert origin_matches_lookup("http://example.com:8080", "https://example.com:8080")
+
+    def test_origin_lookup_does_not_cross_hosts_or_downgrade_https(self):
+        assert not origin_matches_lookup("http://example.com", "https://other.example.com")
+        assert not origin_matches_lookup("https://example.com", "http://example.com")
+        assert not origin_matches_lookup("http://example.com", "https://sub.example.com")
+        assert not origin_matches_lookup("http://example.com:8080", "https://example.com:8443")
+
+    def test_origin_lookup_keeps_exact_matches_unchanged(self):
+        assert origin_matches_lookup("https://Example.com:443/login", "https://example.com")
+        assert origin_matches_lookup("http://example.com:80", "http://example.com")
+        assert not origin_matches_lookup("https://example.com", "https://example.com:8443")
 
 
 # ---------------------------------------------------------------------------
@@ -269,6 +285,23 @@ class TestBrowserVaultTools:
         assert out["items"][0]["identifier"] == "user@example.com"
         assert out["items"][0]["identifier_type"] == "email"
         assert "s3cret-pw" not in json.dumps(out)
+
+    def test_list_https_lookup_finds_http_saved_login_without_widening_hosts(self, store):
+        from tools import browser_vault_tool
+
+        http_meta = _add_login(store, origin="http://example.com")
+        https_meta = _add_login(store, origin="https://secure.example.com")
+        backend = LocalLoginBackend()
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+            upgraded = json.loads(browser_vault_tool.browser_vault_list(kind="login", origin="https://example.com"))
+            wrong_host = json.loads(browser_vault_tool.browser_vault_list(kind="login", origin="https://other.example.com"))
+            exact = json.loads(browser_vault_tool.browser_vault_list(kind="login", origin="https://secure.example.com"))
+
+        assert [item["handle"] for item in upgraded["items"]] == [http_meta.id]
+        assert wrong_host["items"] == []
+        assert [item["handle"] for item in exact["items"]] == [https_meta.id]
+        assert exact["items"][0]["origin"] == "https://secure.example.com"
 
     def test_fill_refused_on_origin_mismatch(self, store):
         from tools import browser_vault_tool
