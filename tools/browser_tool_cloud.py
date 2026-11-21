@@ -16,6 +16,132 @@ from tools.browser_tool_origin import origin_module as _origin
 from tools import browser_tool_cdp as _cdp
 
 
+class BrowserTargetUnavailable(RuntimeError):
+    """A pinned browser target could not be used without selecting another backend."""
+
+    def __init__(self, target: str, reason: str):
+        self.target = target
+        self.reason = reason
+        super().__init__(f"Pinned browser target {target!r} unavailable: {reason}")
+
+
+def browser_target() -> str:
+    """The active profile's pinned browser target, or an empty string.
+
+    Targets are intentionally URL-only. A per-user loopback HTTP(S) proxy must front
+    Unix-socket CDP transports so every backend uses the same safe selection path.
+    """
+    _bt = _origin()
+    return str(_bt._browser_cfg("target", "", lambda v: str(v or "").strip(), "browser.target from config") or "")
+
+
+def browser_fallback_policy() -> str:
+    """Resolve the fallback policy fail-closed on lookup or validation failures.
+
+    Only an absent key and an explicit ``allow`` permit legacy backend selection. A
+    malformed config, an unreadable config, or any other value refuses fallback.
+    """
+    _bt = _origin()
+    try:
+        from hermes_cli.config import read_raw_config
+        config = read_raw_config()
+        if not isinstance(config, dict) or hasattr(config, "read_error"):
+            raise RuntimeError("browser config could not be read")
+        browser_cfg = config.get("browser", {})
+        if not isinstance(browser_cfg, dict):
+            raise TypeError("browser config is not a mapping")
+        if "fallback" not in browser_cfg:
+            return "allow"
+        value = str(browser_cfg["fallback"]).strip().lower()
+        if value in {"allow", "refuse"}:
+            return value
+        _bt.logger.warning("Unknown browser.fallback=%r; refusing backend fallback", browser_cfg["fallback"])
+        return "refuse"
+    except Exception:  # fail-closed boundary: any lookup failure refuses (logged with traceback)
+        _bt.logger.warning("Could not resolve browser.fallback; refusing backend fallback", exc_info=True)
+        return "refuse"
+
+
+def browser_target_refuses() -> bool:
+    return browser_fallback_policy() == "refuse"
+
+
+def pinned_browser_target_refuses() -> bool:
+    """Whether a profile with no fallback is intentionally fail-closed."""
+    return browser_target_refuses()
+
+
+def browser_target_is_camofox() -> bool:
+    """Whether ``browser.target`` is the REST endpoint for the selected Camofox backend."""
+    if not browser_target():
+        return False
+    _bt = _origin()
+    return str(_bt._browser_cfg("cloud_provider", "", lambda v: str(v or "").strip().lower(),
+                                "browser.cloud_provider from config") or "") == "camofox"
+
+
+def _validate_pinned_target(target: str) -> str:
+    """Reject Unix paths rather than guessing a different browser transport."""
+    from urllib.parse import urlsplit
+    try:
+        parsed = urlsplit(target)
+    except ValueError as exc:
+        raise BrowserTargetUnavailable(target, f"invalid target: {exc}") from exc
+    if parsed.scheme not in {"http", "https", "ws", "wss"} or not parsed.netloc:
+        raise BrowserTargetUnavailable(
+            target,
+            "invalid target; Unix-socket paths are unsupported, use a loopback HTTP(S) proxy URL",
+        )
+    return target
+
+
+def pinned_browser_target_or_raise() -> str:
+    """The validated pinned target; raises when none is configured (callers are fail-closed)."""
+    target = browser_target()
+    if not target:
+        raise BrowserTargetUnavailable("<unset>", "no pinned browser target configured")
+    return _validate_pinned_target(target)
+
+
+def browser_target_error(exc: BaseException, target: str = "") -> dict:
+    """Stable tool payload for a refused pinned target; never suggests another backend.
+
+    The target and reason are model-visible, so URL credentials/tokens are redacted."""
+    from agent.redact import redact_cdp_url
+    payload = _browser_target_error_raw(exc, target)
+    for key in ("target", "reason", "error"):
+        payload[key] = redact_cdp_url(payload[key])
+    return payload
+
+
+def _browser_target_error_raw(exc: BaseException, target: str = "") -> dict:
+    if isinstance(exc, BrowserTargetUnavailable):
+        target = exc.target
+        reason = exc.reason
+    else:
+        reason = str(exc) or "connection failed"
+        lower = reason.lower()
+        if "logged out" in lower or "login" in lower or "unauthor" in lower:
+            reason = "logged out or unauthorized"
+        elif "reconnect" in lower:
+            reason = "reconnect failed"
+        elif "refused" in lower or "connect" in lower or "unreachable" in lower:
+            reason = "connection refused or unreachable"
+        elif "socket" in lower or "no such file" in lower:
+            reason = "missing socket"
+    return {"success": False, "error_type": "browser_target_unavailable",
+            "code": "browser_target_unavailable", "target": target or browser_target(),
+            "reason": reason,
+            "error": f"Pinned browser target {(target or browser_target())!r} unavailable: {reason}"}
+
+
+def pinned_browser_target_error(exc: BaseException) -> Optional[dict]:
+    """Return a fail-closed error only when the active profile refuses target fallback."""
+    if not pinned_browser_target_refuses():
+        return None
+    return browser_target_error(exc, browser_target())
+
+
 def _memo(_bt, resolved_attr: str, cache_attr: str, compute: Callable[[], object]):
     """Process-lifetime cache on ``_bt``: the resolved flag is set BEFORE computing, then the final value is stored.
 

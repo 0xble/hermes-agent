@@ -145,7 +145,15 @@ def _auth_headers() -> dict[str, str]:
 
 
 def get_camofox_url() -> str:
-    """Return the configured Camofox server URL, or empty string."""
+    """Return the configured Camofox server URL, or empty string.
+
+    Under ``fallback: refuse`` only a Camofox-pinned ``browser.target`` is an endpoint;
+    ``CAMOFOX_URL`` never substitutes for a CDP-pinned or unset target."""
+    from tools import browser_tool_cloud as cloud
+    if cloud.pinned_browser_target_refuses():
+        return cloud.browser_target().rstrip("/") if cloud.browser_target_is_camofox() else ""
+    if cloud.browser_target_is_camofox():
+        return cloud.browser_target().rstrip("/")
     return (get_secret("CAMOFOX_URL", "") or "").rstrip("/")
 
 
@@ -170,6 +178,11 @@ def is_camofox_mode() -> bool:
     written, a set ``CAMOFOX_URL`` still activates Camofox). A CDP override (``BROWSER_CDP_URL``
     env or ``browser.cdp_url``, same precedence as ``browser_tool_cdp._get_cdp_override()``) wins.
     """
+    from tools import browser_tool_cloud as cloud
+    if cloud.pinned_browser_target_refuses():
+        # Fail closed: Camofox only when it is the pinned target; no CDP override or
+        # CAMOFOX_URL/selection can route a CDP-pinned (or unset) profile to Camofox.
+        return cloud.browser_target_is_camofox()
     from tools.browser_tool_cdp import env_cdp_url, live_cdp_override
     if live_cdp_override() or env_cdp_url() or _config_cdp_url():
         return False
@@ -1117,16 +1130,22 @@ def camofox_navigate(url: str, task_id: Optional[str] = None, account: Optional[
                 result["warning"] = ("The browser server closed this tab right after navigation. "
                                      "Call browser_navigate again before acting on the page.")
         except Exception:
-            pass  # Navigation succeeded; snapshot is a bonus
+            logger.debug("Camofox snapshot fetch failed after navigation", exc_info=True)
         return json.dumps(result)
     except requests.HTTPError as e:
         return tool_error(f"Navigation failed: {e}", success=False)
-    except requests.ConnectionError:
+    except requests.ConnectionError as exc:
+        from tools import browser_tool_cloud as cloud
+        if cloud.pinned_browser_target_refuses():
+            return json.dumps(cloud.browser_target_error(exc, cloud.browser_target()))
         return json.dumps({"success": False, "error": (
             f"Cannot connect to Camofox at {get_camofox_url()}. "
             "Is the server running? Start with: npm start (in camofox-browser dir) "
             "or: docker run -p 9377:9377 -e CAMOFOX_PORT=9377 jo-inc/camofox-browser")})
     except Exception as e:
+        from tools import browser_tool_cloud as cloud
+        if cloud.pinned_browser_target_refuses():
+            return json.dumps(cloud.browser_target_error(e, cloud.browser_target()))
         return tool_error(str(e), success=False)
 
 

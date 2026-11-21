@@ -29,6 +29,10 @@ def task_browser_url(task_id: str | None) -> str | None:
 def use_camofox(task_id: str | None) -> bool:
     """Task attachment takes precedence over profile-wide Camofox selection."""
     from tools import browser_tool as bt
+    from tools import browser_tool_cloud as cloud
+    if cloud.pinned_browser_target_refuses():
+        # Pinned-only: Camofox iff it is the pinned target; a task attachment cannot reroute it.
+        return cloud.browser_target_is_camofox()
     return bt._is_camofox_mode() and not task_browser_url(task_id)
 
 

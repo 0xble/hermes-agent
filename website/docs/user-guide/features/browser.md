@@ -731,6 +731,26 @@ A dedicated profile starts out signed out of everything. If you want the agent t
 
 When connected, `browser_exec`, `browser_cdp`, `browser_dialog` and `browser_vault` all drive your live browser instead of launching their own. The endpoint can also be set persistently with `browser.cdp_url` in `config.yaml` or the `BROWSER_CDP_URL` environment variable.
 
+### Pin a profile to one browser target
+
+Business-agent profiles can make browser selection fail closed. Set one CDP endpoint and
+refuse every cloud, local, or operator-CDP alternative:
+
+```yaml
+browser:
+  target: http://127.0.0.1:9222
+  fallback: refuse
+```
+
+`browser.target` is read per profile and supports HTTP(S) or WS(S) CDP URLs. When
+`browser.cloud_provider: camofox` is selected, the same key is the Camofox server URL.
+Unix-socket CDP paths are intentionally not accepted; front the per-user socket with
+a loopback HTTP(S) proxy instead. With `fallback: refuse`, Hermes never launches or
+selects another browser, including when the target is missing, refuses a connection,
+requires login, or a reconnect fails. Tool results use `error_type: browser_target_unavailable`
+and include the exact `target` and a machine-readable `reason`. Leaving `fallback` unset
+preserves the existing selection behavior.
+
 ### WSL2 + Windows Chrome: prefer MCP over `/browser connect`
 
 If Hermes runs inside WSL2 but the Chrome window you want to control runs on the Windows host, `/browser connect` is often not the best path.

@@ -105,6 +105,10 @@ def get_cdp_override_raw() -> str:
     ``browser.cdp_url``. Is-it-configured gates (check_fns, local-mode checks, doctor) MUST use this:
     a 10 s discovery probe against a stale URL would stall every schema build."""
     from tools.browser_session_cloud import browser_cfg
+    from tools import browser_tool_cloud as cloud
+    if cloud.pinned_browser_target_refuses():  # same fail-closed rule as browser_tool_cdp._get_cdp_override_raw
+        target = cloud.browser_target()
+        return target if target and not cloud.browser_target_is_camofox() else ""
     return live_cdp_override() or env_cdp_url() or browser_cfg("cdp_url", "", lambda v: str(v or "").strip())
 
 

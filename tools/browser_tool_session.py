@@ -312,6 +312,16 @@ def _create_cdp_session(task_id: str, cdp_url: str) -> dict[str, str]:
     return info
 
 
+def _create_pinned_target_session(task_id: str) -> dict[str, Any]:
+    """Use only the profile's pinned target; never launch or select another backend."""
+    target = _cloud.pinned_browser_target_or_raise()
+    if _cloud.browser_target_is_camofox():
+        raise _cloud.BrowserTargetUnavailable(target, "Camofox targets are handled by the Camofox backend")
+    info = _create_cdp_session(task_id, _cdp._resolve_cdp_override(target))
+    info["pinned_target"] = target
+    return info
+
+
 def _create_cloud_session_or_fallback(task_id: str, provider) -> dict[str, Any]:
     """Cloud session; fall back to local Chromium (marked degraded) on failure. ``cdp_url``
     is resolved here because some providers return an HTTP discovery URL, not a websocket."""
@@ -340,7 +350,10 @@ def _create_cloud_session_or_fallback(task_id: str, provider) -> dict[str, Any]:
 
 def _create_session_for_key(task_id: str, force_local: bool) -> dict[str, Any]:
     """Fresh session for ``task_id`` (runs OUTSIDE the lock: cloud mode makes a network call).
-    Precedence: CDP override > hybrid local sidecar (never real-profile) > cloud > local."""
+    A refusing profile is pinned before the legacy CDP/cloud/local chain, even with no target
+    configured (that case raises). Target-without-refuse also pins, as before."""
+    if _cloud.pinned_browser_target_refuses() or _cloud.browser_target():
+        return _create_pinned_target_session(task_id)
     cdp_override = _cdp._get_cdp_override()
     if cdp_override and not force_local:
         return _create_cdp_session(task_id, cdp_override)
@@ -379,6 +392,13 @@ def _get_session_info(task_id: Optional[str] = None) -> dict[str, Any]:
         return replacement if replacement is not None and replacement is not existing_session else None
 
     if existing_session is not None:
+        if _cloud.pinned_browser_target_refuses():
+            pinned_target = _cloud.browser_target()
+            if not pinned_target:
+                raise _cloud.BrowserTargetUnavailable("<unset>", "no pinned browser target configured")
+            if existing_session.get("pinned_target") != pinned_target:
+                raise _cloud.BrowserTargetUnavailable(
+                    pinned_target, "reconnect failed: active session is not the pinned target")
         # Suspect recycle: a command timeout marked this session; the expensive recycle
         # lives here at next use, not on the timeout path (mark must stay cheap).
         if not _bt._browser_session_backend(task_id).ensure_healthy():
@@ -887,7 +907,10 @@ def _dispatch_browser_command(
     # shared agent-browser's default daemon, so one task's snapshot refs or close hit the others.
     # Engine injection keys off the resolved session backend, not global provider
     # state: hybrid routing can create a local sidecar while a cloud provider stays configured.
-    engine = "auto" if session_info.get("external_task_browser") else _engine_override or _cloud._get_browser_engine()
+    # A pinned target never changes engine: no ``--engine`` flag and no Lightpanda→Chrome retry.
+    pinned = bool(session_info.get("pinned_target")) or _cloud.pinned_browser_target_refuses()
+    engine = ("auto" if pinned or session_info.get("external_task_browser")
+              else _engine_override or _cloud._get_browser_engine())
     backend_args = ["--session", session_info["session_name"]]
     if session_info.get("cdp_url"):
         backend_args += ["--cdp", session_info["cdp_url"]]
@@ -940,11 +963,17 @@ def _run_browser_command(
             session_info = _get_session_info(task_id)
         except Exception as e:
             _bt.logger.warning("Failed to create browser session for task=%s: %s", task_id, e)
+            if isinstance(e, _cloud.BrowserTargetUnavailable):
+                return _cloud.browser_target_error(e)
             return {"success": False, "error": f"Failed to create browser session: {e!s}"}
         engine, result = run_fenced_pair(session_info, lambda: _dispatch_browser_command(
             task_id, session_info, browser_cmd, command, args, timeout, _engine_override))
         if result.get("code") == "human_has_control":
             return result
+        if result.get("success") is False and _cloud.pinned_browser_target_refuses():
+            return _cloud.browser_target_error(
+                RuntimeError(result.get("error") or result.get("stderr") or "browser target command failed"),
+                session_info.get("pinned_target") or _cloud.browser_target())
         # #115184: a protocol-level failure (exit 101 on a stale session daemon, empty/non-JSON
         # output) poisons the cached local session record exactly like a timeout — recycle it
         # the same way and retry once on the replacement before handing the caller the error.
@@ -959,7 +988,10 @@ def _run_browser_command(
         break
 
     # Lightpanda automatic Chrome fallback — runs for ALL exit paths (timeout,
-    # empty, non-JSON, nonzero rc, parsed).
+    # empty, non-JSON, nonzero rc, parsed). Never under a refusing pinned target: it would
+    # launch a second, unpinned local Chrome.
+    if _cloud.pinned_browser_target_refuses():
+        return result
     fallback_reason = _lp._lightpanda_fallback_reason(engine, command, result)
     if fallback_reason:
         _bt.logger.info("Lightpanda fallback: retrying '%s' with Chrome (task=%s)", command, task_id)
