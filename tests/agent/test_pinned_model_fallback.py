@@ -55,7 +55,7 @@ def test_pinned_delegate_retries_pooled_billing_on_same_route(tmp_path, monkeypa
         finally:
             child.close()
 
-    assert child._fallback_chain == []  # same_model_fallbacks still filters the cross-model route
+    assert child._fallback_chain == fallback
     assert result["completed"] is True
     assert result["final_response"] == f"OK from {harness.PRIMARY_MODEL}"
     assert [request["model"] for request in primary.requests if request["model"] is not None] == [
@@ -94,9 +94,38 @@ def test_pooled_billing_stops_after_one_retry(tmp_path, monkeypatch):
         finally:
             child.close()
 
-    assert result["failed"] is True
+    assert result["completed"] is True
+    assert result["final_response"] == f"OK from {harness.FALLBACK_MODEL}"
     assert [request["model"] for request in primary.requests if request["model"] is not None] == [
-        harness.PRIMARY_MODEL, harness.PRIMARY_MODEL,
+        harness.PRIMARY_MODEL, harness.PRIMARY_MODEL, harness.FALLBACK_MODEL,
+    ]
+
+
+def test_pinned_delegate_falls_back_after_proxy_503(tmp_path, monkeypatch):
+    """A transient proxy 503 must leave the owned chain available to a pinned child."""
+    home = tmp_path / "hermes"
+    harness.write_home_config(home)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setitem(harness._FAILURE_BODIES, 503, {
+        "error": {"message": "upstream connect error or disconnect/reset before headers", "type": "server_error"},
+    })
+    with harness.StubProvider() as primary:
+        primary.failure_status = 503
+        primary.retry_after = None
+        child, fallback = _build_pinned_child(primary, failures=0, monkeypatch=monkeypatch)
+        primary.primary_available = False
+        child._noninteractive_transient_retry_window_seconds = 0
+        try:
+            child._disable_streaming = True
+            result = child.run_conversation("hello")
+        finally:
+            child.close()
+
+    assert child._fallback_chain == fallback
+    assert result["completed"] is True
+    assert result["final_response"] == f"OK from {harness.FALLBACK_MODEL}"
+    assert [request["model"] for request in primary.requests if request["model"] is not None] == [
+        harness.PRIMARY_MODEL, harness.FALLBACK_MODEL,
     ]
 
 

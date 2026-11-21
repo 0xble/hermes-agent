@@ -2110,7 +2110,7 @@ def init_agent(
     skip_background_review: bool = False, session_db=None, parent_session_id: str | None = None,
     iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
     fallback_model: dict[str, Any] | None = None, model_pinned: bool = False, credential_pool=None, checkpoints_enabled: bool = False,
-    checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
+    fallback_chain_owned: bool = False, checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None, memory_agent_context: str | None = None,
@@ -2192,7 +2192,7 @@ def init_agent(
     _init_prompt_cache_config(agent)
     _init_turn_state(agent, run_budget_seconds)
     _set_defaults(agent, _STREAM_STATE)
-    fallback_chain = _pin_init_fallbacks(agent, fallback_model, model_pinned)
+    fallback_chain = _pin_init_fallbacks(agent, fallback_model, model_pinned, fallback_chain_owned)
     _build_client(agent, api_key, base_url, fallback_chain)
     _init_fallback_chain(agent, fallback_chain)
     _load_tools(agent, enabled_toolsets, disabled_toolsets)
