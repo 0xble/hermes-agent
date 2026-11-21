@@ -183,7 +183,13 @@ _PENDING_ADMISSION_SLOTS: set = set()
 _BACKEND_RETIRING = "backend is retiring; reconnect to continue"
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
-_ROUTING_KEYS = ("scope_id", "user_id", "user_name")
+# Session keys do not retain the originating Slack reply thread (a DM session
+# can legitimately serve several threads), so detached completions persist the
+# complete source envelope captured before the child is built.
+_ROUTING_KEYS = (
+    "platform", "chat_type", "chat_id", "thread_id", "message_id",
+    "scope_id", "user_id", "user_name",
+)
 # Structured stall metadata — additive, present only on stall finalizations.
 _STALL_META_KEYS = ("stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds")
 # Private stall bookkeeping on the record -> public field in list_async_delegations().

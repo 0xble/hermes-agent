@@ -71,6 +71,17 @@ async def test_recovered_bare_session_key_delivers_to_stored_origin(runner, monk
     adapter.send.assert_not_awaited()
 
 
+def test_stored_origin_adopts_completion_thread_from_event(runner):
+    entry = runner.session_store.get_or_create_session(SessionSource(
+        platform=Platform.SLACK, chat_id="D0TEST", chat_type="dm", thread_id="old-thread"))
+    source = runner._build_process_event_source({
+        "session_id": "proc_thread", "session_key": entry.session_key,
+        "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "new-thread",
+    })
+    assert source is not None
+    assert source.thread_id == "new-thread"
+
+
 @pytest.mark.parametrize("thread_id", ["", "17"])
 def test_unknown_bare_key_uses_chat_type_but_never_another_topic(runner, thread_id):
     runner.session_store.get_or_create_session(SessionSource(
