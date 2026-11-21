@@ -195,10 +195,21 @@ def test_config_off_uses_provider_even_for_docs_and_plain_file(harness, monkeypa
     assert [r["title"] for r in results] == ["provider", "provider"]
 
 
-def test_policy_gate_blocks_direct_route(harness, monkeypatch):
-    monkeypatch.setattr("tools.website_policy.check_website_access", lambda url: "blocked")
+def test_policy_gate_refuses_direct_route(harness, monkeypatch):
+    blocked = {
+        "message": "blocked",
+        "host": "site.test",
+        "rule": "site.test",
+        "source": "test",
+    }
+    monkeypatch.setattr("tools.website_policy.check_website_access", lambda url: blocked)
     _transport(monkeypatch, lambda request: pytest.fail("policy-blocked direct HTTP"))
-    assert _run(["https://site.test/file.txt"])[0]["title"] == "provider"
+    result = _run(["https://site.test/file.txt"])[0]
+    assert result["title"] == ""
+    assert result["content"] == ""
+    assert result["error"] == "blocked"
+    assert result["blocked_by_policy"] == {"host": "site.test", "rule": "site.test", "source": "test"}
+    harness.extract.assert_not_awaited()
 
 
 def test_secret_gate_refuses_before_direct_route(harness, monkeypatch):
