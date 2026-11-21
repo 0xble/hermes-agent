@@ -14,6 +14,7 @@ import uuid
 from concurrent.futures import ThreadPoolExecutor
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone, UTC
+from functools import partial
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -154,12 +155,19 @@ def _record_model_calls_in_process(
         store.record_model_call(_dimensions(), _resource())
 
 
+_CHILD_JOIN_SECONDS = 15
+
+
 def _record_client_active_in_process(
     database_path: str,
     outbox_directory: str,
     start_barrier: Any,
 ) -> None:
     store = SharedMetricsStore(Path(database_path), Path(outbox_directory))
+    # A latch write fails fast after 250 ms so an interactive caller never stalls; its production
+    # caller catches that and a later event retries. Called bare here, a peer commit slower than
+    # 250 ms crashed the child. Wait as long as the parent joins, so the loser reads the latch.
+    store._write = partial(store._write, busy_timeout_ms=_CHILD_JOIN_SECONDS * 1000)
     start_barrier.wait()
     store.record_client_active(_resource())
 
@@ -1740,7 +1748,7 @@ def test_cross_process_client_active_attempts_record_one_install(tmp_path):
     for process in processes:
         process.start()
     for process in processes:
-        process.join(timeout=15)
+        process.join(timeout=_CHILD_JOIN_SECONDS)
         assert not process.is_alive()
         assert process.exitcode == 0
 

@@ -328,6 +328,10 @@ def child_env(home: Path, hermes_home: Path, workdir: Path) -> dict[str, str]:
         # The child's state.db IS this test's sandbox db; the live-DB guard would refuse it
         # because a pytest ancestor is present.
         HERMES_STATE_DB_GUARD_BYPASS="1",
+        # Every oneshot starts its own client-owned gateway in this one home. From the sixth start
+        # in 120 s the respawn-storm breaker sleeps 10, 20, 40 s before booting; that is a
+        # supervisor crash-loop guard, not anything these journeys exercise.
+        HERMES_GATEWAY_MAX_STARTS="0",
         PYTHONPATH=str(REPO_ROOT), PYTHONUNBUFFERED="1", NO_COLOR="1", TMPDIR=str(home),
         TZ="UTC", LANG="C.UTF-8", PYTHONHASHSEED="0",
     )

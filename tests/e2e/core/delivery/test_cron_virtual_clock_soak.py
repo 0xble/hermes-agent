@@ -683,6 +683,7 @@ def test_two_replicas_contend_for_every_fire(soak_env):
             peer.request(rnd, job_id)
 
             def both_claimed():
+                peer._check()  # a replica that died reports its stderr, not a 120 s timeout
                 return [c for c in H.read_jsonl(control.claims) if c["round"] == rnd][1:]
 
             H.wait_until(both_claimed, f"round {rnd}: both replicas' claim outcome")
