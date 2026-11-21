@@ -23,10 +23,10 @@ def _pin_init_fallbacks(agent, fallback_model, model_pinned, fallback_chain_owne
     from hermes_cli.fallback_config import same_model_fallbacks
 
     allow_billing_fallback = bool(getattr(agent, "allow_billing_fallback", False))
-    agent._pinned_fallback_model = agent.model if model_pinned and not fallback_chain_owned else None
+    agent._pinned_fallback_model = agent.model if model_pinned else None
     # A route owner may explicitly provide its own fallback chain. That chain is already scoped
     # by the owner, so an explicit model pin must not discard its cross-model entries during init.
-    if model_pinned and (not fallback_chain_owned or not allow_billing_fallback):
+    if model_pinned and not allow_billing_fallback:
         return same_model_fallbacks(_fallback_entries(fallback_model), agent.model)
     return fallback_model
 
