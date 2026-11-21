@@ -1093,6 +1093,14 @@ class GoalState:
     # separate from ``last_turn_at`` because user and external-event turns are allowed to pierce
     # the floor without turning the goal into a sub-minute automatic poller.
     last_automatic_continuation_at: float = 0.0
+    # Ownership-watchdog fields. Empty values preserve legacy rows.
+    due: str = ""
+    next_check: str = ""
+    done_when: str = ""
+    log_path: str = ""
+    plan_path: str = ""
+    baseline: list[dict[str, Any]] = field(default_factory=list)
+    ownership: bool = False
 
     def to_json(self) -> str:
         return json.dumps(asdict(self), ensure_ascii=False)
@@ -1109,6 +1117,13 @@ class GoalState:
             "last_automatic_continuation_at")}
         return cls(
             goal=data.get("goal", ""),
+            due=str(data.get("due") or ""),
+            next_check=str(data.get("next_check") or ""),
+            done_when=str(data.get("done_when") or ""),
+            log_path=str(data.get("log_path") or ""),
+            plan_path=str(data.get("plan_path") or ""),
+            baseline=[row for row in (data.get("baseline") or []) if isinstance(row, dict)],
+            ownership=bool(data.get("ownership")),
             mutation_id=str(data.get("mutation_id") or ""),
             status=data.get("status", "active"),
             max_turns=normalize_goal_max_turns(data.get("max_turns", DEFAULT_MAX_TURNS)),
@@ -2962,7 +2977,10 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
         return max(time.time(), prior + 1e-6)
 
     @snapshot_control
-    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None) -> GoalState:
+    def set(self, goal: str, *, max_turns: Optional[int] = None, contract: Optional[GoalContract] = None,
+            due: str = "", next_check: str = "", done_when: str = "", log_path: str = "",
+            plan_path: str = "", baseline: Optional[list[dict[str, Any]]] = None,
+            ownership: Optional[bool] = None) -> GoalState:
         goal = (goal or "").strip()
         if not goal:
             raise ValueError("goal text is empty")
@@ -2978,10 +2996,23 @@ class GoalManager(GoalPeersMixin, GoalAutonomyMixin, GoalStatusMixin, GoalRevisi
             )
         if goal_autonomy_enabled() and live is not None and live.status in {"active", "paused"}:
             raise ValueError("Use revise or replace to preserve the existing goal contract")
+        owned = bool(ownership) if ownership is not None else bool(due or next_check or done_when or log_path or plan_path or baseline)
+        if owned:
+            from hermes_cli.goal_lints import enforce_ownership
+            enforce_ownership(due=due, done_when=done_when,
+                              verification=getattr(contract, "verification", "") if contract else "",
+                              plan_path=plan_path, log_path=log_path,
+                              constraints=getattr(contract, "constraints", "") if contract else "",
+                              stop_when=getattr(contract, "stop_when", "") if contract else "",
+                              ownership=True)
         self._state = GoalState(
             goal=goal, status="active", turns_used=0, created_at=self._next_instance_time(), last_turn_at=0.0,
             max_turns=self.default_max_turns if max_turns is None else normalize_goal_max_turns(max_turns),
             contract=contract if contract is not None else GoalContract(),
+            due=str(due or "").strip(), next_check=str(next_check or "").strip(),
+            done_when=str(done_when or "").strip() or (contract.verification.strip() if contract else ""),
+            log_path=str(log_path or "").strip(), plan_path=str(plan_path or "").strip(),
+            baseline=[dict(row) for row in (baseline or []) if isinstance(row, dict)], ownership=owned,
             revisions=self._history_for_next_goal(live),
         )
         return self._save()
