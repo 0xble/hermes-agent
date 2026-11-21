@@ -66,7 +66,6 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
 | Async delegation origin route | Detached delegation captures the complete originating message route so completion delivery stays in the asking thread | Async delegation dispatch, completion routing or thread metadata changes | [Patch register](references/maintenance/operations/patch.md#async-delegation-origin-route) |
-Patch identity: `async-delegation-origin-route`
 | Shared fallback endpoint domain | Skip aliases of a proven dead socket for one turn while preserving one bounded independent-domain request at the switch cap | Fallback identity, connection classification, restart limits, terminal copy | [Shared fallback endpoint domain](maintenance/fallback-endpoint-domain.md) |
 | Named remote computer use | Keep shared node identities, no fallback, native images and node-bound terminal/file/process state | Shared node resolution, named execution/file safety, remote process persistence, computer-use provider dispatch, doctor or CuaDriver transport changes | [Named remote computer use](maintenance/remote-computer-use.md) |
 | Native notice delivery | Same-turn host notices preserve complete tool receipts, pairing, cache prefixes and replay provenance | Notice delivery, steer continuations, persistence or provider conversion changes | [Native notice delivery](maintenance/native-notice-delivery.md) |
@@ -298,6 +297,8 @@ Patch identity: `async-delegation-origin-route`
 | Unicode TAG character stripping | Strip invisible plane-14 TAG characters from model-facing skill, web, browser, MCP, and read_file results | Tool-result construction, Unicode tag stripping, or those tool output paths | [Unicode TAG character stripping](maintenance/unicode-tag-strip.md) |
 | Go write lint scope | Post-write lint for `.go` files checks syntax with `gofmt -e`, leaving type, vet and lint checks to package-level gates and the Go LSP | Post-write shell linters, Go lint commands, or LSP redundancy rules in `tools/file_operations_lint.py` | [Go write lint scope](maintenance/go-write-lint.md) |
 | Embedded cua-driver lifetime | Keep each `cua-driver serve --embedded` process and its `hc-` socket from outliving the Hermes process that spawned it, including macOS `open` detachment | Embedded daemon spawn, stop, session release, or gateway/CLI startup | [Embedded cua-driver lifetime](maintenance/cua-driver-lifetime.md) |
+
+Patch identity: `async-delegation-origin-route`
 
 ## Active Patch Record: Release-bound launcher recovery
 

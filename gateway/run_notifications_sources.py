@@ -70,8 +70,17 @@ class GatewayProcessEventSourcesMixin:
                 return source
 
         def _apply_event_thread(source):
-            thread_id = str(evt.get("thread_id") or "").strip()
-            if source is None or not thread_id or getattr(source, "thread_id", None) == thread_id:
+            if source is None or "thread_id" not in evt:
+                return source
+            event_platform = str(evt.get("platform") or "").strip().lower()
+            event_chat_id = str(evt.get("chat_id") or "").strip()
+            source_platform = str(getattr(source.platform, "value", source.platform)).lower()
+            if event_platform and source_platform != event_platform:
+                return source
+            if event_chat_id and str(getattr(source, "chat_id", "")) != event_chat_id:
+                return source
+            thread_id = str(evt.get("thread_id") or "").strip() or None
+            if getattr(source, "thread_id", None) == thread_id:
                 return source
             try:
                 return dataclasses.replace(source, thread_id=thread_id)

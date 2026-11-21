@@ -57,4 +57,4 @@ def test_top_level_route_keeps_thread_empty(tmp_path, monkeypatch):
     event = q.get_nowait()
     assert event["platform"] == "slack"
     assert event["chat_id"] == "D0TEST"
-    assert "thread_id" not in event
+    assert event["thread_id"] == ""

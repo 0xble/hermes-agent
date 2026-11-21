@@ -1097,7 +1097,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({"cut_reason": cut_reason} if cut_reason else {}),
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
-        **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
+        **{k: record[k] for k in _ROUTING_KEYS if k in record},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     if record.get("superseded_by"):
         # The owner already replaced this unit with a running delegation whose own completion will report the
