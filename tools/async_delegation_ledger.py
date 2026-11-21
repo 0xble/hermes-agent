@@ -402,8 +402,6 @@ def _attach_retry_note(evt: dict[str, Any]) -> None:
                         "delegation_id": delegation_id, "cut_reason": record["event"].get("cut_reason")}
         if note := retry_note(plan):
             evt["retry_note"] = note
-        elif provisional_note:
-            evt["retry_note"] = provisional_note
     except Exception:  # the retry classification deferred; keep the provisional delivery guidance
         if provisional_note:
             evt["retry_note"] = provisional_note

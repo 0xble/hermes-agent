@@ -506,8 +506,8 @@ def _retry_notice_suffix(evt: dict) -> str:
     # Only the explicit restart-resume instruction depends on the read-only
     # resume admission stamp. Lifecycle cuts use automatic retry and must keep
     # that instruction even when the resume probe raced the terminal write.
-    if (evt.get("cut_reason") and _cut_is_trusted_restart(evt.get("cut_reason"))
-            and not _resume_offered(evt)):
+    if (evt.get("cut_reason") and not _resume_offered(evt)
+            and "action='resume'" in str(evt.get("retry_note") or "")):
         return ""
     return f"\nRETRY: {evt['retry_note']}"
 

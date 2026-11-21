@@ -1262,7 +1262,14 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
                                          "delegate_task(action='resume', subagent_id='" +
                                          str(evt.get("delegation_id")) + "'). Hermes will not automatically rerun this cut work.")
                 elif cut_reason != "/stop":
-                    evt["retry_note"] = "Hermes will retry this automatically; you will get a notice then."
+                    evt["retry_note"] = ("Hermes will retry this automatically; you will get a notice then. "
+                                         "Do not re-dispatch it yourself.")
+        # The event is published before retry classification so a slow ledger writer cannot delay
+        # completion delivery. Resume admission is a read-only durable probe and must be stamped
+        # before publication, otherwise a consumer can format the event in the race window and
+        # suppress the only valid restart-resume instruction.
+        if not evt.get(_TERMINAL_OWNERSHIP_KEY):
+            _record_context_run(record, _stamp_resume_availability, evt)
         try:
             process_registry.completion_queue.put(evt)
         except Exception as exc:  # pragma: no cover
