@@ -7,6 +7,7 @@ import sys
 import pytest
 
 from tests.gateway.fixtures.local_recovery_probe import child_env
+from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 @pytest.mark.platforms("posix")
@@ -46,8 +47,16 @@ async def test_shell_exec_refusal_names_a_sandboxed_terminal_backend(tmp_path, m
     from gateway import session_local, session_policy
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_controls import AuthorityConnection
+<<<<<<< HEAD
     from hermes_state import SessionDB
     from tests.fakes.runtime_owner import begin_runtime_epoch
+||||||| dff103e05878
+    from hermes_state import SessionDB
+    from hermes_state_runtime import begin_runtime_epoch
+=======
+    from persistence_assembly import open_persistence, profile_scope
+    from tests.fixtures.storage_seed import seed_session
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
     work = tmp_path / 'work'
     work.mkdir()
@@ -55,11 +64,11 @@ async def test_shell_exec_refusal_names_a_sandboxed_terminal_backend(tmp_path, m
     monkeypatch.setattr(session_local, 'authorize_local_source', lambda runner, source: True)
     monkeypatch.setattr(session_policy, 'policy_for_source', lambda runner, source: SimpleNamespace(
         cwd=str(work), terminal_json=json.dumps(terminal)))
-    with SessionDB(db_path=tmp_path / 'state.db') as db:
-        db.create_session('s', source='test')
-        epoch = begin_runtime_epoch(db, instance_id='current')
+    with open_persistence(profile_scope(home=tmp_path)) as db:
+        seed_session(db, 's', 'test')
+        epoch = db.runtime.begin_epoch(instance_id='current')
         authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id=str(tmp_path / 'home'),
-                                     instance_id='current', db=db, epoch=epoch)
+                                     instance_id='current', persistence=storage_handle(db.scope.profile_dir), epoch=epoch)
         authority.sessions['s'] = LiveSession(None, 'route')
         connection = AuthorityConnection(authority, object(), {'user_id': 'owner'})
 

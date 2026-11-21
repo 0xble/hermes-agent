@@ -1348,7 +1348,68 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             raise
         return session
 
-
+<<<<<<< HEAD
+||||||| dff103e05878
+    def spawn_via_env(
+        self, env: Any, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
+        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False) -> ProcessSession:
+        """Spawn a background process inside a non-local backend's sandbox.
+        The command is wrapped to capture its in-sandbox PID and redirect output to a
+        log file that later execute() calls poll. No live pipe or stdin, but it runs in
+        the correct sandbox context. ``persist_on_release`` keeps the process out of
+        agent-lifecycle kill sweeps (#41225)."""
+        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
+                                    persist_on_release=persist_on_release)
+        temp_dir = self._env_temp_dir(env)
+        log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
+        q = shlex.quote
+        bg_command = (
+            f"mkdir -p {q(temp_dir)} && "
+            f"( nohup bash -lc {q(command)} > {q(log_path)} 2>&1; "
+            f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
+            f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
+        result = env.execute(bg_command, cwd=cwd or "", timeout=timeout, rewrite_compound_background=False)
+        output = result.get("output", "").strip()
+        session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
+        # No PID from the wrapper (no bash in the image, sandbox gone, broken redirect): the
+        # command never started, so raise like a failed Popen instead of returning a session.
+        if session.pid is None:
+            raise RuntimeError(f"launch wrapper exited {result.get('returncode')} without a PID: "
+                               f"{output or '(no output)'}")
+        self._track_started(
+            session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+        return session
+=======
+    def spawn_via_env(
+        self, env: Any, command: str, cwd: str | None = None, task_id: str = "", session_key: str = "",
+        timeout: int = 10, owner_task_id: str = "", persist_on_release: bool = False, allow_cwd_fallback: bool = False,
+    ) -> ProcessSession:
+        """Spawn a background process inside a non-local backend's sandbox: wrapped to capture its in-sandbox PID
+        and log to a file later execute() calls poll (no live pipe/stdin). ``persist_on_release`` keeps it out of
+        agent-lifecycle kill sweeps (#41225). ``allow_cwd_fallback`` is ``execute``'s; a fallback sets ``session.cwd``."""
+        session = self._new_session(command, task_id, owner_task_id, session_key, cwd, env_ref=env, pid_scope="sandbox",
+                                    persist_on_release=persist_on_release)
+        temp_dir = self._env_temp_dir(env)
+        log_path, pid_path, exit_path = (f"{temp_dir}/hermes_bg_{session.id}.{ext}" for ext in ("log", "pid", "exit"))
+        q = shlex.quote
+        bg_command = (
+            f"mkdir -p {q(temp_dir)} && "
+            f"( nohup bash -lc {q(command)} > {q(log_path)} 2>&1; "
+            f"rc=$?; printf '%s\\n' \"$rc\" > {q(exit_path)} ) & "
+            f"echo $! > {q(pid_path)} && cat {q(pid_path)}")
+        result = env.execute(bg_command, cwd=cwd or "", timeout=timeout, rewrite_compound_background=False, allow_cwd_fallback=allow_cwd_fallback)
+        session.cwd = (result.get("cwd_fallback") or {}).get("used") or session.cwd
+        output = result.get("output", "").strip()
+        session.pid = next((int(ln) for ln in map(str.strip, output.splitlines()) if ln.isdigit()), None)
+        # No PID from the wrapper (no bash in the image, sandbox gone, broken redirect): the
+        # command never started, so raise like a failed Popen instead of returning a session.
+        if session.pid is None:
+            raise RuntimeError(f"launch wrapper exited {result.get('returncode')} without a PID: "
+                               f"{output or '(no output)'}")
+        self._track_started(
+            session, self._env_poller_loop, f"proc-poller-{session.id}", (env, log_path, pid_path, exit_path))
+        return session
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
     # ----- Reader / Poller Threads -----
 
@@ -1444,7 +1505,105 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
 
 
 
+<<<<<<< HEAD
     _log_delta_command = staticmethod(log_delta_command)
+||||||| dff103e05878
+    def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
+        """Background thread: poll a sandbox log file for non-local backends.
+
+        One ``execute()`` per tick: the read command also reports the process
+        status (see ``log_delta_command``). Sandboxes rate-limit exec starts."""
+        q = shlex.quote
+        # Byte offset already read from the log (bytes, not chars: the shell counts bytes).
+        prev_output_bytes = 0
+        while not session.exited:
+            time.sleep(2)
+            try:
+                # Read only the bytes written since the last poll, plus the process status.
+                raw = env.execute(
+                    log_delta_command(q(log_path), prev_output_bytes, q(pid_path), q(exit_path)),
+                    timeout=10).get("output", "")
+                reply = parse_log_delta_reply(raw)
+                delta = reply.delta if reply else ""
+                if reply:
+                    if reply.offset < prev_output_bytes:
+                        # Log rotated/truncated: what we hold no longer lines up. Restart.
+                        with session._lock:
+                            if session.exited:
+                                return
+                            session.output_buffer = ""
+                    prev_output_bytes = reply.size
+                if delta:
+                    # A kill that landed after this fetch already published its output
+                    # snapshot: leave the output as the kill reported it (as the PTY reader does).
+                    with session._lock:
+                        if session.exited:
+                            return
+                        session.output_buffer += delta
+                        if len(session.output_buffer) > session.max_output_chars:
+                            session.output_buffer = session.output_buffer[-session.max_output_chars:]
+                    self._check_watch_patterns(session, delta)
+                    self._emit_output(session, delta)
+
+                # Unreadable reply: separate liveness and exit-code reads, as before the combined read.
+                exit_code = reply.exit_code if reply else fallback_exit_code(env, q(pid_path), q(exit_path))
+                if exit_code is not None:
+                    self._finish_exited(session, exit_code)
+                    return
+            except Exception:
+                # Environment might be gone (sandbox reaped, etc.). A kill that already
+                # settled the session keeps its result.
+                self._finish_exited(session, -1, reason="lost", source="backend_lost")
+                return
+=======
+    def _env_poller_loop(self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str):
+        """Background thread: poll a sandbox log file for non-local backends.
+
+        One ``execute()`` per tick: the read command also reports the process
+        status (see ``log_delta_command``). Sandboxes rate-limit exec starts."""
+        q = shlex.quote
+        # Byte offset already read from the log (bytes, not chars: the shell counts bytes).
+        prev_output_bytes = 0
+        while not session.exited:
+            time.sleep(2)
+            try:
+                # Read only the bytes written since the last poll, plus the process status.
+                raw = env.execute(  # absolute paths only: "/" survives the job deleting its cwd
+                    log_delta_command(q(log_path), prev_output_bytes, q(pid_path), q(exit_path)),
+                    cwd="/", timeout=10).get("output", "")
+                reply = parse_log_delta_reply(raw)
+                delta = reply.delta if reply else ""
+                if reply:
+                    if reply.offset < prev_output_bytes:
+                        # Log rotated/truncated: what we hold no longer lines up. Restart.
+                        with session._lock:
+                            if session.exited:
+                                return
+                            session.output_buffer = ""
+                    prev_output_bytes = reply.size
+                if delta:
+                    # A kill that landed after this fetch already published its output
+                    # snapshot: leave the output as the kill reported it (as the PTY reader does).
+                    with session._lock:
+                        if session.exited:
+                            return
+                        session.output_buffer += delta
+                        if len(session.output_buffer) > session.max_output_chars:
+                            session.output_buffer = session.output_buffer[-session.max_output_chars:]
+                    self._check_watch_patterns(session, delta)
+                    self._emit_output(session, delta)
+
+                # Unreadable reply: separate liveness and exit-code reads, as before the combined read.
+                exit_code = reply.exit_code if reply else fallback_exit_code(env, q(pid_path), q(exit_path))
+                if exit_code is not None:
+                    self._finish_exited(session, exit_code)
+                    return
+            except Exception:
+                # Environment might be gone (sandbox reaped, etc.). A kill that already
+                # settled the session keeps its result.
+                self._finish_exited(session, -1, reason="lost", source="backend_lost")
+                return
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -2266,6 +2425,7 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
             else:
                 self._terminate_host_pid(session.process.pid, session.host_start_time, deadline=deadline)
         elif session.env_ref and session.pid:
+<<<<<<< HEAD
             remaining = None if deadline is None else max(0.0, deadline - time.monotonic())
             if remaining is not None and remaining <= 0:
                 return {"status": "deadline", "session_id": session_id}
@@ -2273,6 +2433,11 @@ class ProcessRegistry(ProcessReadersMixin, ProcessTerminationMixin, ProcessCheck
                 f"kill {session.pid} 2>/dev/null",
                 timeout=remaining if remaining is not None else 5,
             )
+||||||| dff103e05878
+            session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+=======
+            session.env_ref.execute(f"kill {session.pid} 2>/dev/null", cwd="/", timeout=5)
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         elif session.detached and session.pid_scope == "host" and session.pid:
             # Same fate as poll/list: a gone or reused PID means our process is
             # gone — never tree-kill the stranger — but a live PID with an

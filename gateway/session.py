@@ -24,7 +24,15 @@ from gateway.session_prompt_pin import SessionPromptPinMixin, sanitize_prompt_pi
 from gateway.session_recovery import SessionRecoveryMixin
 from gateway.session_lifecycle import SessionLifecycleMixin, _iso, _local_iso, _local_naive, _new_session_id, _now, _parse_iso
 from gateway.session_transcript import SessionTranscriptMixin
+<<<<<<< HEAD
 from hermes_state_keys import profile_from_session_key_namespace
+||||||| dff103e05878
+# Inverse of _session_key_namespace, defined storage-side (hermes_state must not import gateway).
+from hermes_state_keys import profile_from_session_key_namespace
+=======
+# Inverse of _session_key_namespace, defined in the neutral session_keys module (storage must not import gateway).
+from session_keys import profile_from_session_key_namespace
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 logger = logging.getLogger(__name__)
 
@@ -959,7 +967,7 @@ class SessionStore(
     SessionIncognitoMixin, SessionPersistenceMixin, SessionRecoveryMixin, SessionLifecycleMixin, SessionTranscriptMixin,
     SessionPromptPinMixin, SessionAttendedMixin,
 ):
-    """Session routing index + transcripts: SQLite (SessionDB), legacy JSONL fallback."""
+    """Session routing index + transcripts: SQLite through the storage interface, legacy JSONL fallback."""
 
     def __init__(self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None):
         self.sessions_dir = sessions_dir
@@ -999,9 +1007,39 @@ class SessionStore(
         self._has_active_processes_fn = has_active_processes_fn
         self._write_sessions_json = bool(getattr(config, "write_sessions_json", True))
 
+<<<<<<< HEAD
         # Construction only initializes the cache and makes no state.db probe. The expensive routing load,
         # stale-row recovery, archive/prune and VACUUM remain demand-time/off-loop; AsyncSessionStore and
         # startup recovery offload those operations before admitting restored turns.
+||||||| dff103e05878
+        # SQLite handles are cached per path and resolved through ``_db`` per call, never bound
+        # once: a multiplexed gateway serves every profile from ONE process and a handle frozen to
+        # the root home would land every profile's rows in the root state.db.
+        # Initialize SQLite session database. A multiplexed gateway serves every profile from a SINGLE
+        # process, so a handle bound during __init__ is frozen to the process's own root home; every
+        # profile's rows then land in the root state.db even though ``_profile_runtime_scope`` has already
+        # redirected ``get_hermes_home()`` for the turn (its docstring lists "sessions" among what it
+        # scopes). The row still carries the right ``profile_name``, so the damage is invisible in the data
+        # and shows up only as the desktop listing a profile's session under the default bot --
+        # ``_open_session_db_for_profile`` reads ``profiles/<name>/state.db``, which never received the
+        # write. See #88532. Priming the handle for the current scope here keeps the startup diagnostics
+        # exactly where they were: the live-DB isolation guard still raises during construction, and the
+        # JSONL-fallback warning is still printed once at startup rather than on first use.
+=======
+        # Storage handles are cached per profile and resolved for the active scope per call, never bound
+        # once: a multiplexed gateway serves every profile from ONE process and a handle frozen to
+        # the root home would land every profile's rows in the root state.db.
+        # Initialize SQLite session database. A multiplexed gateway serves every profile from a SINGLE
+        # process, so a handle bound during __init__ is frozen to the process's own root home; every
+        # profile's rows then land in the root state.db even though ``_profile_runtime_scope`` has already
+        # redirected ``get_hermes_home()`` for the turn (its docstring lists "sessions" among what it
+        # scopes). The row still carries the right ``profile_name``, so the damage is invisible in the data
+        # and shows up only as the desktop listing a profile's session under the default bot --
+        # ``_open_session_db_for_profile`` reads ``profiles/<name>/state.db``, which never received the
+        # write. See #88532. Priming the handle for the current scope here keeps the startup diagnostics
+        # exactly where they were: the live-DB isolation guard still raises during construction, and the
+        # JSONL-fallback warning is still printed once at startup rather than on first use.
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         self._db_pinned = _DB_UNPINNED
         self._db_handles: dict[Path, Any] = {}
         self._db_handles_lock = threading.Lock()
@@ -1018,16 +1056,22 @@ class SessionStore(
             handles=self._db_handles, lock=self._db_handles_lock
         )
         # The routing index needs exactly one home for its lifetime: the gateway's own, captured
-        # before any profile scope exists (see ``_routing_db``).
+        # before any profile scope exists (see ``_routing_persistence``).
         try:
             from hermes_constants import get_hermes_home
 
             self._routing_home: Optional[Path] = Path(get_hermes_home())
         except Exception:
             self._routing_home = None
+<<<<<<< HEAD
         # Do not probe state.db during construction: another Hermes process may hold its writer lock.
         # First use resolves the active profile lazily, and async callers cross the thread boundary
         # before invoking blocking SQLite work.
+||||||| dff103e05878
+        self._open_session_db_for_active_scope()
+=======
+        self._open_persistence_for_active_scope()
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via
@@ -1109,10 +1153,21 @@ class SessionStore(
         return updated_keys
 
     def has_any_sessions(self) -> bool:
+<<<<<<< HEAD
         """Whether any session has ever been created. SQLite is the source of truth."""
         if self._db:
+||||||| dff103e05878
+        """Whether any session has ever been created. SQLite is the source of truth (ended sessions
+        count); the current session is already in the DB when this runs, hence ``> 1``."""
+        if self._db:
+=======
+        """Whether any session has ever been created. SQLite is the source of truth (ended sessions
+        count); the current session is already in the DB when this runs, hence ``> 1``."""
+        store = self._scoped_persistence()
+        if store is not None:
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
             try:
-                return self._db.session_count_ge(2)
+                return store.sessions.count_at_least(2)
             except Exception:
                 pass  # fall through to heuristic
         with self._lock:
@@ -1661,7 +1716,7 @@ class SessionStore(
                 return False
             self._entries[entry.session_key] = entry
             self._save()
-        if self._db_for_key(entry.session_key):
+        if self._persistence_for_key(entry.session_key):
             self._reopen_session_row(entry.session_key, entry.session_id)
         self._announce_route(entry.session_key, entry)
         return True
@@ -1695,7 +1750,13 @@ class SessionStore(
             # Adopt a delegate target under the route lock, after the CAS and BEFORE the route moves: a
             # failed marker write leaves the old route intact, and a refused switch never adopts, so it
             # has nothing to undo that an overlapping successful switch onto the same row relies on.
+<<<<<<< HEAD
             if self._db_for_key(session_key):
+||||||| dff103e05878
+            if not refused and self._db_for_key(session_key):
+=======
+            if not refused and self._persistence_for_key(session_key):
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
                 self._adopt_delegate_row(session_key, target_session_id)
             if old_entry.session_id == target_session_id:
                 return old_entry
@@ -1714,12 +1775,40 @@ class SessionStore(
                           if preserve_prompt_pin and "terminal_cwd" in old_entry.metadata else {}),
             )
         try:
+<<<<<<< HEAD
             if self._db_for_key(session_key) and old_entry.session_id:
                 self._promote_session_reset(session_key, old_entry.session_id, "session_switch",
                                             log=lambda e: logger.debug("Session DB end_session failed: %s", e))
             if self._db_for_key(session_key):
                 self._reopen_session_row(session_key, target_session_id,
                                          log_prefix="Session DB reopen_session failed")
+||||||| dff103e05878
+            if self._db_for_key(session_key) and old_entry.session_id:
+                self._promote_session_reset(
+                    session_key, old_entry.session_id, "session_switch",
+                    log=lambda e: logger.debug("Session DB end_session failed: %s", e),
+                )
+            if self._db_for_key(session_key):
+                # An explicit /resume/handoff/branch repoint is real user activity: the row is
+                # reopened (a repoint onto a finalized row must resume it, not write into a dead row).
+                # Mount-time reads (TUI session.resume) no longer reopen (#85303) — only this path does.
+                self._reopen_session_row(
+                    session_key, target_session_id, log_prefix="Session DB reopen_session failed"
+                )
+=======
+            if self._persistence_for_key(session_key) and old_entry.session_id:
+                self._promote_session_reset(
+                    session_key, old_entry.session_id, "session_switch",
+                    log=lambda e: logger.debug("Session DB end_session failed: %s", e),
+                )
+            if self._persistence_for_key(session_key):
+                # An explicit /resume/handoff/branch repoint is real user activity: the row is
+                # reopened (a repoint onto a finalized row must resume it, not write into a dead row).
+                # Mount-time reads (TUI session.resume) no longer reopen (#85303) — only this path does.
+                self._reopen_session_row(
+                    session_key, target_session_id, log_prefix="Session DB reopen_session failed"
+                )
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
                 self._record_gateway_session_peer(
                     target_session_id, session_key, new_entry.origin,
                     display_name=new_entry.display_name, include_compression_ancestors=True,

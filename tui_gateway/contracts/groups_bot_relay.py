@@ -735,6 +735,46 @@ method("browser.controller.detach", params=BrowserControllerParams, result=Brows
        doc="Hard-detach only the controller owned by this authenticated transport.")
 
 
+# ── teammate deliveries a bot is waiting on ───────────────────────────────────────────────────
+
+
+class BotDeliveryListParams(ProfileParams):
+    """``profile`` is the SENDER bot; it routes the call to that profile's connection."""
+
+
+class BotDeliveryState(WireEnum):
+    queued = "queued"
+    claimed = "claimed"
+    working = "working"
+    waiting_on_you = "waiting_on_you"
+    failed = "failed"
+
+
+class BotDeliveryRow(Result):
+    """``tools/bot_delivery_status.py::list_sender_deliveries``. ``since`` is the receipt's last
+    write (epoch seconds); ``waiting_on`` is set for ``waiting_on_you``, ``reason`` (+ ``error``)
+    for ``failed`` — ``unknown_outcome`` means the target may have acted: never resend it."""
+
+    delivery_id: str
+    target: str
+    target_handle: str
+    state: BotDeliveryState
+    since: float
+    preview: str
+    waiting_on: str | None = None
+    reason: str | None = None
+    error: str | None = None
+
+
+class BotDeliveryListResult(Result):
+    sender: str
+    deliveries: list[BotDeliveryRow]
+
+
+method("bot_delivery.list", params=BotDeliveryListParams, result=BotDeliveryListResult,
+       doc="Read-only: this bot's unsettled message_agent deliveries to local teammates, newest first.")
+
+
 __all__ = [
     "GroupsLogResult", "RelayEnvelope", "Room", "RoomAuthority", "RoomEvent", "RoomLinkCatalog",
     "RoomMember", "RoomMemberInput",

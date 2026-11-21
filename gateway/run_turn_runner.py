@@ -138,7 +138,141 @@ class _ExecApprovalDeclined(RuntimeError):
     """
 
 
+<<<<<<< HEAD
 from gateway.run_turn_runner_approval import TurnRunner as TurnRunnerApprovalMixin
+||||||| dff103e05878
+from gateway.run_turn_progress import GatewayTurnProgressMixin
+from gateway.session_execution import GatewaySessionAgentMixin
+
+
+def _settle_api_runtime_lock(agent, result, captured):
+    """A confirmed API model lock settles only on the runtime it named (main's
+    ``_finish_turn_result``): the served runtime rides the usage, a mismatch fails the turn."""
+    from gateway.session_api_turn import api_runtime_locked
+    api = api_runtime_locked()
+    if api is None or not isinstance(result, dict):
+        return
+    settings = api['settings']
+    try:
+        captured['usage']['runtime'] = api['adapter']._turn_runtime_metadata(
+            agent, route=settings.get('route'), requested_runtime=settings.get('requested_runtime'),
+            route_source=settings.get('route_source') or '', confirmed_runtime_lock=True)
+    except RuntimeError as exc:
+        result.update(final_response='', failed=True, completed=False, error=str(exc))
+
+
+def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, str, bool]:
+    """``(chat text, failure_reason, retryable)`` for a model/credential resolution failure before the turn."""
+    from agent.error_classifier import FailoverReason
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.runtime_provider_custom import LocalRuntimeUnavailableError
+    from hermes_state_runtime import RuntimeStoreError
+    auth_permanent = FailoverReason.auth_permanent.value
+    if isinstance(exc, LocalRuntimeUnavailableError):
+        # The chosen model is configured; its local server is down. Not a credential verdict, so
+        # the client must not offer "Update API key" or sign-in: the sentence names the fix.
+        return f"⚠️ {exc}", exc.error_code, exc.retryable
+    if isinstance(exc, RuntimeStoreError) and exc.reason == 'launch_credentials_unavailable':
+        # The session's launch key is gone (a restart revoked a CLI --api-key, a route key changed):
+        # the shared refusal copy names /new, never a resend.
+        from agent.turn_failure_copy import launch_credentials_copy
+        return launch_credentials_copy(exc), 'launch_credentials_unavailable', False
+    if isinstance(exc, RuntimeStoreError):
+        # Session-policy refusals carry a stable reason code (e.g. a CLI launch key revoked by
+        # daemon restart): keep it in the reply so clients can act on it, and do not suggest
+        # /login — the profile's own credentials were never in play.
+        return (f"⚠️ This session's launch credentials are no longer available ({exc.reason}), so this "
+                "message wasn't processed. Start a new session from the CLI to bind them again.", auth_permanent, False)
+    if is_rate_limited_auth_error(exc.__cause__):
+        # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
+        from gateway.run import _gateway_provider_error_reply
+        return _gateway_provider_error_reply(str(exc)), auth_permanent, False
+    if platform == Platform.LOCAL:
+        # The local operator reads the terminal: the resolver's own sentence ("provider 'custom'
+        # resolved without credentials ...") is the diagnosis; /login is not.
+        return f"⚠️ {exc}", auth_permanent, False
+    seen: set[int] = set()
+    host = auth = False
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        host = host or isinstance(link, OSError)
+        auth = auth or isinstance(link, AuthError)
+        link = link.__cause__ or link.__context__
+    if host and not auth:
+        # A host-side failure (a CA bundle deleted under a long-lived process, an unreadable file)
+        # with no credential verdict: /login cannot fix it, the gateway log can (#140344).
+        # host_error sits on the gateway layer, so clients don't offer "Switch provider"; not retryable,
+        # since a deleted bundle or unreadable store fails the same way until the host is fixed.
+        return t("gateway.errors.generic_failed"), "host_error", False
+    return t("gateway.errors.no_credentials"), auth_permanent, False
+=======
+from gateway.run_turn_progress import GatewayTurnProgressMixin
+from gateway.session_execution import GatewaySessionAgentMixin
+
+
+def _settle_api_runtime_lock(agent, result, captured):
+    """A confirmed API model lock settles only on the runtime it named (main's
+    ``_finish_turn_result``): the served runtime rides the usage, a mismatch fails the turn."""
+    from gateway.session_api_turn import api_runtime_locked
+    api = api_runtime_locked()
+    if api is None or not isinstance(result, dict):
+        return
+    settings = api['settings']
+    try:
+        captured['usage']['runtime'] = api['adapter']._turn_runtime_metadata(
+            agent, route=settings.get('route'), requested_runtime=settings.get('requested_runtime'),
+            route_source=settings.get('route_source') or '', confirmed_runtime_lock=True)
+    except RuntimeError as exc:
+        result.update(final_response='', failed=True, completed=False, error=str(exc))
+
+
+def _resolution_failure_reply(exc: Exception, platform: Platform) -> tuple[str, str, bool]:
+    """``(chat text, failure_reason, retryable)`` for a model/credential resolution failure before the turn."""
+    from agent.error_classifier import FailoverReason
+    from hermes_cli.auth import AuthError, is_rate_limited_auth_error
+    from hermes_cli.runtime_provider_custom import LocalRuntimeUnavailableError
+    from persistence.core.errors import AuthorityRefusal
+    auth_permanent = FailoverReason.auth_permanent.value
+    if isinstance(exc, LocalRuntimeUnavailableError):
+        # The chosen model is configured; its local server is down. Not a credential verdict, so
+        # the client must not offer "Update API key" or sign-in: the sentence names the fix.
+        return f"⚠️ {exc}", exc.error_code, exc.retryable
+    if isinstance(exc, AuthorityRefusal) and exc.reason == 'launch_credentials_unavailable':
+        # The session's launch key is gone (a restart revoked a CLI --api-key, a route key changed):
+        # the shared refusal copy names /new, never a resend.
+        from agent.turn_failure_copy import launch_credentials_copy
+        return launch_credentials_copy(exc), 'launch_credentials_unavailable', False
+    if isinstance(exc, AuthorityRefusal):
+        # Session-policy refusals carry a stable reason code (e.g. a CLI launch key revoked by
+        # daemon restart): keep it in the reply so clients can act on it, and do not suggest
+        # /login — the profile's own credentials were never in play.
+        return (f"⚠️ This session's launch credentials are no longer available ({exc.reason}), so this "
+                "message wasn't processed. Start a new session from the CLI to bind them again.", auth_permanent, False)
+    if is_rate_limited_auth_error(exc.__cause__):
+        # Quota cap with valid credentials: /login cannot help; name the reset window (#89401).
+        from gateway.run import _gateway_provider_error_reply
+        return _gateway_provider_error_reply(str(exc)), auth_permanent, False
+    if platform == Platform.LOCAL:
+        # The local operator reads the terminal: the resolver's own sentence ("provider 'custom'
+        # resolved without credentials ...") is the diagnosis; /login is not.
+        return f"⚠️ {exc}", auth_permanent, False
+    seen: set[int] = set()
+    host = auth = False
+    link: BaseException | None = exc
+    while link is not None and id(link) not in seen:
+        seen.add(id(link))
+        host = host or isinstance(link, OSError)
+        auth = auth or isinstance(link, AuthError)
+        link = link.__cause__ or link.__context__
+    if host and not auth:
+        # A host-side failure (a CA bundle deleted under a long-lived process, an unreadable file)
+        # with no credential verdict: /login cannot fix it, the gateway log can (#140344).
+        # host_error sits on the gateway layer, so clients don't offer "Switch provider"; not retryable,
+        # since a deleted bundle or unreadable store fails the same way until the host is fixed.
+        return t("gateway.errors.generic_failed"), "host_error", False
+    return t("gateway.errors.no_credentials"), auth_permanent, False
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 
@@ -178,7 +312,14 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
             owner_id = (source.chat_id if getattr(source, "platform", None) == Platform.LOCAL
                         else authority.logical_owner(getattr(ctx, "session_id", None)))
             if owner_id in authority.sessions:
-                generation = authority.db.get_session(owner_id)["runtime_generation"]
+                from gateway.session_persistence import authority_persistence
+                from persistence.core.errors import StoreUnavailable
+                if (store := authority_persistence(authority)) is None:
+                    raise StoreUnavailable(f"no storage handle for {authority.profile_id}")
+                # A live session without its row fails the turn with the error reading the absent row raises.
+                if (row := store.sessions.get(owner_id)) is None:
+                    raise TypeError("'NoneType' object is not subscriptable")
+                generation = row.runtime_generation
                 self._approval_owner = (authority, owner_id, generation)
 
     def _publish_execution(self, event_type, payload):
@@ -1671,9 +1812,9 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
         ctx = self._ctx
         try:
             # run_sync is off-loop (executor); sync DB is fine.
-            binding = self._runner._session_db._db.get_telegram_topic_binding_by_session(session_id=agent_session_id)
-            if binding and binding.get("thread_id"):
-                ctx.source.thread_id = str(binding["thread_id"])
+            binding = self._runner.persistence.routing.get_topic_binding_for_session(session_id=agent_session_id)
+            if binding and binding.thread_id:
+                ctx.source.thread_id = str(binding.thread_id)
                 logger.debug(
                     "Restored source.thread_id=%s from binding after session split %s → %s",
                     ctx.source.thread_id, ctx.session_id, agent_session_id,
@@ -1731,7 +1872,7 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
                 src = ctx.source
                 if (
                     getattr(src, "platform", None) == Platform.TELEGRAM and getattr(src, "chat_type", None) == "dm"
-                    and getattr(src, "thread_id", None) is None and runner._session_db is not None
+                    and getattr(src, "thread_id", None) is None and runner.persistence is not None
                 ):
                     self._restore_telegram_thread_id_after_split(agent_session_id)
                 runner._sync_telegram_topic_binding(src, entry, reason="agent-run-compression")
@@ -1798,12 +1939,12 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
         from gateway.session_policy import bind_turn_workspace, policy_for_source, policy_scope, refused_turn_result
         from gateway.session_api_turn import api_policy_scope
         from gateway.session_authorities import active_authority
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         policy = policy_for_source(self._runner, self._ctx.source)
         with ExitStack() as scope:
             try:
                 scope.enter_context(policy_scope(policy, authority=active_authority(self._runner)))
-            except RuntimeStoreError as exc:
+            except AuthorityRefusal as exc:
                 result = refused_turn_result(policy, exc)
                 if result is None:
                     raise

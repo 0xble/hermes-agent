@@ -42,7 +42,7 @@ def _run_state_db_auto_maintenance(session_db) -> None:
                 if session_db.get_meta(meta_key):
                     continue
                 count = repair()
-            # Every SessionDB refusal: sqlite/IO, RuntimeStoreError (ValueError), and the
+            # Every SessionDB refusal: sqlite/IO, AuthorityRefusal (ValueError), and the
             # hermes_state_errors busy/replaced family (RuntimeError).
             except (sqlite3.Error, OSError, ValueError, RuntimeError) as _exc:
                 # Latched below regardless: a repair this store refuses (live ledger work,

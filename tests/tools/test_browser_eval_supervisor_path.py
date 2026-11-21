@@ -158,6 +158,7 @@ def _make_supervisor_with_cdp(cdp_response):
     sup._state_lock = threading.Lock()
     sup._active = True
     sup._page_session_id = "test-session-id"
+    sup._documents = {}
 
     # Build a real running event loop on a background thread so
     # asyncio.run_coroutine_threadsafe has somewhere to dispatch.
@@ -187,7 +188,7 @@ class TestEvaluateRuntimeResponseShaping:
         })
         try:
             out = sup.evaluate_runtime("1 + 41")
-            assert out == {"ok": True, "result": 42, "result_type": "number"}
+            assert out == {"ok": True, "result": 42, "result_type": "number", "document": 0}
         finally:
             _stop_supervisor(sup)
 
@@ -244,6 +245,7 @@ def _make_supervisor_with_cdp_fn(cdp_fn):
     sup._state_lock = threading.Lock()
     sup._active = True
     sup._page_session_id = "test-session-id"
+    sup._documents = {}
 
     loop, thread = _start_running_loop()
 

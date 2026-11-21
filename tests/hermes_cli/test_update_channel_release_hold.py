@@ -6,18 +6,17 @@ downgrade on every attempt. An explicit ``--branch`` to a pre-runtime commit is 
 """
 from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import argparse
-from contextlib import closing
 from copy import deepcopy
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 
-import hermes_state_runtime as rt
 from hermes_cli import main, source_releases, update_cmd
 from hermes_cli.subcommands.update import build_update_parser
 from hermes_cli.update_channel import set_install_channel
-from hermes_state import SessionDB
+from persistence_assembly import open_persistence, profile_scope
+from tests.fixtures.storage_seed import seed_session
 
 pytestmark = pytest.mark.real_release_channels
 
@@ -79,10 +78,16 @@ def source(tmp_path, monkeypatch):
 
 
 def _ledgered(home):
-    with closing(SessionDB(home / "state.db")) as db:
+    with open_persistence(profile_scope(home=home)) as store:
+<<<<<<< HEAD
         epoch = _begin_owned_runtime_epoch(db, instance_id="owner")
-        db.create_session("s", source="cli")
-        rt.admit_session_input(db, epoch=epoch, principal_id="p", session_id="s", request_id="r",
+||||||| dff103e05878
+        epoch = rt.begin_runtime_epoch(db, instance_id="owner")
+=======
+        epoch = store.runtime.begin_epoch(instance_id="owner")
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
+        seed_session(store, "s", "cli")
+        store.admissions.admit(epoch=epoch, principal_id="p", session_id="s", request_id="r",
                                payload={"text": "x"})
 
 

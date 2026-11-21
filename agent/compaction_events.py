@@ -37,7 +37,7 @@ _METHODS = frozenset({
 })
 _TRIGGERS = frozenset({
     "manual", "turn_start_threshold", "pre_api", "post_tool", "idle", "engine_preflight", "overflow",
-    "gateway_hygiene", "between_turns", "proactive_prune", "agent_requested", "provider", "unknown",
+    "gateway_hygiene", "cache_expiry", "between_turns", "proactive_prune", "agent_requested", "provider", "unknown",
 })
 # Unclassified triggers are automatic; explicitly classified triggers retain their origin.
 _TRIGGER_CLASSES = {

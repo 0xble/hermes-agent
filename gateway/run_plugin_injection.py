@@ -91,10 +91,11 @@ def wake_background_wait(authority, ref, *, person_input=False):
 
 
 def _wake_if_person_queued(authority, ref, wait):
+    from gateway.session_authority import admission_row
+    from gateway.session_persistence import authority_persistence
     from gateway.session_unattended_unknown import is_unattended
-    from hermes_state_runtime import list_session_admissions
-    if any(row["status"] == "queued" and not is_unattended(row)
-           for row in list_session_admissions(authority.db, session_id=ref.session_id)):
+    rows = authority_persistence(authority).admissions.list(session_id=ref.session_id)
+    if any(row["status"] == "queued" and not is_unattended(row) for row in map(admission_row, rows)):
         wait.set()
 
 
@@ -305,7 +306,7 @@ class GatewayPluginInjectionMixin:
         profile = self._served_profile_for_home(plugin_home)
         owner = profile
         if profile is not None and getattr(getattr(self, "config", None), "multiplex_profiles", False) is True:
-            from hermes_state_keys import profile_from_session_key
+            from session_keys import profile_from_session_key
             owner = profile_from_session_key(session_key)
         if profile is not None and owner == profile:
             return True
@@ -378,7 +379,7 @@ class GatewayPluginInjectionMixin:
             return None
         import json
         import uuid
-        from hermes_state_runtime import RuntimeStoreError
+        from persistence.core.errors import AuthorityRefusal
         identity = json.dumps([_PLUGIN_PRODUCER, plugin_id, session_key, uuid.uuid4().hex], separators=(",", ":"))
         event = MessageEvent(
             text=content, message_type=MessageType.TEXT, source=source, internal=True,
@@ -395,7 +396,7 @@ class GatewayPluginInjectionMixin:
             receipt = await authority.admit_automation(adapter, event, identity)
             if delivery is not None:
                 delivery.finish(True, "adopted", admission_id=receipt.admission_id)
-        except RuntimeStoreError as exc:
+        except AuthorityRefusal as exc:
             # This error is raised before INSERT; other failures may follow a
             # shielded commit and must remain ambiguous rather than replayable.
             if delivery is not None and exc.reason == "queue_full":

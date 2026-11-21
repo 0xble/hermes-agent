@@ -7,6 +7,8 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
+from persistence_assembly import store_location
+
 KEY = 'off-loop-admission-key-long-enough'
 AUTH = {'Authorization': 'Bearer ' + KEY}
 
@@ -58,7 +60,7 @@ async def test_admission_waits_for_the_writer_off_the_owner_loop(api, owner, mon
     monkeypatch.setattr(owner.db, '_execute_write', off_loop_write)
     monkeypatch.setattr(owner.db, '_sleep_before_write_retry', observed_retry)
     async with TestClient(TestServer(app)) as client:
-        holder = sqlite3.connect(owner.db.db_path, timeout=0, isolation_level=None)
+        holder = sqlite3.connect(store_location(owner.persistence.scope), timeout=0, isolation_level=None)
         holder.execute('BEGIN IMMEDIATE')
         request = asyncio.create_task(client.post(path, json=body, headers={**AUTH, **headers}))
         observed = asyncio.create_task(contended.wait())

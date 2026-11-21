@@ -23,8 +23,14 @@ from typing import Any, Callable, Optional
 from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
 from agent.delegation_context import is_dispatcher_owned_worker_context
+<<<<<<< HEAD
 from agent.incognito import incognito_scope, is_incognito
 from agent.message_content import flatten_message_text
+||||||| dff103e05878
+from agent.message_content import flatten_message_text
+=======
+from session_rules.turns import flatten_message_text
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 logger = logging.getLogger(__name__)
 
@@ -526,7 +532,7 @@ def _summarize_user_message(user_message: str) -> str:
         return ""
     described = None
     try:
-        from agent.skill_commands import describe_skill_invocation
+        from session_rules.turns import describe_skill_invocation
         described = describe_skill_invocation(user_message)
     except Exception:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)
@@ -1118,9 +1124,12 @@ def pick_topic_icon(title: str, icon_options, *, instructions: str = "", timeout
         return None
 
 
-def _has_upgraded_title(session_db, session_id: str) -> bool:
+def _has_upgraded_title(session_db, session_id: str, *, persistence=None) -> bool:
     """True when the session already carries an ``llm``/``user`` title (or the check fails)."""
     try:
+        if persistence is not None:
+            from persistence.conversation.sessions import TitleSource
+            return persistence.sessions.get_title_source(session_id) not in (None, TitleSource.DERIVED)
         source_fn = getattr(session_db, "get_session_title_source", None)
         if source_fn is not None:
             return source_fn(session_id) not in (None, "derived")
@@ -1129,7 +1138,13 @@ def _has_upgraded_title(session_db, session_id: str) -> bool:
         return True
 
 
+<<<<<<< HEAD
 def _persist_session_title(session_db, session_id, title, *, source, dedupe=True, reject_collision=False):
+||||||| dff103e05878
+def _persist_session_title(session_db, session_id, title, *, source, dedupe=True):
+=======
+def _persist_session_title(session_db, session_id, title, *, source, dedupe=True, persistence=None):
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     """Persist at *source* authority via ``set_auto_title`` (precedence check + write in one
     transaction, so a manual ``/title`` is never overwritten); None when a higher authority held the row.
     ``ValueError`` = unique-title index collision → append ``#N`` via ``get_next_title_in_lineage``;
@@ -1139,7 +1154,13 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     ``ValueError`` means the name is taken by an unrelated session (the unique-title index); rather than
     leave the session untitled (#50537), append a ``#N`` suffix via ``get_next_title_in_lineage``.
     """
-    auto_fn = getattr(session_db, "set_auto_title", None)
+    if persistence is not None:
+        from persistence.conversation.sessions import TitleSource
+
+        def auto_fn(sid, candidate, *, source):
+            return persistence.sessions.set_auto_title(sid, candidate, source=TitleSource(source))
+    else:
+        auto_fn = getattr(session_db, "set_auto_title", None)
 
     def _set(candidate):
         if auto_fn is not None:
@@ -1159,13 +1180,15 @@ def _persist_session_title(session_db, session_id, title, *, source, dedupe=True
     try:
         return _set(title)
     except ValueError:
-        next_title_fn = getattr(session_db, "get_next_title_in_lineage", None)
+        next_title_fn = (persistence.sessions.next_title_in_lineage if persistence is not None
+                         else getattr(session_db, "get_next_title_in_lineage", None))
         deduped = next_title_fn(title) if dedupe and next_title_fn is not None else None
         if not deduped or deduped == title:
             raise
         return _set(deduped)
 
 
+<<<<<<< HEAD
 def _title_session_boundary(method):
     """Bind live session privacy before title history, auxiliaries or callbacks."""
     @wraps(method)
@@ -1179,12 +1202,19 @@ def _title_session_boundary(method):
 
 @_title_session_boundary
 def apply_subagent_title(session_db, session_id: str, goal: str) -> Optional[str]:
+||||||| dff103e05878
+def apply_subagent_title(session_db, session_id: str, goal: str) -> Optional[str]:
+=======
+def apply_subagent_title(session_db, session_id: str, goal: str, *, persistence=None) -> Optional[str]:
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     """Title a delegate run ``Subagent: <goal's first line>`` at ``derived`` authority. No model call:
     runs fan out in bulk, and the prefix alone is what tells them apart from conversations wherever
     ``sessions.show_subagents`` lists them (#97202). Collisions get ``#N``. Never raises."""
     try:
         derived = derive_title(goal) if is_titleable_user_message(goal) else None
-        return _persist_session_title(session_db, session_id, f"Subagent: {derived}", source="derived") if derived else None
+        return _persist_session_title(
+            session_db, session_id, f"Subagent: {derived}", source="derived", persistence=persistence,
+        ) if derived else None
     except Exception:
         logger.debug("Subagent title failed for %s", session_id, exc_info=True)
         return None
@@ -1193,7 +1223,7 @@ def apply_subagent_title(session_db, session_id: str, goal: str) -> Optional[str
 @_title_session_boundary
 def apply_instant_title(
     session_db, session_id: str, user_message: str, title_callback: Optional[TitleCallback] = None,
-    title_preview: str | None = None,
+    title_preview: str | None = None, *, persistence=None,
 ) -> Optional[str]:
     """Write the derived title inline. Returns it, or None (no usable text, or a ``derived``+ title exists). Never raises.
 
@@ -1202,8 +1232,18 @@ def apply_instant_title(
     if not session_db or not session_id:
         return None
     try:
+<<<<<<< HEAD
         title = derive_title(user_message, title_preview) if is_titleable_user_message(user_message, title_preview) else None
         persisted = _persist_session_title(session_db, session_id, title, source="derived", dedupe=False) if title else None
+||||||| dff103e05878
+        title = derive_title(user_message, title_preview) if is_titleable_user_message(user_message) else None
+        persisted = _persist_session_title(session_db, session_id, title, source="derived", dedupe=False) if title else None
+=======
+        title = derive_title(user_message, title_preview) if is_titleable_user_message(user_message) else None
+        persisted = _persist_session_title(
+            session_db, session_id, title, source="derived", dedupe=False, persistence=persistence,
+        ) if title else None
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         if persisted:
             _notify_title(
                 title_callback, persisted, "derived", "Instant-title", display_title=title
@@ -1225,16 +1265,22 @@ def auto_title_session(
     runtime_validator: Optional[RuntimeValidator] = None,
     icon_context: Optional[dict] = None,
     title_preview: str | None = None,
+<<<<<<< HEAD
     reply_excerpt: str | None = None,
     conversation_history: Optional[list] = None,
     title_style: str = "noun",
+||||||| dff103e05878
+=======
+    *,
+    persistence=None,
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 ) -> None:
     """Generate and store the model title (daemon-thread target); skips sessions already carrying an
     ``llm``/``user`` title (a ``derived`` one is expected — upgrading it is the point). Never lets an
     exception escape (the threading excepthook would spray a traceback into the terminal); the canonical
     trigger is the post-``hermes update`` window where lazy imports read NEW source against OLD modules."""
     try:
-        if not session_db or not session_id or _has_upgraded_title(session_db, session_id):
+        if not session_db or not session_id or _has_upgraded_title(session_db, session_id, persistence=persistence):
             return
         # This thread starts AFTER the turn's ambient context was reset; republish it so the call carries
         # the same Portal ``conversation=`` tag (root-of-lineage) and bills usage to this session.
@@ -1242,10 +1288,12 @@ def auto_title_session(
         from agent.portal_tags import set_conversation_context
         conversation_id = session_id
         with suppress(Exception):
-            conversation_id = session_db.get_conversation_root(session_id) or session_id
+            conversation_id = (persistence.lineage.conversation_root(session_id) if persistence is not None
+                               else session_db.get_conversation_root(session_id)) or session_id
         set_conversation_context(conversation_id)
         # Same for the accounting context, so the title call's token usage is recorded against this session
         # (task='title_generation', #23270).
+<<<<<<< HEAD
         set_accounting_context(session_db, session_id)
         recent_titles = []
         with suppress(Exception):
@@ -1300,6 +1348,21 @@ def auto_title_session(
             source = "llm" if terminal_fallback else "derived"
             chosen_icon.clear()
         if title and not terminal_fallback and _is_provisional_greeting_title(title):
+||||||| dff103e05878
+        set_accounting_context(session_db, session_id)
+        title, source = generate_title(
+            user_message, failure_callback=failure_callback, main_runtime=main_runtime,
+            runtime_validator=runtime_validator, title_preview=title_preview,
+        ), "llm"
+        if title and _is_provisional_greeting_title(title):
+=======
+        set_accounting_context(session_db, session_id, persistence=persistence)
+        title, source = generate_title(
+            user_message, failure_callback=failure_callback, main_runtime=main_runtime,
+            runtime_validator=runtime_validator, title_preview=title_preview,
+        ), "llm"
+        if title and _is_provisional_greeting_title(title):
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
             source = "derived"
         if not title:  # the inline attempt declined collisions; off the critical path the lineage scan is affordable
             title, source = derive_title(user_message, title_preview), "derived"
@@ -1312,8 +1375,14 @@ def auto_title_session(
             logger.debug("Auto-title held: unsupported final subject")
             return
         try:
+<<<<<<< HEAD
             persisted = _persist_session_title(session_db, session_id, title, source=source,
                                                reject_collision=source == "llm")
+||||||| dff103e05878
+            persisted = _persist_session_title(session_db, session_id, title, source=source)
+=======
+            persisted = _persist_session_title(session_db, session_id, title, source=source, persistence=persistence)
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         except Exception as e:
             logger.debug("Failed to set auto-generated title: %s", e)
             return
@@ -1330,6 +1399,14 @@ def auto_title_session(
         _report_failure(failure_callback, e, "Auto-title")
 
 
+def _upgrade_holding_store(hold, *args, **kwargs) -> None:
+    """``auto_title_session`` while ``hold``, the thread's own reference on the store it writes, keeps it open."""
+    try:
+        auto_title_session(*args, **kwargs)
+    finally:
+        hold.close()
+
+
 def _is_real_user_turn(message: Any) -> bool:
     """A question a person actually asked (Hermes persists machinery under ``role="user"``)."""
     if not isinstance(message, dict) or message.get("role") != "user":
@@ -1338,9 +1415,9 @@ def _is_real_user_turn(message: Any) -> bool:
     return is_titleable_user_message(content if isinstance(content, str) else flatten_message_text(content))
 
 
-def _session_is_untitled(session_db, session_id: str) -> bool:
+def _session_is_untitled(session_db, session_id: str, *, persistence=None) -> bool:
     """No title of any provenance; False when it can't tell (no model call per turn for an unreadable title)."""
-    getter = getattr(session_db, "get_session_title", None)
+    getter = persistence.sessions.get_title if persistence is not None else getattr(session_db, "get_session_title", None)
     try:
         return callable(getter) and not str(getter(session_id) or "").strip()
     except Exception:
@@ -1356,13 +1433,13 @@ def _kanban_task_title() -> Optional[str]:
         return None
     try:
         from hermes_cli import kanban_db, kanban_db_connect
-        from hermes_state import SessionDB
+        from persistence.conversation.sessions import MAX_TITLE_LENGTH
         with kanban_db_connect.connect_closing() as conn:
             task = kanban_db.get_task(conn, task_id)
         title = " ".join((task.title or "").split()) if task is not None else ""
         # Cards have no length cap; the title store rejects past MAX_TITLE_LENGTH (and the ``#N``
         # retry suffix needs room), which would leave the worker nameless.
-        cap = SessionDB.MAX_TITLE_LENGTH - 4
+        cap = MAX_TITLE_LENGTH - 4
         if len(title) > cap:
             title = title[: cap - 1].rstrip() + "…"
     except Exception:
@@ -1459,7 +1536,13 @@ def maybe_auto_title(
     runtime_validator: Optional[RuntimeValidator] = None,
     icon_context: dict | None = None,
     title_preview: str | None = None,
+<<<<<<< HEAD
     title_style: str = "noun",
+||||||| dff103e05878
+=======
+    *,
+    persistence=None,
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 ) -> Optional[threading.Thread]:
     """Instant inline title, then a daemon-thread upgrade. Call at the START of a turn, before the model.
 
@@ -1475,9 +1558,17 @@ def maybe_auto_title(
     # may still recover using a deterministic subject, without more model or link requests.
     user_msg_count = sum(1 for m in (conversation_history or []) if _is_real_user_turn(m))
     if user_msg_count > 1 and (
+<<<<<<< HEAD
         _has_upgraded_title(session_db, session_id)
         or (user_msg_count > 3 and not _session_is_untitled(session_db, session_id)
             and not _hold_until_reply_enabled())
+||||||| dff103e05878
+        _has_upgraded_title(session_db, session_id)
+        or (user_msg_count > 3 and not _session_is_untitled(session_db, session_id))
+=======
+        _has_upgraded_title(session_db, session_id, persistence=persistence)
+        or (user_msg_count > 3 and not _session_is_untitled(session_db, session_id, persistence=persistence))
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     ):
         return None
     kanban_title = _kanban_task_title()
@@ -1486,7 +1577,7 @@ def maybe_auto_title(
         # only competes with the worker for capacity (#111166). Final (``llm``) authority: nothing
         # upgrades it later, and a manual ``/title`` still wins inside ``set_auto_title``.
         with suppress(Exception):
-            persisted = _persist_session_title(session_db, session_id, kanban_title, source="llm")
+            persisted = _persist_session_title(session_db, session_id, kanban_title, source="llm", persistence=persistence)
             if persisted:
                 _notify_title(title_callback, persisted, "llm", "Kanban task title")
         return None
@@ -1495,7 +1586,8 @@ def maybe_auto_title(
     if not _auto_title_enabled():  # config read after the cheap guards so the file isn't touched every turn
         logger.debug("Auto-title skipped: auxiliary.title_generation.enabled=false")
         return None
-    apply_instant_title(session_db, session_id, user_message, title_callback, title_preview=title_preview)
+    apply_instant_title(session_db, session_id, user_message, title_callback, title_preview=title_preview,
+                        persistence=persistence)
     if not _model_title_upgrade_enabled():
         logger.debug("Instant title persisted; model upgrade disabled by auxiliary.title_generation.model_upgrade_enabled=false")
         return None
@@ -1509,6 +1601,7 @@ def maybe_auto_title(
         upgrade_kwargs["title_style"] = title_style
     if isinstance(title_preview, str) and title_preview.strip():
         upgrade_kwargs["title_preview"] = title_preview
+<<<<<<< HEAD
     upgrade = spawn_context_thread(
         auto_title_session, name="auto-title",
         args=(session_db, session_id, user_message),
@@ -1524,6 +1617,30 @@ def maybe_auto_title(
         and opener_needs_reply(user_message, title_preview)
     ):
         logger.debug("Auto-title upgrade deferred past the turn")
+||||||| dff103e05878
+    upgrade = spawn_context_thread(
+        auto_title_session, name="auto-title",
+        args=(session_db, session_id, user_message),
+        kwargs=upgrade_kwargs,
+    )
+    if title_upgrade_must_wait_for_turn(main_runtime):
+        logger.debug("Auto-title upgrade deferred past the turn: shares the self-hosted endpoint with the main request")
+=======
+    target, args = auto_title_session, (session_db, session_id, user_message)
+    if persistence is not None:
+        # The caller may close its handle while the model is still answering: the thread writes through its own
+        # reference, which keeps the profile's store open until the title is written (released when the thread ends,
+        # or when a thread that never started is collected).
+        from persistence_assembly import open_persistence
+        hold = open_persistence(persistence.scope)
+        upgrade_kwargs["persistence"] = hold
+        target, args = _upgrade_holding_store, (hold, *args)
+    upgrade = spawn_context_thread(target, name="auto-title", args=args, kwargs=upgrade_kwargs)
+    if persistence is not None:
+        weakref.finalize(upgrade, hold.close)
+    if title_upgrade_must_wait_for_turn(main_runtime):
+        logger.debug("Auto-title upgrade deferred past the turn: shares the self-hosted endpoint with the main request")
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         return upgrade
     start_title_upgrade(upgrade)
     return upgrade

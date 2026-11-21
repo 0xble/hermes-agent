@@ -13,6 +13,7 @@ import time
 import pytest
 
 from tests.gateway.fixtures.local_recovery_probe import daemon, rpc, websocket
+<<<<<<< HEAD
 from tests.waiting import async_wait_until, process_alive
 
 
@@ -30,6 +31,12 @@ def test_background_pid_probe_tolerates_reap(monkeypatch, error_name):
     monkeypatch.setattr(psutil.Process, 'status', reaped)
     assert process_alive(os.getpid()) is False
     assert status == [os.getpid()]
+||||||| dff103e05878
+from tests.waiting import async_wait_until
+=======
+from tests.process_scan import children_matching
+from tests.waiting import async_wait_until
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 class Model(BaseHTTPRequestHandler):
@@ -201,8 +208,8 @@ def test_ordinary_owner_launches_tool_worker_and_detach_does_not_cancel(tmp_path
             assert await asyncio.to_thread(peer.blocked.wait, 240), (home / 'restart.log').read_text()
             workers = query('SELECT execution_id,status FROM worker_executions WHERE session_id=?', (sid,))
             assert len(workers) == 1, workers
-            children = [p for p in psutil.Process(owner.pid).children() if p.cmdline()[-2:] == ['-m', 'agent.managed_worker']]
-            assert len(children) == 1, [(p.pid, p.cmdline()) for p in psutil.Process(owner.pid).children()]
+            children = children_matching(owner.pid, lambda p: p.cmdline()[-2:] == ['-m', 'agent.managed_worker'])
+            assert len(children) == 1, [p.pid for p in psutil.Process(owner.pid).children()]
             pid = children[0].pid
             opened = [json.loads(line) for line in audit.read_text().splitlines()]
             # Positive control: the witness hook is live in the owner, so worker silence is real.

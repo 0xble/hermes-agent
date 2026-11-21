@@ -22,6 +22,7 @@ import pytest
 from hermes_cli.gateway_client import GatewayRPCError
 from tests.acp_adapter.test_gateway_sessions import editor, viewer
 from tests.gateway.test_normal_runtime_boot import control
+from tests.process_scan import children_matching
 from tests.waiting import async_wait_until, process_children, process_cmdline
 
 
@@ -214,8 +215,15 @@ def _policies(home, *session_ids):
 
 
 def _peers_running(pid):
+<<<<<<< HEAD
     return [child for child in process_children(pid)
             if any('peer.py' in part for part in (process_cmdline(child) or []))]
+||||||| dff103e05878
+    return [child for child in psutil.Process(pid).children(recursive=True)
+            if any('peer.py' in part for part in child.cmdline())]
+=======
+    return children_matching(pid, lambda child: any('peer.py' in part for part in child.cmdline()), recursive=True)
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 @pytest.mark.platforms("linux")

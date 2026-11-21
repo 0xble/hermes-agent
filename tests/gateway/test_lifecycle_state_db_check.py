@@ -428,15 +428,13 @@ def test_deferred_scan_skips_a_rollback_journal_store(tmp_path: Path, monkeypatc
 
 
 def test_deferred_scan_skips_when_the_journal_mode_is_undeterminable(tmp_path: Path, monkeypatch) -> None:
-    import hermes_state_wal
-
     _make_state_db(tmp_path, corrupt=False, journal_mode="wal")
     calls = _spy_on_scan(monkeypatch)
 
     def _unreadable(conn):
         raise sqlite3.DatabaseError("file is not a database")
 
-    monkeypatch.setattr(hermes_state_wal, "_on_disk_journal_mode", _unreadable)
+    monkeypatch.setattr("persistence.sqlite.admin._doctor._on_disk_journal_mode", _unreadable)
 
     verdict = run_deferred_integrity_check({"prior_pid": _DEAD_PID}, home=tmp_path, deadline_s=60.0)
 
@@ -458,10 +456,8 @@ def test_deferred_scan_of_an_absent_store_is_unchanged(tmp_path: Path) -> None:
 
 
 def test_deadline_bounds_the_scan(tmp_path: Path, monkeypatch) -> None:
-    import gateway.lifecycle_ledger as ledger
-
     _make_multi_page_state_db(tmp_path)
-    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
+    monkeypatch.setattr("persistence.sqlite.admin._doctor._INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
 
     verdict = check_state_db_integrity(home=tmp_path, deadline_s=0.01)
 
@@ -484,10 +480,8 @@ def test_bounded_background_scan_never_renews_the_startup_lease(tmp_path: Path, 
 
 def test_no_deadline_keeps_the_historic_verdict_contract(tmp_path: Path, monkeypatch) -> None:
     """``deadline_s=None`` must be byte-for-byte today's behaviour: the handler never aborts."""
-    import gateway.lifecycle_ledger as ledger
-
     _make_multi_page_state_db(tmp_path)
-    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
+    monkeypatch.setattr("persistence.sqlite.admin._doctor._INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
 
     assert check_state_db_integrity(home=tmp_path) == "ok"
     assert check_state_db_integrity(home=tmp_path, deadline_s=None) == "ok"
@@ -616,12 +610,10 @@ def test_rollback_journal_check_renews_the_startup_lease_while_sqlite_progresses
     """The synchronous scan is startup work: a 37 GB store needs ~4200 s of quick_check and one
     900 s entry lease cannot cover it (#115542), so it renews a phase-owned lease from SQLite's
     progress handler — without converting corruption into success or aborting the PRAGMA."""
-    import gateway.lifecycle_ledger as ledger
-
     handle = _armed_handle(monkeypatch)
     # Renew on every handler tick so the renewal count is deterministic, not clock-bound.
-    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_LEASE_RENEW_S", 0.0)
-    monkeypatch.setattr(ledger, "_INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
+    monkeypatch.setattr("persistence.sqlite.admin._doctor._INTEGRITY_CHECK_LEASE_RENEW_S", 0.0)
+    monkeypatch.setattr("persistence.sqlite.admin._doctor._INTEGRITY_CHECK_PROGRESS_OPS", 1_000)
     _make_state_db(tmp_path, corrupt=False, journal="delete")
     _write_sentinel(tmp_path)
 

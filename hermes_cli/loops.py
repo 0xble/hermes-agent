@@ -2,7 +2,7 @@
 
 A loop stops when the agent ends a wakeup reply with ``LOOP_COMPLETE`` on its own line, when
 ``--times N`` ticks have fired, when the ``--until`` judge rules the condition met, or when the
-``loops.max_ticks`` backstop pauses it. State lives in SessionDB ``state_meta`` (same contract as
+``loops.max_ticks`` backstop pauses it. State lives in the session store's ``state_meta`` (same contract as
 ``hermes_cli/goals.py``); CLI, gateway, and TUI all drive it through :class:`LoopManager`.
 """
 
@@ -450,8 +450,8 @@ def loop_control_generation(session_id: str, default: Optional[int] = 0) -> Opti
 
 
 def _get_session_db() -> Optional[Any]:
-    """The goals module's cached SessionDB, so goals/loops/heartbeats share one connection and
-    its off-loop bootstrap (a cold cache on the loop thread never runs ``SessionDB()`` inline).
+    """The goals module's cached store handle, so goals/loops/heartbeats share one handle and
+    its off-loop bootstrap (a cold cache on the loop thread never opens the store inline).
 
     The previous copy here did, which froze the loop for the init duration and dropped the first ``loop:*``
     write (the /goal bug class, #88965).
@@ -459,13 +459,13 @@ def _get_session_db() -> Optional[Any]:
     try:
         from hermes_cli.goals import _get_session_db as _goals_db
     except Exception as exc:  # pragma: no cover
-        logger.debug("LoopManager: SessionDB bootstrap failed (%s)", exc)
+        logger.debug("LoopManager: store bootstrap failed (%s)", exc)
         return None
     return _goals_db()
 
 
 def _db_op(label: str, fn, default=None):
-    """Run one SessionDB call; any error is logged at debug and yields ``default``."""
+    """Run one store call; any error is logged at debug and yields ``default``."""
     try:
         return fn()
     except Exception as exc:
@@ -488,6 +488,7 @@ def load_loop(session_id: str, *, cursor=None) -> Optional[LoopState]:
     db = _get_session_db() if session_id else None
     if db is None:
         return None
+<<<<<<< HEAD
     if cursor is not None:
         row = cursor.execute("SELECT value FROM state_meta WHERE key = ?", (_meta_key(session_id),)).fetchone()
         raw = row[0] if row else None
@@ -496,8 +497,16 @@ def load_loop(session_id: str, *, cursor=None) -> Optional[LoopState]:
     state = _parse_state(raw, session_id) if raw else None
     _remember_control_generation(session_id, state)
     return state
+||||||| dff103e05878
+    raw = _db_op("get_meta", lambda: db.get_meta(_meta_key(session_id)))
+    return _parse_state(raw, session_id) if raw else None
+=======
+    raw = _db_op("get_meta", lambda: db.state_meta.get(_meta_key(session_id)))
+    return _parse_state(raw, session_id) if raw else None
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
+<<<<<<< HEAD
 def _next_control_generation(session_id: str, stored: Optional[LoopState], state: LoopState, *,
                              tick_lifecycle: bool) -> int:
     """The control fence *state* must carry when it replaces *stored* (the single bump rule).
@@ -529,6 +538,13 @@ def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None
     be replayed on lock contention and must not mutate a manager's cached state. Return the
     persisted row and command result only after a successful write; cursor owners see errors.
     """
+||||||| dff103e05878
+def save_loop(session_id: str, state: LoopState) -> None:
+    """Persist a loop to SessionDB. No-op if DB unavailable."""
+=======
+def save_loop(session_id: str, state: LoopState) -> None:
+    """Persist a loop to the session store. No-op if the store is unavailable."""
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     if not session_id:
         return None
     db = _get_session_db()
@@ -538,6 +554,7 @@ def save_loop(session_id: str, state: Optional[LoopState] = None, *, cursor=None
         from hermes_cli.goals import _warn_dropped_write
 
         _warn_dropped_write("LoopManager", "loop", session_id)
+<<<<<<< HEAD
         return None
     key = _meta_key(session_id)
 
@@ -580,6 +597,13 @@ def _tick_outcome_applies(stored: Optional[LoopState], instance: Any, fired_tick
         and (expected_phase is None or stored.claim_phase == expected_phase)
         and (owns_turn is None or not owns_turn())
     )
+||||||| dff103e05878
+        return
+    _db_op("set_meta", lambda: db.set_meta(_meta_key(session_id), state.to_json()))
+=======
+        return
+    _db_op("set_meta", lambda: db.state_meta.set(_meta_key(session_id), state.to_json()))
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 def clear_loop(session_id: str) -> None:
@@ -596,9 +620,9 @@ def list_active_loops() -> list[tuple[str, LoopState]]:
     if db is None:
         return []
     out: list[tuple[str, LoopState]] = []
-    for key, raw in _db_op("list_meta_prefix", lambda: db.list_meta_prefix(_META_PREFIX), []):
-        session_id = key[len(_META_PREFIX):]
-        state = _parse_state(raw) if session_id and raw else None
+    for entry in _db_op("list_meta_prefix", lambda: db.state_meta.list_prefix(_META_PREFIX), ()):
+        session_id = entry.key[len(_META_PREFIX):]
+        state = _parse_state(entry.value) if session_id and entry.value else None
         if state is not None and state.status == "active":
             out.append((session_id, state))
     return out
@@ -608,8 +632,8 @@ def store_has_active_loop(db: Any) -> bool:
     """True when *db* holds an ACTIVE ``loop:*`` row — or a row that cannot be parsed (unknown, so the
     caller keeps its full scan). Unlike :func:`list_active_loops` this takes the store explicitly and
     propagates read errors, so an idle gate can tell "empty" from "unavailable"."""
-    for key, raw in db.list_meta_prefix(_META_PREFIX):
-        state = _parse_state(raw, key[len(_META_PREFIX):]) if raw else None
+    for entry in db.state_meta.list_prefix(_META_PREFIX):
+        state = _parse_state(entry.value, entry.key[len(_META_PREFIX):]) if entry.value else None
         if state is None or state.status == "active":
             return True
     return False

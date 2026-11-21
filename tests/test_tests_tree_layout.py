@@ -28,14 +28,29 @@ TESTS_ROOT = REPO_ROOT / "tests"
 # "installation": python driver for the tests/install shell e2e assets.
 # "_fixtures": topic modules tests/conftest.py is split into — suite-wide
 # plumbing (env filtering, live-system guard, platform gating), not tests.
+<<<<<<< HEAD
 # "drills": live cross-process Telegram handover harnesses, which intentionally
 # do not mirror a production package.
+||||||| dff103e05878
+=======
+# "contracts": the storage contract suites, run against every backend of the
+# contracts in persistence/ through one fixture registry.
+# "neutral": the backend-neutral helper modules (session_rules and the modules
+# beside it that import no application package).
+# "persistence_sqlite": the SQLite backend, persistence/sqlite/.
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 _NON_MIRROR_DIRS = {
+<<<<<<< HEAD
     "compat", "installation", "_fixtures", "drills",
+||||||| dff103e05878
+    "compat", "installation", "_fixtures",
+=======
+    "compat", "installation", "_fixtures", "contracts", "neutral", "persistence_sqlite",
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     "ci", "conformance", "dashboard", "desktop", "docker", "e2e", "evals",
     "fakes", "fixtures", "install", "integration", "manual",
     "monitoring", "perf_guards", "scripts", "secret_sources",
-    "security", "skills", "verify", "website", "computer_use", "hermes_state",
+    "security", "skills", "verify", "website", "computer_use",
 }
 
 # Root-level modules whose tests sit directly in tests/ (no package to mirror).

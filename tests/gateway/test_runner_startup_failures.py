@@ -113,11 +113,9 @@ async def test_start_gateway_verbosity_imports_redacting_formatter(monkeypatch, 
     class _CleanExitRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
-            self.session_store._db = self._session_db
+            self.persistence = self.session_store.persistence
             self._draining = False
             self.config = config
             self.should_exit_cleanly = True
@@ -307,11 +305,9 @@ async def test_start_gateway_replace_writes_takeover_marker_before_sigterm(
     class _CleanExitRunner:
         def __init__(self, config):
             from gateway.session import SessionStore
-            from hermes_state import SessionDB
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
-            self._session_db = SessionDB(get_hermes_home() / 'state.db')
-            self.session_store._db = self._session_db
+            self.persistence = self.session_store.persistence
             self._draining = False
             self.config = config
             self.should_exit_cleanly = True
@@ -550,8 +546,15 @@ async def test_start_gateway_propagates_fatal_config_exit_code(monkeypatch, tmp_
             from gateway.session import SessionStore
             from hermes_constants import get_hermes_home
             self.session_store = SessionStore(get_hermes_home() / 'sessions', config)
+<<<<<<< HEAD
             self._session_db = session_db
             self.session_store._db = self._session_db
+||||||| dff103e05878
+            self._session_db = SessionDB(get_hermes_home() / 'state.db')
+            self.session_store._db = self._session_db
+=======
+            self.persistence = self.session_store.persistence
+>>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
             self._draining = False
             self.config = config
             self.should_exit_cleanly = True
