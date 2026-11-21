@@ -76,7 +76,7 @@ def test_stored_origin_adopts_completion_thread_from_event(runner):
         platform=Platform.SLACK, chat_id="D0TEST", chat_type="dm", thread_id="old-thread"))
     source = runner._build_process_event_source({
         "session_id": "proc_thread", "session_key": entry.session_key,
-        "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "new-thread",
+        "type": "async_delegation", "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "new-thread",
     })
     assert source is not None
     assert source.thread_id == "new-thread"
@@ -87,7 +87,7 @@ def test_stored_origin_clears_stale_thread_for_top_level_event(runner):
         platform=Platform.SLACK, chat_id="D0TEST", chat_type="dm", thread_id="old-thread"))
     source = runner._build_process_event_source({
         "session_id": "proc_top_level", "session_key": entry.session_key,
-        "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "",
+        "type": "async_delegation", "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "",
     })
     assert source is not None
     assert source.thread_id is None
@@ -98,7 +98,7 @@ def test_cached_origin_clears_stale_thread_for_top_level_event(runner, monkeypat
     monkeypatch.setattr(runner, "_get_cached_session_source", lambda _session_key: cached)
     source = runner._build_process_event_source({
         "session_id": "proc_cached_top_level", "session_key": "missing",
-        "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "",
+        "type": "async_delegation", "platform": "slack", "chat_type": "dm", "chat_id": "D0TEST", "thread_id": "",
     })
     assert source is not None
     assert source.thread_id is None

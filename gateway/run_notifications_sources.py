@@ -72,6 +72,8 @@ class GatewayProcessEventSourcesMixin:
         def _apply_event_thread(source):
             if source is None or "thread_id" not in evt:
                 return source
+            if not evt.get("thread_id") and evt.get("type") not in {"async_delegation", "delegation_auto_resume"}:
+                return source
             event_platform = str(evt.get("platform") or "").strip().lower()
             event_chat_id = str(evt.get("chat_id") or "").strip()
             source_platform = str(getattr(source.platform, "value", source.platform)).lower()
