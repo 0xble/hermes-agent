@@ -135,7 +135,7 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
 
-    def _hm_mounted_owner_probe(self, authority, _quick_key: str) -> Optional[str]:
+    def _hm_mounted_owner_probe(self, authority: Any, _quick_key: str) -> Optional[str]:
         """Read the route's durable FIFO owner for /stop and /new.
 
         SessionStore and the authority's lineage lookup take blocking storage locks. This read-only
