@@ -9,7 +9,7 @@ from agent.topic_icons import (
     validate_model_icon,
     validate_ranked_icons,
 )
-from gateway.config import PlatformConfig
+from gateway.config import Platform, PlatformConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
 
 
@@ -47,13 +47,168 @@ def test_ranked_proposals_keep_only_catalog_icons_in_order():
 
 @pytest.mark.anyio
 async def test_adapter_renames_name_and_icon_in_one_bot_call():
-    adapter = type("FakeAdapter", (), {})()
-    adapter._bot = type("Bot", (), {"edit_forum_topic": AsyncMock()})()
-    adapter.name = "test"
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock()})()
+    adapter = _retrying_topic_adapter(bot)
     await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage", icon_custom_emoji_id="bug-id")
-    adapter._bot.edit_forum_topic.assert_awaited_once_with(
+    bot.edit_forum_topic.assert_awaited_once_with(
         chat_id=42, message_thread_id=7, name="Bug triage", icon_custom_emoji_id="bug-id"
     )
+
+
+class _TopicNetworkError(Exception):
+    pass
+
+
+class _TopicTimedOut(_TopicNetworkError):
+    pass
+
+
+class _TopicBadRequest(_TopicNetworkError):
+    pass
+
+
+class _TopicForbidden(Exception):
+    pass
+
+
+class _TopicConnectTimeout(Exception):
+    pass
+
+
+class _TopicRetryAfter(Exception):
+    def __init__(self, seconds):
+        super().__init__(f"retry after {seconds}")
+        self.retry_after = seconds
+
+
+def _retrying_topic_adapter(bot):
+    adapter = object.__new__(TelegramAdapter)
+    adapter._bot = bot
+    adapter.platform = Platform.TELEGRAM
+    adapter._telegram_error_types = lambda: (_TopicNetworkError, _TopicBadRequest, _TopicTimedOut)
+    return adapter
+
+
+@pytest.mark.anyio
+async def test_topic_rename_retries_connect_timeout_then_succeeds(monkeypatch):
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    error = _TopicNetworkError()
+    error.__cause__ = _TopicConnectTimeout()
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=[error, None])})()
+    adapter = _retrying_topic_adapter(bot)
+    sleep = AsyncMock()
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", sleep)
+
+    assert await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage") is True
+    assert bot.edit_forum_topic.await_count == 2
+    sleep.assert_awaited_once_with(1)
+
+
+@pytest.mark.anyio
+async def test_topic_rename_retries_plain_timed_out_then_succeeds(monkeypatch):
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=[_TopicTimedOut(), None])})()
+    adapter = _retrying_topic_adapter(bot)
+    sleep = AsyncMock()
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", sleep)
+
+    assert await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage") is True
+    assert bot.edit_forum_topic.await_count == 2
+    sleep.assert_awaited_once_with(1)
+
+
+@pytest.mark.anyio
+async def test_topic_rename_retries_short_retry_after(monkeypatch):
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=[_TopicRetryAfter(0.25), None])})()
+    adapter = _retrying_topic_adapter(bot)
+    sleep = AsyncMock()
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", sleep)
+
+    assert await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage") is True
+    assert bot.edit_forum_topic.await_count == 2
+    sleep.assert_awaited_once_with(0.25)
+
+
+@pytest.mark.anyio
+async def test_topic_rename_does_not_sleep_for_over_cap_retry_after(monkeypatch):
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    error = _TopicRetryAfter(6)
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=error)})()
+    adapter = _retrying_topic_adapter(bot)
+    sleep = AsyncMock()
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(_TopicRetryAfter) as caught:
+        await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage")
+    assert caught.value is error
+    bot.edit_forum_topic.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_topic_rename_does_not_retry_bad_request(monkeypatch):
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    error = _TopicBadRequest("TOPIC_NOT_FOUND")
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=error)})()
+    adapter = _retrying_topic_adapter(bot)
+    sleep = AsyncMock()
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(_TopicBadRequest) as caught:
+        await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage")
+    assert caught.value is error
+    bot.edit_forum_topic.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_topic_not_modified_is_an_idempotent_success():
+    error = _TopicBadRequest("TOPIC_NOT_MODIFIED")
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=error)})()
+    adapter = _retrying_topic_adapter(bot)
+
+    assert await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage") is True
+    bot.edit_forum_topic.assert_awaited_once()
+
+
+@pytest.mark.anyio
+async def test_topic_rename_does_not_retry_forbidden(monkeypatch):
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    error = _TopicForbidden("forbidden")
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=error)})()
+    adapter = _retrying_topic_adapter(bot)
+    sleep = AsyncMock()
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(_TopicForbidden) as caught:
+        await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage")
+    assert caught.value is error
+    bot.edit_forum_topic.assert_awaited_once()
+    sleep.assert_not_awaited()
+
+
+@pytest.mark.anyio
+async def test_topic_rename_raises_the_last_transient_error(monkeypatch):
+    import plugins.platforms.telegram.adapter as adapter_module
+
+    errors = [_TopicNetworkError("first"), _TopicNetworkError("second"), _TopicNetworkError("last")]
+    bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=errors)})()
+    adapter = _retrying_topic_adapter(bot)
+    sleep = AsyncMock()
+    monkeypatch.setattr(adapter_module.asyncio, "sleep", sleep)
+
+    with pytest.raises(_TopicNetworkError) as caught:
+        await TelegramAdapter.rename_dm_topic(adapter, 42, 7, "Bug triage")
+    assert caught.value is errors[-1]
+    assert bot.edit_forum_topic.await_count == 3
+    assert [call.args[0] for call in sleep.await_args_list] == [1, 2]
 
 
 def test_topic_service_messages_are_routed_to_the_manual_icon_recorder(monkeypatch):

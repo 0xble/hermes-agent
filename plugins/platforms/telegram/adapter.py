@@ -3306,7 +3306,12 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
 
     async def rename_dm_topic(self, chat_id: int, thread_id: int, name: Optional[str], icon_custom_emoji_id: Optional[str] = None) -> bool:
         """Rename a forum topic in a private (DM) chat, returning whether Telegram accepted it.
-        ``name=None`` sends an icon-only edit; Bot API ``editForumTopic`` keeps the current name."""
+        ``name=None`` sends an icon-only edit; Bot API ``editForumTopic`` keeps the current name.
+
+        Topic edits are idempotent, so transport failures and plain ``TimedOut`` are safe to retry.
+        Reissuing the PTB call also lets ``TelegramFallbackTransport`` discard a failed sticky path
+        and walk the remaining paths afresh.
+        """
         if not self._bot:
             return False
         try:
@@ -3318,7 +3323,45 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             kwargs["name"] = name
         if icon_custom_emoji_id:
             kwargs["icon_custom_emoji_id"] = str(icon_custom_emoji_id)
-        await self._bot.edit_forum_topic(**kwargs)
+
+        net_error, bad_request, timed_out = self._telegram_error_types()
+        for attempt in range(3):
+            try:
+                await self._bot.edit_forum_topic(**kwargs)
+                break
+            except Exception as error:
+                # BadRequest subclasses NetworkError in PTB, but is permanent here. Telegram reports
+                # an idempotent no-op as TOPIC_NOT_MODIFIED on some versions; treat that as success.
+                if bad_request is not None and isinstance(error, bad_request):
+                    if "not modified" in str(error).lower() or "not_modified" in str(error).lower():
+                        break
+                    raise
+                retry_after = (
+                    _telegram_retry_after(error)
+                    if "retryafter" in error.__class__.__name__.lower()
+                    else None
+                )
+                if retry_after is not None:
+                    if retry_after > _FLOOD_INLINE_WAIT_CAP_SECS or attempt >= 2:
+                        raise
+                    logger.warning(
+                        "[%s] Telegram flood control on topic rename (attempt %d/3), retrying in %.1fs: %s",
+                        self.name, attempt + 1, retry_after, _redact_telegram_error_text(error))
+                    await asyncio.sleep(retry_after)
+                    continue
+                transient = (
+                    isinstance(error, net_error)
+                    or (timed_out is not None and isinstance(error, timed_out))
+                    or self._looks_like_connect_timeout(error)
+                    or self._looks_like_pool_timeout(error)
+                )
+                if not transient or attempt >= 2:
+                    raise
+                wait = 2 ** attempt
+                logger.warning(
+                    "[%s] Network error on topic rename (attempt %d/3), retrying in %ds: %s",
+                    self.name, attempt + 1, wait, _redact_telegram_error_text(error))
+                await asyncio.sleep(wait)
         if icon_custom_emoji_id:
             written = getattr(self, "_auto_topic_icons_written", None)
             if written is None:

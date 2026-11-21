@@ -4,6 +4,8 @@ Tests the _handle_title_command handler (set/show session titles)
 across all gateway messenger platforms.
 """
 
+import asyncio
+import logging
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -133,6 +135,43 @@ class TestHandleTitleCommand:
         else:
             assert "failed" in reply.lower() and "stored" in reply.lower()
         db.close()
+
+    @pytest.mark.asyncio
+    async def test_explicit_title_logs_failure_only_after_topic_retry_exhaustion(self, monkeypatch, caplog):
+        """The explicit /title failure reply is emitted only after the shared adapter retries."""
+        from gateway.run import GatewayRunner
+        from plugins.platforms.telegram.adapter import TelegramAdapter
+
+        class TopicNetworkError(Exception):
+            pass
+
+        errors = [TopicNetworkError("first"), TopicNetworkError("second"), TopicNetworkError("last")]
+        bot = type("Bot", (), {"edit_forum_topic": AsyncMock(side_effect=errors)})()
+        adapter = object.__new__(TelegramAdapter)
+        adapter._bot = bot
+        adapter.platform = Platform.TELEGRAM
+        adapter._telegram_error_types = lambda: (TopicNetworkError, None, None)
+        runner = object.__new__(GatewayRunner)
+        source = _make_event(text="/title New Topic").source
+        source.chat_type = "dm"
+        source.thread_id = "42"
+        runner._claim_telegram_topic_for_title = AsyncMock(return_value=True)
+        runner._delivery_adapter_for = lambda _source: adapter
+        runner._sanitize_telegram_topic_title = lambda title: title
+        runner._explicit_title_icon_proposal = AsyncMock(return_value=([], None))
+        runner._telegram_topic_chat_lock = lambda _source: asyncio.Lock()
+        runner._telegram_topic_bound_to = AsyncMock(return_value=True)
+        runner._persist_telegram_topic_icon_records = AsyncMock()
+        sleep = AsyncMock()
+        import plugins.platforms.telegram.adapter as adapter_module
+        monkeypatch.setattr(adapter_module.asyncio, "sleep", sleep)
+
+        with caplog.at_level(logging.WARNING, logger="gateway.run"):
+            assert await runner._rename_telegram_topic_explicit(source, "session", "New Topic", session_key="key") is False
+
+        assert bot.edit_forum_topic.await_count == 3
+        assert "Explicit Telegram topic rename failed after storing title" in caplog.text
+        assert sleep.await_count == 2
 
     @pytest.mark.asyncio
     async def test_show_title_does_not_rename_topic(self, tmp_path):
