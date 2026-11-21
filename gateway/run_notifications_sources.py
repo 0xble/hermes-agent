@@ -66,7 +66,27 @@ class GatewayProcessEventSourcesMixin:
                 return source
             try:
                 return dataclasses.replace(source, profile=event_profile)
-            except Exception:
+            except (TypeError, ValueError):
+                return source
+
+        def _apply_event_thread(source):
+            if source is None or "thread_id" not in evt:
+                return source
+            if not evt.get("thread_id") and evt.get("type") not in {"async_delegation", "delegation_auto_resume"}:
+                return source
+            event_platform = str(evt.get("platform") or "").strip().lower()
+            event_chat_id = str(evt.get("chat_id") or "").strip()
+            source_platform = str(getattr(source.platform, "value", source.platform)).lower()
+            if event_platform and source_platform != event_platform:
+                return source
+            if event_chat_id and str(getattr(source, "chat_id", "")) != event_chat_id:
+                return source
+            thread_id = str(evt.get("thread_id") or "").strip() or None
+            if getattr(source, "thread_id", None) == thread_id:
+                return source
+            try:
+                return dataclasses.replace(source, thread_id=thread_id)
+            except (TypeError, ValueError):
                 return source
 
         derived = {}
@@ -77,13 +97,13 @@ class GatewayProcessEventSourcesMixin:
                 if entry is None and not _raw_process_event_session_id(evt):
                     entry = self.session_store.lookup_by_session_id(session_key)
                 if entry and getattr(entry, "origin", None) and entry.origin.platform != Platform.API_SERVER:
-                    return self._restored_source(entry)
+                    return _apply_event_thread(self._restored_source(entry))
             except Exception as exc:
                 logger.debug("Synthetic process-event session-store lookup failed for %s: %s", session_key, exc)
             from gateway.session_detached import detached_live_source
             cached_source = detached_live_source(self, session_key) or self._get_cached_session_source(session_key)
             if cached_source is not None:
-                return _stamp_profile(cached_source)
+                return _apply_event_thread(_stamp_profile(cached_source))
             derived = _parse_session_key(session_key) or {}
         profile = event_profile or derived.get("profile")
         platform_name = str(evt.get("platform") or derived.get("platform") or "").strip().lower()
