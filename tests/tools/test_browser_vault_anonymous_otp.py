@@ -148,3 +148,28 @@ def test_anonymous_classifier_guard_matrix_and_code_length(context):
     explicit = LoginControl(index=10, autocomplete="one-time-code", form_index=0,
                             label="", name="", type="text")
     assert [x.control.index for x in classify_otp_controls([*boxes, explicit])] == [10]
+
+
+def test_google_totp_pin_shape_is_a_code_field():
+    control = LoginControl(index=0, autocomplete="off", form_index=0, label="Enter code",
+                           name="totpPin", type="tel", empty=True,
+                           nearby_text="2-Step Verification Get a verification code from the Google Authenticator app")
+    classified = classify_otp_controls([control])
+    assert len(classified) == 1
+    assert classified[0].token == "one-time-code"
+
+
+def test_google_otp_tab_probe_includes_totp_pin_selector():
+    from tools.browser_vault_tool import _TAB_PROBES
+
+    assert "input[name=totpPin i]" in _TAB_PROBES["otp"]
+@pytest.mark.parametrize("name,label,nearby", [
+    ("promoCode", "Promo code", "Apply a promo code"),
+    ("coupon", "Coupon code", "Enter coupon code"),
+    ("postalCode", "ZIP code", "Billing address"),
+    ("search", "Search", "Search verification code documentation"),
+])
+def test_generic_code_fields_are_not_otp(name, label, nearby):
+    control = LoginControl(index=0, autocomplete="off", form_index=0, label=label,
+                           name=name, type="text", empty=True, nearby_text=nearby)
+    assert classify_otp_controls([control]) == []
