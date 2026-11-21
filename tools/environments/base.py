@@ -455,7 +455,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
     def _task_snapshot_path(self, task_id: str) -> str:
         """Per-task snapshot beside the environment's own (``cleanup`` globs the prefix)."""
         digest = hashlib.sha256(task_id.encode()).hexdigest()[:16]
-        return f"{self._snapshot_path[:-len('.sh')]}-{digest}.sh"
+        return f"{Path(self._snapshot_path).parent}/hermes-task-snap-{digest}.sh"
 
     def _snapshot_script_kwargs(self, cwd: str, snap: str | None = None) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.

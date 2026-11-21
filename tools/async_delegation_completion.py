@@ -70,22 +70,9 @@ def _checkpoint_results(task, result, recorded):
         if index not in owned:
             continue
         current = children.get(index)
-        if current is not None and current.get("status") in _SUCCESS | {"waiting_to_resume"}:
-            # ``completion_event`` has already classified a promised child as waiting. Keep
-            # that display result (including dispatcher metadata such as subagent_id) while
-            # retaining checkpoints as the source of truth for missing or downgraded entries.
+        if current is not None and current.get("status") in _SUCCESS:
             continue
         child = dict(entry)
-        if current is not None:
-            # A checkpoint is captured before dispatch adds routing identity and before the
-            # completion event classifies a promised limit stop. Reconcile the checkpoint's
-            # payload, but retain those two pieces of current-runner truth.
-            for key in ("subagent_id", "live_transcript"):
-                if current.get(key) is not None:
-                    child[key] = current[key]
-            from tools.delegate_tool_auto_resume import waiting_on_resume
-            if waiting_on_resume(current) or waiting_on_resume(child):
-                child["status"] = "waiting_to_resume"
         if transcripts.get(str(index)) and not child.get("live_transcript"):
             child["live_transcript"] = transcripts[str(index)]
         children[index] = child
@@ -153,25 +140,23 @@ def record_unit_child(delegation_id: str, entry: dict[str, Any]) -> None:
     from tools import async_delegation as ad
 
     entry = ad.redact_child_result(entry)
-    if isinstance(entry.get("task_index"), int):
-        # Keep the active unit's live view in step with its durable checkpoint. This
-        # lets the join observe a finished sibling before the aggregate is terminal.
-        with ad._records_lock:
-            if (record := ad._records.get(delegation_id)) is not None and record.get("status") in ad._ACTIVE_STATES:
-                record.setdefault("_finished_children", {})[entry["task_index"]] = entry
+    with ad._records_lock:
+        record = ad._records.get(delegation_id)
+        if isinstance(record, dict):
+            record.setdefault("_finished_children", []).append(dict(entry))
     if remote := ad.worker_ledger():
         return remote.child(delegation_id, entry)
     try:
         with ad._DB_LOCK, ad._transaction() as conn:
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute("SELECT result_json FROM async_delegations WHERE delegation_id=? AND state='running'",
+            row = conn.execute("SELECT result_json FROM async_delegations WHERE delegation_id=? AND state IN ('running','finalizing')",
                                (delegation_id,)).fetchone()
             if row is None:
                 return
             partial = ad.redact_child_result(json.loads(row[0] or "{}") or {})
             results = [r for r in partial.get("results") or [] if r.get("task_index") != entry.get("task_index")]
             results.append(entry)
-            conn.execute("UPDATE async_delegations SET result_json=?, updated_at=? WHERE delegation_id=? AND state='running'",
+            conn.execute("UPDATE async_delegations SET result_json=?, updated_at=? WHERE delegation_id=? AND state IN ('running','finalizing')",
                          (json.dumps({"results": results, "partial": True}), time.time(), delegation_id))
     except Exception:
         logger.warning("Async delegation %s: could not record finished child %s", delegation_id, entry.get("task_index"), exc_info=True)

@@ -458,6 +458,8 @@ def _shell_state_chain(task_id: Optional[str]) -> tuple[str, ...]:
         while key and key in _container_aliases and key not in chain:
             chain.append(key)
             key = _container_aliases[key]
+        if key and key != "default" and key not in chain:
+            chain.append(key)
     return tuple(chain)
 
 

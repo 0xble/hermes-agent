@@ -304,7 +304,7 @@ def record_start(run: Any) -> None:
         record = {**prev, **spec, **_owner_identity(), "subagent_id": sid,
                   "delegation_id": getattr(child, "_delegation_id", None), "owners": sorted(owners),
                   # The async unit whose ledger row reports this run (``<call>-k`` with independent completions).
-                  "unit_id": getattr(child, "_delegation_unit_id", None),
+                  "unit_id": getattr(child, "_delegation_unit_id", None) or getattr(child, "_delegation_id", None),
                   "start_cwd": start_cwd, "cwd": durable["cwd"], "worktree": prev.get("worktree")
                   or run.worktree_info, "outcome": "running", "resume_mode": None,
                   # Kept across continues: a tree the child made in an earlier run is still its own.
@@ -503,7 +503,7 @@ def _abandoned_entry(record: dict[str, Any]) -> tuple[dict[str, Any], Optional[s
 def plan_recovery(path: Optional[Path], alive) -> dict[str, tuple[Any, Any, list[str]]]:
     """Boot, BEFORE the recovery transaction: ``{subagent_id: (owner_pid, owner_started_at, pin_paths)}`` for every
     ``running``/``claimed`` record whose owner is gone. The git probes behind the pins run here, holding no lock."""
-    rows = _write(path, lambda conn: conn.execute(
+    rows = _read_only(path, lambda conn: conn.execute(
         "SELECT subagent_id, owner_pid, owner_started_at, record_json FROM resumable_subagents "
         "WHERE state IN ('running','claimed')").fetchall()) or []
     plan = {}
@@ -511,6 +511,35 @@ def plan_recovery(path: Optional[Path], alive) -> dict[str, tuple[Any, Any, list
         if not alive(pid, started):
             plan[sid] = (pid, started, _live_pins(json.loads(raw or "{}"), memo=False))
     return plan
+
+
+def _read_only(path: Optional[Path], fn) -> Any:
+    """Run a read-only ledger query without holding the writer transaction.
+
+    A missing profile store has no abandoned rows. If a read-only connection cannot be
+    opened, fall back to the short query transaction so recovery does not silently lose
+    rows; the connection is still closed before any git probes run.
+    """
+    if path is None or not path.is_file():
+        return []
+    import sqlite3
+    from hermes_cli.sqlite_safe_read import connect_tracked
+    from hermes_state_holders import read_only_db_uri
+    try:
+        conn = connect_tracked(read_only_db_uri(path), tracking_path=path, uri=True, timeout=2.0)
+    except sqlite3.Error:
+        logger.warning("Read-only resumable recovery probe failed for %s; retrying briefly with the writer path", path,
+                       exc_info=True)
+        return _write(path, fn)
+    try:
+        try:
+            return fn(conn)
+        except sqlite3.Error:
+            logger.warning("Read-only resumable recovery query failed for %s; retrying briefly with the writer path", path,
+                           exc_info=True)
+            return _write(path, fn)
+    finally:
+        conn.close()
 
 
 def _begin_immediate(conn) -> None:

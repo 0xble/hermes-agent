@@ -21,13 +21,10 @@ def recover_abandoned_delegations() -> int:
     if alive is None:
         return 0
     now, recovered = time.time(), 0
-    # Each child of a dead owner keeps a resumable record (``delegate_tool_resumable``). Its git probes run here,
-    # before the ledger's write lock is taken, so no other writer waits on them.
     from tools.delegate_tool_resumable import continuable_of, plan_recovery, recover_abandoned
     plan = plan_recovery(_db_path(), alive)
-    recovered_records: dict[str, dict[str, Any]] = {}
     with _DB_LOCK, _transaction() as conn:
-        recover_abandoned(conn, plan, recovered_records)
+        recover_abandoned(conn, plan)
         rows = conn.execute("""SELECT delegation_id, origin_session, origin_ui_session_id,
                       parent_session_id, dispatched_at, owner_pid,
                       owner_started_at, task_json, origin_session_id, result_json, state
@@ -122,19 +119,8 @@ def recover_abandoned_delegations() -> int:
                 diagnostics["transcript_tails"] = tails
             if hint := git_state_hint(task.get("owner_cwd")):
                 diagnostics["git_state_hint"] = hint
-            silent = False
-            if continuable := continuable_of(conn, delegation_id):
+            if continuable := continuable_of(conn, task.get("unit_id") or delegation_id):
                 diagnostics["resumable_subagent_ids"] = continuable
-                from tools.delegate_tool_auto_resume import boot_notice
-                notice, promised = boot_notice(conn, continuable, recovered_records)
-                error += notice or (
-                    " Its subagents can be continued on their own conversation and worktree: "
-                    "delegate_task(action='continue', subagent_id=..., message=...); check git state and the "
-                    "last tool before re-running side effects.")
-                n_tasks = len(task.get("task_indexes") or task.get("goals") or [0])
-                finished = any(r.get("status") != "unknown" for r in recovered_results or ())
-                silent = len(promised) >= n_tasks and not finished  # the scheduler reports each child: no wake
-                diagnostics.update({"waiting_to_resume": promised} if silent else {})
             event = {
                 "type": "async_delegation", "delegation_id": delegation_id, "session_key": session_key,
                 "origin_ui_session_id": origin_ui, "origin_session_id": origin_sid or "",
@@ -149,10 +135,12 @@ def recover_abandoned_delegations() -> int:
                       **({"results": recovered_results} if recovered_results else {})}
             event, result = redact_completion_event(event), redact_child_result(result)
             conn.execute("""UPDATE async_delegations SET state='unknown', completed_at=?,
-                   updated_at=?, event_json=?, result_json=?, delivery_state=?
-                   WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result),
-                                              "delivered" if silent else "pending", delegation_id))
+                   updated_at=?, event_json=?, result_json=?, delivery_state='pending'
+                   WHERE delegation_id=?""", (now, now, json.dumps(event), json.dumps(result), delegation_id))
             recovered += 1
+    if recovered:
+        from tools.delegate_tool_auto_resume import tick
+        tick(lambda *args: None, capacity=0, now=now)
     return recovered
 
 
