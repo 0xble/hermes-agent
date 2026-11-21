@@ -142,6 +142,8 @@ def test_pinned_child_keeps_cross_model_chain_only_when_billing_fallback_enabled
     enabled = SimpleNamespace(model="gpt-6.2-sol", allow_billing_fallback=True)
     assert _pin_init_fallbacks(disabled, chain, True) == []
     assert _pin_init_fallbacks(enabled, chain, True) == chain
+    assert disabled._pinned_fallback_model == disabled.model
+    assert enabled._pinned_fallback_model == enabled.model
 
 
 
