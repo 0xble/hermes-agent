@@ -6,12 +6,17 @@ def test_billing_notice_uses_provider_day_key(monkeypatch):
 
     calls = []
     monkeypatch.setattr(billing_notice.subprocess, "run", lambda *args, **kwargs: calls.append((args, kwargs)))
+
     class ImmediateThread:
-        def __init__(self, *, target, **_kwargs):
-            self.target = target
         def start(self):
             self.target()
-    monkeypatch.setattr(billing_notice.threading, "Thread", ImmediateThread)
+
+    def spawn(target, **_kwargs):
+        thread = ImmediateThread()
+        thread.target = target
+        return thread
+
+    monkeypatch.setattr("agent.memory_provider.spawn_context_thread", spawn)
     billing_notice.notify_provider_out_of_credits("custom:openai-proxy")
     assert calls
     argv = calls[0][0][0]
