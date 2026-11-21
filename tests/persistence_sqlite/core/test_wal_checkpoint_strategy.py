@@ -1,4 +1,4 @@
-"""Tests for the store holder's WAL checkpoint strategy (issue #45383).
+"""Tests for SessionDB WAL checkpoint strategy (issue #45383).
 
 Verifies that ALL checkpoints on the shared state.db use PASSIVE mode:
 periodic, close(), and pre-VACUUM. TRUNCATE fires a full WAL reset, and
@@ -12,10 +12,7 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from persistence.sqlite import _registry
-from persistence.sqlite._holder import StoreHolder
-from persistence.sqlite.admin import SQLiteStoreAdmin
-from persistence.sqlite.admin._maintenance import _FtsStorageOptimizer
+from hermes_state import SessionDB
 
 
 class TrackingConnection:
@@ -35,9 +32,9 @@ class TrackingConnection:
 
 @pytest.fixture()
 def db(tmp_path):
-    """Create a store holder with a temp database file."""
+    """Create a SessionDB with a temp database file."""
     db_path = tmp_path / "test_state.db"
-    session_db = StoreHolder(db_path)
+    session_db = SessionDB(db_path=db_path)
     yield session_db
     try:
         session_db.close()
@@ -49,44 +46,16 @@ class TestTryWalCheckpointPassive:
     """_try_wal_checkpoint() should use PASSIVE mode for periodic use."""
 
     def test_checkpoint_uses_passive_mode(self, db, monkeypatch):
-<<<<<<< HEAD:tests/hermes_state/test_wal_checkpoint_strategy.py
         """PASSIVE checkpoint does not require exclusive lock — safe for large DBs."""
         tracked = []
         open_conn = db._open_writer_conn
-||||||| dff103e05878:tests/hermes_state/test_wal_checkpoint_strategy.py
-        """PASSIVE checkpoint does not require exclusive lock — safe for large DBs."""
-        # Capture the real connection's execute before mocking
-        real_conn = db._conn
-        execute_calls = []
-=======
-        """PASSIVE checkpoint does not require exclusive lock: safe for large DBs."""
-        # Capture the real connection's execute before mocking
-        real_conn = db._conn
-        execute_calls = []
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:tests/persistence_sqlite/core/test_wal_checkpoint_strategy.py
 
         def tracking_open():
             tracked.append(TrackingConnection(open_conn()))
             return tracked[-1]
 
-<<<<<<< HEAD:tests/hermes_state/test_wal_checkpoint_strategy.py
         # The periodic checkpoint runs on its own connection (outside the writer lock).
         monkeypatch.setattr(db, "_open_writer_conn", tracking_open)
-||||||| dff103e05878:tests/hermes_state/test_wal_checkpoint_strategy.py
-        # sqlite3.Connection.execute is read-only (C extension) — replace _conn
-        mock_conn = MagicMock()
-        mock_conn.execute.side_effect = tracking_execute
-        mock_conn.fetchone.return_value = None
-        db._conn = mock_conn
-
-=======
-        # sqlite3.Connection.execute is read-only (C extension): replace _conn
-        mock_conn = MagicMock()
-        mock_conn.execute.side_effect = tracking_execute
-        mock_conn.fetchone.return_value = None
-        db._conn = mock_conn
-
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:tests/persistence_sqlite/core/test_wal_checkpoint_strategy.py
         db._try_wal_checkpoint()
         execute_calls = [sql for conn in tracked for sql in conn.execute_calls]
 
@@ -144,7 +113,7 @@ class TestTryWalCheckpointPassive:
 
 
 class TestCloseUsesPassive:
-    """close() must use PASSIVE. Transient per-cron-run store holder connections
+    """close() must use PASSIVE. Transient per-cron-run SessionDB connections
     close many times an hour; a TRUNCATE reset there races the live gateway
     writer on the large WAL DB and corrupts B-tree pages (#45383)."""
 
@@ -192,23 +161,22 @@ class TestCloseUsesPassive:
 class TestVacuumUsesPassive:
     """Manual vacuum paths must checkpoint PASSIVE, never TRUNCATE."""
 
-    def test_vacuum_uses_passive_before_vacuum(self, tmp_path):
-        """The admin's vacuum() checkpoints PASSIVE before VACUUM.
+    def test_vacuum_uses_passive_before_vacuum(self, db):
+        """SessionDB.vacuum() checkpoints PASSIVE before VACUUM.
 
         A TRUNCATE checkpoint AFTER the VACUUM is expected: VACUUM rewrites
         every page through the WAL, so without it a 3 GB database leaves a
         3 GB state.db-wal behind and `sessions optimize` becomes a net disk
         LOSS. The #45383 tearing concern is about truncating while another
-        writer is mid-transaction: the pre-VACUUM checkpoint stays PASSIVE
+        writer is mid-transaction — the pre-VACUUM checkpoint stays PASSIVE
         for that reason; the post-VACUUM truncate runs under the same
         exclusive-lock window the VACUUM itself required.
         """
-        db = _registry.acquire(tmp_path / "test_state.db")  # the admin vacuums on the registry's writer
         real_conn = db._conn
         tracking_conn = TrackingConnection(real_conn)
         db._conn = tracking_conn
 
-        SQLiteStoreAdmin(db.db_path, read_only=False).vacuum()
+        db.vacuum()
 
         checkpoint_calls = [
             c for c in tracking_conn.execute_calls if "wal_checkpoint" in c.lower()
@@ -232,7 +200,7 @@ class TestVacuumUsesPassive:
         tracking_conn = TrackingConnection(real_conn)
         db._conn = tracking_conn
 
-        result = _FtsStorageOptimizer(db).optimize_fts_storage(vacuum=True)
+        result = db.optimize_fts_storage(vacuum=True)
 
         checkpoint_calls = [
             c for c in tracking_conn.execute_calls if "wal_checkpoint" in c.lower()

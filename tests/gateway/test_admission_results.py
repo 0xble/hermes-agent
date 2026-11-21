@@ -1,67 +1,56 @@
 """Structured results are claim-owned and visible only after settlement."""
 import pytest
 
-from persistence.core.errors import AuthorityRefusal
-from tests.fixtures.storage_seed import seed_session
-<<<<<<< HEAD
+from hermes_state import SessionDB
 from hermes_state_runtime import RuntimeStoreError, admit_session_input, claim_session_input, recover_session_inputs
-||||||| dff103e05878
-from hermes_state_runtime import (
-    RuntimeStoreError, admit_session_input, begin_runtime_epoch,
-    claim_session_input, recover_session_inputs,
-)
-=======
-from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
 def test_result_survives_restart_without_reexecuting(tmp_path):
-    from gateway.session_authority import admission_row
     from gateway.session_results import retain_result, admission_result
-    db = storage_handle(tmp_path)
-    seed_session(db, 'api-session', 'api_server')
-    epoch = db.runtime.begin_epoch(instance_id='first')
-    admitted, _ = db.admissions.admit(epoch=epoch, principal_id='api', session_id='api-session',
-                                      request_id='retry', payload={'text': 'hello'})
-    row = admission_row(db.admissions.claim(epoch=epoch, session_id='api-session'))
+    path = tmp_path / 'state.db'
+    db = SessionDB(path)
+    db.create_session('api-session', source='api_server')
+    epoch = begin_runtime_epoch(db, instance_id='first')
+    admitted = admit_session_input(db, epoch=epoch, principal_id='api', session_id='api-session',
+                                   request_id='retry', payload={'text': 'hello'})
+    row = claim_session_input(db, epoch=epoch, session_id='api-session')
     result = {'final_response': 'reply', 'messages': [], 'usage': {'input_tokens': 7, 'output_tokens': 3}}
-    retain_result(storage_handle(tmp_path), epoch=epoch, row=row, result=result)
-    assert admission_result(storage_handle(tmp_path), admitted.admission_id) == result
+    retain_result(db, epoch=epoch, row=row, result=result)
+    assert admission_result(db, admitted['admission_id']) == result
     db.close()
-    db = storage_handle(tmp_path)
+    db = SessionDB(path)
     try:
-        epoch = db.runtime.begin_epoch(instance_id='second')
-        db.admissions.recover(epoch=epoch)
-        retried, _ = db.admissions.admit(epoch=epoch, principal_id='api', session_id='api-session',
-                                         request_id='retry', payload={'text': 'hello'})
-        assert retried.admission_id == admitted.admission_id
-        assert admission_result(storage_handle(tmp_path), retried.admission_id) == result
-        assert db.admissions.claim(epoch=epoch, session_id='api-session') is None
+        epoch = begin_runtime_epoch(db, instance_id='second')
+        recover_session_inputs(db, epoch=epoch)
+        retried = admit_session_input(db, epoch=epoch, principal_id='api', session_id='api-session',
+                                      request_id='retry', payload={'text': 'hello'})
+        assert retried['admission_id'] == admitted['admission_id']
+        assert admission_result(db, retried['admission_id']) == result
+        assert claim_session_input(db, epoch=epoch, session_id='api-session') is None
     finally:
         db.close()
 
 
 def test_stale_result_cannot_overwrite_settled_or_unknown_claim(tmp_path):
-    from gateway.session_authority import admission_row
     from gateway.session_results import retain_result, admission_result
-    store = storage_handle(tmp_path)
+    db = SessionDB(tmp_path / 'state.db')
     try:
-        seed_session(store, 'api-session', 'api_server')
-        epoch = store.runtime.begin_epoch(instance_id='first')
-        store.admissions.admit(epoch=epoch, principal_id='api', session_id='api-session',
-                               request_id='one', payload={'text': 'hello'})
-        row = admission_row(store.admissions.claim(epoch=epoch, session_id='api-session'))
-        retain_result(store, epoch=epoch, row=row, result={'final_response': 'first'})
-        with pytest.raises(AuthorityRefusal, match='stale_generation'):
-            retain_result(store, epoch=epoch, row=row, result={'final_response': 'late'})
-        assert admission_result(store, row['admission_id']) == {'final_response': 'first'}
-        newer = store.runtime.begin_epoch(instance_id='second')
-        with pytest.raises(AuthorityRefusal, match='stale_epoch'):
-            retain_result(store, epoch=epoch, row=row, result={})
+        db.create_session('api-session', source='api_server')
+        epoch = begin_runtime_epoch(db, instance_id='first')
+        admit_session_input(db, epoch=epoch, principal_id='api', session_id='api-session',
+                            request_id='one', payload={'text': 'hello'})
+        row = claim_session_input(db, epoch=epoch, session_id='api-session')
+        retain_result(db, epoch=epoch, row=row, result={'final_response': 'first'})
+        with pytest.raises(RuntimeStoreError, match='stale_generation'):
+            retain_result(db, epoch=epoch, row=row, result={'final_response': 'late'})
+        assert admission_result(db, row['admission_id']) == {'final_response': 'first'}
+        newer = begin_runtime_epoch(db, instance_id='second')
+        with pytest.raises(RuntimeStoreError, match='stale_epoch'):
+            retain_result(db, epoch=epoch, row=row, result={})
         assert newer != epoch
     finally:
-        store.close()
+        db.close()
 
 
 @pytest.mark.asyncio
@@ -79,10 +68,11 @@ async def test_a_turn_that_failed_before_running_settles_failed_on_every_surface
     from gateway.session import SessionSource
     from gateway.session_authority import LiveSession, SessionAuthority
     from gateway.session_contract import SessionActor, SessionRef, Submission
+    from hermes_state_runtime import get_session_admission
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    db = storage_handle(tmp_path)
-    seed_session(db, 's', 'telegram')
+    db = SessionDB(tmp_path / 'state.db')
+    db.create_session('s', source='telegram')
     gateway = object.__new__(GatewayRunner)
 
     async def stop_typing(event, source):
@@ -98,8 +88,8 @@ async def test_a_turn_that_failed_before_running_settles_failed_on_every_surface
                                                      'k', gateway._PreparedTurn([], '', None, None, None, None))
     runner = SimpleNamespace(_draining=False, config=SimpleNamespace(multiplex_profiles=False),
                              _adapter_for_source=lambda source: None, _handle_message=handle)
-    authority = SessionAuthority(runner, profile_id='p', instance_id='owner',
-                                 epoch=db.runtime.begin_epoch(instance_id='owner'), persistence=db)
+    authority = SessionAuthority(runner, profile_id='p', instance_id='owner', db=db,
+                                 epoch=begin_runtime_epoch(db, instance_id='owner'))
     authority.sessions['s'] = LiveSession(source, 'route')
     frames = []
     authority.sessions['s'].event_stream.observers.add(frames.append)
@@ -108,7 +98,7 @@ async def test_a_turn_that_failed_before_running_settles_failed_on_every_surface
                                          Submission('r1', SessionRef('p', 's'), {'text': 'hello'}, 'queue'))
         await asyncio.wait_for(authority.sessions['s'].task, 10)
         outcome = 'failed' if fails else 'completed'
-        assert db.admissions.get(admission_id=receipt.admission_id).outcome == outcome
+        assert get_session_admission(db, admission_id=receipt.admission_id)['outcome'] == outcome
         complete = [f['params']['payload'] for f in frames if f['params']['type'] == 'message.complete']
         assert complete[-1]['outcome'] == outcome
         assert complete[-1]['status'] == ('error' if fails else 'complete')
@@ -132,24 +122,25 @@ async def test_a_finite_prompt_answered_without_running_settles_failed(tmp_path,
     from gateway.session_contract import SessionActor, SessionRef, Submission
     from gateway.session_results import admission_result
     from hermes_cli.turn_exit import turn_exit_code
+    from hermes_state_runtime import get_session_admission
 
     monkeypatch.setenv('HERMES_HOME', str(tmp_path))
-    db = storage_handle(tmp_path)
-    seed_session(db, 's', 'cli')
+    db = SessionDB(tmp_path / 'state.db')
+    db.create_session('s', source='cli')
 
     async def handle(event):
         return 'Gateway is draining for maintenance; your message was not processed.'
     runner = SimpleNamespace(_draining=False, config=SimpleNamespace(multiplex_profiles=False),
                              _adapter_for_source=lambda source: None, _handle_message=handle)
-    authority = SessionAuthority(runner, profile_id='p', instance_id='owner',
-                                 epoch=db.runtime.begin_epoch(instance_id='owner'), persistence=db)
+    authority = SessionAuthority(runner, profile_id='p', instance_id='owner', db=db,
+                                 epoch=begin_runtime_epoch(db, instance_id='owner'))
     authority.sessions['s'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='c', user_id='human'), 'route')
     try:
         receipt = await authority.submit(SessionActor('human', 'p', frozenset({'session:submit'}), 't'),
                                          Submission('r1', SessionRef('p', 's'), {'text': text, 'finite': True}, 'queue'))
         await asyncio.wait_for(authority.sessions['s'].task, 10)
-        assert db.admissions.get(admission_id=receipt.admission_id).outcome == outcome
-        result = admission_result(authority.persistence, receipt.admission_id)['result']
+        assert get_session_admission(db, admission_id=receipt.admission_id)['outcome'] == outcome
+        result = admission_result(db, receipt.admission_id)['result']
         assert turn_exit_code(result, kanban_worker=False) == (1 if outcome == 'failed' else 0)
     finally:
         db.close()

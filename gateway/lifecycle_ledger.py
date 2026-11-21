@@ -14,7 +14,9 @@ from __future__ import annotations
 import json
 import logging
 import os
+import sqlite3
 import time
+from contextlib import closing
 from datetime import datetime, timezone, UTC
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -156,7 +158,7 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]
     sentinel = _read_json(get_lifecycle_sentinel_path(home))
     if not sentinel or sentinel.get("phase") != "running":
         return None
-    from process_identity import persistent_record_pidns_checkable
+    from hermes_state_pidns import persistent_record_pidns_checkable
     if not persistent_record_pidns_checkable(sentinel.get("pidns")):
         # Written in another PID namespace, so its pid means nothing here (#123081). The home's
         # gateway.lock flock does: held by another process = that life is still running.
@@ -186,7 +188,6 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[dict[str, Any]]
     return evidence
 
 
-<<<<<<< HEAD
 # Startup-watchdog lease held while a SYNCHRONOUS unclean-exit integrity check runs (#115542):
 # ``PRAGMA quick_check(1)`` is one monolithic SQLite operation and per-call leases clamp at
 # 900s, so one entry lease cannot cover a multi-thousand-second healthy check on a huge store;
@@ -203,28 +204,8 @@ _INTEGRITY_CHECK_LEASE_S = 900.0
 # monotonic-clock compare, renewing at most every _INTEGRITY_CHECK_LEASE_RENEW_S.
 _INTEGRITY_CHECK_PROGRESS_OPS = 100_000
 _INTEGRITY_CHECK_LEASE_RENEW_S = 60.0
-||||||| dff103e05878
-# Startup-watchdog lease held while the unclean-exit integrity check runs (#115542):
-# ``PRAGMA quick_check(1)`` is one monolithic SQLite operation and per-call leases
-# clamp at 900s, so a single entry lease cannot cover a multi-thousand-second healthy
-# check on a huge store — without renewal the watchdog kills the attempt with exit 75
-# and the restart loop never reaches the cron ticker. The progress handler below renews
-# a phase-owned lease for as long as SQLite is making progress; without a deadline it
-# always returns 0 so it never aborts the check, and the ok/absent/first-complaint
-# verdicts stay fail-closed. When an explicit ``deadline_at`` is supplied the
-# handler returns non-zero once it passes, so SQLite aborts the scan and the caller
-# can bound a pathological store instead of pinning the boot path.
-_INTEGRITY_CHECK_LEASE_PHASE = "state_db_unclean_integrity_check"
-_INTEGRITY_CHECK_LEASE_S = 900.0
-# VM instructions between progress-handler invocations; each invocation is a
-# monotonic-clock compare, renewing at most every _INTEGRITY_CHECK_LEASE_RENEW_S.
-_INTEGRITY_CHECK_PROGRESS_OPS = 100_000
-_INTEGRITY_CHECK_LEASE_RENEW_S = 60.0
-=======
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 # Bound on the deferred post-connect scan: a pathological store cannot pin its thread forever.
 STATE_DB_INTEGRITY_DEADLINE_S = 1800.0
-<<<<<<< HEAD
 
 
 def _install_integrity_check_lease(
@@ -257,37 +238,6 @@ def _install_integrity_check_lease(
         return 0
 
     conn.set_progress_handler(_on_progress, _INTEGRITY_CHECK_PROGRESS_OPS)
-||||||| dff103e05878
-
-
-def _install_integrity_check_lease(conn: sqlite3.Connection, *, deadline_at: Optional[float] = None) -> None:
-    """Claim the integrity-check lease and renew it from a SQLite progress handler.
-
-    ``report_startup_progress`` is a no-op when no watchdog is armed and never raises.
-    Without ``deadline_at`` the handler always returns 0 -- it must never abort the verdict
-    PRAGMA.  With ``deadline_at`` (a ``time.monotonic`` timestamp) it returns non-zero once
-    that instant is reached, so SQLite raises ``OperationalError: interrupted`` and the
-    caller can bound the scan.  Synchronous by design: no checker worker thread can outlive
-    the check.
-    """
-    from hermes_startup_watchdog import report_startup_progress
-
-    report_startup_progress(_INTEGRITY_CHECK_LEASE_S, phase=_INTEGRITY_CHECK_LEASE_PHASE)
-    last_renew = time.monotonic()
-
-    def _on_progress() -> int:
-        nonlocal last_renew
-        now = time.monotonic()
-        if now - last_renew >= _INTEGRITY_CHECK_LEASE_RENEW_S:
-            last_renew = now
-            report_startup_progress(_INTEGRITY_CHECK_LEASE_S, phase=_INTEGRITY_CHECK_LEASE_PHASE)
-        if deadline_at is not None and now >= deadline_at:
-            return 1
-        return 0
-
-    conn.set_progress_handler(_on_progress, _INTEGRITY_CHECK_PROGRESS_OPS)
-=======
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 def _state_db_is_wal(home: Optional[Path]) -> bool:
@@ -325,7 +275,6 @@ def check_state_db_integrity(
     return ``"check-incomplete: exceeded <N>s"``.  ``deadline_s=None`` (default) is the
     historic unbounded behaviour -- the progress handler never aborts the PRAGMA.
     """
-<<<<<<< HEAD
     path = _home_path(home, "state.db")
     if not path.exists():
         return "absent"
@@ -342,48 +291,24 @@ def check_state_db_integrity(
                 _install_integrity_check_lease(
                     conn, deadline_at=deadline_at, renew_startup_lease=renew_startup_lease)
             row = conn.execute("PRAGMA quick_check(1)").fetchone()
-||||||| dff103e05878
-    path = _home_path(home, "state.db")
-    if not path.exists():
-        return "absent"
-    deadline_at: Optional[float] = None
-    if deadline_s is not None:
-        try:
-            deadline_at = time.monotonic() + max(0.0, float(deadline_s))
-        except (TypeError, ValueError):
-            deadline_at = None
-    try:
-        from hermes_cli.sqlite_safe_read import connect_tracked  # tracked: raw byte probes must see this reader
-
-        with closing(connect_tracked(str(path), tracking_path=path)) as conn:
-            _install_integrity_check_lease(conn, deadline_at=deadline_at)
-            row = conn.execute("PRAGMA quick_check(1)").fetchone()
-=======
-    from persistence.core.admin import AdminUnsupported
-    from persistence_assembly import open_store_admin, profile_scope, store_location
-
-    scope = profile_scope(home=_home_path(home))
-    path = store_location(scope)
-    if path is None or not path.exists():
-        return "absent"
-    try:
-        admin = open_store_admin(scope)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     except Exception as exc:
+        if (deadline_at is not None and isinstance(exc, sqlite3.OperationalError)
+                and "interrupt" in str(exc).lower()):
+            limit = max(0.0, float(deadline_s)) if deadline_s is not None else 0.0
+            return f"check-incomplete: exceeded {limit:g}s"
         return f"check-failed: {exc}"
-    return "absent" if isinstance(admin, AdminUnsupported) else admin.integrity_check(deadline_s=deadline_s)
+    return "check-failed: no result" if not row or row[0] is None else str(row[0])
 
 
 def _state_db_journal_mode(path: Path) -> Optional[str]:
     """On-disk journal mode of ``path`` via one ``PRAGMA journal_mode`` read on a short-lived
-    connection (no lock outlives it); ``None`` when undeterminable or on a backend without the
-    admin capability.  Never raises."""
+    connection (no lock outlives it); ``None`` when undeterminable.  Never raises."""
     try:
-        from persistence.core.admin import AdminUnsupported
-        from persistence_assembly import open_store_admin
+        from hermes_cli.sqlite_safe_read import connect_tracked
+        from hermes_state_wal import _on_disk_journal_mode
 
-        admin = open_store_admin(path)
-        return None if isinstance(admin, AdminUnsupported) else admin.journal_mode()
+        with closing(connect_tracked(str(path), timeout=1.0, tracking_path=path)) as conn:
+            return _on_disk_journal_mode(conn) or None
     except Exception:
         logger.debug("Could not read state.db journal mode", exc_info=True)
         return None
@@ -473,21 +398,11 @@ def record_startup(
         except Exception:
             logger.error("Unclean-exit state.db integrity check could not run", exc_info=True)
     try:
-<<<<<<< HEAD
         from hermes_state_pidns import pid_namespace_id
         claim: dict[str, Any] = {
             "phase": "running", "pid": os.getpid(), "pidns": pid_namespace_id(),
                                  "start_time": time.time(), "started_at": _now_iso(),
         }
-||||||| dff103e05878
-        from hermes_state_pidns import pid_namespace_id
-        claim: dict[str, Any] = {"phase": "running", "pid": os.getpid(), "pidns": pid_namespace_id(),
-                                 "start_time": time.time(), "started_at": _now_iso()}
-=======
-        from process_identity import pid_namespace_id
-        claim: dict[str, Any] = {"phase": "running", "pid": os.getpid(), "pidns": pid_namespace_id(),
-                                 "start_time": time.time(), "started_at": _now_iso()}
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         # Process birth (psutil), distinct from ``start_time`` (the ledger claim, seconds later once
         # imports finish): the Windows start attestation binds PIDs to birth time (#110020 review).
         from hermes_cli.process_identity import _process_create_time
@@ -545,10 +460,8 @@ def run_deferred_integrity_check(
     on-disk mode decides, not config; an undeterminable mode is skipped too.
     """
     try:
-        from persistence_assembly import profile_scope, store_location
-
-        path = store_location(profile_scope(home=_home_path(home)))
-        mode = _state_db_journal_mode(path) if path is not None and path.exists() else "wal"
+        path = _home_path(home, "state.db")
+        mode = _state_db_journal_mode(path) if path.exists() else "wal"
         if mode != "wal":
             verdict = (f"skipped: rollback-journal store (journal_mode={mode or 'unknown'}), "
                        "scan would block live writes")

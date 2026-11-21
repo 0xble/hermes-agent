@@ -9,11 +9,6 @@ patched.
 from tests.fakes.runtime_owner import begin_runtime_epoch as _begin_owned_runtime_epoch
 import pytest
 import json
-from persistence_assembly import store_location
-from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
-from pathlib import Path
-
-pytestmark = pytest.mark.usefixtures('authority_cwd_in_tmp')  # symbolic profile_id: a relative home
 
 
 def _profile(home, model, port, key):
@@ -27,8 +22,9 @@ def _owner(home):
     from gateway.session import SessionStore
     from gateway.session_authority import SessionAuthority
     from gateway.session_controls import AuthorityConnection
+    import hermes_state_runtime as rt
     store = SessionStore(home / 'sessions', GatewayConfig())
-    db = store.persistence
+    db = store._db
     # Keep real session-key derivation and scoped runtime publication without starting a gateway.
     runner = object.__new__(GatewayRunner)
     runner.session_store = store
@@ -39,14 +35,8 @@ def _owner(home):
     runner._cached_agent_for = lambda route: None
     runner._handle_message = None
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', persistence=storage_handle(db.scope.profile_dir),
-<<<<<<< HEAD
+    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
                                  epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
-||||||| dff103e05878
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
-=======
-                                 epoch=db.runtime.begin_epoch(instance_id='owner'))
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     runner.session_authority = authority
     return store, runner, authority, AuthorityConnection(authority, object(), {'user_id': 'human'})
 
@@ -77,7 +67,7 @@ async def test_follow_profile_session_runs_the_profiles_current_route_and_a_pick
     _profile(home, 'old', 1, 'k-old')
     store, runner, authority, owner = _owner(home)
     try:
-        assert Path(store_location(authority.persistence.scope)).parent.resolve() == home.resolve()
+        assert authority.db.db_path.parent.resolve() == home.resolve()
         follow = await _create(owner, authority, home, 'follow')
         pick = await _create(owner, authority, home, 'pick', model='pick')
         assert _route(runner, follow) == ('old', 'http://127.0.0.1:1/v1', 'k-old')

@@ -1490,7 +1490,6 @@ def _run_foreground(
             # bounded_capture: model-facing output keeps a head/tail window
             # while streaming so a verbose command can't OOM the gateway;
             # internal env.execute() consumers stay unbounded.
-<<<<<<< HEAD
             from tools.code_execution_rpc import cell_deadline
             deadline = cell_deadline.get()
             if bound_turn_origin() == "cron" and deadline is not None:
@@ -1504,14 +1503,8 @@ def _run_foreground(
                     return _error_json(
                         "Command not started: execute_code cell deadline expired", exit_code=124,
                     )
-||||||| dff103e05878
-=======
-            # Only the session's inherited cwd may fall back (the result tells the model); a
-            # ``workdir`` the model named is refused, or a typo would run ``rm -f ./*`` a level up.
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
             result = env.execute(
                 execution_command or command, timeout=effective_timeout, cwd=command_cwd, bounded_capture=True,
-                allow_cwd_fallback=not workdir,
                 **_yield_kwargs(command, yield_to_background_handler, env_type=env_type,
                                 cwd=command_cwd, effective_task_id=eff,
                                 task_id=task_id, session_key=session_key),
@@ -1565,8 +1558,8 @@ _PRE_EXEC_GUARD_MIN_TIMEOUT_S = 30
 
 def _refuse_missing_local_workdir(workdir: str, env: Any) -> None:
     """An explicit ``workdir`` the model named is never swapped for a parent: a typo would run
-    ``rm -f ./*`` one level up. Only a cwd the session inherited falls back (``_usable_cwd``);
-    sandbox wrappers refuse it themselves (``execute(allow_cwd_fallback=False)``)."""
+    ``rm -f ./*`` one level up. Only a cwd the session inherited falls back (``_usable_cwd``),
+    and only ``LocalEnvironment`` falls back at all."""
     from tools.environments.local import LocalEnvironment
     if not isinstance(env, LocalEnvironment):
         return

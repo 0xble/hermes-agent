@@ -27,7 +27,7 @@ from tools.environments.base_output import (
     ProcessHandle, _finalize_wait_result, _new_output_collector, _start_drain_thread,
 )
 from tools.environments.base_session_env import (
-    _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _cwd_fallback_marker, _cwd_marker, _pipe_marker, _snapshot_bootstrap_script, _split_cwd_marker,
+    _SHELL_ENV_NAME_RE, _SNAP_TMP_SUFFIX, _cwd_marker, _pipe_marker, _snapshot_bootstrap_script, _split_cwd_marker,
     _wrap_command_script,
 )
 from tools.environments.base_processes import LongLivedProcessMixin
@@ -348,8 +348,6 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
 
     # Per-session PIPESTATUS marker set in __init__; empty means the wrapper emits none.
     _pipe_marker: str = ""
-    # Per-session marker the wrapper prints after falling back from a dead cwd; empty = refuse.
-    _cwd_fallback_marker: str = ""
 
     def get_temp_dir(self) -> str:
         """Return the backend temp directory used for session artifacts.
@@ -374,7 +372,6 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         self._cwd_file = f"{temp_dir}/hermes-cwd-{self._session_id}.txt"
         self._cwd_marker = _cwd_marker(self._session_id)
         self._pipe_marker = _pipe_marker(self._session_id)
-        self._cwd_fallback_marker = _cwd_fallback_marker(self._session_id)
         self._snapshot_ready = False
         self._snapshot_passthrough_names: set[str] = set()
         # True when login bash is unusable (e.g. broken Git-for-Windows startup)
@@ -455,18 +452,6 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             logger.debug("Could not refresh profile-scoped snapshot exclusions", exc_info=True)
         return tuple(sorted(self._snapshot_passthrough_names))
 
-    def _secret_dump_args(self) -> dict:
-        """``secret_fd`` / ``secret_names`` for the snapshot script builders. A backend with an
-        in-memory secret channel (``LocalEnvironment``) returns them, so secret exports leave the
-        file on disk and still reach the next command. Empty here: without a channel, removing the
-        values would drop the user's exports from every later command."""
-        return {}
-
-    def _snapshot_write_path(self, login: bool) -> str:
-        """The snapshot file the script being spawned writes: the bootstrap always writes the
-        environment's own; a wrapped command writes its task's (``_shell_state_paths``)."""
-        return self._snapshot_path if login else self._shell_state_paths()[0]
-
     def _task_snapshot_path(self, task_id: str) -> str:
         """Per-task snapshot beside the environment's own (``cleanup`` globs the prefix)."""
         digest = hashlib.sha256(task_id.encode()).hexdigest()[:16]
@@ -491,8 +476,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         if is_incognito():
             return
         bootstrap = _snapshot_bootstrap_script(
-            excluded_names=self._snapshot_excluded_passthrough_names(), **self._secret_dump_args(),
-            **self._snapshot_script_kwargs(self.cwd))
+            excluded_names=self._snapshot_excluded_passthrough_names(), **self._snapshot_script_kwargs(self.cwd))
         try:
             proc = self._run_bash(bootstrap, login=True, timeout=self._snapshot_timeout)
             result = self._wait_for_process(proc, timeout=self._snapshot_timeout)
@@ -545,29 +529,12 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         rewrite native/mixed Windows paths to ``/c/...``; remote backends are POSIX."""
         return shlex.quote(path)
 
-    def _shell_state_paths(self) -> list[str]:
-        """Snapshot files this command reads, in source order; the first is the one it writes: the
-        task's own (``_task_snapshot_path``), then its delegation ancestors', then the env's own."""
-        chain = [self._task_snapshot_path(t) for t in _shell_state_chain.get()]
-        return [*chain, self._snapshot_path] if chain else [self._snapshot_path]
-
-    def _wrap_command(self, command: str, cwd: str, *, cwd_fallback: bool = False) -> str:
-<<<<<<< HEAD
+    def _wrap_command(self, command: str, cwd: str) -> str:
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         from agent.delegation_context import in_process_child_relay_parent_address
         from agent.incognito import is_incognito
         chain = [self._task_snapshot_path(t) for t in _shell_state_chain.get()]
         seeds = [self._quote_shell_path(p) for p in (*chain[1:], self._snapshot_path)] if chain else []
-||||||| dff103e05878
-        """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
-        chain = [self._task_snapshot_path(t) for t in _shell_state_chain.get()]
-        seeds = [self._quote_shell_path(p) for p in (*chain[1:], self._snapshot_path)] if chain else []
-=======
-        """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers.
-        ``cwd_fallback`` lets the ``cd`` walk up from a missing *cwd* (see ``execute``)."""
-        own, *seed_paths = self._shell_state_paths()
-        seeds = [self._quote_shell_path(p) for p in seed_paths]
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         return _wrap_command_script(
             command,
             passthrough_names=self._snapshot_excluded_passthrough_names(),
@@ -576,9 +543,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             persist_env=self._persist_env and not is_incognito(),
             pipe_marker=self._pipe_marker,
             seed_snaps=seeds,
-            cwd_fallback_marker=self._cwd_fallback_marker if cwd_fallback else "",
-            **self._secret_dump_args(),
-            **self._snapshot_script_kwargs(cwd, own))
+            **self._snapshot_script_kwargs(cwd, chain[0] if chain else None))
 
     @staticmethod
     def _embed_stdin_heredoc(command: str, stdin_data: str) -> str:
@@ -649,11 +614,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             drain_thread.join(timeout=2)
 
         try:
-            # Poll every 2 ms for the first 50 ms, then back off toward 200 ms: an exponential
-            # schedule from the start finds a 14 ms command at its 21 ms tick, and the early polls
-            # cost ~25 cheap waitpid calls, while long builds still pay almost no poll CPU.
-            _poll_sleep = 0.002
-            _fast_until = time.monotonic() + 0.05
+            # Adaptive poll: start at 5ms so fast commands return in ~6ms, back
+            # off exponentially toward 200ms so long builds don't pay poll CPU.
+            _poll_sleep = 0.005
             while proc.poll() is None:
                 trace.iterations += 1
                 if is_interrupted() or is_thread_interrupted(watch_interrupt_tid):
@@ -692,7 +655,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
                 touch_activity_if_due(_activity_state, "terminal command running")
                 trace.heartbeat()
                 time.sleep(_poll_sleep)
-                if _poll_sleep < 0.2 and time.monotonic() >= _fast_until:
+                if _poll_sleep < 0.2:
                     _poll_sleep = min(_poll_sleep * 1.5, 0.2)
         except (KeyboardInterrupt, SystemExit):
             trace.exception_exit()
@@ -738,20 +701,16 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         self._kill_process(proc)
 
     # --- CWD extraction ---
-    def _update_cwd(self, result: dict, *, move_session: bool = True):
-        """Parse the cwd marker into *result*; only a command that may move the session
-        (``move_session``) then publishes it to ``self.cwd``. Parsing never writes ``self.cwd``:
-        the environment is shared, so a housekeeping command run from ``/`` (the background
-        poller) must never expose ``/`` to a concurrent file op, even briefly."""
-        self._parse_cwd_marker(result)
-        if move_session and result.get("cwd_observed"):
-            self.cwd = result["cwd"]
+    def _update_cwd(self, result: dict):
+        """Extract CWD from command output. Override for local file-based read."""
+        self._extract_cwd_from_output(result)
 
-    def _parse_cwd_marker(self, result: dict):
-        """Strip the ``__HERMES_CWD_{session}__`` (and PIPESTATUS) marker lines from
-        ``result["output"]``. ``result["cwd_observed"]``/``["cwd"]`` are set only when THIS
-        command emitted a marker: a killed/timed-out command emits none. Concurrent callers
-        must read ``result["cwd"]`` rather than ``self.cwd``."""
+    def _extract_cwd_from_output(self, result: dict):
+        """Parse the ``__HERMES_CWD_{session}__`` marker from ``result["output"]``, update
+        ``self.cwd`` and strip the marker line. ``result["cwd_observed"]``/``["cwd"]`` are set
+        only when THIS command emitted a marker: a killed/timed-out command emits none and
+        ``self.cwd`` keeps the previous value. The environment is shared across sessions, so
+        concurrent callers must read ``result["cwd"]`` rather than ``self.cwd``."""
         pipe_split = (_split_cwd_marker(result.get("output", ""), self._pipe_marker, validate_cwd=False)
                       if self._pipe_marker else None)
         if pipe_split is not None:
@@ -766,6 +725,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             return
         cwd_path, cleaned = split
         if cwd_path:
+            self.cwd = cwd_path
             result["cwd_observed"] = True
             result["cwd"] = cwd_path
         result["output"] = cleaned
@@ -786,10 +746,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
 
     def _usable_cwd(self, cwd: str) -> tuple[str, dict | None]:
         """Directory the command may actually start in, plus ``{"requested", "used"}`` when it
-        differs. Local swaps a deleted/unenterable one host-side; a sandbox's filesystem is only
-        visible to its own shell, so its wrapper walks up instead (``_cd_with_fallback``) and
-        ``execute`` reports that. Returned, never stored on ``self``: concurrent commands share
-        one environment."""
+        differs. Local swaps a deleted/unenterable one (it would make the wrapper's ``cd`` exit
+        126 on every call); sandboxes resolve their own. Returned, never stored on ``self``:
+        concurrent commands share one environment."""
         return cwd, None
 
     # --- Unified execute() ---
@@ -802,16 +761,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         stdin_data: str | None = None,
         rewrite_compound_background: bool = True,
         bounded_capture: bool = False,
-<<<<<<< HEAD
         yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
         yield_after_seconds: float | None = None,
         yield_when: Callable[[], bool] | None = None) -> dict:
-||||||| dff103e05878
-        yield_handler: Callable[[ProcessHandle, str], dict] | None = None) -> dict:
-=======
-        yield_handler: Callable[[ProcessHandle, str], dict] | None = None,
-        allow_cwd_fallback: bool = False) -> dict:
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         """Execute a command, return {"output": str, "returncode": int}. ``bounded_capture=True``
         caps retention at ``tool_output.max_bytes`` WHILE draining; only the foreground terminal
         tool may set it — internal full-fidelity consumers (file-op ``cat`` reads feeding the
@@ -822,12 +774,6 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         ``bounded_capture=True`` caps stdout/stderr retention at ``tool_output.max_bytes`` WHILE the stream
         is drained (head/tail window) instead of holding the full output in memory (#64435).
         See #94285.
-
-        ``allow_cwd_fallback=True`` runs in the nearest usable ancestor when the cwd is gone and
-        reports it as ``cwd_fallback``. Only the terminal tool's own commands (session cwd, no
-        ``workdir``) may set it, since it tells the model; every other caller fails at ``cd``
-        instead (exit 126), because a file op's relative path would silently resolve against the
-        ancestor and read or write a different file.
         """
         self._before_execute()
 
@@ -845,9 +791,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         exec_command = fill_timeout_token(exec_command, effective_timeout)
         # An explicit ``cwd`` (the session's recorded cd state) can be just as dead as
         # ``self.cwd``; resolving only the latter left every call exiting 126 at ``cd``.
-        effective_cwd, cwd_fallback = (
-            self._usable_cwd(cwd or self.cwd) if allow_cwd_fallback else (cwd or self.cwd, None))
-        moves_session = allow_cwd_fallback or not cwd or cwd == self.cwd
+        effective_cwd, cwd_fallback = self._usable_cwd(cwd or self.cwd)
 
         # Merge sudo stdin with caller stdin.
         effective_stdin = sudo_stdin + (stdin_data or "") if sudo_stdin is not None else stdin_data
@@ -855,7 +799,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             exec_command = self._embed_stdin_heredoc(exec_command, effective_stdin)
             effective_stdin = None
 
-        wrapped = self._wrap_command(exec_command, effective_cwd, cwd_fallback=allow_cwd_fallback)
+        wrapped = self._wrap_command(exec_command, effective_cwd)
 
         # Login shell if the snapshot failed (so the user's profile still
         # loads), unless login itself is broken — then non-login is the only path.
@@ -881,9 +825,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             proc_holder.append(spawned)
             if fenced:  # the hard-exit kill may have stopped waiting for us before we registered
                 self._force_kill_process(spawned)
-            # The fallback line leads the stream; pulled out before capture so truncation can't cut it.
-            output = _new_output_collector(
-                spawned, bounded_capture, control_marker=self._cwd_fallback_marker if allow_cwd_fallback else "")
+            output = _new_output_collector(spawned, bounded_capture)
             output_holder.append(output)
             # The wait watches parent_tid, and its kill path must resolve that same
             # thread's shutdown cause rather than treating it as ordinary /stop. Keep an
@@ -936,13 +878,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
             result["hermes_timed_out"] = True
         else:
             result = bounded.value
-        # Housekeeping from "/" (the background poller) or a one-off workdir must not move the session.
-        self._update_cwd(result, move_session=moves_session)
-        used = output_holder[0].control_value if output_holder else None
-        if allow_cwd_fallback and not used and (split := _split_cwd_marker(result.get("output", ""), self._cwd_fallback_marker)):
-            used, result["output"] = split  # login-shell noise printed ahead of the wrapper's line
-        if used:
-            cwd_fallback = cwd_fallback or {"requested": effective_cwd, "used": used}
+        self._update_cwd(result)
         if getattr(self, "_recreated_notice_pending", False):
             self._recreated_notice_pending = False
             result["environment_recreated"] = True

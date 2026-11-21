@@ -7,10 +7,6 @@ from types import SimpleNamespace
 import pytest
 
 from tests.waiting import async_wait_until
-from tests.fixtures.storage_holder import raw_holder
-from tests.fixtures.storage_read import conversation, session_row
-from tests.fixtures.storage_seed import seed_messages, seed_session
-from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 def _owner(tmp_path, monkeypatch, handle):
@@ -21,24 +17,19 @@ def _owner(tmp_path, monkeypatch, handle):
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
     from hermes_cli import model_switch
+    import hermes_state_runtime as rt
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {})
     monkeypatch.setattr(model_switch, 'switch_model', lambda **k: model_switch.ModelSwitchResult(
         success=True, new_model=k['raw_input'], target_provider='custom', base_url='http://127.0.0.1:9/v1'))
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
-    db = store.persistence
+    db = store._db
     runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
                              _evict_cached_agent=lambda route: None, _cached_agent_for=lambda route: None,
                              _handle_message=handle,
                              _resolve_session_agent_runtime=lambda **k: ('frozen', {}))
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', persistence=storage_handle(db.scope.profile_dir),
-<<<<<<< HEAD
+    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
                                  epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
-||||||| dff103e05878
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
-=======
-                                 epoch=db.runtime.begin_epoch(instance_id='owner'))
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     owner = AuthorityConnection(authority, object(), {'user_id': 'human'})
     ref = create_local_session(authority, owner.actor, dict(request_id='m', source='gui', cwd=str(tmp_path),
                                                             model='frozen', toolsets=[]))
@@ -55,6 +46,7 @@ def _running_model(authority, ref):
 @pytest.mark.asyncio
 async def test_model_pick_during_a_running_turn_applies_to_the_next_turn(tmp_path, monkeypatch):
     from gateway.session_contract import Submission
+    import hermes_state_runtime as rt
     started, release = threading.Event(), asyncio.Event()
     seen = []
     state = {}
@@ -70,7 +62,7 @@ async def test_model_pick_during_a_running_turn_applies_to_the_next_turn(tmp_pat
     try:
         first = await authority.submit(owner.actor, Submission('running', ref, {'text': 'RUNNING'}, 'queue'))
         await async_wait_until(started.is_set, timeout=10, what='the first turn is running')
-        snap = session_row(db, ref.session_id)
+        snap = db.get_session(ref.session_id)
         reply = await owner.dispatch({'id': 1, 'method': 'session.mutate', 'params': {
             'session_id': ref.session_id, 'request_id': 'pick', 'expected_revision': snap['runtime_revision'],
             'expected_generation': snap['runtime_generation'], 'operation': 'model', 'payload': {'model': 'picked'}}})
@@ -80,16 +72,16 @@ async def test_model_pick_during_a_running_turn_applies_to_the_next_turn(tmp_pat
         assert _running_model(authority, ref) == 'frozen'
         release.set()
         await async_wait_until(
-            lambda: db.admissions.get(admission_id=first.admission_id).status == 'terminal',
+            lambda: rt.get_session_admission(db, admission_id=first.admission_id)['status'] == 'terminal',
             timeout=10, what='the running turn settled')
         await async_wait_until(lambda: _running_model(authority, ref) == 'picked',
                                timeout=10, what='the pick published at the turn boundary')
         second = await authority.submit(owner.actor, Submission('next', ref, {'text': 'NEXT'}, 'queue'))
         await async_wait_until(
-            lambda: db.admissions.get(admission_id=second.admission_id).status == 'terminal',
+            lambda: rt.get_session_admission(db, admission_id=second.admission_id)['status'] == 'terminal',
             timeout=10, what='the next turn ran')
         assert seen == [('RUNNING', 'frozen'), ('NEXT', 'picked')]
-        assert session_row(db, ref.session_id)['model'] == 'picked'
+        assert db.get_session(ref.session_id)['model'] == 'picked'
     finally:
         release.set()
         await owner.close()
@@ -102,7 +94,7 @@ async def test_revision_conflict_refusal_carries_the_fresh_fences(tmp_path, monk
         return 'ok'
     store, db, _authority, owner, ref = _owner(tmp_path, monkeypatch, handle)
     try:
-        snap = session_row(db, ref.session_id)
+        snap = db.get_session(ref.session_id)
         reply = await owner.dispatch({'id': 1, 'method': 'session.mutate', 'params': {
             'session_id': ref.session_id, 'request_id': 'stale', 'expected_revision': snap['runtime_revision'] + 7,
             'expected_generation': snap['runtime_generation'], 'operation': 'model', 'payload': {'model': 'picked'}}})
@@ -119,7 +111,7 @@ async def test_revision_conflict_refusal_carries_the_fresh_fences(tmp_path, monk
 
 
 async def _mutate(owner, db, ref, rid, model, snap=None, *, call=1):
-    snap = snap or session_row(db, ref.session_id)
+    snap = snap or db.get_session(ref.session_id)
     return await owner.dispatch({'id': call, 'method': 'session.mutate', 'params': {
         'session_id': ref.session_id, 'request_id': rid, 'expected_revision': snap['runtime_revision'],
         'expected_generation': snap['runtime_generation'], 'operation': 'model', 'payload': {'model': model}}})
@@ -127,9 +119,10 @@ async def _mutate(owner, db, ref, rid, model, snap=None, *, call=1):
 
 async def _run_turn(authority, owner, db, ref, name):
     from gateway.session_contract import Submission
+    import hermes_state_runtime as rt
     turn = await authority.submit(owner.actor, Submission(name, ref, {'text': name}, 'queue'))
     await async_wait_until(
-        lambda: db.admissions.get(admission_id=turn.admission_id).status == 'terminal',
+        lambda: rt.get_session_admission(db, admission_id=turn.admission_id)['status'] == 'terminal',
         timeout=10, what=f'turn {name} settled')
 
 
@@ -151,7 +144,7 @@ async def test_a_retried_deferred_pick_does_not_undo_a_newer_pick(tmp_path, monk
     try:
         await authority.submit(owner.actor, Submission('running', ref, {'text': 'RUNNING'}, 'queue'))
         await async_wait_until(started.is_set, timeout=10, what='the first turn is running')
-        snap = session_row(db, ref.session_id)
+        snap = db.get_session(ref.session_id)
         first = await _mutate(owner, db, ref, 'pick-a', 'model-a', snap)
         assert first['result']['status'] == 'deferred', first
         newer = await _mutate(owner, db, ref, 'pick-b', 'model-b', call=2)
@@ -162,7 +155,7 @@ async def test_a_retried_deferred_pick_does_not_undo_a_newer_pick(tmp_path, monk
         release.set()
         await _run_turn(authority, owner, db, ref, 'NEXT')
         assert seen[-1] == ('NEXT', 'model-b')
-        assert session_row(db, ref.session_id)['model'] == 'model-b'
+        assert db.get_session(ref.session_id)['model'] == 'model-b'
     finally:
         release.set()
         await owner.close()
@@ -182,7 +175,7 @@ async def test_a_newer_idle_pick_replaces_an_older_pending_pick(tmp_path, monkey
     state.update(authority=authority, ref=ref)
     try:
         # An older pick still pending when the drain is between turns (awaiting delivery).
-        snap = session_row(db, ref.session_id)
+        snap = db.get_session(ref.session_id)
         defer_pick(authority, owner.actor, ref, {
             'session_id': ref.session_id, 'request_id': 'old', 'expected_revision': snap['runtime_revision'],
             'expected_generation': snap['runtime_generation'], 'operation': 'model', 'payload': {'model': 'older'}})
@@ -190,7 +183,7 @@ async def test_a_newer_idle_pick_replaces_an_older_pending_pick(tmp_path, monkey
         assert newer['result']['model'] == 'newer', newer
         await _run_turn(authority, owner, db, ref, 'NEXT')
         assert seen == [('NEXT', 'newer')]
-        assert session_row(db, ref.session_id)['model'] == 'newer'
+        assert db.get_session(ref.session_id)['model'] == 'newer'
     finally:
         await owner.close()
         store.close_all_db_handles()
@@ -220,13 +213,12 @@ async def test_pending_pick_writes_do_not_stall_the_event_loop(tmp_path, monkeyp
     try:
         await authority.submit(owner.actor, Submission('running', ref, {'text': 'RUNNING'}, 'queue'))
         await async_wait_until(started.is_set, timeout=10, what='the first turn is running')
-        holder = raw_holder(authority.persistence)
-        write = holder._execute_write
+        write = db._execute_write
 
         def contended(fn, *a, **k):  # a writer lock held elsewhere (transcript write, maintenance)
             time.sleep(0.4)  # health: allow HX013 -- a writer lock held elsewhere, the stall under test
             return write(fn, *a, **k)
-        monkeypatch.setattr(holder, '_execute_write', contended)
+        monkeypatch.setattr(db, '_execute_write', contended)
         beat = asyncio.create_task(heartbeat())
         reply = await _mutate(owner, db, ref, 'pick', 'picked')
         assert reply['result']['status'] == 'deferred', reply
@@ -265,9 +257,10 @@ async def test_a_guarded_deferred_pick_asks_for_confirmation_instead_of_being_dr
     monkeypatch.setattr(stream, 'publish', lambda sid, payload, **k: (
         events.append((k.get('event_type'), payload)), publish(sid, payload, **k))[1])
     try:
-        seed_messages(db, ref.session_id, {'role': 'user', 'content': 'hello'}, {'role': 'assistant', 'content': 'hi'})
-        db.sessions.patch_model_config(ref.session_id, {USAGE_ANCHOR_MODEL_CONFIG_KEY: capture_usage_anchor(
-            250_000, 10, conversation(db, ref.session_id))})
+        db.append_message(ref.session_id, role='user', content='hello')
+        db.append_message(ref.session_id, role='assistant', content='hi')
+        db.patch_session_model_config(ref.session_id, {USAGE_ANCHOR_MODEL_CONFIG_KEY: capture_usage_anchor(
+            250_000, 10, db.get_messages_as_conversation(ref.session_id))})
         await authority.submit(owner.actor, Submission('running', ref, {'text': 'RUNNING'}, 'queue'))
         await async_wait_until(started.is_set, timeout=10, what='the first turn is running')
         assert (await _mutate(owner, db, ref, 'pick', 'guarded'))['result']['status'] == 'deferred'
@@ -283,7 +276,7 @@ async def test_a_guarded_deferred_pick_asks_for_confirmation_instead_of_being_dr
         assert not [p for t, p in events if p.get('status') == 'refused']
         assert _running_model(authority, ref) == 'frozen'
         # The user confirms: the canonical resend carries the owner's token and commits.
-        snap = session_row(db, ref.session_id)
+        snap = db.get_session(ref.session_id)
         confirmed = await owner.dispatch({'id': 9, 'method': 'session.mutate', 'params': {
             'session_id': ref.session_id, 'request_id': 'confirmed', 'expected_revision': snap['runtime_revision'],
             'expected_generation': snap['runtime_generation'], 'operation': 'model',
@@ -339,7 +332,9 @@ async def test_a_refused_deferred_pick_names_the_reason_and_the_committed_model(
 @pytest.mark.parametrize('error', [RuntimeError, OSError])
 async def test_a_deferred_pick_that_raises_is_refused_and_the_queue_keeps_draining(tmp_path, monkeypatch, error):
     from gateway.session_contract import Submission
+    from gateway.session_deferred_pick import _PREFIX
     from hermes_cli import model_switch
+    import hermes_state_runtime as rt
     started, release = threading.Event(), asyncio.Event()
     events, seen, state, raising = [], [], {}, threading.Event()
 
@@ -370,10 +365,12 @@ async def test_a_deferred_pick_that_raises_is_refused_and_the_queue_keeps_draini
         nxt = await authority.submit(owner.actor, Submission('next', ref, {'text': 'NEXT'}, 'queue'))
         release.set()
         await async_wait_until(
-            lambda: db.admissions.get(admission_id=nxt.admission_id).status == 'terminal',
+            lambda: rt.get_session_admission(db, admission_id=nxt.admission_id)['status'] == 'terminal',
             timeout=10, what='the queued turn ran despite the failing pick')
         assert seen == [('RUNNING', 'frozen'), ('NEXT', 'frozen')]
-        assert db.runtime.deferred_pick(ref.session_id) is None
+        with db._read_ctx() as conn:
+            assert conn.execute('SELECT 1 FROM state_meta WHERE key=?',
+                                (_PREFIX + ref.session_id,)).fetchone() is None
         refused = [p for t, p in events if t == 'session.updated' and p.get('status') == 'refused']
         assert refused and refused[0].items() >= {'operation': 'model', 'reason': 'model_resolution_failed',
                                                  'target_model': 'boom', 'model': 'frozen'}.items()
@@ -405,7 +402,7 @@ async def test_a_deferred_model_and_reasoning_pick_commits_both_together(tmp_pat
     try:
         await authority.submit(owner.actor, Submission('running', ref, {'text': 'RUNNING'}, 'queue'))
         await async_wait_until(started.is_set, timeout=10, what='the first turn is running')
-        snap = session_row(db, ref.session_id)
+        snap = db.get_session(ref.session_id)
         reply = await owner.dispatch({'id': 1, 'method': 'session.mutate', 'params': {
             'session_id': ref.session_id, 'request_id': 'pick', 'expected_revision': snap['runtime_revision'],
             'expected_generation': snap['runtime_generation'], 'operation': 'model',
@@ -446,7 +443,7 @@ async def test_a_reasoning_command_during_a_running_turn_is_committed_for_the_ne
     state.update(authority=authority, ref=ref)
     authority.runner._set_session_reasoning_override = lambda *a: None
     authority.runner._apply_reasoning_selection = lambda route, platform, value, persist_global=False: handled.append(value)
-    seed_session(db, 'telegram-row', 'telegram')
+    db.create_session('telegram-row', 'telegram')
     authority.sessions['telegram-row'] = LiveSession(SessionSource(platform=Platform.TELEGRAM, chat_id='42'), 'tg:42')
     try:
         for value, scope in (('minimal', 'global'), ('reset', 'session')):
@@ -477,7 +474,7 @@ async def test_a_reasoning_command_raced_by_another_mutation_is_not_refused(tmp_
     next boundary like a busy session."""
     from gateway import session_mutations
     from gateway.session_policy import policy_for_source
-    from persistence.core.errors import AuthorityRefusal
+    from hermes_state_runtime import RuntimeStoreError
 
     async def handle(event):
         return 'ok'
@@ -490,7 +487,7 @@ async def test_a_reasoning_command_raced_by_another_mutation_is_not_refused(tmp_
     async def racing(authority_, actor, ref_, params, *a, **k):
         if params.get('operation') == 'reasoning' and len(raced) < conflicts:
             raced.append(params['expected_revision'])
-            raise AuthorityRefusal('revision_conflict')
+            raise RuntimeStoreError('revision_conflict')
         return await real(authority_, actor, ref_, params, *a, **k)
     monkeypatch.setattr(session_mutations, 'mutate_session', racing)
     try:

@@ -1,15 +1,11 @@
-"""The codec between the live message-identity keys and the identity columns of a message row."""
-
+"""Durable message-identity columns for SessionDB (schema v31): the codec between the live identity keys
+(``agent.message_metadata``) and the ``message_uid`` / ``absorbed_message_uids`` / ``tool_call_uids`` /
+``tool_call_uid`` columns, shared by the transcript writers, restore, and transcript repair."""
 
 from __future__ import annotations
-<<<<<<< HEAD:hermes_state_identity.py
 
 import hashlib
-||||||| dff103e05878:hermes_state_identity.py
-=======
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/conversation/_store/identity.py
 import json
-<<<<<<< HEAD:hermes_state_identity.py
 import sqlite3
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple, TypeVar
 
@@ -74,18 +70,6 @@ def _unrepresented_tail_rows(
         "AND active = 1", tuple(targets)).fetchall()} if targets else set()
     return [row for row in _newest_message_uid_rows(rows)
             if not row[MESSAGE_UID] or (session_id or row["session_id"], row[MESSAGE_UID]) not in represented]
-||||||| dff103e05878:hermes_state_identity.py
-from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Tuple
-
-from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, TOOL_CALL_UID, TOOL_CALL_UIDS, uid_list
-from agent.message_sanitization import coalesce_tool_call_id
-from hermes_state_common import _json_or
-=======
-from typing import Any, Mapping, MutableMapping, Optional
-from session_rules.turns import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, TOOL_CALL_UIDS, uid_list, coalesce_tool_call_id
-from persistence.sqlite._state.common import _json_or
-from persistence.sqlite.conversation._store.rules import TOOL_CALL_UID
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/conversation/_store/identity.py
 
 
 def _live_or_column(msg: Mapping[str, Any], live_key: str, column: str) -> Any:

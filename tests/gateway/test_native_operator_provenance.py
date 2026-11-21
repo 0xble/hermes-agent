@@ -5,27 +5,13 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
-from tests.fixtures.storage_seed import seed_session
-from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 from gateway.session import SessionSource
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_contract import SessionActor, SessionRef, Submission
 from gateway.config import Platform
-<<<<<<< HEAD
+from hermes_state import SessionDB
 from hermes_state_runtime import RuntimeStoreError, admit_session_input, claim_session_input, list_session_admissions, settle_session_input
-||||||| dff103e05878
-from hermes_state_runtime import (
-    RuntimeStoreError,
-    admit_session_input,
-    begin_runtime_epoch,
-    claim_session_input,
-    list_session_admissions,
-    settle_session_input,
-)
-=======
-from persistence.core.errors import AuthorityRefusal
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 from tests.fakes.runtime_owner import begin_runtime_epoch
 
 
@@ -43,35 +29,34 @@ def _source():
 
 
 def _native_row(db, epoch, sid, route):
-    admitted, _created = db.admissions.admit(
-        epoch=epoch, principal_id="messaging:native", session_id=sid,
+    admitted = admit_session_input(
+        db, epoch=epoch, principal_id="messaging:native", session_id=sid,
         request_id="native",
         payload={"native_text_v1": {"source": {}, "route": route}},
     )
-    started = db.admissions.claim(epoch=epoch, session_id=sid)
-    db.admissions.settle(
-        epoch=epoch, admission_id=admitted.admission_id,
-        generation=started.generation, outcome="completed")
+    started = claim_session_input(db, epoch=epoch, session_id=sid)
+    settle_session_input(
+        db, epoch=epoch, admission_id=admitted["admission_id"],
+        generation=started["generation"], outcome="completed")
 
 
 @pytest.mark.asyncio
 async def test_client_cannot_submit_private_operator_provenance(tmp_path):
     sid = "native-session"
     source = _source()
-    db = storage_handle(tmp_path)
+    db = SessionDB(tmp_path / "state.db")
     try:
-        seed_session(db, sid, "telegram")
-        epoch = db.runtime.begin_epoch(instance_id="first")
+        db.create_session(sid, source="telegram")
+        epoch = begin_runtime_epoch(db, instance_id="first")
         authority = SessionAuthority(
-            _runner(), profile_id="default", instance_id="first", epoch=epoch,
-            persistence=storage_handle(tmp_path))
+            _runner(), profile_id="default", instance_id="first", db=db, epoch=epoch)
         authority.sessions[sid] = LiveSession(source, "telegram:default:chat")
         authority._publish_pending = lambda ref: None
         authority._schedule = lambda ref: None
 
         actor = SessionActor(
             "authenticated-viewer", "default", frozenset({"session:submit"}), "viewer")
-        with pytest.raises(AuthorityRefusal) as caught:
+        with pytest.raises(RuntimeStoreError) as caught:
             await authority.submit(
                 actor,
                 Submission(
@@ -89,7 +74,7 @@ async def test_client_cannot_submit_private_operator_provenance(tmp_path):
                 ),
             )
         assert caught.value.reason == "invalid_params"
-        assert not db.admissions.list(session_id=sid, pending_only=False)
+        assert not list_session_admissions(db, session_id=sid, pending_only=False)
     finally:
         db.close()
 
@@ -99,13 +84,13 @@ async def test_recovery_rejects_mismatched_operator_provenance(monkeypatch, tmp_
     sid = "native-session"
     route = "telegram:default:chat"
     source = _source()
-    db = storage_handle(tmp_path)
+    db = SessionDB(tmp_path / "state.db")
     try:
-        seed_session(db, sid, "telegram")
-        epoch = db.runtime.begin_epoch(instance_id="first")
+        db.create_session(sid, source="telegram")
+        epoch = begin_runtime_epoch(db, instance_id="first")
         _native_row(db, epoch, sid, route)
-        db.admissions.admit(
-            epoch=epoch, principal_id="authenticated-viewer", session_id=sid,
+        admit_session_input(
+            db, epoch=epoch, principal_id="authenticated-viewer", session_id=sid,
             request_id="viewer",
             payload={
                 "text": "viewer follow-up",
@@ -124,8 +109,7 @@ async def test_recovery_rejects_mismatched_operator_provenance(monkeypatch, tmp_
             "gateway.session_envelope.check_native_route", check_native_route)
 
         recovered = SessionAuthority(
-            _runner(), profile_id="default", instance_id="restart", epoch=epoch,
-            persistence=storage_handle(tmp_path))
+            _runner(), profile_id="default", instance_id="restart", db=db, epoch=epoch)
         assert await recovered.recover_native_sessions(
             [(sid, source, object())]
         ) == {sid: "permission_denied"}
@@ -137,21 +121,20 @@ async def test_recovery_rejects_mismatched_operator_provenance(monkeypatch, tmp_
 async def test_native_route_failure_still_blocks_recovery(monkeypatch, tmp_path):
     sid = "native-session"
     source = _source()
-    db = storage_handle(tmp_path)
+    db = SessionDB(tmp_path / "state.db")
     try:
-        seed_session(db, sid, "telegram")
-        epoch = db.runtime.begin_epoch(instance_id="first")
+        db.create_session(sid, source="telegram")
+        epoch = begin_runtime_epoch(db, instance_id="first")
         _native_row(db, epoch, sid, "telegram:default:chat")
 
         async def reject_route(runner, payload, target, available_source, adapter):
-            raise AuthorityRefusal("admission_conflict")
+            raise RuntimeStoreError("admission_conflict")
 
         monkeypatch.setattr(
             "gateway.session_envelope.check_native_route", reject_route)
 
         recovered = SessionAuthority(
-            _runner(), profile_id="default", instance_id="restart", epoch=epoch,
-            persistence=storage_handle(tmp_path))
+            _runner(), profile_id="default", instance_id="restart", db=db, epoch=epoch)
         assert await recovered.recover_native_sessions(
             [(sid, source, object())]
         ) == {sid: "admission_conflict"}

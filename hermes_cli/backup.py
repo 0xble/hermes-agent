@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import stat
 import sys
 import time
@@ -24,19 +25,17 @@ from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, _get_platform_default_hermes_home, get_default_hermes_root, get_hermes_home,
     display_hermes_home,
 )
-from persistence.core.admin import AdminUnsupported
-from persistence_assembly import open_store_admin, profile_scope, store_exists
-from sqlite_support import RETIRED_GENERATION_DIR_SUFFIX, is_zeroed_sqlite_file
+from hermes_state_dbfile import RETIRED_GENERATION_DIR_SUFFIX
+from hermes_state_holders import read_only_db_uri
+from hermes_cli.sqlite_safe_read import connect_tracked, has_live_connection, read_header_bytes_preopen
 
 from agent.provider_media import GENERATED_SUBDIR
 from hermes_cli.archive_safe import normalize_archive_parts
-from hermes_cli.backup_atomic import _atomic_output_path, publish_private_tree
-from hermes_cli.backup_integrity import verify_sqlite_integrity
-from hermes_cli.backup_sqlite import _safe_copy_db
+from hermes_cli.backup_atomic import _atomic_output_path
+from hermes_cli.backup_sqlite import _close_quietly, _safe_copy_db
 from hermes_cli.backup_staging import prune_backup_staging, reclaim_backup_staging, staged_backup_file, warn_legacy_backup_file
 from hermes_cli.config_backend import drop_other_access, require_file_tooling, supports_file_tooling
-from hermes_cli.home_data_layout import (
-    BRIDGE_LOG_PARTS, PM_RUNTIME_ROOT_DIRS, PROVIDER_PLUGIN_SNAPSHOT_PARTS, SECRET_CACHE_FILES, profile_root_entry)
+from hermes_cli.home_data_layout import BRIDGE_LOG_PARTS, PM_RUNTIME_ROOT_DIRS, SECRET_CACHE_FILES, profile_root_entry
 from hermes_cli.sizefmt import format_bytes as _format_size
 from hermes_cli.backup_snapshot_integrity import payload_digest, payload_matches
 
@@ -63,7 +62,6 @@ from hermes_cli.backup_restore import (
     _extract_member_atomically,
     _get_config_path_value,
     _import_db_member,
-    _is_store_file,
     _restore_auth_json,
     _restore_destination_epoch,
     _restore_snapshot_entry,
@@ -145,8 +143,7 @@ def _in_excluded_root_dir(rel_path: Path) -> bool:
     parts = rel_path.parts
     if len(parts) >= 3 and parts[0] == "profiles":
         parts = parts[2:]
-    return (parts in BRIDGE_LOG_PARTS or parts[:2] == PROVIDER_PLUGIN_SNAPSHOT_PARTS
-            or (len(parts) >= 2 and parts[0] == "cache" and parts[1] not in _KEPT_CACHE_SUBDIRS))
+    return parts in BRIDGE_LOG_PARTS or (len(parts) >= 2 and parts[0] == "cache" and parts[1] not in _KEPT_CACHE_SUBDIRS)
 
 
 # SQLite sidecars are excluded because ``*.db`` is snapshotted via ``sqlite3.backup()``:
@@ -370,7 +367,6 @@ def _iter_backup_files(hermes_root: Path, out_path: Path, skipped_dirs: Optional
 
 # --- SQLite safe copy ---
 
-<<<<<<< HEAD
 def _query_ro_sqlite(path: Path, fn):
     """Run ``fn(conn)`` on a read-only connection to *path*; return ``(value, None)`` or ``(None, exc)``."""
     conn = None
@@ -466,109 +462,6 @@ def verify_sqlite_integrity(
             return _done("integrity check passed", valid=True, size=size)
         return _done(f"integrity check failed: {'; '.join(rows[:5])}", size=size)
     return _done("header check passed", valid=True, size=size)
-||||||| dff103e05878
-def _query_ro_sqlite(path: Path, fn):
-    """Run ``fn(conn)`` on a read-only connection to *path*; return ``(value, None)`` or ``(None, exc)``."""
-    conn = None
-    try:
-        conn = connect_tracked(read_only_db_uri(path), uri=True, timeout=1.0, tracking_path=path)
-        return fn(conn), None
-    except Exception as exc:
-        return None, exc
-    finally:
-        _close_quietly(conn)
-
-
-def is_zeroed_sqlite_file(path: Path, *, probe_bytes: int = 100, force: bool = False) -> bool:
-    """True when *path* looks like the #68474 zeroed-state.db signature.
-
-    Only regular files qualify: probing a FIFO/device/socket could block indefinitely.
-
-    Signature: no ``SQLite format 3`` header and no data — either empty (size 0, the total-loss case,
-    #97568) or first *probe_bytes* all NUL. Used at SessionDB open and for snapshot diagnostics so a silent
-    all-zero file becomes a guided recovery instead of a generic failure.
-    """
-    try:
-        if not path.is_file():
-            return False
-    except OSError:
-        return False
-    if not force and has_live_connection(path):
-        return False
-
-    head = read_header_bytes_preopen(path, length=max(16, probe_bytes), force=force)
-    # Empty or all-NUL header => zeroed; a real header (or unreadable) => not.
-    return head is not None and not head.startswith(b"SQLite format 3") and not any(head)
-
-
-# --- SQLite integrity verification ---
-
-_SQLITE_HEADER = b"SQLite format 3\0"
-
-# Above this size ``PRAGMA integrity_check`` (walks every b-tree page — minutes of pegged CPU on a
-# 30 GB state.db, reading as a hung ``hermes update``) is replaced by the O(1) header+schema probe.
-# Default ceiling above which ``PRAGMA integrity_check`` is skipped in favour of the (O(1)) header +
-# structural probe. Sessions databases in the tens of GB are normal for heavy users, so the size-unbounded
-# check is never an acceptable default on the update path. See #70553.
-DEFAULT_INTEGRITY_CHECK_MAX_BYTES = 2 << 30  # 2 GiB
-
-
-def verify_sqlite_integrity(
-    path: Path, *, check_header: bool = True, run_pragma: bool = True,
-    max_bytes: int = DEFAULT_INTEGRITY_CHECK_MAX_BYTES) -> dict:
-    """Verify a SQLite database: existence + minimum size, header magic, then a read-only
-    ``PRAGMA integrity_check`` (or a cheap structural probe above ``max_bytes``)."""
-    def _done(message: str, valid: bool = False, size: Optional[int] = None) -> dict:
-        return {"valid": valid, "message": message, "size": size}
-    try:
-        st = path.stat()
-    except FileNotFoundError:
-        return _done(f"not found: {path}")
-    except OSError as exc:
-        return _done(f"cannot stat: {exc}")
-    size = st.st_size
-    if size < 100:  # SQLite minimum viable size (header + 1 page)
-        return _done(f"too small ({size} bytes) to be a valid SQLite database", size=size)
-    if check_header:
-        # Refused when a live connection exists (close() would cancel this process's POSIX locks
-        # — see sqlite_safe_read); verification targets offline snapshots/backup artifacts anyway.
-        head = read_header_bytes_preopen(path, length=len(_SQLITE_HEADER))
-        if head is None:
-            return _done("cannot read header", size=size)
-        if head != _SQLITE_HEADER:
-            return _done(f"missing SQLite header magic (got {head[:16].hex()!r})", size=size)
-    if max_bytes > 0 and size > max_bytes:
-        # O(1) probe: the header check caught the zeroed signature; reading sqlite_master + page
-        # geometry catches malformed-schema and truncated-header-page classes without a data walk.
-        _, exc = _query_ro_sqlite(path, lambda c: (
-            c.execute("PRAGMA schema_version").fetchone(),
-            c.execute("SELECT count(*) FROM sqlite_master").fetchone()))
-        if exc is not None:
-            kind = "failed" if isinstance(exc, sqlite3.DatabaseError) else "error"
-            return _done(f"schema probe {kind}: {exc}", size=size)
-        return _done(
-            f"size {size:,} bytes exceeds max_bytes {max_bytes:,}; "
-            "skipped PRAGMA integrity_check (header + schema probe passed)",
-            valid=True, size=size)
-    if run_pragma:
-        rows, exc = _query_ro_sqlite(
-            path, lambda c: [str(r[0]) for r in c.execute("PRAGMA integrity_check")])
-        if exc is not None:
-            kind = "cannot open database" if isinstance(exc, sqlite3.DatabaseError) else "integrity check error"
-            return _done(f"{kind}: {exc}", size=size)
-        if rows == ["ok"]:
-            return _done("integrity check passed", valid=True, size=size)
-        return _done(f"integrity check failed: {'; '.join(rows[:5])}", size=size)
-    return _done("header check passed", valid=True, size=size)
-=======
-def _snapshot_db(src: Path, dst: Path) -> bool:
-    """WAL-safe snapshot of the database *src* into *dst*: a store file through its store admin, any other database
-    with ``_safe_copy_db``; False, with *dst* removed, when none can be made."""
-    if not _is_store_file(src):
-        return _safe_copy_db(src, dst)
-    admin = open_store_admin(src)
-    return not isinstance(admin, AdminUnsupported) and admin.backup_to(dst)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 def _discard_failed_zip_members(zf: zipfile.ZipFile, filelist_len: int) -> None:
@@ -609,7 +502,7 @@ def _zip_sqlite_snapshot(zf: zipfile.ZipFile, abs_path: Path, rel_path: Path, ou
     Staged beside the output zip: /tmp may be a small tmpfs that cannot hold large databases.
     """
     with staged_backup_file(out_path.parent, "snapshot.db") as tmp_db:
-        if not _snapshot_db(abs_path, tmp_db):
+        if not _safe_copy_db(abs_path, tmp_db):
             warn_legacy_backup_file(abs_path)
             return None
         _write_zip_file(zf, tmp_db, str(rel_path))
@@ -1303,62 +1196,6 @@ def run_import(args) -> Optional[int]:
 
 
 
-<<<<<<< HEAD
-||||||| dff103e05878
-def _revive_gateway_after_import(hermes_root: Path) -> None:
-    """Start an installed gateway service after a restore, best-effort and prompt-free.
-
-    Bot tokens and cron jobs are inert without a gateway (a platform-less gateway is supported, so
-    this is safe for any backup); failures print a manual fallback, never fail the import. Only
-    revived when the restore landed in the default home or no other install exists: a sandbox or
-    profile restore must not install a second gateway on the default service name.
-    """
-    native_default = _get_platform_default_hermes_home()
-    if hermes_root != native_default and any(
-            (native_default / marker).exists() for marker in ("config.yaml", ".env", "state.db")):
-        print("\nRestored into a non-default home; leaving the gateway service alone to avoid clashing "
-              f"with the install at {native_default}.\n"
-              "To start a gateway for this home, run:  hermes gateway run")
-        return
-    try:
-        from hermes_cli.gateway import _is_service_running
-        from hermes_cli.gateway_setup_service import ensure_gateway_service
-        if not _is_service_running():
-            print()
-            ensure_gateway_service(context="import")
-    except Exception:
-        # Import boundary: the restore already succeeded; any service failure prints the
-        # manual fallback instead of failing the import.
-        logger.debug("gateway revive after import failed", exc_info=True)
-        print("\nStart the gateway to activate cron jobs and messaging:\n  hermes gateway run")
-=======
-def _revive_gateway_after_import(hermes_root: Path) -> None:
-    """Start an installed gateway service after a restore, best-effort and prompt-free.
-
-    Bot tokens and cron jobs are inert without a gateway (a platform-less gateway is supported, so
-    this is safe for any backup); failures print a manual fallback, never fail the import. Only
-    revived when the restore landed in the default home or no other install exists: a sandbox or
-    profile restore must not install a second gateway on the default service name.
-    """
-    native_default = _get_platform_default_hermes_home()
-    if hermes_root != native_default and (any((native_default / marker).exists() for marker in ("config.yaml", ".env")) or (
-            store_exists(profile_scope(home=native_default)))):
-        print("\nRestored into a non-default home; leaving the gateway service alone to avoid clashing "
-              f"with the install at {native_default}.\n"
-              "To start a gateway for this home, run:  hermes gateway run")
-        return
-    try:
-        from hermes_cli.gateway import _is_service_running
-        from hermes_cli.gateway_setup_service import ensure_gateway_service
-        if not _is_service_running():
-            print()
-            ensure_gateway_service(context="import")
-    except Exception:
-        # Import boundary: the restore already succeeded; any service failure prints the
-        # manual fallback instead of failing the import.
-        logger.debug("gateway revive after import failed", exc_info=True)
-        print("\nStart the gateway to activate cron jobs and messaging:\n  hermes gateway run")
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 # --- Quick state snapshots (used by /snapshot slash command and hermes backup --quick) ---
@@ -1893,480 +1730,6 @@ def create_pre_migration_backup(
 
 
 
-<<<<<<< HEAD
-||||||| dff103e05878
-def _create_quick_snapshot_locked(
-    label: Optional[str] = None,
-    hermes_home: Optional[Path] = None,
-    keep: Optional[int] = None,
-    max_file_size: Optional[int] = None,
-) -> Optional[str]:
-    """Create a quick state snapshot of critical files.
-
-    Copies STATE_FILES to a timestamped directory under state-snapshots/.
-    Auto-prunes old snapshots beyond the keep limit.
-
-    Args:
-        max_file_size: When set, individual files larger than this many bytes
-            are skipped (with a printed warning) instead of copied. Used by
-            the pre-update safety snapshot so a multi-GB ``state.db`` can
-            never stall ``hermes update`` or silently eat disk — the small
-            pairing/cron/config files the snapshot exists to protect are
-            always captured. ``None`` (default) copies everything, which
-            preserves manual ``/snapshot`` and ``hermes backup --quick``
-            behavior.
-
-    Returns:
-        Snapshot ID (timestamp-based), or None if no files found.
-    """
-    home = hermes_home or get_hermes_home()
-    root = _quick_snapshot_root(home)
-
-    def _too_large(path: Path, rel_name: str) -> bool:
-        """True (and warn) when ``path`` exceeds the max_file_size cap."""
-        if max_file_size is None:
-            return False
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return False
-        if size <= max_file_size:
-            return False
-        print(
-            f"  ⚠ Snapshot: skipping {rel_name} "
-            f"({_format_size(size)} exceeds {_format_size(max_file_size)} limit)"
-        )
-        logger.warning(
-            "Quick snapshot skipped %s: %d bytes exceeds %d byte limit",
-            rel_name,
-            size,
-            max_file_size,
-        )
-        return True
-
-    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    base_snap_id = f"{ts}-{label}" if label else ts
-    snap_id = base_snap_id
-    suffix = 2
-    while (root / snap_id).exists():
-        snap_id = f"{base_snap_id}-{suffix}"
-        suffix += 1
-    snap_dir = root / snap_id
-    staging_dir = root / f".{snap_id}.{os.getpid()}.partial"
-    shutil.rmtree(staging_dir, ignore_errors=True)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.name != "nt":
-        os.chmod(root, 0o700)
-    staging_dir.mkdir(mode=0o700, exist_ok=False)
-    logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
-
-    manifest: dict[str, int] = {}  # rel_path -> file size
-    failed_dbs: list[str] = []  # present *.db that could not be snapshotted
-    # #68805: track protected DB files skipped for size — they are snapshot
-    # incompleteness just like a failed copy, so pruning must be suppressed
-    # to preserve the older complete snapshot that may contain the only
-    # recoverable database.
-    oversized_skipped: list[str] = []
-
-    for rel in _QUICK_STATE_FILES:
-        src = home / rel
-        if not src.exists():
-            continue
-
-        if src.is_dir():
-            # Walk the directory and record each file individually in the
-            # manifest so restore can treat them uniformly.  Empty dirs are
-            # skipped (nothing to snapshot).
-            for sub in src.rglob("*"):
-                if not sub.is_file():
-                    continue
-                sub_rel = sub.relative_to(home).as_posix()
-                # Skip heavy, regenerable per-board subtrees (scratch
-                # workspaces and task attachments can be large); we only need
-                # the board databases + their metadata to restore a board.
-                if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
-                    continue
-                if _too_large(sub, sub_rel):
-                    if sub.suffix == ".db":
-                        oversized_skipped.append(sub_rel)
-                    continue
-                dst = staging_dir / sub_rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    # Route SQLite DBs through the WAL-safe backup() path so a
-                    # board DB with an open WAL (the gateway may hold it at
-                    # snapshot time) is captured consistently.
-                    if sub.suffix == ".db":
-                        if not _safe_copy_db(sub, dst):
-                            failed_dbs.append(sub_rel)
-                            print(
-                                f"  ⚠ Snapshot: SQLite safe copy FAILED for {sub_rel} "
-                                f"— file may be locked or corrupted"
-                            )
-                            if is_zeroed_sqlite_file(sub):
-                                print(
-                                    f"  ⚠ Snapshot: {sub_rel} looks ZEROED "
-                                    f"(no SQLite header; {sub.stat().st_size} bytes of NULs?)"
-                                )
-                            continue
-                    else:
-                        shutil.copy2(sub, dst)
-                    manifest[sub_rel] = dst.stat().st_size
-                except (OSError, PermissionError) as exc:
-                    logger.warning("Could not snapshot %s: %s", sub_rel, exc)
-            continue
-
-        if not src.is_file():
-            continue
-
-        if _too_large(src, rel):
-            if src.suffix == ".db":
-                oversized_skipped.append(rel)
-            continue
-
-        dst = staging_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            if src.suffix == ".db":
-                if not _safe_copy_db(src, dst):
-                    failed_dbs.append(rel)
-                    print(
-                        f"  ⚠ Snapshot: SQLite safe copy FAILED for {rel} "
-                        f"— file may be locked or corrupted"
-                    )
-                    if is_zeroed_sqlite_file(src):
-                        print(
-                            f"  ⚠ Snapshot: {rel} looks ZEROED "
-                            f"(no SQLite header; {src.stat().st_size} bytes)"
-                        )
-                    continue
-            else:
-                shutil.copy2(src, dst)
-            manifest[rel] = dst.stat().st_size
-        except (OSError, PermissionError) as exc:
-            logger.warning("Could not snapshot %s: %s", rel, exc)
-
-    if failed_dbs:
-        # Critical: update path used to log-and-continue with exit 0, so a
-        # missing state.db backup looked like a successful pre-update snapshot
-        # (#68474). Surface this on stdout where operators actually look.
-        print(
-            "  ⚠ CRITICAL: could not snapshot DB file(s): "
-            + ", ".join(failed_dbs)
-        )
-        print(
-            f"  ⚠ If sessions disappear after the update, check {root}. {_snapshot_recovery_hint()}"
-        )
-        logger.error(
-            "Quick snapshot failed to capture DB file(s): %s",
-            ", ".join(failed_dbs),
-        )
-
-    if not manifest:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        if failed_dbs:
-            # Distinguish "nothing to snapshot" from "state.db present but unreadable"
-            print(
-                "  ⚠ Snapshot aborted: no files captured "
-                f"(failed DBs: {', '.join(failed_dbs)})"
-            )
-        return None
-
-    # Write manifest
-    meta = {
-        "id": snap_id,
-        "timestamp": ts,
-        "label": label,
-        "file_count": len(manifest),
-        "total_size": sum(manifest.values()),
-        "files": manifest,
-        "failed_dbs": failed_dbs,
-        "oversized_skipped": oversized_skipped,
-    }
-    with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-    # Make the staged quick snapshot owner-only before it is published. The
-    # staging directory is private from creation, so copied source modes can
-    # be normalized safely before the final atomic rename exposes the
-    # snapshot. Permission failures are intentionally fatal: publishing a
-    # readable recovery bundle is worse than reporting a failed snapshot.
-    if os.name != "nt":
-        os.chmod(root, 0o700)
-        os.chmod(staging_dir, 0o700)
-        for path in staging_dir.rglob("*"):
-            if path.is_dir():
-                os.chmod(path, 0o700)
-            elif path.is_file():
-                os.chmod(path, 0o600)
-
-    os.replace(staging_dir, snap_dir)
-
-    # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
-    # with known high-churn safety snapshots (for example pre-update) can pass a
-    # smaller keep value so large state.db copies do not accumulate indefinitely.
-    # #68805 review: skip pruning when a present DB failed to capture OR was
-    # skipped for size — either way the snapshot is incomplete and the older
-    # snapshot may contain the only recoverable database.
-    incomplete = failed_dbs or oversized_skipped
-    if not incomplete:
-        _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
-    else:
-        if oversized_skipped:
-            print(
-                "  ⚠ Skipping snapshot prune: DB file(s) skipped for size: "
-                + ", ".join(oversized_skipped)
-            )
-            logger.warning(
-                "Quick snapshot skipped oversized DB file(s): %s",
-                ", ".join(oversized_skipped),
-            )
-        logger.warning(
-            "Skipping snapshot prune because %d DB(s) failed to capture "
-            "and/or %d were oversized — preserving older snapshots as "
-            "recovery source",
-            len(failed_dbs), len(oversized_skipped),
-        )
-
-    logger.info(
-        "quick snapshot phase=copy status=complete id=%s files=%d bytes=%d",
-        snap_id,
-        len(manifest),
-        sum(manifest.values()),
-    )
-    return snap_id
-=======
-def _create_quick_snapshot_locked(
-    label: Optional[str] = None,
-    hermes_home: Optional[Path] = None,
-    keep: Optional[int] = None,
-    max_file_size: Optional[int] = None,
-) -> Optional[str]:
-    """Create a quick state snapshot of critical files.
-
-    Copies STATE_FILES to a timestamped directory under state-snapshots/.
-    Auto-prunes old snapshots beyond the keep limit.
-
-    Args:
-        max_file_size: When set, individual files larger than this many bytes
-            are skipped (with a printed warning) instead of copied. Used by
-            the pre-update safety snapshot so a multi-GB ``state.db`` can
-            never stall ``hermes update`` or silently eat disk — the small
-            pairing/cron/config files the snapshot exists to protect are
-            always captured. ``None`` (default) copies everything, which
-            preserves manual ``/snapshot`` and ``hermes backup --quick``
-            behavior.
-
-    Returns:
-        Snapshot ID (timestamp-based), or None if no files found.
-    """
-    home = hermes_home or get_hermes_home()
-    root = _quick_snapshot_root(home)
-
-    def _too_large(path: Path, rel_name: str) -> bool:
-        """True (and warn) when ``path`` exceeds the max_file_size cap."""
-        if max_file_size is None:
-            return False
-        try:
-            size = path.stat().st_size
-        except OSError:
-            return False
-        if size <= max_file_size:
-            return False
-        print(
-            f"  ⚠ Snapshot: skipping {rel_name} "
-            f"({_format_size(size)} exceeds {_format_size(max_file_size)} limit)"
-        )
-        logger.warning(
-            "Quick snapshot skipped %s: %d bytes exceeds %d byte limit",
-            rel_name,
-            size,
-            max_file_size,
-        )
-        return True
-
-    ts = datetime.now(UTC).strftime("%Y%m%d-%H%M%S")
-    base_snap_id = f"{ts}-{label}" if label else ts
-    snap_id = base_snap_id
-    suffix = 2
-    while (root / snap_id).exists():
-        snap_id = f"{base_snap_id}-{suffix}"
-        suffix += 1
-    snap_dir = root / snap_id
-    staging_dir = root / f".{snap_id}.{os.getpid()}.partial"
-    shutil.rmtree(staging_dir, ignore_errors=True)
-    root.mkdir(parents=True, exist_ok=True, mode=0o700)
-    if os.name != "nt":
-        os.chmod(root, 0o700)
-    staging_dir.mkdir(mode=0o700, exist_ok=False)
-    logger.info("quick snapshot phase=copy status=started id=%s", snap_id)
-
-    manifest: dict[str, int] = {}  # rel_path -> file size
-    failed_dbs: list[str] = []  # present *.db that could not be snapshotted
-    # #68805: track protected DB files skipped for size — they are snapshot
-    # incompleteness just like a failed copy, so pruning must be suppressed
-    # to preserve the older complete snapshot that may contain the only
-    # recoverable database.
-    oversized_skipped: list[str] = []
-
-    for rel in _QUICK_STATE_FILES:
-        src = home / rel
-        if not src.exists():
-            continue
-
-        if src.is_dir():
-            # Walk the directory and record each file individually in the
-            # manifest so restore can treat them uniformly.  Empty dirs are
-            # skipped (nothing to snapshot).
-            for sub in src.rglob("*"):
-                if not sub.is_file():
-                    continue
-                sub_rel = sub.relative_to(home).as_posix()
-                # Skip heavy, regenerable per-board subtrees (scratch
-                # workspaces and task attachments can be large); we only need
-                # the board databases + their metadata to restore a board.
-                if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
-                    continue
-                if _too_large(sub, sub_rel):
-                    if sub.suffix == ".db":
-                        oversized_skipped.append(sub_rel)
-                    continue
-                dst = staging_dir / sub_rel
-                dst.parent.mkdir(parents=True, exist_ok=True)
-                try:
-                    # Route SQLite DBs through the WAL-safe backup() path so a
-                    # board DB with an open WAL (the gateway may hold it at
-                    # snapshot time) is captured consistently.
-                    if sub.suffix == ".db":
-                        if not _snapshot_db(sub, dst):
-                            failed_dbs.append(sub_rel)
-                            print(
-                                f"  ⚠ Snapshot: SQLite safe copy FAILED for {sub_rel} "
-                                f"— file may be locked or corrupted"
-                            )
-                            if is_zeroed_sqlite_file(sub):
-                                print(
-                                    f"  ⚠ Snapshot: {sub_rel} looks ZEROED "
-                                    f"(no SQLite header; {sub.stat().st_size} bytes of NULs?)"
-                                )
-                            continue
-                    else:
-                        shutil.copy2(sub, dst)
-                    manifest[sub_rel] = dst.stat().st_size
-                except (OSError, PermissionError) as exc:
-                    logger.warning("Could not snapshot %s: %s", sub_rel, exc)
-            continue
-
-        if not src.is_file():
-            continue
-
-        if _too_large(src, rel):
-            if src.suffix == ".db":
-                oversized_skipped.append(rel)
-            continue
-
-        dst = staging_dir / rel
-        dst.parent.mkdir(parents=True, exist_ok=True)
-
-        try:
-            if src.suffix == ".db":
-                if not _snapshot_db(src, dst):
-                    failed_dbs.append(rel)
-                    print(
-                        f"  ⚠ Snapshot: SQLite safe copy FAILED for {rel} "
-                        f"— file may be locked or corrupted"
-                    )
-                    if is_zeroed_sqlite_file(src):
-                        print(
-                            f"  ⚠ Snapshot: {rel} looks ZEROED "
-                            f"(no SQLite header; {src.stat().st_size} bytes)"
-                        )
-                    continue
-            else:
-                shutil.copy2(src, dst)
-            manifest[rel] = dst.stat().st_size
-        except (OSError, PermissionError) as exc:
-            logger.warning("Could not snapshot %s: %s", rel, exc)
-
-    if failed_dbs:
-        # Critical: update path used to log-and-continue with exit 0, so a
-        # missing state.db backup looked like a successful pre-update snapshot
-        # (#68474). Surface this on stdout where operators actually look.
-        print(
-            "  ⚠ CRITICAL: could not snapshot DB file(s): "
-            + ", ".join(failed_dbs)
-        )
-        print(
-            f"  ⚠ If sessions disappear after the update, check {root}. {_snapshot_recovery_hint()}"
-        )
-        logger.error(
-            "Quick snapshot failed to capture DB file(s): %s",
-            ", ".join(failed_dbs),
-        )
-
-    if not manifest:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        if failed_dbs:
-            # Distinguish "nothing to snapshot" from "state.db present but unreadable"
-            print(
-                "  ⚠ Snapshot aborted: no files captured "
-                f"(failed DBs: {', '.join(failed_dbs)})"
-            )
-        return None
-
-    # Write manifest
-    meta = {
-        "id": snap_id,
-        "timestamp": ts,
-        "label": label,
-        "file_count": len(manifest),
-        "total_size": sum(manifest.values()),
-        "files": manifest,
-        "failed_dbs": failed_dbs,
-        "oversized_skipped": oversized_skipped,
-    }
-    with open(staging_dir / "manifest.json", "w", encoding="utf-8") as f:
-        json.dump(meta, f, indent=2)
-
-    # Make the staged quick snapshot owner-only, durable, then visible (update auto-restore trusts
-    # a published snapshot, so its files must not read back as zeros after a crash).
-    publish_private_tree(staging_dir, snap_dir)
-
-    # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
-    # with known high-churn safety snapshots (for example pre-update) can pass a
-    # smaller keep value so large state.db copies do not accumulate indefinitely.
-    # #68805 review: skip pruning when a present DB failed to capture OR was
-    # skipped for size — either way the snapshot is incomplete and the older
-    # snapshot may contain the only recoverable database.
-    incomplete = failed_dbs or oversized_skipped
-    if not incomplete:
-        _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
-    else:
-        if oversized_skipped:
-            print(
-                "  ⚠ Skipping snapshot prune: DB file(s) skipped for size: "
-                + ", ".join(oversized_skipped)
-            )
-            logger.warning(
-                "Quick snapshot skipped oversized DB file(s): %s",
-                ", ".join(oversized_skipped),
-            )
-        logger.warning(
-            "Skipping snapshot prune because %d DB(s) failed to capture "
-            "and/or %d were oversized — preserving older snapshots as "
-            "recovery source",
-            len(failed_dbs), len(oversized_skipped),
-        )
-
-    logger.info(
-        "quick snapshot phase=copy status=complete id=%s files=%d bytes=%d",
-        snap_id,
-        len(manifest),
-        sum(manifest.values()),
-    )
-    return snap_id
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 

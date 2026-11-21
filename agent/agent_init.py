@@ -38,7 +38,6 @@ from agent.primary_runtime_snapshot import _snapshot_primary_runtime
 from agent.process_bootstrap import _install_safe_stdio
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.agent_init_memory_provider import _memory_provider_init_kwargs, resolve_memory_provider
-from agent.agent_init_session import _publish_session_id, stand_in_interface
 from agent.think_scrubber import StreamingThinkScrubber
 from agent.tool_guardrails import (
     ToolCallGuardrailConfig, ToolCallGuardrailController
@@ -47,7 +46,7 @@ from hermes_cli.config import DEFAULT_CONFIG, cfg_get
 from hermes_cli.route_identity import normalize_route_base_url
 from hermes_cli.timeouts import get_provider_request_timeout
 from hermes_constants import get_hermes_home
-from session_rules.session_ids import new_session_id
+from hermes_state_ids import new_session_id
 from utils import base_url_host_matches, is_truthy_value
 
 # Same logger name as run_agent so caplog/patches on "run_agent" see our records.
@@ -508,8 +507,6 @@ _SESSION_STATE: dict[str, Any] = {
     # Whether close() also closes _session_db. False: a caller-supplied handle is usually the
     # SHARED launch handle; callers handing over a DEDICATED handle set True.
     "_owns_session_db": False,
-    # The deprecated hermes_state.SessionDB a plugin context engine binds; opened on first need, closed with the agent.
-    "_context_engine_session_db": None,
     # Close flush and turn-start flush can overlap; the durable marker lives on each message
     # dict, so its test-and-append is serialized per agent.
     "_session_persist_lock": threading.RLock,
@@ -565,17 +562,34 @@ def _init_prompt_cache_config(agent):
         agent._anthropic_prompt_cache_policy()
     )
     agent._cache_disabled = False
-    # cache_ttl: "auto" (default) picks 1h when a person paces the session and 5m when a machine does;
-    # "5m"/"1h" pin a tier (1h writes cost 2x vs 1.25x and only pay off across >5-minute pauses, #14971);
-    # unknown values keep "5m". A falsy/off value disables caching entirely (OAuth plans billing cache
-    # writes against "extra usage", proxies injecting their own cache_control, #13477); the disable
-    # survives /model switches and fallback re-derivation. An unreadable config falls back to "auto".
-    from agent.agent_runtime_helpers import cache_ttl_means_disabled
-    from agent.prompt_caching import AUTO_CACHE_TTL, auto_start_cache_ttl
-    ttl = AUTO_CACHE_TTL
+    # cache_ttl: "5m" (default), "1h" (2x write cost; pays off with >5-minute pauses) or "auto"
+    # (1h when a person paces the session, 5m when a machine does); unknown values keep "5m". A falsy/off value disables caching entirely (OAuth plans
+    # billing cache writes, proxies adding their own cache_control); the disable survives
+    # /model switches and fallback re-derivation.
+    # Anthropic supports "5m" (default) and "1h" cache TTL tiers. Read from config.yaml under
+    # prompt_caching.cache_ttl; unknown values keep "5m". 1h tier costs 2x on write vs 1.25x for 5m, but
+    # amortizes across long sessions with >5-minute pauses between turns (#14971). This is useful for OAuth
+    # subscription users where cache writes bill against "extra usage" or for third-party proxies that
+    # inject their own cache_control markers (#13477).
+    agent._cache_ttl = "5m"
     try:
         from hermes_cli.config import load_config_readonly as _load_pc_cfg
-        ttl = (_load_pc_cfg().get("prompt_caching", {}) or {}).get("cache_ttl", AUTO_CACHE_TTL)
+        from agent.agent_runtime_helpers import cache_ttl_means_disabled
+        from agent.prompt_caching import AUTO_CACHE_TTL, auto_cache_ttl_for_source
+        _pc_cfg = _load_pc_cfg().get("prompt_caching", {}) or {}
+        _ttl = _pc_cfg.get("cache_ttl", "5m")
+        if _ttl in {"5m", "1h"}:
+            agent._cache_ttl = _ttl
+        elif _ttl == AUTO_CACHE_TTL:
+            # Decided once per session from its source (a delegated child is clamped to 5m again
+            # in delegate_tool regardless).
+            from agent.session_source import session_source_for
+            agent._cache_ttl = auto_cache_ttl_for_source(session_source_for(getattr(agent, "platform", None)))
+        elif cache_ttl_means_disabled(_ttl):
+            agent._use_prompt_caching = False
+            agent._use_native_cache_layout = False
+            agent._cache_ttl = None
+            agent._cache_disabled = True
     except Exception as exc:  # health: allow BLE001 -- init must survive any config failure; the class is logged
         # Config values and traceback frames may contain credentials.
         logger.warning(
@@ -585,20 +599,6 @@ def _init_prompt_cache_config(agent):
             "configuration imports work again.",
             type(exc).__name__,
         )
-    agent._cache_ttl = "5m"
-    # Auto takes the send-time route clamp (Bedrock legacy 5m) even when a fork copies a 1h tier.
-    agent._cache_ttl_auto = ttl == AUTO_CACHE_TTL
-    if ttl in ("5m", "1h"):  # a tuple: an unhashable YAML value (a list) must not raise here
-        agent._cache_ttl = ttl
-    elif ttl == AUTO_CACHE_TTL and not getattr(agent, "side_agent", False):
-        # From the session's source (delegate_tool clamps children to 5m; a side agent keeps 5m); a 1h
-        # choice starts on 5m and upgrades at the first pause over 5 minutes (prompt_cache_lifecycle.tier).
-        agent._cache_ttl = auto_start_cache_ttl(agent)
-    elif cache_ttl_means_disabled(ttl):
-        agent._use_prompt_caching = False
-        agent._use_native_cache_layout = False
-        agent._cache_ttl = None
-        agent._cache_disabled = True
 
 
 def _init_turn_state(agent, run_budget_seconds):
@@ -1055,14 +1055,30 @@ def _load_tools(agent, enabled_toolsets, disabled_toolsets):
             source = "Anthropic-compatible endpoint"
         else:
             source = "Claude via OpenRouter"
-        from agent.prompt_caching import effective_cache_ttl
-        ttl = effective_cache_ttl(agent._cache_ttl, provider=agent.provider, model=agent.model,
-                                  base_url=agent.base_url or "", auto=agent._cache_ttl_auto)
-        print(f"💾 Prompt caching: ENABLED ({source}, {ttl} TTL)")
+        print(f"💾 Prompt caching: ENABLED ({source}, {agent._cache_ttl} TTL)")
+
+
+def _publish_session_id(session_id: str) -> None:
+    """Expose the session ID to tools via ContextVar (+ legacy os.environ fallback).
+
+    If the ContextVar bridge fails to import, keep the root-agent env fallback but never let
+    delegated construction publish a child ID process-wide.
+    """
+    try:
+        from gateway.session_context import set_current_session_id
+        set_current_session_id(session_id)
+    except Exception:
+        try:
+            from agent.delegation_context import is_delegated_child_context
+            delegated_child = is_delegated_child_context()
+        except Exception:
+            delegated_child = False
+        if not delegated_child:
+            os.environ["HERMES_SESSION_ID"] = session_id
 
 
 def _init_session_state(agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
-    checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb, persistence=None):
+    checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb):
     agent.session_start = datetime.now()
     agent.session_id = session_id or new_session_id(agent.session_start)
     _publish_session_id(agent.session_id)
@@ -1080,21 +1096,15 @@ def _init_session_state(agent, session_id, session_db, parent_session_id, reason
         agent.skip_background_review = True
 
     # Filesystem checkpoint manager (transparent — not a tool)
-    from agent.checkpoints.manager import CheckpointManager
+    from tools.checkpoint_manager import CheckpointManager
     agent._checkpoint_mgr = CheckpointManager(
         enabled=checkpoints_enabled and not agent.incognito, max_snapshots=checkpoint_max_snapshots,
         max_total_size_mb=checkpoint_max_total_size_mb,
         max_file_size_mb=checkpoint_max_file_size_mb,
     )
 
-<<<<<<< HEAD
     agent._incognito_session_db = session_db if agent.incognito else None
     agent._session_db = None if agent.incognito else session_db  # optional SQLite store
-||||||| dff103e05878
-    agent._session_db = session_db  # optional SQLite store (CLI/gateway-provided)
-=======
-    agent._session_db, agent.persistence = session_db, persistence  # optional store and its storage interface
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     agent._parent_session_id = parent_session_id
     agent._session_init_model_config = {
         "max_iterations": agent.max_iterations,
@@ -1832,8 +1842,7 @@ def _compressor_max_tokens(agent):
     return None
 
 
-def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db,
-                          persistence=None):
+def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db):
     _selected_engine = None if getattr(agent, 'incognito', False) else _select_context_engine(_agent_cfg)
     if _selected_engine is not None:
         agent.context_compressor = _selected_engine
@@ -1877,10 +1886,8 @@ def _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_c
         )
     _bind_session_state = getattr(agent.context_compressor, "bind_session_state", None)
     if callable(_bind_session_state):
-        from agent.conversation_compression import context_engine_persistence, context_engine_session_db
         with suppress(Exception):
-            _bind_session_state(session_db=context_engine_session_db(agent, session_db), session_id=agent.session_id,
-                                **context_engine_persistence(_bind_session_state, persistence))
+            _bind_session_state(session_db=session_db, session_id=agent.session_id)
     agent.compression_enabled = cs.enabled
     agent.compression_in_place = cs.in_place
     _cc = agent.context_compressor
@@ -2106,7 +2113,7 @@ def init_agent(
     chat_id: str | None = None, chat_name: str | None = None, chat_type: str | None = None, thread_id: str | None = None,
     gateway_session_key: str | None = None, skip_context_files: bool = False,
     load_soul_identity: bool = False, skip_memory: bool = False,
-    skip_background_review: bool = False, session_db=None, persistence=None, parent_session_id: str | None = None,
+    skip_background_review: bool = False, session_db=None, parent_session_id: str | None = None,
     iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
     fallback_model: dict[str, Any] | None = None, credential_pool=None, checkpoints_enabled: bool = False,
     checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
@@ -2194,11 +2201,10 @@ def init_agent(
     _build_client(agent, api_key, base_url, fallback_model)
     _init_fallback_chain(agent, fallback_model)
     _load_tools(agent, enabled_toolsets, disabled_toolsets)
-    persistence = persistence if persistence is not None else stand_in_interface(session_db)
     _init_session_state(
         agent, session_id, session_db, parent_session_id, reasoning_config, max_tokens,
         checkpoints_enabled, checkpoint_max_snapshots, checkpoint_max_total_size_mb, checkpoint_max_file_size_mb,
-        persistence=persistence)
+    )
 
     # Load config once for memory, skills, and compression sections
     try:
@@ -2223,14 +2229,7 @@ def init_agent(
     _config_context_length, _custom_providers, _effective_context_length, _model_cfg = _resolve_context_length(
         agent, _agent_cfg, base_url
     )
-<<<<<<< HEAD
     _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, agent._session_db)
-||||||| dff103e05878
-    _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db)
-=======
-    _build_context_engine(agent, _agent_cfg, cs, _custom_providers, _effective_context_length, session_db,
-                          persistence=persistence)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     _configure_ollama_num_ctx(agent, _model_cfg, _config_context_length)
     _enforce_minimum_context(agent)
     _warn_nonagentic_hermes_model(agent)
@@ -2238,7 +2237,8 @@ def init_agent(
     _init_usage_state(agent)
     _clamp_compressor_to_ollama_num_ctx(agent)
     _emit_compression_summary(agent, cs)
-    _snapshot_primary_runtime(agent)# Gateway eviction and independent workers construct fresh agents. Adopt a durable primary
+    _snapshot_primary_runtime(agent)
+    # Gateway eviction and independent workers construct fresh agents. Adopt a durable primary
     # outage before the first turn so construction itself never leaves a cooled primary active.
     with suppress(Exception):
         from agent.agent_runtime_helpers import _adopt_shared_primary_cooldown

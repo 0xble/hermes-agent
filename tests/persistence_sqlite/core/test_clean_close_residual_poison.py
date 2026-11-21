@@ -1,4 +1,4 @@
-"""A clean ``StoreHolder.close()`` racing a live caller must never be classified as an externally
+"""A clean ``SessionDB.close()`` racing a live caller must never be classified as an externally
 deleted WAL generation (regression for #116244, sibling of #105567).
 
 ``append_message`` already probes the replaced/lost generation INSIDE ``_lock`` so it can only see
@@ -10,21 +10,15 @@ healthy handle. ``normal`` is the control.
 import sqlite3
 import threading
 import pytest
-from persistence.sqlite import _registry
-from persistence.sqlite._holder import StoreHolder
-from persistence.sqlite.admin import SQLiteStoreAdmin
-from persistence.sqlite.admin._maintenance import _optimize_fts
-from persistence.sqlite.conversation._store.messages import append_message
-from persistence.sqlite.conversation._store.search import rebuild_fts
-from persistence.sqlite.conversation._store.sessions import create_session
+from hermes_state import SessionDB
 
 
 @pytest.mark.requires_wal  # the sticky flag exists only for a recorded WAL/SHM generation; DELETE mode has none
 @pytest.mark.parametrize("entry", ["normal", "optimize", "rebuild", "vacuum", "error_branch"])
 def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry):
     path = tmp_path / "synthetic.db"
-    db = StoreHolder(db_path=path)
-    create_session(db, "synthetic", "cli")
+    db = SessionDB(db_path=path)
+    db.create_session("synthetic", "cli")
     conn = db._conn
     assert db._db_sidecar_identity and path.with_name(path.name + "-wal").exists()
     lock, close = db._lock, db._close_connection_quietly
@@ -79,19 +73,10 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
 
     monkeypatch.setattr(db, "_lock", ObservedLock())
     monkeypatch.setattr(db, "_close_connection_quietly", paused_close)
-<<<<<<< HEAD:tests/hermes_state/test_clean_close_residual_poison.py
     # Normal writers use the cached generation check, SQLite-error recovery the
     # full probe. Both must observe the stable state under the same writer lock.
     for name in ("_raise_if_db_replaced", "_raise_if_db_generation_flagged"):
         monkeypatch.setattr(db, name, observe_guard(getattr(db, name)))
-||||||| dff103e05878:tests/hermes_state/test_clean_close_residual_poison.py
-    monkeypatch.setattr(db, "_raise_if_db_replaced", observed_guard)
-=======
-    monkeypatch.setattr(db, "_raise_if_db_replaced", observed_guard)
-    if entry == "vacuum":  # the store admin's vacuum runs on the registry's writer for the file: lend it this handle
-        monkeypatch.setattr(_registry, "acquire", lambda _path: db)
-        monkeypatch.setattr(_registry, "release_or_close", lambda _db: None)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:tests/persistence_sqlite/core/test_clean_close_residual_poison.py
 
     def closer():
         try:
@@ -106,14 +91,14 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
 
     def writer():
         try:
-            if entry == "normal":  # health: allow HX011 -- one branch per write entry the race is parametrised over
-                append_message(db, "synthetic", "tool", content="normal-during-close")
+            if entry == "normal":
+                db.append_message("synthetic", "tool", content="normal-during-close")
             elif entry == "optimize":
-                _optimize_fts(db)
+                db.optimize_fts()
             elif entry == "rebuild":
-                rebuild_fts(db)
+                db.rebuild_fts()
             elif entry == "vacuum":
-                SQLiteStoreAdmin(path, read_only=False).vacuum()
+                db.vacuum()
             else:
                 db._execute_write(inject_error)
         except BaseException as e:
@@ -137,7 +122,7 @@ def test_clean_close_never_causes_false_sticky_loss(tmp_path, monkeypatch, entry
         assert not any("AssertionError" in x for x in errors), errors
         sticky = bool(db._db_wal_generation_lost)
         try:
-            append_message(db, "synthetic", "tool", content="after-legitimate-close")
+            db.append_message("synthetic", "tool", content="after-legitimate-close")
         except Exception as e:
             post_errors.append(type(e).__name__ + ": " + str(e))
         reader = sqlite3.connect(f"file:{path}?mode=ro", uri=True)

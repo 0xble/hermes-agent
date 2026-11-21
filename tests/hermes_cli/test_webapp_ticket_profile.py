@@ -11,7 +11,6 @@ from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
-from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 _TOKEN = "b" * 43
 
@@ -21,14 +20,8 @@ def two_profiles(monkeypatch, tmp_path):
     from gateway.session_authorities import SessionAuthorities
     from gateway.session_authority import SessionAuthority
     from hermes_cli import web_server as server
-<<<<<<< HEAD
     from hermes_state import SessionDB
     from tests.fakes.runtime_owner import begin_runtime_epoch
-||||||| dff103e05878
-    from hermes_state import SessionDB
-    from hermes_state_runtime import begin_runtime_epoch
-=======
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
     launch = tmp_path / ".hermes"
     beta = launch / "profiles" / "beta"
@@ -39,11 +32,11 @@ def two_profiles(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_HOME", str(launch))
     registry = SessionAuthorities(launch, multiplexed=True)
     runner = SimpleNamespace(_draining=False, session_authorities=registry)
-    authorities = {}
+    authorities, dbs = {}, {}
     for name, home in (("default", launch), ("beta", beta)):
-        store = storage_handle(home)
-        authorities[name] = SessionAuthority(runner, profile_id=str(home), instance_id="ticket-profile", persistence=store,
-                                             epoch=store.runtime.begin_epoch(instance_id="ticket-profile"))
+        db = dbs[name] = SessionDB(home / "state.db")
+        authorities[name] = SessionAuthority(runner, profile_id=str(home), instance_id="ticket-profile", db=db,
+                                             epoch=begin_runtime_epoch(db, instance_id="ticket-profile"))
         registry.add(home, authorities[name], name=name)
     runner.session_authority = authorities["default"]
     monkeypatch.setattr(server.app.state, "session_authority", authorities["default"], raising=False)
@@ -52,7 +45,11 @@ def two_profiles(monkeypatch, tmp_path):
     monkeypatch.setattr(server.app.state, "bound_host", "127.0.0.1", raising=False)
     monkeypatch.setattr(server, "_SESSION_TOKEN", _TOKEN)
     monkeypatch.setattr(server, "_DASHBOARD_EMBEDDED_CHAT_ENABLED", True)
-    yield TestClient(server.app, base_url="http://127.0.0.1"), {"default": launch, "beta": beta}
+    try:
+        yield TestClient(server.app, base_url="http://127.0.0.1"), {"default": launch, "beta": beta}
+    finally:
+        for db in dbs.values():
+            db.close()
 
 
 def _ask(client, method, params, profile=None):

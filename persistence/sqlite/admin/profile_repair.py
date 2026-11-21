@@ -1,35 +1,48 @@
-"""ProfileRepairAdmin on one SQLite state.db.
+"""Crossed-profile durable state in ONE ``state.db`` — finders and fixers for
+``hermes sessions repair-profiles`` (#88715 PR-6).
 
-Every ``state.db`` belongs to exactly one profile (``<root>/state.db`` is ``default``,
-``<root>/profiles/<name>/state.db`` is ``name``) and every gateway session key encodes the profile
-that owns the conversation (``agent:main:...`` for the default, ``agent:<name>:...`` for a named one).
-The finders name each row whose identity disagrees with itself or with this store; the fixers settle it.
+Every ``state.db`` belongs to exactly one profile (``<root>/state.db`` → ``default``,
+``<root>/profiles/<name>/state.db`` → ``name``) and every gateway session key encodes the profile
+that owns the conversation (``agent:main:…`` for the default, ``agent:<name>:…`` for a named one).
+The per-profile store model (#88734) is forward-only: it routes NEW writes to the right store but
+never touched rows that had already landed in the wrong one, and the identity fences
+(``_INHERIT_PARENT_META_SQL``, ``_recovered_row_allowed_for_active_profile``) only refuse to
+*widen* damage that already exists. This module is the backward-looking half: it names each crossed
+row and can settle it.
 
-Moving a session between two stores is two single-store transactions, copy into the target, then
-delete from the source, because a crash between them leaves a *duplicate*, which the next run
+Store-level only. Which profiles exist, which store owns which home, whether a live gateway holds the
+routing index in memory, and the JSON files outside ``state.db`` are the orchestrator's concern
+(``hermes_cli/sessions_repair_profiles.py``).
+
+Moving a session between two stores is two single-store transactions — copy into the target, then
+delete from the source — because a crash between them leaves a *duplicate*, which the next run
 settles idempotently (:meth:`import_moved_session` reports ``present``; the delete only proceeds when
 the target holds at least as many messages). The reverse order would lose the row.
-
-A read-only handle never creates a file: when its ``state.db`` does not exist every read answers
-empty (no rows, no messages, no payload) without opening anything.
 """
-
 from __future__ import annotations
 
-from typing import Any, Iterable, Literal, Mapping, Optional
+import logging
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
-from persistence.sqlite._state.common import _id_chunks, _placeholders as _session_ids_placeholders
-from persistence import SessionLedgered
-from persistence.conversation.sessions import MAX_TITLE_LENGTH
-from persistence.core.keys import session_key_profile
-from session_retention import emit_session_deleted
-from session_rules.route_entries import _session_key_namespace
+from hermes_state_common import (
+    _id_chunks,
+    _placeholders as _session_ids_placeholders,
+    emit_session_deleted,
+)
 
-from .._holder import StoreHolder
-from ..conversation._store.core import _delete_unreferenced_system_prompts
-from ._base import AdminFile
+logger = logging.getLogger(__name__)
 
-__all__ = ["SQLiteProfileRepairAdmin"]
+
+def session_key_profile(session_key: Any) -> Optional[str]:
+    """Profile encoded in an ``agent:<ns>:…`` gateway key (``default`` for ``main``), or None for a
+    keyless row (CLI/subagent lineage) or a key another producer minted (hosted rooms, tests)."""
+    if not isinstance(session_key, str):
+        return None
+    parts = session_key.split(":")
+    if len(parts) < 3 or parts[0] != "agent" or not parts[1]:
+        return None
+    from hermes_state_keys import profile_from_session_key_namespace
+    return profile_from_session_key_namespace(parts[1])
 
 
 def _stored_profile(value: Any) -> Optional[str]:
@@ -43,66 +56,41 @@ def _table_columns(conn, table: str) -> list[str]:
 
 
 # Columns a moved message must NOT carry over verbatim: ``id`` is reassigned by the target's
-# AUTOINCREMENT and ``display_order`` points at a message id of the SOURCE store; left NULL, the
+# AUTOINCREMENT and ``display_order`` points at a message id of the SOURCE store — left NULL, the
 # ``messages_display_order_insert`` trigger recomputes it from ``display_identity`` (a content hash,
 # store-independent) or the new id.
 _MESSAGE_MOVE_SKIP = frozenset({"id", "display_order"})
 
 
-def _ledgered_session_ids(holder: StoreHolder) -> set[str]:
-    """Sessions the gateway's durable ledger references (``session_admissions`` /
-    ``worker_executions``, both ``ON DELETE RESTRICT``). A move copies only the transcript, so
-    such a row could never leave the source: report it instead of copying it. A store whose
-    schema predates the ledger has none."""
-    def _read(conn):
-        tables = {row[0] for row in conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' "
-            "AND name IN ('session_admissions', 'worker_executions')")}
-        ids: set[str] = set()
-        if "session_admissions" in tables:
-            ids.update(r[0] for r in conn.execute("SELECT DISTINCT target_session_id FROM session_admissions"))
-        if "worker_executions" in tables:
-            ids.update(r[0] for r in conn.execute("SELECT DISTINCT session_id FROM worker_executions"))
-        return ids
-    return holder._read_retrying_ioerr(_read)
+class SessionLedgeredError(RuntimeError):
+    """A session with gateway admission/worker history cannot be moved between stores."""
+
+    def __init__(self, session_id: str) -> None:
+        super().__init__(f"{session_id} has gateway admission/worker history; not moved")
 
 
-def _insert_row(conn, table: str, values: dict[str, Any], *, skip: frozenset) -> None:
-    columns = [c for c in _table_columns(conn, table) if c in values and c not in skip]
-    conn.execute(
-        f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
-        [values[c] for c in columns])
-
-
-class SQLiteProfileRepairAdmin(AdminFile):
+class SessionProfileRepairMixin:
     """Per-store crossed-profile identity: find, relabel, sever, move, and settle routing/topic rows."""
 
-    def _absent(self) -> bool:
-        """A read-only handle on a file that does not exist: reads answer empty, nothing is opened."""
-        return self.read_only and not self.db_path.exists()
-
-    # finders
+    # ── finders ────────────────────────────────────────────────────────────────
 
     def find_crossed_profile_sessions(self, owner: str) -> dict[str, list[dict[str, Any]]]:
         """Keyed session rows whose identity disagrees with itself or with this store.
 
         ``mislabelled``: ``profile_name`` names a profile other than the one in the row's own key
         (the key is what routing, the agent cache and ``_db_for_key`` consult; the label is stamped
-        after the fact). ``foreign``: the key's profile is not *owner*, so the row sits in a store that
+        after the fact). ``foreign``: the key's profile is not *owner* — the row sits in a store that
         the routed profile never reads. ``crossed_parents``: child and parent are both keyed and name
         different profiles, so the NULL-fill inheritance fence would have been the only thing standing
         between them. A row can appear in more than one list.
         """
+        rows = self._read_all(
+            "SELECT s.id, s.session_key, s.profile_name, s.parent_session_id, s.message_count, "
+            "       p.session_key AS parent_session_key "
+            "FROM sessions s LEFT JOIN sessions p ON p.id = s.parent_session_id "
+            "WHERE s.session_key LIKE 'agent:%' ORDER BY s.started_at, s.id")
+        ledgered = self._ledgered_session_ids()
         found: dict[str, list[dict[str, Any]]] = {"mislabelled": [], "foreign": [], "crossed_parents": []}
-        if self._absent():
-            return found
-        with self._reader() as holder:
-            rows = holder._read_all(
-                "SELECT s.id, s.session_key, s.profile_name, s.parent_session_id, s.message_count, "
-                "       p.session_key AS parent_session_key "
-                "FROM sessions s LEFT JOIN sessions p ON p.id = s.parent_session_id "
-                "WHERE s.session_key LIKE 'agent:%' ORDER BY s.started_at, s.id")
-            ledgered = _ledgered_session_ids(holder)
         for row in rows:
             key_profile = session_key_profile(row["session_key"])
             if key_profile is None:
@@ -124,21 +112,32 @@ class SQLiteProfileRepairAdmin(AdminFile):
                     "parent_session_id": row["parent_session_id"], "parent_profile": parent_profile})
         return found
 
+    def _ledgered_session_ids(self) -> set[str]:
+        """Sessions the gateway's durable ledger references (``session_admissions`` /
+        ``worker_executions``, both ``ON DELETE RESTRICT``). A move copies only the transcript, so
+        such a row could never leave the source: report it instead of copying it. A store whose
+        schema predates the ledger has none."""
+        def _read(conn):
+            tables = {row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' "
+                "AND name IN ('session_admissions', 'worker_executions')")}
+            ids: set[str] = set()
+            if "session_admissions" in tables:
+                ids.update(r[0] for r in conn.execute("SELECT DISTINCT target_session_id FROM session_admissions"))
+            if "worker_executions" in tables:
+                ids.update(r[0] for r in conn.execute("SELECT DISTINCT session_id FROM worker_executions"))
+            return ids
+        return self._read_retrying_ioerr(_read)
+
     def list_gateway_routing_rows(self) -> list[dict[str, Any]]:
-        if self._absent():
-            return []
-        with self._reader() as holder:
-            return [dict(row) for row in holder._read_all(
-                "SELECT scope, session_key, entry_json, updated_at FROM gateway_routing "
-                "ORDER BY scope, session_key")]
+        return [dict(row) for row in self._read_all(
+            "SELECT scope, session_key, entry_json, updated_at FROM gateway_routing "
+            "ORDER BY scope, session_key")]
 
     def find_profile_less_telegram_topic_rows(self) -> list[dict[str, Any]]:
         """``telegram_dm_topic_bindings`` rows labelled ``default`` whose ``session_key`` names a named
-        profile: written by a multiplexer that had not yet learned to stamp the routed profile.
-        Stores whose topic tables predate ``profile_name`` have nothing to relabel."""
-        if self._absent():
-            return []
-
+        profile: written by a multiplexer that had not yet learned to stamp the routed profile
+        (#76423). Stores whose topic tables predate ``profile_name`` have nothing to relabel."""
         def _read(conn):
             existing = {row[0] for row in conn.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name = 'telegram_dm_topic_bindings'")}
@@ -148,22 +147,17 @@ class SQLiteProfileRepairAdmin(AdminFile):
                 "SELECT chat_id, thread_id, session_key FROM telegram_dm_topic_bindings "
                 "WHERE profile_name = 'default' ORDER BY chat_id, thread_id")]
         out = []
-        with self._reader() as holder:
-            rows = holder._read_retrying_ioerr(_read)
-        for row in rows:
+        for row in self._read_retrying_ioerr(_read):
             key_profile = session_key_profile(row["session_key"])
             if key_profile not in (None, "default"):
                 out.append({**row, "key_profile": key_profile})
         return out
 
     def count_messages_all(self, session_id: str) -> int:
-        if self._absent():
-            return 0
-        with self._reader() as holder:
-            row = holder._read_one("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,))
+        row = self._read_one("SELECT COUNT(*) FROM messages WHERE session_id = ?", (session_id,))
         return int(row[0]) if row else 0
 
-    # in-store fixers
+    # ── in-store fixers ───────────────────────────────────────────────────────
 
     def relabel_sessions_to_key_profile(self, ids: Iterable[str]) -> int:
         """Set ``profile_name`` to the profile in each row's own key. Re-derives the target inside the
@@ -186,18 +180,11 @@ class SQLiteProfileRepairAdmin(AdminFile):
                         "UPDATE sessions SET profile_name = ? WHERE id = ? AND profile_name IS NOT ?",
                         (target, session_id, target)).rowcount
             return changed
-<<<<<<< HEAD:hermes_state_profile_repair.py
         return self._execute_write(_do, session_ids=(ids,), skip_result=0)
-||||||| dff103e05878:hermes_state_profile_repair.py
-        return self._execute_write(_do)
-=======
-        with self._writer("relabel_sessions_to_key_profile") as holder:
-            return holder._execute_write(_do)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/admin/profile_repair.py
 
     def sever_crossed_parents(self, ids: Iterable[str]) -> int:
         """Detach children from a parent keyed under another profile. Only ``parent_session_id`` is
-        cleared (``profile_name`` stays the row's own, relabelled separately when it is wrong), and
+        cleared — ``profile_name`` stays the row's own (relabelled separately when it is wrong) — and
         only while the crossing still holds."""
         wanted = list(ids)
         if not wanted:
@@ -216,25 +203,14 @@ class SQLiteProfileRepairAdmin(AdminFile):
                         severed += conn.execute(
                             "UPDATE sessions SET parent_session_id = NULL WHERE id = ?", (session_id,)).rowcount
             return severed
-<<<<<<< HEAD:hermes_state_profile_repair.py
         return self._execute_write(_do, session_ids=(ids,), skip_result=0)
-||||||| dff103e05878:hermes_state_profile_repair.py
-        return self._execute_write(_do)
-=======
-        with self._writer("sever_crossed_parents") as holder:
-            return holder._execute_write(_do)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/admin/profile_repair.py
 
-    # cross-store move
+    # ── cross-store move ──────────────────────────────────────────────────────
 
-    def export_session_for_move(self, session_id: str) -> dict[str, Any] | None:
+    def export_session_for_move(self, session_id: str) -> Optional[dict[str, Any]]:
         """Everything the target store needs to hold *session_id* as its own: the row (every column),
-        the resolved system prompt, EVERY message row (inactive and compacted generations included;
-        a move is not an export) and its usage rows. ``SessionLedgered`` when the gateway's ledger
-        references the session."""
-        if self._absent():
-            return None
-
+        the resolved system prompt, EVERY message row (inactive and compacted generations included —
+        a move is not an export) and its usage rows."""
         def _read(conn):
             session = conn.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
             if session is None:
@@ -251,25 +227,21 @@ class SQLiteProfileRepairAdmin(AdminFile):
                 "SELECT * FROM session_model_usage WHERE session_id = ?", (session_id,))]
             return {"session": dict(session), "system_prompt": prompt, "tool_pin": tool_pin, "messages": messages,
                     "usage": usage}
-        with self._reader() as holder:
-            payload = holder._read_retrying_ioerr(_read)
-            ledgered = payload is not None and session_id in _ledgered_session_ids(holder)
-        if ledgered:
+        payload = self._read_retrying_ioerr(_read)
+        if payload is not None and session_id in self._ledgered_session_ids():
             # Re-checked at apply time: the scan may predate a turn, and copying first would leave
             # the session in both stores once the ledger's RESTRICT FK refuses the source delete.
-            raise SessionLedgered(session_id)
+            raise SessionLedgeredError(session_id)
         return payload
 
-    def import_moved_session(
-        self, payload: Mapping[str, Any], *, profile_name: str,
-    ) -> Literal["present", "imported"]:
+    def import_moved_session(self, payload: dict[str, Any], *, profile_name: str) -> str:
         """Insert a moved session into THIS store as *profile_name*'s. ``present`` when the id already
         exists (an earlier run copied but did not delete), else ``imported``. The parent link survives
-        only when the parent is already here: a moved row must never point across stores or at a
+        only when the parent is already here — a moved row must never point across stores or at a
         row of another profile. Columns the target schema lacks are dropped, never invented. Titles
         are unique per store only, so a title an unrelated row here already holds gets the moved
-        row's id tail; the resident row keeps its name, since it is the one this profile's clients
-        resolve by title."""
+        row's id tail (the :meth:`import_foreign_history` convention); the resident row keeps its
+        name, since it is the one this profile's clients resolve by title."""
         session = dict(payload["session"])
         session_id = session["id"]
 
@@ -283,30 +255,30 @@ class SQLiteProfileRepairAdmin(AdminFile):
             title = session.get("title")
             if title is not None and conn.execute("SELECT 1 FROM sessions WHERE title = ?", (title,)).fetchone():
                 suffix = f" ({session_id[-12:]})"
-                session["title"] = title[:MAX_TITLE_LENGTH - len(suffix)] + suffix
-            session["system_prompt_hash"] = StoreHolder._store_system_prompt(conn, payload.get("system_prompt"))
+                session["title"] = title[:self.MAX_TITLE_LENGTH - len(suffix)] + suffix
+            session["system_prompt_hash"] = self._store_system_prompt(conn, payload.get("system_prompt"))
             if payload.get("tool_pin") is not None or len(session.get("tool_names") or "") == 64:
                 # A pin hash means nothing in this store: re-store the pin, or drop an unresolvable ref.
-                session["tool_names"] = StoreHolder._store_system_prompt(conn, payload.get("tool_pin"))
-            _insert_row(conn, "sessions", session, skip=frozenset())
+                session["tool_names"] = self._store_system_prompt(conn, payload.get("tool_pin"))
+            self._insert_row(conn, "sessions", session, skip=frozenset())
             for message in payload.get("messages") or []:
-                _insert_row(conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
+                self._insert_row(conn, "messages", {**message, "session_id": session_id}, skip=_MESSAGE_MOVE_SKIP)
             for usage in payload.get("usage") or []:
-                _insert_row(conn, "session_model_usage", {**usage, "session_id": session_id}, skip=frozenset())
+                self._insert_row(conn, "session_model_usage", {**usage, "session_id": session_id}, skip=frozenset())
             return "imported"
-<<<<<<< HEAD:hermes_state_profile_repair.py
         return self._execute_write(_do, session_ids=(payload,), skip_result='')
-||||||| dff103e05878:hermes_state_profile_repair.py
-        return self._execute_write(_do)
-=======
-        with self._writer("import_moved_session") as holder:
-            return holder._execute_write(_do)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/admin/profile_repair.py
+
+    @staticmethod
+    def _insert_row(conn, table: str, values: dict[str, Any], *, skip: frozenset) -> None:
+        columns = [c for c in _table_columns(conn, table) if c in values and c not in skip]
+        conn.execute(
+            f"INSERT INTO {table} ({', '.join(columns)}) VALUES ({', '.join('?' for _ in columns)})",
+            [values[c] for c in columns])
 
     def delete_moved_session(self, session_id: str) -> bool:
         """Remove a session this store no longer owns after the target confirmed it. Children left
-        behind are detached (the same FK rule as a session delete); topic bindings on the row
-        cascade with it. Fires ``on_session_delete`` (``reason="profile_repair"``) after the commit."""
+        behind are detached (same FK rule as :meth:`delete_session`); topic bindings on the row
+        cascade with it."""
         def _do(conn) -> bool:
             if conn.execute("SELECT 1 FROM sessions WHERE id = ?", (session_id,)).fetchone() is None:
                 return False
@@ -314,30 +286,20 @@ class SQLiteProfileRepairAdmin(AdminFile):
             conn.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM session_model_usage WHERE session_id = ?", (session_id,))
             conn.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
-            _delete_unreferenced_system_prompts(conn)
+            self._delete_unreferenced_system_prompts(conn)
             return True
-<<<<<<< HEAD:hermes_state_profile_repair.py
         deleted = self._execute_write(_do, session_ids=(session_id,), skip_result=False)
         if deleted:
             emit_session_deleted(self, [session_id], reason="profile_repair")
-||||||| dff103e05878:hermes_state_profile_repair.py
-        deleted = self._execute_write(_do)
-        if deleted:
-            emit_session_deleted(self, [session_id], reason="profile_repair")
-=======
-        with self._writer("delete_moved_session") as holder:
-            deleted = holder._execute_write(_do)
-            if deleted:
-                emit_session_deleted(self.db_path.parent, [session_id], reason="profile_repair")
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/admin/profile_repair.py
         return bool(deleted)
 
-    # routing index
+    # ── routing index ─────────────────────────────────────────────────────────
 
     def rekey_legacy_main_sessions(self, ids: Iterable[str], profile: str) -> int:
-        """``agent:main:...`` to ``agent:<profile>:...`` (+ ``profile_name``) for rows a standalone
-        gateway wrote before this store's profile was multiplexed. Only rows still under the legacy
-        namespace change; a ``main``-named profile is written in its marked form."""
+        """``agent:main:…`` → ``agent:<profile>:…`` (+ ``profile_name``) for rows a standalone
+        gateway wrote before this store's profile was multiplexed (#113884). Only rows still under
+        the legacy namespace change; a ``main``-named profile is written in its marked form."""
+        from gateway.session import _session_key_namespace
         wanted = list(ids)
         if not wanted:
             return 0
@@ -351,14 +313,7 @@ class SQLiteProfileRepairAdmin(AdminFile):
                     f"WHERE id IN ({_session_ids_placeholders(chunk)}) AND substr(session_key, 1, 11) = 'agent:main:'",
                     (new_ns, profile, *chunk)).rowcount
             return changed
-<<<<<<< HEAD:hermes_state_profile_repair.py
         return self._execute_write(_do, session_ids=(ids,), skip_result=0)
-||||||| dff103e05878:hermes_state_profile_repair.py
-        return self._execute_write(_do)
-=======
-        with self._writer("rekey_legacy_main_sessions") as holder:
-            return holder._execute_write(_do)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/admin/profile_repair.py
 
     def delete_gateway_routing_rows(self, rows: Iterable[tuple[str, str]]) -> int:
         wanted = list(rows)
@@ -369,18 +324,11 @@ class SQLiteProfileRepairAdmin(AdminFile):
             return sum(conn.execute(
                 "DELETE FROM gateway_routing WHERE scope = ? AND session_key = ?", (scope, key)).rowcount
                 for scope, key in wanted)
-<<<<<<< HEAD:hermes_state_profile_repair.py
         return self._execute_write(_do, session_ids=(rows,), skip_result=0)
-||||||| dff103e05878:hermes_state_profile_repair.py
-        return self._execute_write(_do)
-=======
-        with self._writer("delete_gateway_routing_rows") as holder:
-            return holder._execute_write(_do)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/admin/profile_repair.py
 
     def insert_gateway_routing_rows_if_absent(self, rows: Iterable[tuple[str, str, str, float]]) -> int:
         """Adopt ``(scope, session_key, entry_json, updated_at)`` rows another store held for this
-        one's routing index. An existing key wins: the row the gateway actually loads stays."""
+        one's routing index. An existing key wins — the row the gateway actually loads stays."""
         wanted = list(rows)
         if not wanted:
             return 0
@@ -389,18 +337,11 @@ class SQLiteProfileRepairAdmin(AdminFile):
             return sum(conn.execute(
                 "INSERT OR IGNORE INTO gateway_routing (scope, session_key, entry_json, updated_at) "
                 "VALUES (?, ?, ?, ?)", row).rowcount for row in wanted)
-<<<<<<< HEAD:hermes_state_profile_repair.py
         return self._execute_write(_do, session_ids=(rows,), skip_result=0)
-||||||| dff103e05878:hermes_state_profile_repair.py
-        return self._execute_write(_do)
-=======
-        with self._writer("insert_gateway_routing_rows_if_absent") as holder:
-            return holder._execute_write(_do)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/admin/profile_repair.py
 
-    # telegram topic tables
+    # ── telegram topic tables ─────────────────────────────────────────────────
 
-    def relabel_telegram_topic_rows(self, rows: Iterable[Mapping[str, Any]]) -> dict[str, int]:
+    def relabel_telegram_topic_rows(self, rows: Iterable[dict[str, Any]]) -> dict[str, int]:
         """Stamp the key's profile onto ``default``-labelled bindings (and the chat's mode row when
         only the default one exists). A binding that would collide with one the named profile already
         wrote is the stale duplicate and is removed."""
@@ -434,24 +375,14 @@ class SQLiteProfileRepairAdmin(AdminFile):
                         "UPDATE telegram_dm_topic_mode SET profile_name = ? WHERE profile_name = 'default' "
                         "AND chat_id = ?", (target, chat_id)).rowcount
             return counts
-<<<<<<< HEAD:hermes_state_profile_repair.py
         return self._execute_write(_do, session_ids=(rows,), skip_result={})
-||||||| dff103e05878:hermes_state_profile_repair.py
-        return self._execute_write(_do)
-=======
-        with self._writer("relabel_telegram_topic_rows") as holder:
-            return holder._execute_write(_do)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca:persistence/sqlite/admin/profile_repair.py
 
-    # evidence for JSON-file repairs
+    # ── evidence for JSON-file repairs ────────────────────────────────────────
 
     def key_profiles_for_chat(self, platform: str, chat_id: str) -> set[str]:
-        """Profiles whose keyed sessions hold *(platform, chat_id)* in this store: the evidence for
+        """Profiles whose keyed sessions hold *(platform, chat_id)* in this store — the evidence for
         who owns a profile-less ``gateway_voice_mode.json`` entry."""
-        if self._absent():
-            return set()
-        with self._reader() as holder:
-            rows = holder._read_all(
-                "SELECT DISTINCT session_key FROM sessions WHERE source = ? AND chat_id = ? "
-                "AND session_key LIKE 'agent:%'", (platform, str(chat_id)))
+        rows = self._read_all(
+            "SELECT DISTINCT session_key FROM sessions WHERE source = ? AND chat_id = ? "
+            "AND session_key LIKE 'agent:%'", (platform, str(chat_id)))
         return {p for p in (session_key_profile(r["session_key"]) for r in rows) if p is not None}

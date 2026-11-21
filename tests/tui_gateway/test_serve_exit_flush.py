@@ -22,7 +22,6 @@ import time
 import pytest
 
 from tests.waiting import kill_if_alive, process_children, process_cmdline, process_name
-from tests.process_scan import children_matching
 
 from tui_gateway import server
 
@@ -72,13 +71,11 @@ def test_sigterm_flushes_populated_session_into_state_db(
 ):
     """A populated in-memory session survives a SIGTERM into state.db."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-    from persistence_assembly import open_persistence, profile_scope
-    from tests.fixtures.storage_read import transcript_rows
-    from tests.fixtures.storage_seed import seed_messages, seed_session
+    from hermes_state import SessionDB
 
-    db = open_persistence(profile_scope(home=tmp_path))
+    db = SessionDB(db_path=tmp_path / "state.db")
     sid = "sess-sigterm-flush"
-    seed_session(db, sid, "tui")
+    db.create_session(sid, source="tui")
 
     class _DbAgent(_FlushAgent):
         def _persist_session(self, messages, conversation_history=None):
@@ -86,7 +83,7 @@ def test_sigterm_flushes_populated_session_into_state_db(
             for msg in messages:
                 if msg.get("_db_persisted"):
                     continue
-                seed_messages(db, sid, {"role": msg["role"], "content": msg["content"]})
+                db.append_message(sid, msg["role"], msg["content"])
                 msg["_db_persisted"] = True
 
     agent = _DbAgent(messages=[{"role": "user", "content": "survive the kill"}])
@@ -111,7 +108,7 @@ def test_sigterm_flushes_populated_session_into_state_db(
 
     assert chained["called"], "previous SIGTERM handler must still be chained"
     assert agent.flush_calls, "SIGTERM must flush in-memory sessions"
-    rows = transcript_rows(db, sid)
+    rows = db.get_messages(sid)
     assert any("survive the kill" in str(r.get("content", "")) for r in rows)
     db.close()
 
@@ -210,16 +207,8 @@ def test_shutdown_mid_tool_kills_the_command_and_keeps_its_result(monkeypatch):
     deadline = time.monotonic() + 20.0
     sleeper = None
     while sleeper is None and time.monotonic() < deadline:
-<<<<<<< HEAD
-        sleeper = next(iter(children_matching((p for p in process_children(os.getpid())
-                        if process_name(p) == "sleep" and "3518" in " ".join(process_cmdline(p) or [])), None)), None)
-||||||| dff103e05878
-        sleeper = next(iter(children_matching((p for p in psutil.Process().children(recursive=True)
-                        if p.name() == "sleep" and "3518" in " ".join(p.cmdline())), None)), None)
-=======
-        sleeper = next(iter(children_matching(
-            os.getpid(), lambda p: p.name() == "sleep" and "3518" in " ".join(p.cmdline()), recursive=True)), None)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
+        sleeper = next((p for p in process_children(os.getpid())
+                        if process_name(p) == "sleep" and "3518" in " ".join(process_cmdline(p) or [])), None)
         time.sleep(0.05)
     assert sleeper is not None, "test setup: foreground sleep never started"
 
@@ -266,16 +255,8 @@ def test_sigterm_grace_hard_exit_kills_a_sigterm_ignoring_command(monkeypatch):
     deadline = time.monotonic() + 20.0
     sleeper = None
     while sleeper is None and time.monotonic() < deadline:
-<<<<<<< HEAD
-        sleeper = next(iter(children_matching((p for p in process_children(os.getpid())
-                        if process_name(p) == "sleep" and "3522" in " ".join(process_cmdline(p) or [])), None)), None)
-||||||| dff103e05878
-        sleeper = next(iter(children_matching((p for p in psutil.Process().children(recursive=True)
-                        if p.name() == "sleep" and "3522" in " ".join(p.cmdline())), None)), None)
-=======
-        sleeper = next(iter(children_matching(
-            os.getpid(), lambda p: p.name() == "sleep" and "3522" in " ".join(p.cmdline()), recursive=True)), None)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
+        sleeper = next((p for p in process_children(os.getpid())
+                        if process_name(p) == "sleep" and "3522" in " ".join(process_cmdline(p) or [])), None)
         time.sleep(0.05)
     assert sleeper is not None, "test setup: foreground sleep never started"
     exits: list = []

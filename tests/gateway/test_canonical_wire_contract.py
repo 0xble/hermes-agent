@@ -6,26 +6,18 @@ import pytest
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_controls import AuthorityConnection
 from gateway.session_group_controls import GROUP_METHODS
-<<<<<<< HEAD
 from hermes_state import SessionDB
 from tests.fakes.runtime_owner import begin_runtime_epoch
-||||||| dff103e05878
-from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
-=======
-from persistence_assembly import open_persistence, profile_scope
-from tests.fixtures.storage_seed import seed_session
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 from tui_gateway.contracts.registry import CANONICAL_METHODS, METHODS
 
 
 @pytest.fixture
 def owner(tmp_path):
-    with open_persistence(profile_scope(home=tmp_path)) as db:
-        seed_session(db, 's', 'test')
-        epoch = db.runtime.begin_epoch(instance_id='current')
+    with SessionDB(db_path=tmp_path / 'state.db') as db:
+        db.create_session('s', source='test')
+        epoch = begin_runtime_epoch(db, instance_id='current')
         authority = SessionAuthority(SimpleNamespace(_draining=False), profile_id='owned',
-                                     instance_id='current', epoch=epoch, persistence=db)
+                                     instance_id='current', db=db, epoch=epoch)
         authority.sessions['s'] = LiveSession(None, 'route')
         yield AuthorityConnection(authority, object(), {'user_id': 'owner'}), db
 
@@ -45,7 +37,7 @@ async def test_declared_params_gate_canonical_verbs_before_their_handlers(owner)
     """An unknown or missing key is ``4001 invalid_params`` naming the field, including verbs
     whose handlers only ``.get`` their keys; a well-formed call is unaffected."""
     connection, db = owner
-    revision = db.sessions.get('s').runtime_revision
+    revision = db.get_session('s')['runtime_revision']
     mutate = {'session_id': 's', 'request_id': 'r1', 'expected_revision': revision,
               'operation': 'rename', 'payload': {'title': 'Declared'}}
     try:
@@ -59,6 +51,6 @@ async def test_declared_params_gate_canonical_verbs_before_their_handlers(owner)
             assert field in response['error']['data']['fields'], (method, response)
         applied = await connection.dispatch({'id': 2, 'method': 'session.mutate', 'params': mutate})
         CANONICAL_METHODS['session.mutate'].result.model_validate(applied['result'])
-        assert db.sessions.get('s').title == 'Declared'
+        assert db.get_session('s')['title'] == 'Declared'
     finally:
         await connection.close()

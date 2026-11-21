@@ -29,30 +29,18 @@ _HOLDER = (
 
 @pytest.fixture
 def state_db(monkeypatch, tmp_path):
-    from persistence_assembly import open_persistence, profile_scope
-    from tests.fixtures.storage_seed import seed_messages, seed_session
+    from hermes_state import SessionDB
 
     db_path = tmp_path / "state.db"
     # cmd_sessions opens the ACTIVE home's store by explicit path (a served-profile process has
-    # no single default store), so the home is the seam.
+    # no single default store), so the home is the seam, not hermes_state's default resolver.
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-<<<<<<< HEAD
     # The holder gate, not the wall-clock deletion window (tests/hermes_cli/test_sessions_prune_window.py).
     monkeypatch.setattr("hermes_cli.maintenance_window.deletion_window_open", lambda: True)
     seed = SessionDB(db_path=db_path)
     seed.create_session("seed", "cli")
     seed.append_message("seed", "user", "hello")
     seed.close()
-||||||| dff103e05878
-    seed = SessionDB(db_path=db_path)
-    seed.create_session("seed", "cli")
-    seed.append_message("seed", "user", "hello")
-    seed.close()
-=======
-    with open_persistence(profile_scope(home=tmp_path)) as seed:
-        seed_session(seed, "seed", "cli")
-        seed_messages(seed, "seed", {"role": "user", "content": "hello"})
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     return db_path
 
 

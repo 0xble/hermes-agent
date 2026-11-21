@@ -89,13 +89,7 @@ def _default_compression_int(key: str, fallback: int) -> int:
 # _parse_config_int, so null, booleans and garbage land on the default exactly as on a fresh build.
 _COMPRESSION_INT_KEYS = (
     ("proactive_prune_tokens", 0, 0, True),
-<<<<<<< HEAD
     ("proactive_prune_min_result_chars", 8000, 0, True),
-||||||| dff103e05878
-    ("proactive_prune_min_result_chars", 8000, 0),
-=======
-    ("proactive_prune_min_result_chars", 8000, 200),
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     ("proactive_prune_min_reclaim_tokens", 4096, 0, True),
     ("protect_last_n", 20, 0, False),
     ("min_tail_user_messages", 1, 1, True),
@@ -119,7 +113,6 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     enabled_raw = compression.get("enabled", True)
     agent.compression_enabled = enabled_raw if isinstance(enabled_raw, bool) else str(enabled_raw).lower() in {"true", "1", "yes"}
     agent.codex_responses_native_compaction = is_truthy_value(compression.get("codex_responses_native", False))
-    agent.compression_checkpoint_required = is_truthy_value(compression.get("checkpoint_required"), default=False)
     native_threshold_raw = compression.get("codex_responses_compact_threshold", 200_000)
     try:
         if isinstance(native_threshold_raw, bool) or (native_threshold := int(native_threshold_raw)) <= 0:
@@ -142,19 +135,11 @@ def _apply_live_compression_config(agent: Any, cfg: dict | None) -> None:
     for key, fallback, min_value, strict in _COMPRESSION_INT_KEYS:
         default = _default_compression_int(key, fallback)
         raw = compression.get(key, default)
-<<<<<<< HEAD
         if strict:
             setattr(cc, key, max(min_value, _parse_config_int(raw, default)))
             continue
-||||||| dff103e05878
-=======
-        if key.startswith("proactive_prune_") and raw is not None:
-            # agent_init's parser for these keys: a bool is never a count (YAML `true` is not a 1-token trigger).
-            from agent.agent_init import _parse_config_int
-            raw = _parse_config_int(raw, default)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         with contextlib.suppress(TypeError, ValueError):
-            setattr(cc, key, max(min_value, default if raw is None else int(raw or default) if key == "proactive_prune_min_result_chars" else int(raw)))
+            setattr(cc, key, max(min_value, default if raw is None else int(raw)))
     with contextlib.suppress(TypeError, ValueError):
         ratio_raw = compression.get("target_ratio", _compressor_ctor_default("summary_target_ratio", 0.20))
         cc.summary_target_ratio = max(0.10, min(float(ratio_raw), 0.80))
@@ -279,10 +264,6 @@ def _manual_compress_turn(sid: str, session: dict):
     with session["history_lock"]:
         if session.get("running"):
             raise CompressionBusy(busy_message("compress", bool(session.get("_manual_compress_active"))))
-        if session.get("_closing") or session.get("_finalized"):
-            # A queued job (cache-expiry) holding the dict of a chat closed meanwhile (``_pop_session_by_id``
-            # sets ``_closing`` as it unregisters it): never summarize or rewrite it.
-            raise CompressionBusy("session closed")
         _require_transcript_owner(session)  # the commit archives and rewrites the chat's transcript
         session["running"] = session["_manual_compress_active"] = True
         session.pop("_notif_turn_claim", None)
@@ -299,7 +280,7 @@ def _manual_compress_turn(sid: str, session: dict):
 
 def _compress_session_history(
     session: dict, focus_topic: str | None = None, approx_tokens: int | None = None,
-    before_messages: list | None = None, history_version: int | None = None, trigger: str | None = None,
+    before_messages: list | None = None, history_version: int | None = None,
 ) -> tuple[int, dict]:
     """Single choke point for all manual-compress routes. ``focus_topic`` is the RAW argument string after
     ``/compress``; the shared core (``agent.conversation_compression_manual``) parses boundary forms
@@ -328,7 +309,7 @@ def _compress_session_history(
 
     try:
         result = compress_now(agent, before_messages, request, task_id=session.get("session_key") or "default",
-                              snapshot_is_current=snapshot_is_current, trigger=trigger)
+                              snapshot_is_current=snapshot_is_current)
     finally:
         _clear_session_context(tokens)
     if result.status == "preview":

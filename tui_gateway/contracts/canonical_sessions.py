@@ -182,13 +182,7 @@ class CanonicalListParams(ProfileParams):
     title: str | None = None
     include_hidden: bool = False
     # Only conversations of this folder, judged on each conversation's first row by the classic CLI's
-<<<<<<< HEAD
     # ``hermes -c`` rule (``hermes_state_sessions_workspace.workspace_key``): its git repo root equals this, or
-||||||| dff103e05878
-    # ``hermes -c`` rule (``hermes_state_sessions.workspace_key``): its git repo root equals this, or
-=======
-    # ``hermes -c`` rule (``persistence.conversation.sessions.workspace_key``): its git repo root equals this, or
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     # (no root recorded) its cwd is this folder or under it. Pass the caller's repo root (else its cwd).
     workspace: str | None = None
     # Each row also carries the picker fields below (off by default: a live-list poll does not pay for them).

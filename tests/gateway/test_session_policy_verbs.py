@@ -11,8 +11,6 @@ from types import SimpleNamespace
 import pytest
 
 from tests.waiting import async_wait_until
-from tests.fixtures.storage_read import session_row
-from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 def _owner(tmp_path, monkeypatch, handle):
@@ -22,33 +20,20 @@ def _owner(tmp_path, monkeypatch, handle):
     from gateway.session_authority import SessionAuthority
     from gateway.session_controls import AuthorityConnection
     from gateway.session_local import create_local_session
-<<<<<<< HEAD
     import hermes_state_runtime as rt
 
     # The symbolic profile resolves relative to cwd; keep its home out of the checkout.
     monkeypatch.chdir(tmp_path)
-||||||| dff103e05878
-    import hermes_state_runtime as rt
-=======
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     monkeypatch.setattr(run, '_load_gateway_config', lambda *a: {})
     store = SessionStore(tmp_path / 'sessions', GatewayConfig())
-    db = store.persistence
+    db = store._db
     runner = SimpleNamespace(session_store=store, _session_db=db, adapters={}, _draining=False,
                              _evict_cached_agent=lambda route: None, _cached_agent_for=lambda route: None,
                              _set_session_reasoning_override=lambda route, value: None,
                              _handle_message=handle, _resolve_session_agent_runtime=lambda **k: ('frozen', {}))
     runner._adapter_for_source = lambda source: runner.adapters.get(source.platform)
-<<<<<<< HEAD
     authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
                                  epoch=_begin_owned_runtime_epoch(db, instance_id='owner'))
-||||||| dff103e05878
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', db=db,
-                                 epoch=rt.begin_runtime_epoch(db, instance_id='owner'))
-=======
-    authority = SessionAuthority(runner, profile_id='owned', instance_id='owner', persistence=storage_handle(db.scope.profile_dir),
-                                 epoch=db.runtime.begin_epoch(instance_id='owner'))
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     owner = AuthorityConnection(authority, object(), {'user_id': 'human'})
     start = tmp_path / 'project-a'
     start.mkdir()
@@ -58,7 +43,7 @@ def _owner(tmp_path, monkeypatch, handle):
 
 
 def _mutation(db, ref, request_id, operation, payload):
-    snap = session_row(db, ref.session_id)
+    snap = db.get_session(ref.session_id)
     return {'id': request_id, 'method': 'session.mutate', 'params': {
         'session_id': ref.session_id, 'request_id': request_id, 'operation': operation, 'payload': payload,
         'expected_revision': snap['runtime_revision'], 'expected_generation': snap['runtime_generation']}}
@@ -70,7 +55,7 @@ async def test_session_reasoning_mutation_is_the_next_turns_reasoning(tmp_path, 
     store, db, authority, owner, ref = _owner(tmp_path, monkeypatch, None)
     live = authority.sessions[ref.session_id]
     try:
-        before = session_row(db, ref.session_id)
+        before = db.get_session(ref.session_id)
         frozen_prompt = before['system_prompt']
         response = await owner.dispatch(_mutation(db, ref, 'r1', 'reasoning', {'effort': 'high'}))
         assert 'result' in response, response
@@ -79,12 +64,13 @@ async def test_session_reasoning_mutation_is_the_next_turns_reasoning(tmp_path, 
         assert policy_for_source(authority.runner, live.source).reasoning_config == {'enabled': True, 'effort': 'high'}
         info = await owner.dispatch({'id': 2, 'method': 'session.info', 'params': {'session_id': ref.session_id}})
         assert info['result']['reasoning_effort'] == 'high'
-        after = session_row(db, ref.session_id)
+        after = db.get_session(ref.session_id)
         assert after['runtime_revision'] > before['runtime_revision']
         assert after['runtime_generation'] == before['runtime_generation'] + 1
         assert after['system_prompt'] == frozen_prompt
         # Durable: a restarted owner restores the new level from the receipt.
-        assert json.loads(db.bindings.receipt(ref.session_id).policy['config_json'])['agent']['reasoning_effort'] == 'high'
+        from hermes_state_local import local_receipt
+        assert json.loads(local_receipt(db, ref.session_id)['policy']['config_json'])['agent']['reasoning_effort'] == 'high'
         bad = await owner.dispatch(_mutation(db, ref, 'r2', 'reasoning', {'effort': 'hgih'}))
         assert bad['error']['data']['reason'] == 'invalid_params'
     finally:
@@ -96,6 +82,8 @@ async def test_session_reasoning_mutation_is_the_next_turns_reasoning(tmp_path, 
 async def test_move_to_project_rehomes_the_policy_and_row_and_refuses_mid_turn(tmp_path, monkeypatch):
     from gateway.session_contract import Submission
     from gateway.session_policy import policy_for_source
+    from hermes_state_local import local_receipt
+    import hermes_state_runtime as rt
     started, release, seen = asyncio.Event(), asyncio.Event(), []
 
     async def handle(event):
@@ -111,21 +99,21 @@ async def test_move_to_project_rehomes_the_policy_and_row_and_refuses_mid_turn(t
         await asyncio.wait_for(started.wait(), 10)
         busy = await owner.dispatch(_mutation(db, ref, 'mv-busy', 'workspace', {'cwd': str(target)}))
         assert busy['error']['data']['reason'] == 'session_busy', busy
-        assert session_row(db, ref.session_id)['cwd'] == str(tmp_path / 'project-a')
+        assert db.get_session(ref.session_id)['cwd'] == str(tmp_path / 'project-a')
         release.set()
-        await async_wait_until(lambda: db.admissions.get(admission_id=queued.admission_id).status == 'terminal',
+        await async_wait_until(lambda: rt.get_session_admission(db, admission_id=queued.admission_id)['status'] == 'terminal',
                                what='turn-1 to settle')
         moved = await owner.dispatch(_mutation(db, ref, 'mv', 'workspace', {'cwd': str(target)}))
         assert moved['result']['cwd'] == str(target), moved
-        policy = db.bindings.receipt(ref.session_id).policy
+        policy = local_receipt(db, ref.session_id)['policy']
         assert policy['cwd'] == str(target) and json.loads(policy['terminal_json'])['TERMINAL_CWD'] == str(target)
-        assert session_row(db, ref.session_id)['cwd'] == str(target)
+        assert db.get_session(ref.session_id)['cwd'] == str(target)
         info = await owner.dispatch({'id': 3, 'method': 'session.info', 'params': {'session_id': ref.session_id}})
         assert info['result']['cwd'] == str(target)
         started.clear()
         second = await authority.submit(owner.actor, Submission('turn-2', ref, {'text': 'two'}, 'queue'))
         await asyncio.wait_for(started.wait(), 10)
-        await async_wait_until(lambda: db.admissions.get(admission_id=second.admission_id).status == 'terminal',
+        await async_wait_until(lambda: rt.get_session_admission(db, admission_id=second.admission_id)['status'] == 'terminal',
                                what='turn-2 to settle')
         assert seen == [str(tmp_path / 'project-a'), str(target)]
         missing = await owner.dispatch(_mutation(db, ref, 'mv-missing', 'workspace', {'cwd': str(tmp_path / 'nope')}))

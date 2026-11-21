@@ -12,7 +12,7 @@ the root on a child's behalf, and updates the root journal only for a root recon
 reports `child execution retired or superseded (stale_generation)` through the ordinary
 failed-delegation result. Closing the parent store cannot poison that verdict as `outbox_closed`.
 
-Contract tests: `tests/cron/test_detached_child_restart.py`, `tests/hermes_state/test_runtime_worker_children.py`.
+Contract tests: `tests/cron/test_detached_child_restart.py`, `tests/persistence_sqlite/workers/test_runtime_worker_children.py`.
 The detached-parent regression uses the real child store, receipt ledger, epoch retirement,
 and delegation runner with an in-process transport and a five-second Event deadline; it also
 covers a lost response and a parent store closing during the child's reconnect.

@@ -5254,19 +5254,11 @@ def _cmd_install(args):
     if is_managed():
         managed_error("install gateway service")
         return
-<<<<<<< HEAD
     # Installing/bootstrapping the legacy service beside a live withdrawn generation job would
     # start a second poller on the same bot token.
     _refuse_forward_only_leftovers()
     if getattr(args, "if_missing", False) and _is_service_installed():
         print("✓ Gateway service already installed")
-||||||| dff103e05878
-    if getattr(args, "if_missing", False) and _is_service_installed():
-        print("✓ Gateway service already installed")
-=======
-    from hermes_cli.gateway_setup_service import install_after_setup
-    if getattr(args, "if_missing", False) and not install_after_setup(args):
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         return
     force = getattr(args, "force", False)
     # `--force` doubles as the reinstall flag here; a served profile's unit would only ever exit 78.

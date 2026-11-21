@@ -20,7 +20,6 @@ from contextlib import nullcontext, suppress
 from contextvars import copy_context
 from gateway.bot_peer_notices import automatic_notices_allowed
 from gateway.config import Platform
-from storage_user_copy import error_type_name
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, _mark_notify_metadata
 from gateway.platforms.event import MessageEvent
@@ -49,10 +48,10 @@ logger = logging.getLogger("gateway.run")
 def _acp_launch(runner, source) -> bool:
     """An editor session: ACP shows no reasoning event yet, so its reply keeps the projected block."""
     from gateway.session_setting_commands import local_policy
-    from persistence.core.errors import AuthorityRefusal
+    from hermes_state_runtime import RuntimeStoreError
     try:
         return getattr(local_policy(runner, source), "source", None) == "acp"
-    except AuthorityRefusal:  # a local route with no restored policy is not an editor launch
+    except RuntimeStoreError:  # a local route with no restored policy is not an editor launch
         return False
 
 
@@ -462,104 +461,6 @@ class GatewayTurnPersistenceMixin:
             response = (response or "") + "\n\n" + t("gateway.compress.hygiene_failed")
         return response, session_entry
 
-<<<<<<< HEAD
-||||||| dff103e05878
-    def _hmwa_replay_exhausted_request(self, event, agent_result, session_entry, session_key, source):
-        """Re-run the request whose turn exhausted the context on the fresh session, once (#137565).
-
-        The reset drops the old transcript, and with it the user's request: nothing answered it. It
-        goes back in the head slot, ahead of any follow-up, so the adapter's post-handler drain runs
-        it on the fresh session after this turn's lease and active slot are released. Never twice (a
-        replay that exhausts again resets without another replay), never an internal event, and
-        never when the turn already acted (a tool ran) or showed the user output: a re-run would
-        repeat it. A voice note would re-run STT and its transcript echo, so it keeps the resend notice.
-        Nor when follow-ups already wait on the fresh session (re-homed by the reset): the re-run would
-        be admitted behind them and answer out of order, so the user, who has moved on, resends."""
-        if (event is None or event.internal
-                or agent_result.get("already_sent") or agent_result.get("response_previewed")
-                or self._pending_event_audio_paths(event)):
-            return
-        from gateway.session_ingress import executing_admission
-        if executing_admission.get() and not getattr(event, "_adapter_drains_after", False):
-            return  # an authority-run row no adapter task awaits: a parked retry would never run
-        from gateway.media_repair import _current_turn_messages
-        messages = agent_result.get("messages") or []
-        offset = agent_result.get("history_offset", 0) or 0
-        new_messages = _current_turn_messages(messages, offset)
-        if offset > len(messages) and not new_messages:
-            return  # compaction kept no user message to bound the turn: what ran is unknown, resend
-        if (any(m.get("role") in ("tool", "function") or m.get("tool_calls") for m in new_messages)
-                or self._hmwa_fresh_session_has_pending_input(session_entry)):
-            return
-        adapter = self._delivery_adapter_for(source)
-        persistent = self._session_state(session_key).persistent
-        identity = f"{event.message_id or ''}\0{event.text or ''}"  # the drain re-runs a copy of the event
-        if (adapter is None or not isinstance(getattr(adapter, "_pending_messages", None), dict)
-                or persistent.exhaustion_replayed == identity):
-            return
-        persistent.exhaustion_replayed = identity
-        self._requeue_event_at_front(session_key, event, adapter)
-        logger.info("Re-running the request of session %s's exhausted turn on its fresh session", session_key)
-
-    def _hmwa_fresh_session_has_pending_input(self, session_entry) -> bool:
-        """Whether the authority FIFO of the fresh session already holds an admitted input."""
-        from gateway.session_authorities import active_authority
-        from hermes_state_runtime import list_session_admissions
-        authority = active_authority(self)
-        if authority is None or session_entry is None:
-            return False
-        owner = authority.logical_owner(session_entry.session_id)
-        return bool(list_session_admissions(authority.db, session_id=owner))
-
-=======
-    def _hmwa_replay_exhausted_request(self, event, agent_result, session_entry, session_key, source):
-        """Re-run the request whose turn exhausted the context on the fresh session, once (#137565).
-
-        The reset drops the old transcript, and with it the user's request: nothing answered it. It
-        goes back in the head slot, ahead of any follow-up, so the adapter's post-handler drain runs
-        it on the fresh session after this turn's lease and active slot are released. Never twice (a
-        replay that exhausts again resets without another replay), never an internal event, and
-        never when the turn already acted (a tool ran) or showed the user output: a re-run would
-        repeat it. A voice note would re-run STT and its transcript echo, so it keeps the resend notice.
-        Nor when follow-ups already wait on the fresh session (re-homed by the reset): the re-run would
-        be admitted behind them and answer out of order, so the user, who has moved on, resends."""
-        if (event is None or event.internal
-                or agent_result.get("already_sent") or agent_result.get("response_previewed")
-                or self._pending_event_audio_paths(event)):
-            return
-        from gateway.session_ingress import executing_admission
-        if executing_admission.get() and not getattr(event, "_adapter_drains_after", False):
-            return  # an authority-run row no adapter task awaits: a parked retry would never run
-        from gateway.media_repair import _current_turn_messages
-        messages = agent_result.get("messages") or []
-        offset = agent_result.get("history_offset", 0) or 0
-        new_messages = _current_turn_messages(messages, offset)
-        if offset > len(messages) and not new_messages:
-            return  # compaction kept no user message to bound the turn: what ran is unknown, resend
-        if (any(m.get("role") in ("tool", "function") or m.get("tool_calls") for m in new_messages)
-                or self._hmwa_fresh_session_has_pending_input(session_entry)):
-            return
-        adapter = self._delivery_adapter_for(source)
-        persistent = self._session_state(session_key).persistent
-        identity = f"{event.message_id or ''}\0{event.text or ''}"  # the drain re-runs a copy of the event
-        if (adapter is None or not isinstance(getattr(adapter, "_pending_messages", None), dict)
-                or persistent.exhaustion_replayed == identity):
-            return
-        persistent.exhaustion_replayed = identity
-        self._requeue_event_at_front(session_key, event, adapter)
-        logger.info("Re-running the request of session %s's exhausted turn on its fresh session", session_key)
-
-    def _hmwa_fresh_session_has_pending_input(self, session_entry) -> bool:
-        """Whether the authority FIFO of the fresh session already holds an admitted input."""
-        from gateway.session_authorities import active_authority
-        from gateway.session_persistence import authority_persistence
-        authority = active_authority(self)
-        if authority is None or session_entry is None:
-            return False
-        owner = authority.logical_owner(session_entry.session_id)
-        return bool(authority_persistence(authority).admissions.list(session_id=owner))
-
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     def _hmwa_defer_exhaustion_reset(self, session_entry, session_key, source):
         """True when the reset was handed to the authority drain. A LOCAL session (the Bot Chat a
         ``hermes peer dm`` lands in) resets its target in the store, which refuses while an admission
@@ -1121,7 +1022,7 @@ class GatewayTurnPersistenceMixin:
             return record_unexecuted_failure(launch_credentials_copy(e), 'launch_credentials_unavailable')
         # A local client (CLI, TUI, Desktop) is the operator at this host: its result carries the
         # real cause, so its details line is not the chat apology with the log pointer cut off.
-        local_error = f"{error_type_name(e)}: {e}"[:500] if source.platform == Platform.LOCAL else None
+        local_error = f"{type(e).__name__}: {e}"[:500] if source.platform == Platform.LOCAL else None
         return record_unexecuted_failure(self._hmwa_add_failed_turn_notice(
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
         ), error=local_error)

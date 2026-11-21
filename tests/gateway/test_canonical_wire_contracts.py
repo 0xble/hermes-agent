@@ -5,28 +5,19 @@ import pytest
 
 from gateway.session_authority import LiveSession, SessionAuthority
 from gateway.session_controls import AuthorityConnection
-<<<<<<< HEAD
 from hermes_state import SessionDB
 from tests.fakes.runtime_owner import begin_runtime_epoch
-||||||| dff103e05878
-from hermes_state import SessionDB
-from hermes_state_runtime import begin_runtime_epoch
-=======
-from persistence_assembly import open_persistence, profile_scope
-from tests.fixtures.storage_seed import seed_session
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 from tui_gateway.contracts.registry import CANONICAL_METHODS, METHODS, ContractViolation, validate_params
 
 
 @pytest.mark.asyncio
 async def test_canonical_resume_rejects_unknown_keys_and_validates_real_snapshot(tmp_path):
-    db = open_persistence(profile_scope(home=tmp_path))
+    db = SessionDB(db_path=tmp_path / 'state.db')
     viewer = None
     try:
-        seed_session(db, 's', 'test')
-        epoch = db.runtime.begin_epoch(instance_id='test')
-        authority = SessionAuthority(SimpleNamespace(), profile_id='test', instance_id='test', epoch=epoch,
-                                     persistence=db)
+        db.create_session('s', source='test')
+        epoch = begin_runtime_epoch(db, instance_id='test')
+        authority = SessionAuthority(SimpleNamespace(), profile_id='test', instance_id='test', db=db, epoch=epoch)
         authority.sessions['s'] = LiveSession(None, 'route')
         viewer = AuthorityConnection(authority, object(), {'user_id': 'human'})
         from gateway.session_group_controls import GROUP_METHODS
@@ -65,10 +56,10 @@ def test_canonical_admission_and_creation_models_leave_legacy_wire_unchanged():
 async def test_canonical_result_validation_catches_a_handler_contract_violation(tmp_path, monkeypatch):
     from tui_gateway.contracts import registry
     monkeypatch.setattr(registry, 'STRICT', True)
-    db = open_persistence(profile_scope(home=tmp_path))
+    db = SessionDB(db_path=tmp_path / 'state.db')
     try:
-        authority = SessionAuthority(SimpleNamespace(), profile_id='test', instance_id='test', persistence=db,
-                                     epoch=db.runtime.begin_epoch(instance_id='test'))
+        authority = SessionAuthority(SimpleNamespace(), profile_id='test', instance_id='test', db=db,
+                                     epoch=begin_runtime_epoch(db, instance_id='test'))
         viewer = AuthorityConnection(authority, object(), {'user_id': 'human'})
 
         async def broken_ping(ref, params):

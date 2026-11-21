@@ -156,14 +156,8 @@ def _stamp_gateway_routing(proc_session, get_session_env, *, parent_session_id="
 
 
 def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, task_id,
-<<<<<<< HEAD
            session_key, effective_pty, persist_on_release: bool = False,
            survive_restart: bool = False):
-||||||| dff103e05878
-           session_key, effective_pty, persist_on_release: bool = False):
-=======
-           session_key, effective_pty, persist_on_release: bool = False, allow_cwd_fallback: bool = False):
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     common = dict(command=command, cwd=cwd, task_id=effective_task_id,
                   owner_task_id=task_id or effective_task_id, session_key=session_key,
                   persist_on_release=persist_on_release)
@@ -172,17 +166,11 @@ def _spawn(process_registry, *, env, env_type, command, cwd, effective_task_id, 
             env_vars=env.env if hasattr(env, 'env') else None, use_pty=effective_pty,
             survive_restart=survive_restart,
             restore_login_path=True, **common)
-<<<<<<< HEAD
     from tools.process_registry_ssh import SSHLaunchUncertain
     try:
         return process_registry.spawn_via_env(env=env, **common)
     except SSHLaunchUncertain as exc:
         return exc.session  # Reconcile this handle, never launch the command again.
-||||||| dff103e05878
-    return process_registry.spawn_via_env(env=env, **common)
-=======
-    return process_registry.spawn_via_env(env=env, allow_cwd_fallback=allow_cwd_fallback, **common)
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 def _apply_async_support(proc_session, result_data, notify_on_complete, watch_patterns):
@@ -350,38 +338,16 @@ def spawn_background_process(
             process_registry, env=env, env_type=env_type, command=command, cwd=effective_cwd,
             effective_task_id=effective_task_id, task_id=task_id, session_key=session_key,
             effective_pty=effective_pty, persist_on_release=persist_on_release,
-<<<<<<< HEAD
             survive_restart=survive_restart,
-||||||| dff103e05878
-=======
-            allow_cwd_fallback=not workdir,  # a named workdir is refused, never swapped for a parent
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         )
         result_data = {"output": "Background process started", "session_id": proc_session.id,
                        "pid": proc_session.pid, "exit_code": 0, "error": None}
         if persist_on_release:
             result_data["persist_on_release"] = True
-<<<<<<< HEAD
         if survive_restart:
             result_data["survive_restart"] = True
         if env_type == "local" and effective_cwd:
             _annotate_local_cwd_fallback(proc_session, result_data, effective_cwd)
-||||||| dff103e05878
-        if env_type == "local" and effective_cwd:
-            from tools.environments.local import _msys_to_windows_path
-            from tools.terminal_tool_result import _cwd_fallback_note
-            used = getattr(proc_session, "cwd", None)  # spawn_local resolves a dead cwd itself
-            if used and used not in (effective_cwd, _msys_to_windows_path(effective_cwd)):
-                result_data["cwd_fallback"] = _cwd_fallback_note({"requested": effective_cwd, "used": used})
-=======
-        if effective_cwd:
-            from tools.environments.local import _msys_to_windows_path
-            from tools.terminal_tool_result import _cwd_fallback_note
-            # spawn_local resolves a dead cwd itself; spawn_via_env records where the sandbox fell back.
-            used = getattr(proc_session, "cwd", None)
-            if used and used not in (effective_cwd, _msys_to_windows_path(effective_cwd)):
-                result_data["cwd_fallback"] = _cwd_fallback_note({"requested": effective_cwd, "used": used})
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         if approval_note:
             result_data["approval"] = approval_note
         if pty_disabled_reason:

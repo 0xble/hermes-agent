@@ -2,38 +2,15 @@
 ``confirm_deep_truncate`` (#133716: a cut that archives more than one user turn — a valid
 anchor can still name the wrong, stale row)."""
 
-<<<<<<< HEAD
 from tests.tui_gateway._thread_fixtures import patch_server_threads
-||||||| dff103e05878
-=======
-import contextlib
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 import threading
 import types
 
-<<<<<<< HEAD
 import pytest
 
-||||||| dff103e05878
-=======
-from persistence.conversation.messages import ConversationMessage, ReplaceResult
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 from tui_gateway import server
-<<<<<<< HEAD
 
 pytestmark = pytest.mark.usefixtures("without_write_stall_sampler")
-||||||| dff103e05878
-=======
-
-_NO_LEDGER_WORK = types.SimpleNamespace(pending_ledger_status=lambda _key: None)  # no ledger holds work
-
-
-def _use_messages(monkeypatch, messages):
-    """Route the gateway's store through a handle whose transcript verbs are ``messages``."""
-    monkeypatch.setattr(server, "_get_db", lambda: object())
-    persistence = types.SimpleNamespace(messages=messages, runtime=_NO_LEDGER_WORK)
-    monkeypatch.setattr(server, "_persistence_for", lambda _db: contextlib.nullcontext(persistence))
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 def _session(agent=None, **extra):
@@ -51,10 +28,9 @@ def test_prompt_submit_refuses_deep_truncation_without_confirm(monkeypatch):
     monkeypatch.setattr(server, "DEEP_TRUNCATE_ENFORCED", True)  # the next release's behaviour
     replaced = []
 
-    class _FakeMessages:
-        def replace_transcript(self, key, messages, mode, **_kwargs):
+    class _FakeDB:
+        def replace_messages(self, key, messages, **_kwargs):
             replaced.append(list(messages))
-            return ReplaceResult(rows=())
 
     history = []
     for turn in range(3):
@@ -64,7 +40,7 @@ def test_prompt_submit_refuses_deep_truncation_without_confirm(monkeypatch):
         ]
     sess = _session(history=list(history))
     server._sessions["deep-trunc-sid"] = sess
-    _use_messages(monkeypatch, _FakeMessages())
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     # The confirmed submit starts a turn; never run it on a real thread (it would leak).
     patch_server_threads(monkeypatch, server, lambda *a, **k: types.SimpleNamespace(start=lambda: None))
@@ -81,14 +57,13 @@ def test_prompt_submit_refuses_deep_truncation_without_confirm(monkeypatch):
         assert sess["history"] == history and replaced == []
 
         assert _submit(confirm_deep_truncate=True).get("error") is None
-        assert replaced == [[server._new_message(m) for m in history[:2]]]
+        assert replaced == [history[:2]]
 
         # Durable-carrier cut: the target (150) was absorbed into a repaired live carrier;
         # the refusal counts live rows from the carrier on, never live minus physical.
         physical = [{"_row_id": 100, "role": "user", "content": "u0"},
                     {"_row_id": 150, "role": "user", "content": "u0b"}, *history[1:]]
-        _FakeMessages.read_conversation = lambda self, key, request: tuple(  # type: ignore[attr-defined]
-            ConversationMessage.from_openai_message(m) for m in physical)
+        _FakeDB.get_messages_as_conversation = lambda self, key, **_kw: [dict(m) for m in physical]  # type: ignore[attr-defined]
         sess["running"] = False  # the confirmed submit above left a (never-started) turn
         sess["history"] = [{"_row_id": 100, "_absorbed_row_ids": [150], "role": "user",
                             "content": "u0\n\nu0b"}, *history[1:]]
@@ -107,19 +82,18 @@ def test_deep_truncate_counts_every_durable_row_a_merged_carrier_holds(monkeypat
     physical = [{"_row_id": 101, "role": "user", "content": "a"}, {"_row_id": 102, "role": "user", "content": "b"},
                 {"_row_id": 103, "role": "user", "content": "c"}, {"_row_id": 104, "role": "assistant", "content": "reply"}]
 
-    class _FakeMessages:
-        def read_conversation(self, key, request):
-            return tuple(ConversationMessage.from_openai_message(m) for m in physical)
+    class _FakeDB:
+        def get_messages_as_conversation(self, key, **_kwargs):
+            return [dict(m) for m in physical]
 
-        def replace_transcript(self, key, messages, mode, **_kwargs):
+        def replace_messages(self, key, messages, **_kwargs):
             replaced.append(list(messages))
-            return ReplaceResult(rows=())
 
     history = [{"_row_id": 101, "_absorbed_row_ids": [102, 103], "role": "user", "content": "a\n\nb\n\nc"},
                {"_row_id": 104, "role": "assistant", "content": "reply"}]
     sess = _session(history=list(history))
     server._sessions["deep-carrier-sid"] = sess
-    _use_messages(monkeypatch, _FakeMessages())
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     patch_server_threads(monkeypatch, server, lambda *a, **k: types.SimpleNamespace(start=lambda: None))
     try:
@@ -162,10 +136,16 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
         def start(self):
             self._target()
 
-    class _FakeMessages:
-        def replace_transcript(self, key, messages, mode, reject_active_turn_lease=False):
+    class _FakeDB:
+        def replace_messages(
+            self,
+            key,
+            messages,
+            active_only=False,
+            archive_dropped=False,
+            reject_active_turn_lease=False,
+        ):
             replaced.append((key, list(messages)))
-            return ReplaceResult(rows=())
 
     history = [
         {"_row_id": 101, "role": "user", "content": "first"},
@@ -182,7 +162,7 @@ def test_prompt_submit_empty_truncation_allowed_with_confirm(monkeypatch):
         monkeypatch.setattr(server, "_get_usage", lambda _a: {})
         monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
         monkeypatch.setattr(server, "_emit", lambda *a: None)
-        _use_messages(monkeypatch, _FakeMessages())
+        monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
 
         resp = server.handle_request(
             {
@@ -234,17 +214,16 @@ def test_unconfirmed_deep_truncation_is_warn_only_this_release(monkeypatch, capl
 
     replaced = []
 
-    class _FakeMessages:
-        def replace_transcript(self, key, messages, mode, **_kwargs):
+    class _FakeDB:
+        def replace_messages(self, key, messages, **_kwargs):
             replaced.append(list(messages))
-            return ReplaceResult(rows=())
 
     history = []
     for turn in range(3):
         history += [{"_row_id": 100 + 2 * turn, "role": "user", "content": f"u{turn}"},
                     {"_row_id": 101 + 2 * turn, "role": "assistant", "content": f"a{turn}"}]
     server._sessions["warn-only-sid"] = _session(history=list(history))
-    _use_messages(monkeypatch, _FakeMessages())
+    monkeypatch.setattr(server, "_get_db", lambda: _FakeDB())
     monkeypatch.setattr(server, "_start_agent_build", lambda *a, **k: None)
     patch_server_threads(monkeypatch, server, lambda *a, **k: types.SimpleNamespace(start=lambda: None))
     try:
@@ -253,7 +232,7 @@ def test_unconfirmed_deep_truncation_is_warn_only_this_release(monkeypatch, capl
                 "session_id": "warn-only-sid", "text": "u1", "truncate_before_row_id": 102,
                 "confirm_truncate": True}})
         assert result.get("error") is None
-        assert replaced == [[server._new_message(m) for m in history[:2]]]
+        assert replaced == [history[:2]]
         assert "ALLOWED (warn-only release) unconfirmed deep truncation" in caplog.text
     finally:
         server._sessions.pop("warn-only-sid", None)

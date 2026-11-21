@@ -19,7 +19,7 @@ _GROUP_PROBE_FAILED_MSG = "Could not verify this group. Try again after the gate
 
 def _history_user_indices(history: list) -> list:
     """Indices of canonical live-user turns, including composite carriers."""
-    from session_rules.turns import user_originated_turn_view
+    from agent.context_compressor import user_originated_turn_view
     return [i for i, m in enumerate(history) if user_originated_turn_view(m) is not None]
 
 
@@ -42,7 +42,8 @@ def _mem_db_pair_agrees(mem, db_msg) -> bool:
     if mem.get("role") != db_msg.get("role"):
         return False
     if mem.get("role") == "user":
-        from session_rules.turns import user_originated_turn_view, sanitize_context
+        from agent.context_compressor import user_originated_turn_view
+        from agent.memory_context import sanitize_context
         mem_view = user_originated_turn_view(mem)
         db_view = user_originated_turn_view(db_msg)
         if (mem_view is None) != (db_view is None):
@@ -79,18 +80,19 @@ def _load_durable_truncation_history(
     session_key = _submit_row_target_key(session) or str(fallback_sid or "")
     if not session_key:
         return []
-    from persistence.conversation.messages import ConversationRequest
     try:
-        with _session_db(session) as db, _persistence_for(db) as persistence:
-            if persistence is None:
+        with _session_db(session) as db:
+            get_conv = getattr(db, "get_messages_as_conversation", None)
+            if not callable(get_conv):
                 return None
-            return [message.as_openai_message() for message in persistence.messages.read_conversation(
-                session_key, ConversationRequest(repair_alternation=repair_alternation, include_row_ids=True))]
+            history = get_conv(
+                session_key, repair_alternation=repair_alternation, include_row_ids=True)
     except Exception:
         logger.debug(
             "prompt.submit: failed loading durable history for session %s", session_key,
             exc_info=True)
         return None
+    return history if isinstance(history, list) else None
 
 
 def _resolve_truncate_row_id(session: dict, history: list, target_row_id: int):
@@ -171,7 +173,8 @@ def _merge_carrier_holds_target_text(carrier: dict, db_msg: dict) -> bool:
     empty side drops out), so the target's sanitized text either IS the carrier's
     content or appears in it as a whole ``"\\n\\n"``-delimited part. Both views are
     user-originated by construction (the caller only visits user turns)."""
-    from session_rules.turns import user_originated_turn_view, sanitize_context
+    from agent.context_compressor import user_originated_turn_view
+    from agent.memory_context import sanitize_context
     mem_view = user_originated_turn_view(carrier)
     db_view = user_originated_turn_view(db_msg)
     if mem_view is None or db_view is None:
@@ -211,19 +214,18 @@ def _pending_reaction_notes(session: dict) -> str:
     except Exception:
         return ""
     try:
-        with _session_db(session) as db, _persistence_for(db) as persistence:
-            pending = None if persistence is None else persistence.messages.take_unseen_reactions(
-                session_key, author="user")
+        with _session_db(session) as db:
+            pending = None if db is None else db.take_unseen_reactions(session_key, author="user")
     except Exception:
         logger.debug("Failed to read pending reactions", exc_info=True)
         return ""
     notes = []
     for entry in pending or ():
-        snippet = (entry.text or "").strip().replace("\n", " ")
+        snippet = (entry.get("text") or "").strip().replace("\n", " ")
         if len(snippet) > 120:
             snippet = snippet[:120] + "…"
-        emoji = entry.emoji or ""
-        whose = "their own" if entry.role == "user" else "your"
+        emoji = entry.get("emoji") or ""
+        whose = "their own" if entry.get("role") == "user" else "your"
         if snippet:
             notes.append(f'[The user reacted {emoji} to {whose} message: "{snippet}"]')
         else:
@@ -294,16 +296,15 @@ def _legacy_group_fence_error(rid, session, params):
     if not room_id:
         return None
     try:
-        from gateway.hosted_rooms import probe_hosted_room, probe_peer_room_reservation
-        from persistence.gateway.hosted_rooms import HostedRoomError, RoomProbeUnavailableError
-        from tui_gateway.methods_groups import _active_store
-        store = _active_store()
-        hosted = probe_hosted_room(store, placement="shared", room_id=room_id)
+        from gateway.hosted_rooms import (
+            HostedRoomError, RoomProbeUnavailableError, default_db_path, probe_hosted_room,
+            probe_peer_room_reservation)
+        hosted = probe_hosted_room(default_db_path(), room_id=room_id)
         peer = False
         if not hosted:
             from hermes_constants import profile_name_for_home
             peer = probe_peer_room_reservation(
-                store, placement="shared", room_id=room_id, target_profile=(
+                default_db_path(), room_id=room_id, target_profile=(
                     profile_name_for_home(session.get("profile_home"))
                     or str(params.get("profile") or "").strip()
                     or str(_current_profile_name() or "default").strip()))
@@ -461,7 +462,7 @@ def _archived_user_turns(session, sid, history, cut_index, survivor_ids) -> int:
     (#94486): its turns are counted from the physical durable rows, and every id that cannot be
     classified there counts as a turn (fail closed). On a durable-carrier cut the run's rows
     before the target survive (*survivor_ids*)."""
-    from session_rules.turns import user_originated_turn_view
+    from agent.context_compressor import user_originated_turn_view
     physical = None
     archived = 0
     for h_idx in _history_user_indices(history):
@@ -493,7 +494,7 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
     if err is not None:
         return err, {}
     durable_prefix = resolved[3] if len(resolved) > 3 else None
-    from session_rules.turns import history_before_user_originated_turn
+    from agent.context_compressor import history_before_user_originated_turn
     if durable_prefix is not None:
         # Durable-boundary cut: the target row is physically present but merged into
         # a repaired live carrier; the physical rows strictly before it are the
@@ -539,22 +540,21 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
     # after the in-memory rewrite would stack the new exchange on the "undone" turns).
     # Writes through _session_db (profile sessions own their state.db).
     fields = {}
-    from persistence.conversation.messages import ReplaceMode
-    with _session_db(session) as db, _persistence_for(db) as persistence:
-        if persistence is not None:
+    with _session_db(session) as db:
+        if db is not None:
             try:
                 # NULL session_key (old CLI-origin sessions) would trip an FK violation.
-                # ARCHIVE_DROPPED replaces only the live (active=1) rows. In-place compaction (#38763)
+                # active_only=True: replace only the live (active=1) rows. In-place compaction (#38763)
                 # keeps the pre-compaction transcript as active=0/compacted=1 rows under this same session
-                # key; a destructive replace would DELETE that durable archive on every edit/regenerate
+                # key; a bare replace_messages() would DELETE that durable archive on every edit/regenerate
                 # — the same bug class #80216 fixed for /retry. On an uncompacted session all rows are
-                # active=1, so this is behaviorally identical to the full replace. Archiving: a rewind
+                # active=1, so this is behaviorally identical to the full replace. archive_dropped: a rewind
                 # overwrites turns the user may not have meant to drop, and this write is the last step
                 # before they are gone — three reported incidents ended here with nothing to restore from
                 # (#70516, #80763, #82756). Soft-archiving keeps them on disk (active=0) and in the FTS
                 # index, so a mis-aimed cut is recoverable instead of terminal. The live transcript is
                 # unchanged. Fall back to session id when session_key is NULL — CLI-origin sessions created
-                # before the session_key default fix have no key, and a replace under None triggers an FK
+                # before the session_key default fix have no key, and replace_messages(None) triggers an FK
                 # violation.
                 truncation_key = session.get("session_key") or sid
                 old_active_row_ids = _row_ids_of(history)
@@ -567,29 +567,17 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
                         raise RuntimeError("could not load durable row identities for truncation")
                     old_active_row_ids.update(_row_ids_of(durable_rebind_history))
                 old_survivor_row_ids = [_message_row_id(message) for message in truncated]
-                # Only the live rows: a bare replace would DELETE the compaction archive (active=0
-                # rows) on every edit.  Archived, not deleted: a mis-aimed cut stays recoverable.
-                replaced = persistence.messages.replace_transcript(
-                    truncation_key, [_new_message(message) for message in truncated], ReplaceMode.ARCHIVE_DROPPED,
+                # active_only: a bare replace would DELETE the compaction archive (active=0
+                # rows) on every edit.  archive_dropped: a mis-aimed cut stays recoverable.
+                db.replace_messages(
+                    truncation_key, truncated, active_only=True, archive_dropped=True,
                     reject_active_turn_lease=True)
-                # The row state the write gave each message: a kept row only its id and uid, an inserted row
-                # its stored timestamp, ownership version and tool-call uids as well.
-                for message, row in zip(truncated, replaced.rows):
-                    message["_row_id"] = int(row.id)
-                    if row.message_uid:
-                        message["message_uid"] = row.message_uid
-                    if row.db_row_snapshot is not None:
-                        message.update(timestamp=row.timestamp, _db_row_snapshot=row.db_row_snapshot)
-                        if row.tool_call_uids is not None:
-                            message["_tool_call_uids"] = dict(row.tool_call_uids)
-                        if row.tool_call_uid is not None:
-                            message["_tool_call_uid"] = row.tool_call_uid
             except Exception as exc:
                 logger.error(
                     "prompt.submit: replace_messages failed for session %s (ordinal=%d); refusing "
                     "turn so memory and DB stay aligned: %s",
                     sid, ordinal, exc, exc_info=True)
-                return _err(rid, 5008, f"failed to persist history truncation: {_store_error_text(exc)}"), {}
+                return _err(rid, 5008, f"failed to persist history truncation: {exc}"), {}
             # Surface the survivors' live ids so the client rebinds its cached rowIds
             # (a strict-prefix cut keeps them unchanged since #82956; a divergent
             # rewrite mints new rows).  None entries: the client must drop that turn's id.
@@ -612,7 +600,7 @@ def _truncate_history_for_submit(rid, sid, session, params, requested_rebind_ids
 
 def _storage_error_data(failure, raw) -> dict:
     """Machine-readable error data: ``code`` lets a GUI pick a "Run doctor" / "Retry" action."""
-    from storage_user_copy import storage_failure_details
+    from hermes_state_user_copy import storage_failure_details
     return {"code": failure.code, "cause": failure.cause, "details": storage_failure_details(raw)}
 
 
@@ -626,23 +614,20 @@ def _reopen_if_finalized(db, session_id: str) -> None:
     live again. Best-effort: a failed read must not block the send."""
     if not session_id:
         return
-    with _persistence_for(db) as persistence:
-        if persistence is None:
-            return
-        try:
-            row = persistence.sessions.get(session_id)
-        except Exception:
-            logger.debug("finalized-session reopen check failed for %s", session_id, exc_info=True)
-            return
-        if row is not None and row.ended_at is not None:
-            persistence.sessions.reopen(session_id)
+    try:
+        row = db.get_session(session_id)
+    except Exception:
+        logger.debug("finalized-session reopen check failed for %s", session_id, exc_info=True)
+        return
+    if row is not None and row.get("ended_at") is not None:
+        db.reopen_session(session_id)
 
 
 def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
     """Lazily persist the DB row now that the user sent a message (a branch becomes real
     here), then the message itself (#111868: a freeze during the first build must leave a
     resumable transcript); the error reply is the only user-visible signal (desktop maps it to a toast)."""
-    from storage_user_copy import describe_storage_failure
+    from hermes_state_user_copy import describe_storage_failure
     try:
         if _ensure_session_db_row(session) is False:
             failure = describe_storage_failure(_db_error)
@@ -667,14 +652,14 @@ def _persist_session_row_for_submit(rid, session, text=None, display_kind=None):
                 rid, 5070,
                 "Session storage could not be written, so this message was not saved: the disk is full. "
                 "Free some disk space, then send your message again.",
-                data=_storage_error_data(failure, _store_error_text(exc)))
+                data=_storage_error_data(failure, exc))
         else:
             logger.warning("prompt.submit: session persist failed: %s", exc, exc_info=True)
             error = _err(
                 rid, 5071,
                 f"Session storage could not be written, so this message was not saved. Cause: {failure.gloss}. "
                 f"{failure.action} Then send your message again.",
-                data=_storage_error_data(failure, _store_error_text(exc)))
+                data=_storage_error_data(failure, exc))
     # No turn thread will start, so neither resume nor the busy queue may see
     # this rejected prompt as live. Release the slot a turn would normally own.
     with session["history_lock"]:
@@ -853,7 +838,6 @@ def _claim_submit_turn(
 from gateway.session_surface import SURFACES as _CLIENT_SURFACES
 
 
-<<<<<<< HEAD
 @method("prompt.submit")
 def _(rid, params: dict) -> dict:
     from hermes_cli.input_sanitize import sanitize_user_prompt_text
@@ -1395,1065 +1379,6 @@ def _(rid, params: dict) -> dict:
         lambda a: a.resolve_gateway_approval(
             session["session_key"], params.get("choice", "deny"),
             resolve_all=params.get("all", False), request_id=params.get("request_id")))
-||||||| dff103e05878
-@method("prompt.submit")
-def _(rid, params: dict) -> dict:
-    from hermes_cli.input_sanitize import sanitize_user_prompt_text
-    sid = params.get("session_id", "")
-    raw_text = params.get("text", "")
-    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
-    # Off-screen sends (widget intents) type the row so no client renders a bubble;
-    # whitelisted to "hidden" — this RPC must not mint kinds.
-    display_kind = "hidden" if params.get("display_kind") == "hidden" else None
-    title_preview = params.get("title_preview")
-    display_metadata = (
-        {"title_preview": title_preview[:1000]}
-        if isinstance(title_preview, str) and title_preview.strip()
-        else None
-    )
-    if (stopped := _typed_stop_phrase_response(rid, text, sid)) is not None:
-        return stopped
-    if params.get("interrupted"):
-        # Client-side barge-in: latch so this turn's model message carries the note.
-        from tools.tts_streaming import mark_speech_interrupted
-        mark_speech_interrupted()
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    from tools.bot_relay import DeliveryAuthor
-
-    # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
-    raw_author = params.get("_turn_author")
-    if raw_author is not None and not isinstance(raw_author, DeliveryAuthor):
-        return _err(rid, 4124, "turn author is stamped by the gateway, never by a client")
-    turn_author = raw_author.author if raw_author is not None else None
-    hosted_task = params.get("_hosted_task")
-    hosted_terminal_callback = params.get("_hosted_terminal_callback")
-    hosted_images = params.get("_hosted_images")
-    internal_hosted_submit = (
-        hosted_task is not None or hosted_terminal_callback is not None or hosted_images is not None)
-    err = (
-        _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback, hosted_images)
-        if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
-    if err is not None:
-        return err
-    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
-        # Refused HERE — before the busy queue, db row and agent build — so a refusal
-        # leaves the session untouched.  The reason travels as machine-readable data.
-        return _slot_refusal(rid, sid, session, text, params, limit_message, internal_hosted_submit)
-    # Rewritten every submit: a session alternates app window / HUD / live voice; a stale value misinforms.
-    session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
-    # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted
-    # user row stays the words the user said); anything else clears it.
-    voice_context = params.get("voice_context")
-    session["voice_live_context"] = (
-        voice_context[:6000] if session["client_surface"] == "voice-live" and isinstance(voice_context, str) else "")
-    session["voice_turn"] = params.get("voice_turn") is True
-    has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)
-    if has_truncation and isinstance(text, str):
-        # A rewind replays what the transcript shows: re-expand a skill invocation or
-        # `/work fix it` sends nine literal chars.
-        text = _expand_skill_invocation_for_replay(text, str(session.get("session_key") or ""))
-    turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
-    if internal_hosted_submit and turn_isolation:
-        return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
-    # Re-bind to the current transport: streaming must stay on the active websocket even
-    # if a disconnect/fallback moved the session to stdio. Through _rebind_live_transport so a
-    # socket that already closed cannot cancel the orphan reap without coming back (#116464).
-    with _session_resume_lock:
-        if (refusal := _reattach_refusal(rid, sid, session)) is not None:
-            return refusal
-        if (t := current_transport()) is not None:
-            _rebind_live_transport(sid, session, t)
-    # Claim the turn against a possibly-running session (busy/queued reply, else fall
-    # through once ``running`` is observed False).  The provider interrupt happens after
-    # history_lock is released (a non-interruptible tool may hold it); if the old turn
-    # finished between the two acquisitions, retry the claim rather than strand this
-    # prompt in a queue whose drain already ran.
-    while True:
-        with session["history_lock"]:
-            if not session.get("running"):
-                break
-            if internal_hosted_submit:
-                return _err(rid, 4091, "hosted room member session is busy")
-            busy_transport = t or session.get("transport")
-        if has_truncation:
-            # A rewind/edit/restore/regenerate must land as a truncation, never as a
-            # steered correction or a plain follow-up queued to run after the live
-            # turn — either would silently drop the history cut the user asked for.
-            # Signal busy so the caller's own interrupt-then-retry loop (already
-            # built for exactly this race — see desktop's `runRewindSubmit`) waits
-            # for `running` to clear and resubmits with the truncation intact.
-            return _err(rid, 4009, "session busy")
-        busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
-            display_kind=display_kind)
-        if busy_response is not None:
-            return busy_response
-    raw_rebind_ids = params.get("rebind_survivor_row_ids")
-    requested_rebind_ids = (
-        {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
-        if isinstance(raw_rebind_ids, list) else None)
-    err, survivor_fields = _claim_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
-        internal_hosted_submit)
-    if err is not None:
-        return err
-    if turn_isolation:
-        if turn_author:
-            logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
-                         turn_author.get("id"))
-        # The isolated dispatch returns BELOW before the inline persist, so the reopen
-        # cannot live only in _persist_session_row_for_submit: the turn is already
-        # admitted here (running, in flight, active-slot lease claimed, truncation
-        # applied inline), and the child's transcript writes must land in a live row
-        # (#85303 review: the early return made _reopen_if_finalized unreachable on
-        # this path). Best-effort like the helper: a failed read never blocks the send.
-        try:
-            with _session_db(session) as db:
-                if db is not None:
-                    _reopen_if_finalized(db, str(session.get("session_key") or ""))
-        except Exception:
-            logger.debug("finalized-session reopen before isolated dispatch failed for %s",
-                         sid, exc_info=True)
-        isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
-        if not isolated_response.get("error"):
-            # The truncation already happened inline above (memory + DB).
-            isolated_response["result"].update(survivor_fields)
-            return isolated_response
-        # An ordinal/id alone is not consent. A client that carries a leftover ordinal into an ORDINARY
-        # submit sends a request that is indistinguishable, field by field, from a real rewind — same
-        # method, same shape, an in-range target — and the cut it asks for is a destructive
-        # replace_messages() the user never requested (#80763: 296 -> 52 messages, 244 durable rows gone).
-        # Only the client knows whether this submit is a rewind/edit/regenerate, so it has to say so; refuse
-        # the cut when it doesn't. Consent is checked BEFORE target resolution: an unconfirmed
-        # (leaked-state) request must refuse with 4029 without paying the durable transcript read or
-        # heal-stamping live history dicts that row-id resolution performs.
-        logger.warning(
-            "compute-host dispatch failed for session %s; falling back inline: %s", sid,
-            isolated_response["error"].get("message", "unknown error"))
-    if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
-        return err
-    # Capture before starting the worker: it consumes the staging dict and may finish before the RPC returns.
-    staged_user = session.get("_submit_user_row") or {}
-    if isinstance(staged_user.get("_row_id"), int):
-        survivor_fields["user_row_id"] = staged_user["_row_id"]
-    # A completed FAILED build must not wedge the session: rebuild, don't replay it.
-    if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
-        _start_agent_build(sid, session)
-    run_thread = threading.Thread(
-        target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
-            hosted_images),
-        daemon=True, name=f"prompt-submit-{sid}")
-    # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
-    session["_run_thread"] = run_thread
-    run_thread.start()
-    return _ok(rid, {"status": "streaming", **survivor_fields})
-
-
-@method("clipboard.paste")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    try:
-        from hermes_cli.clipboard import has_clipboard_image, save_clipboard_image
-    except Exception as e:
-        return _err(rid, 5027, f"clipboard unavailable: {e}")
-    session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _session_images_dir(session)
-    img_dir.mkdir(parents=True, exist_ok=True)
-    img_path = (
-        img_dir / f"clip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session['image_counter']}.png")
-    # Save-first (CLI keybinding parity): more robust than a has_image() precheck.
-    if not save_clipboard_image(img_path):
-        session["image_counter"] = max(0, session["image_counter"] - 1)
-        return _ok(rid, {"attached": False, "message": (
-            "Clipboard has image but extraction failed" if has_clipboard_image()
-            else "No image found in clipboard")})
-    session.setdefault("attached_images", []).append(str(img_path))
-    return _ok(rid, _attached_image_result(session, img_path))
-
-
-@method("image.attach")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    raw = str(params.get("path", "") or "").strip()
-    if not raw:
-        return _err(rid, 4015, "path required")
-    try:
-        from cli import (
-            _IMAGE_EXTENSIONS, _detect_file_drop, _resolve_attachment_path, _split_path_input)
-        if dropped := _detect_file_drop(raw):
-            image_path, remainder = dropped["path"], dropped["remainder"]
-        else:
-            path_token, remainder = _split_path_input(raw)
-            image_path = _resolve_attachment_path(path_token)
-            if image_path is None:
-                return _err(rid, 4016, f"image not found: {path_token}")
-        if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
-            return _err(rid, 4016, f"unsupported image: {image_path.name}")
-        session.setdefault("attached_images", []).append(str(image_path))
-        return _ok(rid, _attached_image_result(
-            session, image_path,
-            remainder=remainder, text=remainder or f"[User attached image: {image_path.name}]"))
-    except Exception as e:
-        return _err(rid, 5027, str(e))
-
-
-@method("image.attach_bytes")
-def _(rid, params: dict) -> dict:
-    """Attach an image from base64 bytes (remote client); reply mirrors ``image.attach``.
-    ``filename``/``ext`` hint the extension, else magic bytes decide (fallback ``.png``)."""
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
-    if not raw_b64:
-        return _err(rid, 4015, "content_base64 required")
-    img_bytes, err = _decode_attach_payload(
-        rid, raw_b64, mime_prefix="image/", max_bytes=_ATTACH_BYTES_MAX_BYTES,
-        label="image", empty_msg="image is empty")
-    if err is not None:
-        return err
-    filename = str(params.get("filename", "") or "")
-    ext_hint = str(params.get("ext", "") or "").strip().lower()
-    if ext_hint and not ext_hint.startswith("."):
-        ext_hint = "." + ext_hint
-    ext = _sniff_image_ext(img_bytes, filename or (f"x{ext_hint}" if ext_hint else ""))
-    if ext not in _allowed_image_extensions():
-        return _err(rid, 4016, f"unsupported image extension: {ext}")
-    try:
-        img_path = _queue_attached_image(session, img_bytes, ext, prefix="upload")
-    except Exception as e:
-        return _err(rid, 5027, f"write failed: {e}")
-    return _ok(rid, _attached_image_result(
-        session, img_path,
-        remainder="", text=f"[User attached image: {img_path.name}]", bytes=len(img_bytes)))
-
-
-@method("pdf.attach")
-def _(rid, params: dict) -> dict:
-    """Attach a PDF by rendering each page to PNG (``pdftoppm``; 5028 if missing) and
-    queuing the pages as images.  Host ``path`` or base64 ``content_base64``."""
-    import shutil
-    import subprocess
-    import tempfile
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    if shutil.which("pdftoppm") is None:
-        return _err(rid, 5028, "pdftoppm not installed (poppler-utils package required)")
-    raw_path = str(params.get("path", "") or "").strip()
-    raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
-    if not raw_path and not raw_b64:
-        return _err(rid, 4015, "path or content_base64 required")
-    with tempfile.TemporaryDirectory(prefix="pdf_attach_") as td:
-        td_path = Path(td)
-        pdf_path, display_name, err = _pdf_attach_source(rid, params, td_path, raw_path, raw_b64)
-        if err is not None:
-            return err
-        first_page, last_page, err = _pdf_page_range(rid, params)
-        if err is not None:
-            return err
-        argv = [
-            "pdftoppm", "-png", "-r", "150", "-f", str(first_page), "-l", str(last_page),
-            str(pdf_path), str(td_path / "page")]
-        from hermes_cli._subprocess_compat import windows_hide_flags
-        try:
-            # UTF-8 + lossy decode: non-UTF-8 child output must not crash the gateway
-            # thread on locale-mismatched Windows.
-            res = subprocess.run(
-                argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
-                encoding="utf-8", errors="replace", creationflags=windows_hide_flags(), check=False)
-        except subprocess.TimeoutExpired:
-            return _err(rid, 5028, "pdftoppm timed out (>120s)")
-        if res.returncode != 0:
-            tail = (res.stderr or res.stdout or "").strip().splitlines()[-3:]
-            return _err(rid, 5028, "pdftoppm failed: " + " | ".join(tail))
-        rendered = sorted(td_path.glob("page-*.png"))
-        if not rendered:
-            return _err(rid, 5028, "pdftoppm produced no pages (corrupt PDF?)")
-        attached_pages = []
-        for src in rendered:
-            page_num = src.stem.split("-", 1)[-1]
-            try:
-                page_int = int(page_num)
-            except ValueError:
-                page_int = first_page + len(attached_pages)
-            dst = _queue_attached_image(
-                session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}")
-            attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
-        return _ok(rid, {
-            "attached": True, "filename": display_name, "pages_attached": len(attached_pages),
-            "pages": attached_pages, "count": len(session["attached_images"]),
-            "text": f"[User attached PDF: {display_name} ({len(attached_pages)} page(s))]"})
-
-
-@method("file.attach")
-def _(rid, params: dict) -> dict:
-    """Stage a non-image file into the session workspace; returns a workspace-relative
-    ``@file:`` ref.  ``data_url`` carries the bytes when ``path`` isn't gateway-visible."""
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    raw, data_url, name = (
-        str(params.get(k, "") or "").strip() for k in ("path", "data_url", "name"))
-    if not raw and not data_url:
-        return _err(rid, 4015, "path or data_url required")
-    try:
-        stored_path, uploaded = _stage_session_file_attachment(
-            session, raw_path=raw, data_url=data_url, name=name)
-        ref_path = _attachment_ref_path(session, stored_path)
-        return _ok(rid, {
-            "attached": True, "name": stored_path.name, "path": str(stored_path),
-            "ref_path": ref_path, "ref_text": f"@file:{_format_ref_value(ref_path)}",
-            "uploaded": uploaded})
-    except Exception as e:
-        return _err(rid, 5028, str(e))
-
-
-@method("image.detach")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    raw = str(params.get("path", "") or "").strip()
-    if not raw:
-        return _err(rid, 4015, "path required")
-    before = len(images := session.setdefault("attached_images", []))
-    session["attached_images"] = [path for path in images if path != raw]
-    return _ok(rid, {
-        "detached": len(session["attached_images"]) != before,
-        "count": len(session["attached_images"])})
-
-
-@method("input.detect_drop")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    try:
-        from cli import _detect_file_drop
-        dropped = _detect_file_drop(str(params.get("text", "") or ""))
-        if not dropped:
-            return _ok(rid, {"matched": False})
-        drop_path, remainder = dropped["path"], dropped["remainder"]
-        if dropped["is_image"]:
-            session.setdefault("attached_images", []).append(str(drop_path))
-            return _ok(rid, {
-                "matched": True, "is_image": True, "path": str(drop_path),
-                "count": len(session["attached_images"]),
-                "text": remainder or f"[User attached image: {drop_path.name}]",
-                **_image_meta(drop_path)})
-        text = f"[User attached file: {drop_path}]" + (f"\n{remainder}" if remainder else "")
-        return _ok(rid, {
-            "matched": True, "is_image": False, "path": str(drop_path), "name": drop_path.name,
-            "text": text})
-    except Exception as e:
-        return _err(rid, 5027, str(e))
-
-
-@method("prompt.background")
-def _(rid, params: dict) -> dict:
-    session, text, parent, task_id, err = _side_agent_args(rid, params, "bg")
-    if err:
-        return err
-
-    def body():
-        from run_agent import AIAgent
-        kwargs = _background_agent_kwargs(session["agent"], task_id)
-        with _side_agent_session_db(kwargs.get("session_db")) as session_db:
-            agent = AIAgent(**{**kwargs, "session_db": session_db})
-            try:
-                result = agent.run_conversation(user_message=text, task_id=task_id)
-            finally:
-                # AIAgent.close() is the owner boundary (memory shutdown, tool
-                # subprocesses, httpx clients); an unclosed side agent leaks
-                # all of them for the gateway's life (#50197).
-                with contextlib.suppress(Exception):
-                    agent.close()
-        return _final_response_text(result)
-
-    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body)
-
-
-@method("prompt.btw")
-def _(rid, params: dict) -> dict:
-    """Side question over a snapshot of the live conversation (``agent/side_question.py``);
-    history, alternation and prompt cache stay untouched.  Answer: ``btw.complete``."""
-    session, text, parent, task_id, err = _side_agent_args(rid, params, "btw")
-    if err:
-        return err
-    agent = session.get("agent")
-    snapshot = list(getattr(agent, "_session_messages", None) or session.get("history") or [])
-    main_runtime = {
-        k: getattr(agent, k, None)
-        for k in ("model", "provider", "base_url", "api_key", "api_mode", "session_id")}
-
-    def body():
-        from agent.side_question import answer_side_question
-        return answer_side_question(
-            text, snapshot, parent_agent=agent, main_runtime=main_runtime) or ""
-
-    return _spawn_side_agent(
-        rid, session, task_id, parent, "btw.complete", body, extra={"question": text})
-
-
-@method("preview.restart")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    url, cwd, context = (str(params.get(k) or "").strip() for k in ("url", "cwd", "context"))
-    if not url:
-        return _err(rid, 4012, "url required")
-    task_id = f"preview_{uuid.uuid4().hex[:6]}"
-    parent = params.get("session_id", "")
-    with session.get("history_lock") or contextlib.nullcontext():
-        snapshot = list(session.get("history") or [])
-    parent_history = _preview_restart_history(snapshot)
-    prompt = _preview_restart_prompt(url, cwd, context, bool(parent_history))
-    preview_cwd = _validated_preview_cwd(cwd)
-
-    def body():
-        from run_agent import AIAgent
-        from tools.terminal_tool import register_task_env_overrides
-        if preview_cwd:
-            register_task_env_overrides(task_id, {"cwd": preview_cwd})
-        history_note = (
-            f" (with {len(parent_history)} parent-session messages of context)"
-            if parent_history else "")
-        _emit(
-            "preview.restart.progress", parent,
-            {"task_id": task_id, "text": f"Starting hidden restart agent{history_note}"})
-        # Deliberately NOT closed via AIAgent.close(): it would kill the background
-        # server this task exists to leave running.
-        result = AIAgent(
-            **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
-            **_preview_restart_callbacks(parent, task_id),
-        ).run_conversation(
-            user_message=prompt, task_id=task_id, conversation_history=parent_history or None)
-        return _final_response_text(result)
-
-    def cleanup():
-        with contextlib.suppress(Exception):
-            from tools.terminal_tool import clear_task_env_overrides
-            clear_task_env_overrides(task_id)
-
-    # Pin the validated preview cwd, else the parent workspace — never an invalid path.
-    return _spawn_side_agent(
-        rid, session, task_id, parent, "preview.restart.complete", body,
-        cwd=preview_cwd, cleanup=cleanup)
-
-
-@method("clarify.lock")
-def _(rid, params: dict) -> dict:
-    request_id = str(params.get("request_id") or "")
-    question_id = str(params.get("question_id") or "")
-    if not request_id or not question_id:
-        return _err(rid, 4002, "request_id and question_id required")
-    answer = params.get("answer", "")
-    if answer is not None and not isinstance(answer, str):
-        answer = json.dumps(answer, ensure_ascii=False)
-    if (proxied := _lock_compute_host_clarify(rid, request_id, question_id, answer)) is not None:
-        return proxied
-    from tui_gateway import server_requests
-    try:
-        remaining = server_requests.lock_answer(request_id, question_id, answer)
-    except ValueError as e:
-        return _err(rid, 4002, str(e))
-    if remaining is None:
-        # The wait already ended (timeout / cancel) while the card was still visible: not an error.
-        return _ok(rid, {"status": "expired"})
-    return _ok(rid, {"status": "ok", "remaining": remaining})
-
-
-@method("request.answer")
-def _(rid, params: dict) -> dict:
-    """Answer an open server→client request from a client that did not receive it (a Bot Mode room
-    window answering a member's prompt mirrored from its resume snapshot). The response-frame path is
-    the norm; this is the proxy for it. ``expired`` when the request already ended."""
-    request_id = str(params.get("id") or "")
-    result = params.get("result")
-    if not request_id or not isinstance(result, dict):
-        return _err(rid, 4002, "id and an object result required")
-    from tui_gateway import server_requests
-    frame = {"jsonrpc": "2.0", "id": request_id, "result": result}
-    if server_requests.resolve_response(frame) or _relay_compute_host_response(frame):
-        return _ok(rid, {"status": "ok"})
-    return _ok(rid, {"status": "expired"})
-
-
-@method("approval.pending")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    return _approval_reply(
-        rid, "approvals", lambda a: a.list_gateway_approvals(session["session_key"]))
-
-
-@method("approval.received")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    if not isinstance(request_id := params.get("request_id"), str) or not request_id:
-        return _err(rid, 4006, "request_id required")
-    return _approval_reply(
-        rid, "acknowledged", lambda a: a.ack_gateway_approval(session["session_key"], request_id))
-
-
-@method("approval.respond")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        # Session-not-found (4001) only: resolve by durable identity before failing.
-        if (err.get("error") or {}).get("code") != 4001:
-            return err
-        session = _approval_respond_session_fallback(params)
-        if session is None:
-            return err
-    return _approval_reply(
-        rid, "resolved",
-        lambda a: a.resolve_gateway_approval(
-            session["session_key"], params.get("choice", "deny"),
-            resolve_all=params.get("all", False), request_id=params.get("request_id")))
-=======
-@method("prompt.submit")
-def _(rid, params: dict) -> dict:
-    from hermes_cli.input_sanitize import sanitize_user_prompt_text
-    sid = params.get("session_id", "")
-    raw_text = params.get("text", "")
-    text = sanitize_user_prompt_text(raw_text) if isinstance(raw_text, str) else raw_text
-    # Off-screen sends (widget intents) type the row so no client renders a bubble;
-    # whitelisted to "hidden" — this RPC must not mint kinds.
-    display_kind = "hidden" if params.get("display_kind") == "hidden" else None
-    title_preview = params.get("title_preview")
-    display_metadata = (
-        {"title_preview": title_preview[:1000]}
-        if isinstance(title_preview, str) and title_preview.strip()
-        else None
-    )
-    if (stopped := _typed_stop_phrase_response(rid, text, sid)) is not None:
-        return stopped
-    if params.get("interrupted"):
-        # Client-side barge-in: latch so this turn's model message carries the note.
-        from tools.tts_streaming import mark_speech_interrupted
-        mark_speech_interrupted()
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    from tools.bot_relay import DeliveryAuthor
-
-    # Only the relay handler can build a DeliveryAuthor. A dict here is a client claiming a sender.
-    raw_author = params.get("_turn_author")
-    if raw_author is not None and not isinstance(raw_author, DeliveryAuthor):
-        return _err(rid, 4124, "turn author is stamped by the gateway, never by a client")
-    turn_author = raw_author.author if raw_author is not None else None
-    hosted_task = params.get("_hosted_task")
-    hosted_terminal_callback = params.get("_hosted_terminal_callback")
-    hosted_images = params.get("_hosted_images")
-    internal_hosted_submit = (
-        hosted_task is not None or hosted_terminal_callback is not None or hosted_images is not None)
-    err = (
-        _hosted_submit_error(rid, session, hosted_task, hosted_terminal_callback, hosted_images)
-        if internal_hosted_submit else _legacy_group_fence_error(rid, session, params))
-    if err is not None:
-        return err
-    if (limit_message := _ensure_active_session_slot(sid, session)) is not None:
-        # Refused HERE — before the busy queue, db row and agent build — so a refusal
-        # leaves the session untouched.  The reason travels as machine-readable data.
-        return _slot_refusal(rid, sid, session, text, params, limit_message, internal_hosted_submit)
-    # Rewritten every submit: a session alternates app window / HUD / live voice; a stale value misinforms.
-    session["client_surface"] = params.get("surface") if params.get("surface") in _CLIENT_SURFACES else ""
-    # Live-voice delegations carry the recent spoken transcript for the MODEL INPUT only (the persisted
-    # user row stays the words the user said); anything else clears it.
-    voice_context = params.get("voice_context")
-    session["voice_live_context"] = (
-        voice_context[:6000] if session["client_surface"] == "voice-live" and isinstance(voice_context, str) else "")
-    session["voice_turn"] = params.get("voice_turn") is True
-    has_truncation = any(params.get(k) is not None for k in _TRUNCATION_PARAMS)
-    if has_truncation and isinstance(text, str):
-        # A rewind replays what the transcript shows: re-expand a skill invocation or
-        # `/work fix it` sends nine literal chars.
-        text = _expand_skill_invocation_for_replay(text, str(session.get("session_key") or ""))
-    turn_isolation = _session_uses_compute_host(session, _load_dashboard_process_isolation_config())
-    if internal_hosted_submit and turn_isolation:
-        return _err(rid, 4121, "hosted room turns do not support isolated compute workers yet")
-    # Re-bind to the current transport: streaming must stay on the active websocket even
-    # if a disconnect/fallback moved the session to stdio. Through _rebind_live_transport so a
-    # socket that already closed cannot cancel the orphan reap without coming back (#116464).
-    with _session_resume_lock:
-        if (refusal := _reattach_refusal(rid, sid, session)) is not None:
-            return refusal
-        if (t := current_transport()) is not None:
-            _rebind_live_transport(sid, session, t)
-    # Claim the turn against a possibly-running session (busy/queued reply, else fall
-    # through once ``running`` is observed False).  The provider interrupt happens after
-    # history_lock is released (a non-interruptible tool may hold it); if the old turn
-    # finished between the two acquisitions, retry the claim rather than strand this
-    # prompt in a queue whose drain already ran.
-    while True:
-        with session["history_lock"]:
-            if not session.get("running"):
-                break
-            if internal_hosted_submit:
-                return _err(rid, 4091, "hosted room member session is busy")
-            busy_transport = t or session.get("transport")
-        if has_truncation:
-            # A rewind/edit/restore/regenerate must land as a truncation, never as a
-            # steered correction or a plain follow-up queued to run after the live
-            # turn — either would silently drop the history cut the user asked for.
-            # Signal busy so the caller's own interrupt-then-retry loop (already
-            # built for exactly this race — see desktop's `runRewindSubmit`) waits
-            # for `running` to clear and resubmits with the truncation intact.
-            return _err(rid, 4009, "session busy")
-        busy_response = _handle_busy_submit(
-            rid, sid, session, text, busy_transport, queued=bool(params.get("queued")), turn_author=turn_author,
-            display_kind=display_kind)
-        if busy_response is not None:
-            return busy_response
-    raw_rebind_ids = params.get("rebind_survivor_row_ids")
-    requested_rebind_ids = (
-        {r for r in raw_rebind_ids if isinstance(r, int) and not isinstance(r, bool)}
-        if isinstance(raw_rebind_ids, list) else None)
-    err, survivor_fields = _claim_submit_turn(
-        rid, sid, session, text, params, has_truncation, requested_rebind_ids, hosted_task, display_kind,
-        internal_hosted_submit)
-    if err is not None:
-        return err
-    if turn_isolation:
-        if turn_author:
-            logger.debug("isolated compute turns carry no author yet; the turn from %s runs unattributed",
-                         turn_author.get("id"))
-        # The isolated dispatch returns BELOW before the inline persist, so the reopen
-        # cannot live only in _persist_session_row_for_submit: the turn is already
-        # admitted here (running, in flight, active-slot lease claimed, truncation
-        # applied inline), and the child's transcript writes must land in a live row
-        # (#85303 review: the early return made _reopen_if_finalized unreachable on
-        # this path). Best-effort like the helper: a failed read never blocks the send.
-        try:
-            with _session_db(session) as db:
-                if db is not None:
-                    _reopen_if_finalized(db, str(session.get("session_key") or ""))
-        except Exception:
-            logger.debug("finalized-session reopen before isolated dispatch failed for %s",
-                         sid, exc_info=True)
-        isolated_response = _submit_prompt_to_compute_host(
-            rid, sid, session, text, display_kind=display_kind, display_metadata=display_metadata)
-        if not isolated_response.get("error"):
-            # The truncation already happened inline above (memory + DB).
-            isolated_response["result"].update(survivor_fields)
-            return isolated_response
-        # An ordinal/id alone is not consent. A client that carries a leftover ordinal into an ORDINARY
-        # submit sends a request that is indistinguishable, field by field, from a real rewind — same
-        # method, same shape, an in-range target — and the cut it asks for is a destructive
-        # replace_messages() the user never requested (#80763: 296 -> 52 messages, 244 durable rows gone).
-        # Only the client knows whether this submit is a rewind/edit/regenerate, so it has to say so; refuse
-        # the cut when it doesn't. Consent is checked BEFORE target resolution: an unconfirmed
-        # (leaked-state) request must refuse with 4029 without paying the durable transcript read or
-        # heal-stamping live history dicts that row-id resolution performs.
-        logger.warning(
-            "compute-host dispatch failed for session %s; falling back inline: %s", sid,
-            isolated_response["error"].get("message", "unknown error"))
-    if (err := _persist_session_row_for_submit(rid, session, text, display_kind)) is not None:
-        return err
-    # Capture before starting the worker: it consumes the staging dict and may finish before the RPC returns.
-    staged_user = session.get("_submit_user_row") or {}
-    if isinstance(staged_user.get("_row_id"), int):
-        survivor_fields["user_row_id"] = staged_user["_row_id"]
-    # A completed FAILED build must not wedge the session: rebuild, don't replay it.
-    if not _restart_completed_failed_agent_build(sid, session, session.get("agent_ready")):
-        _start_agent_build(sid, session)
-    run_thread = threading.Thread(
-        target=lambda: _run_after_agent_ready(
-            rid, sid, session, text, display_kind, display_metadata, hosted_terminal_callback, turn_author,
-            hosted_images),
-        daemon=True, name=f"prompt-submit-{sid}")
-    # Handle lets session.interrupt tell a live turn from a stuck `running` flag.
-    session["_run_thread"] = run_thread
-    run_thread.start()
-    return _ok(rid, {"status": "streaming", **survivor_fields})
-
-
-@method("clipboard.paste")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    try:
-        from hermes_cli.clipboard import has_clipboard_image, save_clipboard_image
-    except Exception as e:
-        return _err(rid, 5027, f"clipboard unavailable: {e}")
-    session["image_counter"] = session.get("image_counter", 0) + 1
-    img_dir = _session_images_dir(session)
-    img_dir.mkdir(parents=True, exist_ok=True)
-    img_path = (
-        img_dir / f"clip_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{session['image_counter']}.png")
-    # Save-first (CLI keybinding parity): more robust than a has_image() precheck.
-    if not save_clipboard_image(img_path):
-        session["image_counter"] = max(0, session["image_counter"] - 1)
-        return _ok(rid, {"attached": False, "message": (
-            "Clipboard has image but extraction failed" if has_clipboard_image()
-            else "No image found in clipboard")})
-    session.setdefault("attached_images", []).append(str(img_path))
-    return _ok(rid, _attached_image_result(session, img_path))
-
-
-@method("image.attach")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    raw = str(params.get("path", "") or "").strip()
-    if not raw:
-        return _err(rid, 4015, "path required")
-    try:
-        from cli import (
-            _IMAGE_EXTENSIONS, _detect_file_drop, _resolve_attachment_path, _split_path_input)
-        if dropped := _detect_file_drop(raw):
-            image_path, remainder = dropped["path"], dropped["remainder"]
-        else:
-            path_token, remainder = _split_path_input(raw)
-            image_path = _resolve_attachment_path(path_token)
-            if image_path is None:
-                return _err(rid, 4016, f"image not found: {path_token}")
-        if image_path.suffix.lower() not in _IMAGE_EXTENSIONS:
-            return _err(rid, 4016, f"unsupported image: {image_path.name}")
-        session.setdefault("attached_images", []).append(str(image_path))
-        return _ok(rid, _attached_image_result(
-            session, image_path,
-            remainder=remainder, text=remainder or f"[User attached image: {image_path.name}]"))
-    except Exception as e:
-        return _err(rid, 5027, str(e))
-
-
-@method("image.attach_bytes")
-def _(rid, params: dict) -> dict:
-    """Attach an image from base64 bytes (remote client); reply mirrors ``image.attach``.
-    ``filename``/``ext`` hint the extension, else magic bytes decide (fallback ``.png``)."""
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
-    if not raw_b64:
-        return _err(rid, 4015, "content_base64 required")
-    img_bytes, err = _decode_attach_payload(
-        rid, raw_b64, mime_prefix="image/", max_bytes=_ATTACH_BYTES_MAX_BYTES,
-        label="image", empty_msg="image is empty")
-    if err is not None:
-        return err
-    filename = str(params.get("filename", "") or "")
-    ext_hint = str(params.get("ext", "") or "").strip().lower()
-    if ext_hint and not ext_hint.startswith("."):
-        ext_hint = "." + ext_hint
-    ext = _sniff_image_ext(img_bytes, filename or (f"x{ext_hint}" if ext_hint else ""))
-    if ext not in _allowed_image_extensions():
-        return _err(rid, 4016, f"unsupported image extension: {ext}")
-    try:
-        img_path = _queue_attached_image(session, img_bytes, ext, prefix="upload")
-    except Exception as e:
-        return _err(rid, 5027, f"write failed: {e}")
-    return _ok(rid, _attached_image_result(
-        session, img_path,
-        remainder="", text=f"[User attached image: {img_path.name}]", bytes=len(img_bytes)))
-
-
-@method("pdf.attach")
-def _(rid, params: dict) -> dict:
-    """Attach a PDF by rendering each page to PNG (``pdftoppm``; 5028 if missing) and
-    queuing the pages as images.  Host ``path`` or base64 ``content_base64``."""
-    import shutil
-    import subprocess
-    import tempfile
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    if shutil.which("pdftoppm") is None:
-        return _err(rid, 5028, "pdftoppm not installed (poppler-utils package required)")
-    raw_path = str(params.get("path", "") or "").strip()
-    raw_b64 = str(params.get("content_base64") or params.get("data") or "").strip()
-    if not raw_path and not raw_b64:
-        return _err(rid, 4015, "path or content_base64 required")
-    with tempfile.TemporaryDirectory(prefix="pdf_attach_") as td:
-        td_path = Path(td)
-        pdf_path, display_name, err = _pdf_attach_source(rid, params, td_path, raw_path, raw_b64)
-        if err is not None:
-            return err
-        first_page, last_page, err = _pdf_page_range(rid, params)
-        if err is not None:
-            return err
-        argv = [
-            "pdftoppm", "-png", "-r", "150", "-f", str(first_page), "-l", str(last_page),
-            str(pdf_path), str(td_path / "page")]
-        from hermes_cli._subprocess_compat import windows_hide_flags
-        try:
-            # UTF-8 + lossy decode: non-UTF-8 child output must not crash the gateway
-            # thread on locale-mismatched Windows.
-            res = subprocess.run(
-                argv, capture_output=True, text=True, timeout=120, stdin=subprocess.DEVNULL,
-                encoding="utf-8", errors="replace", creationflags=windows_hide_flags(), check=False)
-        except subprocess.TimeoutExpired:
-            return _err(rid, 5028, "pdftoppm timed out (>120s)")
-        if res.returncode != 0:
-            tail = (res.stderr or res.stdout or "").strip().splitlines()[-3:]
-            return _err(rid, 5028, "pdftoppm failed: " + " | ".join(tail))
-        rendered = sorted(td_path.glob("page-*.png"))
-        if not rendered:
-            return _err(rid, 5028, "pdftoppm produced no pages (corrupt PDF?)")
-        attached_pages = []
-        for src in rendered:
-            page_num = src.stem.split("-", 1)[-1]
-            try:
-                page_int = int(page_num)
-            except ValueError:
-                page_int = first_page + len(attached_pages)
-            dst = _queue_attached_image(
-                session, src.read_bytes(), ".png", prefix=f"pdf_p{page_num}")
-            attached_pages.append({"path": str(dst), "page": page_int, **_image_meta(dst)})
-        return _ok(rid, {
-            "attached": True, "filename": display_name, "pages_attached": len(attached_pages),
-            "pages": attached_pages, "count": len(session["attached_images"]),
-            "text": f"[User attached PDF: {display_name} ({len(attached_pages)} page(s))]"})
-
-
-@method("file.attach")
-def _(rid, params: dict) -> dict:
-    """Stage a non-image file into the session workspace; returns a workspace-relative
-    ``@file:`` ref.  ``data_url`` carries the bytes when ``path`` isn't gateway-visible."""
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    raw, data_url, name = (
-        str(params.get(k, "") or "").strip() for k in ("path", "data_url", "name"))
-    if not raw and not data_url:
-        return _err(rid, 4015, "path or data_url required")
-    try:
-        stored_path, uploaded = _stage_session_file_attachment(
-            session, raw_path=raw, data_url=data_url, name=name)
-        ref_path = _attachment_ref_path(session, stored_path)
-        return _ok(rid, {
-            "attached": True, "name": stored_path.name, "path": str(stored_path),
-            "ref_path": ref_path, "ref_text": f"@file:{_format_ref_value(ref_path)}",
-            "uploaded": uploaded})
-    except Exception as e:
-        return _err(rid, 5028, str(e))
-
-
-@method("image.detach")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_building(params, rid)
-    if err:
-        return err
-    raw = str(params.get("path", "") or "").strip()
-    if not raw:
-        return _err(rid, 4015, "path required")
-    before = len(images := session.setdefault("attached_images", []))
-    session["attached_images"] = [path for path in images if path != raw]
-    return _ok(rid, {
-        "detached": len(session["attached_images"]) != before,
-        "count": len(session["attached_images"])})
-
-
-@method("input.detect_drop")
-def _(rid, params: dict) -> dict:
-    session, err = _sess_nowait(params, rid)
-    if err:
-        return err
-    try:
-        from cli import _detect_file_drop
-        dropped = _detect_file_drop(str(params.get("text", "") or ""))
-        if not dropped:
-            return _ok(rid, {"matched": False})
-        drop_path, remainder = dropped["path"], dropped["remainder"]
-        if dropped["is_image"]:
-            session.setdefault("attached_images", []).append(str(drop_path))
-            return _ok(rid, {
-                "matched": True, "is_image": True, "path": str(drop_path),
-                "count": len(session["attached_images"]),
-                "text": remainder or f"[User attached image: {drop_path.name}]",
-                **_image_meta(drop_path)})
-        text = f"[User attached file: {drop_path}]" + (f"\n{remainder}" if remainder else "")
-        return _ok(rid, {
-            "matched": True, "is_image": False, "path": str(drop_path), "name": drop_path.name,
-            "text": text})
-    except Exception as e:
-        return _err(rid, 5027, str(e))
-
-
-@method("prompt.background")
-def _(rid, params: dict) -> dict:
-    session, text, parent, task_id, err = _side_agent_args(rid, params, "bg")
-    if err:
-        return err
-
-    def body():
-        from run_agent import AIAgent
-        kwargs = _background_agent_kwargs(session["agent"], task_id)
-        with _side_agent_session_db(kwargs.get("session_db")) as session_db, _persistence_for(session_db) as persistence:
-            agent = AIAgent(**{**kwargs, "session_db": session_db, "persistence": persistence})
-            try:
-                result = agent.run_conversation(user_message=text, task_id=task_id)
-            finally:
-                # AIAgent.close() is the owner boundary (memory shutdown, tool
-                # subprocesses, httpx clients); an unclosed side agent leaks
-                # all of them for the gateway's life (#50197).
-                with contextlib.suppress(Exception):
-                    agent.close()
-        return _final_response_text(result)
-
-    return _spawn_side_agent(rid, session, task_id, parent, "background.complete", body)
-
-
-@method("prompt.btw")
-def _(rid, params: dict) -> dict:
-    """Side question over a snapshot of the live conversation (``agent/side_question.py``);
-    history, alternation and prompt cache stay untouched.  Answer: ``btw.complete``."""
-    session, text, parent, task_id, err = _side_agent_args(rid, params, "btw")
-    if err:
-        return err
-    agent = session.get("agent")
-    snapshot = list(getattr(agent, "_session_messages", None) or session.get("history") or [])
-    main_runtime = {
-        k: getattr(agent, k, None)
-        for k in ("model", "provider", "base_url", "api_key", "api_mode", "session_id")}
-
-    def body():
-        from agent.side_question import answer_side_question
-        return answer_side_question(
-            text, snapshot, parent_agent=agent, main_runtime=main_runtime) or ""
-
-    return _spawn_side_agent(
-        rid, session, task_id, parent, "btw.complete", body, extra={"question": text})
-
-
-@method("preview.restart")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    url, cwd, context = (str(params.get(k) or "").strip() for k in ("url", "cwd", "context"))
-    if not url:
-        return _err(rid, 4012, "url required")
-    task_id = f"preview_{uuid.uuid4().hex[:6]}"
-    parent = params.get("session_id", "")
-    with session.get("history_lock") or contextlib.nullcontext():
-        snapshot = list(session.get("history") or [])
-    parent_history = _preview_restart_history(snapshot)
-    prompt = _preview_restart_prompt(url, cwd, context, bool(parent_history))
-    preview_cwd = _validated_preview_cwd(cwd)
-
-    def body():
-        from run_agent import AIAgent
-        from tools.terminal_tool import register_task_env_overrides
-        if preview_cwd:
-            register_task_env_overrides(task_id, {"cwd": preview_cwd})
-        history_note = (
-            f" (with {len(parent_history)} parent-session messages of context)"
-            if parent_history else "")
-        _emit(
-            "preview.restart.progress", parent,
-            {"task_id": task_id, "text": f"Starting hidden restart agent{history_note}"})
-        # Deliberately NOT closed via AIAgent.close(): it would kill the background
-        # server this task exists to leave running.
-        result = AIAgent(
-            **_ephemeral_preview_agent_kwargs(session["agent"], task_id),
-            **_preview_restart_callbacks(parent, task_id),
-        ).run_conversation(
-            user_message=prompt, task_id=task_id, conversation_history=parent_history or None)
-        return _final_response_text(result)
-
-    def cleanup():
-        with contextlib.suppress(Exception):
-            from tools.terminal_tool import clear_task_env_overrides
-            clear_task_env_overrides(task_id)
-
-    # Pin the validated preview cwd, else the parent workspace — never an invalid path.
-    return _spawn_side_agent(
-        rid, session, task_id, parent, "preview.restart.complete", body,
-        cwd=preview_cwd, cleanup=cleanup)
-
-
-@method("clarify.lock")
-def _(rid, params: dict) -> dict:
-    request_id = str(params.get("request_id") or "")
-    question_id = str(params.get("question_id") or "")
-    if not request_id or not question_id:
-        return _err(rid, 4002, "request_id and question_id required")
-    answer = params.get("answer", "")
-    if answer is not None and not isinstance(answer, str):
-        answer = json.dumps(answer, ensure_ascii=False)
-    if (proxied := _lock_compute_host_clarify(rid, request_id, question_id, answer)) is not None:
-        return proxied
-    from tui_gateway import server_requests
-    try:
-        remaining = server_requests.lock_answer(request_id, question_id, answer)
-    except ValueError as e:
-        return _err(rid, 4002, str(e))
-    if remaining is None:
-        # The wait already ended (timeout / cancel) while the card was still visible: not an error.
-        return _ok(rid, {"status": "expired"})
-    return _ok(rid, {"status": "ok", "remaining": remaining})
-
-
-@method("request.answer")
-def _(rid, params: dict) -> dict:
-    """Answer an open server→client request from a client that did not receive it (a Bot Mode room
-    window answering a member's prompt mirrored from its resume snapshot). The response-frame path is
-    the norm; this is the proxy for it. ``expired`` when the request already ended."""
-    request_id = str(params.get("id") or "")
-    result = params.get("result")
-    if not request_id or not isinstance(result, dict):
-        return _err(rid, 4002, "id and an object result required")
-    from tui_gateway import server_requests
-    frame = {"jsonrpc": "2.0", "id": request_id, "result": result}
-    if server_requests.resolve_response(frame) or _relay_compute_host_response(frame):
-        return _ok(rid, {"status": "ok"})
-    return _ok(rid, {"status": "expired"})
-
-
-@method("approval.pending")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    return _approval_reply(
-        rid, "approvals", lambda a: a.list_gateway_approvals(session["session_key"]))
-
-
-@method("approval.received")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        return err
-    if not isinstance(request_id := params.get("request_id"), str) or not request_id:
-        return _err(rid, 4006, "request_id required")
-    return _approval_reply(
-        rid, "acknowledged", lambda a: a.ack_gateway_approval(session["session_key"], request_id))
-
-
-@method("approval.respond")
-def _(rid, params: dict) -> dict:
-    session, err = _sess(params, rid)
-    if err:
-        # Session-not-found (4001) only: resolve by durable identity before failing.
-        if (err.get("error") or {}).get("code") != 4001:
-            return err
-        session = _approval_respond_session_fallback(params)
-        if session is None:
-            return err
-    return _approval_reply(
-        rid, "resolved",
-        lambda a: a.resolve_gateway_approval(
-            session["session_key"], params.get("choice", "deny"),
-            resolve_all=params.get("all", False), request_id=params.get("request_id")))
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
 
 
 # ── attachments ─────────────────────────────────────────────────────────────

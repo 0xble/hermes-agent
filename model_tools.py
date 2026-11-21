@@ -1128,19 +1128,14 @@ def handle_function_call(
         return scrub_browser_result(function_name, transformed, ids.task_id)
 
     except Exception as e:
-<<<<<<< HEAD
         from agent.browser_output_egress import scrub_browser_result
         # Browser exceptions can quote page values: scrub before the model, hooks or logs see them.
         detail = scrub_browser_result(function_name, str(e), ids.task_id)
-||||||| dff103e05878
-=======
-        from storage_user_copy import error_type_name
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         error_msg = f"Error executing {function_name}: {detail}"
         # A traceback repeats the raw message: omit it whenever scrubbing changed the text.
         logger.error(error_msg, exc_info=detail == str(e))
         return _emit(tool_error(_sanitize_tool_error(error_msg)), duration_ms=_elapsed_ms(start),
-                     status="error", error_type=error_type_name(e), error_message=detail)
+                     status="error", error_type=type(e).__name__, error_message=detail)
 
 
 # =============================================================================

@@ -164,7 +164,7 @@ def _session_key_or_err(rid, session, module: str, label: str):
 
 def _user_turn_indices(session):
     """(history, indices of user-originated turns) minus ephemeral scaffolding. Call under history_lock."""
-    is_user = _tools_mod("session_rules.turns").user_originated_turn_view
+    is_user = _tools_mod("agent.context_compressor").user_originated_turn_view
     history = _history_without_ephemeral_scaffolding(session.get("history", []))
     return history, [i for i, m in enumerate(history) if is_user(m) is not None]
 
@@ -755,14 +755,8 @@ def _cmd_retry(rid, params, session, name, arg):
         return _err(rid, 4001, "no active session to retry")
     if busy := _busy_error(rid, session, "retry"):
         return busy
-<<<<<<< HEAD
     cc = _tools_mod("agent.context_compressor")
     from agent.context_compressor_retry import retryable_user_text
-||||||| dff103e05878
-    cc = _tools_mod("agent.context_compressor")
-=======
-    cc = _tools_mod("session_rules.turns")
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     with session["history_lock"]:
         if busy := _busy_error(rid, session, "retry"):
             return busy
@@ -865,7 +859,7 @@ def _cmd_undo(rid, params, session, name, arg):
         if err:
             return err
         active, live_view, rewound_count = rewound
-        target_text = _tools_mod("session_rules.turns").flatten_message_text(live_view.get("content"))
+        target_text = _tools_mod("agent.message_content").flatten_message_text(live_view.get("content"))
     # Notify memory providers (same hook /branch fires) with rewound=True so cached per-turn state invalidates.
     agent = session.get("agent")
     if agent is not None:
@@ -1136,14 +1130,12 @@ def _(rid, params: dict) -> dict:
     days = params.get("days", 30)
     # ``profile`` selects that profile's store; the launch handle is never the fallback for a
     # scoped call (a foreign first touch used to pin the process-wide handle, #102526).
-    from persistence.conversation.sessions import SessionQuery, SessionWindow
-    with _profile_db(params) as db, _persistence_for(db) as persistence:
-        if persistence is None:
+    with _profile_db(params) as db:
+        if db is None:
             return _db_unavailable_error(rid, code=5017)
         cutoff = time.time() - days * 86400
-        entries = persistence.sessions.list_sessions(SessionQuery(), SessionWindow(limit=500), compact_rows=True)
-        rows = [e.session for e in entries if (e.session.started_at or 0) >= cutoff]
-    return _ok(rid, {"days": days, "sessions": len(rows), "messages": sum(s.message_count for s in rows)})
+        rows = [s for s in db.list_sessions_rich(limit=500, compact_rows=True) if (s.get("started_at") or 0) >= cutoff]
+    return _ok(rid, {"days": days, "sessions": len(rows), "messages": sum(s.get("message_count", 0) for s in rows)})
 
 
 @_rpc("rollback.list", live_session=True, fail_code=5020)
@@ -1176,7 +1168,7 @@ def _(rid, params: dict, session) -> dict:
             return {"success": False, "error": reason}
         # A whole-tree restore keeps the user's hand-edits unless ``all`` (main's --all), as on the owner.
         commit = _resolve_checkpoint_hash(mgr, cwd, target)
-        taken = _tools_mod("agent.checkpoints.undo_hint").checkpoint_taken_at(cwd, commit)
+        taken = _tools_mod("tools.checkpoint_undo_hint").checkpoint_taken_at(cwd, commit)
         result = mgr.restore(cwd, commit, file_path=file_path or None,
                              safe=not file_path and params.get("all") is not True)
         if result.get("success") and not file_path:
@@ -1184,7 +1176,7 @@ def _(rid, params: dict, session) -> dict:
             with session["history_lock"]:
                 history, user_indices = _user_turn_indices(session)
                 # Not a turn /undo kept: only one that made or followed this checkpoint.
-                if _tools_mod("agent.checkpoints.undo_hint").rollback_rewinds_newest_turn(history, user_indices, taken):
+                if _tools_mod("tools.checkpoint_undo_hint").rollback_rewinds_newest_turn(history, user_indices, taken):
                     try:
                         removed = _rewind_active_session_history(session, len(user_indices) - 1)[2]
                     except SessionNotOwned:

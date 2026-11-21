@@ -7,8 +7,6 @@ import pytest
 from gateway.config import PlatformConfig
 from plugins.platforms.telegram import telegram_send_path_recovery as recovery
 from plugins.platforms.telegram.adapter import TelegramAdapter
-from tests.fixtures.storage_holder import raw_holder
-from tests.gateway.fixtures.storage_handles import close_storage_handles, storage_handle
 
 
 class _Runner:
@@ -137,7 +135,7 @@ async def test_stopping_a_profile_mid_recovery_leaves_no_reply_stranded(tmp_path
     from gateway.config import Platform
     from gateway.run import GatewayRunner
 
-    monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # the ledger opens the launch home's store
+    monkeypatch.setattr(ledger, "_db_path", lambda: tmp_path / "state.db")
     monkeypatch.setattr(ledger, "ledger_enabled", lambda config=None: True)
     for oid in ("ob-1", "ob-2", "ob-3"):
         ledger.record_obligation(obligation_id=oid, session_key=f"agent:work:telegram:dm:{oid}",
@@ -192,7 +190,6 @@ async def test_stopping_a_profile_mid_recovery_leaves_no_reply_stranded(tmp_path
     assert len(sent) == (1 if stop_during == "send" else 0)
 
     # The profile starts again and its next sweep runs.
-<<<<<<< HEAD
     assert await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile="work") == (
         2 if stop_during == "send" else 3)
     assert len(sent) == 3
@@ -200,16 +197,4 @@ async def test_stopping_a_profile_mid_recovery_leaves_no_reply_stranded(tmp_path
     states = {oid: ledger._connect().execute(
         "SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
         for oid in ("ob-1", "ob-2", "ob-3")}
-||||||| dff103e05878
-    assert await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile="work") == 3
-    states = {oid: ledger._connect().execute(
-        "SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
-        for oid in ("ob-1", "ob-2", "ob-3")}
-=======
-    assert await runner._redeliver_failed_obligations_for_platform(Platform.TELEGRAM, profile="work") == 3
-    with raw_holder(storage_handle(ledger._scope().profile_dir))._read_ctx() as conn:
-        states = {oid: conn.execute(
-            "SELECT state FROM delivery_obligations WHERE obligation_id=?", (oid,)).fetchone()[0]
-            for oid in ("ob-1", "ob-2", "ob-3")}
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
     assert states == {"ob-1": "delivered", "ob-2": "delivered", "ob-3": "delivered"}

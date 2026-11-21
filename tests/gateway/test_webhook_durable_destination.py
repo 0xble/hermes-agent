@@ -10,7 +10,6 @@ from aiohttp.test_utils import TestClient, TestServer
 from gateway.config import PlatformConfig
 from gateway.platforms.webhook import WebhookAdapter
 from tests.gateway.fixtures.webhook_route_authority import mount_authority
-from tests.fixtures.storage_holder import raw_holder
 
 
 @pytest.mark.asyncio
@@ -31,7 +30,7 @@ async def test_destination_commits_with_input_and_survives_adapter_restart():
         response = await client.post('/webhooks/fixture', data=body, headers=headers)
         assert response.status == 202, await response.text()
         runner = adapter._message_handler.__self__
-        row = raw_holder(runner.session_authority.persistence)._read_one('SELECT payload_json FROM session_admissions')
+        row = runner.session_authority.db._read_one('SELECT payload_json FROM session_admissions')
         retained = json.loads(row['payload_json'])['native_text_v1']['webhook_delivery']
         assert retained['deliver'] == 'github_comment'
         assert retained['deliver_extra'] == {'repo': 'owned/repo', 'pr_number': '7'}
@@ -84,14 +83,14 @@ async def test_later_automation_completion_keeps_original_destination_resolvable
         # The production completion path: an internal native_text_v1 admission on the original chat.
         from gateway.platforms.event import MessageEvent
         from gateway.session_envelope import restore_native
-        origin = restore_native(json.loads(raw_holder(authority.persistence)._read_one(
+        origin = restore_native(json.loads(authority.db._read_one(
             'SELECT payload_json FROM session_admissions')['payload_json']), runner)
         entry = runner.session_store.lookup_by_session_key(runner.session_store._generate_session_key(origin.source))
         completion = MessageEvent(text='[process finished]', source=origin.source, internal=True,
                                   metadata={'gateway_session_key': entry.session_key,
                                             'gateway_session_id': entry.session_id})
         await authority.admit_automation(adapter, completion, 'process:abc:1')
-        assert len(raw_holder(authority.persistence)._read_all('SELECT admission_id FROM session_admissions')) == 2
+        assert len(authority.db._read_all('SELECT admission_id FROM session_admissions')) == 2
         assert (await adapter.send(chat_id, 'second reply')).success
         assert [content for content, _ in calls] == ['first reply', 'second reply']
         assert calls[0][1] == calls[1][1] == {'deliver': 'github_comment',
@@ -129,26 +128,26 @@ async def test_exact_legacy_webhook_retry_keeps_receipt_without_inference():
                    'sha256=' + hmac.new(b'owned-secret', body, hashlib.sha256).hexdigest()}
         assert (await client.post('/webhooks/fixture', data=body, headers=headers)).status == 202
         authority = adapter._message_handler.__self__.session_authority
-        row = raw_holder(authority.persistence)._read_one('SELECT admission_id,payload_json FROM session_admissions')
+        row = authority.db._read_one('SELECT admission_id,payload_json FROM session_admissions')
         legacy = json.loads(row['payload_json'])
         legacy['native_text_v1'].pop('webhook_delivery')
         legacy['native_text_v1'].pop('webhook_route')
         encoded = json.dumps(legacy, sort_keys=True, separators=(',', ':'))
-        raw_holder(authority.persistence)._execute_write(lambda conn: conn.execute(
+        authority.db._execute_write(lambda conn: conn.execute(
             'UPDATE session_admissions SET payload_json=?, payload_digest=? WHERE admission_id=?',
             (encoded, hashlib.sha256(encoded.encode()).hexdigest(), row['admission_id'])))
         adapter._seen_deliveries.clear()
         retry = await client.post('/webhooks/fixture', data=body, headers=headers)
         assert retry.status == 200, await retry.text()
-        assert raw_holder(authority.persistence)._read_one('SELECT payload_json FROM session_admissions')['payload_json'] == encoded
-        assert len(raw_holder(authority.persistence)._read_all('SELECT admission_id FROM session_admissions')) == 1
+        assert authority.db._read_one('SELECT payload_json FROM session_admissions')['payload_json'] == encoded
+        assert len(authority.db._read_all('SELECT admission_id FROM session_admissions')) == 1
         # Receipt compatibility cannot authorize an invented destination or changed input.
         from gateway.session_envelope import check_native_route, restore_native
-        from persistence.core.errors import AuthorityRefusal
+        from hermes_state_runtime import RuntimeStoreError
         event = restore_native(legacy)
-        with pytest.raises(AuthorityRefusal):
+        with pytest.raises(RuntimeStoreError):
             await check_native_route(authority.runner, legacy,
-                raw_holder(authority.persistence)._read_one('SELECT target_session_id FROM session_admissions')['target_session_id'],
+                authority.db._read_one('SELECT target_session_id FROM session_admissions')['target_session_id'],
                 event.source, adapter)
         adapter._seen_deliveries.clear()
         changed = json.dumps({'text': 'changed'}).encode()
@@ -174,33 +173,26 @@ async def test_fenced_webhook_retry_only_observes_existing_receipt(fence):
         if fence == 'draining':
             authority.runner._draining = True
         else:
-<<<<<<< HEAD
             from tests.fakes.runtime_owner import begin_runtime_epoch
             begin_runtime_epoch(authority.db, instance_id='replacement-owner')
-||||||| dff103e05878
-            from hermes_state_runtime import begin_runtime_epoch
-            begin_runtime_epoch(authority.db, instance_id='replacement-owner')
-=======
-            authority.persistence.runtime.begin_epoch(instance_id='replacement-owner')
->>>>>>> 32dbc1dcda2255fd35969ec99cfc0170988c3eca
         schedules = []
         authority._schedule = schedules.append
         async def forbidden_admission(event):
             pytest.fail('observing a receipt must not admit new work')
         original_admit = authority.admit_native
         authority.admit_native = forbidden_admission
-        with raw_holder(authority.persistence)._read_ctx() as conn:
+        with authority.db._read_ctx() as conn:
             before = tuple(conn.iterdump())
         adapter._seen_deliveries.clear()
         response = await client.post('/webhooks/fixture', data=body, headers=headers)
         assert response.status == 200, await response.text()
-        with raw_holder(authority.persistence)._read_ctx() as conn:
+        with authority.db._read_ctx() as conn:
             assert tuple(conn.iterdump()) == before
         assert schedules == []
-        row = raw_holder(authority.persistence)._read_one('SELECT status FROM session_admissions')
+        row = authority.db._read_one('SELECT status FROM session_admissions')
         assert row['status'] == 'queued'
         authority.admit_native = original_admit
         headers['X-GitHub-Delivery'] = 'never-accepted'
         assert (await client.post('/webhooks/fixture', data=body, headers=headers)).status == 503
-        assert len(raw_holder(authority.persistence)._read_all('SELECT admission_id FROM session_admissions')) == 1
+        assert len(authority.db._read_all('SELECT admission_id FROM session_admissions')) == 1
         assert schedules == []
