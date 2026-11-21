@@ -49,6 +49,15 @@ def _update_profile(home: Path, project: Path) -> None:
     (project / "AGENTS.md").write_text("Project rules revision two.", encoding="utf-8")
 
 
+def _set_gateway_mode(home: Path, mode: str) -> None:
+    import hermes_yaml as yaml
+
+    config_path = home / "config.yaml"
+    config = yaml.safe_load(config_path.read_text()) or {}
+    config["delegation"] = {"gateway_mode": mode}
+    config_path.write_text(yaml.safe_dump(config), encoding="utf-8")
+
+
 @pytest.fixture
 def profile(monkeypatch, tmp_path):
     home = Path(os.environ["HERMES_HOME"])
@@ -304,6 +313,21 @@ def test_refresh_keeps_the_sessions_tools_pin(profile, monkeypatch):
     _turn(srv, home, "chat-new", "hello", [])
     assert _tool_description(srv.main_requests()[-1], "clarify") == changed
 
+
+def test_refresh_converges_the_pinned_delegate_mode_from_explicit_config(profile, monkeypatch):
+    srv, home, project = profile
+    _set_gateway_mode(home, "background")
+    history, _ = _turn(srv, home, "chat-a", "hello", [])
+    first_tool = next(t["function"] for t in srv.main_requests()[-1]["tools"] if t["function"]["name"] == "delegate_task")
+    assert "Parallel children are joined and their results return in this tool call." not in first_tool["description"]
+
+    _set_gateway_mode(home, "inline")
+    _update_profile(home, project)
+    _refresh_prompts(monkeypatch, home)
+    _turn(srv, home, "chat-a", "next", history)
+
+    tool = next(t["function"] for t in srv.main_requests()[-1]["tools"] if t["function"]["name"] == "delegate_task")
+    assert "Parallel children are joined and their results return in this tool call." in tool["description"]
 
 def test_refresh_prompts_unknown_session_fails(profile, monkeypatch, capsys):
     import hermes_cli.main as main_mod

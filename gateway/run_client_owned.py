@@ -15,6 +15,13 @@ async def start_runner_for_owner(runner) -> bool:
     logging.getLogger("gateway.run").info("Starting Hermes Gateway...")
     if getattr(runner, "_client_owned", False):
         return await start_client_owned_runner(runner)
+    from gateway.zero_cut_standby import is_standby
+    if not is_standby():
+        from agent.incognito_private_dir import sweep_private_dirs
+        removed = sweep_private_dirs()
+        if removed:
+            logging.getLogger(__name__).info(
+                "Incognito startup sweep removed %d private directories", removed)
     return await runner._start_impl()
 
 

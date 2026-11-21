@@ -41,6 +41,7 @@ def remote_env(monkeypatch, tmp_path):
     env = _FakeRemoteEnv()
     monkeypatch.setattr(media_fetch, "_active_remote_env", lambda: env)
     monkeypatch.setattr("gateway.platforms.base.DOCUMENT_CACHE_DIR", tmp_path / "cache" / "documents")
+    monkeypatch.setattr("gateway.platforms.base.get_document_cache_dir", lambda: tmp_path / "cache" / "documents")
     monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (tmp_path / "cache" / "documents",))
     return env
 
@@ -64,6 +65,19 @@ def test_local_backend_and_strict_mode_do_not_fetch(monkeypatch, tmp_path, remot
     monkeypatch.setattr(media_fetch, "_active_remote_env", lambda: None)
     assert BasePlatformAdapter.filter_media_delivery_paths([(str(tmp_path / "nope.txt"), False)]) == []
     assert remote_env.fetched == []
+
+
+def test_remote_fetch_uses_resolved_document_cache(monkeypatch, tmp_path, remote_env):
+    from agent.incognito import incognito_scope
+
+    private_root = tmp_path / "private-interval"
+    private_cache = private_root / "cache" / "documents"
+    monkeypatch.setattr("agent.incognito_private_dir.private_path_for_current_session", lambda: private_root)
+    monkeypatch.setattr("gateway.platforms.base.get_document_cache_dir", lambda: private_cache)
+    with incognito_scope(True, session_id="private-media"):
+        delivered = BasePlatformAdapter.filter_media_delivery_paths([("/home/agent/out/report.txt", False)])
+    assert delivered and Path(delivered[0][0]).parent == private_cache
+    assert Path(delivered[0][0]).read_bytes() == b"hello from sandbox"
 
 
 class _ScriptedEnv(BaseEnvironment):

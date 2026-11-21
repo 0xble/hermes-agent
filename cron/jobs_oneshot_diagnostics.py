@@ -81,12 +81,16 @@ def write_retired(
 ) -> None:
     """Route both retirement gates through the same interrupted-versus-unrun diagnostic."""
     from cron.jobs_oneshot import occurrence_finished, occurrence_started
-    from cron.jobs import _hermes_now, ONESHOT_GRACE_SECONDS
+    from cron.jobs import _hermes_now, oneshot_grace_seconds
 
     if occurrence_started(job) and not occurrence_finished(job):
         # A consumed, unfinished dispatch may already have side effects.
         write_wedged(job)
         return
+    # The window the retirement gate applied to THIS job, not the global floor: an owner told
+    # "120s" about a job allowed 600s would recreate it with the wrong expectation.
+    seconds = oneshot_grace_seconds(job)
+    grace = int(seconds) if seconds.is_integer() else seconds
     reason = "dispatch limit reached" if dispatch_limit else "run time outside grace window"
     _write(
         job,
@@ -94,7 +98,7 @@ def write_retired(
         f"- job id: {job.get('id')}\n"
         f"- name: {job.get('name')}\n"
         f"- scheduled run time: {next_run}\n"
-        f"- grace window: {ONESHOT_GRACE_SECONDS}s\n"
+        f"- grace window: {grace}s\n"
         f"- removed at: {_hermes_now().isoformat()}\n\n"
         f"This one-shot was removed without running: {reason}. "
         "A re-armed record may have consumed its dispatch budget on a prior run. "

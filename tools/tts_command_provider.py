@@ -351,7 +351,10 @@ def _generate_command_tts(
     if output.exists():
         output.unlink()
     timeout = _get_command_tts_timeout(config)
-    with tempfile.TemporaryDirectory() as tmpdir:
+    from agent.incognito_private_dir import disposable_path_for_current_session
+    private_root = disposable_path_for_current_session()
+    temp_parent = str(private_root) if private_root is not None else None
+    with tempfile.TemporaryDirectory(dir=temp_parent) as tmpdir:
         text_path = Path(tmpdir) / "input.txt"
         text_path.write_text(text, encoding="utf-8")
         placeholders = {

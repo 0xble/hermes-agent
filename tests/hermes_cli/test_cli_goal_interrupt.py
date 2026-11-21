@@ -107,6 +107,53 @@ class TestHealthyTurnStillRuns:
         assert "Continuing toward your standing goal" in queued
         assert mgr.state.status == "active"
 
+    def test_failed_synthetic_continuation_is_requeued_without_judging(self, hermes_home):
+        sid = f"sid-failed-{uuid.uuid4().hex}"
+        cli, mgr = _make_cli_with_goal(sid)
+        cli._goal_turn_user_initiated = False
+        cli._last_turn_origin = "goal_loop"
+        cli._last_turn_is_goal_continuation = True
+        cli._last_turn_failed = True
+        cli._last_turn_started = True
+        cli._last_turn_result = {
+            "completed": False,
+            "failed": True,
+            "final_response": "Your request was not processed. Send it again if you still want me to carry it out.",
+        }
+
+        with patch("hermes_cli.goals.judge_goal") as judge:
+            cli._maybe_continue_goal_after_turn()
+
+        judge.assert_not_called()
+        assert mgr.state.status == "active"
+        assert "Continuing toward your standing goal" in cli._pending_input.get_nowait()
+
+    def test_user_skill_turn_is_not_classified_as_synthetic(self, hermes_home):
+        from hermes_cli.cli_loops_mixin import _is_explicit_synthetic_turn
+
+        assert _is_explicit_synthetic_turn("/skill software-development") is False
+        assert _is_explicit_synthetic_turn("[IMPORTANT: user-authored note]") is False
+        assert _is_explicit_synthetic_turn("[Continuing toward your standing goal]\nGoal: build") is True
+
+    def test_failed_user_turn_keeps_the_visible_notice_path(self, hermes_home):
+        sid = f"sid-user-failed-{uuid.uuid4().hex}"
+        cli, mgr = _make_cli_with_goal(sid)
+        cli._goal_turn_user_initiated = True
+        cli._last_turn_failed = True
+        cli._last_turn_started = True
+        cli._last_turn_result = {
+            "completed": False,
+            "failed": True,
+            "final_response": "Your request was not processed. Send it again if you still want me to carry it out.",
+        }
+
+        with patch("hermes_cli.goals.judge_goal") as judge:
+            cli._maybe_continue_goal_after_turn()
+
+        judge.assert_not_called()
+        assert cli._pending_input.empty()
+        assert mgr.state.status == "active"
+
     def test_clean_response_marks_done_when_judge_says_done(self, hermes_home):
         sid = f"sid-done-{uuid.uuid4().hex}"
         cli, mgr = _make_cli_with_goal(sid)

@@ -52,31 +52,125 @@ class IncognitoPluginTests(unittest.TestCase):
         self.assertEqual(self.manager.invoke_hook("pre_tool_call", content="normal"), ["unsafe", "safe"])
         self.assertEqual([name for name, _ in self.seen], ["unsafe", "safe"])
 
-    def test_plugin_tools_require_the_same_privacy_opt_in_as_hooks(self):
+    def test_undeclared_plugin_tool_is_refused_and_writes_nothing(self):
         from tools.registry import registry
 
-        for ctx in (self.unsafe, self.safe):
-            name = "incognito_probe_" + ctx.plugin_id
-            callback = mock.Mock(return_value='{"ok": true}')
-            handle = ctx.register_tool(
-                name=name, toolset="incognito-probe",
-                schema={"name": name, "parameters": {"type": "object"}},
-                handler=callback,
+        register_session(self.sid, True)
+        callback = mock.Mock(return_value='{"ok": true}')
+        handle = self.unsafe.register_tool(
+            name="incognito_probe_undeclared", toolset="incognito-probe",
+            schema={"name": "incognito_probe_undeclared", "parameters": {"type": "object"}},
+            handler=lambda args, **kwargs: callback(args, **kwargs),
+        )
+        assert handle is not None
+        self.addCleanup(handle.dispose)
+        try:
+            result = registry.dispatch("incognito_probe_undeclared", {"content": CANARY}, session_id=self.sid)
+            self.assertEqual(result, '{"error": "This plugin tool is unavailable in incognito mode."}')
+            callback.assert_not_called()
+            self.assertFalse((self.home / "plugin-data").exists())
+            self.assertFalse((self.home / "memories").exists())
+        finally:
+            register_session(self.sid, False)
+
+    def test_declared_safe_plugin_state_and_storage_stay_private(self):
+        from agent.incognito_private_dir import bind_private_session, discard_private_dir
+        from hermes_cli.plugins_state import PluginState
+        from plugins.plugin_storage import plugin_data_dir
+        from tools.registry import registry
+
+        register_session(self.sid, True)
+        interval = self.home / "private-interval"
+        interval.mkdir()
+        bind_private_session(self.sid, interval)
+        state = PluginState("safe", "safe-state")
+
+        def handler(args, **kwargs):
+            plugin_data_dir("safe").joinpath("state.txt").write_text(args["content"], encoding="utf-8")
+            state.set("secret", args["content"])
+            assert state.path.is_relative_to(interval)
+            return '{"ok": true}'
+
+        handle = self.safe.register_tool(
+            name="incognito_probe_safe", toolset="incognito-probe",
+            schema={"name": "incognito_probe_safe", "parameters": {"type": "object"}},
+            handler=handler,
+        )
+        assert handle is not None
+        self.addCleanup(handle.dispose)
+        try:
+            self.assertEqual(
+                registry.dispatch("incognito_probe_safe", {"content": CANARY}, session_id=self.sid),
+                '{"ok": true}',
             )
-            assert handle is not None
-            self.addCleanup(handle.dispose)
-            with incognito_scope():
-                result = registry.dispatch(name, {"content": CANARY})
-            if ctx is self.safe:
-                self.assertEqual(result, '{"ok": true}')
-                callback.assert_called_once()
-            else:
-                assert isinstance(result, str)
-                self.assertIn("incognito", result.lower())
-                callback.assert_not_called()
-            callback.reset_mock()
-            self.assertEqual(registry.dispatch(name, {"content": "normal"}), '{"ok": true}')
-            callback.assert_called_once()
+            self.assertEqual((interval / "plugin-data" / "safe" / "state.txt").read_text(encoding="utf-8"), CANARY)
+            self.assertFalse((self.home / "plugin-data").exists())
+        finally:
+            register_session(self.sid, False)
+            discard_private_dir(self.sid)
+        self.assertFalse(interval.exists())
+
+    def test_incognito_safe_plugin_cannot_persist_settings(self):
+        from hermes_cli.plugins_state import save_plugin_setting
+
+        register_session(self.sid, True)
+        config = self.home / "config.yaml"
+        config.write_text(
+            "plugins:\n  entries:\n    safe:\n      settings:\n        existing: keep\n",
+            encoding="utf-8",
+        )
+        before = config.read_bytes()
+        try:
+            with incognito_scope(session_id=self.sid):
+                with self.assertRaisesRegex(PermissionError, "incognito mode"):
+                    save_plugin_setting("safe", ("probe",), CANARY)
+            self.assertEqual(config.read_bytes(), before)
+            self.assertNotIn(CANARY.encode(), config.read_bytes())
+        finally:
+            register_session(self.sid, False)
+
+    def test_explicit_false_plugin_tool_stays_refused(self):
+        from tools.registry import registry
+        denied = PluginContext(
+            PluginManifest(name="declared-unsafe", incognito_safe=False), self.manager,
+        )
+        callback = mock.Mock(return_value='{"ok": true}')
+        handle = denied.register_tool(
+            name="incognito_probe_declared_unsafe", toolset="incognito-probe",
+            schema={"name": "incognito_probe_declared_unsafe", "parameters": {"type": "object"}},
+            handler=callback,
+        )
+        assert handle is not None
+        self.addCleanup(handle.dispose)
+        with incognito_scope(session_id=self.sid):
+            result = registry.dispatch("incognito_probe_declared_unsafe", {"content": CANARY})
+        self.assertIsInstance(result, str)
+        self.assertIn("incognito", result.lower())
+        callback.assert_not_called()
+
+    def test_durable_dispatch_refusals_are_one_line_and_leave_home_unchanged(self):
+        from model_tools import handle_function_call
+        register_session(self.sid, True)
+        cases = [
+            ("goal_set", {"action": "set", "goal": "nope"}),
+            ("loop_set", {"action": "set", "prompt": "nope", "interval": "1h", "times": 1}),
+            ("cronjob_manage", {"action": "create", "prompt": "nope"}),
+            ("terminal", {"command": "printf nope", "background": True}),
+            ("delegate_task", {"tasks": [{"goal": "nope"}], "background": True}),
+            ("memory", {"action": "write", "content": CANARY}),
+            ("skill_manage", {"operations": [{"action": "create", "name": "nope"}]}),
+        ]
+        try:
+            for name, args in cases:
+                before = {p.relative_to(self.home): p.read_bytes() for p in self.home.rglob("*") if p.is_file()}
+                with incognito_scope(session_id=self.sid):
+                    result = handle_function_call(name, args, session_id=self.sid)
+                self.assertEqual(result.count("\n"), 0, name)
+                self.assertIn("unavailable in incognito mode", result, name)
+                after = {p.relative_to(self.home): p.read_bytes() for p in self.home.rglob("*") if p.is_file()}
+                self.assertEqual(after, before, name)
+        finally:
+            register_session(self.sid, False)
 
     def test_registry_blocks_delayed_hooks_without_scope(self):
         callback = mock.Mock()

@@ -56,3 +56,24 @@ if claimed:
         remove_pid_file()
         release_gateway_runtime_lock()
     assert contender() == 'CLAIMED True'
+
+
+def test_exit_state_cleans_this_process_incognito_intervals(tmp_path, monkeypatch):
+    from agent import incognito_private_dir
+    from gateway import run
+    from gateway.run_shutdown import GatewayShutdownMixin
+
+    home = tmp_path / "runtime"
+    home.mkdir()
+    monkeypatch.setattr(run, "_hermes_home", home)
+    monkeypatch.setattr(incognito_private_dir, "_configured_root", lambda: tmp_path / "private")
+    interval = incognito_private_dir._new_dir()
+    runner = SimpleNamespace(
+        _startup_cleanup_only=False, _client_owned=False,
+        _restart_requested=False, _exit_reason=None, _restart_command_source=None,
+        _restart_via_service=False, _restart_detached=False, _draining=True,
+        _update_runtime_status=lambda *args: None,
+    )
+    ctx = SimpleNamespace(timed_out=False, active_agents={}, elapsed=lambda: 0)
+    asyncio.run(GatewayShutdownMixin._stop_persist_exit_state(runner, ctx))
+    assert not interval.exists()

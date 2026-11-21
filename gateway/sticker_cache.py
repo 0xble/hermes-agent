@@ -19,9 +19,11 @@ _CACHE_PATH_AT_IMPORT = CACHE_PATH
 
 
 def _resolve_cache_path() -> Path:
-    """Active profile's cache file at call time: the patched ``CACHE_PATH`` when a test changed
-    it, else live profile-scoped HERMES_HOME — under the multiplexed gateway one process serves
-    every profile, so the import-time constant would pin every profile to the launch home."""
+    """Active profile's cache file at call time, redirected while private."""
+    from agent.incognito_private_dir import private_path_for_current_session
+    private_root = private_path_for_current_session()
+    if private_root is not None:
+        return private_root / "sticker_cache.json"
     return CACHE_PATH if CACHE_PATH != _CACHE_PATH_AT_IMPORT else get_hermes_home() / "sticker_cache.json"
 
 # Kept concise to save tokens.

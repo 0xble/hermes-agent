@@ -264,6 +264,22 @@ class TestDispatchExceptionLogging:
         assert len(result["error"]) < _MAX_TOOL_ERROR_CHARS + 200
 
 
+def test_handler_internal_unexpected_keyword_error_runs_once():
+    reg = ToolRegistry()
+    calls = {"n": 0}
+
+    def handler(args, **kwargs):
+        calls["n"] += 1
+        raise TypeError("got an unexpected keyword argument 'internal'")
+
+    reg.register(name="once", toolset="core", schema=_make_schema("once"), handler=handler)
+    result = reg.dispatch("once", {}, task_id="task")
+    assert isinstance(result, str)
+    result = json.loads(result)
+    assert calls["n"] == 1
+    assert "TypeError" in result["error"]
+
+
 class TestToolsetAvailability:
     def test_no_check_fn_is_available(self):
         reg = ToolRegistry()

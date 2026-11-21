@@ -110,6 +110,11 @@ def is_registered(session_id: str | None) -> bool:
         return isinstance(session_id, str) and session_id in _sessions
 
 
+def current_session_id() -> str | None:
+    """Return the named session bound to this call, if any."""
+    return _session_id.get()
+
+
 def any_incognito_sessions() -> bool:
     """Protect unattributable ingress without guessing which private topic owns it."""
     with _lock:
@@ -133,6 +138,16 @@ def register_session(session_id: str, enabled: bool = True) -> None:
             _sessions.discard(session_id)
             _private_states.pop(session_id, None)
     install_logging_filter()
+
+
+def register_foreground_session(session_id: str) -> None:
+    """Register a private session unless this call is a delegated child.
+
+    Children inherit the parent's interval and must not create a second registry entry.
+    """
+    from agent.delegation_context import is_delegated_child_context
+    if not is_delegated_child_context():
+        register_session(session_id)
 
 
 def _private_work_state(session_id: str | None) -> dict:
@@ -261,7 +276,8 @@ def failure_class(exc: BaseException) -> str:
 
 
 def log_private_failure(logger: logging.Logger, exc: BaseException | None = None, *,
-                        operation: str, reason: str | None = None, session_id: str | None = None) -> None:
+                        operation: str, reason: str | None = None, session_id: str | None = None,
+                        force: bool = False) -> None:
     """Record a content-free failure class when a private turn fails. Public turns are a no-op.
 
     The privacy filter redacts every record a private scope creates, so this one is
@@ -271,7 +287,7 @@ def log_private_failure(logger: logging.Logger, exc: BaseException | None = None
     """
     import re
     try:
-        if not (is_incognito() or is_incognito(session_id)):
+        if not force and not (is_incognito() or is_incognito(session_id)):
             return
         parts = []
         if exc is not None:
@@ -317,10 +333,16 @@ def tool_refusal(name: str, args: dict) -> str | None:
         return None
     lower = name.lower()
     hindsight_write = "hindsight" in lower and not lower.endswith(("recall", "reflect"))
-    durable = name in {"skill_manage", "goal_set", "loop_set", "cronjob", "cron_create", "request_update", "request_restart"}
+    durable = name in {
+        "skill_manage", "goal_set", "loop_set", "cronjob", "cron_create", "cronjob_manage",
+        "request_update", "request_restart",
+    }
+    background_delegate = name == "delegate_task" and (
+        args.get("background") is True or args.get("survive_restart") is True
+    )
     memory_write = name == "memory" and args.get("action") not in {"read", "list", "view"}
     process = name in {"terminal", "process", "process_manage"} and (
-        args.get("persist_on_release") or args.get("survive_restart"))
-    if hindsight_write or durable or memory_write or process:
+        args.get("background") is True or args.get("persist_on_release") or args.get("survive_restart"))
+    if hindsight_write or durable or background_delegate or memory_write or process:
         return "This durable operation is unavailable in incognito mode."
     return None

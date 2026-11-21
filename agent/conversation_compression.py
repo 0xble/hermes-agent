@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the live gateway baseline adds the delegation schema refresh at this established compaction seam; extract the facade before adding unrelated behavior.
 """Context compression: feasibility probe, warning replay, compress, image fix.
 
 Thread-safety contract for extension points: with ``compression.context_timeout_seconds > 0`` (default) the
@@ -174,7 +175,8 @@ def is_compaction_progress_status(text: str | None) -> bool:
 def _refresh_agent_tool_definitions(agent) -> bool:
     """Rebuild agent.tools at the compaction commit boundary (the only moment config reaches a forever-session's
     frozen tool schemas; the prompt cache is already invalid). Returns True when tools were added."""
-    from tools.mcp_tool_agent import refresh_agent_mcp_tools
+    from tools.mcp_tool_agent import refresh_agent_delegation_tool, refresh_agent_mcp_tools
+    refresh_agent_delegation_tool(agent)
     added = refresh_agent_mcp_tools(agent, content_aware=True)
     if added:
         logger.info("Compaction tool refresh added tools: %s", sorted(added))

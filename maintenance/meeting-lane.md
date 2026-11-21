@@ -43,3 +43,5 @@ busy steering at every admission boundary and a non-destructive session reasonin
 default. Revert the commit carrying this fork patch trailer. A previously persisted
 medium override remains an ordinary session pick and can be cleared with the
 existing `/reasoning reset`; no state migration is necessary.
+
+Contract tests: `tests/gateway/test_multiplex_busy_input_mode.py`, `tests/gateway/test_busy_command.py`, `tests/gateway/test_busy_session_ack.py`.

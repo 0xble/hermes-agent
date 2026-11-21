@@ -8,6 +8,7 @@ import queue
 import stat
 import subprocess
 import sys
+import types
 import threading
 from pathlib import Path
 
@@ -1110,6 +1111,9 @@ def test_smoke_runs_the_interpreter_the_candidate_boots(tmp_path, monkeypatch):
     _fake_release(release, "B")
     generation = _fake_release_generation(release, ["slack"])
     ran = []
+    # The running release's identity is the updater's own lookup, not part of the smoke command.
+    monkeypatch.setattr("hermes_cli.version_info.get_version_info",
+                        lambda: types.SimpleNamespace(base_version="unknown"))
     monkeypatch.setattr(releases.subprocess, "run",
                         lambda argv, **kwargs: ran.append(argv[0]) or subprocess.CompletedProcess(argv, 0, "", ""))
     releases.smoke_plugins(release, tmp_path / "profile")
@@ -1687,6 +1691,44 @@ def test_candidate_import_smoke_blocks_bad_enabled_plugin_without_writing_profil
     (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n")
     releases.smoke_plugins(source, home)
     assert not (home / "logs").exists()
+
+
+@pytest.mark.parametrize("running, blocked", [("999.1", True), ("0.1.0", False)])
+def test_candidate_smoke_blocks_a_plugin_the_running_release_loads_and_the_candidate_would_not(
+        tmp_path, monkeypatch, running, blocked):
+    """The loader skips a plugin whose ``requires_hermes`` rejects the running version, so its
+    module still imports and an import-only smoke activates a release that boots without it. A
+    plugin the running release already rejects is not the candidate's regression and never blocks."""
+    monkeypatch.setattr("pm.environments.project_python", lambda _release: Path(sys.executable))
+    monkeypatch.setattr("hermes_cli.version_info.get_version_info",
+                        lambda: types.SimpleNamespace(base_version=running))
+    home = tmp_path / "profile"
+    plugin = home / "plugins" / "needs-newer"
+    plugin.mkdir(parents=True)
+    (home / "config.yaml").write_text("plugins:\n  enabled: [needs-newer]\n")
+    (plugin / "plugin.yaml").write_text("name: needs-newer\nversion: '1.0'\nrequires_hermes: '>=999.0'\n")
+    (plugin / "__init__.py").write_text("def register(ctx):\n    pass\n")
+    source = Path(__file__).resolve().parents[2]
+
+    # The version staging stamped into the candidate, as stage_release passes it. A shallow CI
+    # checkout has no tags, so the candidate cannot be asked for its own version here.
+    if blocked:
+        with pytest.raises(RuntimeError, match="enabled plugin needs-newer: requires hermes >=999.0, candidate 0.23.1"):
+            releases.smoke_plugins(source, home, candidate_version="0.23.1")
+    else:
+        releases.smoke_plugins(source, home, candidate_version="0.23.1")
+
+
+def test_candidate_version_is_read_from_the_stamp_staging_wrote(tmp_path):
+    """stage_release stamps the candidate before smoking it; the version gate reads that stamp,
+    and a release without one (or stamped unknown) is never gated."""
+    release = tmp_path / "release"
+    release.mkdir()
+    assert releases._stamped_base_version(release) == ""
+    (release / "install-stamp.json").write_text(json.dumps({"baseVersion": "unknown"}), encoding="utf-8")
+    assert releases._stamped_base_version(release) == ""
+    (release / "install-stamp.json").write_text(json.dumps({"baseVersion": "0.23.1"}), encoding="utf-8")
+    assert releases._stamped_base_version(release) == "0.23.1"
 
 
 def test_candidate_import_smoke_accepts_enabled_portable_plugin(tmp_path, monkeypatch):

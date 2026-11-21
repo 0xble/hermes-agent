@@ -44,6 +44,11 @@ class SessionIncognitoMixin:
             # and absolute deadline. A restart must not turn a timed pick permanent.
             register_session(entry.session_id, True)
             register_session(key, True)
+            from agent.incognito_private_dir import bind_private_session, private_dir_for_session
+            private_dir = private_dir_for_session(entry.session_id)
+            bind_private_session(key, private_dir)
+            # Only restoration from the sidecar proves that a restart dropped private RAM history.
+            self._lazy("_incognito_restarted_sessions", set).add(key)
         self._incognito_stale = frozenset(stale)
 
     def _refuse_stale_incognito(self, session_key: str) -> None:
@@ -85,6 +90,10 @@ class SessionIncognitoMixin:
         history = self.load_transcript(entry.session_id) if enabled else None
         if enabled:
             self._flush_public_token_counts()
+            # A public execute_code kernel may already contain public state and use public
+            # scratch. Retire both routing identities before this interval can admit a cell.
+            from tools.code_kernel import shutdown_kernels_for_owners
+            shutdown_kernels_for_owners(session_key, entry.session_id)
         with self._lock:
             records = deepcopy(getattr(self, "_incognito_records", {}))
             if enabled:
@@ -113,15 +122,24 @@ class SessionIncognitoMixin:
                     entry.model_role = None
                 register_session(entry.session_id, True)
                 register_session(session_key, True)
+                from agent.incognito_private_dir import bind_private_session, private_dir_for_session
+                private_dir = private_dir_for_session(entry.session_id)
+                bind_private_session(session_key, private_dir)
             else:
+                current_session_id = entry.session_id
                 saved = SessionEntry.from_dict(entry._incognito_persisted)
                 entry.__dict__.clear()
                 entry.__dict__.update(saved.__dict__)
                 self._lazy("_incognito_histories", dict).pop(entry.session_id, None)
+                self._lazy("_incognito_restarted_sessions", set).discard(session_key)
                 register_session(entry.session_id, False)
+                register_session(current_session_id, False)
                 register_session(session_key, False)
                 from gateway.incognito import discard_private_topic
                 discard_private_topic(session_key)
+                from agent.incognito_private_dir import discard_private_dir
+                discard_private_dir(entry.session_id)
+                discard_private_dir(session_key)
         return entry
 
     def _flush_public_token_counts(self) -> None:
@@ -157,6 +175,13 @@ class SessionIncognitoMixin:
             return None
         histories = self._lazy("_incognito_histories", dict)
         if session_id not in histories:
-            # Restart loses the RAM tail, not the durable prefix.
             histories[session_id] = self._load_saved_transcript(session_id)
         return histories[session_id]
+
+    def mark_incognito_restart_notice_sent(self, session_key: str) -> bool:
+        """Atomically consume a pending post-restart notice."""
+        pending = self._lazy("_incognito_restarted_sessions", set)
+        if session_key not in pending:
+            return False
+        pending.remove(session_key)
+        return True

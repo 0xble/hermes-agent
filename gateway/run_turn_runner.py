@@ -1,3 +1,4 @@
+# health: allow FILE_LINES -- the live gateway baseline adds the interim-message mode marker at this established turn seam; extract the facade before adding unrelated behavior.
 """Per-turn callback runner (progress/status/voice/run_sync) for the gateway agent turn.
 
 ``TurnRunner`` owns the per-turn callbacks ``GatewayRunner._run_agent_inner`` binds. ``gateway.run``
@@ -1030,6 +1031,7 @@ class TurnRunner(TurnRunnerApprovalMixin, TurnSessionTitlesMixin, TaskCardProgre
         agent.step_callback = ctx._step_callback_sync if (ctx._hooks_ref.loaded_hooks or self._approval_owner is not None) else None
         agent.stream_delta_callback = stream_delta_cb
         agent.interim_assistant_callback = interim_assistant_cb if want_interim_messages else None
+        agent._gateway_interim_messages_enabled = bool(want_interim_messages)
         from gateway.run_turn_progress import local_viewer_turn
         agent.status_callback, agent.notice_callback = ctx._status_callback_sync, (
             self._local_notice_callback_sync if local_viewer_turn(self) else self._notice_callback_sync)

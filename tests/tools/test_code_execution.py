@@ -19,6 +19,7 @@ import json
 import os
 import socket
 import time
+from types import SimpleNamespace
 
 os.environ["TERMINAL_ENV"] = "local"
 
@@ -121,6 +122,19 @@ class TestHermesToolsGeneration(unittest.TestCase):
 
 
 class TestExecuteCodeRemoteTempDir(unittest.TestCase):
+    def test_execute_code_refuses_remote_backend_in_incognito(self):
+        with patch("tools.terminal_scope.enforce_no_refusal"), \
+             patch("agent.deadline.run_bounded_sync",
+                   return_value=SimpleNamespace(timed_out=False, value=False)), \
+             patch("tools.code_execution_tool._load_config", return_value={"timeout": 30}), \
+             patch("tools.terminal_tool._get_env_config", return_value={"env_type": "ssh"}), \
+             patch("tools.terminal_tool._docker_has_host_access", return_value=False), \
+             patch("agent.incognito.is_incognito", return_value=True), \
+             patch("tools.code_execution_tool._execute_remote") as remote:
+            result = execute_code("print('private')")
+        self.assertIn("unavailable in incognito mode", result)
+        remote.assert_not_called()
+
     def test_execute_remote_uses_backend_temp_dir_for_sandbox(self):
         class FakeEnv:
             def __init__(self):

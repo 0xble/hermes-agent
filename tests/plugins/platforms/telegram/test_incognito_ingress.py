@@ -13,7 +13,6 @@ from gateway.config import PlatformConfig
 from gateway.incognito import private_topic
 from gateway.platforms.event import MessageType
 from plugins.platforms.telegram import adapter as telegram
-from plugins.platforms.telegram.private_ingress import PRIVATE_ATTACHMENT_NOTE
 
 
 def message(**changes):
@@ -60,70 +59,6 @@ def private_lane(adapter):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("kind", ["photo", "voice", "audio", "video", "document", "sticker"])
-async def test_private_media_refused_before_download_preserves_caption(adapter, private_lane, kind, tmp_path):
-    attachment = SimpleNamespace(get_file=AsyncMock(), file_size=100, file_name="private.txt", mime_type="text/plain")
-    msg = message(caption="PRIVATE_CAPTION", **{kind: [attachment] if kind == "photo" else attachment})
-    seen = []
-
-    async def receive(event):
-        seen.append((event, is_incognito(), private_topic()))
-
-    adapter.handle_message = AsyncMock(side_effect=receive)
-    await adapter._handle_media_message(update(msg), None)
-    attachment.get_file.assert_not_awaited()
-    event, private, topic = seen[0]
-    assert private and topic == private_lane
-    assert event.text == "PRIVATE_CAPTION\n\n" + PRIVATE_ATTACHMENT_NOTE
-    assert event.message_type == MessageType.TEXT
-    assert not event.media_urls and not event.media_types
-    assert not is_incognito()
-
-
-@pytest.mark.asyncio
-async def test_sidecar_scopes_preprocessing_after_restart(adapter, monkeypatch, tmp_path):
-    msg = message(photo=[SimpleNamespace(get_file=AsyncMock())], caption="PRIVATE_RESTART_CAPTION")
-    key = key_for(adapter, msg)
-    home = tmp_path / "home"
-    (home / "sessions").mkdir(parents=True)
-    (home / "sessions" / "incognito.json").write_text(json.dumps({key: {"session_id": "private-restart-session"}}))
-    monkeypatch.setenv("HERMES_HOME", str(home))
-    from hermes_constants import get_hermes_home
-    get_hermes_home()  # First-use static defaults are unrelated to inbound content.
-    before = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
-    adapter.handle_message = AsyncMock()
-    try:
-        await adapter._handle_media_message(update(msg), None)
-        msg.photo[0].get_file.assert_not_awaited()
-        assert PRIVATE_ATTACHMENT_NOTE in adapter.handle_message.call_args.args[0].text
-        after = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
-        assert all(after[path] == content for path, content in before.items())
-        assert after.keys() - before.keys() <= {Path("SOUL.md")}
-        assert all(b"PRIVATE_RESTART_CAPTION" not in content for content in after.values())
-    finally:
-        register_session(key, False)
-        register_session("private-restart-session", False)
-
-
-@pytest.mark.asyncio
-async def test_private_reply_media_does_not_break_text_chat(adapter, private_lane):
-    photo = SimpleNamespace(get_file=AsyncMock())
-    msg = message(text="PRIVATE_TEXT", reply_to_message=message(photo=[photo]))
-    seen = []
-
-    async def receive(event):
-        seen.append((event, is_incognito(), private_topic()))
-
-    adapter._prepare_text_event = AsyncMock(side_effect=receive)
-    await adapter._handle_text_message(update(msg), None)
-    photo.get_file.assert_not_awaited()
-    event, private, topic = seen[0]
-    assert private and topic == private_lane
-    assert "PRIVATE_TEXT" in event.text and PRIVATE_ATTACHMENT_NOTE in event.text
-    assert not event.media_urls
-
-
-@pytest.mark.asyncio
 async def test_private_entry_command_preprocessing_is_scoped(adapter):
     msg = message(text="/incognito")
     seen = []
@@ -149,6 +84,129 @@ async def test_public_photo_uses_existing_cache_and_batch_route(adapter, monkeyp
     event = adapter._route_photo_event.call_args.args[1]
     assert event.media_urls == ["/public/image.jpg"]
     assert event.text == "PUBLIC_CAPTION" and event.message_type == MessageType.PHOTO
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["photo", "voice", "audio", "video", "document", "sticker"])
+async def test_private_media_is_downloaded_into_private_directory(adapter, private_lane, kind, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from agent import incognito_private_dir as private_dirs
+    monkeypatch.setattr(private_dirs, "_configured_root", lambda: tmp_path / "private")
+    payload = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"private" if kind in ("photo", "sticker") else b"private-media"
+    file_obj = SimpleNamespace(file_path=f"{kind}.bin", download_as_bytearray=AsyncMock(return_value=bytearray(payload)))
+    attachment = SimpleNamespace(
+        get_file=AsyncMock(return_value=file_obj), file_size=len(payload), file_name="private.txt",
+        mime_type="text/plain", file_unique_id="private-file", emoji="", set_name="",
+        is_animated=False, is_video=False)
+    msg = message(caption="PRIVATE_CAPTION", **{kind: [attachment] if kind == "photo" else attachment})
+    seen = []
+
+    async def receive(event):
+        seen.append((event, is_incognito(), private_topic()))
+
+    if kind == "sticker":
+        monkeypatch.setattr(
+            "tools.vision_tools.vision_analyze_tool",
+            AsyncMock(return_value=json.dumps({"success": True, "analysis": "a private sticker"})),
+        )
+        monkeypatch.setattr("gateway.sticker_cache.cache_sticker_description_async", AsyncMock())
+    before_home = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    adapter.handle_message = AsyncMock(side_effect=receive)
+    async def route_photo(msg, event):
+        await receive(event)
+    adapter._route_photo_event = AsyncMock(side_effect=route_photo)
+    try:
+        await adapter._handle_media_message(update(msg), None)
+        attachment.get_file.assert_awaited()
+        event, private, topic = seen[0]
+        assert private and topic == private_lane
+        if kind != "sticker":
+            assert "PRIVATE_CAPTION" in (event.text or "")
+        else:
+            assert private and "PRIVATE_CAPTION" not in (event.text or "")
+        private_root = private_dirs.private_dir_for_session(private_lane, create=False)
+        assert private_root is not None
+        cached = list(private_root.rglob("*"))
+        assert any(path.is_file() and payload in path.read_bytes() for path in cached)
+        after_home = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+        assert after_home == before_home
+    finally:
+        register_session(private_lane, False)
+        private_dirs.discard_private_dir(private_lane)
+
+
+@pytest.mark.asyncio
+async def test_sidecar_scopes_preprocessing_after_restart(adapter, monkeypatch, tmp_path):
+    msg = message(photo=[SimpleNamespace(get_file=AsyncMock(return_value=SimpleNamespace(
+        file_path="photo.jpg", download_as_bytearray=AsyncMock(return_value=bytearray(bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"restart")))))],
+        caption="PRIVATE_RESTART_CAPTION")
+    key = key_for(adapter, msg)
+    home = tmp_path / "home"
+    (home / "sessions").mkdir(parents=True)
+    (home / "sessions" / "incognito.json").write_text(json.dumps({key: {"session_id": "private-restart-session"}}))
+    from gateway.config import GatewayConfig
+    from gateway.session import SessionStore
+    store = SessionStore(home / "sessions", GatewayConfig())
+    entry = store.get_or_create_session(adapter._build_message_event(msg, MessageType.PHOTO).source)
+    entry.session_id = "private-restart-session"
+    store._entries[key] = entry
+    store._load_incognito_locked()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from agent import incognito_private_dir as private_dirs
+    monkeypatch.setattr(private_dirs, "_configured_root", lambda: tmp_path / "private")
+    from hermes_constants import get_hermes_home
+    get_hermes_home()
+    before = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+    adapter.handle_message = AsyncMock()
+    try:
+        await adapter._handle_media_message(update(msg), None)
+        msg.photo[0].get_file.assert_awaited()
+        private_root = private_dirs.private_dir_for_session("private-restart-session", create=False)
+        assert private_root is not None
+        after = {p.relative_to(home): p.read_bytes() for p in home.rglob("*") if p.is_file()}
+        assert all(after[path] == content for path, content in before.items())
+        assert all(b"PRIVATE_RESTART_CAPTION" not in content for content in after.values())
+        assert any(path.is_file() for path in private_root.rglob("*"))
+    finally:
+        register_session(key, False)
+        register_session("private-restart-session", False)
+        private_dirs.discard_private_dir("private-restart-session")
+
+
+@pytest.mark.asyncio
+async def test_private_reply_media_stays_in_private_lane(adapter, private_lane, tmp_path, monkeypatch):
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from agent import incognito_private_dir as private_dirs
+    monkeypatch.setattr(private_dirs, "_configured_root", lambda: tmp_path / "private")
+    photo = SimpleNamespace(get_file=AsyncMock(return_value=SimpleNamespace(
+        file_path="reply.png", download_as_bytearray=AsyncMock(return_value=bytearray(
+            bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"private-reply")))),
+        file_size=21, file_name="reply.png", mime_type="image/png")
+    msg = message(text="PRIVATE_TEXT", reply_to_message=message(photo=[photo]))
+    seen = []
+
+    async def receive(event):
+        seen.append((event, is_incognito(), private_topic()))
+
+    adapter._prepare_text_event = AsyncMock(side_effect=receive)
+    try:
+        await adapter._handle_text_message(update(msg), None)
+        photo.get_file.assert_awaited()
+        event, private, topic = seen[0]
+        assert private and topic == private_lane
+        assert "PRIVATE_TEXT" in event.text
+        assert event.media_urls
+        private_root = private_dirs.private_dir_for_session(private_lane, create=False)
+        assert private_root is not None
+        assert any(path.is_file() and b"private-reply" in path.read_bytes() for path in private_root.rglob("*"))
+        assert not any(path.is_file() for path in home.rglob("*"))
+    finally:
+        register_session(private_lane, False)
+        private_dirs.discard_private_dir(private_lane)
 
 
 @pytest.mark.asyncio
@@ -207,12 +265,20 @@ async def test_clarify_callbacks_keep_answers_functional_without_private_logs(
 
 
 @pytest.mark.asyncio
-async def test_observed_group_attachments_use_shared_private_lane(adapter, monkeypatch):
+async def test_observed_group_attachments_use_shared_private_lane(adapter, monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "_telegram_observe_unmentioned_group_messages", lambda: True)
     monkeypatch.setattr(adapter, "_telegram_observe_allowed_chats", lambda: {"100"})
     monkeypatch.setattr(adapter, "_should_process_message", lambda msg: False)
     monkeypatch.setattr(adapter, "_should_observe_unmentioned_group_message", lambda msg: True)
-    photo = SimpleNamespace(get_file=AsyncMock())
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    from agent import incognito_private_dir as private_dirs
+    monkeypatch.setattr(private_dirs, "_configured_root", lambda: tmp_path / "private")
+    photo = SimpleNamespace(get_file=AsyncMock(return_value=SimpleNamespace(
+        file_path="group.png", download_as_bytearray=AsyncMock(return_value=bytearray(
+            bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]) + b"private-group")))),
+        file_size=21, file_name="group.png", mime_type="image/png")
     msg = message(chat=SimpleNamespace(id=100, type="supergroup", title="Group", is_forum=True), photo=[photo])
     key = key_for(adapter, msg)
     register_session(key)
@@ -224,13 +290,17 @@ async def test_observed_group_attachments_use_shared_private_lane(adapter, monke
     monkeypatch.setattr(adapter, "_observe_unmentioned_group_message", observe)
     try:
         await adapter._handle_media_message(update(msg), None)
-        photo.get_file.assert_not_awaited()
+        photo.get_file.assert_awaited()
         private, topic, event = seen[0]
         assert private and topic == key
-        assert PRIVATE_ATTACHMENT_NOTE in event.text
-        assert not event.media_urls
+        assert event.media_urls
+        private_root = private_dirs.private_dir_for_session(key, create=False)
+        assert private_root is not None
+        assert any(path.is_file() and b"private-group" in path.read_bytes() for path in private_root.rglob("*"))
+        assert not any(path.is_file() for path in home.rglob("*"))
     finally:
         register_session(key, False)
+        private_dirs.discard_private_dir(key)
 
 
 @pytest.mark.parametrize("thread_id,refused", [(None, True), ("99", False)])

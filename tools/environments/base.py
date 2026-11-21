@@ -504,9 +504,14 @@ class BaseEnvironment(ABC):
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         from agent.delegation_context import in_process_child_relay_parent_address
         from agent.incognito import is_incognito
+        passthrough_names = self._snapshot_excluded_passthrough_names()
+        if is_incognito():
+            # A public snapshot can contain the launch process's scratch path. Preserve the
+            # private per-command values while sourcing it, or $TMPDIR writes escape the interval.
+            passthrough_names = (*passthrough_names, "TMPDIR", "TMP", "TEMP")
         return _wrap_command_script(
             command,
-            passthrough_names=self._snapshot_excluded_passthrough_names(),
+            passthrough_names=passthrough_names,
             snapshot_ready=self._snapshot_ready,
             relay_parent_address=in_process_child_relay_parent_address(),
             persist_env=self._persist_env and not is_incognito(),

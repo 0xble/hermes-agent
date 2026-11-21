@@ -8,16 +8,23 @@ so ``patch("gateway.run.X")`` keeps intercepting them at call time.
 from __future__ import annotations
 
 import asyncio
+import copy
 import dataclasses
 import functools
 import logging
 import time
+import uuid
 from contextlib import nullcontext, suppress
 from contextvars import ContextVar
 from typing import TYPE_CHECKING, Any, Dict, Optional
 
 from gateway.config import Platform
-from gateway.platforms.event import GOAL_CONTINUATION_METADATA_KEY, MessageEvent, MessageType
+from gateway.platforms.event import (
+    GOAL_CONTINUATION_METADATA_KEY,
+    MessageEvent,
+    MessageType,
+    is_goal_continuation_event,
+)
 from hermes_cli.goal_notices import HIDDEN, notice_level
 from gateway.run_background_admission import BACKGROUND_RESERVATION_ATTR
 from gateway.run_loop_wake import GatewayLoopWakeMixin
@@ -890,6 +897,74 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                 owners.append(bookkeeping_owner)
             captured['post_delivery'] = owners
 
+    async def _retry_failed_synthetic_event(
+        self, event: Any, source: Any, agent_result: Any, *, invalidation_epoch: Optional[int] = None,
+    ) -> bool:
+        """Requeue one failed internal delivery instead of exposing failed-turn copy.
+
+        Admission is durable, but inference can still fail after the admission is consumed. One
+        retry covers provider-transient races without turning a user/lifecycle interrupt into new
+        work; user events and context/safety refusals never enter this path.
+        """
+        if not isinstance(agent_result, dict) or event is None:
+            return False
+        metadata = getattr(event, "metadata", None) or {}
+        if not (getattr(event, "internal", False) or is_goal_continuation_event(event)):
+            return False
+        if metadata.get("gateway_internal_retry_count", 0) >= 1:
+            return False
+        from hermes_cli.session_controls import LOOP_WAKE_METADATA_KEY
+        if metadata.get("gateway_loop_tick") or metadata.get(LOOP_WAKE_METADATA_KEY):
+            return False  # loop settlement schedules the next due tick
+        if agent_result.get("failure_reason") in {"context_overflow", "content_policy_blocked"}:
+            return False
+        # An interrupt is a user/lifecycle decision, not a provider failure. In particular, a
+        # /stop or /new invalidation must never be resurrected by this post-turn hook.
+        if agent_result.get("interrupted"):
+            return False
+        if not (agent_result.get("failed") or agent_result.get("completed") is False):
+            return False
+        if agent_result.get("failure_retryable") is False:
+            return False
+        try:
+            key = self._session_key_for_source(source)
+            if invalidation_epoch is not None:
+                current_epoch = getattr(self, "_session_invalidation_epoch", lambda _key: invalidation_epoch)(key)
+                if current_epoch != invalidation_epoch:
+                    return False
+            if getattr(self, "_user_stop_latched", lambda *_keys: False)(key):
+                return False
+            retry = copy.copy(event)
+            retry.metadata = {**metadata, "gateway_internal_retry_count": 1}
+            # A copied event must not carry the consumed transport/admission identity. Durable
+            # outbox treats those stamps as deduplication keys, so issue a fresh transport id.
+            for name in tuple(vars(retry)):
+                if name.startswith("_outbox_"):
+                    delattr(retry, name)
+            retry._outbox_transport_id = uuid.uuid4().hex
+            adapter = self._delivery_adapter_for(source)
+            if getattr(source, "platform", None) == Platform.LOCAL:
+                from gateway.session_automation import admit_route_wake
+                accepted = await admit_route_wake(
+                    self, adapter, source, retry.text, "internal-failure-retry",
+                    metadata=retry.metadata, event=retry,
+                )
+                if not accepted:
+                    return False
+            elif adapter and key:
+                from gateway.wake import automatic_event_is_current
+                if not await automatic_event_is_current(self, retry):
+                    return False
+                self._enqueue_fifo(key, retry, adapter)
+            else:
+                return False
+            logger.info("requeued failed internal turn for %s", key or "unknown")
+            return True
+        except Exception:
+            logger.debug("failed internal turn requeue failed", exc_info=True)
+            return False
+
+    # health: allow CC -- retry exhaustion warning/pause must remain adjacent to post-turn settlement to preserve the one-retry contract.
     async def _run_post_turn_hooks(
         self, *, agent_result: Any, source: Any, is_internal: bool, event: Any = None,
         invalidation_epoch: Optional[int] = None, existing_session_only: bool = False,
@@ -906,6 +981,20 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         )
         if not successful:
             final_text = ""
+        retry_scheduled = False
+        if not successful:
+            try:
+                retry_scheduled = await self._retry_failed_synthetic_event(
+                    event, source, agent_result, invalidation_epoch=invalidation_epoch,
+                )
+            except Exception:
+                # Recovery is best-effort and must never mask goal/loop settlement.
+                logger.debug("failed internal turn recovery hook failed", exc_info=True)
+        exhausted_synthetic = (
+            not successful and not retry_scheduled and event is not None
+            and (getattr(event, "internal", False) or is_goal_continuation_event(event))
+            and (getattr(event, "metadata", None) or {}).get("gateway_internal_retry_count", 0) >= 1
+        )
         try:
             if existing_session_only:
                 # Settlement can precede a stop that suspends this route. Deferred
@@ -921,6 +1010,22 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
         except Exception as exc:
             logger.debug("post-turn session resolution failed: %s", exc)
             return
+        if exhausted_synthetic:
+            from gateway.platforms.event import turn_origin_for_event
+            origin = turn_origin_for_event(event)
+            logger.warning(
+                "synthetic turn retry exhausted: session=%s origin=%s",
+                getattr(session_entry, "session_id", "unknown"), origin,
+            )
+            if origin == "goal_loop":
+                try:
+                    manager, _ = await self._get_goal_manager_for_event(event)
+                    if manager is not None and manager.is_active():
+                        await asyncio.to_thread(
+                            manager.pause, "synthetic turn retry exhausted", by="system",
+                        )
+                except Exception:
+                    logger.debug("pausing goal after synthetic retry exhaustion failed", exc_info=True)
         # Failed/interrupted turns stay out of /goal. Successful empty turns still carry
         # tool evidence; an in-flight /loop tick always needs release/rescheduling.
         # The terminal turn's identity: a queued chain carries its last turn's, not the head's.

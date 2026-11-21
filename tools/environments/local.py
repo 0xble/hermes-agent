@@ -864,6 +864,10 @@ def _make_run_env(env: dict) -> dict:
     if published:
         run_env.update(published)
         run_env.pop("WAYLAND_DISPLAY", None)  # X11 desktop; a leaked Wayland socket flips GTK/Chromium backends
+    from agent.incognito_private_dir import private_path_for_current_session
+    if private_path_for_current_session() is not None:
+        from hermes_constants import apply_scratch_tmp_env
+        apply_scratch_tmp_env(run_env)
     return run_env
 
 

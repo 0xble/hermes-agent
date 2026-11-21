@@ -61,8 +61,8 @@ def _fresh_kernel_registry():
     shutdown_all_kernels()
 
 
-def _run(code, **kwargs):
-    return json.loads(execute_code(code, task_id="kernel-test", **kwargs))
+def _run(code, task_id="kernel-test", **kwargs):
+    return json.loads(execute_code(code, task_id=task_id, **kwargs))
 
 
 class TestSessionStatePersistence(unittest.TestCase):
@@ -76,6 +76,121 @@ class TestSessionStatePersistence(unittest.TestCase):
         self.assertIn("42", second["output"])
         self.assertEqual(second["kernel"]["reused"], True)
         self.assertEqual(second["kernel"]["execution_count"], 2)
+
+    def test_private_session_persists_state_and_keeps_kernel_artifacts_in_interval(self):
+        from agent.incognito import incognito_scope, register_session
+        from agent.incognito_private_dir import bind_private_session, discard_private_dir
+
+        sid = "private-kernel-session"
+        with tempfile.TemporaryDirectory(prefix="hermes-incognito-" + "a" * 32 + "-") as interval_dir:
+            interval = Path(interval_dir)
+            register_session(sid, True)
+            bind_private_session(sid, interval)
+            try:
+                with _kernel_config(), incognito_scope(session_id=sid):
+                    first = _run("import os, tempfile; x = 41; print(os.environ['TMPDIR']); print(tempfile.mkstemp()[1])")
+                    second = _run("print(x + 1)")
+                self.assertEqual(first["status"], "success", first)
+                self.assertEqual(second["status"], "success", second)
+                self.assertIn("42", second["output"])
+                self.assertTrue(second["kernel"]["reused"])
+                kernel = next(iter(_KERNELS.values()))
+                self.assertTrue(Path(kernel.tmpdir).is_relative_to(interval))
+                self.assertTrue(Path(first["output"].splitlines()[-1]).is_relative_to(interval))
+                sock_path = Path(kernel.sock_path) if kernel.sock_path else None
+                if sock_path is not None:
+                    self.assertEqual(sock_path.stat().st_mode & 0o777, 0o600)
+                self.assertTrue(all(path.is_relative_to(interval) for path in interval.rglob("*")))
+            finally:
+                shutdown_all_kernels()
+                register_session(sid, False)
+                discard_private_dir(sid)
+            self.assertFalse(interval.exists())
+            if sock_path is not None:
+                self.assertFalse(sock_path.exists())
+
+    def test_public_kernel_is_retired_before_private_interval(self):
+        from agent.incognito import incognito_scope
+        from gateway.config import GatewayConfig, Platform
+        from gateway.session import SessionSource, SessionStore
+
+        from tools.approval_context import reset_current_session_key, set_current_session_key
+
+        with tempfile.TemporaryDirectory(prefix="hermes-kernel-boundary-") as root:
+            store = SessionStore(Path(root) / "sessions", GatewayConfig())
+            entry = store.get_or_create_session(
+                SessionSource(platform=Platform.TELEGRAM, chat_id="public-then-private", thread_id="1")
+            )
+            sid, key = entry.session_id, entry.session_key
+            session_token = set_current_session_key(key)
+            try:
+                with _kernel_config():
+                    public = _run(
+                        "import os, tempfile; secret_state = 7; print(os.environ['TMPDIR']); print(tempfile.mkstemp()[1])",
+                        task_id=sid,
+                    )
+                    public_path = Path(public["output"].splitlines()[-1])
+                    assert public["status"] == "success", public
+                    from tools.code_kernel import _KERNELS
+                    assert next(iter(_KERNELS))[0] == key
+                    store.set_incognito(key, True)
+                    assert not _KERNELS
+                    try:
+                        with incognito_scope(session_id=sid):
+                            private = _run(
+                                "import os, tempfile; print('secret_state' in globals()); print(os.environ['TMPDIR']); print(tempfile.mkstemp()[1])",
+                                task_id=sid,
+                            )
+                        assert private["status"] == "success", private
+                        assert private["kernel"]["reused"] is False
+                        private_lines = private["output"].splitlines()
+                        assert private_lines[0] == "False"
+                        private_path = Path(private_lines[-1])
+                        assert private_path != public_path
+                        assert private_path.exists()
+                    finally:
+                        store.set_incognito(key, False)
+                    assert not private_path.exists()
+            finally:
+                reset_current_session_key(session_token)
+
+    def test_unbound_incognito_kernel_fails_closed(self):
+        from agent.incognito import incognito_scope
+
+        with _kernel_config(), incognito_scope(session_id="unbound-private-session"):
+            result = _run("print('must not use public scratch')")
+
+        self.assertEqual(result["status"], "error", result)
+        self.assertIn("no bound private interval", result.get("error", "").lower())
+        self.assertFalse(_KERNELS)
+
+    def test_incognito_boundary_retires_delegated_child_kernels(self):
+        from agent.delegation_context import delegated_child_context
+        from agent.incognito import incognito_scope, register_session
+        from agent.incognito_private_dir import bind_private_session, discard_private_dir
+        from tools.approval_context import reset_current_session_key, set_current_session_key
+        from tools.code_kernel import shutdown_kernels_for_owners
+
+        sid = "private-delegated-child"
+        session_token = set_current_session_key(sid)
+        with tempfile.TemporaryDirectory(prefix="hermes-incognito-" + "b" * 32 + "-") as interval_dir:
+            interval = Path(interval_dir)
+            register_session(sid, True)
+            bind_private_session(sid, interval)
+            try:
+                with _kernel_config(), incognito_scope(session_id=sid):
+                    with delegated_child_context("child-1"):
+                        result = _run("child_state = 1", task_id="child-task")
+                    self.assertEqual(result["status"], "success", result)
+                    self.assertEqual(len(_KERNELS), 1)
+                    owner = next(iter(_KERNELS))[0]
+                    self.assertTrue(owner.startswith(sid + "::child::"), owner)
+                    shutdown_kernels_for_owners(sid)
+                    self.assertFalse(_KERNELS)
+            finally:
+                register_session(sid, False)
+                discard_private_dir(sid)
+                reset_current_session_key(session_token)
 
     def test_reset_discards_state(self):
         with _kernel_config():

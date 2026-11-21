@@ -43,8 +43,11 @@ not only the command reply.
 - The content-free sidecar preserves privacy routing across restart. Model
   overrides pass through the existing sanitizer. Do not persist a private model
   selection or credentials as recovery metadata.
-- Plugin content observation is opt-in through `incognito_safe`, including tools,
-  hooks, middleware and event subscribers. New execution paths need the same
+- Plugin content observation is opt-in through an explicit `incognito_safe: true`,
+  including tools, hooks, middleware and event subscribers. An omitted declaration
+  refuses the plugin tool. A declared-safe tool runs with `plugin_data_dir` and
+  `PluginState` redirected into the private interval; direct `HERMES_HOME` writes
+  remain the plugin author's responsibility. New execution paths need the same
   admission owner, not an independently maintained exception list. Hindsight read
   operations remain available. A queued recall keeps the route it was queued
   under, and pending recall is discarded at every boundary. A refused private
@@ -67,8 +70,33 @@ not only the command reply.
 - Intake policy belongs to the receiving adapter. Observed groups whose command
   and conversation keys differ are refused, rather than changing actor identity
   or claiming privacy on only one of the lanes.
-- Media without an existing RAM-only path is refused before download. A temporary
-  file followed by deletion is not an admissible implementation.
+- Media without a persistent store may use the interval's private directory, which is
+  deleted on `/incognito off` and `/new`; no private artifact may outlive that interval.
+  A SIGKILL of the outgoing zero-cut gateway can leave its interval until the next startup sweep.
+  The default parent is outside `HERMES_HOME`, in the account cache root and scoped to the
+  process Hermes home (`~/Library/Caches/Hermes/incognito/<home-hash>/` on macOS,
+  `$XDG_CACHE_HOME/Hermes/incognito/<home-hash>/` elsewhere), so the startup sweep
+  cannot reach another home's live interval. Zero-cut promotion preserves directories
+  owned by another live gateway process; clean shutdown removes its own intervals.
+  `incognito.private_dir` may override that parent (for example, to a RAM-backed volume)
+  and must not be shared between Hermes homes. Kernel scripts, spill files and temporary
+  content stay inside the interval. The random 0600 AF_UNIX RPC endpoint uses
+  `socket_safe_tmpdir()` because deep private paths exceed the OS socket-path limit.
+  Socket nodes contain no persisted payload and are unlinked on kernel teardown.
+  Resolver identity is `agent.incognito_private_dir`: a bound public session is never
+  redirected into another topic's directory. A call with no bound identity receives no
+  shared private directory and private cache writers fail closed rather than landing in a
+  public path. Durable plugin data redirects only on a positive private identity. Legacy
+  `unattributed` directories are removed by cleanup and startup sweep, but new work never
+  creates one. Cleanup that cannot delete a directory records a content-free failure
+  through `log_private_failure` and does not fail `/incognito off`; the startup sweep
+  reports how many directories it removed.
+- Local terminal commands preserve private `TMPDIR`, `TMP` and `TEMP` values when
+  sourcing a public shell snapshot. Remote media downloads resolve the document cache
+  inside the active interval rather than using an import-time public path.
+  Private Docker turns create no cache bind mounts from the private interval.
+  `execute_code` is available only on the local execution backend while private;
+  remote execution is refused because remote kernels can outlive the interval.
 - Picker dispatch and ingress share 1 callback-family registry. Only exact chat
   and sent-message IDs may resolve existing RAM prompt state and its session lane.
   Stale buttons cannot run or consume a newer prompt. Unmatched pickers remain
@@ -137,3 +165,5 @@ Retire this unit with its implementation only after a replacement passes that
 same boundary proof. A source rollback removes the feature, it does not retract
 content already sent to messaging or model providers. Never turn an active
 private lane public merely by ignoring or deleting its routing sidecar.
+
+Contract tests: `tests/agent/test_incognito.py`, `tests/agent/test_incognito_main_sinks.py`, `tests/hermes_cli/test_incognito_plugins.py`, `tests/plugins/platforms/telegram/test_incognito_ingress.py`, `tests/tools/test_delegate_tool.py`, `tests/gateway/test_incognito_turn_e2e.py`, `tests/hermes_state/test_incognito_off_regression.py`.

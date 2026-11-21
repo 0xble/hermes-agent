@@ -529,6 +529,7 @@ class GatewayTurnPersistenceMixin:
             _user_entry["platform_message_id"] = str(event._hermes_recovery_id)
         return _user_entry
 
+    # health: allow CC -- fallback boundary copy must classify synthetic origin before writing; keep this persistence seam intact.
     async def _hmwa_persist_turn_transcript(
         self, *, event, source, session_entry, session_key, agent_result, agent_messages,
         prepared, response, agent_failed_early, hidden_reasoning_incomplete, is_context_overflow_failure,
@@ -616,7 +617,15 @@ class GatewayTurnPersistenceMixin:
                 # into an unrelated future message and replay stale side effects (#107070).
                 supervisor_status = bool(response) and agent_result.get(
                     "queued_terminal_display_kind", prepared.persist_user_display_kind) == "supervisor_checkin"
+                from gateway.run_turn import _failed_turn_copy_is_user_facing
                 notice = response if supervisor_status else self._hmwa_failed_turn_notice(agent_result)
+                if not supervisor_status and not _failed_turn_copy_is_user_facing(
+                    event, prepared.persist_user_display_kind,
+                ):
+                    # Only the generic resend boundary is human-facing copy. A supervisor's
+                    # normalized status is explicit durable work content and must survive even on
+                    # a synthetic origin; synthetic failures without status content stay empty.
+                    notice = ""
                 await self._hmwa_close_failed_turn(
                     sid, notice, self._hmwa_own_failed_boundary_row_id(agent_result) if supervisor_status else None)
             else:
@@ -837,6 +846,9 @@ class GatewayTurnPersistenceMixin:
                 from gateway.copy_blocks import strip_copy_blocks
                 media_delivered = bool(await self._deliver_media_from_response(
                     strip_copy_blocks(response), event, adapter))
+            from gateway.run_turn_incognito_notice import apply_streamed_incognito_restart_notice
+            response = await apply_streamed_incognito_restart_notice(
+                self, session_entry, response, adapter, source, event)
             # Streaming delivered the body, but the footer was held back (`not already_sent` gate).
             if _footer_line and adapter and not _intentional_silence:
                 try:
@@ -877,7 +889,12 @@ class GatewayTurnPersistenceMixin:
             # extraction, instead of promoting a possibly partial block to its own message.
             with suppress(Exception):
                 event._copy_blocks_inline_only = True
-        return response
+        return self._prepend_incognito_restart_notice(session_entry, response)
+
+    def _prepend_incognito_restart_notice(self, session_entry, response):
+        """One visible line after a restart dropped the private RAM tail."""
+        from gateway.run_turn_incognito_notice import prepend_incognito_restart_notice
+        return prepend_incognito_restart_notice(getattr(self, "session_store", None), session_entry, response)
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own
     # sign-in, `{relogin}` the profile-aware host equivalent, filled from the turn's agent provider).
