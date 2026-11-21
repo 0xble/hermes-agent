@@ -270,6 +270,13 @@ def _canonical_silence_candidates(text: Any) -> tuple[str, ...]:
         return ()
     depunctuated = _strip_edge_silence_punctuation(stripped)
     forms = (stripped,) if depunctuated == stripped else (stripped, depunctuated)
+    # Models sometimes space a control token to evade exact matching (e.g.
+    # ``[ S I L E N T ]``). Only collapse whitespace for this short, bracketed
+    # marker-shaped form; prose is never normalized here.
+    if stripped.startswith("[") and stripped.endswith("]"):
+        compact = "[" + "".join(stripped[1:-1].split()) + "]"
+        if compact not in forms:
+            forms = (*forms, compact)
     return tuple(_canonical_silence_candidate(f) for f in forms)
 
 
