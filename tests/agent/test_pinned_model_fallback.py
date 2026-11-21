@@ -146,6 +146,19 @@ def test_pinned_child_keeps_cross_model_chain_only_when_billing_fallback_enabled
     assert enabled._pinned_fallback_model == enabled.model
 
 
+def test_owned_chain_keeps_pin_until_billing_attempt():
+    from types import SimpleNamespace
+    from agent.agent_init_fallback import _pin_init_fallbacks
+
+    chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"}]
+    disabled = SimpleNamespace(model="gpt-6.2-sol", allow_billing_fallback=False)
+    enabled = SimpleNamespace(model="gpt-6.2-sol", allow_billing_fallback=True)
+    assert _pin_init_fallbacks(disabled, chain, True, fallback_chain_owned=True) == []
+    assert _pin_init_fallbacks(enabled, chain, True, fallback_chain_owned=True) == chain
+    assert disabled._pinned_fallback_model == disabled.model
+    assert enabled._pinned_fallback_model == enabled.model
+
+
 
 
 @pytest.mark.parametrize("served", ["other-model", None])

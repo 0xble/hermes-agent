@@ -2498,6 +2498,10 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         prefill_messages=setup.prefill_messages,
         fallback_model=setup.fallback_model,
         model_pinned=_job_route_pinned(job),
+        fallback_chain_owned=(
+            isinstance(_cfg.get("cron"), dict)
+            and (_cfg.get("cron") or {}).get("fallback_providers") is not None
+        ),
         allow_billing_fallback=bool((_cfg.get("cron") or {}).get("allow_billing_fallback", False)),
         credential_pool=setup.credential_pool,
         providers_allowed=pr.get("only"),

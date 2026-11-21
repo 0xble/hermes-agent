@@ -2291,7 +2291,15 @@ def try_activate_fallback(
             agent._billing_fallback_attempt = False
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
-                unavailable.add(fb_key)
+                from hermes_cli.fallback_config import same_fallback_model
+                pinned = getattr(agent, "_pinned_fallback_model", None)
+                pin_rejection = (
+                    isinstance(pinned, str)
+                    and pinned
+                    and not same_fallback_model(pinned, fb_model)
+                )
+                if not pin_rejection:
+                    unavailable.add(fb_key)
                 _release_spare_lease(agent, reservation)
                 continue
             old_model, old_provider = bound
