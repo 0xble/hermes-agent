@@ -162,10 +162,12 @@ class TestVaultStore:
         assert not origin_matches_lookup("http://example.com", "https://sub.example.com")
         assert not origin_matches_lookup("http://example.com:8080", "https://example.com:8443")
 
-    def test_origin_lookup_keeps_exact_matches_unchanged(self):
-        assert origin_matches_lookup("https://Example.com:443/login", "https://example.com")
-        assert origin_matches_lookup("http://example.com:80", "http://example.com")
-        assert not origin_matches_lookup("https://example.com", "https://example.com:8443")
+    def test_origin_lookup_handles_ipv6_and_malformed_origins(self):
+        assert normalize_origin("http://[2001:DB8::1]:8080/login") == "http://[2001:db8::1]:8080"
+        assert origin_matches_lookup("http://[2001:db8::1]:8080", "https://[2001:db8::1]:8080")
+        assert not origin_matches_lookup("http://[2001:db8::1]:8080", "https://[2001:db8::2]:8080")
+        assert not origin_matches_lookup("http://[2001:db8::1", "https://[2001:db8::1]")
+        assert not origin_matches_lookup("not an origin", "https://example.com")
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +305,19 @@ class TestBrowserVaultTools:
         assert [item["handle"] for item in exact["items"]] == [https_meta.id]
         assert exact["items"][0]["origin"] == "https://secure.example.com"
 
+    def test_list_https_ipv6_lookup_finds_http_saved_login_without_raising(self, store):
+        from tools import browser_vault_tool
+
+        http_meta = _add_login(store, origin="http://[2001:db8::1]:8080")
+        backend = LocalLoginBackend()
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+            out = json.loads(browser_vault_tool.browser_vault_list(
+                kind="login", origin="https://[2001:db8::1]:8080"))
+
+        assert out["success"] is True
+        assert [item["handle"] for item in out["items"]] == [http_meta.id]
+
     def test_fill_refused_on_origin_mismatch(self, store):
         from tools import browser_vault_tool
 
@@ -313,6 +328,51 @@ class TestBrowserVaultTools:
         assert out["success"] is False
         assert out["error_type"] == "origin_mismatch"
         assert "s3cret-pw" not in json.dumps(out)
+
+    def test_fill_allows_https_upgrade_for_same_host_and_port(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin="http://example.com:8443")
+        controls = [
+            {"autocomplete": "current-password", "formIndex": 0, "index": 0,
+             "label": "", "name": "pw", "type": "password"},
+        ]
+
+        def fake_eval(task_id, expression):
+            return {"success": True, "result": json.dumps(controls)}
+
+        def fake_eval_secret(task_id, expression):
+            return {"success": True, "result": json.dumps({"filled": 1})}
+
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_current_page_origin",
+                          return_value="https://example.com:8443"), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret):
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
+
+        assert out["success"] is True
+        assert out["origin"] == "https://example.com:8443"
+        assert out["filled_fields"] == 1
+
+    def test_fill_refuses_other_hosts_subdomains_ports_and_downgrades(self, store):
+        from tools import browser_vault_tool
+
+        http_meta = _add_login(store, origin="http://example.com:8443")
+        https_meta = _add_login(store, origin="https://secure.example.com")
+        refused = (
+            (http_meta, "https://other.example.com:8443"),
+            (http_meta, "https://sub.example.com:8443"),
+            (http_meta, "https://example.com:9443"),
+            (https_meta, "http://secure.example.com"),
+        )
+        for meta, page_origin in refused:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch.object(browser_vault_tool, "_current_page_origin", return_value=page_origin):
+                out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
+            assert out["success"] is False, page_origin
+            assert out["error_type"] == "origin_mismatch", page_origin
+            assert "s3cret-pw" not in json.dumps(out)
 
     @staticmethod
     def _manager_meta():
