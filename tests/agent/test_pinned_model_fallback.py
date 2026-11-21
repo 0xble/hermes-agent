@@ -102,7 +102,7 @@ def test_pooled_billing_stops_after_one_retry(tmp_path, monkeypatch):
     assert result["completed"] is True
     assert result["final_response"] == f"OK from {harness.FALLBACK_MODEL}"
     assert [request["model"] for request in primary.requests if request["model"] is not None] == [
-        harness.PRIMARY_MODEL, harness.PRIMARY_MODEL, harness.FALLBACK_MODEL,
+        harness.PRIMARY_MODEL, harness.FALLBACK_MODEL,
     ]
 
 

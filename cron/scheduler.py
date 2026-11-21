@@ -1909,9 +1909,13 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        # Resolve-time fallback handles auth and transport failures. A pinned job may receive
-        # the global chain for billing-only mid-run recovery, but it never substitutes models here.
-        chain = [] if _job_route_pinned(job) else (_job_fallback_chain(job, jc.cfg) or [])
+        # Resolve-time fallback handles auth and transport failures. A pinned job may use an
+        # explicitly owned cron chain, but it never substitutes through the inherited global chain.
+        cron_cfg = jc.cfg.get("cron") if isinstance(jc.cfg, dict) else None
+        owns_chain = isinstance(cron_cfg, dict) and cron_cfg.get("fallback_providers") is not None
+        chain = _job_fallback_chain(job, jc.cfg) or [] if (
+            not _job_route_pinned(job) or owns_chain
+        ) else []
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), %s",
             job_id, "auth" if is_auth else "transient network", resolve_exc,
