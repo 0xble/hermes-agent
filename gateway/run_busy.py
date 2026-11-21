@@ -1069,7 +1069,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
             )
             return True  # handled (silently dropped); do not fall through
         # A steered or queued follow-up never reaches _hm_admit_event, so the budget is charged here.
-        charge = object() if event.source.is_bot else None
+        charge = object() if getattr(event.source, "is_bot", False) else None
         # The charge is passed only when one is taken: a human message keeps the one-argument call.
         admitted = (self._admit_bot_message_for_source(event.source) if charge is None
                     else self._admit_bot_message_for_source(event.source, charge=charge))
