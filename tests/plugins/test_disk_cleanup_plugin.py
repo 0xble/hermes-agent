@@ -282,8 +282,8 @@ class TestConcurrentSaves:
         import threading
 
         dg = _load_lib()
-        import utils
-        real_atomic_replace = utils.atomic_replace
+        import utils.files
+        real_atomic_replace = utils.files.atomic_replace
         replace_barrier = threading.Barrier(2)
         temp_paths = []
 
@@ -295,7 +295,7 @@ class TestConcurrentSaves:
                 replace_barrier.wait(timeout=5.0)
             return real_atomic_replace(tmp_path, target)
 
-        monkeypatch.setattr(utils, "atomic_replace", synchronized_replace)
+        monkeypatch.setattr(utils.files, "atomic_replace", synchronized_replace)
         payloads = [[{"path": f"/tmp/hermes-race-{i}", "category": "test"}] for i in range(2)]
         with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
             futures = [pool.submit(dg.save_tracked, payload) for payload in payloads]

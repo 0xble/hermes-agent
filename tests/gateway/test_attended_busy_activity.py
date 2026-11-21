@@ -53,7 +53,9 @@ def busy_activity(monkeypatch):
         mark_user_activity=AsyncMock(),
     )
     runner._is_user_authorized_for_source = lambda _source: True
-    runner._admit_bot_message_for_source = lambda _source: True
+    # The production helper accepts an optional charge for bot-loop accounting; keep the fixture
+    # compatible with both the human one-argument path and the charged bot path.
+    runner._admit_bot_message_for_source = lambda source, *, charge=None: True
     runner._route_plaintext_approval_while_busy = AsyncMock(return_value=False)
     runner._session_has_compression_in_flight = AsyncMock(return_value=False)
     runner._hm_busy_slash_or_photo = AsyncMock(return_value=(False, None))
@@ -573,7 +575,9 @@ async def test_drain_arrival_records_receipt_before_spool_and_preserves_it_on_re
     runner._session_state(key).conversation.last_user_activity_at = previous
     runner._draining = path in {"idle", "busy"}
     runner._is_user_authorized_for_source = lambda _source: True
-    runner._admit_bot_message_for_source = lambda _source: True
+    # The production helper accepts an optional charge for bot-loop accounting; keep the fixture
+    # compatible with both the human one-argument path and the charged bot path.
+    runner._admit_bot_message_for_source = lambda source, *, charge=None: True
     runner._scale_to_zero_note_real_inbound = lambda: None
     runner._hm_pre_gateway_dispatch_hook = AsyncMock(side_effect=lambda event, _source: event)
     original = MessageEvent(text="human drain arrival", source=source, user_id=source.user_id)

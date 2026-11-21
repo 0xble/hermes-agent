@@ -700,7 +700,10 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
                 if tick.got_flush:
                     self._signal_flush(tick.flush_event)
 
-                await asyncio.sleep(0.05)  # Small yield to not busy-loop
+                # Native streams deliberately push every delta; yield at the
+                # configured cadence so a fast producer is not hidden behind
+                # the old fixed 50 ms polling quantum.
+                await asyncio.sleep(min(0.05, max(0.001, self.cfg.edit_interval)))
 
         except asyncio.CancelledError:
             await self._on_cancelled()

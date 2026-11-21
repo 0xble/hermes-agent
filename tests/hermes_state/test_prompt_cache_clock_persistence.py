@@ -160,31 +160,46 @@ def test_a_managed_worker_clock_carries_the_owner_generation(tmp_path, monkeypat
         db.archive_and_compact("s1", [{"role": "user", "content": "[summary]"}])
         owner_generation = db.prompt_cache_generation("s1")
         assert owner_generation > 0
-        scope = dict(epoch=begin_runtime_epoch(db, instance_id="fixture"), execution_id="w", session_id="s1",
-                     generation=0)
-        register_worker_execution(db, **scope, kind="compute", adoption_secret="secret")
-        store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / "outbox")
-        try:
-            agent = _resumed_agent(store, "s1")
-            record_attempt_sent(agent, {"messages": [{"role": "system", "content": [
-                {"type": "text", "text": "s", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}]})
-            write = normalize_usage({"prompt_tokens": 5000, "completion_tokens": 3,
-                                     "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 4800}},
-                                    provider=_OR[0], api_mode="chat_completions")
-            event = record_cache_response(agent, write, model=_OR[2], provider=_OR[0], base_url=_OR[1],
-                                          api_mode="chat_completions")
-            store.queue_token_counts("s1", input_tokens=10, cache_write_tokens=4800, api_call_count=1,
-                                     prompt_cache_clock=event_to_json(event))
-            assert store.failure is None
-            assert event_from_json(db.get_session("s1")["prompt_cache_clock"]).generation == owner_generation
-            stored = stored_cache_window(db.get_session("s1")["prompt_cache_clock"], session_id="s1",
-                                         generation=db.prompt_cache_generation("s1"))
-            assert (stored["confidence"], stored["tier"]) == ("declared", "1h")
-            # A prune in the same worker archives in place without moving compression_count: the
-            # window it folded is gone, and the next response must not carry its coverage.
-            store.archive_and_compact("s1", [{"role": "user", "content": "[pruned]"}])
-            assert (cache_window(agent).confidence, cache_window(agent).reason) == ("unknown", "compacted")
-        finally:
-            store.close()
+        from gateway.runtime_ownership import exclusive_maintenance
+
+        with exclusive_maintenance([tmp_path], purpose="prompt-cache-test"):
+            epoch = begin_runtime_epoch(db, instance_id="fixture")
+            execution_id = "w"
+            session_id = "s1"
+            generation = 0
+            register_worker_execution(db, epoch=epoch, execution_id=execution_id, session_id=session_id,
+                                      generation=generation, kind="compute", adoption_secret="secret")
+            scope = dict(epoch=epoch, execution_id=execution_id, session_id=session_id, generation=generation)
+            store = RuntimeSessionStore(lambda method, **p: mutate_worker_execution(db, **p), scope, tmp_path / "outbox")
+            try:
+                agent = _resumed_agent(store, "s1")
+                record_attempt_sent(agent, {"messages": [{"role": "system", "content": [
+                    {"type": "text", "text": "s", "cache_control": {"type": "ephemeral", "ttl": "1h"}}]}]})
+                write = normalize_usage({"prompt_tokens": 5000, "completion_tokens": 3,
+                                         "prompt_tokens_details": {"cached_tokens": 0, "cache_write_tokens": 4800}},
+                                        provider=_OR[0], api_mode="chat_completions")
+                event = record_cache_response(agent, write, model=_OR[2], provider=_OR[0], base_url=_OR[1],
+                                              api_mode="chat_completions")
+                assert event is not None
+                store.queue_token_counts("s1", input_tokens=10, cache_write_tokens=4800, api_call_count=1,
+                                         prompt_cache_clock=event_to_json(event))
+                assert store.failure is None
+                saved = db.get_session("s1")
+                assert saved is not None
+                clock = event_from_json(saved["prompt_cache_clock"])
+                assert clock is not None
+                assert clock.generation == owner_generation
+                stored = stored_cache_window(saved["prompt_cache_clock"], session_id="s1",
+                                             generation=db.prompt_cache_generation("s1"))
+                assert stored is not None
+                assert (stored["confidence"], stored["tier"]) == ("declared", "1h")
+                # A prune in the same worker archives in place without moving compression_count: the
+                # window it folded is gone, and the next response must not carry its coverage.
+                store.archive_and_compact("s1", [{"role": "user", "content": "[pruned]"}])
+                window = cache_window(agent)
+                assert window is not None
+                assert (window.confidence, window.reason) == ("unknown", "compacted")
+            finally:
+                store.close()
     finally:
         db.close()
