@@ -46,7 +46,7 @@ def snapshot_refusal(backend, handle, meta, page_origin):
     fresh = backend.get_meta(handle)
     fresh = apply_origin_aliases([fresh])[0] if fresh is not None else None
     if fresh is not None and fresh.kind == meta.kind and any(
-            origin_matches_lookup(saved, page_origin) for saved in saved_origins(fresh)):
+            origin_matches_lookup(saved, page_origin, kind=meta.kind) for saved in saved_origins(fresh)):
         return None
     return {"success": False, "error_type": "origin_mismatch",
             "error": (f"Refused: the saved item changed before the fill and no longer binds {page_origin}. "

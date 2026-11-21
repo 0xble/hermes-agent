@@ -75,7 +75,7 @@ def test_saved_origin_refuses_extra_signin_origin_without_alias(monkeypatch):
     assert result["error_type"] == "origin_mismatch"
     assert result["error"] == (
         "Refused: current page origin (https://login.gusto.com) does not match the vault item's bound origin(s) "
-        "(https://gusto.com). Vault fills only run on the exact origin(s) the credential was saved for. Add the exact "
+        "(https://gusto.com). Login fills allow only the same-host/port HTTP-to-HTTPS upgrade; other kinds require exact-origin matching. Add the exact "
         "origin with `hermes config set vault.origin_aliases.op:gusto-id '[\"https://login.gusto.com\"]'`, including any "
         "existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may "
         "write this config entry; alias-only fills ask the user to confirm the exact origin and item label unless `vault.confirm_alias_fills` is false. Never edit or rewrite "

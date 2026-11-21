@@ -168,14 +168,14 @@ def normalize_origin(url_or_origin: str) -> str:
     return f"{scheme}://{host_text}:{port}"
 
 
-def origin_matches_lookup(saved_origin: str | None, lookup_origin: str | None) -> bool:
-    """Return whether a saved origin is a candidate for an origin lookup.
+def origin_matches_lookup(saved_origin: str | None, lookup_origin: str | None, *, kind: str = "login") -> bool:
+    """Return whether a saved origin authorizes a lookup for an item kind.
 
-    Lookups preserve exact-origin matching, with one discovery-only compatibility
-    rule: an HTTPS lookup may find an HTTP item for the same normalized host and
-    port. The comparison is deliberately asymmetric; it never lets an HTTP
-    lookup find an HTTPS item or crosses hosts/subdomains. Callers must still
-    enforce the item's allowed origins before filling.
+    Matching is exact after normalization. Login items additionally allow an
+    HTTPS lookup to match an HTTP item for the same host and port; the
+    comparison is deliberately asymmetric and never crosses hosts/subdomains.
+    Other item kinds remain exact-origin only. Malformed metadata is untrusted
+    input and is never eligible.
     """
     if not saved_origin or not lookup_origin:
         return False
@@ -184,6 +184,8 @@ def origin_matches_lookup(saved_origin: str | None, lookup_origin: str | None) -
         lookup = normalize_origin(lookup_origin)
         if saved == lookup:
             return True
+        if kind != "login":
+            return False
         saved_parts = urlsplit(saved)
         lookup_parts = urlsplit(lookup)
         return (
