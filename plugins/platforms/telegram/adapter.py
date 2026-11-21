@@ -6824,8 +6824,17 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         def _ph_wrap(open_: str, close: str):
             return lambda m: _ph(f"{open_}{_escape_mdv2(m.group(1))}{close}")
 
-        # 0) Rewrite GFM-style pipe tables into Telegram-friendly row groups
-        #    before the normal MarkdownV2 conversions run.
+        # 0) MarkdownV2 has no math. Render known LaTeX macros in prose before
+        #    the normal escaping pass, while leaving code spans and fences verbatim.
+        from .rich_code_regions import map_outside_code
+        from .telegram_markdown import normalize_latex_macros
+        content = map_outside_code(content, normalize_latex_macros)
+        # A doubled literal backslash is data (for example, an escaped Windows
+        # path or an intentionally escaped macro), not a Markdown escape. The
+        # final MarkdownV2 escape pass doubles each slash once, so double this
+        # input run first to preserve both literal slashes in the delivered text.
+        content = map_outside_code(content, lambda prose: re.sub(r"\\\\(?=[A-Za-z])", r"\\\\\\\\", prose))
+        # Rewrite GFM-style pipe tables into Telegram-friendly row groups.
         from .copy_quotes import protect_copy_quotes
         text = _wrap_markdown_tables(protect_copy_quotes(content, _ph, _escape_mdv2))
         # 1) Protect fenced code blocks (``` ... ```)
