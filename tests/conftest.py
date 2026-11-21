@@ -370,8 +370,12 @@ def _hermetic_environment(tmp_path, tmp_path_factory, monkeypatch):
     get_home_override = hermes_constants.get_hermes_home_override
 
     def isolated_home_override(value):
-        if value is not None and not Path(value).is_absolute():
-            value = fake_hermes_home / "profile-scopes" / value
+        if value is not None:
+            # Keep symbolic authority ids under the test home, but do not mistake
+            # an env/user-expanded absolute path for a relative profile id.
+            expanded = Path(os.path.expandvars(os.path.expanduser(str(value))))
+            if not expanded.is_absolute():
+                value = fake_hermes_home / "profile-scopes" / value
         return set_home_override(value)
 
     def isolated_get_home_override():
