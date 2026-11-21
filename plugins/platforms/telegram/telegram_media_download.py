@@ -46,7 +46,11 @@ async def fetch_telegram_file(source: Any, what: str, local_root: str | None = N
                     return file_obj, data
                 except BadRequest:  # PTB makes this permanent error a NetworkError subclass.
                     raise
-                except NetworkError as exc:
+                except Exception as exc:
+                    # Keep SDK-free test doubles and compatible PTB shims retryable by
+                    # their stable exception name without broadening permanent failures.
+                    if not isinstance(exc, NetworkError) and type(exc).__name__ != "TimedOut":
+                        raise
                     # Error strings may contain a token-bearing URL; log only the type.
                     logger.warning("[Telegram] %s: media fetch attempt %d/3 failed (%s)",
                                    what, attempt, type(exc).__name__)
