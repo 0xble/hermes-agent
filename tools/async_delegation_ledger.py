@@ -391,7 +391,7 @@ def _attach_retry_note(evt: dict[str, Any]) -> None:
         return
     provisional_note = evt.get("retry_note")
     try:
-        from tools.delegation_resume import retry_note, retry_status, schedule_retry
+        from tools.delegation_resume import is_user_cancel_reason, retry_note, retry_status, schedule_retry
         delegation_id = evt["delegation_id"]
         plan = schedule_retry(delegation_id)
         if plan is None:
@@ -402,6 +402,17 @@ def _attach_retry_note(evt: dict[str, Any]) -> None:
                         "delegation_id": delegation_id, "cut_reason": record["event"].get("cut_reason")}
         if note := retry_note(plan):
             evt["retry_note"] = note
+        elif plan is None:
+            # A user stop invalidates any already-serialized promise.  For legacy
+            # CLI/TUI/scalar cuts there is no gateway retry plan, so retain the
+            # explicit one-shot resume instruction seeded by the producer.
+            record = retry_status(delegation_id)
+            stopped = bool(record and record["retry_state"] == "cancelled")
+            if stopped or (record and record["event"].get("cut_reason") and
+                           is_user_cancel_reason(record["event"].get("cut_reason"))):
+                evt.pop("retry_note", None)
+            elif provisional_note:
+                evt["retry_note"] = provisional_note
     except Exception:  # the retry classification deferred; keep the provisional delivery guidance
         if provisional_note:
             evt["retry_note"] = provisional_note

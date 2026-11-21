@@ -24,7 +24,7 @@ import uuid
 from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, cast
 
 from hermes_constants import get_hermes_home, hermes_home_key
 from tools.daemon_pool import DaemonThreadPoolExecutor
@@ -1075,7 +1075,12 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
             snapshot["cancel_fn"]("queued delegation cancelled")
         except Exception:
             logger.debug("Queued delegation %s cleanup failed", delegation_id, exc_info=True)
-    _push_completion_event(snapshot, result(snapshot) if callable(result) else result, status)
+    # Build and durably classify the event while the terminal claim is held, but
+    # publish it only after the in-memory lifecycle reaches its terminal state.
+    # Consumers use queue visibility as the completion boundary; publishing from
+    # ``finalizing`` made active_count/admission race the consumer and left the
+    # just-finished child occupying a slot during rapid turnover.
+    _push_completion_event(snapshot, cast(dict[str, Any], result(snapshot) if callable(result) else result), status, publish=False)
     with _records_lock:
         live = _records.get(delegation_id)
         if live is not None:
@@ -1088,7 +1093,9 @@ def _finalize(delegation_id: str, result: Any, status: str, *, _claimed_snapshot
             live.pop("_worker_context_runner", None)
             live.pop("_finished_children", None)
         _prune_completed_locked()
-    # A terminal event does not free a submitted slot; only release_slot does.
+    _publish_completion_event(snapshot)
+    # Capacity remains reserved until the executor Future's done callback, which
+    # is the admission contract even when the worker finished before submit returned.
 
 
 def completion_event(record: dict[str, Any], result: dict[str, Any], status: str) -> tuple[dict, dict, bool]:
@@ -1149,7 +1156,25 @@ def completion_event(record: dict[str, Any], result: dict[str, Any], status: str
     return evt, result, silent
 
 
-def _push_completion_event(record: dict[str, Any], result: dict[str, Any], status: str) -> None:
+def _publish_completion_event(record: dict[str, Any]) -> None:
+    """Publish a completion previously built by ``_push_completion_event``.
+
+    The caller invokes this after the registry's memory transition, so a
+    consumer can safely use queue visibility as the terminal lifecycle edge.
+    """
+    evt = record.pop("_completion_event_to_publish", None)
+    if evt is None:
+        return
+    try:
+        from tools.process_registry import process_registry
+        process_registry.completion_queue.put(evt)
+    except Exception as exc:  # pragma: no cover
+        label = " batch" if record.get("is_batch") else ""
+        logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
+                     "result lost: %s", record.get("delegation_id"), exc, exc_info=True)
+
+
+def _push_completion_event(record: dict[str, Any], result: dict[str, Any], status: str, *, publish: bool = True) -> None:
     """Push a type='async_delegation' event onto the shared completion queue. Batch records
     (``is_batch``) carry the per-task ``results`` list (plus live transcript paths, the
     full-fidelity record of each child's run) instead of a single summary. Best-effort: failure
@@ -1257,26 +1282,34 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
                          in {"failed", "error", "interrupted", "unknown"} for child in (children or []))
             cut_reason = evt.get("cut_reason") or record.get("_cut_reason")
             if (cut_reason and cut_reason != "/stop") or str(evt.get("status") or "").lower() in {"failed", "interrupted"} or failed:
-                if cut_reason == "gateway shutdown (restart)":
-                    evt["retry_note"] = ("Work was cut before finishing. To continue call "
-                                         "delegate_task(action='resume', subagent_id='" +
-                                         str(evt.get("delegation_id")) + "'). Hermes will not automatically rerun this cut work.")
-                elif cut_reason != "/stop":
+                from tools.delegation_resume import gateway_retry_origin, is_user_cancel_reason
+                if cut_reason and not is_user_cancel_reason(cut_reason):
+                    # Gateway lifecycle cuts are owned by the durable retry driver, except for
+                    # an explicit planned restart. Stateless/CLI/TUI cuts retain the established
+                    # one-shot resume action; they must never be presented as automatic retries.
+                    explicit_resume = (cut_reason == "gateway shutdown (restart)"
+                                       or not gateway_retry_origin(record))
+                    if explicit_resume:
+                        evt["retry_note"] = ("Work was cut before finishing. To continue call "
+                                             "delegate_task(action='resume', subagent_id='" +
+                                             str(evt.get("delegation_id")) +
+                                             "'). Hermes will not automatically rerun this cut work.")
+                    else:
+                        evt["retry_note"] = ("Hermes will retry this automatically; you will get a notice then. "
+                                             "Do not re-dispatch it yourself.")
+                elif not cut_reason and (str(evt.get("status") or "").lower() in {"failed", "interrupted"} or failed):
                     evt["retry_note"] = ("Hermes will retry this automatically; you will get a notice then. "
                                          "Do not re-dispatch it yourself.")
-        # The event is published before retry classification so a slow ledger writer cannot delay
-        # completion delivery. Resume admission is a read-only durable probe and must be stamped
-        # before publication, otherwise a consumer can format the event in the race window and
-        # suppress the only valid restart-resume instruction.
-        if not evt.get(_TERMINAL_OWNERSHIP_KEY):
-            _record_context_run(record, _stamp_resume_availability, evt)
-        try:
-            process_registry.completion_queue.put(evt)
-        except Exception as exc:  # pragma: no cover
-            logger.error(f"Async delegation{label} %s: failed to enqueue completion event; "
-                         "result lost: %s", record.get("delegation_id"), exc, exc_info=True)
+        # Classification and resume admission are durable prerequisites for publishing a
+        # completion. Publishing first leaves consumers racing an armed row and can turn a
+        # restart/stop resume instruction into an automatic retry (or no instruction).
         if not evt.get(_TERMINAL_OWNERSHIP_KEY):
             _record_context_run(record, _attach_retry_note, evt)
+        if publish:
+            _publish_completion_event({**record, "_completion_event_to_publish": evt})
+        else:
+            record["_completion_event_to_publish"] = evt
+
 
 
 def _failure_notice_will_auto_retry(delegation_id: str, entry: dict[str, Any]) -> bool:
