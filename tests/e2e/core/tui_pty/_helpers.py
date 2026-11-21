@@ -237,6 +237,8 @@ class TmuxTui:
             self._sock_dir = tempfile.mkdtemp(prefix="htui-")
             sock = Path(self._sock_dir) / "s"
         self.sock = str(sock)
+        from hermes_cli.test_artifact_lifetime import register_tmux_server
+        register_tmux_server(socket=self.sock)
         if write_home:
             write_hermes_home(self.hermes_home, base_url, extra_config=BASE_CONFIG + extra_config)
         for sub in ("tmp", "work"):
