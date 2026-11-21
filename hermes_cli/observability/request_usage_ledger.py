@@ -14,6 +14,7 @@ import os
 import queue
 import threading
 import time
+from collections import OrderedDict, deque
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -26,11 +27,30 @@ REQUEST_ROW_KEYS = (
     "fallback_index", "failure_class", "input_tokens", "cache_read_tokens",
     "cache_write_tokens", "output_tokens", "system_prompt_tier_sizes",
     "from_model", "to_model", "idle_gap_bucket",
+    "prune_committed", "compaction_committed",
 )
 REQUEST_ROW_KEY_SET = frozenset(REQUEST_ROW_KEYS)
 _RETENTION_DAYS = 30
 _QUEUE_SIZE = 4096
 _STOP = object()
+_HISTORY_REWRITE_FIELDS = ("prune_committed", "compaction_committed")
+# Pending only until the first eligible request, not a second durable ledger. Bound
+# memory even if sessions stop (or rotate again) without sending another request.
+_PENDING_REWRITE_LIMIT = 4096
+_pending_rewrites: OrderedDict[tuple[Path, str], deque[tuple[float, str]]] = OrderedDict()
+_pending_rewrites_lock = threading.Lock()
+
+
+def _reset_pending_rewrites_after_fork() -> None:
+    # Pending flags belong to requests in the original process. An inherited lock
+    # could also be held by a thread that does not survive the fork.
+    global _pending_rewrites_lock
+    _pending_rewrites_lock = threading.Lock()
+    _pending_rewrites.clear()
+
+
+if hasattr(os, "register_at_fork"):
+    os.register_at_fork(after_in_child=_reset_pending_rewrites_after_fork)
 
 
 def _text(value: Any, limit: int = 256) -> str | None:
@@ -91,6 +111,7 @@ def sanitize_request_row(row: dict[str, Any]) -> dict[str, Any]:
         "from_model": _text(row.get("from_model"), 256),
         "to_model": _text(row.get("to_model"), 256),
         "idle_gap_bucket": _text(row.get("idle_gap_bucket"), 64),
+        **{key: row[key] if type(row.get(key)) is bool else None for key in _HISTORY_REWRITE_FIELDS},
     }
 
 
@@ -346,14 +367,68 @@ def record_request_row(row: dict[str, Any]) -> bool:
     return _guarded(lambda: row)
 
 
+def note_history_rewrite(session_id: str, *, pruned: bool, origin_session_id: str | None = None) -> bool:
+    """Stage a committed Hermes history rewrite for the next main request in its live session."""
+    try:
+        from agent.incognito import is_incognito
+
+        if not session_id or is_incognito(session_id) or is_incognito(origin_session_id):
+            return False
+        key = get_hermes_home(), session_id
+        field = "prune_committed" if pruned else "compaction_committed"
+        with _pending_rewrites_lock:
+            _pending_rewrites.setdefault(key, deque(maxlen=32)).append((time.time(), field))
+            _pending_rewrites.move_to_end(key)
+            if len(_pending_rewrites) > _PENDING_REWRITE_LIMIT:
+                _pending_rewrites.popitem(last=False)
+        return True
+    except Exception:  # health: allow BLE001 -- local telemetry cannot fail a committed rewrite; errors are counted
+        _count_hook_error()
+        return False
+
+
+def _take_history_rewrites(agent: Any, session_id: str | None) -> dict[str, bool]:
+    """Attribute each rewrite once, never to a request already in flight at commit."""
+    started_at = getattr(agent, "_current_api_request_started_at", None)
+    if not session_id or not isinstance(started_at, (int, float)):
+        return {}
+    detached = getattr(agent, "_persist_disabled", False)
+    fields: dict[str, bool] = dict.fromkeys(_HISTORY_REWRITE_FIELDS, False)
+    if not _pending_rewrites:
+        return {} if detached else fields
+    from agent.incognito import is_incognito
+
+    key = get_hermes_home(), session_id
+    private = is_incognito(session_id)
+    with _pending_rewrites_lock:
+        if private:
+            _pending_rewrites.pop(key, None)
+            return {}
+        if detached:
+            return {}
+        pending = _pending_rewrites.get(key)
+        if pending is not None:
+            while pending and pending[0][0] <= started_at:
+                _, field = pending.popleft()
+                fields[field] = True
+            if not pending:
+                _pending_rewrites.pop(key)
+    return fields
+
+
+def _with_history_rewrites(agent: Any, row: dict[str, Any]) -> dict[str, Any]:
+    row.update(_take_history_rewrites(agent, row["session_id"]))
+    return row
+
+
 def note_response(agent: Any, usage: Any = None) -> bool:
     """Record one response row for ``agent``. Never raises into the request path."""
-    return _guarded(lambda: row_for_response(agent, usage))
+    return _guarded(lambda: _with_history_rewrites(agent, row_for_response(agent, usage)))
 
 
 def note_error(agent: Any, failure_class: str | None) -> bool:
     """Record one failed-request row for ``agent``. Never raises into the request path."""
-    return _guarded(lambda: row_for_error(agent, failure_class))
+    return _guarded(lambda: _with_history_rewrites(agent, row_for_error(agent, failure_class)))
 
 
 def _auxiliary_row(payload: dict[str, Any]) -> dict[str, Any]:

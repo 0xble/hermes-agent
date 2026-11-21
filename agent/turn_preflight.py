@@ -15,6 +15,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
+from agent.context_compressor_summary import _accepts_keyword_argument
 from agent.context_engine import automatic_compaction_status_message
 from agent.conversation_compression import (
     PRE_API_COMPRESSION_STATUS_TEMPLATE, compression_blocked_transiently,
@@ -23,6 +24,7 @@ from agent.conversation_compression import (
 )
 from agent.conversation_compression_boundary import mark_context_loss_boundary
 from agent.conversation_compression_feasibility import ensure_compression_feasibility_checked
+from agent.prompt_caching import provider_cache_expired
 from agent.turn_context import _review_fork_first_request_pending
 from agent.turn_context_compaction import (
     _apply_grown_window, _blocked_compress_reason, _clear_overflow_warn, _refund_api_call,
@@ -461,7 +463,9 @@ def compress_after_tool_results(
             agent._warn_context_overflow_blocked(
                 _block_reason, _real_tokens, int(getattr(_compressor, "threshold_tokens", 0) or 0)
             )
-        _pruned_msgs = _proactive_tool_result_prune(agent, _compressor, messages, _real_tokens)
+        _pruned_msgs = _proactive_tool_result_prune(
+            agent, _compressor, messages, _real_tokens, turn_start=current_turn_user_idx,
+        )
         if _pruned_msgs is not messages:
             messages = _pruned_msgs
             # A committed prune is a content-loss boundary like compaction: demoted skill_view /
@@ -471,29 +475,47 @@ def compress_after_tool_results(
     return _verdict(False)
 
 
-def _proactive_tool_result_prune(agent: Any, compressor: Any, messages: list, current_tokens: int) -> list:
+def _proactive_tool_result_prune(
+    agent: Any, compressor: Any, messages: list, current_tokens: int, *,
+    turn_start: int | None = None, cold_only: bool = False,
+) -> list:
     """Proactive tool-result prune (deterministic, no LLM, keeps tail): the pruned list when one
-    committed, else the same ``messages`` object. No-op unless proactive_prune_tokens is exceeded;
-    commits only past proactive_prune_min_reclaim_tokens so cache breaks stay episodic.
+    committed, else the same ``messages`` object. A confirmed cold cache needs no warm trigger.
 
     Withheld while compression.checkpoint_required is armed: the prune rewrites the durable
     transcript between compactions, so no checkpoint precedes it. Gating here, not in the
     compressor, also covers engines that override the hook. Suppression, not refusal (it runs per
     tool iteration); the material stays in context for the checkpointed threshold compaction.
     """
+    # The response clock can describe another route, and a fallback episode may be
+    # too short to recoup a warm rewrite. Resume normal pruning on the primary.
+    if getattr(agent, "_provider_fallback_active", False) is True:
+        return messages
+    cold_cache = provider_cache_expired(agent, messages)
+    if cold_only and not cold_cache:
+        return messages
     if getattr(agent, "compression_checkpoint_required", False) is True:
         from agent.conversation_compression_checkpoint import (
             _prune_would_have_run, _record_checkpoint_gate_suppression,
         )
 
-        if _prune_would_have_run(compressor, current_tokens):
+        if cold_cache or _prune_would_have_run(compressor, current_tokens):
             _record_checkpoint_gate_suppression(agent, "the proactive tool-result prune")
         return messages
     prune = getattr(compressor, "prune_tool_results_only", None)
-    if not callable(prune):
+    # No bound session row keeps the originals: a committed prune would drop them for good.
+    if not (callable(prune) and getattr(compressor, "_session_db", None) is not None
+            and getattr(compressor, "_session_id", "")):
         return messages
+    kwargs: dict[str, Any] = {"current_tokens": current_tokens}
+    if _accepts_keyword_argument(prune, "cold_cache"):  # older plugin engines keep their signature
+        kwargs["cold_cache"] = cold_cache
+    elif cold_only:
+        return messages
+    if turn_start is not None and _accepts_keyword_argument(prune, "turn_start"):
+        kwargs["turn_start"] = turn_start
     try:
-        pruned_msgs, pruned_n = prune(messages, current_tokens=current_tokens)
+        pruned_msgs, pruned_n = prune(messages, **kwargs)
     except Exception:
         logger.debug("proactive tool-result prune failed; skipping", exc_info=True)
         return messages

@@ -2833,8 +2833,9 @@ class ContextCompressor(
         self.proactive_prune_min_result_chars = max(_PRUNE_MIN_CHARS, int(proactive_prune_min_result_chars or 8000))
         # Every commit breaks the prompt-cache prefix; require a meaningful reclaim batch so fires are episodic.
         self.proactive_prune_min_reclaim_tokens = max(0, int(proactive_prune_min_reclaim_tokens or 0))
-        # A committed prune is a cache boundary: rearm only after the prompt regrows the reclaimed tokens.
+        # Rearm after a committed prune only once the prompt regrows; cold prunes credit the next warm gate.
         self._proactive_prune_rearm_tokens: int = 0
+        self._proactive_prune_cold_credit: int = 0
         # Dedup key for the over-threshold "reclamation no-oped" warning
         # (#101889) so a tool loop riding above the threshold warns once per
         # distinct reason + rearm snapshot instead of every iteration.
@@ -3323,20 +3324,6 @@ class ContextCompressor(
                 result, prune_boundary, protect_tail_tokens, call_id_to_tool, min_prune_chars, spared,
             )
         return result, pruned
-
-    def _reset_proactive_prune_rearm(self) -> None:
-        """Fully rearm the proactive prune and let a future lockout warn again.
-
-        Every path that zeroes the rearm mark (compaction, session
-        reset/end/rebind, model recalibration) is a reclamation or a fresh
-        start, so the over-threshold no-op dedup key must not survive it —
-        otherwise an identical lockout after a full compaction (rearm back
-        at 0) would be silent (#101889).
-        """
-        self._proactive_prune_rearm_tokens = 0
-        self._consecutive_archive_capacity_failures = 0
-        self._optional_archive_cooldown_until = 0.0
-        self._last_reclaim_block_warn = None
 
     def _billed_basis_over_threshold(self, current_tokens: int | None) -> bool:
         """Whether a provider-billed reading says the session is over threshold.

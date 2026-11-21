@@ -87,9 +87,10 @@ def test_billed_basis_over_threshold_defeats_message_only_rearm_lockout() -> Non
     # Stand in for the real multi-pass scan: a NEW list whose old tool outputs
     # are reclaimed, so the (untouched) reclaim gate can commit it.
     reclaimed = [dict(m) for m in msgs]
-    for m in reclaimed[:-2]:
-        if m.get("role") == "tool":
-            m["content"] = "[pruned]"
+    large_results = [m for m in reclaimed if m["role"] == "tool" and m["content"] != "ok"]
+    assert len(large_results) == 3
+    for m in large_results:
+        m["content"] = "[pruned]"
 
     def _scan(*args: Any, **kwargs: Any) -> tuple[list[dict[str, Any]], int]:
         scans.append(1)

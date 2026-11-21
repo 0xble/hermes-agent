@@ -625,12 +625,9 @@ DEFAULT_CONFIG = {
         # max_attempts: retry rounds before a turn gives up with "max compression attempts reached".
         # Raise (e.g. 6) for tool-schema-heavy sessions. Validated >= 1, cap 10.
         "max_attempts": 3,
-        # proactive_prune_tokens: default trigger (tokens) for the deterministic no-LLM tool-result
-        # prune, independent of `threshold` (which rarely fires on large windows, so old tool output
-        # is re-sent every turn). 48000 reclaims early; set 0 to disable. Tail protected by
-        # `protect_last_n`. Built-in compressor only. Each committed prune rewrites sent history and
-        # breaks the prompt-cache prefix — the min_reclaim gate below keeps those breaks episodic.
-        "proactive_prune_tokens": 48000,
+        # Warm-cache trigger in tokens (0 = off). On a confirmed expired cache,
+        # the built-in compressor can still reclaim old tool results at the cold gate.
+        "proactive_prune_tokens": 0,
         # Prune's summarize pass only touches tool results larger than this (chars); clamped >= 200
         # so a generated summary can't be re-summarized.
         "proactive_prune_min_result_chars": 8000,
@@ -1399,6 +1396,8 @@ DEFAULT_CONFIG = {
         # and every compaction is a chance to lose detail, so the default stays off. A token count >= 16000 enables it;
         # other values (true, "200k") are config errors: warned and ignored.
         "compression_threshold_tokens": 0,
+        # Separate opt-in so primary warm-prune settings do not apply to delegated agents.
+        "proactive_prune_tokens": 0,
         # When delegate_task narrows child toolsets, keep the parent's enabled MCP toolsets (so
         # toolsets=["web"] doesn't strip MCP). false = strict intersection.
         "inherit_mcp_toolsets": True,

@@ -15,6 +15,24 @@ from typing import Any, Optional
 
 logger = logging.getLogger("agent.context_compressor")
 
+# Reclaim floor for an expired cache, where pruning doesn't cause a cache break.
+_COLD_CACHE_MIN_RECLAIM_TOKENS = 16_000
+
+
+def _restore_protected_prune_rows(
+    messages: list[dict[str, Any]], pruned_msgs: list[dict[str, Any]],
+    turn_start: int | None, boundary: int,
+) -> None:
+    """Keep the running turn and the protected parallel tool round intact."""
+    if turn_start is not None:
+        pruned_msgs[turn_start:] = messages[turn_start:]
+    # A protected parallel round stays whole, including dedup and image retirement.
+    if 0 <= boundary < len(messages) and messages[boundary].get("tool_calls"):
+        end = boundary + 1
+        while end < len(messages) and messages[end].get("role") == "tool":
+            end += 1
+        pruned_msgs[boundary:end] = messages[boundary:end]
+
 
 def _cc():
     """The origin module, resolved lazily: avoids the import cycle and keeps tests that patch
@@ -34,6 +52,20 @@ class ProactivePruneMixin:
         seconds = _cc()._next_timeout_cooldown(self, "_consecutive_archive_capacity_failures")
         self._optional_archive_cooldown_until = max(self._optional_archive_cooldown_until, time.monotonic() + seconds)
 
+    def _reset_proactive_prune_rearm(self) -> None:
+        """Fully rearm the proactive prune and let a future lockout warn again.
+
+        Every path that zeroes the rearm mark (compaction, session
+        reset/end/rebind, model recalibration) is a reclamation or a fresh
+        start, so the over-threshold no-op dedup key must not survive it —
+        otherwise an identical lockout after a full compaction (rearm back
+        at 0) would be silent (#101889).
+        """
+        self._proactive_prune_rearm_tokens = self._proactive_prune_cold_credit = 0
+        self._consecutive_archive_capacity_failures = 0
+        self._optional_archive_cooldown_until = 0.0
+        self._last_reclaim_block_warn = None
+
     def would_proactively_prune(self, current_tokens: int | None = None) -> bool:
         """Configured on AND above its trigger: the two state-free preconditions
         ``prune_tool_results_only`` checks first, published so the host can tell a withheld prune
@@ -44,30 +76,35 @@ class ProactivePruneMixin:
         )
 
     def prune_tool_results_only(
-        self, messages: list[dict[str, Any]], current_tokens: int | None = None,
+        self, messages: list[dict[str, Any]], current_tokens: int | None = None, *, cold_cache: bool = False,
+        turn_start: int | None = None,
     ) -> tuple[list[dict[str, Any]], int]:
-        """Deterministic, no-LLM tool-result prune gated on ``proactive_prune_tokens``.
+        """Prune old tool results on an expired cache, or above the opt-in warm trigger.
 
-        Protects the tail by message COUNT only. A commit breaks the prompt cache, so it requires
-        ``proactive_prune_min_reclaim_tokens`` and a full regrowth runway; otherwise returns the INPUT
-        object as ``(messages, 0)``. The rearm gate is measured on message bodies only, so it is
+        Never shorten the running turn. An invalid anchor means the running turn
+        cannot be identified, so skip rather than guessing from the tail size.
+
+        Protects the tail by message COUNT only. A warm commit breaks the prompt cache, so it requires
+        ``proactive_prune_min_reclaim_tokens`` (less what cold prunes freed since the last warm one) and a
+        full regrowth runway; otherwise returns the INPUT object as ``(messages, 0)``. ``cold_cache`` (the
+        provider cache has already expired) has nothing to break: the gate drops to
+        ``_COLD_CACHE_MIN_RECLAIM_TOKENS`` and the runway is neither checked nor moved. The rearm gate is measured on message bodies only, so it is
         bypassed (never the reclaim gate) when a provider-billed ``current_tokens`` reading already
         puts the request over ``threshold_tokens`` (#101889); every no-op taken while over threshold
         is logged once per distinct reason.
 
-        ``_prune_old_tool_results`` runs all deterministic passes: (1) dedup byte-identical tool results —
-        keeps the newest full copy and back-references older exact duplicates ANYWHERE in the list
-        (including the protected tail), so no unique content is ever lost; (2) summarize non-tail tool
-        results larger than ``min_prune_chars``; (3) truncate oversized tool_call arguments on non-tail
-        assistant messages; (3.5) retire image payloads on all but the newest ``_MAX_KEEP_TOOL_IMAGES``
-        image-bearing tool results, except a pending round that fits the hard share (#92699). Only pass (2)'s floor is
-        raised by ``proactive_prune_min_result_chars``; passes (1) and (3) keep their own fixed floors. The
-        recent-tail protection applies to passes (2) and (3); pass (1) is tail-agnostic by design because
-        dedup is lossless.
+        The underlying planner deduplicates identical results, summarizes oversized old result
+        bodies, and retires old tool images. Canonical tool-call arguments stay unchanged.
+        Dedup and image retirement may otherwise touch the protected tail; the running turn and
+        the tool round at the tail boundary are restored whole before counting token savings.
         """
         if self._optional_archive_cooldown_until > time.monotonic():
             return messages, 0
-        if not self.would_proactively_prune(current_tokens):
+        if not (cold_cache or self.would_proactively_prune(current_tokens)):
+            return messages, 0
+        if turn_start is not None and not (type(turn_start) is int and 0 <= turn_start < len(messages)
+                and messages[turn_start].get("role") == "user"):
+            self._warn_reclamation_no_op("prune:running_turn_unknown", current_tokens)
             return messages, 0
         if len(messages) <= self.protect_last_n + self._protect_head_size(messages) + 1:
             self._warn_reclamation_no_op("prune:tail_only", current_tokens)
@@ -75,7 +112,8 @@ class ProactivePruneMixin:
         _estimate_msg_budget_tokens = _cc()._estimate_msg_budget_tokens
         before = sum(_estimate_msg_budget_tokens(m) for m in messages)
         # Under-threshold runway skip is ordinary hysteresis (silent); above it the lockout is the bug.
-        if before < self._proactive_prune_rearm_tokens and not self._billed_basis_over_threshold(current_tokens):
+        if (not cold_cache and before < self._proactive_prune_rearm_tokens
+                and not self._billed_basis_over_threshold(current_tokens)):
             return messages, 0
         # Capability gate first: a store without archive_and_compact makes every prune a no-op.
         session_db = getattr(self, "_session_db", None)
@@ -83,9 +121,15 @@ class ProactivePruneMixin:
         if session_db and session_id and not callable(getattr(session_db, "archive_and_compact", None)):
             self._warn_reclamation_no_op("prune:store_cannot_persist", current_tokens)
             return messages, 0
-        pruned_msgs, pruned_count = self._prune_old_tool_results(
-            messages, protect_tail_count=self.protect_last_n, protect_tail_tokens=None, min_prune_chars=self.proactive_prune_min_result_chars,
+        boundary = len(messages) - self.protect_last_n
+        if 0 < boundary < len(messages) and messages[boundary].get("role") == "tool":
+            boundary = self._align_boundary_backward(messages, boundary)
+        pruned_msgs, _ = self._prune_old_tool_results(
+            messages, protect_tail_count=len(messages) - boundary, protect_tail_tokens=None,
+            min_prune_chars=self.proactive_prune_min_result_chars,
         )
+        _restore_protected_prune_rows(messages, pruned_msgs, turn_start, boundary)
+        pruned_count = sum(a != b for a, b in zip(messages, pruned_msgs))
         from agent.context_compressor_tail import with_pruned_row_skill_safety_rule
         pruned_msgs = with_pruned_row_skill_safety_rule(messages, pruned_msgs)
         if not pruned_count:
@@ -95,12 +139,17 @@ class ProactivePruneMixin:
         # Prompt-cache hysteresis: commit only when the reclaim is meaningful.
         after = sum(_estimate_msg_budget_tokens(m) for m in pruned_msgs)
         reclaimed = max(0, before - after)
-        if reclaimed < self.proactive_prune_min_reclaim_tokens:
+        gate = self.proactive_prune_min_reclaim_tokens
+        cold_gate = _COLD_CACHE_MIN_RECLAIM_TOKENS
+        if self.proactive_prune_tokens > 0:
+            cold_gate = min(gate, cold_gate)
+        if reclaimed < (cold_gate if cold_cache else max(cold_gate, gate - self._proactive_prune_cold_credit)):
             self._warn_reclamation_no_op("prune:reclaim_below_minimum", current_tokens, before=before)
             return messages, 0
-        # Require a full trigger-sized regrowth before the next cache-breaking rewrite.
-        runway = max(reclaimed, self.proactive_prune_tokens, self.proactive_prune_min_reclaim_tokens)
-        next_rearm_tokens = after + runway
+        if cold_cache:  # Nothing to protect: keep the warm runway and credit the reclaim to the next warm gate.
+            next_rearm_tokens, cold_credit = self._proactive_prune_rearm_tokens, self._proactive_prune_cold_credit + reclaimed
+        else:  # Require a full trigger-sized regrowth before the next cache-breaking rewrite.
+            next_rearm_tokens, cold_credit = after + max(reclaimed, self.proactive_prune_tokens, gate), 0
         if session_db and session_id:
             _cc_ = _cc()
             from hermes_state_errors import HeldRowRewrittenError
@@ -153,7 +202,7 @@ class ProactivePruneMixin:
                     if original.get(_DB_PERSISTED_MARKER)])
         self._consecutive_archive_capacity_failures = 0
         self._optional_archive_cooldown_until = 0.0
-        self._proactive_prune_rearm_tokens = next_rearm_tokens
+        self._proactive_prune_rearm_tokens, self._proactive_prune_cold_credit = next_rearm_tokens, cold_credit
         # Reclamation just ran: let a future lockout warn again.
         self._last_reclaim_block_warn = None
         return pruned_msgs, pruned_count
