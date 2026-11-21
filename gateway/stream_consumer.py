@@ -930,7 +930,8 @@ class GatewayStreamConsumer(StreamTransportMixin, StreamFallbackMixin, StreamThi
         if self.cfg.buffer_only:
             return False
         if self._use_native_streaming:
-            # No platform edit-rate limit: push every delta immediately.
+            # Native streams are intentionally unthrottled: the connector owns
+            # coalescing/backpressure and must see every distinct cumulative delta.
             should_edit = bool(self._accumulated) or self._tool_progress_active
         elif self._use_draft_streaming:
             should_edit = self._should_push_draft()
