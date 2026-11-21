@@ -124,8 +124,10 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
         # Unlike a delegated child's malformed override, an explicit cron override
         # never silently restores the global chain (including legacy fallback_model).
         return get_cron_fallback_chain(cfg) or None
+    pinned = _job_route_pinned(job)
+    allow_billing_fallback = bool(cron.get("allow_billing_fallback", False)) if isinstance(cron, dict) else False
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+        get_fallback_chain(cfg), None, pinned=pinned and not allow_billing_fallback, owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:

@@ -105,8 +105,8 @@ def test_pooled_billing_stops_after_one_retry(tmp_path, monkeypatch):
     ]
 
 
-def test_pinned_delegate_keeps_pin_after_proxy_503(tmp_path, monkeypatch):
-    """A transient proxy 503 must not cross a pinned child's model boundary."""
+def test_pinned_delegate_falls_back_after_proxy_503(tmp_path, monkeypatch):
+    """A transient proxy 503 must leave the owned chain available to a pinned child."""
     home = tmp_path / "hermes"
     harness.write_home_config(home)
     monkeypatch.setenv("HERMES_HOME", str(home))
@@ -126,10 +126,11 @@ def test_pinned_delegate_keeps_pin_after_proxy_503(tmp_path, monkeypatch):
             child.close()
 
     assert child._fallback_chain == fallback
-    assert result["completed"] is False
-    assert {
-        request["model"] for request in primary.requests if request["model"] is not None
-    } == {harness.PRIMARY_MODEL}
+    assert result["completed"] is True
+    assert result["final_response"] == f"OK from {harness.FALLBACK_MODEL}"
+    assert [request["model"] for request in primary.requests if request["model"] is not None] == [
+        harness.PRIMARY_MODEL, harness.FALLBACK_MODEL,
+    ]
 
 
 def test_pinned_child_keeps_cross_model_chain_only_when_billing_fallback_enabled():
@@ -152,9 +153,9 @@ def test_owned_chain_keeps_pin_until_billing_attempt():
     chain = [{"provider": "anthropic", "model": "claude-sonnet-5-5"}]
     disabled = SimpleNamespace(model="gpt-6.2-sol", allow_billing_fallback=False)
     enabled = SimpleNamespace(model="gpt-6.2-sol", allow_billing_fallback=True)
-    assert _pin_init_fallbacks(disabled, chain, True, fallback_chain_owned=True) == []
+    assert _pin_init_fallbacks(disabled, chain, True, fallback_chain_owned=True) == chain
     assert _pin_init_fallbacks(enabled, chain, True, fallback_chain_owned=True) == chain
-    assert disabled._pinned_fallback_model == disabled.model
+    assert disabled._pinned_fallback_model is None
     assert enabled._pinned_fallback_model == enabled.model
 
 

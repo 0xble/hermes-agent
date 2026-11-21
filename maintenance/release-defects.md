@@ -144,7 +144,7 @@ here; move a section into a behavior-specific unit when that unit starts owning 
 
 - A delegated role's explicitly authored `fallback_providers` list is already scoped by its route owner. Preserve cross-model entries through pinned child initialization instead of applying the inherited same-model filter; otherwise a proxy 5xx exhausts retries on the role primary and never reaches its configured backup.
 - A shared cooldown remains route-scoped by `(provider, base_url, model)`. A primary outage must not suppress a different model or provider merely because it uses the same proxy endpoint.
-- **Contract tests:** `tests/agent/test_pinned_model_fallback.py::test_pinned_delegate_keeps_pin_after_proxy_503`, `tests/agent/test_shared_primary_cooldown.py::test_primary_cooldown_does_not_cool_different_fallback_routes`.
+- **Contract tests:** `tests/agent/test_pinned_model_fallback.py::test_pinned_delegate_falls_back_after_proxy_503`, `tests/agent/test_shared_primary_cooldown.py::test_primary_cooldown_does_not_cool_different_fallback_routes`.
 - **Fork patch identity:** `delegated-fallback-chain-ownership`.
 
 ## Billing outage persistence and provider-wide classification

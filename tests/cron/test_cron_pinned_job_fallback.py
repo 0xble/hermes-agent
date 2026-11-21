@@ -184,6 +184,7 @@ def test_pinned_job_receives_billing_fallback_opt_in(tmp_path):
     assert (success, error) == (True, None)
     assert agent_kwargs["model_pinned"] is True
     assert agent_kwargs["allow_billing_fallback"] is True
+    assert agent_kwargs["fallback_model"] == _CHAIN
 
 
 def test_unpinned_job_still_walks_the_global_chain_at_resolve_time(tmp_path):
