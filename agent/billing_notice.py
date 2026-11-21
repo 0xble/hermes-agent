@@ -5,7 +5,6 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import logging
 import subprocess
-import threading
 
 logger = logging.getLogger(__name__)
 
@@ -29,4 +28,5 @@ def notify_provider_out_of_credits(provider: str) -> None:
         except (OSError, subprocess.SubprocessError):
             logger.debug("Provider credit notice could not be sent", exc_info=True)
 
-    threading.Thread(target=_send, name="hermes-credit-notice", daemon=True).start()
+    from agent.memory_provider import spawn_context_thread
+    spawn_context_thread(_send, name="hermes-credit-notice").start()
