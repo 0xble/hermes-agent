@@ -66,7 +66,7 @@ class GatewayProcessEventSourcesMixin:
                 return source
             try:
                 return dataclasses.replace(source, profile=event_profile)
-            except Exception:
+            except (TypeError, ValueError):
                 return source
 
         def _apply_event_thread(source):
