@@ -525,26 +525,37 @@ _RICH_CURRENCY_PLACEHOLDER = "\x00HERMES_RICH_CURRENCY_{index}\x00"
 
 def _protect_rich_currency(text: str) -> str:
     """Escape prose dollars and wrap multiple same-line amounts so they cannot pair as math."""
+    from .rich_code_regions import rich_code_regions
     from .telegram_markdown import escape_rich_currency_dollars
 
-    stashed: list[str] = []
+    # Decide which amounts to wrap on the raw text, then run the shared dollar
+    # escaper once over the transformed text.  Escaping separate prose fragments
+    # is incorrect when a code span contains dollars: the fragment before the
+    # span has no knowledge of its closing delimiter.
+    code_spans = rich_code_regions(text)
+    from .telegram_markdown import _RICH_DOLLAR_RE
+    math_spans = [m.span() for m in _RICH_DOLLAR_RE.finditer(text) if m.group("keep")]
 
-    def stash_text(value: str) -> str:
-        stashed.append(value)
-        return _RICH_CURRENCY_PLACEHOLDER.format(index=len(stashed) - 1)
+    def protected(start: int, end: int) -> bool:
+        return any(start < hi and end > lo for lo, hi in (*code_spans, *math_spans))
 
-    masked = _RICH_CURRENCY_PROTECTED_RE.sub(lambda match: stash_text(match.group(0)), text)
-    lines = masked.split("\n")
-    for index, line in enumerate(lines):
-        if len(_RICH_CURRENCY_AMOUNT_RE.findall(line)) < 2:
-            continue
-        lines[index] = _RICH_CURRENCY_AMOUNT_RE.sub(lambda match: stash_text(f"`{match.group(0)}`"), line)
-    # Escape the remaining prose before restoring generated code spans: a stray
-    # backtick in the input can otherwise pair with an inserted opener.
-    protected = escape_rich_currency_dollars("\n".join(lines))
-    for index, original in enumerate(stashed):
-        protected = protected.replace(_RICH_CURRENCY_PLACEHOLDER.format(index=index), original)
-    return protected
+    replacements: set[tuple[int, int]] = set()
+    line_start = 0
+    for line in text.splitlines(keepends=True):
+        amounts = [m for m in _RICH_CURRENCY_AMOUNT_RE.finditer(line)]
+        amounts = [m for m in amounts if not protected(line_start + m.start(), line_start + m.end())]
+        if len(amounts) >= 2:
+            replacements.update((line_start + m.start(), line_start + m.end()) for m in amounts)
+        line_start += len(line)
+
+    if not replacements:
+        return escape_rich_currency_dollars(text)
+    out, pos = [], 0
+    for start, end in sorted(replacements):
+        out.extend((text[pos:start], f"`{text[start:end]}`"))
+        pos = end
+    out.append(text[pos:])
+    return escape_rich_currency_dollars("".join(out))
 
 
 def _rich_normalize_linebreaks(text: str) -> str:
@@ -6889,6 +6900,10 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
             return _ph(f'[{display}]({url})')
 
         text = _MD_LINK_RE.sub(_convert_link, text)
+        # Protect marks inside bare URLs before emphasis resolution; URL text is
+        # literal, not a legacy Markdown delimiter.
+        from .telegram_markdown import _stash_bare_urls
+        text = _stash_bare_urls(text, _ph)
         # 4) Headers (## Title) → bold *Title*, stripping redundant ** inside the header
         def _convert_header(m):
             inner = re.sub(r'\*\*(.+?)\*\*', r'\1', m.group(1).strip())
