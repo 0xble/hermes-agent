@@ -34,7 +34,7 @@ from gateway.warning_notifications import diagnostic_wake_muted
 from gateway.turn_lease import DEFAULT_LEASE_WAIT, TurnLeaseTimeoutError
 from hermes_constants import get_hermes_home_override
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, cast
 from utils import base_url_hostname
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -485,22 +485,23 @@ class GatewayTurnPersistenceMixin:
         repeat it. A voice note would re-run STT and its transcript echo, so it keeps the resend notice.
         Nor when follow-ups already wait on the fresh session (re-homed by the reset): the re-run would
         be admitted behind them and answer out of order, so the user, who has moved on, resends."""
+        runner = cast(Any, self)
         if (event is None or event.internal
                 or agent_result.get("already_sent") or agent_result.get("response_previewed")
-                or self._pending_event_audio_paths(event)):
+                or runner._pending_event_audio_paths(event)):
             return
         new_messages = (agent_result.get("messages") or [])[agent_result.get("history_offset", 0) or 0:]
         if (any(m.get("role") in ("tool", "function") or m.get("tool_calls") for m in new_messages)
                 or self._hmwa_fresh_session_has_pending_input(session_entry)):
             return
-        adapter = self._delivery_adapter_for(source)
-        persistent = self._session_state(session_key).persistent
+        adapter = runner._delivery_adapter_for(source)
+        persistent = runner._session_state(session_key).persistent
         identity = f"{event.message_id or ''}\0{event.text or ''}"  # the drain re-runs a copy of the event
         if (adapter is None or not isinstance(getattr(adapter, "_pending_messages", None), dict)
                 or persistent.exhaustion_replayed == identity):
             return
         persistent.exhaustion_replayed = identity
-        self._requeue_event_at_front(session_key, event, adapter)
+        runner._requeue_event_at_front(session_key, event, adapter)
         logger.info("Re-running the request of session %s's exhausted turn on its fresh session", session_key)
 
     def _hmwa_fresh_session_has_pending_input(self, session_entry) -> bool:
@@ -531,20 +532,21 @@ class GatewayTurnPersistenceMixin:
 
     async def _hmwa_rotate_exhausted_session(self, session_entry, session_key, source):
         """The compression-exhaustion auto-reset itself; returns the route's (fresh) entry."""
+        runner = cast(Any, self)
         logger.info("Auto-resetting session %s after compression exhaustion.", session_entry.session_id)
         from gateway.session_automation import move_route_wakes, reset_and_rehome_messages
         # Messages queued behind the exhausted turn still run, on the fresh session (unlike /new).
         new_entry, release_fresh = await reset_and_rehome_messages(self, session_key, session_entry.session_id)
         try:
             await move_route_wakes(self, session_key, session_entry.session_id)
-            self._evict_cached_agent(session_key)
+            runner._evict_cached_agent(session_key)
             # The /queue overflow behind the deferred head slot is queued user input, like the
             # re-homed native rows: it survives the boundary the funnel below otherwise clears.
-            queued = list(self._overflow_queue(session_key) or ())
+            queued = list(runner._overflow_queue(session_key) or ())
             # Conversation boundary: the funnel clears every conversation-scoped per-session dict.
-            self._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
+            runner._clear_conversation_scope(session_key, reason="compression_exhausted_reset")
             if queued:
-                self._session_state(session_key).conversation.queued_events.extend(queued)
+                runner._session_state(session_key).conversation.queued_events.extend(queued)
             if new_entry is not None:
                 # Re-point the Telegram topic binding at the fresh session, or the binding-heal walk
                 # switches the next message back onto the bloated child and re-triggers exhaustion
@@ -558,7 +560,7 @@ class GatewayTurnPersistenceMixin:
                 # of the #9893/#10063 auto-reset).
                 session_entry = new_entry
                 await asyncio.to_thread(
-                    self._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
+                    runner._sync_telegram_topic_binding, source, session_entry, reason="compression-exhausted-reset",
                 )
         finally:
             # Only now may the fresh session's FIFO claim (it is fenced until here, against every
