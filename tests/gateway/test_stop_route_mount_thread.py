@@ -1,48 +1,55 @@
 """The busy /stop route probes durable state off-loop but mounts authority state on-loop."""
 from __future__ import annotations
 
-import asyncio
 from threading import get_ident
-from types import SimpleNamespace
 
 import pytest
 
-from gateway.run_inbound import GatewayInboundMixin
+from tests.fakes.runtime_owner import initialize_session_authority
+from tests.gateway.test_superseded_queued_rows import _queue_rows, _rows, _setup
 
 
 @pytest.mark.asyncio
 async def test_stop_route_mount_keeps_authority_mutation_on_gateway_loop(monkeypatch):
+    """The real /stop route mounts a cold owner on-loop before cancelling its queued rows."""
+    from gateway import session_route_recovery
+
+    runner, adapter = _setup(monkeypatch)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    route, owner = await _queue_rows(runner, authority, source, 'A', 'B')
+    authority.sessions.pop(owner)
+
     loop_thread = get_ident()
     probe_threads: list[int] = []
+    plan_threads: list[int] = []
     mount_threads: list[int] = []
-    sessions: dict[str, object] = {}
+    real_probe = runner._hm_mounted_owner_probe
+    real_plan = runner._hm_mounted_owner_mount_plan
+    real_restore = session_route_recovery.restore_routed_session
 
-    class Store:
-        def peek_session_id(self, key):
-            probe_threads.append(get_ident())
-            return f"sid:{key}"
+    def probe(*args):
+        probe_threads.append(get_ident())
+        return real_probe(*args)
 
-    authority = SimpleNamespace(
-        runner=SimpleNamespace(session_store=Store()),
-        sessions=sessions,
-        logical_owner=lambda sid: sid,
-    )
-    runner = object.__new__(GatewayInboundMixin)
-
-    def restore_routed_session(_authority, sid):
+    def restore_routed_session(*args, **kwargs):
         mount_threads.append(get_ident())
-        sessions[sid] = object()
+        return real_restore(*args, **kwargs)
 
-    monkeypatch.setattr(
-        "gateway.session_route_recovery.restore_routed_session",
-        restore_routed_session,
-    )
+    def mount_plan(*args):
+        plan_threads.append(get_ident())
+        return real_plan(*args)
 
-    sid = await asyncio.to_thread(
-        runner._hm_mounted_owner_probe, authority, "route-key"
-    )
-    assert probe_threads and probe_threads[0] != loop_thread
-
-    assert runner._hm_mounted_owner(authority, sid, "route-key") == sid
-    assert mount_threads == [loop_thread]
-    assert sessions == {sid: next(iter(sessions.values()))}
+    monkeypatch.setattr(runner, '_hm_mounted_owner_probe', probe)
+    monkeypatch.setattr(runner, '_hm_mounted_owner_mount_plan', mount_plan)
+    monkeypatch.setattr(session_route_recovery, 'restore_routed_session', restore_routed_session)
+    try:
+        await runner._hm_stop_owner_turn(route)
+        assert probe_threads and loop_thread not in probe_threads
+        assert plan_threads and loop_thread not in plan_threads
+        assert mount_threads == [loop_thread]
+        assert owner in authority.sessions
+        assert _rows(authority, owner) == [('A', 'terminal', 'cancelled'), ('B', 'terminal', 'cancelled')]
+    finally:
+        authority.db.close()

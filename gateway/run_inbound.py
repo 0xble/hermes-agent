@@ -131,6 +131,9 @@ async def _admit_outbox_event(runner, event, source):
         bind_turn(home, turn_id)
 
 
+_MOUNT_PLAN_UNSET = object()
+
+
 class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin, GatewayLoopWakeMixin):
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
@@ -143,7 +146,12 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         """
         return authority.logical_owner(authority.runner.session_store.peek_session_id(_quick_key))
 
-    def _hm_mounted_owner(self, authority, sid: Optional[str], _quick_key: str) -> Optional[str]:
+    def _hm_mounted_owner_mount_plan(self, authority: Any, sid: str):
+        """Read the cold route's mount plan off-loop; publishing it remains an on-loop mutation."""
+        from gateway.session_route_recovery import _mount_plan
+        return _mount_plan(authority, sid)
+
+    def _hm_mounted_owner(self, authority, sid: Optional[str], _quick_key: str, *, plan=_MOUNT_PLAN_UNSET) -> Optional[str]:
         """Mount the route's durable FIFO owner for /stop and /new on the gateway loop.
 
         Right after a restart startup recovery may not have mounted it yet, but its committed rows
@@ -153,7 +161,10 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         if sid and sid not in authority.sessions:
             from gateway.session_route_recovery import restore_routed_session
             try:
-                restore_routed_session(authority, sid)
+                if plan is _MOUNT_PLAN_UNSET:
+                    restore_routed_session(authority, sid)
+                elif plan is not None:
+                    restore_routed_session(authority, sid, plan=plan)
             except Exception:
                 logger.debug("Could not mount %s for %s before stopping it", sid, _quick_key, exc_info=True)
         return sid if sid and sid in authority.sessions else None
@@ -935,18 +946,32 @@ class GatewayInboundMixin(GatewayInboundHooksMixin, GatewayInboundTranscriptionM
         claimed generation: a turn still constructing its agent latches the Stop for adopt_agent."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        # SessionStore's routing map and lineage lookup are guarded by blocking storage locks. Keep
-        # only that read-only probe off the gateway event-loop thread. Mounting publishes authority
-        # state and must remain serialized on the loop.
+        # SessionStore's routing map, lineage lookup, and cold mount plan are guarded by blocking
+        # storage locks. Keep those read-only operations off the gateway event-loop thread. Mounting
+        # then publishes authority state and must remain serialized on the loop.
         sid = None
         if authority:
-            sid = await asyncio.to_thread(self._hm_mounted_owner_probe, authority, _quick_key)
-            sid = self._hm_mounted_owner(authority, sid, _quick_key)
+            from gateway.session_store_async import run_store_call
+            sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+            plan = None
+            if sid and sid not in authority.sessions:
+                plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid)
+            sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
         if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
                 authority.fence_route(_quick_key)
-            return
+                # The initial probe can finish before a first admission publishes its durable owner.
+                # Fence first, then take one fresh off-loop snapshot so that input is cancelled rather
+                # than left queued behind /new or /stop.
+                from gateway.session_store_async import run_store_call
+                sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+                plan = None
+                if sid and sid not in authority.sessions:
+                    plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid)
+                sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
+            if not sid:
+                return
         from gateway.session_contract import SessionActor, SessionRef
         from hermes_state_runtime import RuntimeStoreError, list_session_admissions
         ref = SessionRef(authority.profile_id, sid)
