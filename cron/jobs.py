@@ -1915,7 +1915,6 @@ def _save_jobs_unlocked(
             except FileNotFoundError:
                 current_bytes = None
             if current_bytes == payload_bytes:
-                current_stamp = _jobs_file_stamp(jobs_file)
                 store_health.note_writable(jobs_file.parent)
                 if removed_ids:
                     _record_removed_jobs_unlocked(removed_ids)
