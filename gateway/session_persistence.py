@@ -434,8 +434,9 @@ class SessionPersistenceMixin:
             for key in list(legacy_keys - mirror_keys):
                 entries.pop(key, None)
                 legacy_keys.discard(key)
-        except Exception as exc:
-            logger.warning("gateway.session: external sessions.json reload failed: %s", exc)
+        except Exception:
+            # Fail open: keep the in-memory roster and retry the reload on the next read.
+            logger.warning("gateway.session: external sessions.json reload failed", exc_info=True)
             self._sessions_json_signature = None
             return
         after = {key: entry.to_dict() for key, entry in entries.items()}

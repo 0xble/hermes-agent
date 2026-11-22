@@ -78,6 +78,21 @@ def _queued(adapter, route):
     return route in pending or route in batches
 
 
+async def _group_routed_by_scope(runner, entries, scope_key):
+    """Group routed, unsuspended entries by profile scope, yielding so a large roster never pins the loop."""
+    by_scope = {}
+    for index, entry in enumerate(entries):
+        if index and not index % _SCAN_YIELD_EVERY:
+            await asyncio.sleep(0)
+        if entry.suspended or not entry.origin:
+            continue
+        source = runner._restored_source(entry)
+        if source is None:
+            continue
+        by_scope.setdefault(scope_key(source), (source, []))[1].append((entry, source))
+    return by_scope
+
+
 async def poll_checkins(runner):
     from gateway.run_turn import GatewayTurnMixin
 
@@ -99,34 +114,14 @@ async def poll_checkins(runner):
         if changed_entries is not None:
             runner._checkin_roster_generation = generation
             runner._checkin_roster_entries = changed_entries
-            base_by_scope = {}
-            for index, entry in enumerate(changed_entries):
-                if index and not index % _SCAN_YIELD_EVERY:
-                    await asyncio.sleep(0)  # let the loop breathe while rebuilding a changed roster
-                if entry.suspended or not entry.origin:
-                    continue
-                source = runner._restored_source(entry)
-                if source is None:
-                    continue
-                key = scope_key(source)
-                base_by_scope.setdefault(key, (source, []))[1].append((entry, source))
+            base_by_scope = await _group_routed_by_scope(runner, changed_entries, scope_key)
             runner._checkin_base_by_scope = base_by_scope
         else:
             base_by_scope = getattr(runner, "_checkin_base_by_scope", {})
     else:
         # Test doubles and older SessionStore implementations retain the old full-scan contract.
         entries = await runner._run_in_executor_with_context(store.list_sessions)
-        base_by_scope = {}
-        for index, entry in enumerate(entries):
-            if index and not index % _SCAN_YIELD_EVERY:
-                await asyncio.sleep(0)
-            if entry.suspended or not entry.origin:
-                continue
-            source = runner._restored_source(entry)
-            if source is None:
-                continue
-            key = scope_key(source)
-            base_by_scope.setdefault(key, (source, []))[1].append((entry, source))
+        base_by_scope = await _group_routed_by_scope(runner, entries, scope_key)
     # Copy only the small scope map: the potentially large routed-entry grouping is reused.
     by_scope = {key: (source, list(entries)) for key, (source, entries) in base_by_scope.items()}
     for source, _ in getattr(runner, "_checkin_watch", {}).values():
