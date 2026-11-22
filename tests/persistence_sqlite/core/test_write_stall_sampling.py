@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.hermes_state.test_transcript_write_diagnostics import _Clock
+from tests.persistence_sqlite.core.test_transcript_write_diagnostics import _Clock
 
 
 def _watcher(tmp_path, monkeypatch):

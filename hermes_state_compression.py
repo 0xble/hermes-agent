@@ -409,7 +409,7 @@ class SessionCompressionMixin:
             lease_ttl_seconds=lease_ttl_seconds, watermark=watermark, watermark_ceiling=watermark_ceiling),
             messages, session_id=child_session_id, session_ids=(parent_session_id, child_session_id))
         # The caller adopts the committed handoff in memory: one dict per message_uid, as stored.
-        from hermes_state_identity import _newest_message_uid_rows
+        from persistence.sqlite.conversation._store.identity import _newest_message_uid_rows
         messages[:] = _newest_message_uid_rows(messages)
 
     def _publish_compression_child_on_conn(
@@ -422,7 +422,7 @@ class SessionCompressionMixin:
         """:meth:`publish_compression_child` on the caller's write transaction (never commits). The
         owner and the worker/canonical-mutation verbs share this one body so they cannot drift."""
         from persistence.sqlite._state.errors import CompressionSessionBusyError
-        from hermes_state_identity import _compaction_messages
+        from persistence.sqlite.conversation._store.identity import _compaction_messages
         from hermes_state_message_archive import clone_tail_survivors
         if require_lease_refresh and compression_lock_holder:
             conn.execute(

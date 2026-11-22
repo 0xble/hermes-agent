@@ -201,7 +201,7 @@ def worker_history(db, conn, sid, payload):
         rows = db._dedupe_display_generations(rows, drop_removed=display)
     elif payload['repair_alternation'] and not payload['include_inactive'] and not payload['include_ancestors']:
         # The owner's live-replay rule: an already-corrupt session names each message_uid once.
-        from hermes_state_identity import _newest_message_uid_rows
+        from persistence.sqlite.conversation._store.identity import _newest_message_uid_rows
         rows = _newest_message_uid_rows(rows)
     return {'messages': db._rows_to_conversation(rows, session_id=target,
         include_ancestors=payload['include_ancestors'], repair_alternation=payload['repair_alternation'],

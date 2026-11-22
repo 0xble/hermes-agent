@@ -110,7 +110,7 @@ def test_close_does_not_wait_for_in_progress_sample(monkeypatch):
 
 @pytest.mark.platforms("macos")
 def test_dead_helper_can_restart_after_cooldown(tmp_path, monkeypatch):
-    from tests.hermes_state.test_transcript_write_diagnostics import _Clock
+    from tests.persistence_sqlite.core.test_transcript_write_diagnostics import _Clock
     from tests.waiting import wait_until
 
     clock = _Clock()

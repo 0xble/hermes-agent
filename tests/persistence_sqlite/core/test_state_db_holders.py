@@ -8,6 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from persistence.sqlite._state import dbfile as dbfile_module
 from persistence.sqlite._state import holders as holders_module
 
 
@@ -32,9 +33,9 @@ def test_darwin_holder_scan_uses_native_descriptor_identity(tmp_path, monkeypatc
         if generation == "retired":
             db.unlink()
             db.write_bytes(b"replacement generation")
-        monkeypatch.setattr(hermes_state_holders.psutil, "process_iter",
+        monkeypatch.setattr(holders_module.psutil, "process_iter",
                             lambda *args, **kwargs: pytest.fail("ambient psutil path scan"))
-        holders = hermes_state_holders.foreign_state_db_holders(db)
+        holders = holders_module.foreign_state_db_holders(db)
         assert any(pid == child.pid for pid, _ in holders), holders
         assert not any(pid < 0 for pid, _ in holders), holders
     finally:
@@ -45,7 +46,7 @@ def test_darwin_holder_scan_uses_native_descriptor_identity(tmp_path, monkeypatc
 @pytest.mark.platforms("macos")
 @pytest.mark.parametrize("partial", [False, True])
 def test_darwin_holder_scan_retains_uncertainty_on_enumeration_failure(tmp_path, monkeypatch, partial):
-    import persistence.sqlite._state.dbfile
+    from persistence.sqlite._state import dbfile as hermes_state_dbfile
 
     db = tmp_path / "state.db"
     db.touch()
@@ -54,8 +55,8 @@ def test_darwin_holder_scan_retains_uncertainty_on_enumeration_failure(tmp_path,
         if partial:
             yield 4242, 7, str(db), (info.st_dev, info.st_ino)
         raise RuntimeError("descriptor enumeration interrupted")
-    monkeypatch.setattr(hermes_state_dbfile, "_iter_darwin_fd_targets", interrupted)
-    holders = hermes_state_holders.foreign_state_db_holders(db)
+    monkeypatch.setattr(dbfile_module, "_iter_darwin_fd_targets", interrupted)
+    holders = holders_module.foreign_state_db_holders(db)
     assert any(pid < 0 and "descriptor enumeration interrupted" in detail for pid, detail in holders)
     assert ((4242, str(db)) in holders) == partial
 
