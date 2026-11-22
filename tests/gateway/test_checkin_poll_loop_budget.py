@@ -6,6 +6,7 @@ that released and re-took the GIL per call and stalled the loop for seconds unde
 """
 
 import asyncio
+from contextlib import asynccontextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -72,3 +73,44 @@ async def test_a_large_roster_scan_lets_other_loop_work_run(monkeypatch):
     assert len(seen_at) == len(entries)
     # Without a yield the ticker cannot run between the first and last entry of the scan.
     assert seen_at[-1] > seen_at[0]
+
+
+@pytest.mark.asyncio
+async def test_newly_due_roster_entry_is_seen_after_generation_change(monkeypatch):
+    source = SessionSource(platform=Platform.TELEGRAM, chat_id="one")
+    first = SimpleNamespace(session_key="route-1", session_id="session-1", suspended=False, origin=source)
+    second = SimpleNamespace(session_key="route-2", session_id="session-2", suspended=False, origin=source)
+
+    class Store:
+        generation = 1
+        entries = [first]
+
+        def list_sessions_since(self, previous):
+            if previous == self.generation:
+                return self.generation, None
+            return self.generation, list(self.entries)
+
+    @asynccontextmanager
+    async def scope():
+        yield
+
+    store = Store()
+    runner = SimpleNamespace(
+        config=SimpleNamespace(multiplex_profiles=False), session_store=store,
+        _run_in_executor_with_context=asyncio.to_thread, _restored_source=lambda entry: entry.origin,
+        _async_profile_scope_for_source=lambda _source: scope(), _checkin_watch={}, _checkin_seen={},
+    )
+    config = SimpleNamespace()
+    monkeypatch.setattr(run_checkins.CheckinConfig, "load", classmethod(lambda cls: config))
+    reconciled = []
+
+    async def reconcile(_runner, _source, route, *, config):
+        reconciled.append(route)
+        return True
+
+    monkeypatch.setattr(run_checkins, "reconcile_turn", reconcile)
+    await run_checkins.poll_checkins(runner)
+    store.entries = [first, second]
+    store.generation = 2
+    await run_checkins.poll_checkins(runner)
+    assert reconciled == ["route-1", "route-2"]

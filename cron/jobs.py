@@ -115,6 +115,9 @@ TICKER_INTERVAL_SECONDS = 60
 # mark_job_run / advance_next_run calls clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
+_jobs_parse_cache_lock = threading.RLock()
+_jobs_parse_cache: dict[str, tuple[Optional[tuple[int, int, int]], list[dict[str, Any]]]] = {}
+_jobs_raw_parse_cache: dict[str, tuple[tuple[int, int, int], tuple[Any, bool]]] = {}
 _fire_fence_locks: dict[str, threading.RLock] = {}
 _fire_fence_locks_guard = threading.Lock()
 _fire_fence_lock_state = threading.local()
@@ -1491,12 +1494,53 @@ def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
     """Tolerant jobs.json parse -> ``(data, used_strict_fallback)``: utf-8-sig absorbs a BOM, strict
     failure retries with ``strict=False``. IO/fallback errors propagate (caller decides repair vs
     bail)."""
+    stamp = _jobs_file_stamp(jobs_file)
+    key = _jobs_cache_key(jobs_file)
+    if stamp is not None:
+        with _jobs_parse_cache_lock:
+            cached = _jobs_raw_parse_cache.get(key)
+            if cached is not None and cached[0] == stamp:
+                return copy.deepcopy(cached[1][0]), cached[1][1]
     with open(jobs_file, "r", encoding="utf-8-sig") as f:
         raw = f.read()
     try:
-        return json.loads(raw), False
+        result = (json.loads(raw), False)
     except json.JSONDecodeError:
-        return json.loads(raw, strict=False), True
+        result = (json.loads(raw, strict=False), True)
+    if stamp is not None and _jobs_file_stamp(jobs_file) == stamp:
+        with _jobs_parse_cache_lock:
+            _jobs_raw_parse_cache[key] = (stamp, (copy.deepcopy(result[0]), result[1]))
+    return result
+
+
+def _jobs_cache_key(jobs_file: Path) -> str:
+    return os.fspath(jobs_file.resolve())
+
+
+def _cached_jobs(jobs_file: Path, stamp: Optional[tuple[int, int, int]]) -> Optional[list[dict[str, Any]]]:
+    key = _jobs_cache_key(jobs_file)
+    with _jobs_parse_cache_lock:
+        cached = _jobs_parse_cache.get(key)
+        if cached is None or cached[0] != stamp:
+            return None
+        return copy.deepcopy(cached[1])
+
+
+def _cache_jobs(jobs_file: Path, stamp: Optional[tuple[int, int, int]], jobs: list[dict[str, Any]]) -> None:
+    key = _jobs_cache_key(jobs_file)
+    with _jobs_parse_cache_lock:
+        _jobs_parse_cache[key] = (stamp, copy.deepcopy(jobs))
+
+
+def _invalidate_jobs_cache(jobs_file: Optional[Path] = None) -> None:
+    with _jobs_parse_cache_lock:
+        if jobs_file is None:
+            _jobs_parse_cache.clear()
+            _jobs_raw_parse_cache.clear()
+        else:
+            key = _jobs_cache_key(jobs_file)
+            _jobs_parse_cache.pop(key, None)
+            _jobs_raw_parse_cache.pop(key, None)
 
 
 def load_jobs() -> list[dict[str, Any]]:
@@ -1507,8 +1551,13 @@ def load_jobs() -> list[dict[str, Any]]:
     # merge.
     pre_read_stamp = _jobs_file_stamp(jobs_file)
     if not jobs_file.exists():
+        _invalidate_jobs_cache(jobs_file)
         _record_load_stamp(None)
         return []
+    cached = _cached_jobs(jobs_file, pre_read_stamp)
+    if cached is not None:
+        _record_load_stamp(pre_read_stamp)
+        return cached
 
     try:
         data, _strict_retry = _parse_jobs_file(jobs_file)
@@ -1585,8 +1634,11 @@ def load_jobs() -> list[dict[str, Any]]:
             logger.warning("Auto-repaired jobs.json (%s)", repair)
         except OSError as exc:  # repaired in memory; the next load retries the persist
             store_health.note_unwritable(exc, f"jobs.json repair ({repair}) not persisted", "load")
+    post_read_stamp = _jobs_file_stamp(jobs_file)
+    if post_read_stamp == pre_read_stamp and post_read_stamp is not None:
+        _cache_jobs(jobs_file, post_read_stamp, jobs)
     _record_load_stamp(pre_read_stamp)
-    return jobs
+    return copy.deepcopy(jobs)
 
 
 def _peek_jobs_unlocked() -> Optional[list[dict[str, Any]]]:
@@ -1678,14 +1730,9 @@ def _unlink_quiet(path: Optional[str]) -> None:
             os.unlink(path)
 
 
-def _stage_jobs_payload(
-    jobs_file: Path, jobs: list[dict[str, Any]], *, document: Optional[Any] = None,
-) -> str:
-    """Serialize the store payload to a fsynced temp file beside *jobs_file*; return its path.
-
-    Normal saves use the canonical wrapper with a fresh ``updated_at``. Recovery callers may pass
-    an existing document to preserve its top-level metadata exactly while replacing only its jobs.
-    """
+def _jobs_payload_bytes(
+    jobs: list[dict[str, Any]], *, document: Optional[Any] = None,
+) -> bytes:
     if document is None:
         payload: Any = {"jobs": jobs, "updated_at": _hermes_now().isoformat()}
     elif isinstance(document, dict):
@@ -1695,10 +1742,23 @@ def _stage_jobs_payload(
         payload = jobs
     else:
         raise ValueError("Cron jobs document must be a dict or list")
+    return json.dumps(payload, indent=2, ensure_ascii=False).encode("utf-8")
+
+
+def _stage_jobs_payload(
+    jobs_file: Path, jobs: list[dict[str, Any]], *, document: Optional[Any] = None,
+    payload_bytes: Optional[bytes] = None,
+) -> str:
+    """Serialize the store payload to a fsynced temp file beside *jobs_file*; return its path.
+
+    Normal saves use the canonical wrapper with a fresh ``updated_at``. Recovery callers may pass
+    an existing document to preserve its top-level metadata exactly while replacing only its jobs.
+    """
+    payload_bytes = _jobs_payload_bytes(jobs, document=document) if payload_bytes is None else payload_bytes
     fd, tmp_path = mkstemp_beside(jobs_file, suffix=".tmp", prefix=".jobs_")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(payload, f, indent=2, ensure_ascii=False)
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload_bytes)
             f.flush()
             os.fsync(f.fileno())
     except BaseException:
@@ -1833,7 +1893,21 @@ def _save_jobs_unlocked(
         for attempt in range(_SAVE_JOBS_MERGE_ATTEMPTS + 1):
             if not replace:
                 jobs = _merge_unexpected_disk_jobs(jobs, removed_ids=removed_ids)
-            tmp_path = _stage_jobs_payload(jobs_file, jobs, document=document)
+            payload_bytes = _jobs_payload_bytes(jobs, document=document)
+            try:
+                current_bytes = jobs_file.read_bytes()
+            except FileNotFoundError:
+                current_bytes = None
+            if current_bytes == payload_bytes:
+                current_stamp = _jobs_file_stamp(jobs_file)
+                _cache_jobs(jobs_file, current_stamp, jobs)
+                _record_load_stamp(current_stamp)
+                store_health.note_writable(jobs_file.parent)
+                if removed_ids:
+                    _record_removed_jobs_unlocked(removed_ids)
+                return
+            tmp_path = _stage_jobs_payload(
+                jobs_file, jobs, document=document, payload_bytes=payload_bytes)
             # Verify-after-stage: a sibling landing during serialization forces another merge round.
             if (
                 not replace
@@ -1849,6 +1923,7 @@ def _save_jobs_unlocked(
             fsync_directory(replaced.parent)
             _secure_file(jobs_file)
             _preserve_file_ownership(jobs_file, _stat_before)
+            _invalidate_jobs_cache(jobs_file)
             # Invalidate (never refresh) the stamp: a refresh would let a nested save certify disk
             # against an OUTER caller's stale payload. Later saves take the full merge (fail-safe).
             _record_load_stamp(None)

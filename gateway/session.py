@@ -974,6 +974,12 @@ class SessionStore(
         self._routing_generation = 0
         self._persisted_routing_generation = 0
         self._fast_persisted_entries: dict[str, tuple[int, str]] = {}
+        # Generation and immutable snapshot for callers that poll the routed roster frequently.
+        # The legacy mirror signature lets the cheap path notice routes written by another process.
+        self._roster_generation = 0
+        self._roster_snapshot: Optional[tuple[SessionEntry, ...]] = None
+        self._sessions_json_signature = None
+        self._legacy_session_keys: set[str] = set()
         # Routing rows this process last persisted (key -> entry_json, None if unknown); full saves
         # write their diff against it. Guarded by _save_lock.
         self._routing_baseline: Optional[dict[str, Optional[str]]] = None
@@ -1036,6 +1042,11 @@ class SessionStore(
             value = factory()
             setattr(self, name, value)
         return value
+
+    def _mark_roster_changed_locked(self) -> None:
+        """Invalidate the sorted routed-session snapshot (caller holds ``_lock``)."""
+        self._roster_generation = getattr(self, "_roster_generation", 0) + 1
+        self._roster_snapshot = None
 
     def _has_active_processes_safe(self, session_key: str, *, context: str) -> bool:
         """Whether a session has active work, failing closed (True) on registry errors."""
@@ -1711,13 +1722,42 @@ class SessionStore(
         """List all sessions, optionally filtered by activity."""
         with self._lock:
             self._ensure_loaded_locked()
-            entries = list(self._entries.values())
+            if self._roster_snapshot is None:
+                entries = list(self._entries.values())
+                # Legacy local timestamps and canonical UTC timestamps can coexist after recovery.
+                entries.sort(key=lambda e: e.updated_at.timestamp(), reverse=True)
+                self._roster_snapshot = tuple(entries)
+            entries = list(self._roster_snapshot)
         if active_minutes is not None:
             cutoff = _now() - timedelta(minutes=active_minutes)
             entries = [e for e in entries if e.updated_at.timestamp() >= cutoff.timestamp()]
-        # Legacy local timestamps and canonical UTC timestamps can coexist after recovery.
-        entries.sort(key=lambda e: e.updated_at.timestamp(), reverse=True)
         return entries
+
+    def list_sessions_since(
+        self, generation: Optional[int] = None,
+    ) -> tuple[int, Optional[list[SessionEntry]]]:
+        """Return a fresh roster copy only when its generation changed.
+
+        The external mirror is probed while taking the store lock, so another gateway's atomic
+        sessions.json replacement is folded in before an unchanged result is reported. ``None``
+        means the caller may safely reuse its prior roster; a list is always caller-owned.
+        """
+        with self._lock:
+            self._ensure_loaded_locked()
+            current = self._roster_generation
+            if generation == current and self._roster_snapshot is not None:
+                return current, None
+            if self._roster_snapshot is None:
+                entries = list(self._entries.values())
+                entries.sort(key=lambda e: e.updated_at.timestamp(), reverse=True)
+                self._roster_snapshot = tuple(entries)
+            return current, list(self._roster_snapshot)
+
+    def roster_generation(self) -> int:
+        """Return the current routed-roster generation after external mirror reconciliation."""
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._roster_generation
 
     def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
         """Return the active session entry for a persisted session ID, if any."""
