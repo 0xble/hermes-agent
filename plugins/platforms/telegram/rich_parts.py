@@ -254,7 +254,12 @@ async def send_rich_parts(
     unavailable (nothing was delivered yet). Every part passes the same rich shape checks as a
     single message — only the 32,768-char cap moves from the whole message to each part.
     """
-    if adapter._should_attempt_rich(content, metadata=metadata):
+    try:
+        should_attempt = adapter._should_attempt_rich(content, metadata=metadata)
+    except (AttributeError, TypeError) as exc:
+        logger.warning("Telegram rich eligibility unavailable; using MarkdownV2 fallback: %s", exc)
+        should_attempt = False
+    if should_attempt:
         return await adapter._try_send_rich(chat_id, content, reply_to, metadata)
     # Only SIZE may be the reason this message missed the rich path: ordinary long prose keeps the
     # legacy MarkdownV2 chunker (rich sends stay reserved for the constructs it cannot render), and

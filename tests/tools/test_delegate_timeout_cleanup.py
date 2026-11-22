@@ -133,9 +133,9 @@ def test_finished_child_checkpoint_arrives_after_timeout_without_rewriting_outco
         deferred.append(future)
         return defer_close(native_child, future, **kwargs)
 
-    def wait_after_start(run, settled, timeout):
+    def wait_after_start(_run, settled, future, timeout):
         assert child.started.wait(10)
-        return wait_liveness(run, settled, timeout)
+        return wait_liveness(_run, settled, future, timeout)
 
     monkeypatch.setattr(child, "run_conversation", counted_converse)
     monkeypatch.setattr(child_run, "_defer_close_after_timeout", observe_defer)

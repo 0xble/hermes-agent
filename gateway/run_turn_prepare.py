@@ -258,7 +258,7 @@ def load_runtime_for_source(runner, **kwargs):
     return runner._load_session_agent_runtime(**kwargs, config=config)
 
 
-def load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route):
+def load_session_agent_runtime(*, runner=None, source, skey, user_config, config, override, last_model, attended_route):
     """Resolve a detached route snapshot; the caller owns the session-state commit."""
     from gateway.run import (
         _resolve_gateway_model,
