@@ -402,7 +402,7 @@ class SessionMaintenanceMixin:
                     ids = [int(row["id"]) for row in rows]
                     for row in rows:
                         if int(row["id"]) not in archived_ids:
-                            out.write(json.dumps(dict(row), default=str, separators=(",", ":")) + "\\n")
+                            out.write(json.dumps(dict(row), default=str, separators=(",", ":")) + "\n")
                             archived_ids.add(int(row["id"]))
                     out.flush()
                     gz.flush()

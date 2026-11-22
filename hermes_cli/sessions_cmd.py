@@ -659,11 +659,12 @@ def _export_markdown_single(db, args, export_one, output_dir, lineage_is_logical
 # -- delete / prune / archive -------------------------------------------------
 
 def _cmd_compact_history(db, args):
-    try:
-        days = float(args.older_than)
-    except (TypeError, ValueError):
-        print("Error: --older-than must be a number of days")
+    from hermes_cli.session_filters import parse_duration_seconds
+    seconds = parse_duration_seconds(str(args.older_than))
+    if seconds is None:
+        print("Error: --older-than must be a duration (for example, 14d or 2w)")
         return 1
+    days = seconds / 86400.0
     result = db.compacted_history_retention(days, archive_path=args.archive,
                                             dry_run=args.dry_run, batch_size=args.batch_size)
     print(json.dumps(result, sort_keys=True))
@@ -1467,7 +1468,7 @@ _DB_HANDLERS = {
     "archive": partial(_cmd_prune_or_archive, action="archive"), "unpin": partial(_cmd_pin, pinning=False),
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
     "clean-markers": _cmd_clean_markers, "optimize-storage": _cmd_optimize_storage,
-    "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "compact-history": _cmd_compact_history, "stats": _cmd_stats,
+    "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "stats": _cmd_stats,
     "refresh-prompts": _cmd_refresh_prompts,
 }
 

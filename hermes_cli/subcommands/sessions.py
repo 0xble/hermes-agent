@@ -172,7 +172,8 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
 
     sessions_compacted = sessions_subparsers.add_parser(
         "compact-history", help="Archive and delete inactive compacted message history (session_search recovery of deleted rows degrades)")
-    sessions_compacted.add_argument("--older-than", default="14", metavar="AGE", help="Retention age in days")
+    sessions_compacted.add_argument("--older-than", default="14", metavar="AGE",
+        help="Retention age (bare number of days, or a duration like '14d'/'2w')")
     sessions_compacted.add_argument("--archive", type=Path, help="Gzip JSONL archive path")
     sessions_compacted.add_argument("--batch-size", type=int, default=500)
     add_yes_flag(sessions_compacted, "Skip confirmation")

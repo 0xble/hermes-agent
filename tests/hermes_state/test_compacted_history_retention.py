@@ -1,6 +1,7 @@
 import gzip
 import json
 import sqlite3
+import subprocess
 import time
 from pathlib import Path
 
@@ -47,7 +48,7 @@ def test_round_trip_filters_and_fts(tmp_path):
     try:
         assert conn.execute("SELECT count(*) FROM messages_fts").fetchone()[0] == 2
         assert conn.execute("SELECT count(*) FROM messages_fts_trigram").fetchone()[0] == 2
-        assert conn.execute("SELECT count(*) FROM messages_fts WHERE messages_fts MATCH 'needle-0'").fetchone()[0] == 0
+        assert conn.execute("SELECT count(*) FROM messages_fts WHERE rowid IN (1, 2)").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -104,5 +105,8 @@ def test_crash_after_archive_append_recovers_without_duplicates(tmp_path, monkey
     assert db.compacted_history_retention(archive_path=archive)["deleted"] == 2
     db.close()
     with gzip.open(archive, "rt", encoding="utf-8") as f:
-        assert [json.loads(line)["id"] for line in f] == [1, 2]
+        archived_ids = [json.loads(line)["id"] for line in f]
+    subprocess.run(["gunzip", "-t", str(archive)], check=True)
+    assert archived_ids == [1, 2]
+    assert len(archived_ids) == len(set(archived_ids))
     assert [row[0] for row in _rows(path)] == [3, 4]
