@@ -60,9 +60,7 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
                                             fallback=fallback)
     notice = None
     if fallback_entry is not None:
-        from agent.primary_auth_fallback import RUNTIME_KEY, set_pending_primary_auth_failure
         from hermes_cli.fallback_config import pre_agent_fallback_notice
-        set_pending_primary_auth_failure(runtime.get(RUNTIME_KEY))
         notice = pre_agent_fallback_notice(
             provider or '', model or '',
             runtime.get('provider') or fallback_entry.get('provider') or 'unknown',
@@ -73,6 +71,8 @@ def _resolve_policy_agent_runtime(runner, policy, *, fallback=True, session_key=
         kwargs["_preflight_fallback"] = runtime["_preflight_fallback"]
     if policy_pins_model(policy, frozen):
         kwargs["model_pinned"] = True
+    if not record_notice:
+        return model, kwargs
     if session_key:
         # Use the same session-scoped publication as ordinary resolution. The turn consumes this
         # notice before choosing its model, so a runner-global notice would reapply the primary model
@@ -205,10 +205,9 @@ def commit_stored_oauth_credentials(override: Optional[dict], runtime: dict) -> 
         override.update(api_key=runtime["api_key"], credential_pool=runtime.get("credential_pool"))
 
 
-def _resolve_channel_runtime(runner, source, model, runtime_kwargs) -> tuple[str, dict]:
+def _resolve_channel_runtime(config, source, model, runtime_kwargs) -> tuple[str, dict]:
     from gateway.run import _get_channel_override, _resolve_runtime_agent_kwargs_for_provider
 
-    config = runner._serving_channel_config(source) if source is not None else None
     if config and source is not None:
         ch = _get_channel_override(
             config, source.platform, str(source.chat_id) if source.chat_id else "",
@@ -256,21 +255,17 @@ def load_runtime_for_source(runner, **kwargs):
     profile's (#136198). Runs with the loader, so that read stays off the event loop."""
     source = kwargs.get("source")
     config = runner._serving_channel_config(source) if source is not None else None
-    return runner._load_session_agent_runtime(runner=runner, **kwargs, config=config)
+    return runner._load_session_agent_runtime(**kwargs, config=config)
 
 
-def load_session_agent_runtime(*, runner, source, skey, user_config, config, override, last_model, attended_route):
+def load_session_agent_runtime(*, source, skey, user_config, config, override, last_model, attended_route):
     """Resolve a detached route snapshot; the caller owns the session-state commit."""
     from gateway.run import (
         _resolve_gateway_model,
         _resolve_runtime_agent_kwargs, _resolve_runtime_agent_kwargs_for_provider,
     )
-    from agent.primary_auth_fallback import (
-        RUNTIME_KEY, failure_for_route, route_snapshot, set_pending_primary_auth_failure,
-    )
     from gateway.run_agent_cache import GatewayAgentCacheMixin
 
-    set_pending_primary_auth_failure(None)
     model = _resolve_gateway_model(user_config)
     selected = resolve_stored_override(override, model)
     if selected is not None:
@@ -295,8 +290,6 @@ def load_session_agent_runtime(*, runner, source, skey, user_config, config, ove
     # Private notice metadata must never reach an ``AIAgent(**runtime_kwargs)`` spread; the turn
     # runner surfaces it through the agent's one-shot fallback notice (#74349).
     notice = runtime_kwargs.pop("_fallback_notice", None)
-    primary_failure = runtime_kwargs.pop(RUNTIME_KEY, None)
-    resolved_route = route_snapshot(runtime_kwargs)
     runtime_model = runtime_kwargs.pop("model", None)
     if runtime_model:
         logger.info("Runtime provider supplied explicit model override: %s -> %s", model, runtime_model)
@@ -306,15 +299,13 @@ def load_session_agent_runtime(*, runner, source, skey, user_config, config, ove
         notice = pre_agent_fallback_notice(
             unavailable_override["provider"], unavailable_override.get("model"), runtime_kwargs.get("provider"), model)
 
-    model, runtime_kwargs = _resolve_channel_runtime(runner, source, model, runtime_kwargs)
+    model, runtime_kwargs = _resolve_channel_runtime(config, source, model, runtime_kwargs)
     model, runtime_kwargs, notice = _resolve_attended_runtime(attended_route, model, runtime_kwargs, notice)
 
     if override and skey:
         model, runtime_kwargs = GatewayAgentCacheMixin._apply_model_override(override, model, runtime_kwargs)
         if override.get("model"):
             runtime_kwargs["model_pinned"] = True
-
-    set_pending_primary_auth_failure(failure_for_route(primary_failure, resolved_route, runtime_kwargs))
 
     # Provider resolved but no model.default (`hermes auth add` without `hermes model`): use the
     # provider's first catalog model.
@@ -353,10 +344,8 @@ class GatewayTurnPrepareMixin:
         config/env (``_resolve_gateway_model(user_config)`` and default provider resolution).
         ``fallback=False`` keeps a launch-policy session on its own route (see
         ``_resolve_policy_agent_runtime``)."""
-        from agent.primary_auth_fallback import set_pending_primary_auth_failure
         from gateway.attended_model import parse_attended_config
         from gateway.session_policy import policy_for_source
-        set_pending_primary_auth_failure(None)
         if record_notice:
             self._pre_agent_fallback_notice = None
         policy = policy_for_source(self, source) if source is not None else None
@@ -368,7 +357,6 @@ class GatewayTurnPrepareMixin:
         skey = self._resolve_session_key_or_none(source, session_key)
         if record_notice:
             self._last_attended_decision = None
-            self._pre_agent_fallback_notice = None
         if record_notice and skey and assignment is None:
             self._rehydrate_session_model_override(skey)
             self._expire_attended_temporary_picks(skey, user_config)
@@ -380,7 +368,7 @@ class GatewayTurnPrepareMixin:
             override = assignment.get("override")
         attended_route = self._attended_route_for_session(
             source=source, session_key=skey, user_config=user_config, override=override,
-            last_model=last_model, assignment=assignment,
+            last_model=last_model, assignment=assignment, record_notice=record_notice,
         )
         resolved = load_runtime_for_source(
             self, source=source, skey=skey, user_config=user_config,

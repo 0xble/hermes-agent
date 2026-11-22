@@ -23,9 +23,9 @@ async def test_status_lookup_leaves_another_turns_fallback_notice_untouched(tmp_
     seen = []
     real_channel_runtime = prepare._resolve_channel_runtime
 
-    def observe(r, *a, **k):  # what a concurrent turn reading the slot mid-lookup would see
-        seen.append(r._pre_agent_fallback_notice)
-        return real_channel_runtime(r, *a, **k)
+    def observe(config, *a, **k):  # what a concurrent turn reading the slot mid-lookup would see
+        seen.append(runner._pre_agent_fallback_notice)
+        return real_channel_runtime(config, *a, **k)
 
     try:
         with patch("gateway.run._load_gateway_config",
