@@ -9,7 +9,7 @@ from gateway.config import Platform
 from gateway.session import SessionEntry, SessionSource
 from gateway.session_contract import SessionRef
 from gateway.session_store_async import run_store_call
-from hermes_state_keys import local_identity
+from persistence.sqlite._state.keys import local_identity
 from hermes_state_local import POLICY_PREFIX, local_receipt
 from hermes_state_runtime import RuntimeStoreError, list_session_admissions
 

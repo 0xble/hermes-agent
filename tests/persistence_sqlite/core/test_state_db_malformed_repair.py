@@ -515,7 +515,7 @@ def _release_header_probe_fds() -> None:
     """Close this process's cached header-probe fds (no SQLite connection is live, so no lock is at risk)."""
     import os
 
-    import hermes_state_dbfile
+    import persistence.sqlite._state.dbfile
     with hermes_state_dbfile._HEADER_PROBE_LOCK:
         for fd, _dev, _ino in hermes_state_dbfile._HEADER_PROBE_FDS.values():
             os.close(fd)

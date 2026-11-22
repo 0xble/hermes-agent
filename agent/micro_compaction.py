@@ -13,7 +13,7 @@ from typing import Any, Dict, List, Optional
 
 from agent.compaction_events import publish_micro
 from agent.context_compressor_telemetry import _safe_int
-from agent.message_metadata import record_absorbed_message
+from session_rules.turns import record_absorbed_message
 from agent.model_metadata import estimate_messages_tokens_rough, estimate_tokens_rough
 
 # Log name parity with the origin module.
@@ -434,7 +434,7 @@ class MicroCompactionMixin:
         session_db, session_id = getattr(self, "_session_db", None), getattr(self, "_session_id", "")
         if not session_db or not session_id:
             return None
-        from hermes_state_errors import HeldRowRewrittenError
+        from persistence.sqlite._state.errors import HeldRowRewrittenError
         try:
             # Micro-compaction is prefix + marker + suffix, not a contiguous tail. Identify the exact
             # byte-identical originals by their persistence marker; the state transaction resolves each

@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from agent.message_content import flatten_message_text
+from session_rules.turns import flatten_message_text
 from agent.synthetic_prompt import human_prompt_text
 
 logger = logging.getLogger(__name__)

@@ -14,9 +14,8 @@ from agent.context_compressor import (
     _DB_PERSISTED_MARKER as _DB_PERSISTED_MARKER_KEY, MODEL_ONLY_DISPLAY_METADATA_KEY, _is_checkpoint_item,
     _newest_checkpoint_carrier, split_user_originated_turn, ContextCompressor)
 from agent.memory_context import sanitize_context
-from agent.message_metadata import (
-    CANONICAL_ROW, DATA_USE, DB_ROW_SNAPSHOT, lift_data_use, MESSAGE_UID, REPLAY_PERSISTED_CONTENT, TOOL_CALL_UID, TOOL_CALL_UIDS,
-    index_tool_call_uids, message_uid_or_none, resolve_tool_call_uid, mint_uid, stamp_message_uid)
+from agent.message_metadata import CANONICAL_ROW, DATA_USE, DB_ROW_SNAPSHOT, lift_data_use, MESSAGE_UID, REPLAY_PERSISTED_CONTENT, TOOL_CALL_UID, TOOL_CALL_UIDS, stamp_message_uid
+from session_rules.turns import index_tool_call_uids, message_uid_or_none, resolve_tool_call_uid, mint_uid
 from agent.message_sanitization import _sanitize_surrogates, coalesce_tool_call_id
 from hermes_cli.timefmt import coerce_epoch
 from hermes_state_common import (
@@ -234,7 +233,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         unowned turn lease in that same transaction.
         """
         from hermes_state import SessionCompressionInProgressError
-        from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+        from persistence.sqlite._state.errors import CompressionSessionClosedError, SessionTurnLeaseLostError
         from hermes_state_mutation_retirement import retired_in
         if retired_in(conn, session_id):
             raise sqlite3.IntegrityError(f"Session {session_id!r} was deleted")
@@ -596,7 +595,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
                                         reject_active_turn_lease: bool = False,
                                         expected_active_ids: Optional[list[int]] = None) -> None:
         """Replace messages on the caller's transaction without committing it."""
-        from hermes_state_errors import CompressionSessionClosedError
+        from persistence.sqlite._state.errors import CompressionSessionClosedError
         if reject_active_turn_lease:
             self._check_transcript_write_guards(
                 conn, session_id, None, reject_active_turn_lease=True, reject_active_compression_lock=True)
@@ -639,7 +638,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         the whole transcript on every rewind). The live view is identical either way; only the durability
         of the dropped turns differs.
         """
-        from hermes_state_errors import CompressionSessionClosedError
+        from persistence.sqlite._state.errors import CompressionSessionClosedError
         def _do(conn):
             self.replace_messages_in_transaction(
                 conn, session_id, messages, active_only=active_only, archive_dropped=archive_dropped,
@@ -733,7 +732,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
         fold_plan: Optional[_FoldPlan] = None) -> int:
         """Run compaction on the caller's write transaction without committing it."""
         from hermes_state import SessionCompressionInProgressError
-        from hermes_state_errors import CompressionLeaseLostError
+        from persistence.sqlite._state.errors import CompressionLeaseLostError
         affected_fold = self._begin_display_fold(conn, fold_plan)
         with write_phase("compaction_prepare"):
             if lock_holder is not None:
@@ -746,7 +745,7 @@ class SessionMessagesMixin(SessionMessageReactionsMixin, DisplayFoldMixin, Sessi
             if held_for_cas:
                 mismatches = getattr(self, "held_row_mismatches", None)
                 if callable(mismatches) and mismatches(conn, session_id, held_for_cas):
-                    from hermes_state_errors import HeldRowRewrittenError
+                    from persistence.sqlite._state.errors import HeldRowRewrittenError
                     raise HeldRowRewrittenError(
                         f"a held row of session {session_id} was rewritten in place before the commit")
             patch = model_config_patch is not None

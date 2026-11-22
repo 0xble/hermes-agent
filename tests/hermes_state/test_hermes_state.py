@@ -161,7 +161,7 @@ class TestConnectionLifecycle:
         import subprocess
         import sys
 
-        from hermes_state_dbfile import iter_deleted_sqlite_sidecar_holders
+        from persistence.sqlite._state.dbfile import iter_deleted_sqlite_sidecar_holders
 
         db_path = tmp_path / "state.db"
         first = SessionDB(db_path=db_path)

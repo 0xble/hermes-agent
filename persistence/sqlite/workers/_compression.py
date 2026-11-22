@@ -394,7 +394,7 @@ def worker_claim_origin(db, params):
 
 def worker_retry_target(db, params):
     """Transport verification accepts old targets only for exact publication replay."""
-    from hermes_state_keys import admission_fingerprint
+    from persistence.sqlite._state.keys import admission_fingerprint
     if params.get('operation') != 'compression.publish':
         return params['session_id']
     digest = admission_fingerprint(canonical_target=params['session_id'],

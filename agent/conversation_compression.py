@@ -45,8 +45,8 @@ from agent.model_metadata import estimate_messages_tokens_rough, estimate_reques
 from agent.session_activity import ActivityProvenance, normalize_activity_provenance
 from agent.usage_anchor import set_usage_anchor
 from agent.notice_style import ContextNotice
-from hermes_state_ids import new_session_id as mint_session_id
-from hermes_state_pidns import holder_namespace_token
+from session_rules.session_ids import new_session_id as mint_session_id
+from process_identity import holder_namespace_token
 from agent.conversation_compression_watermark import held_archive_watermark
 
 logger = logging.getLogger(__name__)
@@ -2430,7 +2430,7 @@ def _merge_anchor_into_user_message(target: dict, anchor: dict) -> None:
         target.pop(flag, None)
     # The anchor's text leads the composite, so the fold keeps the anchor's uid and records the
     # scaffolding turn's (merge witness).
-    from agent.message_metadata import record_absorbed_message
+    from session_rules.turns import record_absorbed_message
 
     record_absorbed_message(target, anchor, dropped_leads=True)
 

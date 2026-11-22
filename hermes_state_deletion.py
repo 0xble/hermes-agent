@@ -12,7 +12,7 @@ import time
 from pathlib import Path
 
 from hermes_state_common import _id_chunks, _placeholders
-from hermes_state_keys import prefix_range
+from persistence.sqlite._state.keys import prefix_range
 
 logger = logging.getLogger(__name__)
 

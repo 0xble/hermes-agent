@@ -546,7 +546,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
         # Match kernel identities without stat-ing unrelated descriptor paths,
         # including hardlink aliases and a retired SQLite generation.
         try:
-            from hermes_state_dbfile import _iter_darwin_fd_targets
+            from persistence.sqlite._state.dbfile import _iter_darwin_fd_targets
 
             for pid, _fd, target, identity in _iter_darwin_fd_targets():
                 if pid == os.getpid():

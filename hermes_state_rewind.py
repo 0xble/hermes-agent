@@ -193,9 +193,8 @@ class SessionRewindMixin:
         clients can address follow-ups by row; the CLI leaves its history shape alone. Out-of-range /
         wrong-shape targets raise :class:`RewindTargetUnavailableError`."""
         from agent.context_compressor import _DB_PERSISTED_MARKER
-        from agent.context_compressor_retry import retryable_user_text
-        from agent.message_content import flatten_message_text
-        from agent.message_metadata import MESSAGE_UID, message_uid_or_none
+        from session_rules.turns import retryable_user_text, flatten_message_text, message_uid_or_none
+        from agent.message_metadata import MESSAGE_UID
 
         plan = self.plan_user_turn_rewind(session_id, user_ordinal, warm_history=warm_history,
                                           require_retryable=require_retryable, require_composite=require_composite)

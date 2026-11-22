@@ -148,7 +148,7 @@ def test_write_metrics_obey_threshold_and_do_not_leak_across_attempts(tmp_path, 
 def test_compaction_failure_phases_rollback_and_remain_attempt_local(
     tmp_path, monkeypatch, caplog, named_coverage, failure_phase,
 ):
-    from hermes_state_errors import CompressionLeaseLostError
+    from persistence.sqlite._state.errors import CompressionLeaseLostError
     from hermes_state_write_metrics import current_write_metrics
 
     db = SessionDB(tmp_path / "state.db")

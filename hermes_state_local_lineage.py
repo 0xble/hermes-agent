@@ -13,7 +13,7 @@ import itertools
 
 def validate_local_lineage(conn, receipt):
     from hermes_state_compression import _CHAIN_STEP_SQL
-    from hermes_state_keys import local_identity
+    from persistence.sqlite._state.keys import local_identity
     if ('legacy_session_id' not in receipt and
             receipt['session_id'] != local_identity(receipt['profile_id'], receipt['principal_id'], receipt['request_id'])):
         raise RuntimeStoreError('storage_unavailable')

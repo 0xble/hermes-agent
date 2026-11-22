@@ -45,7 +45,7 @@ def test_darwin_holder_scan_uses_native_descriptor_identity(tmp_path, monkeypatc
 @pytest.mark.platforms("macos")
 @pytest.mark.parametrize("partial", [False, True])
 def test_darwin_holder_scan_retains_uncertainty_on_enumeration_failure(tmp_path, monkeypatch, partial):
-    import hermes_state_dbfile
+    import persistence.sqlite._state.dbfile
 
     db = tmp_path / "state.db"
     db.touch()

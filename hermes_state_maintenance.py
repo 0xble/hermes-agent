@@ -159,7 +159,7 @@ class SessionMaintenanceMixin:
         """True when a live turn lease / compression lock protects ``sid``; expired or
         dead-holder guards are reclaimed and fenced as a side effect."""
         from hermes_state import SessionCompressionInProgressError
-        from hermes_state_errors import SessionTurnLeaseLostError
+        from persistence.sqlite._state.errors import SessionTurnLeaseLostError
         try:
             self._check_transcript_write_guards(
                 conn, sid, compression_lock_holder=None, turn_lease_holder=None,
@@ -668,7 +668,7 @@ class SessionMaintenanceMixin:
                 # one multiplexed process another live SessionDB generation for this same path is
                 # just as much a holder as another process would be.
                 # Automatic maintenance only ever SKIPS — a turn is never refused over housekeeping.
-                from hermes_state_holders import (
+                from persistence.sqlite._state.holders import (
                     foreign_state_db_holders, in_process_state_db_holders)
                 holders = (foreign_state_db_holders(self.db_path)
                            + in_process_state_db_holders(self.db_path, exclude=self))

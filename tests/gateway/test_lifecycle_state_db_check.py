@@ -198,7 +198,7 @@ def test_wal_scan_stays_lock_visible_during_sessiondb_startup(
     child can take the exclusive reset lock.
     """
     import gateway.lifecycle_ledger as ledger
-    import hermes_state_dbfile
+    import persistence.sqlite._state.dbfile
     from hermes_state import SessionDB
 
     path = tmp_path / "state.db"

@@ -9,7 +9,7 @@ import time
 from typing import Any, Dict, List, Optional
 
 from hermes_state_common import _sql_preview_raw, _sql_session_last_active
-from hermes_state_errors import StateDbReplacedError
+from persistence.sqlite._state.errors import StateDbReplacedError
 
 # caplog tests pin the "hermes_state" logger name.
 logger = logging.getLogger("hermes_state")

@@ -217,7 +217,7 @@ class SessionUsageMixin:
         handed back to the queue: a write refused on the in-process writer mutex (``WriterMutexTimeout``
         is raised before BEGIN, so nothing ran) goes back to the FRONT with everything after it, in
         order, for the next pass. Dropping it would lose usage the old unbounded mutex wait kept."""
-        from hermes_state_write import WriterMutexTimeout
+        from persistence.sqlite._state.write import WriterMutexTimeout
         try:
             coalesced = self._coalesce_token_deltas(batch)
         except Exception as exc:

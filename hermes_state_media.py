@@ -2,7 +2,7 @@
 import hashlib
 import json
 
-from hermes_state_keys import prefix_range
+from persistence.sqlite._state.keys import prefix_range
 
 PREFIX = 'gateway.media.retired.v1.'
 SPILLOVER_PREFIX = 'gateway.spillover.retired.v1.'

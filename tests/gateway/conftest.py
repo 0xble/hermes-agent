@@ -97,7 +97,7 @@ def private_db_probe_cleanup(tmp_path):
     owns the inode cancels its POSIX locks. Opt-in tests must first register normal
     runner/store cleanup and use only databases underneath their private tmp_path.
     """
-    import hermes_state_dbfile as dbfile
+    import persistence.sqlite._state.dbfile as dbfile
 
     with dbfile._HEADER_PROBE_LOCK:
         existing = set(dbfile._HEADER_PROBE_FDS)

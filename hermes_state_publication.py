@@ -169,6 +169,6 @@ def record_publication_attempt():
 
 def raise_if_nonretryable_contention(exc):
     """Expired patience and lost holders are terminal, not a live foreign writer."""
-    from hermes_state_errors import CompressionLeaseLostError
+    from persistence.sqlite._state.errors import CompressionLeaseLostError
     if isinstance(exc, (LocalStateLockTimeout, CompressionLeaseLostError)):
         raise exc

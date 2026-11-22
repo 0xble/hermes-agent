@@ -9,7 +9,8 @@ import json
 import sqlite3
 from typing import Any, Dict, List, Mapping, MutableMapping, Optional, Sequence, Tuple, TypeVar
 
-from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, TOOL_CALL_UID, TOOL_CALL_UIDS, stamp_message_uid, uid_list
+from agent.message_metadata import ABSORBED_MESSAGE_UIDS, MESSAGE_UID, TOOL_CALL_UID, TOOL_CALL_UIDS, stamp_message_uid
+from session_rules.turns import uid_list
 from agent.message_sanitization import coalesce_tool_call_id
 from hermes_state_common import _json_or, _placeholders
 

@@ -16,8 +16,8 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any, Callable, Collection, Dict, List, Optional, Tuple
 
-from agent.skill_commands import describe_skill_invocation
-from hermes_state_errors import is_malformed_db_error, is_sqlite_lock_error, is_fts_query_syntax_error
+from session_rules.turns import describe_skill_invocation
+from persistence.sqlite._state.errors import is_malformed_db_error, is_sqlite_lock_error, is_fts_query_syntax_error
 from hermes_state_search_runtime import search_operation, hydration_stage, search_stage, set_search_path
 from hermes_state_common import (
     FTS_SQL, FTS_STALE_KEY, FTS_STORAGE_VERSION, FTS_TOOL_CONTENT_PREFIX_CHARS,

@@ -8,7 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
-import hermes_state_dbfile as dbfile
+import persistence.sqlite._state.dbfile as dbfile
 
 
 @pytest.mark.platforms("macos")

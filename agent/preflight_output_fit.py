@@ -21,7 +21,7 @@ def _request_input_tokens(agent: Any, messages: list, prompt: str, *, wire: bool
     request_tools = tools if (wire or tools is not None) else getattr(agent, "tools", None)
     native_prompt = effective_prompt
     if wire and not native_prompt:
-        from agent.message_content import flatten_message_text
+        from session_rules.turns import flatten_message_text
 
         native_prompt = "\n".join(
             flatten_message_text(row.get("content"))
@@ -46,7 +46,7 @@ def _request_input_tokens(agent: Any, messages: list, prompt: str, *, wire: bool
 
 
 def _native_wire_tokens(agent: Any, messages: list, tools) -> Optional[int]:
-    from agent.message_content import flatten_message_text
+    from session_rules.turns import flatten_message_text
 
     prompt = "\n".join(
         flatten_message_text(row.get("content"))

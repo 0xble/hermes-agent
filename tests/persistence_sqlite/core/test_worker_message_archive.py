@@ -5,7 +5,7 @@ import pytest
 
 from agent.runtime_session_store import RuntimeSessionStore, WorkerPersistenceError
 from hermes_state import SessionDB
-from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+from persistence.sqlite._state.errors import CompressionSessionClosedError, SessionTurnLeaseLostError
 from tests.fakes.runtime_owner import begin_runtime_epoch
 from hermes_state_runtime import (
     RuntimeStoreError, mutate_worker_execution, register_worker_execution,

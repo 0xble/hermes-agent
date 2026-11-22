@@ -421,7 +421,7 @@ class SessionCompressionMixin:
             watermark: Optional[int] = None, watermark_ceiling: Optional[int] = None) -> None:
         """:meth:`publish_compression_child` on the caller's write transaction (never commits). The
         owner and the worker/canonical-mutation verbs share this one body so they cannot drift."""
-        from hermes_state_errors import CompressionSessionBusyError
+        from persistence.sqlite._state.errors import CompressionSessionBusyError
         from hermes_state_identity import _compaction_messages
         from hermes_state_message_archive import clone_tail_survivors
         if require_lease_refresh and compression_lock_holder:

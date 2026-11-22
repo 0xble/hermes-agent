@@ -35,14 +35,14 @@ from hermes_cli.env_loader import load_hermes_dotenv
 from hermes_cli.process_identity import release_process_group_once_empty, spawn_owned
 from tui_gateway.pet_sheet import _clone_pet_payload, _pet_row_frame_counts, _pet_sheet_revision, _pet_state_rows
 from utils import is_truthy_value
-from hermes_state_ids import new_session_id
+from session_rules.session_ids import new_session_id
 from tools.environments.local import hermes_subprocess_env
 from agent.fast_mode import STATIC_TIERS
 from agent.replay_cleanup import canonicalize_replay_history
 from agent.reasoning_effort import clamp_effort, route_supported_efforts
 from agent.voice_turn_route import session_runtime_view
 from agent.compaction_display import project_compaction_message_for_display
-from agent.skill_commands import describe_skill_invocation
+from session_rules.turns import describe_skill_invocation
 from agent.conversation_loop import INTERRUPT_WAITING_FOR_MODEL_PREFIX
 from tui_gateway import git_probe, pending_moa, stream_segments
 from hermes_state import _BARE_BILLING_PROVIDERS

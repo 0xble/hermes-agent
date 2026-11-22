@@ -179,7 +179,7 @@ def test_lease_ttl_starts_after_writer_wait(tmp_path, operation):
 
 
 def test_lost_compaction_lease_is_not_retried(tmp_path):
-    from hermes_state_errors import SessionCompressionInProgressError
+    from persistence.sqlite._state.errors import SessionCompressionInProgressError
 
     db = SessionDB(tmp_path / "lost.db")
     try:

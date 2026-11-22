@@ -25,8 +25,8 @@ from hermes_constants import (
     LOCAL_RUNTIME_ROOT_DIRS, _get_platform_default_hermes_home, get_default_hermes_root, get_hermes_home,
     display_hermes_home,
 )
-from hermes_state_dbfile import RETIRED_GENERATION_DIR_SUFFIX
-from hermes_state_holders import read_only_db_uri
+from persistence.sqlite._state.dbfile import RETIRED_GENERATION_DIR_SUFFIX
+from persistence.sqlite._state.holders import read_only_db_uri
 from hermes_cli.sqlite_safe_read import connect_tracked, has_live_connection, read_header_bytes_preopen
 
 from agent.provider_media import GENERATED_SUBDIR

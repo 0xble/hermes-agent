@@ -28,8 +28,8 @@ from hermes_cli.web_routers._common import (
     CORRUPT_STORE_DETAIL, corrupt_store_as_status, log as _log, destructive_profile, http_failure,
 )
 from hermes_state import is_malformed_db_error
-from hermes_state_errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
-from hermes_state_health import STORAGE_CORRUPT, note_storage_error, storage_state
+from persistence.sqlite._state.errors import SessionActiveWriteGuardError, StateDbReplacedError, is_transient_sqlite_error
+from persistence.sqlite._state.health import STORAGE_CORRUPT, note_storage_error, storage_state
 
 list_router = APIRouter()
 search_router = APIRouter()
@@ -688,7 +688,7 @@ def _project_for_display(messages: list, *, home=None, inline_images: bool = Tru
     from agent.context_compressor import is_compaction_summary_message
     from agent.conversation_compression import _extract_steer_text_from_message
     from agent.history_commentary import project_history_commentary
-    from agent.message_metadata import withheld_prompt_text
+    from session_rules.turns import withheld_prompt_text
     from agent.prompt_builder import STEER_DISPLAY_KIND
     from agent.turn_failure_copy import CONTENT_REFUSED_DISPLAY_KIND, untyped_failed_turn_display_kind
 

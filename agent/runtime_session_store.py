@@ -181,7 +181,7 @@ class WorkerRPC:
             self._drop()
         from hermes_cli.gateway_client import GatewayClientError
         from hermes_cli.gateway_runtime_discovery import DiscoveryError
-        from hermes_state_errors import GatewayOwnerRestartError
+        from persistence.sqlite._state.errors import GatewayOwnerRestartError
         from websockets.exceptions import ConnectionClosed
 
         deadline = deadline if deadline is not None else time.monotonic() + OWNER_RESTART_TIMEOUT

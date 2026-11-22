@@ -11,7 +11,7 @@ import os
 
 import pytest
 
-import hermes_state_dbfile as dbfile
+import persistence.sqlite._state.dbfile as dbfile
 from hermes_state import DeletedWalGenerationError
 
 

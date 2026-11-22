@@ -255,7 +255,7 @@ def test_corrupt_search_never_takes_writer_for_repair(db, monkeypatch):
 
 
 def test_sqlite_result_code_overrides_parser_looking_text():
-    from hermes_state_errors import is_fts_query_syntax_error
+    from persistence.sqlite._state.errors import is_fts_query_syntax_error
 
     error = sqlite3.OperationalError('fts5: syntax error near "AND"')
     error.sqlite_errorcode = sqlite3.SQLITE_INTERRUPT

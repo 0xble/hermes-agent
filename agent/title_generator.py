@@ -24,7 +24,7 @@ from agent.auxiliary_client import call_llm
 from agent.context_compressor import LEGACY_SUMMARY_PREFIX
 from agent.delegation_context import is_dispatcher_owned_worker_context
 from agent.incognito import incognito_scope, is_incognito
-from agent.message_content import flatten_message_text
+from session_rules.turns import flatten_message_text
 
 logger = logging.getLogger(__name__)
 
@@ -526,7 +526,7 @@ def _summarize_user_message(user_message: str) -> str:
         return ""
     described = None
     try:
-        from agent.skill_commands import describe_skill_invocation
+        from session_rules.turns import describe_skill_invocation
         described = describe_skill_invocation(user_message)
     except Exception:
         logger.debug("Skill-scaffolding summary failed; titling raw", exc_info=True)

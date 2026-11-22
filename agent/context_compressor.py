@@ -36,7 +36,7 @@ from agent.context_compressor_prune import ProactivePruneMixin
 from agent.context_compressor_summary import SummaryDispatchMixin
 from agent.context_compressor_sampling import SummaryInputSamplingMixin
 from agent.context_compressor_prompt_rules import EPISTEMIC_STANCE_RULE, UNVERIFIED_HYPOTHESES_SECTION, _today_for_prompt
-from agent.context_compressor_retry import retryable_user_text, typed_prompt_content
+from session_rules.turns import retryable_user_text, typed_prompt_content
 from agent.context_compressor_typed_input import TYPED_TURNS_POINTER, typed_summary_messages
 from agent.conversation_compression_scaffolding import is_user_role_scaffolding
 from agent.context_compressor_tail import (
@@ -53,7 +53,7 @@ from agent.model_metadata import (
 from agent.replayed_reasoning import codex_reasoning_replay_tokens, strip_opaque_replay_items
 from agent.context_default_record import last_defaulted_context_length
 from agent.redact import redact_derived_text, redact_sensitive_text
-from agent.turn_context import drop_stale_api_content
+from session_rules.turns import drop_stale_api_content
 from tools.todo_tool import TODO_INJECTION_HEADER
 
 logger = logging.getLogger(__name__)
@@ -951,7 +951,7 @@ def _synthetic_user_row(content: str) -> bool:
 def _typed_user_text(content: str) -> str:
     """A ``/skill``, bundle or auto-load turn as the user typed it (``/skill do X``); other text unchanged.
     Its inline skill body is not the user's words — it is carried by a ``[SKILL_PRUNED: ...]`` marker instead."""
-    from agent.skill_commands import describe_skill_invocation, skills_loaded_by_scaffold
+    from session_rules.turns import describe_skill_invocation, skills_loaded_by_scaffold
     return (describe_skill_invocation(content, separator=" ") or "") if skills_loaded_by_scaffold(content) else content
 
 
@@ -4672,7 +4672,8 @@ Write only the summary body. Do not include any preamble or prefix."""
             )
 
         last_visible_role = _last_template_visible_role(compressed)
-        from agent.message_metadata import MESSAGE_UID, mark_inflight_restatement, message_uid_or_none, record_absorbed_message, typed_ask_fields
+        from agent.message_metadata import MESSAGE_UID, mark_inflight_restatement, typed_ask_fields
+        from session_rules.turns import message_uid_or_none, record_absorbed_message
         if self._has_merged_inflight_replay(inflight):
             # Never copy a summary carrier (its metadata marks it synthetic): a plain user row, keeping only the ask stamp.
             replay = {"role": "user", "content": task_text, "display_metadata": typed_ask_fields(inflight)}

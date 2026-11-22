@@ -248,7 +248,7 @@ async def test_cron_worker_registration_still_requires_adoption_capability(tmp_p
 @pytest.fixture
 def detached_observation(tmp_path, monkeypatch):
     from cron import executions, scheduler_authority
-    from hermes_state_keys import CRON_PRINCIPAL_ID
+    from persistence.sqlite._state.keys import CRON_PRINCIPAL_ID
 
     monkeypatch.setattr(executions, 'EXECUTIONS_FILE', tmp_path / 'executions.db')
     execution = executions.create_execution('observe-job', source='test')

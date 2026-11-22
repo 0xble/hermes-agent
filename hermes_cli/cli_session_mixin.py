@@ -14,7 +14,7 @@ import sys
 
 from agent.i18n import t
 from hermes_constants import get_hermes_home
-from hermes_state_ids import new_session_id
+from session_rules.session_ids import new_session_id
 from pathlib import Path
 from rich.console import Console
 from rich.markup import escape as _escape
@@ -790,7 +790,7 @@ class CLISessionMixin:
             return None
 
         from agent.context_compressor import history_before_user_originated_turn
-        from agent.context_compressor_retry import retryable_user_text
+        from session_rules.turns import retryable_user_text
         from agent.memory_context import sanitize_context
 
         warm_history = list(self.conversation_history)

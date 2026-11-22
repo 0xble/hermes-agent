@@ -5,7 +5,7 @@ import os
 import pytest
 
 from hermes_state import SessionDB
-from hermes_state_errors import CompressionSessionClosedError, SessionTurnLeaseLostError
+from persistence.sqlite._state.errors import CompressionSessionClosedError, SessionTurnLeaseLostError
 
 
 @pytest.fixture

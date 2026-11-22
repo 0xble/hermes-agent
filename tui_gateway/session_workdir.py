@@ -911,7 +911,7 @@ def _rewind_active_session_history(
     from session_rules.turns import (
         history_before_user_originated_turn, user_originated_turn_view,
     )
-    from agent.context_compressor_retry import retryable_user_text
+    from session_rules.turns import retryable_user_text
 
     _require_transcript_owner(session)  # another surface may own the chat now: its transcript is not ours to cut
     history = _history_without_ephemeral_scaffolding(session.get("history", []))

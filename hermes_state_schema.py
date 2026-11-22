@@ -30,9 +30,9 @@ from hermes_state_common import (
 )
 from hermes_state_fts import (_drop_orphan_fts_shadow_tables, base_index_recognised, base_source_view_is_stale,
                               drop_retired_cjk_index, fts_layout_current)
-from hermes_state_holders import _read_proc_argv
+from persistence.sqlite._state.holders import _read_proc_argv
 from hermes_state_search import _delete_meta, _meta_row
-from hermes_state_errors import is_sqlite_lock_error
+from persistence.sqlite._state.errors import is_sqlite_lock_error
 from hermes_state_titles import next_title_in_lineage
 from hermes_state_session_signature import SESSION_SIGNATURE_FIELDS, SESSION_SIGNATURE_TRIGGER_SQL
 

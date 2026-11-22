@@ -16,7 +16,7 @@ from pathlib import Path
 
 from hermes_cli.cli_output import print_truncated
 from hermes_cli.sessions_cmd_browse import _relative_time, _session_browse_picker
-from hermes_state_errors import SessionActiveWriteGuardError
+from persistence.sqlite._state.errors import SessionActiveWriteGuardError
 
 
 def get_hermes_home():
@@ -129,7 +129,7 @@ def _cmd_repair(args):
     if not db_path.exists():
         print(f"No session database at {db_path} (nothing to repair).")
         return
-    from hermes_state_reconcile import repair_declarative_schema, schema_drift_reason
+    from persistence.sqlite.admin._reconcile import repair_declarative_schema, schema_drift_reason
     # A missing canonical sessions table is not additive upgrade drift: creating
     # an empty one could hide lost history. Preserve corruption/recovery routing.
     reason = _db_opens_cleanly(db_path)
@@ -926,7 +926,7 @@ def _cmd_pinned(db, args):
 
 
 def _cmd_retitle_skills(db, args):
-    from agent.skill_commands import describe_skill_invocation
+    from session_rules.turns import describe_skill_invocation
     from agent.title_generator import generate_title
     limit = max(1, int(getattr(args, "limit", 200) or 200))
     apply_changes = bool(getattr(args, "apply", False))
@@ -1503,7 +1503,7 @@ def cmd_sessions(args, sessions_parser=None):
             return
         if (action in _HELD_STORE_ACTIONS and not getattr(args, "dry_run", False) and not getattr(args, "force", False)
                 and getattr(args, "owner_endpoint", None) is None):
-            from hermes_state_holders import held_store_refusal
+            from persistence.sqlite._state.holders import held_store_refusal
             # Same path the SessionDB above opened, so the scan never depends on the db object.
             refusal = held_store_refusal(path, command=action)
             if refusal:

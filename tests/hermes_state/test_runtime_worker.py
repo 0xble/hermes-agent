@@ -106,7 +106,7 @@ def test_worker_mutation_and_receipt_roll_back_together(tmp_path, content):
 
 @pytest.mark.parametrize('closed', [False, True])
 def test_worker_append_preserves_compression_write_guards(tmp_path, closed):
-    from hermes_state_errors import CompressionSessionClosedError
+    from persistence.sqlite._state.errors import CompressionSessionClosedError
 
     db, epoch, assignment = setup_worker(tmp_path)
     try:

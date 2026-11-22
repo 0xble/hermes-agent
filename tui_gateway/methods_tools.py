@@ -756,7 +756,7 @@ def _cmd_retry(rid, params, session, name, arg):
     if busy := _busy_error(rid, session, "retry"):
         return busy
     cc = _tools_mod("agent.context_compressor")
-    from agent.context_compressor_retry import retryable_user_text
+    from session_rules.turns import retryable_user_text
     with session["history_lock"]:
         if busy := _busy_error(rid, session, "retry"):
             return busy
@@ -859,7 +859,7 @@ def _cmd_undo(rid, params, session, name, arg):
         if err:
             return err
         active, live_view, rewound_count = rewound
-        target_text = _tools_mod("agent.message_content").flatten_message_text(live_view.get("content"))
+        target_text = _tools_mod("session_rules.turns").flatten_message_text(live_view.get("content"))
     # Notify memory providers (same hook /branch fires) with rewound=True so cached per-turn state invalidates.
     agent = session.get("agent")
     if agent is not None:
