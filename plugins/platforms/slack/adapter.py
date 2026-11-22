@@ -3565,6 +3565,16 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             newest = sorted(self._processed_message_ts.items(), key=lambda item: item[1])
             self._processed_message_ts = dict(newest[-self._PROCESSED_MESSAGE_TS_MAX :])
 
+    def _remember_processed_file_id(self, file_id: str) -> None:
+        """Track a file included in an inbound turn so ``file_shared`` cannot duplicate it."""
+        if file_id:
+            self._remember_processed_message_ts(f"file:{file_id}")
+
+    def _file_was_processed(self, file_id: str) -> bool:
+        """Return whether a Slack file was already included in an inbound turn."""
+        processed = getattr(self, "_processed_message_ts", {})
+        return bool(file_id and f"file:{file_id}" in processed)
+
     @staticmethod
     def _event_team_id(event: dict, body: Optional[dict] = None) -> str:
         """Resolve a workspace ID from the event plus Bolt's outer payload.
@@ -3783,7 +3793,8 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
 
     async def _handle_slack_file_shared(self, event: dict, body: Optional[dict] = None) -> None:
         """Fallback for file shares never delivered as message.files (``file_shared`` has only a
-        file ID → ``files.info``). Video only: other uploads arrive on the message event."""
+        file ID → ``files.info``). The fallback covers every file type because Slack can omit
+        ``message.files`` for top-level DM documents."""
         channel_id = event.get("channel_id") or event.get("channel") or ""
         if self._is_ignored_channel(channel_id):
             logger.info(
@@ -3792,7 +3803,25 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         file_id = event.get("file_id") or (event.get("file") or {}).get("id") or ""
         if not channel_id or not file_id:
             return
+        if self._file_was_processed(file_id):
+            return
         team_id = self._event_team_id(event, body)
+
+        async def _dispatch_unresolved_file_notice(file_obj: dict[str, Any]) -> None:
+            """Keep a file_shared failure visible to the agent instead of dropping it."""
+            event_ts = str(event.get("event_ts") or event.get("ts") or "")
+            await self._handle_slack_message({
+                "type": "message",
+                "subtype": "file_share",
+                "text": _slack_file_marker(file_obj),
+                "user": event.get("user_id") or file_obj.get("user", ""),
+                "channel": channel_id,
+                "channel_type": "im" if channel_id.startswith("D") else "channel",
+                "team": team_id,
+                "ts": f"{event_ts}:file:{file_id}" if event_ts else f"file:{file_id}",
+                "files": [file_obj],
+            })
+
         try:
             client = self._team_clients.get(team_id) if team_id else None
             info_resp = await (client or self._get_client(channel_id)).files_info(file=file_id)
@@ -3800,36 +3829,54 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             detail = self._describe_slack_api_error(
                 getattr(exc, "response", None), file_obj={"id": file_id})
             logger.warning("[Slack] files.info error for file_shared %s: %s", file_id, detail or exc)
+            await _dispatch_unresolved_file_notice({
+                "id": file_id,
+                "name": event.get("file_name") or file_id,
+                "mimetype": event.get("mimetype") or "application/octet-stream",
+            })
             return
         if not info_resp.get("ok"):
             detail = self._describe_slack_api_error(info_resp, file_obj={"id": file_id})
             logger.warning(
                 "[Slack] files.info failed for file_shared %s: %s", file_id,
                 detail or info_resp.get("error"))
+            await _dispatch_unresolved_file_notice({
+                "id": file_id,
+                "name": event.get("file_name") or file_id,
+                "mimetype": event.get("mimetype") or "application/octet-stream",
+            })
             return
         file_obj = info_resp.get("file") or {}
-        if not str(file_obj.get("mimetype", "")).startswith("video/"):
-            return
         share = self._first_file_share(file_obj, channel_id)
         ts = share.get("ts") or event.get("event_ts") or ""
         thread_ts = share.get("thread_ts") or ""
         # Let the normal message.file_share event arrive first; if it did,
         # its share ts is already recorded and this fallback skips.
         await asyncio.sleep(0.75)
-        if ts and self._dedup.is_duplicate(self._workspace_event_id(team_id, ts)):
+        if self._file_was_processed(file_id):
             return
         fallback_event = {
             "type": "message",
             "subtype": "file_share",
-            "text": "",
+            # Keep the attachment visible even if its download fails or Slack omits
+            # size metadata needed by the document cache.
+            "text": _slack_file_marker(file_obj),
             "user": event.get("user_id") or file_obj.get("user", ""),
             "channel": channel_id,
             "channel_type": "im" if channel_id.startswith("D") else "channel",
             "team": team_id,
-            "ts": "",  # already recorded above; avoid tripping our own dedup guard
+            # Use a synthetic event id so a preceding text-only message with the
+            # same Slack timestamp does not deduplicate the attachment turn.
+            "ts": f"{ts}:file:{file_id}" if ts else f"file:{file_id}",
             "files": [file_obj]}
         if thread_ts and thread_ts != ts:
             fallback_event["thread_ts"] = thread_ts
+        elif (
+            ts
+            and channel_id.startswith("D")
+            and self._dm_top_level_threads_as_sessions()
+        ):
+            fallback_event["thread_ts"] = ts
         await self._handle_slack_message(fallback_event)
 
     def _register_mentioned_thread(self, thread_ts: str, team_id: str = "") -> None:
@@ -4395,6 +4442,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         # before the slow enrichment awaits. Claiming before the filters would let an ignored
         # original block a later "@bot" edit from summoning the bot.
         self._remember_processed_message_ts(str(event.get("ts") or ""))
+        for file_obj in event.get("files") or []:
+            if isinstance(file_obj, dict):
+                self._remember_processed_file_id(str(file_obj.get("id") or ""))
         self._note_live_inbound(event, channel_id)
         if is_mentioned:
             text, original_text, command_probe_text, is_command_text = self._apply_bot_mention(
@@ -4611,11 +4661,17 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             mimetype = f.get("mimetype", "unknown")
             url = f.get("url_private_download") or f.get("url_private", "")
             if not url:
+                notices.append(
+                    f"Slack attachment {_attachment_label(f)} could not be downloaded because "
+                    "Slack did not provide a download URL.")
                 continue
             kind = self._slack_file_kind(f, mimetype)
             try:
                 cached = await self._cache_slack_file(kind, f, url, mimetype, team_id)
                 if cached is None:
+                    notices.append(
+                        f"Slack attachment {_attachment_label(f)} was not cached because its "
+                        "size is missing or exceeds Slack's 20 MB limit.")
                     continue
                 cached_path, media_type, injection = cached
                 media_urls.append(cached_path)
@@ -4624,8 +4680,12 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 if injection:
                     text = f"{injection}\n\n{text}" if text else injection
             except Exception as e:  # pragma: no cover - defensive logging
+                detail = self._describe_slack_download_failure(e, file_obj=f)
+                detail = detail or (
+                    f"Slack attachment {_attachment_label(f)} could not be downloaded. "
+                    "The file is still identified above, but its contents are unavailable.")
                 self._note_attachment_failure(
-                    notices, self._describe_slack_download_failure(e, file_obj=f),
+                    notices, detail,
                     f"[Slack] Failed to cache {kind} from %s: %s", url, e, exc_info=True)
         if notices:
             notice_block = "[Slack attachment notice]\n" + "\n".join(f"- {n}" for n in notices)
