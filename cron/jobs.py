@@ -115,6 +115,9 @@ TICKER_INTERVAL_SECONDS = 60
 # mark_job_run / advance_next_run calls clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
+# Parsed jobs are immutable from the store's perspective: callers receive a deep copy, while
+# the cache is invalidated naturally by the atomic writer's (mtime, size, inode) stamp.
+_jobs_load_cache: dict[str, tuple[tuple[int, int, int], list[dict[str, Any]]] | None] = {}
 _fire_fence_locks: dict[str, threading.RLock] = {}
 _fire_fence_locks_guard = threading.Lock()
 _fire_fence_lock_state = threading.local()
@@ -1508,7 +1511,14 @@ def load_jobs() -> list[dict[str, Any]]:
     pre_read_stamp = _jobs_file_stamp(jobs_file)
     if not jobs_file.exists():
         _record_load_stamp(None)
+        _jobs_load_cache.pop(str(jobs_file), None)
         return []
+
+    cache_key = str(jobs_file)
+    cached = _jobs_load_cache.get(cache_key)
+    if cached is not None and cached[0] == pre_read_stamp:
+        _record_load_stamp(pre_read_stamp)
+        return copy.deepcopy(cached[1])
 
     try:
         data, _strict_retry = _parse_jobs_file(jobs_file)
@@ -1586,6 +1596,9 @@ def load_jobs() -> list[dict[str, Any]]:
         except OSError as exc:  # repaired in memory; the next load retries the persist
             store_health.note_unwritable(exc, f"jobs.json repair ({repair}) not persisted", "load")
     _record_load_stamp(pre_read_stamp)
+    # Do not cache a stamp that raced with a writer; the next load must parse again.
+    if pre_read_stamp is not None and _jobs_file_stamp(jobs_file) == pre_read_stamp:
+        _jobs_load_cache[cache_key] = (pre_read_stamp, copy.deepcopy(list(jobs)))
     return jobs
 
 
