@@ -17,7 +17,8 @@ def test_load_jobs_reuses_mtime_cache_and_returns_safe_snapshots(tmp_path):
     with jobs.use_cron_store(tmp_path):
         jobs.save_jobs_document(_document())
         jobs._invalidate_jobs_cache()
-        with patch.object(jobs, "_parse_jobs_file", wraps=jobs._parse_jobs_file) as parse:
+        with patch.object(jobs, "_stamp_is_racy", return_value=False), \
+                patch.object(jobs, "_parse_jobs_file", wraps=jobs._parse_jobs_file) as parse:
             first = jobs.load_jobs()
             first[0]["prompt"] = "unsaved mutation"
             second = jobs.load_jobs()
@@ -77,3 +78,48 @@ def test_changed_document_still_uses_atomic_replace(tmp_path):
             jobs.save_jobs_document(_document("after"))
         assert replace.call_count == 1
         assert jobs.load_jobs()[0]["id"] == "after"
+
+
+def test_same_size_in_place_rewrite_in_one_second_is_seen(tmp_path):
+    import os
+
+    with jobs.use_cron_store(tmp_path):
+        jobs.save_jobs_document(_document("before"))
+        assert jobs.load_jobs()[0]["id"] == "before"
+        path = tmp_path / "cron" / "jobs.json"
+        before = path.stat()
+        replacement = json.dumps(_document("change"), indent=2).encode()
+        assert len(replacement) == path.stat().st_size
+        path.write_bytes(replacement)
+        os.utime(path, ns=(before.st_atime_ns, before.st_mtime_ns))
+        after = path.stat()
+        assert after.st_size == before.st_size
+        assert after.st_mtime_ns == before.st_mtime_ns
+        assert jobs.load_jobs()[0]["id"] == "change"
+
+
+def test_racy_parse_is_not_cached_under_its_post_read_stamp(tmp_path):
+    with jobs.use_cron_store(tmp_path):
+        jobs.save_jobs_document(_document("race"))
+        path = tmp_path / "cron" / "jobs.json"
+        jobs._invalidate_jobs_cache(path)
+        stamp = (jobs.time.time_ns(), 1, 2, 3)
+        with patch.object(jobs, "_jobs_file_stamp", side_effect=[stamp, stamp]), \
+                patch.object(jobs, "_stamp_is_racy", return_value=True):
+            parsed, _ = jobs._parse_jobs_file(path)
+        assert parsed["jobs"][0]["id"] == "race"
+        assert jobs._jobs_raw_parse_cache.get(jobs._jobs_cache_key(path)) is None
+
+
+def test_stamp_change_between_read_and_stat_never_caches_under_later_stamp(tmp_path):
+    with jobs.use_cron_store(tmp_path):
+        jobs.save_jobs_document(_document("race"))
+        path = tmp_path / "cron" / "jobs.json"
+        jobs._invalidate_jobs_cache(path)
+        before = (10, 1, 1, 1)
+        during = (11, 1, 1, 1)
+        # load_jobs sees the original stamp before and after the read, but _parse_jobs_file
+        # observes a different stamp after reading. The payload is therefore not certified.
+        with patch.object(jobs, "_jobs_file_stamp", side_effect=[before, before, during, before]):
+            assert jobs.load_jobs()[0]["id"] == "race"
+        assert jobs._jobs_parse_cache.get(jobs._jobs_cache_key(path)) is None

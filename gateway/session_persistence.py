@@ -580,7 +580,6 @@ class SessionPersistenceMixin:
             logger.warning("gateway.session: recovered state.db routing load failed: %s", exc)
             return
         current = self._entries_as_dicts()
-        changed = False
         for key, entry_json in durable.items():
             durable_entry = self._routing_entry_from_json(key, entry_json)
             if durable_entry is None:
@@ -589,12 +588,10 @@ class SessionPersistenceMixin:
                 # A key created while on fallback wins over a DB-only key; otherwise restore the
                 # authoritative row that fallback never saw.
                 self._entries.setdefault(key, durable_entry)
-                changed = True
             elif key not in current:
                 continue  # loaded from fallback and deliberately removed
             elif current[key] == baseline[key]:
                 self._entries[key] = durable_entry  # unchanged fallback data yields to the DB copy
-                changed = True
         self._heal_missing_origins(getattr(self, "_entries").values())
         self._routing_db_loaded = True
         self._routing_fallback_baseline = None

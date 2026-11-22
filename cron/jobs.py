@@ -1512,7 +1512,10 @@ def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
         result = (json.loads(raw), False)
     except json.JSONDecodeError:
         result = (json.loads(raw, strict=False), True)
-    if stamp is not None and _jobs_file_stamp(jobs_file) == stamp and not _stamp_is_racy(stamp):
+    post_stamp = _jobs_file_stamp(jobs_file)
+    if stamp is not None and post_stamp != stamp:
+        _jobs_lock_state.parse_stamp_changed = True
+    if stamp is not None and post_stamp == stamp and not _stamp_is_racy(stamp):
         with _jobs_parse_cache_lock:
             _jobs_raw_parse_cache[key] = (stamp, (copy.deepcopy(result[0]), result[1]))
     return result
@@ -1566,6 +1569,7 @@ def load_jobs() -> list[dict[str, Any]]:
         return cached
 
     try:
+        _jobs_lock_state.parse_stamp_changed = False
         data, _strict_retry = _parse_jobs_file(jobs_file)
     except OSError as e:
         logger.error("IOError reading jobs.json: %s", e)
@@ -1642,8 +1646,10 @@ def load_jobs() -> list[dict[str, Any]]:
             repair_persisted = False
             store_health.note_unwritable(exc, f"jobs.json repair ({repair}) not persisted", "load")
     post_read_stamp = _jobs_file_stamp(jobs_file)
-    if post_read_stamp == pre_read_stamp and post_read_stamp is not None and not _stamp_is_racy(post_read_stamp) and repair_persisted:
+    parse_stamp_changed = getattr(_jobs_lock_state, "parse_stamp_changed", False)
+    if post_read_stamp == pre_read_stamp and post_read_stamp is not None and not _stamp_is_racy(post_read_stamp) and repair_persisted and not parse_stamp_changed:
         _cache_jobs(jobs_file, post_read_stamp, jobs)
+    _jobs_lock_state.parse_stamp_changed = False
     _record_load_stamp(pre_read_stamp)
     return copy.deepcopy(jobs)
 
