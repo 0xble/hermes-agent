@@ -1887,6 +1887,15 @@ def save_jobs(
 ):
     """Save all jobs under the lock; see ``_save_jobs_unlocked`` for ``removed_ids``/``replace``."""
     with _jobs_lock():
+        # Scheduler scans commonly call save_jobs after every tick.  Avoid an atomic rewrite when
+        # the semantic job list is unchanged; the writer adds a fresh updated_at wrapper timestamp.
+        if not replace and not removed_ids and not getattr(_jobs_lock_state, "saving_noop_check", False):
+            _jobs_lock_state.saving_noop_check = True
+            try:
+                if _peek_jobs_unlocked() == jobs:
+                    return
+            finally:
+                _jobs_lock_state.saving_noop_check = False
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
 
 
