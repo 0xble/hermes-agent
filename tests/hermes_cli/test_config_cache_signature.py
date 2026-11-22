@@ -29,3 +29,78 @@ def test_load_config_sees_replacement_with_pinned_mtime_and_size(tmp_path):
         assert config_mod._load_config_impl(want_deepcopy=False) is first  # unchanged file: cache hit
         _replace_pinning_mtime(cfg, "model:\n  default: bbbb-route\n")
         assert config_mod.load_config()["model"]["default"] == "bbbb-route"
+
+
+def test_load_config_readonly_reuses_raw_parse_across_secret_scopes(tmp_path, monkeypatch):
+    from agent import secret_scope
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(
+        "providers:\n  demo:\n    api_key: ${CACHE_SCOPE_KEY}\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    config_mod._RAW_CONFIG_CACHE.clear()
+    calls = 0
+    original = config_mod.read_config_doc
+
+    def counted(path):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(config_mod, "read_config_doc", counted)
+    try:
+        for value in ("scope-a", "scope-b", "scope-a", "scope-b"):
+            token = secret_scope.set_secret_scope({"CACHE_SCOPE_KEY": value})
+            try:
+                loaded = config_mod.load_config_readonly()
+                assert loaded["providers"]["demo"]["api_key"] == value
+            finally:
+                secret_scope.reset_secret_scope(token)
+    finally:
+        config_mod._LOAD_CONFIG_CACHE.clear()
+        config_mod._RAW_CONFIG_CACHE.clear()
+    assert calls == 1
+
+
+def test_read_raw_and_load_config_readonly_share_raw_parse_cache(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("model:\n  default: shared-route\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    config_mod._RAW_CONFIG_CACHE.clear()
+    calls = 0
+    original = config_mod.read_config_doc
+
+    def counted(path):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(config_mod, "read_config_doc", counted)
+    config_mod.read_raw_config()
+    assert config_mod.load_config_readonly()["model"]["default"] == "shared-route"
+    config_mod.read_raw_config()
+    config_mod.load_config_readonly()
+    assert calls == 1
+
+
+def test_load_config_readonly_reparses_changed_file(tmp_path, monkeypatch):
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text("model:\n  default: aaaa-route\n", encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    config_mod._RAW_CONFIG_CACHE.clear()
+    calls = 0
+    original = config_mod.read_config_doc
+
+    def counted(path):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(config_mod, "read_config_doc", counted)
+    assert config_mod.load_config_readonly()["model"]["default"] == "aaaa-route"
+    _replace_pinning_mtime(config_file, "model:\n  default: bbbb-route\n")
+    assert config_mod.load_config_readonly()["model"]["default"] == "bbbb-route"
+    assert calls == 2

@@ -2280,14 +2280,16 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
 
         if user_sig is not None:
             try:
-                # Parse YAML once per file signature. Expansion below remains per-scope so secret
-                # values never enter the raw-document cache and scope changes stay observable.
-                raw_cached = _RAW_CONFIG_CACHE.get(path_key)
-                if raw_cached is not None and raw_cached[0] == user_sig:
-                    user_config = copy.deepcopy(raw_cached[1])
+                # ``user_sig`` is the same ``config_cache_version(config_path)`` used by
+                # read_raw_config(); keep both raw-read paths on one cache-entry shape. Expansion
+                # below remains per-scope so secret values never enter the raw-document cache.
+                cache_key = user_sig
+                raw_cached = _raw_config_cache_hit(path_key, cache_key)
+                if raw_cached is not None:
+                    user_config = copy.deepcopy(raw_cached)
                 else:
                     user_config = read_config_doc(config_path) or {}
-                    _RAW_CONFIG_CACHE[path_key] = (user_sig, copy.deepcopy(user_config))
+                    _raw_config_cache_store(path_key, cache_key, copy.deepcopy(user_config))
                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
                 if "max_turns" in user_config:
