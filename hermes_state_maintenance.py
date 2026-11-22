@@ -380,18 +380,38 @@ class SessionMaintenanceMixin:
         if dry_run or not count:
             return result
         archive.parent.mkdir(parents=True, exist_ok=True)
-        with gzip.open(archive, "at", encoding="utf-8") as out:
-            while True:
-                rows = self._read_all(
-                    f"SELECT * FROM messages WHERE {where} ORDER BY id LIMIT ?", (cutoff, batch_size))
-                if not rows:
-                    break
-                ids = [int(row["id"]) for row in rows]
-                for row in rows:
-                    out.write(json.dumps(dict(row), default=str, separators=(",", ":")) + "\\n")
-                self._execute_write(lambda conn, ids=ids: conn.execute(
-                    f"DELETE FROM messages WHERE id IN ({_placeholders(ids)})", ids).rowcount)
-                result["deleted"] += len(ids)
+        # A crash after the archive flush/fsync but before DELETE is safe: the next run
+        # recognizes the already-appended ids and deletes them without appending duplicates.
+        archived_ids = set()
+        if archive.exists():
+            with gzip.open(archive, "rt", encoding="utf-8") as existing:
+                for line in existing:
+                    try:
+                        archived_ids.add(int(json.loads(line)["id"]))
+                    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+                        continue
+        with archive.open("ab") as raw:
+            with gzip.GzipFile(fileobj=raw, mode="ab") as gz:
+                import io
+                out = io.TextIOWrapper(gz, encoding="utf-8")
+                while True:
+                    rows = self._read_all(  # type: ignore[attr-defined]
+                        f"SELECT * FROM messages WHERE {where} ORDER BY id LIMIT ?", (cutoff, batch_size))
+                    if not rows:
+                        break
+                    ids = [int(row["id"]) for row in rows]
+                    for row in rows:
+                        if int(row["id"]) not in archived_ids:
+                            out.write(json.dumps(dict(row), default=str, separators=(",", ":")) + "\\n")
+                            archived_ids.add(int(row["id"]))
+                    out.flush()
+                    gz.flush()
+                    os.fsync(raw.fileno())
+                    self._execute_write(  # type: ignore[attr-defined]
+                        lambda conn, ids=ids: conn.execute(
+                        f"DELETE FROM messages WHERE id IN ({_placeholders(ids)})", ids).rowcount)
+                    result["deleted"] += len(ids)
+                out.detach()
         return result
 
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,

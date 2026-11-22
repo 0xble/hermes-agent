@@ -171,7 +171,7 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
     _flag(sessions_export, "--force", help="md/qmd only: overwrite an existing export file")
 
     sessions_compacted = sessions_subparsers.add_parser(
-        "compact-history", help="Archive and delete inactive compacted message history")
+        "compact-history", help="Archive and delete inactive compacted message history (session_search recovery of deleted rows degrades)")
     sessions_compacted.add_argument("--older-than", default="14", metavar="AGE", help="Retention age in days")
     sessions_compacted.add_argument("--archive", type=Path, help="Gzip JSONL archive path")
     sessions_compacted.add_argument("--batch-size", type=int, default=500)
