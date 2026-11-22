@@ -164,29 +164,44 @@ def _skip_file(path: Path) -> bool:
     return any(p.search(path.name) for p in SKIP_FILE_PATTERNS)
 
 
-def _git_ignored(root: Path) -> set[Path]:
-    """Ignored/untracked-by-.gitignore paths (runner artifacts such as ``test_durations.json``)
-    are build products, not sources; a scan that reads them fails on whatever the last test
-    run wrote. Empty when *root* is not a git checkout."""
+def _git_ignored(root: Path) -> tuple[set[Path], set[Path]]:
+    """Return ignored files and directories without expanding ignored directories.
+
+    ``--directory`` makes Git report a wholly ignored directory as one ``dir/`` entry
+    instead of enumerating every artifact below it. Keeping those directory entries lets
+    ``iter_files`` prune them before ``os.walk`` descends into them.
+    """
     try:
         out = subprocess.run(
-            ["git", "-C", str(root), "ls-files", "--others", "--ignored", "--exclude-standard", "-z"],
+            ["git", "-C", str(root), "ls-files", "--others", "--ignored", "--exclude-standard", "--directory", "-z"],
             capture_output=True, text=True, check=True, stdin=subprocess.DEVNULL,
         ).stdout
     except (OSError, subprocess.CalledProcessError):
-        return set()
-    return {root / rel for rel in out.split("\0") if rel}
+        return set(), set()
+    ignored_files: set[Path] = set()
+    ignored_dirs: set[Path] = set()
+    for rel in out.split("\0"):
+        if not rel:
+            continue
+        if rel.endswith("/"):
+            ignored_dirs.add(root / rel.rstrip("/"))
+        else:
+            ignored_files.add(root / rel)
+    return ignored_files, ignored_dirs
 
 
 def iter_files(root: Path | None = None):
     root = (root or ROOT).resolve()
-    ignored = _git_ignored(root)
+    ignored, ignored_dirs = _git_ignored(root)
     for dirpath, dirnames, filenames in os.walk(root):
         here = Path(dirpath)
         rel_here = here.relative_to(root) if here != root else Path()
         excluded = SKIP_DIRS | (ROOT_SKIP_DIRS if here == root else set())
         dirnames[:] = sorted(
-            d for d in dirnames if d not in excluded and (rel_here / d) not in SKIP_REL_DIRS
+            d for d in dirnames
+            if d not in excluded
+            and (rel_here / d) not in SKIP_REL_DIRS
+            and (here / d) not in ignored_dirs
         )
         for filename in sorted(filenames):
             path = here / filename
