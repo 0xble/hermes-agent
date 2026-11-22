@@ -114,3 +114,36 @@ async def test_newly_due_roster_entry_is_seen_after_generation_change(monkeypatc
     store.generation = 2
     await run_checkins.poll_checkins(runner)
     assert reconciled == ["route-1", "route-2"]
+
+
+@pytest.mark.asyncio
+async def test_scope_grouping_rebuilds_when_multiplex_mode_flips(monkeypatch):
+    default = SessionSource(platform=Platform.TELEGRAM, chat_id="one", profile="default")
+    secondary = SessionSource(platform=Platform.TELEGRAM, chat_id="two", profile="secondary")
+    first = SimpleNamespace(session_key="route-1", session_id="session-1", suspended=False, origin=default)
+    second = SimpleNamespace(session_key="route-2", session_id="session-2", suspended=False, origin=secondary)
+
+    class Store:
+        entries = [first, second]
+        def list_sessions_since(self, previous):
+            return 1, None if previous == 1 else list(self.entries)
+
+    @asynccontextmanager
+    async def scope():
+        yield
+
+    store = Store()
+    config = SimpleNamespace(multiplex_profiles=False, profile_routes=[],
+                             _runtime_profile_homes=(("default", Path("default")), ("secondary", Path("secondary"))))
+    runner = SimpleNamespace(
+        config=config, session_store=store, _run_in_executor_with_context=asyncio.to_thread,
+        _restored_source=lambda entry: entry.origin, _resolve_profile_home_for_source=lambda source: Path(source.profile),
+        _async_profile_scope_for_source=lambda _source: scope(), _checkin_watch={}, _checkin_seen={},
+    )
+    monkeypatch.setattr(run_checkins.CheckinConfig, "load", classmethod(lambda cls: SimpleNamespace()))
+    monkeypatch.setattr(run_checkins, "reconcile_turn", AsyncMock())
+    await run_checkins.poll_checkins(runner)
+    assert set(runner._checkin_base_by_scope) == {None}
+    config.multiplex_profiles = True
+    await run_checkins.poll_checkins(runner)
+    assert set(runner._checkin_base_by_scope) == {Path("default"), Path("secondary")}

@@ -1,6 +1,7 @@
 """Focused tests for the cron jobs parse cache and no-op writer."""
 
 import json
+from pathlib import Path
 from unittest.mock import patch
 
 from cron import jobs
@@ -69,6 +70,40 @@ def test_save_jobs_document_skips_byte_identical_replace(tmp_path):
         assert replace.call_count == 0
         assert (after.st_ino, after.st_mtime_ns, after.st_size) == (
             before.st_ino, before.st_mtime_ns, before.st_size)
+
+
+def test_save_jobs_document_skip_leaves_load_stamp_unrefreshed(tmp_path):
+    with jobs.use_cron_store(tmp_path):
+        document = _document()
+        jobs.save_jobs_document(document)
+        sentinel = (1, 2, 3, 4)
+        with jobs._jobs_lock():
+            jobs._jobs_lock_state.load_stamp = sentinel
+            jobs._save_jobs_unlocked(document["jobs"], document=document)
+            assert jobs._jobs_lock_state.load_stamp == sentinel
+
+
+def test_skip_read_then_replace_does_not_serve_stale_cache(tmp_path):
+    with jobs.use_cron_store(tmp_path):
+        before = _document("before")
+        after = _document("after")
+        jobs.save_jobs_document(before)
+        path = tmp_path / "cron" / "jobs.json"
+        real_read_bytes = Path.read_bytes
+        replaced = False
+
+        def replace_after_read(file):
+            nonlocal replaced
+            payload = real_read_bytes(file)
+            if not replaced:
+                replaced = True
+                path.write_bytes(json.dumps(after, indent=2).encode())
+            return payload
+
+        with patch.object(Path, "read_bytes", replace_after_read):
+            with jobs._jobs_lock():
+                jobs._save_jobs_unlocked(before["jobs"], document=before)
+        assert jobs.load_jobs()[0]["id"] == "after"
 
 
 def test_changed_document_still_uses_atomic_replace(tmp_path):

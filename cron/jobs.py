@@ -1916,8 +1916,6 @@ def _save_jobs_unlocked(
                 current_bytes = None
             if current_bytes == payload_bytes:
                 current_stamp = _jobs_file_stamp(jobs_file)
-                _cache_jobs(jobs_file, current_stamp, jobs)
-                _record_load_stamp(current_stamp)
                 store_health.note_writable(jobs_file.parent)
                 if removed_ids:
                     _record_removed_jobs_unlocked(removed_ids)

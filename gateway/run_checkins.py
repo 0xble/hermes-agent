@@ -93,6 +93,21 @@ async def _group_routed_by_scope(runner, entries, scope_key):
     return by_scope
 
 
+def _checkin_scope_epoch(runner):
+    """Cheap generation for the inputs that can change a restored source's scope."""
+    config = getattr(runner, "config", None)
+    multiplex = bool(getattr(config, "multiplex_profiles", False))
+    routes = repr(getattr(config, "profile_routes", None))
+    if not multiplex:
+        return multiplex, routes
+    served = getattr(config, "_runtime_profile_homes", None)
+    if served is None:
+        served = ()
+    else:
+        served = tuple((str(name), str(home)) for name, home in served)
+    return multiplex, routes, served
+
+
 async def poll_checkins(runner):
     from gateway.run_turn import GatewayTurnMixin
 
@@ -113,9 +128,14 @@ async def poll_checkins(runner):
             lambda: roster_reader(previous_generation))
         if changed_entries is not None:
             runner._checkin_roster_entries = changed_entries
-            base_by_scope = await _group_routed_by_scope(runner, changed_entries, scope_key)
             runner._checkin_roster_generation = generation
+        entries = getattr(runner, "_checkin_roster_entries", ())
+        scope_epoch = _checkin_scope_epoch(runner)
+        cache_key = (generation, scope_epoch)
+        if getattr(runner, "_checkin_base_by_scope_key", None) != cache_key:
+            base_by_scope = await _group_routed_by_scope(runner, entries, scope_key)
             runner._checkin_base_by_scope = base_by_scope
+            runner._checkin_base_by_scope_key = cache_key
         else:
             base_by_scope = getattr(runner, "_checkin_base_by_scope", {})
     else:

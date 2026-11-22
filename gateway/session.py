@@ -594,6 +594,10 @@ class _RosterEntries(dict):
         self[key] = default
         return default
 
+    def __ior__(self, other):
+        self.update(other)
+        return self
+
 
 @dataclass
 class SessionEntry:
@@ -705,12 +709,13 @@ class SessionEntry:
     _route_version: int = field(default_factory=_route_versions.__next__, compare=False, repr=False)
     _roster_change: Any = field(default=None, init=False, compare=False, repr=False)
 
-    _ROSTER_FIELDS = frozenset(("session_key", "session_id", "origin", "updated_at", "suspended"))
+    _ROSTER_FIELDS = frozenset(("session_key", "session_id", "origin", "transport_profile", "updated_at", "suspended"))
 
     def __setattr__(self, name, value):
         old = getattr(self, name, None)
         object.__setattr__(self, name, value)
-        if name in self._ROSTER_FIELDS and old != value:
+        changed = old is not value if name == "origin" else old != value
+        if name in self._ROSTER_FIELDS and changed:
             callback = getattr(self, "_roster_change", None)
             if isinstance(callback, weakref.WeakMethod):
                 callback = callback()
@@ -725,7 +730,7 @@ class SessionEntry:
 
     def __setstate__(self, state):
         self.__dict__.update(state)
-    # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
+    # Fields (de)serialized verbatim, in wire order.
     _PLAIN_FIELDS = (
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
         "total_tokens", "last_prompt_tokens", "estimated_cost_usd", "cost_status",
@@ -1859,11 +1864,9 @@ class SessionStore(
     def list_sessions_since(
         self, generation: Optional[int] = None,
     ) -> tuple[int, Optional[list[SessionEntry]]]:
-        """Return a fresh roster copy only when its generation changed.
+        """Return a fresh roster copy only when its in-memory generation changed.
 
-        The external mirror is probed while taking the store lock, so another gateway's atomic
-        sessions.json replacement is folded in before an unchanged result is reported. ``None``
-        means the caller may safely reuse its prior roster; a list is always caller-owned.
+        ``None`` means the caller may safely reuse its prior roster; a list is always caller-owned.
         """
         with self._lock:
             self._ensure_loaded_locked()
@@ -1878,7 +1881,7 @@ class SessionStore(
                 return current, list(self._roster_snapshot)
 
     def roster_generation(self) -> int:
-        """Return the current routed-roster generation after external mirror reconciliation."""
+        """Return the current in-memory routed-roster generation."""
         with self._lock:
             self._ensure_loaded_locked()
             return self._roster_generation

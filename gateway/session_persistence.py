@@ -419,7 +419,6 @@ class SessionPersistenceMixin:
         """Legacy import: sessions.json fills only keys the DB lacks. Lock held. Returns how many
         mirror entries it skipped as retired routes."""
         from gateway.session import SessionEntry
-        self._legacy_import_ok = True
         sessions_file = self.sessions_dir / "sessions.json"
         retired = 0
         if not sessions_file.exists():
@@ -444,8 +443,8 @@ class SessionPersistenceMixin:
                             {'session_id': entry_data['session_id']})):
                         retired += 1
                         continue
-                    self._entries[key] = SessionEntry.from_dict(
-                        {**entry_data, "session_key": key})
+                    entries = getattr(self, "_entries")
+                    entries[key] = SessionEntry.from_dict(entry_data)
                     imported += 1
                 except (ValueError, KeyError, TypeError) as e:
                     logger.warning("Skipping invalid session entry %r: %s", key, e)
@@ -454,7 +453,6 @@ class SessionPersistenceMixin:
                     "gateway.session: imported %d legacy sessions.json entr%s missing from "
                     "state.db routing table", imported, "y" if imported == 1 else "ies")
         except Exception as e:
-            self._legacy_import_ok = False
             print(f"[gateway] Warning: Failed to load sessions: {e}")
         return retired
 
