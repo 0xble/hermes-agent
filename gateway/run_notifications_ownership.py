@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import sqlite3
+from functools import wraps
 from typing import Any, Optional, Sequence, cast
 
 from gateway.session import SessionEntry, SessionStore
@@ -27,6 +28,26 @@ logger = logging.getLogger("gateway.run")
 # turning one completion event into an unbounded run of sequential session reads. Exceeding it is
 # fail-closed, like every other unresolved provenance.
 _MAX_DELEGATE_PROVENANCE_HOPS = 16
+
+
+def owns_notice_work(deliver):
+    """Keep the existing consumer task visible while a detached notice awaits admission.
+
+    This is only physical liveness, not a delivery receipt: producer identities and
+    admissions still decide deduplication and ACKs. Nested delivery keeps its outer owner.
+    """
+    @wraps(deliver)
+    async def owned(runner, *args, **kwargs):
+        tasks = runner.__dict__.setdefault('_notice_delivery_tasks', set())
+        task = asyncio.current_task()
+        outer_owner = task in tasks
+        tasks.add(task)
+        try:
+            return await deliver(runner, *args, **kwargs)
+        finally:
+            if not outer_owner:
+                tasks.discard(task)
+    return owned
 
 
 class GatewayNotificationOwnershipMixin:

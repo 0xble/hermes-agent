@@ -8,6 +8,7 @@ import contextlib
 import dataclasses
 from typing import Optional
 
+from gateway.run_notifications_ownership import owns_notice_work
 
 logger = logging.getLogger('gateway.run')
 
@@ -608,6 +609,7 @@ class GatewayNotificationsMixin:
             getattr(self, attr).clear()
 
 
+    @owns_notice_work
     async def _enqueue_process_completion_notification(
         self, synth_text: str, evt: dict, *, session_busy: bool = False,
     ) -> Optional[bool]:

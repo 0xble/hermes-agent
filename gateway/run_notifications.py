@@ -1,8 +1,5 @@
 """Process/completion/update notifications, media delivery and async-delegation delivery for GatewayRunner.
-
-Split out of ``gateway/run.py``; bound onto ``GatewayRunner`` via the MRO.
-``gateway.run`` internals are imported lazily inside method bodies (import cycle),
-so ``patch("gateway.run.X")`` keeps intercepting them at call time.
+``gateway.run`` internals stay lazy for import cycles and facade patches.
 """
 
 from __future__ import annotations
@@ -35,7 +32,7 @@ from gateway.run_notifications_update import GatewayUpdateNotificationsMixin
 from gateway.run_notifications_ledger import (
     claim_off_loop, claim_siblings_off_loop, settle_durable_claim, settle_durable_claims,
 )
-from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin
+from gateway.run_notifications_ownership import GatewayNotificationOwnershipMixin, owns_notice_work
 from gateway.run_notifications_sources import GatewayProcessEventSourcesMixin, _raw_process_event_session_id
 from gateway.run_notifications_process import GatewayProcessNotificationsMixin
 from gateway.watch_match_coalesce import coalesce_pending_watch_matches
@@ -536,7 +533,6 @@ class GatewayNotificationsMixin(
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
         return delivered_any
 
-
     async def _deliver_queued_first_response(
         self, response: str, source: SessionSource, adapter,
         metadata: Optional[dict[str, Any]] = None, event_message_id: Optional[str] = None,
@@ -895,6 +891,7 @@ class GatewayNotificationsMixin(
         except (OSError, ValueError, TypeError, AttributeError):
             pass
         return "✅ Update Complete", "Hermes update finished successfully."
+
     @staticmethod
     def _read_update_output_since(path: Path, offset: int) -> tuple[bytes, int]:
         """Keep the original bytes: a replacement character cannot reconstruct its file offset."""
@@ -1527,44 +1524,6 @@ class GatewayNotificationsMixin(
                     platform, home, transport, message, "state.db warning notification failed for %s:%s: %s"),
                 platform=platform)
 
-    async def _drain_watch_notifications(self, completion_queue) -> None:
-        """Consume watches in their owning profile, backing off refusals even during drain."""
-        from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
-        watch_events = coalesce_pending_watch_matches(_drain_gateway_watch_events(completion_queue))
-        for evt in watch_events:
-            next_retry_at = evt.get("_watch_next_retry_at")
-            draining = getattr(self, "_draining", False)
-            drain_offered = evt.pop("_watch_drain_offered", False)
-            if draining:
-                evt["_watch_drain_offered"] = True
-            # Offer a held event once per drain for spooling, not on every refused tick.
-            if (next_retry_at is not None and next_retry_at > time.monotonic()
-                    and (not draining or drain_offered)):
-                # Refused injections back off to a later drain tick, not every 2 s (#140899).
-                completion_queue.put(evt)
-                continue
-            async with self._completion_event_scope(evt):
-                from tools.process_registry_notifications import should_surface_notification
-                if not should_surface_notification(evt):
-                    continue
-                if self._load_background_notifications_mode() == "off":
-                    continue
-                if evt.get("type") == "heartbeat":
-                    from gateway.session_automation import deliver_heartbeat
-                    delivered = await deliver_heartbeat(self, evt)
-                else:
-                    synth_text = _format_gateway_process_notification(evt)
-                    if not synth_text:
-                        continue
-                    try:
-                        delivered = await self._inject_watch_notification(synth_text, evt)
-                    except Exception:
-                        logger.exception("Watch notification injection error")
-                        delivered = False
-            # The original event: a requeued tick folds again from what is still queued.
-            if delivered is False:
-                self._requeue_refused_watch_event(completion_queue, evt)
-
     @staticmethod
     def _requeue_refused_watch_event(completion_queue, evt: dict) -> None:
         """Retry a refused watch event on a bounded backoff, never on every 2 s tick (#140899).
@@ -1941,6 +1900,46 @@ class GatewayNotificationsMixin(
     # Ledger transitions write state.db: run them off the loop (see ``gateway.run_notifications_ledger``).
     _settle_durable_claim = staticmethod(settle_durable_claim)
 
+    @owns_notice_work
+    async def _drain_watch_notifications(self, completion_queue) -> None:
+        """Consume watches in their owning profile, backing off refusals even during drain."""
+        from gateway.run import _drain_gateway_watch_events, _format_gateway_process_notification
+        watch_events = coalesce_pending_watch_matches(_drain_gateway_watch_events(completion_queue))
+        for evt in watch_events:
+            next_retry_at = evt.get("_watch_next_retry_at")
+            draining = getattr(self, "_draining", False)
+            drain_offered = evt.pop("_watch_drain_offered", False)
+            if draining:
+                evt["_watch_drain_offered"] = True
+            # Offer a held event once per drain for spooling, not on every refused tick.
+            if (next_retry_at is not None and next_retry_at > time.monotonic()
+                    and (not draining or drain_offered)):
+                # Backoff between refused injections: hold the event for a later drain tick
+                # instead of re-attempting admission every 2 s (#140899).
+                completion_queue.put(evt)
+                continue
+            async with self._completion_event_scope(evt):
+                from tools.process_registry_notifications import should_surface_notification
+                if not should_surface_notification(evt):
+                    continue
+                if self._load_background_notifications_mode() == "off":
+                    continue
+                if evt.get("type") == "heartbeat":
+                    from gateway.session_automation import deliver_heartbeat
+                    delivered = await deliver_heartbeat(self, evt)
+                else:
+                    synth_text = _format_gateway_process_notification(evt)
+                    if not synth_text:
+                        continue
+                    try:
+                        delivered = await self._inject_watch_notification(synth_text, evt)
+                    except Exception:
+                        logger.exception("Watch notification injection error")
+                        delivered = False
+            # The original event: a requeued tick folds again from what is still queued.
+            if delivered is False:
+                self._requeue_refused_watch_event(completion_queue, evt)
+
     @staticmethod
     def _back_off_refused_completions(group: list[dict]) -> None:
         """Space out an undelivered async group's retries instead of re-offering it every 2 s pass.
@@ -2074,146 +2073,3 @@ class GatewayNotificationsMixin(
             log_message="Live process watcher arming failed",
         )
         return future is not None
-
-    async def _run_process_watcher(self, watcher: dict) -> None:
-        """Run :meth:`_watch_process` inside the owning profile's scope, start to finish. A watcher starts
-        in an empty context (live-armed from a tool thread, or recovered at startup), and the output it
-        prepares runs that profile's own ``transform_terminal_output`` hooks before any delivery."""
-        async with self._completion_event_scope(watcher):
-            await self._watch_process(watcher)
-
-    async def _process_completion_committed(self, completion_evt: dict, session_id: str) -> bool:
-        """Recheck a possibly lost admission ACK before falling back to a plain notice."""
-        if (getattr(self, 'session_authority', None) is not None
-                and self._completion_delivery_identity(completion_evt) is not None):
-            from gateway.session_automation import completion_admission
-            try:
-                # The owning profile's authority, as on the delivery path.
-                async with self._completion_event_scope(completion_evt):
-                    committed = await asyncio.to_thread(completion_admission, self, completion_evt) is not None
-            except Exception:
-                # Failing open sends the notice; a dead watcher would send nothing.
-                logger.debug("Process watcher: admission recheck failed for %s", session_id,
-                             exc_info=True)
-                committed = False
-            return committed
-        return False
-
-    async def _watch_process(self, watcher: dict) -> None:
-        """Poll a background process and push updates until it exits. Mode
-        (``display.background_process_notifications``): concise (default one-liner; failures append
-        the output tail) / all (running updates + final raw) / result (final raw) / error (final raw
-        if exit != 0) / off."""
-        from tools.process_registry import process_registry
-        from tools.process_registry_notifications import acknowledge_survivor_notifications, format_process_notification
-        from tools.process_registry_survival import is_restart_safe
-        session_id = watcher["session_id"]
-        interval = watcher["check_interval"]
-        platform_name = watcher.get("platform", "")
-        chat_id = watcher.get("chat_id", "")
-        thread_id = watcher.get("thread_id", "")
-        agent_notify = watcher.get("notify_on_complete", False)
-        notify_mode = self._load_background_notifications_mode()  # the owning profile's (scope bound above)
-        logger.debug("Process watcher started: %s (every %ss, notify=%s, agent_notify=%s)",
-                      session_id, interval, notify_mode, agent_notify)
-        # Off hides public receipts, not an explicitly requested messaging wake.
-        silent = notify_mode == "off" and (not agent_notify or platform_name == Platform.LOCAL.value)
-        last_output_len = 0
-        busy_receipt_sent = False
-        text_retry_interval = min(max(interval, 1.0), 30.0)
-        completion_attempts = 0
-        retry_interval = interval
-        while True:
-            await asyncio.sleep(retry_interval)
-            # A finished process falls back to retained results, whose ownership check reads state.db.
-            session = await asyncio.to_thread(process_registry.get, session_id)
-            if session is None:
-                break
-            # A retiring topic or a subagent handoff can transfer a live process. Its mutable
-            # registry route is authoritative, not this watcher's launch-time snapshot.
-            if self._follow_process_route(watcher, session):
-                platform_name = watcher.get("platform", "")
-                chat_id, thread_id = watcher.get("chat_id", ""), watcher.get("thread_id", "")
-            surface = await self._process_watcher_surface(watcher, session, silent, session_id)
-            if surface is None:
-                break
-            if not surface:
-                continue
-            current_output_len = len(session.output_buffer)
-            has_new_output = current_output_len > last_output_len
-            last_output_len = current_output_len
-            if session.exited:
-                from tools.process_registry_notifications import process_exit_unknown
-                non_success = session.exit_code != 0 or process_exit_unknown(
-                    session.exit_code, getattr(session, "completion_reason", ""),
-                    getattr(session, "termination_source", ""))
-                # Durable delivery suppresses replay, not a consumer's render/wait/log snapshot.
-                # Claim before admission; while a live peer gateway holds the claim, wait so
-                # this watcher can reclaim the completion if that peer dies before delivering.
-                if is_restart_safe(session) and not process_registry._claim_survivor_delivery(session):
-                    if process_registry._survivor_delivery_pending(session):
-                        continue
-                    break
-                # Agent-notify: inject a synthetic message unless the agent already consumed the result via
-                # wait/log (poll() is read-only and deliberately does NOT mark consumed).
-                if agent_notify and not process_registry.is_completion_consumed(session_id):
-                    completion_evt = self._build_process_completion_event(watcher, session, session_id)
-                    synth_text = format_process_notification(completion_evt)
-                    if not synth_text:
-                        break
-                    # Captured before injection: afterwards the key is busy either way (the injected
-                    # turn itself installs the guard).
-                    turn_busy = await self._launching_turn_active(platform_name, watcher)
-                    delivery = asyncio.ensure_future(self._enqueue_process_completion_notification(
-                        synth_text, completion_evt, session_busy=turn_busy,
-                    ))
-                    # The agent normally reports the result itself, so the chat gets no separate receipt.
-                    # While the launching turn is still running the agent hears of it only later (a
-                    # queued follow-up, or a held fan-in batch), and the chat would stay mute that long
-                    # (#112033): send the concise receipt now, once, without waiting for the wake.
-                    if turn_busy and not busy_receipt_sent and (notify_mode in {"concise", "all", "result"} or (
-                        notify_mode == "error" and non_success
-                    )):
-                        busy_receipt_sent = True
-                        message_text = self._format_process_final_message(session_id, session, "concise")
-                        await self._send_watcher_message(platform_name, chat_id, thread_id, message_text, watcher)
-                    admitted = await delivery
-                    if admitted is not False:
-                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
-                        break
-                    # A refusal may clear (adapter reconnecting, store draining), so retry with backoff
-                    # for a few minutes, then fall through to the plain notice instead of dropping it.
-                    completion_attempts += 1
-                    if completion_attempts < _MAX_COMPLETION_INJECTION_ATTEMPTS:
-                        # The process remains terminal; only this claim owner may return it to pending.
-                        if is_restart_safe(session):
-                            process_registry.release_survivor_completion(session_id)
-                        retry_interval = jittered_backoff(
-                            completion_attempts, base_delay=max(interval, 1) * 2,
-                            max_delay=_COMPLETION_INJECTION_RETRY_MAX_DELAY, jitter_ratio=0.0)
-                        continue
-                    if await self._process_completion_committed(completion_evt, session_id):
-                        # The last refusal was a lost ACK: the turn is committed.
-                        await asyncio.to_thread(acknowledge_survivor_notifications, process_registry, ((completion_evt, synth_text),))
-                        break
-                    logger.warning(
-                        "Process watcher: completion for %s was refused %d times; falling back to the "
-                        "notify_mode=%s notice", session_id, completion_attempts, notify_mode,
-                    )
-                if not await self._finish_process_text_notification(
-                    session_id, session, notify_mode, non_success, watcher,
-                    route=(platform_name, chat_id, thread_id),
-                ):
-                    # Keep one offer alive until shutdown cancels the watcher, even if
-                    # transport recovery takes hours. A capped scalar bounds retry state.
-                    interval = retry_interval = text_retry_interval
-                    text_retry_interval = min(text_retry_interval * 2, 15 * 60.0)
-                    continue
-                break
-            elif has_new_output and notify_mode == "all" and not agent_notify:
-                # New output — deliver a status update (only in "all" mode; agent_notify watchers
-                # only care about completion).
-                await self._send_watcher_message(
-                    platform_name, chat_id, thread_id, self._format_process_running_message(session), watcher,
-                )
-        logger.debug("Process watcher ended%s: %s", " (silent)" if silent else "", session_id)
