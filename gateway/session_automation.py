@@ -1046,7 +1046,8 @@ async def reset_and_rehome_messages(runner, session_key, old_session_id):
     move) starts a turn there against stale state; ``release()`` then schedules its FIFO."""
     from gateway.session_authorities import active_authority
     authority = active_authority(runner)
-    old = SessionRef(authority.profile_id, authority.logical_owner(old_session_id)) if authority else None
+    profile_id = getattr(authority, 'profile_id', 'default')
+    old = SessionRef(profile_id, authority.logical_owner(old_session_id)) if authority else None
     live = authority.sessions.get(old.session_id) if old and old_session_id else None
     local = _local_owner(authority, session_key) if authority else None
     if local is not None:

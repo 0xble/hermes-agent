@@ -114,19 +114,11 @@ async def _wait_for_serial_inputs(adapter, *, except_burst=None):
 
 
 async def burst_gate(adapter, event, session_key):
-    """Entry gate for shared-runtime input and serial lifecycle commands."""
+    """Queue shared-runtime input behind an existing burst; wait for commits before a serial command."""
     if adapter._shared_runtime_owns_input(event):
         return holds_busy_burst(adapter, session_key)
-    if (cmd := event.get_command()) and _serial(adapter):
-        from hermes_cli.commands import is_interrupt_then_dispatch
-        if is_interrupt_then_dispatch(cmd):
-            discard_busy_burst(adapter, session_key)
-        for key, burst in list(adapter.__dict__.get('_shared_bursts', {}).items()):
-            _flush(adapter, key, burst)
-        if pending := list(adapter.__dict__.get('_shared_burst_commits', {}).values()):
-            await asyncio.wait(pending)
-        if held := list(adapter.__dict__.get('_uncommitted_inputs', ())):
-            await asyncio.wait(held)
+    if event.get_command() and _serial(adapter):
+        await _wait_for_serial_inputs(adapter)
     return False
 
 
