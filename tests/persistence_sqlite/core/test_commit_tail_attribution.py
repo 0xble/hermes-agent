@@ -9,7 +9,7 @@ import hermes_state
 import hermes_state_runtime as rt
 from hermes_state import SessionDB
 from tests.fakes.runtime_owner import begin_runtime_epoch
-from tests.hermes_state.test_transcript_write_diagnostics import _Clock, _Connection, _warnings
+from tests.persistence_sqlite.core.test_transcript_write_diagnostics import _Clock, _Connection, _warnings
 
 
 @pytest.mark.parametrize("worker", [False, True])

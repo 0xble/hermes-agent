@@ -425,7 +425,7 @@ def format_session_db_unavailable(
             f"{prefix}. {_SESSION_DB_CONSEQUENCE} Run `hermes {profile_arg}doctor` to check the "
             "storage location."
         )
-    from hermes_state_user_copy import describe_storage_failure
+    from storage_user_copy import describe_storage_failure
     failure = describe_storage_failure(cause)
     gloss, action, hint = failure.gloss, failure.action, ""
     if any(m in cause.lower() for m in _WAL_INCOMPAT_MARKERS):
@@ -435,7 +435,7 @@ def format_session_db_unavailable(
             hint = _NETWORK_DRIVE_HINT
     text = f"{prefix}: {gloss}. {_SESSION_DB_CONSEQUENCE} {action}{hint}"
     if details:
-        from hermes_state_user_copy import storage_failure_details
+        from storage_user_copy import storage_failure_details
         text += f"\nDetails: {storage_failure_details(cause)}"
     return text
 

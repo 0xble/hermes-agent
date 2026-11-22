@@ -25,7 +25,7 @@ from hermes_state_compaction_display import later_tool_copy_ids, not_a_later_too
 from hermes_state_detached_results import SessionDetachedResultsMixin
 from hermes_state_todo import SessionTodoResultMixin
 from hermes_state_display_kind import SessionDisplayKindMixin
-from hermes_state_identity import (
+from persistence.sqlite.conversation._store.identity import (
     _absorbed_uids_json, _compaction_messages, _newest_message_uid_rows, _restore_identity_columns,
     _stable_tool_key, _tool_call_uid_map, _tool_call_uid_or_none, _tool_call_uids_json, _uid_list, display_identity)
 from hermes_state_transactions import execute_transcript_write
