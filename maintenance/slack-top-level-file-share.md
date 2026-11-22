@@ -6,10 +6,11 @@ Fork patch identity: `slack-top-level-file-share`.
 
 ## Contract
 
-Slack may deliver a top-level DM's document through `file_shared` and `files.info` without putting
-the file in the preceding `message.files` event. The fallback must dispatch every file type, retain a
-`[file: name (mime)]` marker, and surface a visible attachment notice when metadata or download
-fails. A normal message that already included the file must not be dispatched twice.
+Slack may deliver a top-level DM's document through `message.files`, including a
+`file_access: check_file_info` stub, or through the `file_shared` fallback. The message path resolves
+stubs before dispatch, caches documents larger than the outbound bot-upload limit, retains a
+`[file: name (mime)]` marker, and surfaces a visible attachment notice when metadata or download
+fails. A normal message and its `file_shared` event must not dispatch twice.
 
 `dm_top_level_threads_as_sessions` remains a session-keying choice. This patch does not change its
 value or interpretation.
@@ -27,9 +28,9 @@ transport or session path.
 ## Ownership And Verification
 
 The owner is `SlackAdapter._handle_slack_file_shared` and the inbound media collector in
-`plugins/platforms/slack/adapter.py`. The contract tests live in
-`tests/gateway/test_slack.py` and cover rolling and per-thread DM modes, including a text event
-followed by a separate PDF `file_shared` event.
+`plugins/platforms/slack/adapter.py`. Contract tests live only in
+`tests/gateway/test_slack_top_level_file_share.py`, covering rolling and per-thread DM modes,
+message-file stubs, visible failures, both event orders, real timestamps, and bot-upload exclusion.
 
 Contract tests: `tests/gateway/test_slack_top_level_file_share.py`.
 

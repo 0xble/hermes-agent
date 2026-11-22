@@ -3803,6 +3803,10 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         file_id = event.get("file_id") or (event.get("file") or {}).get("id") or ""
         if not channel_id or not file_id:
             return
+        sender_id = event.get("user_id") or event.get("user") or ""
+        if self._is_own_bot_user(sender_id):
+            logger.debug("[Slack] Ignoring file_shared for the bot's own upload: %s", file_id)
+            return
         if self._file_was_processed(file_id):
             return
         team_id = self._event_team_id(event, body)
@@ -3818,8 +3822,8 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 "channel": channel_id,
                 "channel_type": "im" if channel_id.startswith("D") else "channel",
                 "team": team_id,
-                "ts": f"{event_ts}:file:{file_id}" if event_ts else f"file:{file_id}",
-                "files": [file_obj],
+                "ts": event_ts or f"file:{file_id}",
+                "files": [{**file_obj, "file_access": "unavailable"}],
             })
 
         try:
@@ -3847,6 +3851,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             })
             return
         file_obj = info_resp.get("file") or {}
+        if self._is_own_bot_user(file_obj.get("user") or ""):
+            logger.debug("[Slack] Ignoring file_shared for the bot's own upload: %s", file_id)
+            return
         share = self._first_file_share(file_obj, channel_id)
         ts = share.get("ts") or event.get("event_ts") or ""
         thread_ts = share.get("thread_ts") or ""
@@ -3858,16 +3865,15 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         fallback_event = {
             "type": "message",
             "subtype": "file_share",
-            # Keep the attachment visible even if its download fails or Slack omits
-            # size metadata needed by the document cache.
+            # Keep the attachment visible even if its download fails.
             "text": _slack_file_marker(file_obj),
             "user": event.get("user_id") or file_obj.get("user", ""),
             "channel": channel_id,
             "channel_type": "im" if channel_id.startswith("D") else "channel",
             "team": team_id,
-            # Use a synthetic event id so a preceding text-only message with the
-            # same Slack timestamp does not deduplicate the attachment turn.
-            "ts": f"{ts}:file:{file_id}" if ts else f"file:{file_id}",
+            # Keep Slack's share timestamp as the message identity and reply anchor.
+            # ``file:<id>`` is used only by the internal dedup cache.
+            "ts": ts or f"file:{file_id}",
             "files": [file_obj]}
         if thread_ts and thread_ts != ts:
             fallback_event["thread_ts"] = thread_ts
@@ -4234,9 +4240,19 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         turn from a mid-flight unfurl); if THIS call newly claimed it and raises, release the claim
         so a retry/edit can re-drive it. Pre-existing claims stay."""
         _ts = str((event or {}).get("ts") or "")
+        _file_ids = {
+            str(file_obj.get("id"))
+            for file_obj in (event or {}).get("files") or []
+            if isinstance(file_obj, dict) and file_obj.get("id")
+        }
         # getattr: bare test doubles (object.__new__) may lack the map.
         _claims = getattr(self, "_processed_message_ts", None)
         _was_claimed = bool(_ts) and _claims is not None and _ts in _claims
+        _was_file_claimed = {
+            file_id
+            for file_id in _file_ids
+            if _claims is not None and f"file:{file_id}" in _claims
+        }
         try:
             return await self._handle_slack_message_impl(event, payload)
         except BaseException:
@@ -4246,6 +4262,10 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 logger.warning(
                     "[%s] handler failed after claiming ts=%s; claim released "
                     "so a retry or edit can re-drive the turn", self.name, _ts)
+            for file_id in _file_ids:
+                file_key = f"file:{file_id}"
+                if file_id not in _was_file_claimed and _claims is not None and file_key in _claims:
+                    _claims.pop(file_key, None)
             raise
 
     async def _drop_bot_sender(self, event: dict) -> bool:
@@ -4556,6 +4576,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         except Exception as e:
             if notices is not None:
                 detail = self._describe_slack_api_error(getattr(e, "response", None), file_obj=f)
+                detail = detail or (
+                    f"Slack attachment {_attachment_label(f)} could not be resolved via files.info. "
+                    "The file contents are unavailable.")
                 self._note_attachment_failure(
                     notices, detail, "[Slack] files.info error for %s: %s", file_id, e, exc_info=True
                 )
@@ -4564,6 +4587,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             return info_resp["file"]
         if notices is not None:
             detail = self._describe_slack_api_error(info_resp, file_obj=f)
+            detail = detail or (
+                f"Slack attachment {_attachment_label(f)} could not be resolved via files.info. "
+                "The file contents are unavailable.")
             self._note_attachment_failure(
                 notices, detail, "[Slack] files.info failed for %s: %s", file_id,
                 info_resp.get("error"))
@@ -4613,16 +4639,17 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         self, f: dict[str, Any], url: str, mimetype: str, team_id: str
     ) -> Optional[tuple[str, str, str]]:
         """Document branch of :meth:`_cache_slack_file`: any extension is accepted (authorization
-        is the gate); Slack's bot upload cap is 20 MB; small text-like files are injected."""
+        is the gate); small text-like files are injected."""
         original_filename = f.get("name", "")
         ext = os.path.splitext(original_filename)[1].lower() if original_filename else ""
         if not ext and mimetype:
             mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
             ext = mime_to_ext.get(mimetype, "")
-        # Any extension accepted (authorization is the gate); Slack bot upload cap is 20 MB.
+        # Slack's outbound bot upload limit does not cap inbound files. Keep larger documents
+        # available to the agent when the Slack file metadata and download are valid.
         file_size = f.get("size", 0)
-        if not file_size or file_size > 20 * 1024 * 1024:
-            logger.warning("[Slack] Document too large or unknown size: %s", file_size)
+        if file_size and file_size < 0:
+            logger.warning("[Slack] Document has invalid size metadata: %s", file_size)
             return None
         raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id)
         cached_path = await cache_document_from_bytes_async(
@@ -4654,13 +4681,21 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         media_text_inlined: list[bool] = [False] * len(media_urls)
         notices: list[str] = []
         for f in event.get("files", []):
-            if f.get("file_access") == "check_file_info":
+            if not isinstance(f, dict):
+                continue
+            marker = _slack_file_marker(f)
+            url = f.get("url_private_download") or f.get("url_private", "")
+            needs_file_info = f.get("file_access") == "check_file_info" or (
+                not url and f.get("id") and f.get("file_access") != "unavailable")
+            if needs_file_info:
                 f = await self._resolve_file_stub(f, channel_id, team_id, notices)
                 if f is None:
+                    notices.append(marker)
                     continue
             mimetype = f.get("mimetype", "unknown")
             url = f.get("url_private_download") or f.get("url_private", "")
             if not url:
+                notices.append(marker)
                 notices.append(
                     f"Slack attachment {_attachment_label(f)} could not be downloaded because "
                     "Slack did not provide a download URL.")
@@ -4669,9 +4704,10 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             try:
                 cached = await self._cache_slack_file(kind, f, url, mimetype, team_id)
                 if cached is None:
+                    notices.append(marker)
                     notices.append(
                         f"Slack attachment {_attachment_label(f)} was not cached because its "
-                        "size is missing or exceeds Slack's 20 MB limit.")
+                        "metadata is invalid.")
                     continue
                 cached_path, media_type, injection = cached
                 media_urls.append(cached_path)
@@ -4684,6 +4720,7 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 detail = detail or (
                     f"Slack attachment {_attachment_label(f)} could not be downloaded. "
                     "The file is still identified above, but its contents are unavailable.")
+                notices.append(marker)
                 self._note_attachment_failure(
                     notices, detail,
                     f"[Slack] Failed to cache {kind} from %s: %s", url, e, exc_info=True)
