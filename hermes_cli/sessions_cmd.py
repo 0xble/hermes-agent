@@ -658,6 +658,18 @@ def _export_markdown_single(db, args, export_one, output_dir, lineage_is_logical
 
 # -- delete / prune / archive -------------------------------------------------
 
+def _cmd_compact_history(db, args):
+    try:
+        days = float(args.older_than)
+    except (TypeError, ValueError):
+        print("Error: --older-than must be a number of days")
+        return 1
+    result = db.compacted_history_retention(days, archive_path=args.archive,
+                                            dry_run=args.dry_run, batch_size=args.batch_size)
+    print(json.dumps(result, sort_keys=True))
+    return 0
+
+
 def _cmd_delete(db, args):
     resolved_session_id = db.resolve_session_id(args.session_id)
     if not resolved_session_id:
@@ -1450,12 +1462,12 @@ _PRE_DB_HANDLERS = {
 }
 _OBSERVATIONAL_DB_ACTIONS = frozenset({"list", "stats", "pinned"})
 _DB_HANDLERS = {
-    "list": _cmd_list, "export": _cmd_export, "delete": _cmd_delete, "rename": _cmd_rename, "pinned": _cmd_pinned,
+    "list": _cmd_list, "export": _cmd_export, "delete": _cmd_delete, "compact-history": _cmd_compact_history, "rename": _cmd_rename, "pinned": _cmd_pinned,
     "prune": partial(_cmd_prune_or_archive, action="prune"), "pin": partial(_cmd_pin, pinning=True),
     "archive": partial(_cmd_prune_or_archive, action="archive"), "unpin": partial(_cmd_pin, pinning=False),
     "retitle-skills": _cmd_retitle_skills, "browse": _cmd_browse, "optimize": _cmd_optimize,
     "clean-markers": _cmd_clean_markers, "optimize-storage": _cmd_optimize_storage,
-    "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "stats": _cmd_stats,
+    "repair-routing": _cmd_repair_routing, "repair-prompts": _cmd_repair_prompts, "compact-history": _cmd_compact_history, "stats": _cmd_stats,
     "refresh-prompts": _cmd_refresh_prompts,
 }
 

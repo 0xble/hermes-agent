@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import gzip
+import json
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Tuple
@@ -359,6 +362,38 @@ class SessionMaintenanceMixin:
                 groups.setdefault(local_conversation_ids(conn, sid)[0], []).append(sid)
         return list(groups.values())
 
+    def compacted_history_retention(self, older_than_days: float = 14, archive_path: Optional[Path] = None,
+                                    dry_run: bool = False, batch_size: int = 500) -> dict:
+        """Archive and remove superseded message rows without touching active history.
+
+        The archive is JSONL gzip so it remains recoverable without SQLite. Deletes are
+        bounded transactions and use the normal DELETE triggers, keeping FTS in sync.
+        """
+        if older_than_days < 0 or batch_size < 1:
+            raise ValueError("older_than_days must be non-negative and batch_size must be positive")
+        cutoff = time.time() - older_than_days * 86400.0
+        archive = Path(archive_path or (Path(os.environ.get("HERMES_ARCHIVE_DIR", "/Volumes/Hermes Archive")).expanduser() / "compacted-history.jsonl.gz"))
+        where = "active = 0 AND timestamp < ?"
+        count, bytes_est = self._read_one(
+            f"SELECT COUNT(*), COALESCE(SUM(length(COALESCE(content, ''))), 0) FROM messages WHERE {where}", (cutoff,))
+        result = {"rows": int(count), "estimated_bytes": int(bytes_est), "archive": str(archive), "deleted": 0}
+        if dry_run or not count:
+            return result
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(archive, "at", encoding="utf-8") as out:
+            while True:
+                rows = self._read_all(
+                    f"SELECT * FROM messages WHERE {where} ORDER BY id LIMIT ?", (cutoff, batch_size))
+                if not rows:
+                    break
+                ids = [int(row["id"]) for row in rows]
+                for row in rows:
+                    out.write(json.dumps(dict(row), default=str, separators=(",", ":")) + "\\n")
+                self._execute_write(lambda conn, ids=ids: conn.execute(
+                    f"DELETE FROM messages WHERE id IN ({_placeholders(ids)})", ids).rowcount)
+                result["deleted"] += len(ids)
+        return result
+
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,
                        sessions_dir: Optional[Path] = None, exclude_active_write_guards: bool = False,
                        deleted_ids: Optional[list] = None, within_deletion_window: bool = False,
@@ -383,12 +418,13 @@ class SessionMaintenanceMixin:
         from hermes_state_prune_budget import PruneBudget, PruneBudgetExpired, PruneWriteContended, prune_budget
         from hermes_state_transactions import finish_prune_maintenance
         removed_ids = []
+        db_path: Path = getattr(self, "db_path")
         budget = PruneBudget(
-            within_deletion_window, max_seconds, db_path=self.db_path,
+            within_deletion_window, max_seconds, db_path=db_path,
             window_already_admitted=within_deletion_window,
         )
         try:
-            with prune_pass(self.db_path), prune_budget(budget):
+            with prune_pass(db_path), prune_budget(budget):
                 result = self._prune_sessions_pass(older_than_days, source, sessions_dir, exclude_active_write_guards,
                                                    removed_ids, within_deletion_window, filters)
                 finish_prune_maintenance(self)

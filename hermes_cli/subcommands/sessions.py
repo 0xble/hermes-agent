@@ -170,6 +170,14 @@ def build_sessions_parser(subparsers, *, cmd_sessions: Callable) -> None:
         help="md/qmd only: after verified single-session export, delete that session (needs --yes)")
     _flag(sessions_export, "--force", help="md/qmd only: overwrite an existing export file")
 
+    sessions_compacted = sessions_subparsers.add_parser(
+        "compact-history", help="Archive and delete inactive compacted message history")
+    sessions_compacted.add_argument("--older-than", default="14", metavar="AGE", help="Retention age in days")
+    sessions_compacted.add_argument("--archive", type=Path, help="Gzip JSONL archive path")
+    sessions_compacted.add_argument("--batch-size", type=int, default=500)
+    add_yes_flag(sessions_compacted, "Skip confirmation")
+    _flag(sessions_compacted, "--dry-run", help="Report rows and estimated bytes without changing anything")
+
     sessions_delete = sessions_subparsers.add_parser("delete", help="Delete a specific session")
     sessions_delete.add_argument("session_id", help="Session ID to delete")
     add_yes_flag(sessions_delete, "Skip confirmation")
