@@ -429,6 +429,11 @@ class SessionPersistenceMixin:
                 if self._routing_db is not None and route_retired(
                         self._routing_db, key, json.dumps({"session_id": entry_data.get("session_id")})):
                     continue
+                # The mapping key is authoritative. Legacy writers occasionally left the
+                # embedded session_key copied from another route, which otherwise makes the
+                # newly imported entry disappear from roster-key consumers.
+                entry_data = dict(entry_data)
+                entry_data["session_key"] = key
                 entries[key] = SessionEntry.from_dict(entry_data)
                 legacy_keys.add(key)
             for key in list(legacy_keys - mirror_keys):
@@ -497,7 +502,8 @@ class SessionPersistenceMixin:
                             {'session_id': entry_data['session_id']})):
                         retired += 1
                         continue
-                    self._entries[key] = SessionEntry.from_dict(entry_data)
+                    self._entries[key] = SessionEntry.from_dict(
+                        {**entry_data, "session_key": key})
                     getattr(self, "_legacy_session_keys", set()).add(key)
                     imported += 1
                 except (ValueError, KeyError, TypeError) as e:

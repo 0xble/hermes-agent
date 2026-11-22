@@ -14,7 +14,7 @@ def _document(job_id="job-1"):
 
 
 def test_load_jobs_reuses_mtime_cache_and_returns_safe_snapshots(tmp_path):
-    with jobs.use_cron_store(tmp_path / "cron"):
+    with jobs.use_cron_store(tmp_path):
         jobs.save_jobs_document(_document())
         jobs._invalidate_jobs_cache()
         with patch.object(jobs, "_parse_jobs_file", wraps=jobs._parse_jobs_file) as parse:
@@ -26,7 +26,7 @@ def test_load_jobs_reuses_mtime_cache_and_returns_safe_snapshots(tmp_path):
 
 
 def test_load_jobs_cache_invalidates_on_external_rewrite(tmp_path):
-    with jobs.use_cron_store(tmp_path / "cron"):
+    with jobs.use_cron_store(tmp_path):
         jobs.save_jobs_document(_document("before"))
         assert jobs.load_jobs()[0]["id"] == "before"
         path = tmp_path / "cron" / "jobs.json"
@@ -44,7 +44,7 @@ def test_load_jobs_cache_isolated_between_cron_stores(tmp_path):
 
 
 def test_save_jobs_document_skips_byte_identical_replace(tmp_path):
-    with jobs.use_cron_store(tmp_path / "cron"):
+    with jobs.use_cron_store(tmp_path):
         document = _document()
         jobs.save_jobs_document(document)
         path = tmp_path / "cron" / "jobs.json"
@@ -58,7 +58,7 @@ def test_save_jobs_document_skips_byte_identical_replace(tmp_path):
 
 
 def test_changed_document_still_uses_atomic_replace(tmp_path):
-    with jobs.use_cron_store(tmp_path / "cron"):
+    with jobs.use_cron_store(tmp_path):
         jobs.save_jobs_document(_document("before"))
         with patch.object(jobs, "atomic_replace", wraps=jobs.atomic_replace) as replace:
             jobs.save_jobs_document(_document("after"))

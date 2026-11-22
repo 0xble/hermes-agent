@@ -116,8 +116,8 @@ TICKER_INTERVAL_SECONDS = 60
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
 _jobs_parse_cache_lock = threading.RLock()
-_jobs_parse_cache: dict[str, tuple[Optional[tuple[int, int, int]], list[dict[str, Any]]]] = {}
-_jobs_raw_parse_cache: dict[str, tuple[tuple[int, int, int], tuple[Any, bool]]] = {}
+_jobs_parse_cache: dict[str, tuple[Optional[tuple[int, int, int, int]], list[dict[str, Any]]]] = {}
+_jobs_raw_parse_cache: dict[str, tuple[tuple[int, int, int, int], tuple[Any, bool]]] = {}
 _fire_fence_locks: dict[str, threading.RLock] = {}
 _fire_fence_locks_guard = threading.Lock()
 _fire_fence_lock_state = threading.local()
@@ -1517,7 +1517,7 @@ def _jobs_cache_key(jobs_file: Path) -> str:
     return os.fspath(jobs_file.resolve())
 
 
-def _cached_jobs(jobs_file: Path, stamp: Optional[tuple[int, int, int]]) -> Optional[list[dict[str, Any]]]:
+def _cached_jobs(jobs_file: Path, stamp: Optional[tuple[int, int, int, int]]) -> Optional[list[dict[str, Any]]]:
     key = _jobs_cache_key(jobs_file)
     with _jobs_parse_cache_lock:
         cached = _jobs_parse_cache.get(key)
@@ -1526,7 +1526,7 @@ def _cached_jobs(jobs_file: Path, stamp: Optional[tuple[int, int, int]]) -> Opti
         return copy.deepcopy(cached[1])
 
 
-def _cache_jobs(jobs_file: Path, stamp: Optional[tuple[int, int, int]], jobs: list[dict[str, Any]]) -> None:
+def _cache_jobs(jobs_file: Path, stamp: Optional[tuple[int, int, int, int]], jobs: list[dict[str, Any]]) -> None:
     key = _jobs_cache_key(jobs_file)
     with _jobs_parse_cache_lock:
         _jobs_parse_cache[key] = (stamp, copy.deepcopy(jobs))
@@ -1657,18 +1657,21 @@ def _peek_jobs_unlocked() -> Optional[list[dict[str, Any]]]:
     return data if isinstance(data, list) else None
 
 
-def _jobs_file_stamp(jobs_file: Path) -> Optional[tuple[int, int, int]]:
-    """Shrink-merge fast-path stamp ``(mtime_ns, size, ino)``; ``None`` if unstatable. ``st_ino`` is
-    included because every writer uses mkstemp+rename, so a same-size write in one mtime quantum
-    can't false-match."""
+def _jobs_file_stamp(jobs_file: Path) -> Optional[tuple[int, int, int, int]]:
+    """Shrink-merge fast-path stamp ``(mtime_ns, size, ino, ctime_ns)``; ``None`` if unstatable.
+
+    ``mtime_ns`` can stay in the same filesystem timestamp quantum when an external editor
+    truncates and rewrites a file in place. ``ctime_ns`` changes for that metadata update even
+    though the inode is retained, so the parse cache cannot serve the old document.
+    """
     try:
         st = jobs_file.stat()
-        return (st.st_mtime_ns, st.st_size, st.st_ino)
+        return (st.st_mtime_ns, st.st_size, st.st_ino, st.st_ctime_ns)
     except OSError:
         return None
 
 
-def _record_load_stamp(stamp: Optional[tuple[int, int, int]]) -> None:
+def _record_load_stamp(stamp: Optional[tuple[int, int, int, int]]) -> None:
     """Remember jobs.json's stamp for the enclosing _jobs_lock() section (no-op outside one) so the
     save path can skip the shrink-merge when disk provably hasn't changed. Capture it BEFORE
     reading: a mid-read sibling then mismatches (fail-safe); stamping after would certify an
