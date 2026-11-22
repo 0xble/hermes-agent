@@ -106,7 +106,7 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
     pinned = getattr(agent, "_pinned_fallback_model", None)
     if not explicit_switch and isinstance(pinned, str) and pinned:
         from hermes_cli.fallback_config import same_fallback_model
-        if not same_fallback_model(pinned, model):
+        if not same_fallback_model(pinned, model) and not getattr(agent, "_billing_fallback_attempt", False):
             return None
 
     from agent.auxiliary_client import resolve_provider_client
@@ -149,7 +149,13 @@ def bind_route_entry(agent: Any, entry: dict[str, Any], provider: str, model: st
         elif not api_mode_explicit and api_mode == "chat_completions":
             api_mode = _fallback_api_mode_resolved(agent, provider, model, base_url)
 
-    if not explicit_switch and isinstance(pinned, str) and pinned and not same_fallback_model(pinned, model):
+    if (
+        not explicit_switch
+        and isinstance(pinned, str)
+        and pinned
+        and not same_fallback_model(pinned, model)
+        and not getattr(agent, "_billing_fallback_attempt", False)
+    ):
         if client is not getattr(agent, "client", None):
             _close_failed_route_client(agent, client)
         return None

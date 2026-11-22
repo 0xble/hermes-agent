@@ -66,6 +66,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
 | Async delegation origin route | Detached delegation captures the complete originating message route so completion delivery stays in the asking thread | Async delegation dispatch, completion routing or thread metadata changes | [Patch register](references/maintenance/operations/patch.md#async-delegation-origin-route) |
+| Delegated billing fallback | Pinned delegated and cron runs may use configured cross-model fallbacks on billing exhaustion and emit one provider/day notice | Delegation or cron fallback policy, billing classification or provider-credit notices | [Patch register](references/maintenance/operations/patch.md#delegated-billing-fallback) |
 | Shared fallback endpoint domain | Skip aliases of a proven dead socket for one turn while preserving one bounded independent-domain request at the switch cap | Fallback identity, connection classification, restart limits, terminal copy | [Shared fallback endpoint domain](maintenance/fallback-endpoint-domain.md) |
 | Named remote computer use | Keep shared node identities, no fallback, native images and node-bound terminal/file/process state | Shared node resolution, named execution/file safety, remote process persistence, computer-use provider dispatch, doctor or CuaDriver transport changes | [Named remote computer use](maintenance/remote-computer-use.md) |
 | Native notice delivery | Same-turn host notices preserve complete tool receipts, pairing, cache prefixes and replay provenance | Notice delivery, steer continuations, persistence or provider conversion changes | [Native notice delivery](maintenance/native-notice-delivery.md) |
@@ -298,13 +299,6 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Go write lint scope | Post-write lint for `.go` files checks syntax with `gofmt -e`, leaving type, vet and lint checks to package-level gates and the Go LSP | Post-write shell linters, Go lint commands, or LSP redundancy rules in `tools/file_operations_lint.py` | [Go write lint scope](maintenance/go-write-lint.md) |
 | Embedded cua-driver lifetime | Keep each `cua-driver serve --embedded` process and its `hc-` socket from outliving the Hermes process that spawned it, including macOS `open` detachment | Embedded daemon spawn, stop, session release, or gateway/CLI startup | [Embedded cua-driver lifetime](maintenance/cua-driver-lifetime.md) |
 
-## Active Patch Record: Async delegation origin route
-
-- **Patch identity:** `async-delegation-origin-route`.
-- **Behavior:** Detached delegation captures the complete originating message route, including an explicit empty thread for top-level messages, so restored completions stay in the asking thread without inheriting stale topic state.
-- **Source surfaces:** `tools/async_delegation.py`, `tools/async_delegation_ledger.py`, `gateway/run_notifications_sources.py`.
-- **Rollback:** Revert commits carrying `Fork-Patch: async-delegation-origin-route`.
-
 ## Active Patch Record: Release-bound launcher recovery
 
 - **Patch identity:** `release-launcher-stability`.
@@ -382,6 +376,13 @@ Fork-Patch-Backfill: 0f3af0ef0c43ad57eeedc58dd375566f83698699; gateway-transport
 - **Retirement:** Remove when upstream covers inherited Ultrafast and equivalent per-response requested/served auditing, without silent paid fallback or losing explicit-override precedence.
 - **Rollback:** Revert the commit carrying `Fork-Patch: speed-tier-audit`.
 
+## Active Patch Record: Async delegation origin route
+
+- **Patch identity:** `async-delegation-origin-route`.
+- **Behavior:** Detached delegation captures the complete originating message route, including an explicit empty thread for top-level messages, so restored completions stay in the asking thread without inheriting stale topic state.
+- **Source surfaces:** `tools/async_delegation.py`, `tools/async_delegation_ledger.py`, `gateway/run_notifications_sources.py`.
+- **Rollback:** Revert commits carrying `Fork-Patch: async-delegation-origin-route`.
+
 ## Active patch record: resumable delegation retention
 
 - **Patch identity:** `resumable-delegation-retention`.
@@ -391,6 +392,14 @@ Fork-Patch-Backfill: 0f3af0ef0c43ad57eeedc58dd375566f83698699; gateway-transport
 - **Focused regression:** `scripts/run_tests.sh tests/tools/test_delegation_resume.py tests/gateway/test_delegation_auto_resume.py`.
 - **Retirement:** Remove this patch when upstream preserves resumable delegation rows through pruning and suppresses stale auto-resume notices at injection time.
 - **Rollback:** Revert the resumable-delegation-retention fix commit.
+
+## Active patch record: delegated billing fallback
+
+- **Patch identity:** `delegated-billing-fallback`.
+- **Behavior:** Pinned delegated and cron runs may use configured cross-model fallbacks on billing exhaustion, with one provider/day notice after retries and fallback activation are exhausted. Other failure reasons preserve the model pin.
+- **Source surfaces:** `agent/agent_init.py`, `agent/agent_init_fallback.py`, `agent/chat_completion_helpers.py`, `agent/route_binding.py`, `agent/billing_notice.py`, `tools/delegate_tool_config.py`, `cron/scheduler.py`, and `hermes_cli/config_defaults.py`.
+- **Retirement:** Remove when a released upstream implementation preserves cross-model billing fallback and provider/day notification behavior.
+- **Rollback:** Revert the commits carrying `Fork-Patch: delegated-billing-fallback`.
 
 ## Active patch record: edge silence markers (S1)
 
