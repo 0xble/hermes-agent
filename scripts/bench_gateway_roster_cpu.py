@@ -43,7 +43,6 @@ def main() -> None:
             for index in range(ROSTER_SIZE)
         }
         store._loaded = True
-        store._sessions_json_signature = None
 
         def uncached_roster():
             entries = list(store._entries.values())
@@ -66,6 +65,8 @@ def main() -> None:
             old_jobs_ms = _elapsed(lambda: (jobs._invalidate_jobs_cache(), jobs.load_jobs()))
             jobs._invalidate_jobs_cache()
             jobs.load_jobs()
+            # The cache intentionally avoids the two-second git-style racy-write window.
+            time.sleep(2.1)
             new_jobs_ms = _elapsed(jobs.load_jobs)
 
     print(f"fixture roster_entries={ROSTER_SIZE} jobs={JOB_SIZE} iterations={ITERATIONS}")

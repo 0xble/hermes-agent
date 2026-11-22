@@ -509,6 +509,87 @@ def sanitize_reasoning_override(override: Optional[dict[str, Any]]) -> Optional[
     return parse_reasoning_effort(override)
 
 
+class _RosterEntries(dict):
+    """Dict backing SessionStore._entries with structural roster invalidation."""
+
+    def __init__(self, on_change, initial=()):
+        self._on_change = on_change
+        dict.__init__(self)
+        for key, value in dict(initial).items():
+            dict.__setitem__(self, key, value)
+            self._attach(value)
+
+    def _attach(self, value) -> None:
+        if isinstance(value, SessionEntry):
+            value._roster_change = self._on_change
+
+    def _detach(self, value) -> None:
+        if isinstance(value, SessionEntry) and value._roster_change == self._on_change:
+            value._roster_change = None
+
+    def _changed(self) -> None:
+        self._on_change()
+
+    def __setitem__(self, key, value):
+        old = self.get(key)
+        if old is not value:
+            self._detach(old)
+        dict.__setitem__(self, key, value)
+        self._attach(value)
+        if old is not value:
+            self._changed()
+
+    def __delitem__(self, key):
+        old = self[key]
+        dict.__delitem__(self, key)
+        self._detach(old)
+        self._changed()
+
+    def pop(self, key, *args):
+        if key in self:
+            value = self[key]
+            dict.__delitem__(self, key)
+            self._detach(value)
+            self._changed()
+            return value
+        if args:
+            return args[0]
+        raise KeyError(key)
+
+    def popitem(self):
+        key, value = dict.popitem(self)
+        self._detach(value)
+        self._changed()
+        return key, value
+
+    def clear(self):
+        if not self:
+            return
+        values = list(self.values())
+        dict.clear(self)
+        for value in values:
+            self._detach(value)
+        self._changed()
+
+    def update(self, *args, **kwargs):
+        incoming = dict(*args, **kwargs)
+        if not incoming:
+            return
+        for key, value in incoming.items():
+            old = self.get(key)
+            if old is not value:
+                self._detach(old)
+            dict.__setitem__(self, key, value)
+            self._attach(value)
+        self._changed()
+
+    def setdefault(self, key, default=None):
+        if key in self:
+            return self[key]
+        self[key] = default
+        return default
+
+
 @dataclass
 class SessionEntry:
     """Routing-index entry: maps a session key to its current session ID and metadata."""
@@ -617,8 +698,17 @@ class SessionEntry:
     # Metadata copies and compression advances keep this in-memory identity.
     # A conversation switch replaces the entry with a new identity.
     _route_version: int = field(default_factory=_route_versions.__next__, compare=False, repr=False)
+    _roster_change: Any = field(default=None, init=False, compare=False, repr=False)
 
-    # Fields (de)serialized verbatim, in wire order (``from_dict`` reads them with
+    _ROSTER_FIELDS = frozenset(("session_key", "origin", "updated_at", "suspended"))
+
+    def __setattr__(self, name, value):
+        old = getattr(self, name, None)
+        object.__setattr__(self, name, value)
+        if name in self._ROSTER_FIELDS and old != value:
+            callback = getattr(self, "_roster_change", None)
+            if callback is not None:
+                callback()
     # ``data.get(name, <dataclass default>)``), split around the three ISO-datetime/token keys.
     _PLAIN_FIELDS = (
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -960,7 +1050,9 @@ class SessionStore(
     def __init__(self, sessions_dir: Path, config: GatewayConfig, has_active_processes_fn=None):
         self.sessions_dir = sessions_dir
         self.config = config
-        self._entries: dict[str, SessionEntry] = {}
+        self._roster_generation = 0
+        self._roster_snapshot: Optional[tuple[SessionEntry, ...]] = None
+        self._entries = {}
         self._loaded = False
         # A fallback-only initial load is reconciled with state.db once the handle recovers.
         self._routing_db_loaded = False
@@ -975,11 +1067,7 @@ class SessionStore(
         self._persisted_routing_generation = 0
         self._fast_persisted_entries: dict[str, tuple[int, str]] = {}
         # Generation and immutable snapshot for callers that poll the routed roster frequently.
-        # The legacy mirror signature lets the cheap path notice routes written by another process.
-        self._roster_generation = 0
-        self._roster_snapshot: Optional[tuple[SessionEntry, ...]] = None
-        self._sessions_json_signature = None
-        self._legacy_session_keys: set[str] = set()
+        # _entries is an invalidating dict, and SessionEntry tracks fields consumed by roster readers.
         # Routing rows this process last persisted (key -> entry_json, None if unknown); full saves
         # write their diff against it. Guarded by _save_lock.
         self._routing_baseline: Optional[dict[str, Optional[str]]] = None
@@ -1034,6 +1122,23 @@ class SessionStore(
         # First use resolves the active profile lazily, and async callers cross the thread boundary
         # before invoking blocking SQLite work.
 
+    @property
+    def _entries(self):
+        return self.__entries
+
+    @_entries.setter
+    def _entries(self, value) -> None:
+        old = getattr(self, "__entries", None)
+        if old is not None:
+            for entry in old.values():
+                if isinstance(entry, SessionEntry) and entry._roster_change == self._mark_roster_changed_locked:
+                    entry._roster_change = None
+        self.__entries = value if isinstance(value, _RosterEntries) else _RosterEntries(
+            self._mark_roster_changed_locked, value
+        )
+        if old is not None:
+            self._mark_roster_changed_locked()
+
     def _lazy(self, name: str, factory):
         """``self.<name>``, created via *factory* when missing/None (suites build bare stores via
         ``object.__new__`` without ``__init__``; optional locks/maps are read through this)."""
@@ -1044,7 +1149,7 @@ class SessionStore(
         return value
 
     def _mark_roster_changed_locked(self) -> None:
-        """Invalidate the sorted routed-session snapshot (caller holds ``_lock``)."""
+        """Invalidate the sorted routed-session snapshot."""
         self._roster_generation = getattr(self, "_roster_generation", 0) + 1
         self._roster_snapshot = None
 

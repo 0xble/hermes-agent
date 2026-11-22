@@ -25,6 +25,19 @@ def test_load_jobs_reuses_mtime_cache_and_returns_safe_snapshots(tmp_path):
         assert second[0]["prompt"] == "cache"
 
 
+def test_load_jobs_cache_hit_does_not_refresh_load_stamp(tmp_path):
+    with jobs.use_cron_store(tmp_path):
+        jobs.save_jobs_document(_document())
+        jobs._invalidate_jobs_cache()
+        with patch.object(jobs, "_stamp_is_racy", return_value=False):
+            jobs.load_jobs()
+            sentinel = (1, 2, 3, 4)
+            with jobs._jobs_lock():
+                jobs._jobs_lock_state.load_stamp = sentinel
+                jobs.load_jobs()
+                assert jobs._jobs_lock_state.load_stamp == sentinel
+
+
 def test_load_jobs_cache_invalidates_on_external_rewrite(tmp_path):
     with jobs.use_cron_store(tmp_path):
         jobs.save_jobs_document(_document("before"))

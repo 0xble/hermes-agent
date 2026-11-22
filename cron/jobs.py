@@ -1490,6 +1490,11 @@ def get_ticker_last_error() -> Optional[str]:
 
 # --- Job CRUD Operations ---
 
+def _stamp_is_racy(stamp: Optional[tuple[int, int, int, int]]) -> bool:
+    """Avoid caching files modified in the current racy-write window."""
+    return stamp is None or (time.time_ns() - stamp[0]) <= 2_000_000_000
+
+
 def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
     """Tolerant jobs.json parse -> ``(data, used_strict_fallback)``: utf-8-sig absorbs a BOM, strict
     failure retries with ``strict=False``. IO/fallback errors propagate (caller decides repair vs
@@ -1507,7 +1512,7 @@ def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
         result = (json.loads(raw), False)
     except json.JSONDecodeError:
         result = (json.loads(raw, strict=False), True)
-    if stamp is not None and _jobs_file_stamp(jobs_file) == stamp:
+    if stamp is not None and _jobs_file_stamp(jobs_file) == stamp and not _stamp_is_racy(stamp):
         with _jobs_parse_cache_lock:
             _jobs_raw_parse_cache[key] = (stamp, (copy.deepcopy(result[0]), result[1]))
     return result
@@ -1556,7 +1561,8 @@ def load_jobs() -> list[dict[str, Any]]:
         return []
     cached = _cached_jobs(jobs_file, pre_read_stamp)
     if cached is not None:
-        _record_load_stamp(pre_read_stamp)
+        # A cache hit is a read-only operation. Do not certify the payload as the
+        # caller's load stamp; the writer must merge conservatively.
         return cached
 
     try:
@@ -1618,7 +1624,7 @@ def load_jobs() -> list[dict[str, Any]]:
             except (TypeError, ValueError, OverflowError):
                 rep["completed"] = 0
             repair = repair or "invalid repeat.completed normalized"
-    # Persist even an empty result, or an all-junk store repeats the repair on every tick.
+    repair_persisted = True
     if repair:
         if not getattr(_jobs_lock_state, "depth", 0):
             # An unlocked snapshot may predate a locked writer's update to a job it already holds
@@ -1633,9 +1639,10 @@ def load_jobs() -> list[dict[str, Any]]:
             save_jobs(jobs, replace=unmergeable and _peek_jobs_unlocked() is None)
             logger.warning("Auto-repaired jobs.json (%s)", repair)
         except OSError as exc:  # repaired in memory; the next load retries the persist
+            repair_persisted = False
             store_health.note_unwritable(exc, f"jobs.json repair ({repair}) not persisted", "load")
     post_read_stamp = _jobs_file_stamp(jobs_file)
-    if post_read_stamp == pre_read_stamp and post_read_stamp is not None:
+    if post_read_stamp == pre_read_stamp and post_read_stamp is not None and not _stamp_is_racy(post_read_stamp) and repair_persisted:
         _cache_jobs(jobs_file, post_read_stamp, jobs)
     _record_load_stamp(pre_read_stamp)
     return copy.deepcopy(jobs)

@@ -365,7 +365,6 @@ class SessionPersistenceMixin:
         """
         if self._loaded:
             self._reconcile_recovered_routing_locked()
-            self._refresh_legacy_sessions_json_locked()
             return
         self.sessions_dir.mkdir(parents=True, exist_ok=True)
         db_load_succeeded = self._load_routing_rows_locked()
@@ -391,63 +390,6 @@ class SessionPersistenceMixin:
                     logger.warning("gateway.session: could not strip retired routes from sessions.json", exc_info=True)
         # A hard crash skips graceful shutdown and leaves sessions.json pointing at ended sessions.
         self._prune_stale_sessions_locked()
-        getattr(self, "_mark_roster_changed_locked", lambda: None)()
-        self._sessions_json_signature = self._sessions_json_stat(getattr(self, "sessions_dir") / "sessions.json")
-
-    @staticmethod
-    def _sessions_json_stat(path: Path) -> Optional[tuple[int, int, int]]:
-        try:
-            stat = path.stat()
-            return (stat.st_mtime_ns, stat.st_size, stat.st_ino)
-        except OSError:
-            return None
-
-    def _refresh_legacy_sessions_json_locked(self) -> None:
-        """Import mirror-only routes after an external atomic sessions.json replacement."""
-        path = getattr(self, "sessions_dir") / "sessions.json"
-        signature = self._sessions_json_stat(path)
-        if signature == getattr(self, "_sessions_json_signature", None):
-            return
-        entries = getattr(self, "_entries")
-        before = {key: entry.to_dict() for key, entry in entries.items()}
-        legacy_keys = getattr(self, "_legacy_session_keys", set())
-        try:
-            with open(path, "r", encoding="utf-8-sig") as stream:
-                data = json.load(stream)
-            if not isinstance(data, dict):
-                raise ValueError("sessions.json must contain an object")
-            from gateway.session import SessionEntry
-            from hermes_state_mutation_retirement import route_retired
-            mirror_keys = set()
-            for key, entry_data in data.items():
-                if key.startswith("_"):
-                    continue
-                if not isinstance(entry_data, dict):
-                    logger.warning("Skipping invalid session entry %r during mirror reload", key)
-                    continue
-                mirror_keys.add(key)
-                if self._routing_db is not None and route_retired(
-                        self._routing_db, key, json.dumps({"session_id": entry_data.get("session_id")})):
-                    continue
-                # The mapping key is authoritative. Legacy writers occasionally left the
-                # embedded session_key copied from another route, which otherwise makes the
-                # newly imported entry disappear from roster-key consumers.
-                entry_data = dict(entry_data)
-                entry_data["session_key"] = key
-                entries[key] = SessionEntry.from_dict(entry_data)
-                legacy_keys.add(key)
-            for key in list(legacy_keys - mirror_keys):
-                entries.pop(key, None)
-                legacy_keys.discard(key)
-        except Exception:
-            # Fail open: keep the in-memory roster and retry the reload on the next read.
-            logger.warning("gateway.session: external sessions.json reload failed", exc_info=True)
-            self._sessions_json_signature = None
-            return
-        after = {key: entry.to_dict() for key, entry in entries.items()}
-        if after != before:
-            getattr(self, "_mark_roster_changed_locked", lambda: None)()
-        self._sessions_json_signature = self._sessions_json_stat(path)
 
     def _heal_missing_origins(self, entries) -> None:
         for entry in entries:
@@ -504,7 +446,6 @@ class SessionPersistenceMixin:
                         continue
                     self._entries[key] = SessionEntry.from_dict(
                         {**entry_data, "session_key": key})
-                    getattr(self, "_legacy_session_keys", set()).add(key)
                     imported += 1
                 except (ValueError, KeyError, TypeError) as e:
                     logger.warning("Skipping invalid session entry %r: %s", key, e)
@@ -616,7 +557,6 @@ class SessionPersistenceMixin:
 
     def _save(self) -> None:
         """Persist the routing index while the caller holds ``_lock``."""
-        getattr(self, "_mark_roster_changed_locked", lambda: None)()
         self._persist_routing_data(*self._snapshot_routing_locked())
 
     def _next_routing_generation_locked(self) -> int:
@@ -655,8 +595,6 @@ class SessionPersistenceMixin:
             elif current[key] == baseline[key]:
                 self._entries[key] = durable_entry  # unchanged fallback data yields to the DB copy
                 changed = True
-        if changed:
-            getattr(self, "_mark_roster_changed_locked", lambda: None)()
         self._heal_missing_origins(getattr(self, "_entries").values())
         self._routing_db_loaded = True
         self._routing_fallback_baseline = None
@@ -751,7 +689,6 @@ class SessionPersistenceMixin:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
         path = getattr(self, "sessions_dir") / "sessions.json"
         atomic_json_write(path, {"_README": _SESSIONS_JSON_README, **data}, mode=0o600)
-        self._sessions_json_signature = self._sessions_json_stat(path)
 
     def _save_entries(self) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""

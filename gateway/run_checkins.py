@@ -112,9 +112,9 @@ async def poll_checkins(runner):
         generation, changed_entries = await runner._run_in_executor_with_context(
             lambda: roster_reader(previous_generation))
         if changed_entries is not None:
-            runner._checkin_roster_generation = generation
             runner._checkin_roster_entries = changed_entries
             base_by_scope = await _group_routed_by_scope(runner, changed_entries, scope_key)
+            runner._checkin_roster_generation = generation
             runner._checkin_base_by_scope = base_by_scope
         else:
             base_by_scope = getattr(runner, "_checkin_base_by_scope", {})
