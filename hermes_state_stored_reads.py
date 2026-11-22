@@ -290,7 +290,7 @@ class SessionStoredReadsMixin:
         confirms each with ``compaction_summary``. A paged read shows a handoff once, at its first row.
 
         Storage interface: port as ``transcript_handoffs_shown_before``."""
-        from hermes_state_compaction_display import not_a_later_tool_copy_sql
+        from persistence.sqlite.conversation._store.compaction_display import not_a_later_tool_copy_sql
         from hermes_state_messages import DISPLAY_VISIBLE_SQL
         handoffs = list(handoffs)
         uids = sorted({uid for uid, _ in handoffs if uid})
