@@ -2,6 +2,7 @@
 must still invalidate the load_config() cache, while an unchanged
 file keeps serving the cached object."""
 import os
+import pytest
 from unittest.mock import patch
 
 from hermes_cli import config as config_mod
@@ -83,6 +84,27 @@ def test_read_raw_and_load_config_readonly_share_raw_parse_cache(tmp_path, monke
     config_mod.read_raw_config()
     config_mod.load_config_readonly()
     assert calls == 1
+
+
+
+
+@pytest.mark.parametrize("yaml_root", ["- not-a-mapping\n", "not-a-mapping\n", "0\n"])
+def test_load_config_non_mapping_root_is_failed_config_on_miss_and_hit(tmp_path, monkeypatch, yaml_root):
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    config_file = tmp_path / "config.yaml"
+    config_file.write_text(yaml_root, encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    config_mod._LOAD_CONFIG_CACHE.clear()
+    config_mod._RAW_CONFIG_CACHE.clear()
+
+    first = config_mod.load_config()
+    second = config_mod.load_config()
+    assert isinstance(first, FailedConfigRead)
+    assert isinstance(second, FailedConfigRead)
+    assert not isinstance(first, list)
+    assert not isinstance(second, list)
+    assert config_mod._RAW_CONFIG_CACHE.get(str(config_file)) is None
 
 
 def test_load_config_readonly_reparses_changed_file(tmp_path, monkeypatch):

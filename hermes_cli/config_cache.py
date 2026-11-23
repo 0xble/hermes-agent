@@ -14,11 +14,21 @@ _RAW_CONFIG_CACHE: dict[str, tuple[Any, ...]] = {}
 
 
 def _raw_config_cache_hit(path_key: str, cache_key: tuple[Any, ...]) -> Optional[dict[str, Any]]:
-    """Return the cached raw config when its signature equals ``cache_key``."""
+    """Return a cached raw mapping when its signature equals ``cache_key``.
+
+    Older callers may have populated the cache before the root-type validation was
+    added. Never let such an entry bypass the mapping guard on a cache hit.
+    """
     cached = _RAW_CONFIG_CACHE.get(path_key)
     if cached is not None and cached[:len(cache_key)] == cache_key:
-        return cached[len(cache_key)]
+        data = cached[len(cache_key)]
+        return data if isinstance(data, dict) else None
     return None
+
+
+def _raw_config_cache_clear(path_key: str) -> None:
+    """Remove one raw config entry through the cache module's single binding."""
+    _RAW_CONFIG_CACHE.pop(path_key, None)
 
 
 def _raw_config_cache_store(path_key: str, cache_key: tuple[Any, ...], data: dict[str, Any]) -> None:

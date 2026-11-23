@@ -179,9 +179,11 @@ _LAST_EXPANDED_CONFIG_BY_PATH: dict[str, Any] = {}
 # the config writer seam, which produces a fresh inode, so stat() sees a new signature and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
 _LOAD_CONFIG_CACHE: dict[str, tuple[Any, ...]] = {}
-# Re-export the raw YAML cache and its helpers for existing callers.
+# Re-export the raw YAML cache and its helpers for existing callers. Production code uses
+# the module helper for cache removal so rebinding a compatibility name cannot split the cache binding.
 from hermes_cli.config_cache import (
     _RAW_CONFIG_CACHE,
+    _raw_config_cache_clear,
     _raw_config_cache_hit,
     _raw_config_cache_store,
     _worker_config_snapshot,
@@ -1827,7 +1829,8 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
         try:
-            data = read_config_doc(config_path) or {}
+            loaded = read_config_doc(config_path)
+            data = {} if loaded is None else loaded
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return FailedConfigRead(error=e)
@@ -2264,8 +2267,15 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
                 if raw_cached is not None:
                     user_config = copy.deepcopy(raw_cached)
                 else:
-                    user_config = read_config_doc(config_path) or {}
+                    loaded = read_config_doc(config_path)
+                    user_config = {} if loaded is None else loaded
+                    if not isinstance(user_config, dict):
+                        raise TypeError(
+                            f"top-level YAML must be a mapping, got {type(user_config).__name__}")
                     _raw_config_cache_store(path_key, cache_key, copy.deepcopy(user_config))
+                if not isinstance(user_config, dict):
+                    raise TypeError(
+                        f"top-level YAML must be a mapping, got {type(user_config).__name__}")
                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
                 if "max_turns" in user_config:
@@ -2424,7 +2434,7 @@ def save_config(
         note_first_stamp(config_path.parent, _raw_for_paths, normalized)
         atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
         _secure_file(config_path)
-        _RAW_CONFIG_CACHE.pop(str(config_path), None)
+        _raw_config_cache_clear(str(config_path))
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
     from hermes_cli.observability.shared_metrics_disabled import record_config_saved
     record_config_saved(_raw_for_paths, current_normalized)
