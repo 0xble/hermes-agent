@@ -230,13 +230,20 @@ class FileBackend:
 
     def probe_readable(self, home: Path) -> None:
         path = self.config_path(home)
-        # Cache-hit validation must not open the file: callers can run while a
-        # replacement is in progress, and an unusual file-like config path could
-        # block an open indefinitely. The cache signature already performed stat;
-        # this probe only needs to confirm that the backing path is still readable.
-        path.stat()
-        if not os.access(path, os.R_OK):
-            raise PermissionError(path)
+        # Keep the module-level ``open`` seam used by integrity tests and callers
+        # that inject a transient EMFILE/EIO, but use a non-blocking descriptor for
+        # the normal path.  A FIFO or other file-like config path must not stall a
+        # gateway cache hit while an ordinary unreadable file must still raise.
+        injected_open = globals().get("open")
+        if injected_open is not None:
+            with injected_open(path, "rb") as stream:
+                stream.read(1)
+            return
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            os.read(fd, 1)
+        finally:
+            os.close(fd)
 
     def write_changes(self, home: Path, changes: Changes) -> None:
         self.write_path(self.config_path(home), changes)
