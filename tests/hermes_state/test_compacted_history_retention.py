@@ -5,6 +5,7 @@ import signal
 import subprocess
 import sys
 import time
+import tracemalloc
 from pathlib import Path
 
 import pytest
@@ -156,6 +157,86 @@ def test_archive_identity_mismatch_is_error(tmp_path):
     finally:
         db.close()
     assert _rows(path) == before
+
+
+def test_foreign_archive_with_torn_tail_is_byte_identical(tmp_path):
+    path = _fixture(tmp_path)
+    foreign_path = tmp_path / "foreign.db"
+    archive = tmp_path / "history.jsonl.gz"
+    foreign = SessionDB(db_path=foreign_path)
+    sid = foreign.create_session(session_id="foreign", source="cli")
+    foreign.append_message(sid, role="user", content="foreign")
+    foreign.close()
+    foreign = SessionDB(db_path=foreign_path)
+    from hermes_state_maintenance import _append_compacted_archive_member
+    _append_compacted_archive_member(archive, [{"_format": "hermes-compacted-history-v1",
+                                                "identity": {"db_path": str(foreign_path.resolve())}}])
+    _append_compacted_archive_member(archive, [{"id": 99, "session_id": "foreign", "timestamp": 1}])
+    foreign.close()
+    data = archive.read_bytes()
+    archive.write_bytes(data[:-5])
+    before = archive.read_bytes()
+    db = SessionDB(db_path=path)
+    try:
+        with pytest.raises(ValueError, match="different database"):
+            db.compacted_history_retention(archive_path=archive)
+    finally:
+        db.close()
+    assert archive.read_bytes() == before
+
+
+def test_empty_and_torn_first_header_are_rebuilt(tmp_path):
+    from hermes_state_maintenance import _append_compacted_archive_member
+    for torn in (False, True):
+        path = _fixture(tmp_path / ("torn" if torn else "empty"))
+        archive = path.parent / "history.jsonl.gz"
+        if torn:
+            _append_compacted_archive_member(
+                archive, [{"_format": "hermes-compacted-history-v1", "identity": {"db_path": "old"}}]
+            )
+            archive.write_bytes(archive.read_bytes()[:-5])
+        else:
+            archive.write_bytes(b"")
+        db = SessionDB(db_path=path)
+        result = db.compacted_history_retention(archive_path=archive)
+        db.close()
+        assert result["deleted"] == 2
+        subprocess.run(["gunzip", "-t", str(archive)], check=True)
+        with gzip.open(archive, "rt", encoding="utf-8") as stream:
+            assert json.loads(next(stream))["_format"] == "hermes-compacted-history-v1"
+
+
+def test_archive_reader_retains_only_message_identity_index(tmp_path):
+    from hermes_state_maintenance import _read_compacted_archive
+    archive = tmp_path / "large.jsonl.gz"
+    with gzip.open(archive, "wt", encoding="utf-8") as stream:
+        stream.write(json.dumps({"_format": "hermes-compacted-history-v1",
+                                 "identity": {"db_path": "synthetic"}}) + "\n")
+        body = "x" * 2048
+        for message_id in range(200_000):
+            stream.write(json.dumps({"id": message_id, "session_id": "s", "timestamp": message_id,
+                                     "content": body}) + "\n")
+    tracemalloc.start()
+    try:
+        identity, archived, recovered, offset = _read_compacted_archive(archive)
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert identity == {"db_path": "synthetic"}
+    assert not recovered
+    assert offset == archive.stat().st_size
+    assert len(archived) == 200_000
+    assert all(len(key) == 3 for key in archived.values())
+    assert peak < 96 * 1024 * 1024
+
+
+def test_zero_delete_progress_fails_instead_of_spinning(tmp_path, monkeypatch):
+    path = _fixture(tmp_path)
+    db = SessionDB(db_path=path)
+    monkeypatch.setattr(db, "_execute_write", lambda fn, **kwargs: 0)
+    with pytest.raises(RuntimeError, match="made no delete progress"):
+        db.compacted_history_retention(archive_path=tmp_path / "history.jsonl.gz")
+    db.close()
 
 
 def test_real_sigkill_after_archive_write_recovers(tmp_path):
