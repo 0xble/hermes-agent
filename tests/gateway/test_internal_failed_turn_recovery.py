@@ -235,15 +235,10 @@ async def test_post_turn_hooks_retries_unsuccessful_synthetic_turn_and_suppresse
     ) == ""
 
 
-@pytest.mark.parametrize("origin_text, expected", [
-    ("[Continuing toward your standing goal]\\nGoal: x", "goal_loop"),
-])
-def test_cli_synthetic_origin_markers_are_goal_loop(origin_text, expected):
-    from hermes_cli.cli_loops_mixin import _turn_origin_for_cli_message
-    assert _turn_origin_for_cli_message(origin_text) == expected
+@pytest.mark.parametrize("text", ["[Continuing toward your standing goal]\nGoal: x",
+                                  "[/loop wakeup #1]", "[Heartbeat — recurring instruction, fires every minute]"])
+def test_cli_only_scheduler_provenance_gets_goal_loop_origin(text):
+    from hermes_cli.cli_loops_mixin import ScheduledWakeup, _turn_origin_for_cli_message
 
-
-def test_cli_loop_wakeup_marker_maps_to_goal_loop():
-    from hermes_cli.cli_loops_mixin import _turn_origin_for_cli_message
-    from hermes_cli.loops import WAKEUP_PROMPT_PREFIX
-    assert _turn_origin_for_cli_message(WAKEUP_PROMPT_PREFIX + "test") == "goal_loop"
+    assert _turn_origin_for_cli_message(ScheduledWakeup(text)) == "goal_loop"
+    assert _turn_origin_for_cli_message(text) == "user"

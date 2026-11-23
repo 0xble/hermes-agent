@@ -111,11 +111,11 @@ def _(rid, params: dict) -> dict:
                 logger.debug("session.interrupt wake resume failed", exc_info=True)
 
 
-def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status: str) -> dict:
+def _apply_correction(rid, session: dict, verb: str, text: str, accepted_status: str, *, human: bool = True) -> dict:
     """``agent.<verb>(text)``; on acceptance record it on the live turn (mid-turn resume rebuilds the bubble)
     and purge queued self-copies so post-turn drain cannot re-fire the old prompt."""
     try:
-        accepted = getattr(session["agent"], verb)(text)
+        accepted = getattr(session["agent"], verb)(text, human=human)
     except Exception as exc:
         return _err(rid, 5000, f"{verb} failed: {exc}")
     if accepted:
@@ -163,7 +163,8 @@ def _correction_method(name: str, verb: str, accepted_status: str, supported, un
         # row (#64578). 'rejected' makes the client queue it as a normal next prompt.
         if verb == "steer" and not session.get("running"):
             return _ok(rid, {"status": "rejected", "text": text})
-        return _apply_correction(rid, session, verb, text, accepted_status)
+        return _apply_correction(rid, session, verb, text, accepted_status,
+                                 human=params.get("human", True))
 
 
 # Inject text into the next tool result without interrupting (AIAgent.steer(): no new user turn, no role

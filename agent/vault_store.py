@@ -151,18 +151,53 @@ def normalize_origin(url_or_origin: str) -> str:
         raise VaultError("origin is required")
     if "://" not in value:
         raise VaultError(f"origin must include a scheme (got {value!r})")
-    parts = urlsplit(value)
-    scheme = (parts.scheme or "").lower()
-    host = (parts.hostname or "").lower()
+    try:
+        parts = urlsplit(value)
+        scheme = (parts.scheme or "").lower()
+        host = (parts.hostname or "").lower()
+        port = parts.port
+    except (TypeError, ValueError) as exc:
+        raise VaultError(f"could not parse origin from {value!r}") from exc
     if not scheme or not host:
         raise VaultError(f"could not parse origin from {value!r}")
-    try:
-        port = parts.port
-    except ValueError as exc:
-        raise VaultError(f"invalid port in origin {value!r}") from exc
+    # urlsplit.hostname omits IPv6 brackets; retain them in the canonical origin
+    # so the result remains parseable when origin_matches_lookup compares it.
+    host_text = f"[{host}]" if ":" in host else host
     if port is None or port == _DEFAULT_PORTS.get(scheme):
-        return f"{scheme}://{host}"
-    return f"{scheme}://{host}:{port}"
+        return f"{scheme}://{host_text}"
+    return f"{scheme}://{host_text}:{port}"
+
+
+def origin_matches_lookup(saved_origin: str | None, lookup_origin: str | None, *, kind: str = "login") -> bool:
+    """Return whether a saved origin authorizes a lookup for an item kind.
+
+    Matching is exact after normalization. Login items additionally allow an
+    HTTPS lookup to match an HTTP item for the same host and port; the
+    comparison is deliberately asymmetric and never crosses hosts/subdomains.
+    Other item kinds remain exact-origin only. Malformed metadata is untrusted
+    input and is never eligible.
+    """
+    if not saved_origin or not lookup_origin:
+        return False
+    try:
+        saved = normalize_origin(saved_origin)
+        lookup = normalize_origin(lookup_origin)
+        if saved == lookup:
+            return True
+        if kind != "login":
+            return False
+        saved_parts = urlsplit(saved)
+        lookup_parts = urlsplit(lookup)
+        return (
+            saved_parts.scheme == "http"
+            and lookup_parts.scheme == "https"
+            and saved_parts.hostname == lookup_parts.hostname
+            and saved_parts.port == lookup_parts.port
+        )
+    except (TypeError, ValueError, VaultError):
+        # Origin metadata is untrusted input; a malformed value is simply not
+        # eligible and must never abort listing or filling.
+        return False
 
 
 @dataclass(frozen=True)

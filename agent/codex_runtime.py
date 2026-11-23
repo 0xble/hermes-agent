@@ -507,14 +507,14 @@ def _close_codex_session(agent) -> None:
     agent._codex_session = None
 
 
-def _consume_user_interrupt(agent, active: bool = True) -> tuple[bool, Any]:
-    """(user_interrupted, interrupt_message); clears the agent-level interrupt so a hard
-    stop cannot poison the next turn (mirrors the conversation-loop finalizer)."""
+def _consume_user_interrupt(agent, active: bool = True) -> tuple[bool, Any, Any]:
+    """(interrupted, interrupt_message, interrupt_source); clears the agent-level interrupt."""
     interrupted = bool(active and getattr(agent, "_interrupt_requested", False))
     message = getattr(agent, "_interrupt_message", None) if interrupted else None
+    source = getattr(agent, "_interrupt_source", None) if interrupted else None
     if interrupted:
         agent.clear_interrupt()
-    return interrupted, message
+    return interrupted, message, source
 
 
 def _codex_developer_instructions(agent) -> str:
@@ -818,14 +818,15 @@ def run_codex_app_server_turn(agent, *, user_message: str, original_user_message
     )
 
 
-def _turn_result(interrupt: tuple[bool, Any], messages: list[dict[str, Any]], *, api_calls: int, completed: bool,
+def _turn_result(interrupt: tuple[bool, Any, Any], messages: list[dict[str, Any]], *, api_calls: int, completed: bool,
                  error: Any, final_response: Any, **extra: Any) -> dict[str, Any]:
     """Result shape shared with the chat_completions path (``partial`` == ``not completed``)."""
-    user_interrupted, interrupt_message = interrupt
+    user_interrupted, interrupt_message, interrupt_source = interrupt
     return {
         "final_response": final_response, "messages": messages, "api_calls": api_calls,
         "completed": completed, "partial": not completed, "interrupted": user_interrupted,
         **({"interrupt_message": interrupt_message} if interrupt_message else {}),
+        **({"interrupt_source": interrupt_source} if interrupt_source else {}),
         "error": error, **extra,
     }
 

@@ -52,7 +52,7 @@ from gateway.run_inbound_unauthorized import (
 from gateway.attended_model import is_genuine_user_message
 from gateway.session import SessionSource, build_session_context, label_shared_sender
 from gateway.turn_lease import TurnLeaseTimeoutError
-from gateway.zero_cut_handover_drain import handover_accepts_received
+from gateway.zero_cut_handover_drain import handover_accepts_received, handover_runs_admission
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from hermes_cli.observability.shared_metrics_busy import (
     note_busy_admitting, note_busy_outcome, settle_busy_arrival, stamp_busy_arrival)
@@ -136,6 +136,9 @@ async def _admit_outbox_event(runner, event, source):
         bind_turn(home, turn_id)
 
 
+_MOUNT_PLAN_UNSET = object()
+
+
 class GatewayInboundMixin(
     GatewayInboundHooksMixin, GatewayInboundTranscriptionMixin, GatewayPluginInjectionMixin,
     GatewayLoopWakeMixin, GatewayInboundMoaMixin,
@@ -143,16 +146,33 @@ class GatewayInboundMixin(
     """Inbound message pipeline (_handle_message, text/media preparation, durable-turn markers, plugin injection) for GatewayRunner."""
 
 
-    def _hm_mounted_owner(self, authority, _quick_key: str) -> Optional[str]:
-        """The route's durable FIFO owner for /stop and /new, mounted. Right after a restart the
-        startup recovery may not have mounted it yet, but its committed rows are still this chat's:
-        skipping them left them queued forever once /new moved the lane to a fresh session. None
-        when the chat has no durable session here."""
-        sid = authority.logical_owner(self.session_store.peek_session_id(_quick_key))
+    def _hm_mounted_owner_probe(self, authority: Any, _quick_key: str) -> Optional[str]:
+        """Read the route's durable FIFO owner for /stop and /new.
+
+        SessionStore and the authority's lineage lookup take blocking storage locks. This read-only
+        probe may run off the gateway event loop; it must not inspect or publish ``authority.sessions``.
+        """
+        return authority.logical_owner(authority.runner.session_store.peek_session_id(_quick_key))
+
+    def _hm_mounted_owner_mount_plan(self, authority: Any, sid: str):
+        """Read the cold route's mount plan off-loop; publishing it remains an on-loop mutation."""
+        from gateway.session_route_recovery import _mount_plan
+        return _mount_plan(authority, sid)
+
+    def _hm_mounted_owner(self, authority, sid: Optional[str], _quick_key: str, *, plan=_MOUNT_PLAN_UNSET) -> Optional[str]:
+        """Mount the route's durable FIFO owner for /stop and /new on the gateway loop.
+
+        Right after a restart startup recovery may not have mounted it yet, but its committed rows
+        are still this chat's. Keep this publication and all authority/session mutations on the loop
+        so they cannot race inbound admission, recovery, or shutdown.
+        """
         if sid and sid not in authority.sessions:
             from gateway.session_route_recovery import restore_routed_session
             try:
-                restore_routed_session(authority, sid)
+                if plan is _MOUNT_PLAN_UNSET:
+                    restore_routed_session(authority, sid)
+                elif plan is not None:
+                    restore_routed_session(authority, sid, plan=plan)
             except Exception:
                 logger.debug("Could not mount %s for %s before stopping it", sid, _quick_key, exc_info=True)
         return sid if sid and sid in authority.sessions else None
@@ -981,14 +1001,32 @@ class GatewayInboundMixin(
         claimed generation: a turn still constructing its agent latches the Stop for adopt_agent."""
         from gateway.session_authorities import active_authority
         authority = active_authority(self)
-        # SessionStore's routing map is guarded by a blocking lock. Keep the probe and any
-        # recovery mount off the gateway event-loop thread while a busy command stops a turn.
-        sid = await asyncio.to_thread(self._hm_mounted_owner, authority, _quick_key) if authority else None
+        # SessionStore's routing map, lineage lookup, and cold mount plan are guarded by blocking
+        # storage locks. Keep those read-only operations off the gateway event-loop thread. Mounting
+        # then publishes authority state and must remain serialized on the loop.
+        sid = None
+        if authority:
+            from gateway.session_store_async import run_store_call
+            sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+            plan = None
+            if sid and sid not in authority.sessions:
+                plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid)
+            sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
         if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.
                 authority.fence_route(_quick_key)
-            return
+                # The initial probe can finish before a first admission publishes its durable owner.
+                # Fence first, then take one fresh off-loop snapshot so that input is cancelled rather
+                # than left queued behind /new or /stop.
+                from gateway.session_store_async import run_store_call
+                sid = await run_store_call(self._hm_mounted_owner_probe, authority, _quick_key)
+                plan = None
+                if sid and sid not in authority.sessions:
+                    plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid)
+                sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
+            if not sid:
+                return
         from gateway.session_contract import SessionActor, SessionRef
         from hermes_state_runtime import RuntimeStoreError, list_session_admissions
         ref = SessionRef(authority.profile_id, sid)
@@ -1146,7 +1184,7 @@ class GatewayInboundMixin(
         from gateway.run import _AGENT_PENDING_SENTINEL
         if (self._draining and not self._hm_is_registered_command(event)
                 and getattr(event, "_admitted_before_drain", False) is not True
-                and not handover_accepts_received(self, source)):
+                and not handover_accepts_received(self, source) and not handover_runs_admission(self)):
             if await self._route_plaintext_approval_while_busy(event, _quick_key):
                 return None
             self._preserve_drain_event(_quick_key, event)
@@ -1549,7 +1587,7 @@ class GatewayInboundMixin(
         ``(handled, result, command)``; an alias quick command rewrites ``command``."""
         if (self._draining and not self._hm_is_registered_command(event)
                 and getattr(event, "_admitted_before_drain", False) is not True
-                and not handover_accepts_received(self, source)):
+                and not handover_accepts_received(self, source) and not handover_runs_admission(self)):
             self._preserve_drain_event(self._session_key_for_source(source), event)
             return True, None, command
 
@@ -2036,7 +2074,7 @@ class GatewayInboundMixin(
             return None
         if (self._draining and not self._hm_is_registered_command(event)
                 and getattr(event, "_admitted_before_drain", False) is not True
-                and not handover_accepts_received(self, source)):
+                and not handover_accepts_received(self, source) and not handover_runs_admission(self)):
             from gateway.session_retry_admission import refuse_deferred_retry
             refuse_deferred_retry(event)
             session_key = self._session_key_for_source(source)
@@ -2110,10 +2148,9 @@ class GatewayInboundMixin(
             if self._is_session_running(_quick_key):
                 # The passive check awaits; a turn that started meanwhile owns the session now.
                 return await self._hm_handle_running_session_message(event, source, _quick_key)
-            # External-drain new-turn gate: when NAS engaged an external drain (.drain_request.json,
-            # seen by _drain_control_watcher), refuse to START new turns so the in-flight set can
-            # only fall to zero. Reversible.
-            if self._external_drain_active and not handover_accepts_received(self, source):
+            # External input stays closed; the released owner may finish its committed FIFO.
+            if (self._external_drain_active and not handover_accepts_received(self, source)
+                    and not handover_runs_admission(self)):
                 logger.info("Refusing new turn for session %s — external drain active.", _quick_key)
                 return t("gateway.busy.draining_maintenance")
 
@@ -2305,11 +2342,11 @@ class GatewayInboundMixin(
         return image_paths, audio_paths, audio_file_paths, video_paths
 
     async def _enrich_inbound_images(
-        self, source: SessionSource, session_key: str, message_text: str, image_paths: list[str]
+        self, event: MessageEvent, source: SessionSource, session_key: str,
+        message_text: str, image_paths: list[str],
     ) -> str:
         """Route images natively (attach pixels at run_conversation) or pre-analyze them into text."""
-        # See agent/image_routing.py. Offloaded to a thread: the decision does blocking network I/O
-        # (models.dev fetch on cache miss, Ollama /api/show probe) that would stall the event loop.
+        # models.dev and Ollama probes can block, so resolve the mode off the event loop.
         _img_mode = await asyncio.to_thread(
             self._decide_image_input_mode, source=source, session_key=session_key,
         )
@@ -2324,8 +2361,7 @@ class GatewayInboundMixin(
             "Image routing: text (mode=%s). Pre-analyzing %d image(s) via vision_analyze.",
             _img_mode, len(image_paths),
         )
-        # Vision enrichment runs before AIAgent.run_conversation(), so bind this session's resolved
-        # runtime explicitly rather than consulting process-global compatibility mirrors.
+        # Bind this event and runtime before the agent turn; a queued event may have a different origin.
         vision_runtime = None
         try:
             turn_model, runtime_kwargs = await self._resolve_session_agent_runtime_async(
@@ -2336,8 +2372,8 @@ class GatewayInboundMixin(
             logger.debug("vision enrichment: session runtime resolution failed", exc_info=True)
 
         from agent.auxiliary_client import scoped_runtime_main
-
-        with scoped_runtime_main(vision_runtime):
+        from agent.proxy_request_class import bind_aux_request_origin
+        with scoped_runtime_main(vision_runtime), bind_aux_request_origin(turn_origin_for_event(event)):
             return await self._enrich_message_with_vision(message_text, image_paths)
 
     async def _enrich_inbound_voice(
@@ -2563,7 +2599,7 @@ class GatewayInboundMixin(
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
         if image_paths:
-            message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
+            message_text = await self._enrich_inbound_images(event, source, session_key, message_text, image_paths)
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         # Keep current media after the recall boundary, not among discarded backfill.

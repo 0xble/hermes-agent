@@ -116,7 +116,8 @@ def _failure(effects: HandoverEffects, idle_label: str, message: str, *, cleanup
 
 
 def run_handover(*, home: Path | None = None, enabled: bool | None = None,
-                 timeout: float, effects: HandoverEffects | None = None) -> int:
+                 timeout: float, effects: HandoverEffects | None = None,
+                 wait_for_exit: bool = True) -> int:
     """Perform one A→B handover and return a CLI exit code."""
     home = Path(home or get_hermes_home()).expanduser().resolve()
     fx = _effects(effects)
@@ -213,6 +214,10 @@ def run_handover(*, home: Path | None = None, enabled: bool | None = None,
         (_query(fx, home, "status", idle_slot) or {}).get("standby") is False)):
         print(f"⚠ {idle_label} accepted promotion but has not reported active status yet; leaving it running")
 
+    if not wait_for_exit:
+        # A caller inside the old gateway cannot wait for its own process to exit. Promotion is
+        # complete and the old owner will retire through its accepted-handover shutdown path.
+        return 0
     # The old slot finishes its own in-flight turns with no drain budget (zero-cut), then exits 0.
     print(f"… {idle_label} is serving; waiting for {active_label} to finish its in-flight turns and exit")
     _poll(fx, float("inf"), lambda: _old_active_exited(fx, home, old_pid, active_slot))
@@ -260,6 +265,16 @@ def _old_active_exited(fx: HandoverEffects, home: Path, pid: Any, slot: str) -> 
         return pid is not None and not fx.process_exists(int(pid))
     except (TypeError, ValueError, OSError):
         return False
+
+
+def planned_handover() -> bool | None:
+    """Run the opt-in handover without changing the legacy restart path when disabled."""
+    from hermes_cli.config import load_config_readonly
+    if not is_zero_cut_handover_enabled(load_config_readonly()):
+        return None
+    return run_handover(
+        home=get_hermes_home(), timeout=STANDBY_READY_BUDGET_S, wait_for_exit=False
+    ) == 0
 
 
 def cmd_handover(args) -> int:

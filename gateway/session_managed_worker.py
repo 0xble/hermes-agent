@@ -255,7 +255,7 @@ class ManagedWorker:
     def control(self, frame):
         if self.closed.is_set():
             raise RuntimeStoreError('managed_worker_lost')
-        if frame == {'type': 'stop'}:
+        if frame.get('type') == 'stop':
             if self.stopped_at is None:
                 self.stopped_at = time.monotonic()
             self.stop.set()

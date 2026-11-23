@@ -105,6 +105,31 @@ def test_tui_wakeup_stream_never_shows_the_marker(monkeypatch):
     assert "".join(_run(LOOP_WAKEUP, "Queue is 2.", ["Checking.", "\n\nQueue is 2."])) == "Checking.\n\nQueue is 2."
 
 
+def test_tui_forwards_user_origin_only_for_identified_user_turns(monkeypatch):
+    from tui_gateway.prompt_turn import _TurnRun
+
+    # The server installs this function with its shared handler globals.
+    invoke_agent = getattr(srv, "_invoke_agent")
+
+    monkeypatch.setattr(srv, "_emit", lambda *_a, **_k: None)
+    monkeypatch.setattr(srv, "_load_interim_assistant_messages", lambda: False)
+    monkeypatch.setattr(srv, "_start_usage_ticker", lambda _sid, _agent: (
+        SimpleNamespace(set=lambda: None), SimpleNamespace(join=lambda: None)))
+    seen = []
+
+    def run_conversation(_message, *, turn_origin="unknown", **kwargs):
+        seen.append(turn_origin)
+        return {"final_response": "ok"}
+
+    agent = SimpleNamespace(run_conversation=run_conversation)
+    session = {"session_key": "k", "history_lock": contextlib.nullcontext(), "agent": agent}
+    for user_turn, origin in ((True, "user"), (False, "goal_loop")):
+        st = _TurnRun(agent=agent, one_turn_restore=None, terminal_callback=None, receipt_committed=True)
+        invoke_agent("sid", session, st, LOOP_WAKEUP, LOOP_WAKEUP, None, [], None, None,
+                     user_turn=user_turn, turn_origin=origin)
+    assert seen == ["user", "goal_loop"]
+
+
 def test_tui_voice_fallback_speaks_delivered_text_not_the_marker(monkeypatch):
     spoken = []
     monkeypatch.setattr(srv, "_voice_tts_enabled", lambda: True)

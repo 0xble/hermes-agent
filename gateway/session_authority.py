@@ -160,7 +160,7 @@ class SessionAuthority:
         # session -> (generation, [steer text]) accepted before that generation adopted an agent;
         # adopt_agent hands it to that agent (never a later generation's), the drain drops the rest.
         self.pending_steers = {}
-        # session -> (generation, {admission_id: delivered}): queued admissions prompt.steer_queued handed
+        self.pending_steer_human = {}
         # to that running claim (gateway/session_queued_controls.py); its settlement decides each one.
         self.steer_transfers = {}
         self.launch_sources = {}  # session -> its frozen launch source (session_queued_controls)
@@ -244,7 +244,7 @@ class SessionAuthority:
         from gateway.session_retirement import touch_restored
         touch_restored(self, ref.session_id)  # a rename or a read brought a retired one back
 
-    def _require_admission_open(self, *, queue_only=False):
+    def _require_admission_open(self, *, queue_only=False, owned_work=False):
         """``queue_only``: the caller only COMMITS a queued row (never claims or runs it). A restart's
         after-turn wait accepts those (#139041): the row is durable FIFO input the next owner runs
         exactly once, while this owner's claim path stays refused."""
@@ -252,14 +252,16 @@ class SessionAuthority:
             raise RuntimeStoreError('runtime_draining')
         if self.runner._draining:
             from gateway.drain_control import restart_wait_open
-            if not (queue_only and restart_wait_open(self.runner)):
+            from gateway.zero_cut_handover_drain import handover_runs_followups
+            if not ((queue_only and restart_wait_open(self.runner))
+                    or (owned_work and handover_runs_followups(self.runner))):
                 raise RuntimeStoreError('runtime_draining')
 
-    def _admission_gate(self, authorize=None, *, queue_only=False):
+    def _admission_gate(self, authorize=None, *, queue_only=False, owned_work=False):
         """The admission gate re-checked inside an off-loop write transaction (with the caller's
         own guard), so a drain that began while the write waited on the writer still refuses it."""
         def guard(conn):
-            self._require_admission_open(queue_only=queue_only)
+            self._require_admission_open(queue_only=queue_only, owned_work=owned_work)
             if authorize is not None:
                 authorize(conn)
         return guard
@@ -531,11 +533,12 @@ class SessionAuthority:
         from gateway.session_pause_announce import schedule_pause_announcement
         schedule_pause_announcement(self, ref, reason)
 
-    async def admit_automation(self, adapter, event, identity, replaces=None, fold=None, *, authorize_write=None):
+    async def admit_automation(self, adapter, event, identity, replaces=None, fold=None, *, authorize_write=None, owned_work=False):
         from gateway.admission_canary import refusal_evidence
         from gateway.session_automation import admit_automation
         with refusal_evidence('automation', identity):
-            return await admit_automation(self, adapter, event, identity, replaces, fold, authorize_write=authorize_write)
+            return await admit_automation(self, adapter, event, identity, replaces, fold,
+                                          authorize_write=authorize_write, owned_work=owned_work)
 
     async def admit_native(self, event):
         """Await current connector policy, then commit before ACK or scheduling execution."""
@@ -773,7 +776,7 @@ class SessionAuthority:
         self._require_admission_open(queue_only=queue_only)
         if (request.intent != 'queue' or not {'text'} <= set(request.payload) <= {
                 'text', 'attachments', 'finite', 'unattended', 'surface', 'voice_context', 'interrupted',
-                'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'api_text', 'model_override', 'clarify_batch'}
+                'voice_turn', 'display_kind', 'title_preview', 'turn_author', 'turn_origin', 'api_text', 'model_override', 'clarify_batch'}
                 or not isinstance(request.payload['text'], str)):
             raise RuntimeStoreError('invalid_params')
         from gateway.session_ingress_media import admit_attachments
@@ -1049,7 +1052,7 @@ class SessionAuthority:
         agent = running.get(running_key(self.runner, live.route, ref.session_id))
         return agent is not None and agent is not _AGENT_PENDING_SENTINEL
 
-    def steer_agent(self, ref, generation, text):
+    def steer_agent(self, ref, generation, text, *, human: bool = True):
         """The agent a steer for this running generation reaches; the caller holds the session's
         event_stream.lock after check_approval_generation. Before the turn adopts its agent the
         resident one is the previous turn's cached agent, which this turn may replace, so *text* is
@@ -1065,6 +1068,7 @@ class SessionAuthority:
             return agent, False
         latched, texts = self.pending_steers.get(ref.session_id, (None, []))
         self.pending_steers[ref.session_id] = (generation, [*texts, text] if latched == generation else [text])
+        self.pending_steer_human[ref.session_id] = human
         return None, True
 
     def adopt_agent(self, session_id, generation, agent):
@@ -1085,8 +1089,9 @@ class SessionAuthority:
                 from agent.interrupt_compat import request_hard_interrupt
                 request_hard_interrupt(agent)
             latched, steers = self.pending_steers.pop(session_id, (None, ()))
+            latched_human = self.pending_steer_human.pop(session_id, True)
             for text in steers if latched == generation else ():
-                agent.steer(text)
+                agent.steer(text, human=latched_human)
 
     def check_approval_generation(self, session_id, generation):
         handle = self._handle(SessionRef(self.profile_id, session_id))
@@ -1145,7 +1150,7 @@ class SessionAuthority:
         from gateway.session_automation import check_local_automation
         live = self.sessions.get(ref.session_id)
         await asyncio.to_thread(check_local_automation, self, ref, row, route=route)
-        self._require_admission_open()
+        self._require_admission_open(owned_work=True)
         if self.sessions.get(ref.session_id) is not live or (live is not None and live.route != route):
             raise RuntimeStoreError('admission_conflict')
 
@@ -1234,13 +1239,13 @@ class SessionAuthority:
                 from gateway.session_automation_retry import retry_ready
                 if not await retry_ready(self, first):
                     return 'automation_wait', first
-            self._require_admission_open()
+            self._require_admission_open(owned_work=True)
             from gateway.session_runtime_workers import tracked_write
             live.rescan = False  # a _schedule from here on may not be visible to this claim's read
             # The row these checks validated, never whichever is first when the write runs: a
             # cancellation commits from a worker thread and can advance the FIFO at any point.
             row = await tracked_write(self, partial(claim_session_input, self.db, epoch=self.epoch,
-                                                    session_id=ref.session_id, _guard=self._admission_gate(),
+                                                    session_id=ref.session_id, _guard=self._admission_gate(owned_work=True),
                                                     head=first['admission_id'] if first is not None else None,
                                                     passing=passing),
                                       then=partial(self._stamp_claim, ref, live))
@@ -1266,7 +1271,9 @@ class SessionAuthority:
     def _drain_stopping(self, ref, live):
         """A drain about to wait (storage retry, classic slot) exits instead when the runtime drains,
         the profile retires or the live entry was replaced; committed rows stay queued."""
-        if self.runner._draining or self.retiring or self.sessions.get(ref.session_id) is not live:
+        from gateway.zero_cut_handover_drain import handover_runs_followups
+        if ((self.runner._draining and not handover_runs_followups(self.runner))
+                or self.retiring or self.sessions.get(ref.session_id) is not live):
             self._pause(ref, 'runtime_draining')
             return True
         return False
@@ -1395,6 +1402,7 @@ class SessionAuthority:
             self.pending_stops.pop(ref.session_id, None)
             self.pending_stop_causes.pop(ref.session_id, None)
             self.pending_steers.pop(ref.session_id, None)
+            self.pending_steer_human.pop(ref.session_id, None)
             self.adopted.pop(ref.session_id, None)
             # An automation turn nobody waits on settles here, at the exit that fenced it (GW-10),
             # so the followers already queued run in this drain; a person's turn still pauses.
@@ -1438,7 +1446,7 @@ class SessionAuthority:
                 if live.rescan:
                     continue
                 from gateway.session_retirement import retire_at_idle
-                retire_at_idle(self, ref, live)
+                await retire_at_idle(self, ref, live)
                 return
             admission_id = row['admission_id']
             from gateway.run_plugin_injection import admission_turn_scope

@@ -1,5 +1,6 @@
-"""Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, proxy path,
-MCP reload. Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
+"""Agent-turn execution for GatewayRunner: _handle_message_with_agent, _run_agent*, and proxy path.
+
+Bound onto ``GatewayRunner`` via the MRO; ``gateway.run`` internals
 are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.X")`` still works.
 """
 
@@ -36,6 +37,7 @@ from gateway.platforms.event import MessageEvent, turn_origin_for_event
 from gateway.platforms.typing_state import call_typing_with_metadata
 from gateway.session_context import bound_turn_origin, scoped_turn_actor, set_turn_origin
 from gateway.run_turn_hygiene import hygiene_no_commit_reason
+from gateway.run_turn_mcp import GatewayTurnMCPMixin
 from gateway.run_turn_pending import _drain_leftover_steer
 from gateway.run_loop_wake import GatewayLoopWakeMixin
 from gateway.run_turn_persistence import GatewayTurnPersistenceMixin, _acp_launch
@@ -47,7 +49,7 @@ from gateway.response_filters import (
 from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted, diagnostic_wake_muted
 from gateway.zero_cut_handover_drain import handover_runs_followups
 from gateway.session import (
-    SessionSource, _session_key_namespace, build_channel_continuity_note,
+    SessionSource, build_channel_continuity_note,
     build_session_context,
 )
 from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
@@ -60,9 +62,8 @@ from gateway.run_turn_bubble_cleanup import settle_turn_senders
 from gateway.run_turn_final_reconcile import edit_streamed_message, owns_reconcilable_preview
 from gateway.turn_context import _GATEWAY_SILENCE_RETRY_NOTE, TurnContext, TurnWorker
 from gateway.turn_lease import DEFAULT_LEASE_WAIT
-from hermes_constants import get_hermes_home_override
-from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
+from pathlib import Path
 from utils import base_url_hostname
 
 if TYPE_CHECKING:  # string annotations only; never imported at runtime (cycle)
@@ -201,7 +202,14 @@ from gateway.run_background import GatewayBackgroundMixin
 from gateway.run_turn_hygiene import GatewayTurnHygieneMixin
 
 
-class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, GatewayTurnPersistenceMixin):
+class GatewayTurnMixin(
+    GatewayLoopWakeMixin,
+    GatewayBackgroundMixin,
+    GatewayTurnPrepareMixin,
+    GatewayTurnHygieneMixin,
+    GatewayTurnPersistenceMixin,
+    GatewayTurnMCPMixin,
+):
     """Agent-turn execution for GatewayRunner (see module docstring)."""
 
 
@@ -1485,117 +1493,6 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
         enabled = self._resolve_enabled_toolsets_for_source(user_config, source, platform_key)
         disabled = parse_config_string_list((user_config.get("agent") or {}).get("disabled_toolsets")) or None
         return enabled, disabled
-
-
-
-    def _mcp_reload_refresh_cached_agents(self, multiplex: bool, profile) -> None:
-        """Refresh cached agents so existing sessions see new MCP tools on their next turn without
-        a history-destroying ``/new``. Each agent keeps its build-time toolset selection EXACTLY: a
-        session built with restricted enabled_toolsets (e.g. ["safe"]) must NOT silently gain tools."""
-        try:
-            from tools.mcp_tool_agent import refresh_agent_mcp_tools
-            _cache = getattr(self, "_agent_cache", None)
-            _cache_lock = getattr(self, "_agent_cache_lock", None)
-            if _cache_lock is None or not _cache:
-                return
-            # Multiplex: only this profile's sessions (another profile's agent would get this registry).
-            _ns_prefix = _session_key_namespace(profile) + ":" if multiplex else None
-            with _cache_lock:
-                for _sess_key, _entry in list(_cache.items()):
-                    if _ns_prefix and not str(_sess_key).startswith(_ns_prefix):
-                        continue
-                    _agent = _entry[0] if isinstance(_entry, tuple) else _entry
-                    if _agent is not None:
-                        refresh_agent_mcp_tools(_agent, quiet_mode=True)
-        except Exception as _exc:
-            logger.debug("Failed to update cached agent tools after MCP reload: %s", _exc)
-
-    async def _execute_mcp_reload(self, event: MessageEvent) -> str:
-        """Disconnect, reconnect, and notify MCP tool changes (shared by button / text / no-confirm paths).
-
-        Under multiplex the reload runs inside the requesting profile's runtime scope (entered here
-        when the caller did not) and only that profile's servers are torn down and rediscovered.
-
-        See #95518.
-        """
-        from gateway.run import _profile_runtime_scope
-        multiplex = bool(getattr(self.config, "multiplex_profiles", False))
-        if multiplex and not get_hermes_home_override():
-            profile_home = self._resolve_profile_home_for_source(event.source)
-            with _profile_runtime_scope(Path(profile_home)):
-                return await self._execute_mcp_reload(event)
-        try:
-            from tools.mcp_tool_lifecycle import shutdown_mcp_servers
-            from tools.mcp_tool_discovery import discover_mcp_tools
-            from tools.mcp_tool import _servers, _lock, _server_visible_in_scope
-            from tools.mcp_tool_agent import reprobe_tool_availability
-            from tools.mcp_tool_scope import _key_name
-            from tools.registry import registry
-
-            reload_scope = registry.current_scope_key() if multiplex else None
-
-            def _scoped_server_names() -> set:
-                with _lock:
-                    return {
-                        _key_name(key) for key in _servers
-                        if _server_visible_in_scope(key, reload_scope)
-                    }
-
-            old_servers = _scoped_server_names()
-            await self._run_in_executor_with_context(lambda: shutdown_mcp_servers(scope=reload_scope))
-            # Explicit reload also re-probes tool availability (check_fn).
-            reprobe_tool_availability()
-            # Reconnect by discovering tools (reads config.yaml fresh). A chat command cannot finish
-            # a browser OAuth flow either: an expired token parks with a `hermes mcp login` hint.
-            from tools.mcp_oauth import suppress_interactive_oauth
-            with suppress_interactive_oauth():
-                new_tools = await self._run_in_executor_with_context(discover_mcp_tools)
-
-            connected_servers = _scoped_server_names()
-            if reload_scope is not None:
-                from tools.mcp_tool import _mcp_tool_server_names
-                with _lock:
-                    new_tools = [n for n in new_tools if _mcp_tool_server_names.get(n) in connected_servers]
-            # (label, i18n key, names); i18n lines list reconnected first, the injected note added first.
-            changes = (
-                ("Reconnected", "gateway.reload_mcp.reconnected", connected_servers & old_servers),
-                ("Added", "gateway.reload_mcp.added", connected_servers - old_servers),
-                ("Removed", "gateway.reload_mcp.removed", old_servers - connected_servers),
-            )
-            lines = [t("gateway.reload_mcp.header")] + [
-                t(key, names=", ".join(sorted(names))) for _label, key, names in changes if names
-            ]
-            from tools.mcp_tool_discovery import mcp_servers_not_connected
-            failed = await self._run_in_executor_with_context(mcp_servers_not_connected)
-            if not connected_servers:
-                lines.append(t("gateway.reload_mcp.none_connected"))
-            else:
-                lines.append(t("gateway.reload_mcp.tools_available", tools=len(new_tools), servers=len(connected_servers)))
-            if failed:  # a configured server that did not connect is named, never passed over as success
-                lines.append(t("gateway.reload_mcp.failed", error=f"did not connect: {', '.join(failed)}"))
-
-            self._mcp_reload_refresh_cached_agents(multiplex, event.source.profile)
-
-            # Append a note at the END of the history (preserves the prompt-cache prefix).
-            change_parts = [
-                f"{label} servers: {', '.join(sorted(names))}"
-                for label, _key, names in (changes[1], changes[2], changes[0]) if names
-            ]
-            tool_summary = f"{len(new_tools)} MCP tool(s) now available" if new_tools else "No MCP tools available"
-            change_detail = ". ".join(change_parts) + ". " if change_parts else ""
-            reload_msg = {
-                "role": "user",
-                "content": f"[IMPORTANT: MCP servers have been reloaded. {change_detail}{tool_summary}. The tool list for this conversation has been updated accordingly.]",
-            }
-            with suppress(Exception):  # Best-effort; don't fail the reload over a transcript write
-                session_entry = await self.async_session_store.get_or_create_session(event.source)
-                await self.async_session_store.append_to_transcript(session_entry.session_id, reload_msg)
-
-            return "\n".join(lines)
-
-        except Exception as e:
-            logger.warning("MCP reload failed: %s", e)
-            return t("gateway.reload_mcp.failed", error=e)
 
     def _get_proxy_url(self) -> Optional[str]:
         """Proxy URL if proxy mode is configured (GATEWAY_PROXY_URL env wins over ``gateway.proxy_url``).
@@ -2966,11 +2863,11 @@ class GatewayTurnMixin(GatewayLoopWakeMixin, GatewayBackgroundMixin, GatewayTurn
                         _hook_adapter, pending_event, "on_processing_complete", ProcessingOutcome.SUCCESS)
                     return result
 
-            # Each drained follow-up is its own turn: bind its origin, not the chain head's.
-            # Event-less interrupt/steer text continues the turn it follows, so it keeps that origin.
+            # Eventless follow-ups are human input: the drain discards control interrupts and
+            # carries late steers as text. Only a queued event can supply a background origin.
             _head_origin = bound_turn_origin()
+            set_turn_origin(turn_origin_for_event(pending_event) if pending_event is not None else "user")
             if pending_event is not None:
-                set_turn_origin(turn_origin_for_event(pending_event))
                 # In-band turns bypass the inbound slot claim. Keep the conversation clock on
                 # the latest actual input, like its terminal goal identity; never restore the head.
                 self._session_state(next_session_key).conversation.last_turn_started_at = time.time()

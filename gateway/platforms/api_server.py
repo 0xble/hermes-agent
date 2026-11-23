@@ -32,7 +32,6 @@ from gateway.startup_timeouts import startup_restore_drain_timeout_secs
 # distinct from None (no prefix / multiplexing off -> default profile).
 _PROFILE_REJECTED = object()
 
-
 def _prefix_names_served_profile(profile: str) -> bool:
     """True when a /p/<profile>/ prefix names the profile this gateway serves. Fail closed: a
     single-profile gateway answering /p/<x>/ served the owner's toolsets under another URL."""
@@ -149,7 +148,7 @@ from gateway.platforms.api_server_run_idempotency import RunIdempotencyStore
 from gateway.platforms.api_server_response_store import ResponseStore
 from agent.i18n import t
 from agent.redact import redact_sensitive_text
-from agent.interrupt_compat import request_hard_interrupt
+from agent.interrupt_compat import request_hard_interrupt, request_soft_interrupt
 from gateway.readiness import collect_runtime_readiness
 from gateway.browser_control_artifacts import (
     ArtifactError, ArtifactRateLimiter, ArtifactStore, ArtifactTooLarge, DEFAULT_ALLOWED_MIME_TYPES,
@@ -2342,8 +2341,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         if model_pinned:
             agent_kwargs["model_pinned"] = True
         agent = AIAgent(**agent_kwargs)
+        # Preserve the release's typed primary-auth failure attachment while retaining live's
+        # conditional preflight fallback semantics for unpinned API requests.
         attach_primary_auth_failure(agent, failure_for_route(_primary_auth_failure, resolved_route, runtime_kwargs))
-        agent._preflight_fallback = None if model_pinned else preflight_fallback
+        if preflight_fallback is not None and not model_pinned:
+            agent._preflight_fallback = preflight_fallback
         route_source = (
             "session_model_lock" if confirmed_runtime_lock
             else "session_model_override" if session_override
@@ -3735,7 +3737,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                     await task
             return
         with suppress(Exception):
-            agent.interrupt(interrupt_message)
+            request_soft_interrupt(agent, interrupt_message, interrupt_source="system")
         if not task.done():
             with suppress(Exception):
                 await (asyncio.shield(task) if shield_wait else task)

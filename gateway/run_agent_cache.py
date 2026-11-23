@@ -276,12 +276,16 @@ class GatewayAgentCacheMixin:
 
     async def _rehydrate_session_model_override_async(self, session_key: str) -> None:
         """Serialize restart hydration with route edits, publishing only on the loop."""
-        from gateway.session_store_async import run_store_lookup
         async with self._session_model_override_lock(session_key):
-            if self._session_model_override(session_key) is None:
-                epoch = self._session_model_override_epoch(session_key)
-                loaded = await run_store_lookup(self, "_load_session_model_override", session_key)
-                self._commit_session_model_override(session_key, loaded, epoch)
+            await self._rehydrate_session_model_override_locked_async(session_key)
+
+    async def _rehydrate_session_model_override_locked_async(self, session_key: str) -> None:
+        """Hydrate an override while the caller already owns its route lock."""
+        if self._session_model_override(session_key) is None:
+            from gateway.session_store_async import run_store_lookup
+            epoch = self._session_model_override_epoch(session_key)
+            loaded = await run_store_lookup(self, "_load_session_model_override", session_key)
+            self._commit_session_model_override(session_key, loaded, epoch)
 
     def _rehydrate_session_model_override(self, session_key: str) -> None:
         """Synchronous callers retain lazy restoration, using the same fenced commit.

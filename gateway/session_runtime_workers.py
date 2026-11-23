@@ -18,8 +18,11 @@ def uncounted_runtime_work(runner):
     authorities = all_authorities(runner)
     managed = sum(not worker.closed.is_set() for authority in authorities
                   for worker in getattr(authority, '_managed_workers', {}).values())
-    return (managed + sum(live.route not in running and sid not in getattr(authority, '_managed_workers', {})
-                for authority in authorities for sid, live, _ in executing_sessions(authority))
+    # Stream execution stamps clear before outbound delivery. The existing FIFO
+    # drain task still owns that send, so count it through its final await.
+    return (managed + sum(live.task is not None and not live.task.done()
+                and live.route not in running and sid not in getattr(authority, '_managed_workers', {})
+                for authority in authorities for sid, live in authority.sessions.items())
             + sum(len(mutation_tasks(authority)) + len(side_agents(authority)) for authority in authorities))
 
 
@@ -82,7 +85,7 @@ def interrupt_side_agents(runner, reason):
     for authority in all_authorities(runner):
         for _, holder in side_agents(authority):
             if holder and holder[0] is not None:
-                count += bool(request_hard_interrupt(holder[0], reason))
+                count += bool(request_hard_interrupt(holder[0], reason, interrupt_source="system"))
     return count
 
 
@@ -204,7 +207,7 @@ def stop_authority_work(authority):
     stop_authority_turns(authority, in_process=True)
     for _, holder in [*physical_workers(authority), *side_agents(authority)]:
         if holder and holder[0] is not None:
-            request_hard_interrupt(holder[0], 'Profile runtime is stopping')
+            request_hard_interrupt(holder[0], 'Profile runtime is stopping', interrupt_source="system")
     for cancel in getattr(authority, '_cron_cancellations', {}).values():
         cancel.set()
 

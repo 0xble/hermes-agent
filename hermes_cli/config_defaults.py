@@ -1350,6 +1350,7 @@ DEFAULT_CONFIG = {
         # Delegated children's fallback chain (top-level entry format). Unpinned child: null = inherit the
         # parent chain, [] = disable. A child pinned by provider, endpoint or model gets none unless declared.
         "fallback_providers": None,
+        "allow_billing_fallback": False,  # Pinned children may cross fallback models on billing exhaustion.
         # Subagent/cron/side-agent runs retry transient errors on the same route this long before fallback; 0 = no wait.
         "fallback": {"transient_retry_window_seconds": 180.0},
         "base_url": "",  # direct OpenAI-compatible endpoint for subagents
@@ -1875,6 +1876,7 @@ DEFAULT_CONFIG = {
         # null inherits the global fallback chain; [] disables cron fallback.
         # An explicit provider/model list replaces the global chain for cron only.
         "fallback_providers": None,
+        "allow_billing_fallback": False,  # Pinned cron jobs may cross fallback models on billing exhaustion.
         # Cron SCHEDULER provider (WHEN a due job fires). "" = built-in in-process 60s ticker. Name
         # an installed provider (plugins/cron_providers/<name>/ or $HERMES_HOME/plugins/ <name>/),
         # e.g. "chronos" (NAS-mediated managed cron for scale-to-zero). An unknown or unavailable
@@ -2164,14 +2166,11 @@ DEFAULT_CONFIG = {
     # Native hosted-room Discussion ceilings, shared by all members per discussion.
     # Positive integers only (no unlimited/0). Read from the root owner's config at service
     # startup for all hosted rooms; restart the owning service after changing them.
-    "hosted_rooms": {
-        "discussion": {
-            "max_rounds": 3,
-            "max_messages": 10,
-        },
-    },
+    "hosted_rooms": {"discussion": {"max_rounds": 3, "max_messages": 10}},
     "gateway": {  # Gateway settings (messaging platforms: Telegram, Discord, Slack, ...).
         "zero_cut_handover": {"enabled": False},
+        # Answer messages that arrived while a platform was disconnected (Slack DMs and @-mentions).
+        "missed_inbound_recovery": {"enabled": True},
         "unmanaged_idle_exit_seconds": 600,  # client-auto-started gateway only; 0 disables
         "guardian": {
             "enabled": False,
@@ -2800,9 +2799,7 @@ DEFAULT_CONFIG = {
     "_config_version": 54,  # Config schema version - bump this when adding new required fields
 }
 
-
 from hermes_cli.config_defaults_env import OptionalEnvVars, _base_url, _env, _msg, _prov, _setting, _skill, _tool
-
 
 # Optional environment variables that enhance functionality. Feeds the dashboard keys page and setup
 # checklists; category: provider|tool|skill|messaging|setting, advanced=True hides from checklists,

@@ -42,7 +42,7 @@ def _reviewing(live):
     return run is not None and not run.request_done.is_set()
 
 
-def retire_idle(authority, session_id, live, target):
+async def retire_idle(authority, session_id, live, target):
     """Drop *live* when nothing pins it. Called with no await since the last check before it, and
     with none inside: the FIFO read below and the removal are one step on the loop. Input committed
     before that read shows as a queued row (or a worker as registered) and keeps the session; input
@@ -51,7 +51,7 @@ def retire_idle(authority, session_id, live, target):
     if _pinned(authority, session_id, live):
         return False
     from gateway.session_viewer_close import _busy
-    if _busy(authority, session_id, target):
+    if await asyncio.to_thread(_busy, authority, session_id, target):
         return False
     del authority.sessions[session_id]
     authority.launch_sources.pop(session_id, None)  # a cache: re-read from the row on demand
@@ -61,33 +61,35 @@ def retire_idle(authority, session_id, live, target):
     return True
 
 
-def retire_closed(authority, session_id, live, target, idle_stamp):
+async def retire_closed(authority, session_id, live, target, idle_stamp):
     """A closed local conversation nobody views and nothing runs in. A turn claimed since the close
     found the FIFO idle (*idle_stamp* replaced) reopened its row: it stays. A close whose retirement a
     running drain pinned is retired by that drain's idle exit (``retire_at_idle``)."""
     live.closed_stamp = (idle_stamp,)
     if live.event_stream.execution is not idle_stamp:
         return False
-    return retire_idle(authority, session_id, live, target)
+    return await retire_idle(authority, session_id, live, target)
 
 
-def retire_at_idle(authority, ref, live):
+async def retire_at_idle(authority, ref, live):
     """The drain's idle exit: an API conversation between requests, or a closed local one whose
     close ran while this drain was alive."""
     platform = live.source.platform if live.source is not None else None
     if platform == Platform.API_SERVER:
-        return retire_idle(authority, ref.session_id, live, authority.physical_target(ref))
+        target = await asyncio.to_thread(authority.physical_target, ref)
+        return await retire_idle(authority, ref.session_id, live, target)
     stamp = live.closed_stamp
     if platform == Platform.LOCAL and stamp is not None and stamp[0] is live.event_stream.execution:
         from gateway.session_viewer_close import _physical_target
-        return retire_idle(authority, ref.session_id, live, _physical_target(authority, ref.session_id))
+        target = await asyncio.to_thread(_physical_target, authority, ref.session_id)
+        return await retire_idle(authority, ref.session_id, live, target)
     return False
 
 
-def retire_after_review(authority, ref, live):
+async def retire_after_review(authority, ref, live):
     """A cold ``/refine`` review ended (loop side): a close it pinned retires the conversation now."""
     if authority.sessions.get(ref.session_id) is live and live.closed_stamp is not None:
-        retire_at_idle(authority, ref, live)
+        await retire_at_idle(authority, ref, live)
 
 
 def restore_retired(authority, session_id):
@@ -124,20 +126,23 @@ def touch_restored(authority, session_id):
         if LISTING_READ.get():
             return
         live.retire_timer.cancel()
-    live.retire_timer = loop.call_later(RESTORED_IDLE_S, _retire_restored, authority, session_id, live)
+    live.retire_timer = loop.call_later(
+        RESTORED_IDLE_S,
+        lambda: asyncio.create_task(_retire_restored(authority, session_id, live)),
+    )
 
 
-def _retire_restored(authority, session_id, live):
+async def _retire_restored(authority, session_id, live):
     live.retire_timer = None
     if authority.sessions.get(session_id) is not live or live.subscribers or live.source is None:
         return  # deleted or restored anew, or watched: that viewer's close retires it
     from gateway.session_contract import SessionRef
     if live.source.platform == Platform.API_SERVER:
-        target = authority.physical_target(SessionRef(authority.profile_id, session_id))
+        target = await asyncio.to_thread(authority.physical_target, SessionRef(authority.profile_id, session_id))
     else:
         from gateway.session_viewer_close import _physical_target
-        target = _physical_target(authority, session_id)
-    if not retire_idle(authority, session_id, live, target):
+        target = await asyncio.to_thread(_physical_target, authority, session_id)
+    if not await retire_idle(authority, session_id, live, target):
         touch_restored(authority, session_id)  # running work pins it: check again later
 
 

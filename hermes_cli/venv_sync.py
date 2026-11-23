@@ -130,7 +130,7 @@ def sync(project_root: Path | None = None, *, check: bool = False) -> dict:
         return {"state": "failed", "ok": False, "detail": str(exc)}
 
 
-def collect_superseded_generations(project_root: Path) -> None:
+def collect_superseded_generations(project_root: Path, *, include_test_environment: bool = False) -> None:
     """Collect what a publish just superseded, as the Docker boot already does.
 
     Without this only a manual `hermes pm gc` reclaimed old environments. Safe
@@ -142,11 +142,15 @@ def collect_superseded_generations(project_root: Path) -> None:
     from hermes_cli.runtime_state import collect_generations
     from pm.environments import install_state_dir
     from pm.install_gc import collect_install_orphans
+    from pm.operations import collect_environment_generations
     from pm.runtime import collect_runtime_generations
+    from pm.testenv import testenv_root
 
     try:
         removed = collect_generations(project_root) + collect_runtime_generations(
             install_state_dir(project_root) / "pm-runtime")
+        if include_test_environment:
+            removed += collect_environment_generations(testenv_root(project_root), keep_previous=1)
         removed += collect_install_orphans((project_root,))
     except (OSError, ValueError) as exc:
         # Reclaiming space must never turn a committed update into a failure.

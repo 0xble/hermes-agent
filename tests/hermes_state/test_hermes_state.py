@@ -4074,10 +4074,6 @@ class TestOptimizeFts:
         assert any("VALUES('usermerge', 2)" in sql for sql in statements)
         assert not any("'optimize'" in sql for sql in statements)
 
-
-
-
-
     def test_write_path_merges_fts_only_at_cadence_boundary(self, db, monkeypatch):
         """Routine writes use bounded merge and never full optimize."""
         db._FTS_MERGE_EVERY_N_WRITES = 5

@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import contextlib
 import json
 import logging
+import os
 import ssl
 import time
 from typing import Any, Dict, Optional
@@ -28,6 +29,33 @@ from agent.turn_recovery import (
 )
 
 logger = logging.getLogger("agent.conversation_loop")
+
+
+def _is_pooled_proxy_route(agent: Any) -> bool:
+    """Return true only for a named, explicitly opted-in CLIProxyAPI route.
+
+    ``proxy_request_class`` owns the existing route detection used for the
+    CLIProxyAPI scheduling header. Reusing it avoids treating arbitrary custom
+    gateways or direct provider URLs as credential pools.
+    """
+    try:
+        from agent.proxy_request_class import _enabled_for_route
+        provider = getattr(agent, "requested_provider", "") or getattr(agent, "provider", "") or ""
+        base_url = str(getattr(agent, "base_url", "") or "")
+        return bool(_enabled_for_route(provider, base_url))
+    except (ImportError, AttributeError, TypeError, ValueError):
+        logger.debug("Unable to identify pooled proxy route", exc_info=True)
+        return False
+
+
+def _notify_billing_exhausted(agent: Any, classified: Any) -> None:
+    """Notify unattended callers only after retries and fallback have been exhausted."""
+    if classified.reason != FailoverReason.billing or os.environ.get("HERMES_TEST_ISOLATION"):
+        return
+    if getattr(agent, "platform", "") not in {"subagent", "cron"}:
+        return
+    from agent.billing_notice import notify_provider_out_of_credits
+    notify_provider_out_of_credits(getattr(agent, "requested_provider", "") or getattr(agent, "provider", ""))
 
 
 @dataclass
@@ -157,6 +185,18 @@ def handle_api_error(
         retry_count=retry_count, max_retries=max_retries, retryable=classified.retryable,
         reason=classified.reason.value,
     )
+
+    # A CLIProxyAPI pool may select a healthy credential on the next request. Retry
+    # the exact route once before the normal billing/fallback path; this does not
+    # relax the same-model pin and is deliberately excluded for direct providers.
+    if (
+        classified.reason == FailoverReason.billing
+        and not _retry.pooled_proxy_billing_retry_attempted
+        and _is_pooled_proxy_route(agent)
+    ):
+        _retry.pooled_proxy_billing_retry_attempted = True
+        logger.info("billing error from pooled proxy, retrying once on same route")
+        return _verdict("continue")
 
     if getattr(agent, "_turn_independent_attempt_active", False) is True:
         from agent.fallback_endpoint_domain import note_endpoint_failure
@@ -441,6 +481,7 @@ def settle_unrecovered_error(
                 retry_count = compression_attempts = 0
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
+        _notify_billing_exhausted(agent, classified)
         _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", nonretryable_client_error_result(
@@ -516,6 +557,7 @@ def settle_unrecovered_error(
             elif _ladder["action"] == "return":
                 _settle_primary_exit()
             return _verdict(_ladder["action"], _ladder.get("result"))
+        _notify_billing_exhausted(agent, classified)
         _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", max_retries_exhausted_result(

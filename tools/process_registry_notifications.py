@@ -789,3 +789,14 @@ def format_process_notification(evt: dict) -> "str | None":
     if payload is not None and evt.get("node"):
         payload += f"\nExecution node: {evt['node']} (SSH: {evt.get('ssh', '?')})"
     return f"{payload}\n{PROCESS_NOTIFICATION_END}" if payload is not None else None
+
+
+def promote_to_completion_notice(registry, session) -> None:
+    """Promote a watched job to one completion notice and give it the normal owner."""
+    session.notify_on_complete = True
+    if not session.watcher_platform or session.watcher_interval:
+        return
+    # Direct completion requests use this registration path too. Keep the
+    # import lazy to avoid the registry/tool import cycle at startup.
+    from tools.terminal_tool_background import _register_completion_watcher
+    _register_completion_watcher(registry, session, session.session_key)

@@ -422,7 +422,7 @@ _CONTROL_STATE: dict[str, Any] = {
     # Interrupts. Hard cancellation is separate from redirect/message state; the Event makes
     # the cause atomic for auxiliary stream pollers.
     "_interrupt_requested": False,
-    "_interrupt_message": None,  # optional message that triggered the interrupt
+    "_interrupt_message": None, "_interrupt_source": None,  # trigger text; system/user provenance
     "_hard_interrupt_requested": threading.Event,
     "_execution_thread_id": None,  # set at run_conversation() start
     "_interrupt_thread_signal_pending": False,
@@ -2109,7 +2109,7 @@ def init_agent(
     skip_background_review: bool = False, session_db=None, parent_session_id: str | None = None,
     iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
     fallback_model: dict[str, Any] | None = None, model_pinned: bool = False, credential_pool=None, checkpoints_enabled: bool = False,
-    checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
+    fallback_chain_owned: bool = False, allow_billing_fallback: bool = False, checkpoint_max_snapshots: int = 20, checkpoint_max_total_size_mb: int = 500,
     checkpoint_max_file_size_mb: int = 10, pass_session_id: bool = False,
     requested_provider: str | None = None, capabilities: Optional[dict[str, bool]] = None, cwd: Optional[str] = None,
     side_agent: bool = False, memory_manager=None, memory_agent_context: str | None = None,
@@ -2191,7 +2191,7 @@ def init_agent(
     _init_prompt_cache_config(agent)
     _init_turn_state(agent, run_budget_seconds)
     _set_defaults(agent, _STREAM_STATE)
-    fallback_chain = _pin_init_fallbacks(agent, fallback_model, model_pinned)
+    fallback_chain = _pin_init_fallbacks(agent, fallback_model, model_pinned, fallback_chain_owned)
     _build_client(agent, api_key, base_url, fallback_chain)
     _init_fallback_chain(agent, fallback_chain)
     _load_tools(agent, enabled_toolsets, disabled_toolsets)

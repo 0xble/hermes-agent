@@ -67,6 +67,8 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 
 | Unit | Required behavior | Load when | Contract |
 |---|---|---|---|
+| Async delegation origin route | Detached delegation captures the complete originating message route so completion delivery stays in the asking thread | Async delegation dispatch, completion routing or thread metadata changes | [Patch register](references/maintenance/operations/patch.md#async-delegation-origin-route) |
+| Delegated billing fallback | Pinned delegated and cron runs may use configured cross-model fallbacks on billing exhaustion and emit one provider/day notice | Delegation or cron fallback policy, billing classification or provider-credit notices | [Patch register](references/maintenance/operations/patch.md#delegated-billing-fallback) |
 | Shared fallback endpoint domain | Skip aliases of a proven dead socket for one turn while preserving one bounded independent-domain request at the switch cap | Fallback identity, connection classification, restart limits, terminal copy | [Shared fallback endpoint domain](maintenance/fallback-endpoint-domain.md) |
 | Named remote computer use | Keep shared node identities, no fallback, native images and node-bound terminal/file/process state | Shared node resolution, named execution/file safety, remote process persistence, computer-use provider dispatch, doctor or CuaDriver transport changes | [Named remote computer use](maintenance/remote-computer-use.md) |
 | Native notice delivery | Same-turn host notices preserve complete tool receipts, pairing, cache prefixes and replay provenance | Notice delivery, steer continuations, persistence or provider conversion changes | [Native notice delivery](maintenance/native-notice-delivery.md) |
@@ -88,6 +90,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Busy turn queue | Preserve admitted user input across same-key generation overlap and session-lease contention | Gateway lease waits, generation cleanup or pending-input recovery changes | [Busy turn queue](maintenance/busy-turn-queue.md) |
 | Delivered steer observer | Give native mid-turn insertions a stable plugin delivery identity | Steer insertion, turn identity or plugin lifecycle changes | [Steer delivery observer](maintenance/steer-delivery-observer.md) |
 | Turn-origin provenance | Give plugins and session context a default-deny per-turn provenance value | Gateway turn identity, plugin hook context, or session environment changes | [Turn-origin provenance](maintenance/turn-origin-provenance.md) |
+| Proxy request class | Attach turn priority only to opted-in CLIProxyAPI routes | Turn provenance, provider request assembly, auxiliary route identity, or HTTP redirects | [Proxy request class](maintenance/proxy-request-class.md) |
 | Fork CI | Reproducible patch proof surfaces, hermetic Git fixtures, and complete-suite access on bounded runners | CI, test harness, Git fixture, proof-surface, or startup capability-read changes | [Fork CI](maintenance/fork-ci.md), [startup capability reads](maintenance/startup-capability-reads.md) |
 | Rejected preflight input | Archive rejected asks without growing oversized model history | Turn-start compression rejection or archived message append changes | [Rejected preflight input archive](maintenance/preflight-input-archive.md) |
 | Queued metrics consent | Honor owning-profile revocation during asynchronous persistence | Relay subscriber delivery, consent or exit-flush changes | [Queued metrics consent](maintenance/queued-metrics-consent.md) |
@@ -181,6 +184,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | State.db prune lock batching | Automatic and operator session prunes delete only in the deletion window (operator override `--now`), one pass per store, in short paced transactions without full receipt scans, with actionable long-lock diagnostics | Session auto-prune, retention maintenance, SQLite write-lock diagnostics, or pruning regressions | [State.db prune lock batching](maintenance/state-db-prune-lock-batching.md) |
 | Session admission adoption index | Worker adoption probes only `started`/`unknown` admissions through a partial index, keeping terminal admission history out of the write transaction's candidate scan | `adopt_worker_execution`, `_linked_worker_admission`, session-admission schema indexes, or adoption-plan regressions | [Session admission adoption index](maintenance/session-admission-adoption-index.md) |
 | State write-lock hold indexes | Receipt handoff and held-media writer scans use plan-pinned indexes, while session-row prompt cleanup targets only the newly inserted hash | Local receipt handoff, held-media collection, prompt cleanup, or state.db write-lock plan regressions | [State write-lock hold indexes](maintenance/state-write-lock-hold-indexes.md) |
+| FTS writer-side automatic merge | Keep SQLite FTS5 segment merges off response-critical message-trigger writes while bounded maintenance merges preserve eventual index maintenance | FTS schema setup, FTS5 merge policy, or state.db writer-lock regressions | [FTS writer-side automatic merge](maintenance/fts-writer-automerge.md) |
 | Desktop idle session refresh cost | Bound metadata serialization and preview projection without changing polling or session-list semantics | Change watcher signatures, preview SQL or recent session-list queries | [Desktop idle CPU](maintenance/desktop-idle-cpu.md) |
 | Gateway scan poll | Reuse skills-tree signatures for a few seconds instead of walking them on every prompt or lookup. config.yaml stays signature-checked on every load | Skills manifest walks or catalog signatures on a hot path | [Gateway scan poll](maintenance/gateway-scan-poll.md) |
 | Desktop core completion recovery | Preserve local completion admission and live subscriptions across socket replacement | Local-source admission, canonical replay/attach or Desktop active-list settlement changes | [Desktop core recovery](maintenance/desktop-core-completion-recovery.md) |
@@ -195,6 +199,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Background turn admission | Cap running turns nobody typed (restart resumes, goal/loop wakes, completions) gateway-wide, never gate typed input, and refuse rather than drop queued wakes on drain | Wake admission, restart resume scheduling, the replay scheduler, or `gateway.background_turn_concurrency` | [Background turn admission](maintenance/background-turn-admission.md) |
 | Restart notices | Scope shutdown notices to conversation lanes, preserve interim streams, and describe the actual resume policy | Shutdown advisories, home-channel broadcast, or restart notice wording | [Restart notices](maintenance/restart-notices.md) |
 | Bounded restart shutdown | Retain unverifiable survivors, signal active workers before scope cleanup, and refresh escaped descendants before escalation | Process-registry bounded shutdown, detached identity, or systemd scope cleanup changes | [Bounded terminal shutdown](maintenance/seamless-restart.md) |
+| Missed inbound recovery | Slack DMs and @-mentions sent while the platform was disconnected are answered late through the live inbound handler, once, behind `gateway.missed_inbound_recovery.enabled` | The recovery module, its `state_meta` watermark or claims, the Slack scan, or the Slack inbound prefilter, accept point or Socket Mode restart | [Missed inbound recovery](maintenance/missed-inbound-recovery.md) |
 | Zero-cut gateway handover | Design-only two-slot launchd handover behind `gateway.zero_cut_handover.enabled` (off); with the switch off, restart and shutdown behavior is unchanged | The handover flag, second launchd slot labels, standby readiness, or this design record | [Zero-cut gateway handover](maintenance/zero-cut-handover.md) |
 | Restart verification truth | Cover cron drain in the bounded observer wait, preserve outgoing inventory PIDs, and treat saved obligations as history | CLI update/restart wait, fleet snapshot, or pending warning changes | [Restart verification truth](maintenance/restart-verification-truth.md) |
 | Delegation restart drain | Planned restarts wait for live background delegations, and interrupted children report why they stopped | Restart wait, shutdown drain accounting, CLI exit-wait budget, or child interrupt reporting | [Delegation restart drain](maintenance/delegation-restart.md) |
@@ -296,6 +301,14 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Go write lint scope | Post-write lint for `.go` files checks syntax with `gofmt -e`, leaving type, vet and lint checks to package-level gates and the Go LSP | Post-write shell linters, Go lint commands, or LSP redundancy rules in `tools/file_operations_lint.py` | [Go write lint scope](maintenance/go-write-lint.md) |
 | Embedded cua-driver lifetime | Keep each `cua-driver serve --embedded` process and its `hc-` socket from outliving the Hermes process that spawned it, including macOS `open` detachment | Embedded daemon spawn, stop, session release, or gateway/CLI startup | [Embedded cua-driver lifetime](maintenance/cua-driver-lifetime.md) |
 
+## Active Patch Record: Release-bound launcher recovery
+
+- **Patch identity:** `release-launcher-stability`.
+- **Behavior:** Recovered commands from immutable releases use the install-bound runtime when the release has no local convenience launcher.
+- **Source surfaces:** `hermes_cli/_launchers.py` and `tests/hermes_cli/test_source_launcher_publication.py`.
+- **Retirement:** Remove when immutable release recovery persists only stable install-bound commands.
+- **Rollback:** Revert the commit carrying `Fork-Patch: release-launcher-stability`.
+
 ## Active Patch Record: Exa Lite Routing
 
 - **Patch identity:** `exa-lite-routing`.
@@ -313,6 +326,27 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `tests/tools/test_web_exa_lite_routing.py::test_search_hits_carry_exa_preview_images`.
 - **Retirement:** Remove when upstream search results carry provider preview images.
 - **Rollback:** Revert the commit carrying `Fork-Patch: exa-result-images`.
+
+## Active Patch Record: FTS writer-side automatic merge
+
+- **Patch identity:** `fts-writer-automerge`.
+- **Behavior:** Disable SQLite FTS5 automatic segment merges for the shipped word and trigram indexes during message-trigger writes. The existing bounded maintenance merge path remains responsible for eventual segment maintenance outside the application writer guard.
+- **Source surfaces:** `hermes_state_fts.py`, `tests/hermes_state/test_hermes_state.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/hermes_state/test_hermes_state.py -k 'fts_automerge_is_disabled_for_writer_transactions or incremental_merge_bounded_commands_per_present_index'`.
+- **Contract tests:** `tests/hermes_state/test_fts_automerge.py`.
+- **Retirement:** Remove when upstream prevents automatic FTS5 merge work from running in the response-critical insert path while retaining bounded maintenance merges.
+- **Rollback:** Revert the commit carrying `Fork-Patch: fts-writer-automerge`.
+
+Fork-Patch-Backfill: 0f3af0ef0c43ad57eeedc58dd375566f83698699; gateway-transport-rebind
+
+## Active Patch Record: Native transport reference rebind
+
+- **Patch identity:** `gateway-transport-rebind`.
+- **Behavior:** Rebind an absent or dead native transport reference after adapter reconnect while still rejecting a live foreign adapter.
+- **Source surfaces:** `gateway/session_ingress_context.py`, `tests/gateway/test_retry_native_provenance.py`.
+- **Contract tests:** `tests/gateway/test_retry_native_provenance.py`.
+- **Retirement:** Remove when released upstream preserves the same authenticated adapter reconnect invariant.
+- **Rollback:** Revert the commit carrying `Fork-Patch: gateway-transport-rebind`.
 
 ## Active patch record: state.db prune lock batching
 
@@ -344,6 +378,13 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Retirement:** Remove when upstream covers inherited Ultrafast and equivalent per-response requested/served auditing, without silent paid fallback or losing explicit-override precedence.
 - **Rollback:** Revert the commit carrying `Fork-Patch: speed-tier-audit`.
 
+## Active Patch Record: Async delegation origin route
+
+- **Patch identity:** `async-delegation-origin-route`.
+- **Behavior:** Detached delegation captures the complete originating message route, including an explicit empty thread for top-level messages, so restored completions stay in the asking thread without inheriting stale topic state.
+- **Source surfaces:** `tools/async_delegation.py`, `tools/async_delegation_ledger.py`, `gateway/run_notifications_sources.py`.
+- **Rollback:** Revert commits carrying `Fork-Patch: async-delegation-origin-route`.
+
 ## Active patch record: resumable delegation retention
 
 - **Patch identity:** `resumable-delegation-retention`.
@@ -353,6 +394,14 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/tools/test_delegation_resume.py tests/gateway/test_delegation_auto_resume.py`.
 - **Retirement:** Remove this patch when upstream preserves resumable delegation rows through pruning and suppresses stale auto-resume notices at injection time.
 - **Rollback:** Revert the resumable-delegation-retention fix commit.
+
+## Active patch record: delegated billing fallback
+
+- **Patch identity:** `delegated-billing-fallback`.
+- **Behavior:** Pinned delegated and cron runs may use configured cross-model fallbacks on billing exhaustion, with one provider/day notice after retries and fallback activation are exhausted. Other failure reasons preserve the model pin.
+- **Source surfaces:** `agent/agent_init.py`, `agent/agent_init_fallback.py`, `agent/chat_completion_helpers.py`, `agent/route_binding.py`, `agent/billing_notice.py`, `tools/delegate_tool_config.py`, `cron/scheduler.py`, and `hermes_cli/config_defaults.py`.
+- **Retirement:** Remove when a released upstream implementation preserves cross-model billing fallback and provider/day notification behavior.
+- **Rollback:** Revert the commits carrying `Fork-Patch: delegated-billing-fallback`.
 
 ## Active patch record: edge silence markers (S1)
 
@@ -486,6 +535,16 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 - **Focused regression:** `scripts/run_tests.sh tests/plugins/test_telegram_first_poll_fast_ptb.py tests/plugins/test_telegram_polling_progress_ptb.py tests/gateway/test_telegram_polling_progress.py`.
 - **Retirement:** Remove when upstream or PTB proves first-poll health without an idle long poll. Review on any PTB 23+ upgrade (private `RequestParameter`).
 - **Rollback:** Revert the commit carrying `Fork-Patch: telegram-first-poll-health`.
+
+## Active patch record: missed inbound recovery
+
+- **Patch identity:** `missed-inbound-recovery`.
+- **Behavior:** When a platform connects, the messages people sent it during the offline interval are fetched and handed to the adapter's own inbound handler with a late note, so authorization, mention rules, gating, session routing and threading are those of a live message. The interval runs from a per-platform last-connected watermark to the reconnect, capped at 24 hours. Each message is claimed in `state_meta` before dispatch and the claim is never released. At most 20 messages are dispatched per scan. Overflow gets 1 summary line per conversation. Slack is the only adapter that implements the scan.
+- **Source surfaces:** `gateway/missed_inbound_recovery.py`, `hermes_state_missed_inbound.py`, `plugins/platforms/slack/adapter_missed_inbound.py`, the 4 hooks in `plugins/platforms/slack/adapter.py` (`_restart_socket_mode`, `_prefilter_inbound`, the accept point and the `handle_message` call in `_handle_slack_message`), `GatewayConfig.missed_inbound_recovery_enabled`, `_publish_primary_adapter` in `gateway/run_adapters.py`, and [Missed inbound recovery](maintenance/missed-inbound-recovery.md).
+- **Upstream status:** Upstream has no recovery of messages missed while a Socket Mode app was disconnected. No equivalent upstream fix found.
+- **Focused regression:** `scripts/run_tests.sh tests/gateway/test_missed_message_ack.py tests/plugins/platforms/slack/test_missed_message_ack.py`.
+- **Retirement:** Remove when upstream answers messages missed during a disconnect, or when Slack queues events for a disconnected Socket Mode app.
+- **Rollback:** Set `gateway.missed_inbound_recovery.enabled: false`, or revert the commit carrying `Fork-Patch: missed-inbound-recovery`. The `missed_inbound:*` rows in `state_meta` are inert without the code.
 
 ## Active patch record: update post-swap claim
 

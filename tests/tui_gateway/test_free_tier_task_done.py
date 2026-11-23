@@ -64,7 +64,7 @@ def test_disqualified_turns_record_nothing(result, anonymous, display_kind, user
 ], ids=["steer", "redirect"])
 def test_a_correction_rpc_during_the_task_disqualifies_it(method, params):
     """The session-level mark covers agents whose own flag never reaches this process (compute host)."""
-    agent = types.SimpleNamespace(anonymous=True, steer=lambda text: True, redirect=lambda text: True,
+    agent = types.SimpleNamespace(anonymous=True, steer=lambda text, **_kwargs: True, redirect=lambda text, **_kwargs: True,
                                   _supports_active_turn_redirect=True)
     server._sessions["sid"] = session = _session(agent=agent)
     try:
@@ -99,7 +99,7 @@ def test_prompt_submit_records_only_untouched_turns(monkeypatch, touch, recorded
         session_id = "k"
         _cached_system_prompt = ""
 
-        def steer(self, text):
+        def steer(self, text, *, human=True):
             return True
 
         def run_conversation(self, prompt, **kw):

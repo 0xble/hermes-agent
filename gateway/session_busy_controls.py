@@ -196,7 +196,8 @@ async def correct(connection, ref, params, *, verb):
             raise RuntimeStoreError('unsupported_control')
         # Accepted for this exact claim before its turn built an agent: steer_agent latches it for
         # the agent this generation adopts, never a later one.
-        agent, latched = authority.steer_agent(ref, generation, params['text'] if verb == 'steer' else None)
+        agent, latched = authority.steer_agent(ref, generation, params['text'] if verb == 'steer' else None,
+                                                human=params.get('human', True))
         if latched:
             return {'status': 'queued', 'text': params['text'], 'execution_generation': generation,
                     'authority_epoch': authority.epoch}
@@ -212,7 +213,7 @@ async def correct(connection, ref, params, *, verb):
         method = getattr(agent, verb, None)
         if not callable(method):
             raise RuntimeStoreError('execution_not_ready')
-        accepted = method(params['text'])
+        accepted = method(params['text'], human=params.get('human', True))
         return {'status': ({'steer': 'queued', 'redirect': 'redirected'}[verb] if accepted else 'rejected'),
                 'text': params['text'], 'execution_generation': generation,
                 'authority_epoch': authority.epoch}

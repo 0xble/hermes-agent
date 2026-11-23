@@ -6,6 +6,10 @@ Published commit `c016f92bbbca7b37162d17ac3384df47d181ae29` (PR #630) omitted it
 
 Fork-Patch-Backfill: adf8f9ace4f2f1c05c2230edef450a41edf71d06; zero-cut-handover
 
+Published commit `719277e593ab56e545a7ab3d3911017fdfc598fc` (PR #1364, stale native transport rebind) also omitted its trailer during squash merge; its source commit `a5b02e4fa102` carried `Fork-Patch: zero-cut-handover`.
+
+Fork-Patch-Backfill: 0f3af0ef0c43ad57eeedc58dd375566f83698699; zero-cut-handover
+
 **Status:** opt-in source implementation. This record does not activate or migrate
 a gateway. The design sections after the received-work repair are historical.
 

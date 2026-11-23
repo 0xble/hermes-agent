@@ -418,13 +418,16 @@ def _list_two_factor_metadata(backend, meta, origin: Optional[str], unambiguous:
     """Availability is a display hint, never fill or OTP authorization."""
     from agent.vault_backends.onepassword import OnePasswordLoginBackend
 
+    from agent.vault_store import origin_matches_lookup
+
     available = meta.has_otp
     entry = {}
     if meta.kind == "login":
         if not available and isinstance(backend, OnePasswordLoginBackend):
             available = backend.otp_availability(
                 meta.id, fetch=(origin is not None and unambiguous
-                                and origin in (meta.allowed_origins or (meta.origin,))))
+                                and any(origin_matches_lookup(saved_origin, origin, kind="login")
+                                        for saved_origin in (meta.allowed_origins or (meta.origin,)))))
         elif not available and backend.needs_unlock:
             available = None
         entry["otp_available"] = available
@@ -450,7 +453,7 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
     """
     from agent.vault_backends import enabled_backends
     from agent.vault_backends.unlock import can_prompt_here
-    from agent.vault_store import VaultError, normalize_origin
+    from agent.vault_store import VaultError, normalize_origin, origin_matches_lookup
 
     if kind is not None and kind not in ("login", "payment", "address", "protected_field"):
         return json.dumps({"success": False, "error_type": "invalid_kind", "error": "Unknown vault item kind."})
@@ -474,8 +477,10 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
             # matching cached logins, other filters, and unfiltered listings keep the quota-saving path.
             if (origin is not None and kind in (None, "login")
                     and (backend.name == "onepassword" or backend.name.startswith("onepassword@"))
-                    and not any(meta.kind == "login" and origin in (meta.allowed_origins or (meta.origin,))
-                                for meta in metas)):
+                    and not any(meta.kind == "login" and any(
+                        origin_matches_lookup(saved_origin, origin, kind=meta.kind)
+                        for saved_origin in (meta.allowed_origins or (meta.origin,))
+                    ) for meta in metas)):
                 from agent.vault_backends.onepassword import OnePasswordLoginBackend
                 if isinstance(backend, OnePasswordLoginBackend):
                     metas = apply_origin_aliases(backend.list_items(fresh=True))
@@ -485,6 +490,9 @@ def browser_vault_list(kind: Optional[str] = None, origin: Optional[str] = None)
         metas = [meta for meta in metas
                  if (kind is None or meta.kind == kind)
                  and (origin is None or not (meta.origin or meta.allowed_origins)
+                      or (meta.kind == "login"
+                          and any(origin_matches_lookup(saved_origin, origin, kind=meta.kind)
+                                  for saved_origin in (meta.allowed_origins or (meta.origin,))))
                       or origin in (meta.allowed_origins or (meta.origin,)))]
         # One origin-selected login may need a detail lookup. An unfiltered or
         # ambiguous listing must not turn into account-wide field reads.
@@ -610,6 +618,7 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, re
     from agent.vault_backends.base import MissingCredential
     from agent.vault_backends.unlock import can_prompt_here, get_code_prompt_callback
     from agent.vault_login_classifier import LoginControl, build_fill_js, build_inspection_js, build_otp_fills, classify_otp_controls
+    from agent.vault_store import origin_matches_lookup
 
     effective_task_id = task_id or "default"
     backend = backend_for_handle(handle) if handle else None
@@ -646,13 +655,15 @@ def browser_vault_enter_code(handle: str = "", task_id: Optional[str] = None, re
     origin = _current_page_origin(browser_key)
     if not origin:
         return json.dumps({"success": False, "error": "No page with a code field is open."})
-    if allowed is not None and origin not in allowed:
+    if allowed is not None and not any(origin_matches_lookup(saved, origin, kind="login") for saved in allowed):
         return json.dumps({"success": False, "error_type": "origin_mismatch",
                            "error": (f"Refused: current page origin ({origin}) does not match "
                                      f"the vault item's bound origin(s) ({', '.join(allowed)}).")})
     from agent.vault_origin_aliases import alias_domain_warning, alias_fill_confirmation_enabled
 
-    alias_only = allowed is not None and origin not in saved_origins
+    alias_only = allowed is not None and not any(
+        origin_matches_lookup(saved, origin, kind="login") for saved in saved_origins
+    )
     if alias_only:
         alias_key = _alias_fill_key(effective_task_id, handle, origin)
         decision = _alias_fill_decision(alias_key)
@@ -788,7 +799,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, remember: boo
     )
     from agent.vault_backends import UnlockRequired, backend_for_handle
     from agent.vault_backends.base import FILL_METADATA_NOT_APPLICABLE, FILL_METADATA_TTL_SECONDS
-    from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, VaultItemMeta, scrub_secret_from_text
+    from agent.vault_store import ADDRESS_FIELDS, PAYMENT_FIELDS, VaultItemMeta, origin_matches_lookup, scrub_secret_from_text
 
     effective_task_id = task_id or "default"
     # Pin ONE browser for the whole fill: the privacy check, inspection, write and redaction must
@@ -861,8 +872,9 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, remember: boo
     # ── Origin binding pre-check (cheap early exit; the authoritative check
     # runs synchronously inside the fill script itself) ──────────────────────
     # Manager items can bind several websites (e.g. amazon.co.uk + www.amazon.co.uk);
-    # every saved origin is a valid fill target. Matching stays exact-origin —
-    # nothing wildcard/parent-domain is ever inferred.
+    # every saved origin is a valid fill target. Login items may use the
+    # HTTP-to-HTTPS same-host/port upgrade; other kinds stay exact-origin.
+    # Nothing wildcard/parent-domain is ever inferred.
     allowed = list(meta.allowed_origins) or ([str(meta.origin)] if meta.origin else [])
     page_origin = None
     for candidate in allowed:
@@ -875,7 +887,7 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, remember: boo
         return json.dumps(
             {"success": False, "error": "Could not determine the current page origin. Navigate to the login page first."}
         )
-    if page_origin not in allowed:
+    if not any(origin_matches_lookup(saved, page_origin, kind=meta.kind) for saved in allowed):
         _discard_fill_metadata()
         return json.dumps(
             {
@@ -883,13 +895,15 @@ def browser_vault_fill(handle: str, task_id: Optional[str] = None, remember: boo
                 "error_type": "origin_mismatch",
                 "error": (
                     f"Refused: current page origin ({page_origin}) does not match "
-                    f"the vault item's bound origin(s) ({', '.join(allowed)}). Vault fills "
-                    "only run on the exact origin(s) the credential was saved for. Add the exact origin with `hermes config set "
+                    f"the vault item's bound origin(s) ({', '.join(allowed)}). Login fills allow only the same-host/port "
+                    "HTTP-to-HTTPS upgrade; other kinds require exact-origin matching. Add the exact origin with `hermes config set "
                     f"vault.origin_aliases.{handle} '[\"{page_origin}\"]'`, including any existing aliases because `set` replaces the entire value for that item, then retry the fill. The agent may write this config entry; alias-only fills ask the user to confirm the exact origin and item label unless `vault.confirm_alias_fills` is false. Never edit or rewrite the existing 1Password item to add a URL: template rewrites can delete passkeys."
                 ),
             }
         )
-    alias_only = meta.kind == "login" and page_origin not in saved_origins
+    alias_only = meta.kind == "login" and not any(
+        origin_matches_lookup(saved, page_origin, kind=meta.kind) for saved in saved_origins
+    )
     if alias_only:
         from tools.browser_vault_aliases import authorize_login_alias
 
@@ -1173,10 +1187,11 @@ def _alias_fill_revalidation_refusal(raw_meta: Any, page_origin: str) -> str | N
     longer allowed. Navigation is refused by the fill script's ``expected_origin`` check.
     """
     from agent.vault_origin_aliases import apply_origin_aliases
+    from agent.vault_store import origin_matches_lookup
 
     fresh = apply_origin_aliases([raw_meta])[0]
     allowed = list(fresh.allowed_origins) or ([str(fresh.origin)] if fresh.origin else [])
-    if page_origin not in allowed:
+    if not any(origin_matches_lookup(saved, page_origin, kind=fresh.kind) for saved in allowed):
         return json.dumps({"success": False, "error_type": "origin_alias_revoked",
                            "error": (f"Refused: the origin alias for {page_origin} was removed from "
                                      "vault.origin_aliases while the fill was pending. Nothing was written. "

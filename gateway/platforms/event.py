@@ -92,9 +92,15 @@ def _is_human_event(event: Any) -> bool:
 
 def turn_origin_for_event(event: Any) -> str:
     """Classify a gateway turn, preserving human input when events are merged."""
+    from gateway.session_cli_turn import cli_turn
+
     events = _event_chain(event)
-    if any(_is_human_event(candidate) for candidate in events):
+    origins = [cli_turn(getattr(candidate, "message_id", None)).get("turn_origin") for candidate in events]
+    if any(origin == "user" or (origin is None and _is_human_event(candidate))
+           for candidate, origin in zip(events, origins)):
         return "user"
+    if (admitted := next((origin for origin in origins if origin is not None), None)) is not None:
+        return admitted
     if any(_is_relay_event(candidate) for candidate in events):
         return "relay"
     if any(is_goal_continuation_event(candidate)

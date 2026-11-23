@@ -298,8 +298,8 @@ async def test_closed_conversation_with_a_running_refine_review_stays(tmp_path, 
     checked = []
     retire_closed = session_retirement.retire_closed
 
-    def recorded(*args):
-        checked.append(retire_closed(*args))
+    async def recorded(*args):
+        checked.append(await retire_closed(*args))
         return checked[-1]
     monkeypatch.setattr(session_retirement, 'retire_closed', recorded)
     try:

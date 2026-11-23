@@ -186,11 +186,11 @@ def _binding(runner, source, profile):
     relay = source.delivered_via_upstream_relay is True
     platform = Platform.RELAY if relay else source.platform
     candidates = _registry_candidates(runner, platform)
+    lookup_profile = None if profile == 'default' else profile
     adapter = _slot_adapter(candidates, profile)
     if adapter is None or sum(item is adapter for _, item in candidates) != 1:
         raise RuntimeStoreError('not_found')
-    home = getattr(runner, '_native_transport_homes', {}).get(
-        None if profile == 'default' else profile)
+    home = getattr(runner, '_native_transport_homes', {}).get(lookup_profile)
     if home is None or not home.is_dir():
         raise RuntimeStoreError('profile_mismatch')
     runtime_home = home
@@ -239,8 +239,9 @@ def _binding(runner, source, profile):
         # plugin platform with no discoverable credential (in-memory / socket-only adapters) is
         # still one registered adapter; it binds by platform + owning profile rather than being
         # refused as not_found.
+        lookup_profile = None if profile == 'default' else profile
         connector = (runner._adapter_credential_fingerprint(adapter)
-                     or f'adapter:{source.platform.value}:{profile or ""}')
+                     or f'adapter:{source.platform.value}:{lookup_profile or ""}')
     if connector is None:
         raise RuntimeStoreError('not_found')
     provenance = {'transport_home': str(home), 'runtime_home': str(runtime_home),
@@ -264,6 +265,21 @@ def capture_provenance(runner, event):
         owner = (adapter, context[3])
     else:
         owner = runner._transport_owner(event.source)
+        if owner is None:
+            # The callback has already authenticated this event and _binding has resolved the
+            # currently registered adapter for the callback's profile and home.  A source carried
+            # across an adapter reconnect can retain a dead weak reference, though, which makes
+            # _transport_owner return None even while the authenticated callback is live.  Rebind
+            # only a dead weak reference.  A missing or live reference remains a hard failure so
+            # a malformed, swapped, or forged source cannot borrow the current callback's route.
+            adapter_ref = getattr(event.source, '_transport_adapter_ref', None)
+            if not callable(adapter_ref):
+                raise RuntimeStoreError('not_found')
+            prior_adapter = adapter_ref()
+            if prior_adapter is not None:
+                raise RuntimeStoreError('not_found')
+            event.source._transport_adapter_ref = weakref.ref(adapter)
+            owner = runner._transport_owner(event.source)
     if owner is None or owner[0] is not adapter or home != context[2]:
         raise RuntimeStoreError('not_found')
     return provenance

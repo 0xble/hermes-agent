@@ -516,6 +516,15 @@ def test_external_interpreter_keeps_its_owned_dependencies(tmp_path, monkeypatch
     assert result.stdout.strip() == "external-runtime-ready"
 
 
+def test_release_root_without_convenience_launcher_uses_runtime_command(tmp_path, monkeypatch):
+    repo, _home, _ = fixture_tree(tmp_path, monkeypatch)
+    launcher = repo / ".hermes" / "bin" / "hermes"
+    assert not launcher.exists()
+    command = _launchers.installation_command(repo, module="source_probe")
+    assert command[0] != str(launcher)
+    assert "-c" in command
+
+
 @pytest.mark.platforms("posix")
 @pytest.mark.spawns_gateway_lookalike
 def test_service_survives_python_tool_replacement(tmp_path, monkeypatch):

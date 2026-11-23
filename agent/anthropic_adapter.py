@@ -454,7 +454,10 @@ def _new_sdk_client(sdk, kwargs: dict[str, Any], headers: dict[str, str], route:
     merged.update(_custom_provider_extra_headers(route or kwargs.get("base_url")))
     if merged:
         kwargs["default_headers"] = merged
-    return sdk.Anthropic(**kwargs)
+    client = sdk.Anthropic(**kwargs)
+    from agent.proxy_request_class import protect_request_class_redirects
+    protect_request_class_redirects(client)
+    return client
 
 
 def _custom_provider_extra_headers(base_url) -> dict[str, str]:

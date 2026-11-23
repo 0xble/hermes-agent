@@ -6,6 +6,8 @@ import logging
 import asyncio
 from typing import Optional
 
+from gateway.run_notifications_ownership import owns_notice_work
+
 
 logger = logging.getLogger('gateway.run')
 
@@ -56,6 +58,7 @@ class GatewayNotificationsMixin:
             self._detach_batch_flush(tasks, releases, key, current_task, release)
 
 
+    @owns_notice_work
     async def _enqueue_async_delegation_group(self, group: list[dict]) -> Optional[bool]:
         """Deliver a same-tick group now, or hold routine results per the batch window.
 
@@ -481,6 +484,7 @@ class GatewayNotificationsMixin:
         return source, True
 
 
+    @owns_notice_work
     async def _deliver_auto_resume_notice(self, evt: dict) -> Optional[bool]:
         """Deliver one boot recovery notice without claiming explicit resume or spawning a child."""
         from gateway.run_notifications import asyncio, claim_off_loop

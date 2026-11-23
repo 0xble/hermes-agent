@@ -1047,6 +1047,7 @@ def _bind_interrupt_scope(agent: Any, ra) -> None:
     else:
         agent._interrupt_message = None
         agent._tool_interrupt_reason = None
+        agent._interrupt_source = None
     agent._interrupt_thread_signal_pending = False
 
 
