@@ -252,3 +252,65 @@ def test_detached_cron_workers_pin_both_profiles_before_and_after_flip(tmp_path,
                 os.kill(pid, signal.SIGTERM)
             except ProcessLookupError:
                 pass
+
+
+# Tests for immutable releases retention (terminal status filtering in _execution_code_sha_pins)
+# Use scratch HERMES_HOME (tmp_path) per task requirement; never touch live ~/.hermes
+
+import sqlite3
+
+from hermes_cli.immutable_releases import _execution_code_sha_pins
+
+
+def test_execution_code_sha_pins_terminal_only_shas_not_pinned(tmp_path):
+    """terminal-only shas (completed/failed/cancelled/missed) are not pinned."""
+    home = tmp_path / "scratch_home"
+    cron_dir = home / "cron"
+    releases_dir = home / "releases"
+    cron_dir.mkdir(parents=True)
+    releases_dir.mkdir()
+    db = cron_dir / "executions.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE executions (id INTEGER PRIMARY KEY, code_sha TEXT, status TEXT)")
+        for status in ("completed", "failed", "cancelled", "missed"):
+            sha = "a" * 40 if status == "completed" else "b" * 40 if status == "failed" else "c" * 40 if status == "cancelled" else "d" * 40
+            conn.execute("INSERT INTO executions (code_sha, status) VALUES (?, ?)", (sha, status))
+            (releases_dir / sha).mkdir()
+    pins = _execution_code_sha_pins(home)
+    assert len(pins) == 0, f"expected no pins for terminal-only, got {pins}"
+
+
+def test_execution_code_sha_pins_non_terminal_are_pinned(tmp_path):
+    """unknown/running/claimed/NULL shas are pinned (fail-closed)."""
+    home = tmp_path / "scratch_home2"
+    cron_dir = home / "cron"
+    releases_dir = home / "releases"
+    cron_dir.mkdir(parents=True)
+    releases_dir.mkdir()
+    db = cron_dir / "executions.db"
+    with sqlite3.connect(db) as conn:
+        conn.execute("CREATE TABLE executions (id INTEGER PRIMARY KEY, code_sha TEXT, status TEXT)")
+        non_terminal = [
+            ("e" * 40, "running"),
+            ("f" * 40, "unknown"),
+            ("g" * 40, "claimed"),
+            ("h" * 40, None),
+        ]
+        for sha, status in non_terminal:
+            conn.execute("INSERT INTO executions (code_sha, status) VALUES (?, ?)", (sha, status))
+            (releases_dir / sha).mkdir()
+    pins = _execution_code_sha_pins(home)
+    assert len(pins) == 4
+    for sha, _ in non_terminal:
+        assert any(sha in str(p) for p in pins)
+
+
+def test_execution_code_sha_pins_unreadable_ledger_still_raises(tmp_path):
+    """unreadable ledger still raises (fail-closed, read-only)."""
+    home = tmp_path / "scratch_home3"
+    cron_dir = home / "cron"
+    cron_dir.mkdir(parents=True)
+    db = cron_dir / "executions.db"
+    db.write_text("not a valid sqlite db", encoding="utf-8")
+    with pytest.raises(RuntimeError, match="unreadable cron execution ledger"):
+        _execution_code_sha_pins(home)

@@ -1339,8 +1339,9 @@ def _execution_code_sha_pins(home: Path) -> set[Path]:
     """Keep releases referenced by the durable cron execution ledger.
 
     Detached cron workers import an immutable release and persist its ``code_sha``.
-    An execution can remain ``unknown`` after its owner disappears, so that row is
-    still a live code-generation pin until execution-ledger retention removes it.
+    Only non-terminal rows (anything except completed/failed/cancelled/missed from
+    cron/executions.py:84) pin a release; terminal rows no longer do. NULL/unknown/
+    running/claimed still pin (fail-closed on uncertainty or future statuses).
     Read the ledger without acquiring a writer handle; an unreadable ledger must
     fail closed rather than allowing release deletion under uncertainty.
     """
@@ -1353,8 +1354,15 @@ def _execution_code_sha_pins(home: Path) -> set[Path]:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(executions)")}
             if "code_sha" not in columns:
                 return set()
+            # Only pin shas from non-terminal rows so completed/failed/cancelled/missed
+            # executions no longer hold releases forever. NULL/unknown/running/claimed
+            # (and any future status) still pin (fail-closed).
+            terminal = ("completed", "failed", "cancelled", "missed")
             values = connection.execute(
-                "SELECT DISTINCT code_sha FROM executions WHERE code_sha IS NOT NULL"
+                "SELECT DISTINCT code_sha FROM executions "
+                "WHERE code_sha IS NOT NULL "
+                "AND (status IS NULL OR status NOT IN (?, ?, ?, ?))",
+                terminal,
             ).fetchall()
     except sqlite3.Error as exc:
         raise RuntimeError(f"cannot safely prune releases: unreadable cron execution ledger {database}: {exc}") from exc
