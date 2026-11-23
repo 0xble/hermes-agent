@@ -211,41 +211,41 @@ class StreamFallbackMixin:
         from gateway.copy_blocks import balance_copy_quote_chunks
         return balance_copy_quote_chunks(list(chunks))
 
-    async def _send_fallback_final(self, text: str) -> None:
-        """Send the final continuation after streaming edits stop working (one flood retry
-        per chunk)."""
+    async def _prepare_fallback_final(self, text: str) -> tuple[str, str, Optional[str]] | None:
+        """Prepare the visible final text and continuation before fallback sends."""
         if getattr(self, "_egress_declined", False):
-            # The connector refused this destination earlier in the run. The
-            # whole point of this path is to deliver the unseen tail as a NEW
-            # message, which is exactly the re-addressing the egress guard
-            # exists to stop.
             logger.warning(
                 "suppressing the fallback continuation: the connector already "
                 "declined this destination for this run"
             )
-            return
+            return None
         if self._turn_reset():
-            return  # the refused final edit before this was awaited; /stop or /new may have landed
-        # Balance fences BEFORE computing the continuation so the closing fence
-        # reaches the user even when only the tail is delivered.
+            return None
         final_text = ensure_closed_code_fences(self._clean_for_display(text))
         self._fragment_cut = None
         continuation = self._continuation_text(final_text)
-        stale_message_id = self._message_id  # partial message to clean up
+        stale_message_id = self._message_id
         if self._fragment_cut is not None and stale_message_id:
-            # The whole answer replaces a first-word fragment only once that fragment is gone: a
-            # delete refused twice keeps it on screen, so only the tail follows it.
             if await self._delete_fragment_preview(stale_message_id):
                 stale_message_id = None
             else:
                 continuation = final_text[self._fragment_cut:].lstrip()
             if self._turn_reset():
-                return  # /stop or /new landed during the delete: the dead turn sends nothing
+                return None
         self._fallback_final_send = False
         if not continuation.strip():
             continuation = await self._fallback_when_nothing_unseen(final_text)
             if continuation is None:
-                return
+                return None
+        return final_text, continuation, stale_message_id
+
+    async def _send_fallback_final(self, text: str) -> None:
+        """Send the final continuation after streaming edits stop working (one flood retry
+        per chunk)."""
+        prepared = await self._prepare_fallback_final(text)
+        if prepared is None:
+            return
+        final_text, continuation, stale_message_id = prepared
 
         _len_fn, raw_limit = self._fallback_len_budget()
         chunks = self._split_text_chunks(continuation, max(500, raw_limit - 100), len_fn=_len_fn)

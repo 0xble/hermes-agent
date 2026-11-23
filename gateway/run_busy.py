@@ -584,7 +584,6 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
         session the text carries the same ``[Name]`` sender label a turn-opening message gets."""
         if not text.strip():
             return text
-        import json
         from gateway.session import label_shared_sender
 
         source = event.source
@@ -1034,7 +1033,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
         except Exception as e:
             logger.debug("Failed to send busy-ack: %s", e)
 
-    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+    async def _busy_active_preflight(self, event: MessageEvent, session_key: str) -> bool | None:
         from hermes_cli.session_controls import internal_wake_is_current, is_gateway_wake
         if is_gateway_wake(event) and not await self._run_in_executor_with_context(
                 internal_wake_is_current, event):
@@ -1042,7 +1041,7 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
         # Handled without a receipt: a strict event whose pinned session lost its key is dropped,
         # not queued behind (and later run in) the conversation that replaced it.
         from gateway.run_turn import GatewayTurnMixin
-        if not await GatewayTurnMixin._strict_session_pin_holds(self, event):  # type: ignore[arg-type]
+        if not await self._strict_session_pin_holds(event):  # type: ignore[attr-defined]
             return True
         # Gateway wakes have no external user identity. Admit them before auth/drain/approval
         # handling, without merging their text into an already queued human message.
@@ -1092,6 +1091,12 @@ class GatewayBusySessionMixin(GatewayBusyRestartMixin):
         if self._draining and not self._hm_is_registered_command(event):
             self._preserve_drain_event(session_key, event)
             return True
+        return None
+
+    async def _handle_active_session_busy_message(self, event: MessageEvent, session_key: str) -> bool:
+        preflight = await self._busy_active_preflight(event, session_key)
+        if preflight is not None:
+            return preflight
         passive_fyi = is_passive_fyi_relay_event(
             event, event.source,
             enabled=bool(getattr(self, "_relay_fyi_passive_enabled", lambda _source=None: False)(event.source)),
