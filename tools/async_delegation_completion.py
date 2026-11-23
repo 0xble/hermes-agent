@@ -70,9 +70,22 @@ def _checkpoint_results(task, result, recorded):
         if index not in owned:
             continue
         current = children.get(index)
-        if current is not None and current.get("status") in _SUCCESS:
+        if current is not None and current.get("status") in _SUCCESS | {"waiting_to_resume"}:
+            # ``completion_event`` has already classified a promised child as waiting. Keep
+            # that display result (including dispatcher metadata such as subagent_id) while
+            # retaining checkpoints as the source of truth for missing or downgraded entries.
             continue
         child = dict(entry)
+        if current is not None:
+            # A checkpoint is captured before dispatch adds routing identity and before the
+            # completion event classifies a promised limit stop. Reconcile the checkpoint's
+            # payload, but retain those two pieces of current-runner truth.
+            for key in ("subagent_id", "live_transcript"):
+                if current.get(key) is not None:
+                    child[key] = current[key]
+            from tools.delegate_tool_auto_resume import waiting_on_resume
+            if waiting_on_resume(current) or waiting_on_resume(child):
+                child["status"] = "waiting_to_resume"
         if transcripts.get(str(index)) and not child.get("live_transcript"):
             child["live_transcript"] = transcripts[str(index)]
         children[index] = child
