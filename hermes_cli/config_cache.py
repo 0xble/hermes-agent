@@ -5,7 +5,10 @@ surface while lock-free readers and worker snapshots stay isolated from the
 larger configuration implementation.
 """
 
+from pathlib import Path
 from typing import Any, Optional
+
+from hermes_cli.config_backend import probe_config_readable
 
 
 # path -> (cache signature..., raw YAML mapping). Published by whole-tuple
@@ -24,6 +27,18 @@ def _raw_config_cache_hit(path_key: str, cache_key: tuple[Any, ...]) -> Optional
         data = cached[len(cache_key)]
         return data if isinstance(data, dict) else None
     return None
+
+
+
+
+def _raw_config_cache_hit_if_readable(
+    path_key: str, cache_key: tuple[Any, ...], config_path: Path,
+) -> Optional[dict[str, Any]]:
+    """Return a raw cache hit only while its backing file remains readable."""
+    hit = _raw_config_cache_hit(path_key, cache_key)
+    if hit is not None:
+        probe_config_readable(config_path)
+    return hit
 
 
 def _raw_config_cache_clear(path_key: str) -> None:

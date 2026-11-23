@@ -185,24 +185,11 @@ from hermes_cli.config_cache import (
     _RAW_CONFIG_CACHE,
     _raw_config_cache_clear,
     _raw_config_cache_hit,
+    _raw_config_cache_hit_if_readable,
     _raw_config_cache_store,
     _worker_config_snapshot,
 )
 
-
-
-def _raw_config_cache_hit_if_readable(
-    path_key: str, cache_key: tuple[Any, ...], config_path: Path,
-) -> Optional[dict[str, Any]]:
-    """Use a raw parse cache entry only while the backing file is still readable.
-
-    The cache intentionally avoids YAML parsing, but it must not turn a transient open failure into
-    a healthy config hit: the file can become unreadable without changing its stat signature.
-    """
-    hit = _raw_config_cache_hit(path_key, cache_key)
-    if hit is not None:
-        probe_config_readable(config_path)
-    return hit
 _EXTRA_ENV_KEYS = frozenset({
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
     "DISCORD_HOME_CHANNEL", "DISCORD_HOME_CHANNEL_NAME",
@@ -1823,7 +1810,7 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
         hit = _raw_config_cache_hit_if_readable(str(config_path), cache_key, config_path)
         if hit is not None:
             return copy.deepcopy(hit) if want_deepcopy else hit
-    except Exception:
+    except Exception:  # health: allow BLE001 -- cache fast path must fall through on any stale backend seam
         pass
 
     with _CONFIG_LOCK:
