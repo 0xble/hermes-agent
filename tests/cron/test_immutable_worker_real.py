@@ -291,10 +291,10 @@ def test_execution_code_sha_pins_non_terminal_are_pinned(tmp_path):
     with sqlite3.connect(db) as conn:
         conn.execute("CREATE TABLE executions (id INTEGER PRIMARY KEY, code_sha TEXT, status TEXT)")
         non_terminal = [
-            ("e" * 40, "running"),
-            ("f" * 40, "unknown"),
-            ("g" * 40, "claimed"),
-            ("h" * 40, None),
+            ("1" * 40, "running"),
+            ("2" * 40, "unknown"),
+            ("3" * 40, "claimed"),
+            ("4" * 40, None),
         ]
         for sha, status in non_terminal:
             conn.execute("INSERT INTO executions (code_sha, status) VALUES (?, ?)", (sha, status))
