@@ -454,13 +454,37 @@ def _shell_state_chain(task_id: Optional[str]) -> tuple[str, ...]:
     environment's own). Empty for a task with no alias (#84536)."""
     chain: list[str] = []
     key = task_id
+    from agent.delegation_context import is_delegated_child_context
     with _container_alias_lock:
+        if not is_delegated_child_context():
+            if key and key in _container_aliases:
+                chain.append(key)
+            return tuple(chain)
         while key and key in _container_aliases and key not in chain:
             chain.append(key)
             key = _container_aliases[key]
         if key and key != "default" and key not in chain:
             chain.append(key)
     return tuple(chain)
+
+
+def _shell_state_paths(task_id: Optional[str], env: Any) -> tuple[str, ...]:
+    """Return snapshot paths from each task's owning local environment, not task-id hashing."""
+    chain = _shell_state_chain(task_id)
+    if not chain:
+        return ()
+    paths: list[str] = []
+    with _env_lock:
+        for index, owner in enumerate(chain):
+            owner_env = env if index == 0 else _active_environments.get(_resolve_container_task_id(owner))
+            if owner_env is None or not hasattr(owner_env, "_task_snapshot_path"):
+                return ()
+            with _container_alias_lock:
+                owner_is_delegated = owner in _container_aliases
+            paths.append(
+                owner_env._task_snapshot_path(owner) if owner_is_delegated else owner_env._snapshot_path
+            )
+    return tuple(paths)
 
 
 def _is_isolation_override_key(key: str) -> bool:
@@ -770,19 +794,7 @@ def _lookup_active_env(effective_task_id: str, task_id: Optional[str]):
     """
     from tools.environments.sandbox_scope import admit_env, hosted_scope
     from tools.node_execution import current_execution
-    raw_allowed = effective_task_id == task_id
-    if not raw_allowed and task_id:
-        # A CWD-only override intentionally collapses to a shared container but may
-        # have an environment cached under the originating raw task id. Do not apply
-        # that compatibility fallback to session/node keys: a reused raw task id must
-        # never resurrect another session's shell snapshot.
-        try:
-            raw_overrides = resolve_task_overrides(task_id)
-            raw_allowed = effective_task_id == "default" and isinstance(raw_overrides.get("cwd"), str)
-        except Exception:
-            raw_allowed = False
-    keys = (effective_task_id,) if current_execution() or hosted_scope() is not None else (
-        (effective_task_id, task_id) if raw_allowed else (effective_task_id,))
+    keys = (effective_task_id,) if current_execution() or hosted_scope() is not None else (effective_task_id, task_id)
     for key in keys:
         if key and key in _active_environments:
             _last_activity[key] = time.time()
@@ -1697,7 +1709,9 @@ def terminal_tool(
         env = _acquire_env(plan, task_id)
         # _lookup_active_env stamps whichever of the two keys holds the env.
         from tools.environments.base import shell_state_scope
-        with _call_in_flight(plan.effective_task_id, task_id), shell_state_scope(_shell_state_chain(task_id)):
+        with _call_in_flight(plan.effective_task_id, task_id), shell_state_scope(
+            _shell_state_chain(task_id), _shell_state_paths(task_id, env)
+        ):
             env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
             if survive_restart and (not background or pty or env_type != "local"):
                 raise _Rejected(_error_json(

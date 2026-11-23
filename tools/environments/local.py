@@ -1428,3 +1428,5 @@ class LocalEnvironment(BaseEnvironment):
         for f in (self._snapshot_path, self._cwd_file, *stale):
             with contextlib.suppress(OSError):
                 os.unlink(f)
+        from tools.environments.base import _forget_task_snapshots
+        _forget_task_snapshots(self._snapshot_path[:-3])

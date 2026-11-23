@@ -80,15 +80,43 @@ _HOST_EXITING_OUTPUT = (
 # became the parent's shell state (#84536).
 _shell_state_chain: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "terminal_shell_state_chain", default=())
+_shell_state_paths: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "terminal_shell_state_paths", default=())
+
+# A local delegated child may use its own environment object while inheriting its parent's shell
+# snapshot. Keep that fallback handoff in-process and environment-scoped; terminal_tool passes
+# explicit paths, and task ids alone are never used to derive a cross-process path.
+_task_snapshot_paths: dict[str, str] = {}
+_task_snapshot_paths_lock = threading.Lock()
+
+
+def _remember_task_snapshot(task_id: str, path: str) -> None:
+    if task_id:
+        with _task_snapshot_paths_lock:
+            _task_snapshot_paths[task_id] = path
+
+
+def _ancestor_task_snapshot(task_id: str) -> str | None:
+    with _task_snapshot_paths_lock:
+        return _task_snapshot_paths.get(task_id)
+
+
+def _forget_task_snapshots(snapshot_prefix: str) -> None:
+    with _task_snapshot_paths_lock:
+        for task_id, path in tuple(_task_snapshot_paths.items()):
+            if path.startswith(snapshot_prefix):
+                _task_snapshot_paths.pop(task_id, None)
 
 
 @contextmanager
-def shell_state_scope(chain: tuple[str, ...]):
+def shell_state_scope(chain: tuple[str, ...], snapshot_paths: tuple[str, ...] = ()):
     """Run commands against the per-task snapshot of ``chain[0]`` (seeded from its ancestors)."""
     token = _shell_state_chain.set(tuple(chain))
+    paths_token = _shell_state_paths.set(tuple(snapshot_paths))
     try:
         yield
     finally:
+        _shell_state_paths.reset(paths_token)
         _shell_state_chain.reset(token)
 
 
@@ -457,6 +485,22 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         digest = hashlib.sha256(task_id.encode()).hexdigest()[:16]
         return f"{self._snapshot_path[:-len('.sh')]}-{digest}.sh"
 
+    def _shell_state_snapshot_paths(self) -> list[str]:
+        """Resolve the current task locally and delegated ancestors from their owning environments."""
+        explicit = _shell_state_paths.get()
+        if explicit:
+            return list(explicit)
+        task_ids = _shell_state_chain.get()
+        paths: list[str] = []
+        for index, task_id in enumerate(task_ids):
+            path = self._task_snapshot_path(task_id) if index == 0 else _ancestor_task_snapshot(task_id)
+            if path is None:
+                path = self._task_snapshot_path(task_id)
+            if index == 0:
+                _remember_task_snapshot(task_id, path)
+            paths.append(path)
+        return paths
+
     def _snapshot_script_kwargs(self, cwd: str, snap: str | None = None) -> dict:
         """Quoting inputs shared by the bootstrap and per-command wrapper scripts.
         ``_quote_cwd_for_cd`` / ``_quote_shell_path`` (not bare shlex.quote) let the Windows
@@ -533,7 +577,7 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
         """Full bash script: source snapshot, cd, run, re-dump env, emit CWD markers."""
         from agent.delegation_context import in_process_child_relay_parent_address
         from agent.incognito import is_incognito
-        chain = [self._task_snapshot_path(t) for t in _shell_state_chain.get()]
+        chain = self._shell_state_snapshot_paths()
         seeds = [self._quote_shell_path(p) for p in (*chain[1:], self._snapshot_path)] if chain else []
         return _wrap_command_script(
             command,
