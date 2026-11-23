@@ -256,7 +256,7 @@ def get_active_env(task_id: str):
             if env is not None:
                 env._hermes_owner_tasks.add(current_execution().task_id)
             return env
-        return env or (_active_environments.get(task_id) if lookup == task_id else None)
+        return env or _active_environments.get(task_id)
 
 
 def ensure_task_env(task_id: Optional[str] = None):

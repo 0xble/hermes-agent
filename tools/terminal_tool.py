@@ -794,19 +794,7 @@ def _lookup_active_env(effective_task_id: str, task_id: Optional[str]):
     """
     from tools.environments.sandbox_scope import admit_env, hosted_scope
     from tools.node_execution import current_execution
-    raw_allowed = effective_task_id == task_id
-    if not raw_allowed and task_id:
-        # A CWD-only override intentionally collapses to a shared container but may
-        # have an environment cached under the originating raw task id. Do not apply
-        # that compatibility fallback to session/node keys: a reused raw task id must
-        # never resurrect another session's shell snapshot.
-        try:
-            raw_overrides = resolve_task_overrides(task_id)
-            raw_allowed = effective_task_id == "default" and isinstance(raw_overrides.get("cwd"), str)
-        except Exception:
-            raw_allowed = False
-    keys = (effective_task_id,) if current_execution() or hosted_scope() is not None else (
-        (effective_task_id, task_id) if raw_allowed else (effective_task_id,))
+    keys = (effective_task_id,) if current_execution() or hosted_scope() is not None else (effective_task_id, task_id)
     for key in keys:
         if key and key in _active_environments:
             _last_activity[key] = time.time()
