@@ -785,33 +785,57 @@ class GatewayTurnPrepareMixin:
         if _lease_registry is None:
             return
         async def _preempt_machine_holder(holder):
-            """A cold-path waiter can miss adapter busy dispatch; yield an internal holder before waiting."""
+            """A genuine user waiter may yield an internal holder before waiting on the lease.
+
+            This is deliberately narrower than adapter busy dispatch: relays, agent-origin text,
+            internal events, steer mode, active subagents, and compression all retain queue semantics.
+            """
             if event is None:
+                return
+            is_user_turn = getattr(self, "_is_user_turn_event", None)
+            if callable(is_user_turn) and not is_user_turn(event):
+                return
+            if not callable(is_user_turn) and getattr(event, "internal", False):
+                return
+            from gateway.response_filters import is_agent_origin_text
+            if is_agent_origin_text(getattr(event, "text", None)):
                 return
             holder_event = getattr(holder, "event", None)
             if holder_event is None or not getattr(holder_event, "internal", False):
                 return
+            from gateway.meeting_lane import busy_input_mode
+            if await busy_input_mode(self, event, _quick_key) == "steer":
+                return
             state = getattr(self, "_peek_session_state")(holder.owner_key)
-            running_agent = state.turn.agent if state is not None else None
+            running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
             from gateway.run import _AGENT_PENDING_SENTINEL
-            # Lease acquisition is the cold-path boundary; adapter busy dispatch may not have seen this turn.
-            # Reuse the busy interrupt machinery when available, but never make lease admission depend on
-            # optional mixin methods (tests and minimal runners may only expose cancellation).
-            if running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL:
-                adapter = getattr(self, "_delivery_adapter_for")(event.source)
-                if adapter is not None and hasattr(self, "_interrupt_running_agent_for_busy_event"):
-                    await getattr(self, "_interrupt_running_agent_for_busy_event")(event, adapter, running_agent)
-                    event._gateway_lease_machine_preempted = True
-                elif adapter is not None:
-                    task = getattr(self, "_session_tasks", {}).get(holder.owner_key)
-                    if task is not None and not task.done():
-                        task.cancel()
-                        event._gateway_lease_machine_preempted = True
-            else:
-                task = getattr(self, "_session_tasks", {}).get(holder.owner_key)
-                if task is not None and not task.done():
-                    task.cancel()
-                    event._gateway_lease_machine_preempted = True
+            # A pending sentinel/None means the machine turn has not exposed an interruptible agent yet.
+            # Do not cancel its task: admission waits for the ordinary lease release path.
+            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+                return
+            if getattr(self, "_agent_has_active_subagents")(running_agent):
+                return
+            compression_check = getattr(self, "_session_has_compression_in_flight", None)
+            if callable(compression_check) and await compression_check(_quick_key):  # type: ignore[reportGeneralTypeIssues]
+                return
+            adapter = getattr(self, "_delivery_adapter_for")(event.source)
+            interrupt = getattr(self, "_interrupt_running_agent_for_busy_event", None)
+            if adapter is None or not callable(interrupt):
+                return
+            await interrupt(event, adapter, running_agent, preserve_event_message=False)  # type: ignore[reportGeneralTypeIssues]
+            event._gateway_lease_machine_preempted = True
+            # Use the same busy-ack channel as warm-path preemption. The flag prevents the
+            # later lease-wait notice from sending a second (queued) acknowledgement.
+            if not getattr(event, "_gateway_busy_ack_sent", False):
+                from agent.i18n import t
+                from agent.notice_style import ContextNotice
+                notice = ContextNotice(t(
+                    "gateway.busy.ack", head=t("gateway.busy.interrupting_head"), detail="",
+                    tail=t("gateway.busy.interrupting_tail")))
+                notice._temporary = True  # type: ignore[attr-defined]
+                send_ack = getattr(self, "_send_busy_ack_reply", None)
+                if callable(send_ack):
+                    await send_ack(event, adapter, notice)  # type: ignore[reportGeneralTypeIssues]
 
         try:
             _lease_token = await _lease_registry.acquire(

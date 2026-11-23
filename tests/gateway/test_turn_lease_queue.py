@@ -42,37 +42,118 @@ async def test_contended_internal_holder_can_be_preempted_before_waiting():
 
 
 @pytest.mark.asyncio
-async def test_cold_path_user_turn_yields_internal_lease_holder(monkeypatch):
+@pytest.mark.parametrize("mode", ["queue", "interrupt"])
+async def test_cold_path_user_turn_yields_internal_lease_holder(monkeypatch, mode):
     from gateway.run_turn_prepare import GatewayTurnPrepareMixin
 
     runner = object.__new__(GatewayTurnPrepareMixin)
     registry = SessionTurnLeaseRegistry()
-    runner._turn_leases = registry
+    setattr(runner, "_turn_leases", registry)
     agent = SimpleNamespace()
     state = SimpleNamespace(turn=SimpleNamespace(agent=agent, lease_tokens={}))
-    runner._peek_session_state = lambda _key: state
-    runner._session_state = lambda _key: state
-    runner._delivery_adapter_for = lambda _source: object()
-    runner._BusySteerOutcome = lambda **kwargs: SimpleNamespace(**kwargs)
-    runner._clear_session_env = lambda _tokens: None
+    setattr(runner, "_peek_session_state", lambda _key: state)
+    setattr(runner, "_session_state", lambda _key: state)
+    setattr(runner, "_delivery_adapter_for", lambda _source: object())
+    setattr(runner, "_clear_session_env", lambda _tokens: None)
+    setattr(runner, "_is_user_turn_event", lambda event: not event.internal)
+    setattr(runner, "_agent_has_active_subagents", lambda _agent: False)
+    setattr(runner, "_session_has_compression_in_flight", AsyncMock(return_value=False))
+    ack = AsyncMock(side_effect=lambda event, *_args: setattr(event, "_gateway_busy_ack_sent", True))
+    setattr(runner, "_send_busy_ack_reply", ack)
     interrupted = []
 
-    async def interrupt(event, _adapter, _agent):
-        interrupted.append(event)
+    async def interrupt(event, _adapter, _agent, *, preserve_event_message=True):
+        interrupted.append((event, preserve_event_message))
         registry.release(registry._leases["session"].holder)
 
-    async def ack(*_args):
-        return None
+    monkeypatch.setattr("gateway.meeting_lane.busy_input_mode", AsyncMock(return_value=mode))
 
-    runner._interrupt_running_agent_for_busy_event = interrupt
-    runner._busy_interrupt_and_ack = ack
+    setattr(runner, "_interrupt_running_agent_for_busy_event", interrupt)
     machine_event = SimpleNamespace(internal=True)
     await registry.acquire("session", owner_key="topic", generation=1, event=machine_event)
     user_event = SimpleNamespace(internal=False, source=object())
     entry = SimpleNamespace(session_id="session")
     await runner._hmwa_acquire_turn_lease("topic", 2, entry, None, user_event)
-    assert interrupted == [user_event]
+    assert interrupted == [(user_event, False)]
+    getattr(runner, "_send_busy_ack_reply").assert_awaited_once()
+    assert user_event._gateway_busy_ack_sent is True
     assert state.turn.lease_tokens[2].event is user_event
+    registry.release(state.turn.lease_tokens[2])
+
+
+@pytest.mark.asyncio
+async def test_cold_path_preemption_does_not_carry_user_text_into_interrupted_turn():
+    from gateway.run_busy import GatewayBusySessionMixin
+
+    runner = object.__new__(GatewayBusySessionMixin)
+    setattr(runner, "_pending_event_audio_paths", lambda _event: False)
+    agent = MagicMock()
+    event = SimpleNamespace(text="user message", media_urls=[], source=object())
+    await runner._interrupt_running_agent_for_busy_event(
+        event, object(), agent, preserve_event_message=False,  # type: ignore[arg-type]
+    )
+    agent.interrupt.assert_called_once_with(None, tool_reason="gateway user turn preemption")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("guard", ["subagents", "compression", "ineligible", "agent_origin", "steer"])
+async def test_cold_path_preemption_demotes_to_wait_for_safety_guards(monkeypatch, guard):
+    from gateway.run_turn_prepare import GatewayTurnPrepareMixin
+
+    runner = object.__new__(GatewayTurnPrepareMixin)
+    registry = SessionTurnLeaseRegistry()
+    setattr(runner, "_turn_leases", registry)
+    agent = SimpleNamespace()
+    state = SimpleNamespace(turn=SimpleNamespace(agent=agent, lease_tokens={}))
+    setattr(runner, "_peek_session_state", lambda _key: state)
+    setattr(runner, "_session_state", lambda _key: state)
+    setattr(runner, "_delivery_adapter_for", lambda _source: object())
+    setattr(runner, "_clear_session_env", lambda _tokens: None)
+    setattr(runner, "_is_user_turn_event", lambda _event: guard not in {"ineligible"})
+    setattr(runner, "_agent_has_active_subagents", lambda _agent: guard == "subagents")
+    setattr(runner, "_session_has_compression_in_flight", AsyncMock(return_value=guard == "compression"))
+    interrupted = AsyncMock()
+    setattr(runner, "_interrupt_running_agent_for_busy_event", interrupted)
+    mode = "steer" if guard == "steer" else "queue"
+    monkeypatch.setattr("gateway.meeting_lane.busy_input_mode", AsyncMock(return_value=mode))
+    machine_event = SimpleNamespace(internal=True)
+    await registry.acquire("session", owner_key="machine", generation=1, event=machine_event)
+    asyncio.get_running_loop().call_soon(registry.release, registry._leases["session"].holder)
+    user_text = "[relay from=agent receipt=abc]" if guard == "agent_origin" else "hello"
+    user_event = SimpleNamespace(internal=False, text=user_text, source=object())
+    await runner._hmwa_acquire_turn_lease(
+        "topic", 2, SimpleNamespace(session_id="session"), None, user_event,
+    )
+    interrupted.assert_not_awaited()
+    token = state.turn.lease_tokens[2]
+    registry.release(token)
+
+
+@pytest.mark.asyncio
+async def test_cold_path_pending_or_missing_agent_never_cancels_session_task(monkeypatch):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+    from gateway.run_turn_prepare import GatewayTurnPrepareMixin
+
+    runner = object.__new__(GatewayTurnPrepareMixin)
+    registry = SessionTurnLeaseRegistry()
+    setattr(runner, "_turn_leases", registry)
+    state = SimpleNamespace(turn=SimpleNamespace(agent=_AGENT_PENDING_SENTINEL, lease_tokens={}))
+    setattr(runner, "_peek_session_state", lambda _key: state)
+    setattr(runner, "_session_state", lambda _key: state)
+    setattr(runner, "_delivery_adapter_for", lambda _source: object())
+    setattr(runner, "_clear_session_env", lambda _tokens: None)
+    setattr(runner, "_is_user_turn_event", lambda _event: True)
+    setattr(runner, "_agent_has_active_subagents", lambda _agent: False)
+    setattr(runner, "_session_tasks", {"machine": MagicMock()})
+    monkeypatch.setattr("gateway.meeting_lane.busy_input_mode", AsyncMock(return_value="queue"))
+    machine_event = SimpleNamespace(internal=True)
+    await registry.acquire("session", owner_key="machine", generation=1, event=machine_event)
+    asyncio.get_running_loop().call_soon(registry.release, registry._leases["session"].holder)
+    user_event = SimpleNamespace(internal=False, text="hello", source=object())
+    await runner._hmwa_acquire_turn_lease(
+        "topic", 2, SimpleNamespace(session_id="session"), None, user_event,
+    )
+    getattr(runner, "_session_tasks")["machine"].cancel.assert_not_called()
     registry.release(state.turn.lease_tokens[2])
 
 
