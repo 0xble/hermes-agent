@@ -16,6 +16,20 @@ from gateway import delivery_ledger as dl
 from persistence_assembly import profile_scope
 
 
+class _TrackingConnection:
+    """Close instrumentation mixed into the requested real connection factory."""
+    def __init__(self, real, closed_ids):
+        self._real = real
+        self._closed_ids = closed_ids
+
+    def close(self):
+        self._closed_ids.append(id(self._real))
+        return self._real.close()
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
 def _point_ledger(monkeypatch, tmp_path):
     monkeypatch.setattr(dl, "_scope", lambda: profile_scope(home=tmp_path))
     return dl
