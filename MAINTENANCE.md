@@ -518,6 +518,18 @@ row:
 | Updater external supervisor sweep | Protect newly spawned supervised gateways while draining pre-existing processes for supervisor hand-back | Update restart sweeps, gateway PID snapshots, launchd or external-supervisor ownership changes; also load runtime ownership | [Updater external supervisor sweep](maintenance/updater-external-supervisor-sweep.md) |
 | Internal recovered follow-up retirement | Preserve, decline, visibly note, and quarantine shutdown follow-ups when identity is missing or uncertain; retire durable recovered inputs without replay | Shutdown follow-up spooling, restart recovery admission/retirement, or durable recovered-turn failure handling | [Internal recovered follow-up retirement](maintenance/internal-followup-retirement.md) |
 
+## Active patch record: bounded temporary-path literal scan
+
+Fork patch identity: `bounded-tmp-literals`.
+
+- **Load when:** changing the temporary-path literal scanner, its Git/ignore traversal, or its regression tests.
+- **Behavior:** Enumerate tracked source entries through Git and prune ignored directories before walking, so the scanner does not materialize every ignored artifact path in memory. Preserve the existing source scope, baseline accounting, and literal-detection rules.
+- **Source surfaces:** `scripts/check_no_tmp_literals.py` and `tests/scripts/test_check_no_tmp_literals.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/scripts/test_check_no_tmp_literals.py`.
+- **Upstream status:** Fork-only bounded-memory repair for the ignored-file scan; no equivalent upstream fix has been established.
+- **Retirement:** Remove when upstream bounds the scanner's ignored-file traversal without changing its detection contract.
+- **Rollback:** Revert the commit carrying `Fork-Patch: bounded-tmp-literals`.
+
 ## Active patch record: internal recovered follow-up retirement
 
 Fork patch identity: `internal-followup-retirement`.
