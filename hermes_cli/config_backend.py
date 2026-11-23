@@ -230,8 +230,13 @@ class FileBackend:
 
     def probe_readable(self, home: Path) -> None:
         path = self.config_path(home)
-        with open(path, "rb") as f:
-            f.read(1)
+        # Cache-hit validation must not open the file: callers can run while a
+        # replacement is in progress, and an unusual file-like config path could
+        # block an open indefinitely. The cache signature already performed stat;
+        # this probe only needs to confirm that the backing path is still readable.
+        path.stat()
+        if not os.access(path, os.R_OK):
+            raise PermissionError(path)
 
     def write_changes(self, home: Path, changes: Changes) -> None:
         self.write_path(self.config_path(home), changes)
