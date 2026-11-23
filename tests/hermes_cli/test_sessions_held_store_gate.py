@@ -67,6 +67,9 @@ def _args(action, force):
                          **{name: None for name in sessions_cmd._FILTER_ARGS})
     if action == "optimize-storage":
         return Namespace(no_vacuum=False, yes=True, **common)
+    if action == "compact-history":
+        return Namespace(older_than="14d", archive=None, dry_run=force,
+                         batch_size=500, yes=True, **common)
     return Namespace(**common)
 
 

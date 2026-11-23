@@ -84,6 +84,8 @@ def _add_compacted_history_parser(sessions_subparsers) -> None:
     parser.add_argument("--archive", type=Path, help="Gzip JSONL archive path")
     parser.add_argument("--batch-size", type=int, default=500)
     add_yes_flag(parser, "Skip confirmation")
+    _flag(parser, "--force",
+        help="Run even while another Hermes process holds state.db; only use with all other writers stopped")
     _flag(parser, "--dry-run", help="Report rows and estimated bytes without changing anything")
 
 

@@ -7,8 +7,9 @@ import json
 import logging
 import os
 import time
+import zlib
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple, cast
 
 from hermes_state_common import (
     AUTO_VACUUM_MIN_FREELIST_RATIO, _id_chunks, _non_continuation_child_sql, _placeholders, _sql_session_last_active,
@@ -110,6 +111,137 @@ _PINNED_TAIL_SQL = ("WITH RECURSIVE tail(id) AS ("
 def _not_pinned_sql(alias: str = "s") -> str:
     """Predicate sparing pinned rows and the unpinned continuations a pinned segment covers."""
     return f"COALESCE({alias}.pinned, 0) = 0 AND {alias}.id NOT IN ({_PINNED_TAIL_SQL})"
+
+
+_COMPACTED_ARCHIVE_FORMAT = "hermes-compacted-history-v1"
+_COMPACTED_ARCHIVE_READ_CHUNK = 1024 * 1024
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist a newly created archive directory where the platform supports it."""
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _read_compacted_member(raw, chunk: bytes) -> tuple[bytes, bytes, int, bool]:
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    payload = bytearray()
+    while chunk:
+        try:
+            payload.extend(decompressor.decompress(chunk))
+        except zlib.error as exc:
+            raise ValueError(f"invalid gzip member in compacted-history archive") from exc
+        if decompressor.eof:
+            pending = decompressor.unused_data
+            return bytes(payload), pending, raw.tell() - len(pending), True
+        chunk = raw.read(_COMPACTED_ARCHIVE_READ_CHUNK)
+    return bytes(payload), b"", 0, False
+
+
+def _read_compacted_archive(path: Path) -> tuple[dict[str, object], dict[int, tuple], bool]:
+    """Read complete gzip members and discard a torn trailing member.
+
+    A compacted archive is deliberately a sequence of closed gzip members: a
+    kill can therefore leave only the last member incomplete.  ``zlib`` exposes
+    the unused bytes after each member, which lets us find the last durable byte
+    without loading the archive or trusting ``gzip.open`` to recover from EOF.
+    """
+    lines: list[dict[str, object]] = []
+    last_good_offset = 0
+    truncated = False
+    pending = b""
+    with path.open("rb") as raw:
+        while True:
+            if pending:
+                chunk = pending
+                pending = b""
+            else:
+                chunk = raw.read(_COMPACTED_ARCHIVE_READ_CHUNK)
+            if not chunk:
+                break
+            payload, pending, member_end, complete = _read_compacted_member(raw, chunk)
+            if not complete:
+                truncated = True
+                break
+            last_good_offset = member_end
+            for raw_line in bytes(payload).splitlines():
+                if not raw_line:
+                    continue
+                try:
+                    value = json.loads(raw_line)
+                except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"invalid JSON in compacted-history archive {path}: {exc}") from exc
+                if not isinstance(value, dict):
+                    raise ValueError(f"non-object record in compacted-history archive {path}")
+                lines.append(value)
+    if not lines:
+        raise ValueError(f"existing compacted-history archive {path} has no durable header")
+    header = lines[0]
+    if header.get("_format") != _COMPACTED_ARCHIVE_FORMAT or not isinstance(header.get("identity"), dict):
+        raise ValueError(f"compacted-history archive {path} has no recognized identity header")
+    archived: dict[int, tuple] = {}
+    for record in lines[1:]:
+        try:
+            int_value = record.get("id")
+            if not isinstance(int_value, (int, str)):
+                raise ValueError(f"invalid message identity in compacted-history archive {path}")
+            key = (int(int_value), record.get("session_id"), record.get("timestamp"))
+            if key[1] is None or key[2] is None:
+                raise ValueError(f"invalid message identity in compacted-history archive {path}")
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError(f"invalid message identity in compacted-history archive {path}") from exc
+        previous = archived.get(key[0])
+        if previous is not None and previous != key:
+            raise ValueError(f"conflicting message identity for id {key[0]} in compacted-history archive {path}")
+        archived[key[0]] = key
+    if truncated:
+        # Only the complete prefix is retained.  Subsequent open('ab') writes
+        # then start at a valid gzip-member boundary.
+        with path.open("r+b") as raw:
+            raw.truncate(last_good_offset)
+            raw.flush()
+            os.fsync(raw.fileno())
+        _fsync_directory(path.parent)
+        logger.warning("ignored and truncated incomplete trailing gzip member in %s", path)
+    return cast(dict[str, object], header["identity"]), archived, truncated
+
+
+def _append_compacted_archive_member(path: Path, records: list[dict[str, object]], *, parent_created: bool = False) -> None:
+    """Append one complete gzip member, then make both file and first directory entry durable."""
+    first_creation = not path.exists()
+    with path.open("ab") as raw:
+        with gzip.GzipFile(fileobj=raw, mode="wb") as gz:
+            for record in records:
+                gz.write((json.dumps(record, default=str, separators=(",", ":")) + "\n").encode("utf-8"))
+        raw.flush()
+        os.fsync(raw.fileno())
+    if first_creation or parent_created:
+        _fsync_directory(path.parent)
+
+
+def _compacted_archive_identity(db) -> dict[str, object]:
+    """Stable identity for the opened DB, including the per-store UUID when available."""
+    identity: dict[str, object] = {"db_path": str(Path(db.db_path).expanduser().resolve())}
+    meta = db._read_one("SELECT value FROM state_meta WHERE key = 'store_instance_id'")
+    if meta is not None and meta[0]:
+        identity["store_instance_id"] = str(meta[0])
+        return identity
+    # Old stores without provenance still get a stable identity from their first
+    # creation row rather than relying on collidable message ids alone.
+    first = db._read_one("SELECT id, started_at FROM sessions ORDER BY rowid LIMIT 1")
+    if first is not None:
+        identity["first_session"] = {"id": str(first[0]), "started_at": first[1]}  # type: ignore[assignment]
+    return identity
+
+
+def _message_archive_key(row) -> tuple:
+    return (int(row["id"]), row["session_id"], row["timestamp"])
 
 
 class SessionMaintenanceMixin:
@@ -366,8 +498,13 @@ class SessionMaintenanceMixin:
                                     dry_run: bool = False, batch_size: int = 500) -> dict:
         """Archive and remove superseded message rows without touching active history.
 
-        The archive is JSONL gzip so it remains recoverable without SQLite. Deletes are
-        bounded transactions and use the normal DELETE triggers, keeping FTS in sync.
+        The archive is identity-bound JSONL gzip. Each append is a complete gzip
+        member, followed by file fsync, and only then a separate committed DELETE
+        transaction. A crash can therefore leave an archived-but-still-present row
+        (harmless and recovered on the next run), but never a deleted row without
+        a durable archive record. The DELETE rechecks the age and inactive
+        predicates under its write lock; rows changed concurrently remain in both
+        places until a later pass.
         """
         if older_than_days < 0 or batch_size < 1:
             raise ValueError("older_than_days must be non-negative and batch_size must be positive")
@@ -377,42 +514,65 @@ class SessionMaintenanceMixin:
         where = "active = 0 AND timestamp < ?"
         count, bytes_est = self._read_one(
             f"SELECT COUNT(*), COALESCE(SUM(length(COALESCE(content, ''))), 0) FROM messages WHERE {where}", (cutoff,))
-        result = {"rows": int(count), "estimated_bytes": int(bytes_est), "archive": str(archive), "deleted": 0}
-        if dry_run or not count:
+        result = {"rows": int(count), "estimated_bytes": int(bytes_est), "archive": str(archive),
+                  "deleted": 0, "recovered_truncated_member": False}
+        if dry_run:
             return result
+
+        identity = _compacted_archive_identity(self)
+        parent_created = not archive.parent.exists()
         archive.parent.mkdir(parents=True, exist_ok=True)
-        # A crash after the archive flush/fsync but before DELETE is safe: the next run
-        # recognizes the already-appended ids and deletes them without appending duplicates.
-        archived_ids = set()
+        archived_by_id: dict[int, tuple] = {}
         if archive.exists():
-            with gzip.open(archive, "rt", encoding="utf-8") as existing:
-                for line in existing:
-                    try:
-                        archived_ids.add(int(json.loads(line)["id"]))
-                    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-                        continue
-        with archive.open("ab") as raw:
-            with gzip.GzipFile(fileobj=raw, mode="ab") as gz:
-                import io
-                out = io.TextIOWrapper(gz, encoding="utf-8")
-                while True:
-                    rows = self._read_all(  # type: ignore[attr-defined]
-                        f"SELECT * FROM messages WHERE {where} ORDER BY id LIMIT ?", (cutoff, batch_size))
-                    if not rows:
-                        break
-                    ids = [int(row["id"]) for row in rows]
-                    for row in rows:
-                        if int(row["id"]) not in archived_ids:
-                            out.write(json.dumps(dict(row), default=str, separators=(",", ":")) + "\n")
-                            archived_ids.add(int(row["id"]))
-                    out.flush()
-                    gz.flush()
-                    os.fsync(raw.fileno())
-                    self._execute_write(  # type: ignore[attr-defined]
-                        lambda conn, ids=ids: conn.execute(
-                        f"DELETE FROM messages WHERE id IN ({_placeholders(ids)})", ids).rowcount)
-                    result["deleted"] += len(ids)
-                out.detach()
+            archive_identity, archived_by_id, recovered = _read_compacted_archive(archive)
+            result["recovered_truncated_member"] = recovered
+            if archive_identity != identity:
+                raise ValueError(
+                    f"refusing compacted-history archive for a different database: {archive} "
+                    f"(archive={archive_identity!r}, current={identity!r})"
+                )
+        else:
+            _append_compacted_archive_member(
+                archive, [{"_format": _COMPACTED_ARCHIVE_FORMAT, "identity": identity}],
+                parent_created=parent_created,
+            )
+
+        if not count:
+            return result
+
+        while True:
+            rows = self._read_all(  # type: ignore[attr-defined]
+                f"SELECT * FROM messages WHERE {where} ORDER BY id LIMIT ?", (cutoff, batch_size))
+            if not rows:
+                break
+            ids = [int(row["id"]) for row in rows]
+            new_records: list[dict] = []
+            for row in rows:
+                key = _message_archive_key(row)
+                previous = archived_by_id.get(key[0])
+                if previous is not None and previous != key:
+                    raise ValueError(
+                        f"refusing to deduplicate conflicting message identity for id {key[0]} "
+                        f"in compacted-history archive {archive}"
+                    )
+                if previous is None:
+                    new_records.append(dict(row))
+                    archived_by_id[key[0]] = key
+            if new_records:
+                # Close the gzip member before fsync and before DELETE. This is
+                # intentionally one member per batch, not one member per run.
+                _append_compacted_archive_member(archive, new_records)
+
+            def _delete_batch(conn, ids=ids):
+                cursor = conn.execute(
+                    f"DELETE FROM messages WHERE id IN ({_placeholders(ids)}) "
+                    "AND active = 0 AND timestamp < ?",
+                    (*ids, cutoff),
+                )
+                return max(cursor.rowcount, 0)
+
+            deleted = self._execute_write(_delete_batch, skip_result=0)  # type: ignore[attr-defined]
+            result["deleted"] += int(deleted or 0)
         return result
 
     def prune_sessions(self, older_than_days: Optional[float] = 90, source: str | None = None,

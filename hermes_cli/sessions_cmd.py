@@ -664,6 +664,12 @@ def _cmd_compact_history(db, args):
     if seconds is None:
         print("Error: --older-than must be a duration (for example, 14d or 2w)")
         return 1
+    if not getattr(args, "dry_run", False) and not getattr(args, "yes", False):
+        refused = _confirm_or_exit_code(
+            f"Archive and delete inactive compacted history older than {args.older_than}? [y/N] "
+        )
+        if refused is not None:
+            return refused
     days = seconds / 86400.0
     result = db.compacted_history_retention(days, archive_path=args.archive,
                                             dry_run=args.dry_run, batch_size=args.batch_size)
@@ -1485,7 +1491,7 @@ def _print_empty_store(action: str, args) -> None:
 
 # VACUUM, the FTS-layout rebuild and bulk deletes rewrite the store; underneath a live gateway/Desktop/cron
 # writer that is the second-writer class behind the retired-WAL refusal (#110054). `--force` is the override.
-_HELD_STORE_ACTIONS = frozenset({"optimize", "optimize-storage", "prune"})
+_HELD_STORE_ACTIONS = frozenset({"optimize", "optimize-storage", "prune", "compact-history"})
 
 
 def cmd_sessions(args, sessions_parser=None):
