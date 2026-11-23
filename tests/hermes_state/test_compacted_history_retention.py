@@ -94,12 +94,12 @@ def test_crash_after_archive_append_recovers_without_duplicates(tmp_path, monkey
     original = db._execute_write
     calls = 0
 
-    def fail_once(fn):
+    def fail_once(fn, **kwargs):
         nonlocal calls
         calls += 1
         if calls == 1:
             raise RuntimeError("injected crash")
-        return original(fn)
+        return original(fn, **kwargs)
 
     monkeypatch.setattr(db, "_execute_write", fail_once)
     try:
