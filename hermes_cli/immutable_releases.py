@@ -1339,9 +1339,10 @@ def _execution_code_sha_pins(home: Path) -> set[Path]:
     """Keep releases referenced by the durable cron execution ledger.
 
     Detached cron workers import an immutable release and persist its ``code_sha``.
-    Only non-terminal rows (anything except completed/failed/cancelled/missed from
-    cron/executions.py:84) pin a release; terminal rows no longer do. NULL/unknown/
-    running/claimed still pin (fail-closed on uncertainty or future statuses).
+    Only rows that may still run pin a release. ``unknown`` stays a pin because its
+    owner may have disappeared mid-run, and NULL or unrecognized statuses pin so the
+    check fails closed. Finished rows (completed, failed, cancelled, missed) do not,
+    otherwise every release that ever ran a cron job would be kept forever.
     Read the ledger without acquiring a writer handle; an unreadable ledger must
     fail closed rather than allowing release deletion under uncertainty.
     """
@@ -1354,9 +1355,6 @@ def _execution_code_sha_pins(home: Path) -> set[Path]:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(executions)")}
             if "code_sha" not in columns:
                 return set()
-            # Only pin shas from non-terminal rows so completed/failed/cancelled/missed
-            # executions no longer hold releases forever. NULL/unknown/running/claimed
-            # (and any future status) still pin (fail-closed).
             terminal = ("completed", "failed", "cancelled", "missed")
             values = connection.execute(
                 "SELECT DISTINCT code_sha FROM executions "
