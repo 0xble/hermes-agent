@@ -521,7 +521,7 @@ class MicroCompactionMixin:
         """Merge consecutive plain-text real user turns left by a supersede. Same ``\\n\\n`` join as
         ``repair_message_sequence`` pass 2, done here so the marker and cursor are never collateral
         damage of the downstream repair. Lists untouched."""
-        from agent.turn_context import drop_stale_api_content
+        from session_rules.turns import drop_stale_api_content
 
         def _plain_user(m: Any) -> bool:
             return (

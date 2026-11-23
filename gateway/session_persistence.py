@@ -4,6 +4,30 @@ load/save paths (state.db gateway_routing primary, sessions.json legacy mirror).
 
 from __future__ import annotations
 
+import functools
+
+
+def authority_persistence(authority):
+    """*authority*'s storage interface handle, the one it was built with."""
+    return authority.runner.persistence
+
+
+def owner_rule():
+    """The host owner rule used by gateway session readers."""
+    from gateway.owner_identity import _BUNDLED_LOGINS, host_owner_subject
+    from hermes_cli.dashboard_auth.registry import list_session_providers
+    from persistence.authority.vocabulary import OwnerRule
+    return OwnerRule(host_subject=host_owner_subject(),
+                     login_providers=_BUNDLED_LOGINS | {provider.name for provider in list_session_providers()},
+                     messaging_labels=_messaging_labels())
+
+
+@functools.lru_cache(maxsize=1)
+def _messaging_labels():
+    from gateway.config import Platform
+    bundled, aliases = Platform._scan_bundled_plugin_platforms()
+    return frozenset({platform.value for platform in Platform} | set(bundled) | set(aliases))
+
 import contextlib
 import logging
 import json

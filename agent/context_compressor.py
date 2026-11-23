@@ -4387,7 +4387,7 @@ Write only the summary body. Do not include any preamble or prefix."""
         also expands ``response_item_id`` and composite ``call|item`` bridge spellings (#63000), so the
         compressor's pairing tolerance matches the pre-call sanitizer's exactly and the two can never drift.
         """
-        from agent.message_sanitization import tool_call_id_variants
+        from session_rules.turns import tool_call_id_variants
         return set(tool_call_id_variants(tc))
 
     def _sanitize_tool_pairs(self, messages: list[dict[str, Any]]) -> list[dict[str, Any]]:

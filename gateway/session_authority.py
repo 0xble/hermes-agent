@@ -43,6 +43,16 @@ native_write_started = ContextVar('native_write_started', default=False)
 messaging_admission = ContextVar('messaging_admission', default=None)
 
 
+def admission_row(record):
+    """The admission row dict of *record* (None stays None) that the drain, the settlement and the
+    producers read; a claim's row keeps its ``transcript_mark``."""
+    if record is None:
+        return None
+    row = asdict(record)
+    row.pop('queued_owner_epoch', None)
+    return row
+
+
 @dataclass
 class LiveSession:
     source: object
