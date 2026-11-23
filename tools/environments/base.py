@@ -80,10 +80,12 @@ _HOST_EXITING_OUTPUT = (
 # became the parent's shell state (#84536).
 _shell_state_chain: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
     "terminal_shell_state_chain", default=())
+_shell_state_paths: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar(
+    "terminal_shell_state_paths", default=())
 
 # A local delegated child may use its own environment object while inheriting its parent's shell
-# snapshot. Keep that handoff in-process and environment-scoped; never derive an ancestor's path
-# from task_id alone, because task ids can be reused across processes and sessions.
+# snapshot. Keep that fallback handoff in-process and environment-scoped; terminal_tool passes
+# explicit paths, and task ids alone are never used to derive a cross-process path.
 _task_snapshot_paths: dict[str, str] = {}
 _task_snapshot_paths_lock = threading.Lock()
 
@@ -107,12 +109,14 @@ def _forget_task_snapshots(snapshot_prefix: str) -> None:
 
 
 @contextmanager
-def shell_state_scope(chain: tuple[str, ...]):
+def shell_state_scope(chain: tuple[str, ...], snapshot_paths: tuple[str, ...] = ()):
     """Run commands against the per-task snapshot of ``chain[0]`` (seeded from its ancestors)."""
     token = _shell_state_chain.set(tuple(chain))
+    paths_token = _shell_state_paths.set(tuple(snapshot_paths))
     try:
         yield
     finally:
+        _shell_state_paths.reset(paths_token)
         _shell_state_chain.reset(token)
 
 
@@ -483,6 +487,9 @@ class BaseEnvironment(LongLivedProcessMixin, ABC):
 
     def _shell_state_snapshot_paths(self) -> list[str]:
         """Resolve the current task locally and delegated ancestors from their owning environments."""
+        explicit = _shell_state_paths.get()
+        if explicit:
+            return list(explicit)
         task_ids = _shell_state_chain.get()
         paths: list[str] = []
         for index, task_id in enumerate(task_ids):
