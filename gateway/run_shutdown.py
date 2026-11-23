@@ -2112,6 +2112,7 @@ class GatewayShutdownMixin(InterruptionNotesMixin, GatewaySessionEndMixin, Gatew
         # WARNING and keeps the wait: that budget's end or a force stops it, never this notice.
         next_warn_at = wait_started + turn_timeout if turn_timeout > 0 else None
         while True:
+            force = getattr(self, "_restart_force_event", None)
             if force is not None and force.is_set():
                 logger.warning("Forced restart: stopping now and interrupting: %s", _log_view(self._describe_active_work()))
                 return False

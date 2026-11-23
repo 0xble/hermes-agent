@@ -4320,13 +4320,33 @@ class SlackAdapter(SlackSocketLifecycleMixin, SlackReactionsMixin, SlackThreadSt
             event = normalized_event
         # Socket Mode redelivers after reconnects (#4777). Scope by workspace: ts is only unique per team.
         event_ts = event.get("_slack_changed_event_ts") or event.get("ts", "")
-        dedup_team_id = self._event_team_id(event, payload)
+        dedup_team_id = self._event_team_id(event, payload, install_set=getattr(self, "_team_clients", None))
+        if getattr(self, "_team_clients", None) and not dedup_team_id:
+            logger.info("[Slack] Ignoring event with no authenticated workspace: type=%s channel=%s",
+                        event.get("type"), event.get("channel", ""))
+            return None
         if self._is_recovered_replay(event) or (
                 event_ts and self._dedup.is_duplicate(self._workspace_event_id(dedup_team_id, event_ts))):
             return None
         channel_id = event.get("channel", "")
         if self._is_ignored_channel(channel_id):
             logger.info("[Slack] Ignoring message in configured ignored channel %s", channel_id)
+            return None
+        # Slack Connect external-org users can DM the bot even though their home
+        # workspace never installed it.  Only compare explicit T… author fields;
+        # absent author attribution remains the documented fail-open path.
+        author_team = ""
+        for field in ("user_team", "team"):
+            value = event.get(field)
+            if isinstance(value, str) and value.startswith("T"):
+                author_team = value
+                break
+        is_dm_event = (
+            event.get("channel_type") == "im" or str(channel_id).startswith("D")
+            or str(event.get("_hermes_reaction_source_channel", "")).startswith("D"))
+        if is_dm_event and self._is_foreign_author(author_team, dedup_team_id):
+            logger.info("[Slack] Ignoring DM from external-org user %s (team %s) in %s",
+                        event.get("user"), author_team, channel_id)
             return None
         if await self._drop_bot_sender(event):
             return None

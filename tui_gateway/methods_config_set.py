@@ -8,6 +8,7 @@ import os
 
 from hermes_cli.config_backend import ConfigWriteError
 from hermes_constants import INDICATOR_STYLES
+from .session_lifecycle import SessionNotOwned, _require_transcript_owner
 
 from .method_ctx import HandlerRegistry, bind_module
 
@@ -181,6 +182,7 @@ def _set_model(rid, params, key, value, session):
     if session:
         from hermes_cli.model_switch import parse_model_switch_args
         sid = params.get("session_id", "")
+        _require_transcript_owner(session)
         parsed_flags = parse_model_switch_args(value)
         # Compute-host sessions ALWAYS defer, busy or idle. Their live agent is in
         # the child process — the direct path below would build a SECOND agent in

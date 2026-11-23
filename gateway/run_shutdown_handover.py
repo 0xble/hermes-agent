@@ -37,8 +37,8 @@ def request_restart(self, *, detached: bool = False, via_service: bool = False,
     self._restart_detached = detached
     self._restart_via_service = via_service
     self._restart_task_started = True
-    # Refuse new turns; keep ``_running`` True so the active turn can still deliver its final response.
-    self._draining = True
+    # Refuse new turns only once the active-work wait completes; the requesting
+    # turn and any follow-up admitted before that boundary keep being served.
     from gateway.drain_control import open_restart_wait
     open_restart_wait(self)  # clients may still answer a turn parked on approval/clarify (#139041)
     # The restart's after-turn wait is a drain window too: pollers of GET /v1/runs/{id} must see
@@ -47,13 +47,20 @@ def request_restart(self, *, detached: bool = False, via_service: bool = False,
 
     async def _run_restart() -> None:
         await self._await_active_work_before_restart()
+        # Admission closes only after the bounded wait.  A forced update pause
+        # must never launch a detached helper captured by an earlier /restart.
+        self._draining = True
+        restart_detached, restart_via_service = detached, via_service
+        if getattr(self, "_restart_force_event", None) is not None and self._restart_force_event.is_set():
+            restart_detached = False
+            restart_via_service = True
         # Detached helper only AFTER the after-turn wait, or its drain_timeout+5 deadline fires mid-turn.
-        if detached:
+        if restart_detached:
             from gateway.run_shutdown import _log_suppressed
             with _log_suppressed(logging.ERROR, "Failed to launch detached gateway restart helper: %s"):
                 await self._launch_detached_restart_command()
         await asyncio.sleep(0.05)
-        await self.stop(restart=True, detached_restart=detached, service_restart=via_service)
+        await self.stop(restart=True, detached_restart=restart_detached, service_restart=restart_via_service)
 
     # NOT in _background_tasks: _stop_impl cancels those, which would cancel _run_restart while it
     # awaits _stop_task and skip _shutdown_event.set() / _exit_code = 75 (#12875). We still hold a strong reference in

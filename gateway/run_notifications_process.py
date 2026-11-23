@@ -181,6 +181,12 @@ class GatewayProcessNotificationsMixin:
         failed poll: drop the watcher without retaining it in the live watcher set or retrying it.
         """
         from gateway.profile_routing import ProfileRouteRejected
+        live_watchers = getattr(self, "_live_process_watchers", None)
+        if live_watchers is None:
+            live_watchers = self._live_process_watchers = set()
+        watcher_id = watcher.get("session_id") or watcher.get("process_id")
+        if watcher_id:
+            live_watchers.add(watcher_id)
         try:
             async with self._completion_event_scope(watcher):
                 await self._watch_process(watcher)
@@ -188,6 +194,9 @@ class GatewayProcessNotificationsMixin:
             from gateway.run_notifications import logger
             logger.info("Process watcher %s dropped: profile route is no longer served",
                         watcher.get("session_id", ""))
+        finally:
+            if watcher_id:
+                live_watchers.discard(watcher_id)
 
     async def _watch_process(self, watcher: dict) -> None:
         """Poll a background process and push updates until it exits. Mode

@@ -3655,6 +3655,8 @@ class GatewayRunner(
         self._completion_deliveries_inflight: set[tuple[str, str, object]] = set()
         self._completion_deliveries_delivered: OrderedDict[tuple[str, str, object], None] = OrderedDict()
         self._completion_delivery_retention = 2048
+        # Process watchers currently holding the gateway's restart-when-idle wait open.
+        self._live_process_watchers: set[str] = set()
         # Per-conversation completion fan-in (see GatewayNotificationsMixin._completion_hold_seconds):
         # routine results for a busy or recently woken session are held so the agent gets one
         # synthetic turn per window instead of one per result. Failures never wait.

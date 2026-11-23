@@ -312,10 +312,12 @@ class StreamFallbackMixin:
 
         self._message_id = last_message_id
         self._already_sent = True
-        if continuation == final_text or getattr(self, "_delivery_uncertain", False):
-            mark_final = getattr(self, "_mark_final_delivered", None)
-            if callable(mark_final):
-                mark_final(record=final_text)
+        mark_final = getattr(self, "_mark_final_delivered", None)
+        if callable(mark_final):
+            # A tail-only fallback completes the answer together with the frozen
+            # preview; the preview must remain on screen, but the cumulative
+            # delivery is final.
+            mark_final(record=final_text)
             result = locals().get("result")
             if result is not None:
                 from gateway.reply_latency import record_final_reply
