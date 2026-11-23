@@ -95,6 +95,53 @@ _BOOL_WORDS = frozenset({"1", "0", "true", "false", "yes", "no", "on", "off"})
 class _SlackInboundFileTooLarge(ValueError):
     """Raised when an inbound Slack document exceeds the bounded download limit."""
 
+
+async def _read_slack_stream_body(response: Any, *, max_bytes: Optional[int]) -> bytes:
+    """Read a Slack response, enforcing the inbound document limit when requested."""
+    if max_bytes is None:
+        return await response.aread()
+    content_length = response.headers.get("content-length")
+    try:
+        content_length = int(content_length) if content_length else None
+    except (TypeError, ValueError):
+        content_length = None
+    if content_length is not None and content_length > max_bytes:
+        raise _SlackInboundFileTooLarge(
+            f"Slack attachment exceeds the {max_bytes // (1024 * 1024)} MB inbound document limit.")
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in response.aiter_bytes():
+        total += len(chunk)
+        if total > max_bytes:
+            raise _SlackInboundFileTooLarge(
+                f"Slack attachment exceeds the {max_bytes // (1024 * 1024)} MB inbound document limit.")
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+def _slack_redirect_target(
+    response: Any, *, redirect_count: int, is_safe_url: Callable[[str], bool],
+    is_slack_cdn_url: Callable[[str], bool],
+) -> str:
+    """Validate a Slack file redirect before the bearer token follows it."""
+    from tools.url_safety import redirect_target_from_response
+
+    target = redirect_target_from_response(response)
+    if not target:
+        raise ValueError("Slack file redirect missing Location header")
+    if not is_safe_url(target):
+        raise ValueError(
+            "Blocked unsafe Slack file redirect (SSRF protection): "
+            f"{safe_url_for_log(target)}")
+    if not is_slack_cdn_url(target):
+        raise ValueError(
+            "Blocked non-Slack-CDN file redirect (token-exfiltration protection): "
+            f"{safe_url_for_log(target)}")
+    if redirect_count == 3:
+        raise ValueError("Too many Slack file redirects (maximum 3)")
+    return target
+
+
 # Model picker Block Kit action IDs. The picker is a two-step drill-down:
 # provider static_select → model static_select, plus Back/Cancel buttons.
 _MODEL_PICKER_PROVIDER_ACTION = "hermes_model_provider"
@@ -6155,7 +6202,7 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         re-validated; an HTML body (sign-in page) is rejected so bogus bytes are never cached."""
         import httpx
         from tools.url_safety import (
-            create_ssrf_safe_async_client, is_safe_url, redirect_target_from_response,
+            create_ssrf_safe_async_client, is_safe_url,
         )
         if not is_safe_url(url):
             raise ValueError(
@@ -6179,20 +6226,10 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                             "GET", download_url,
                             headers={"Authorization": f"Bearer {bot_token}"}) as response:
                             if response.status_code in (301, 302, 303, 307, 308):
-                                target = redirect_target_from_response(response)
-                                if not target:
-                                    raise ValueError("Slack file redirect missing Location header")
-                                if not is_safe_url(target):
-                                    raise ValueError(
-                                        "Blocked unsafe Slack file redirect (SSRF protection): "
-                                        f"{safe_url_for_log(target)}")
-                                if not self._is_slack_cdn_url(target):
-                                    raise ValueError(
-                                        "Blocked non-Slack-CDN file redirect (token-exfiltration protection): "
-                                        f"{safe_url_for_log(target)}")
-                                if redirect_count == 3:
-                                    raise ValueError("Too many Slack file redirects (maximum 3)")
-                                download_url = target
+                                download_url = _slack_redirect_target(
+                                    response, redirect_count=redirect_count,
+                                    is_safe_url=is_safe_url,
+                                    is_slack_cdn_url=self._is_slack_cdn_url)
                                 redirect_count += 1
                                 continue
                             response.raise_for_status()
@@ -6202,27 +6239,7 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                                     f"Slack returned HTML instead of {html_label} (content-type: {ct}); "
                                     "check bot token scopes and file permissions, or a cross-origin "
                                     "redirect dropped the token (Enterprise Grid files-origin)")
-                            if max_bytes is None:
-                                return await response.aread()
-                            content_length = response.headers.get("content-length")
-                            try:
-                                content_length = int(content_length) if content_length else None
-                            except (TypeError, ValueError):
-                                content_length = None
-                            if content_length is not None and content_length > max_bytes:
-                                raise _SlackInboundFileTooLarge(
-                                    f"Slack attachment exceeds the "
-                                    f"{max_bytes // (1024 * 1024)} MB inbound document limit.")
-                            chunks: list[bytes] = []
-                            total = 0
-                            async for chunk in response.aiter_bytes():
-                                total += len(chunk)
-                                if total > max_bytes:
-                                    raise _SlackInboundFileTooLarge(
-                                        f"Slack attachment exceeds the "
-                                        f"{max_bytes // (1024 * 1024)} MB inbound document limit.")
-                                chunks.append(chunk)
-                            return b"".join(chunks)
+                            return await _read_slack_stream_body(response, max_bytes=max_bytes)
                 except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
                         raise
