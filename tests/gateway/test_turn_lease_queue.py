@@ -42,6 +42,41 @@ async def test_contended_internal_holder_can_be_preempted_before_waiting():
 
 
 @pytest.mark.asyncio
+async def test_cold_path_user_turn_yields_internal_lease_holder(monkeypatch):
+    from gateway.run_turn_prepare import GatewayTurnPrepareMixin
+
+    runner = object.__new__(GatewayTurnPrepareMixin)
+    registry = SessionTurnLeaseRegistry()
+    runner._turn_leases = registry
+    agent = SimpleNamespace()
+    state = SimpleNamespace(turn=SimpleNamespace(agent=agent, lease_tokens={}))
+    runner._peek_session_state = lambda _key: state
+    runner._session_state = lambda _key: state
+    runner._delivery_adapter_for = lambda _source: object()
+    runner._BusySteerOutcome = lambda **kwargs: SimpleNamespace(**kwargs)
+    runner._clear_session_env = lambda _tokens: None
+    interrupted = []
+
+    async def interrupt(event, _adapter, _agent):
+        interrupted.append(event)
+        registry.release(registry._leases["session"].holder)
+
+    async def ack(*_args):
+        return None
+
+    runner._interrupt_running_agent_for_busy_event = interrupt
+    runner._busy_interrupt_and_ack = ack
+    machine_event = SimpleNamespace(internal=True)
+    await registry.acquire("session", owner_key="topic", generation=1, event=machine_event)
+    user_event = SimpleNamespace(internal=False, source=object())
+    entry = SimpleNamespace(session_id="session")
+    await runner._hmwa_acquire_turn_lease("topic", 2, entry, None, user_event)
+    assert interrupted == [user_event]
+    assert state.turn.lease_tokens[2].event is user_event
+    registry.release(state.turn.lease_tokens[2])
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("holder_key", ["same-key", "other-key"])
 async def test_admitted_successor_waits_past_lease_deadline(monkeypatch, tmp_path, caplog, holder_key):
     runner = _bootstrap(monkeypatch, tmp_path)

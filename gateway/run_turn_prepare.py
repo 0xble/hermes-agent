@@ -794,16 +794,19 @@ class GatewayTurnPrepareMixin:
             state = getattr(self, "_peek_session_state")(holder.owner_key)
             running_agent = state.turn.agent if state is not None else None
             from gateway.run import _AGENT_PENDING_SENTINEL
+            # Lease acquisition is the cold-path boundary; adapter busy dispatch may not have seen this turn.
+            # Reuse the busy interrupt machinery when available, but never make lease admission depend on
+            # optional mixin methods (tests and minimal runners may only expose cancellation).
             if running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL:
                 adapter = getattr(self, "_delivery_adapter_for")(event.source)
-                if adapter is not None:
+                if adapter is not None and hasattr(self, "_interrupt_running_agent_for_busy_event"):
                     await getattr(self, "_interrupt_running_agent_for_busy_event")(event, adapter, running_agent)
                     event._gateway_lease_machine_preempted = True
-                    outcome = getattr(self, "_BusySteerOutcome")(
-                        effective_mode="interrupt", demoted_for_subagents=False,
-                        demoted_for_compression=False, steered=False, redirected=False,
-                    )
-                    await getattr(self, "_busy_interrupt_and_ack")(event, _quick_key, adapter, state, running_agent, outcome)
+                elif adapter is not None:
+                    task = getattr(self, "_session_tasks", {}).get(holder.owner_key)
+                    if task is not None and not task.done():
+                        task.cancel()
+                        event._gateway_lease_machine_preempted = True
             else:
                 task = getattr(self, "_session_tasks", {}).get(holder.owner_key)
                 if task is not None and not task.done():
