@@ -752,6 +752,16 @@ async def test_session_hygiene_honors_configurable_hard_message_limit(
 # Cooldown persistence across gateway restarts (#74136)
 # ---------------------------------------------------------------------------
 
+_STORAGE_HANDLES = []
+
+
+@pytest.fixture(autouse=True)
+def _close_storage_handles():
+    yield
+    while _STORAGE_HANDLES:
+        _STORAGE_HANDLES.pop().close()
+
+
 def _make_cooldown_runner(monkeypatch, tmp_path, agent_cls, session_db, session_id):
     """Scaffolding for the restart-persistence tests: a fresh GatewayRunner
     wired to a REAL AsyncSessionDB facade (not a MagicMock) so the hygiene
