@@ -1759,9 +1759,17 @@ class TurnRunner(TurnRunnerNoticesMixin, TurnRunnerApprovalMixin, TurnSessionTit
             else:
                 pending_fallback_notice = getattr(runner, "_pre_agent_fallback_notice", None)
                 runner._pre_agent_fallback_notice = None
-            from agent.primary_auth_fallback import failure_for_route, route_snapshot, take_pending_primary_auth_failure
+            from agent.primary_auth_fallback import (
+                RUNTIME_KEY,
+                failure_for_route,
+                route_snapshot,
+                take_pending_primary_auth_failure,
+            )
             pending_primary_auth = take_pending_primary_auth_failure()
             resolved_route = route_snapshot(runtime_kwargs)
+            # The marker is gateway bookkeeping, not an AIAgent constructor option. Keep the
+            # pending failure separately and strip it before shaping the route runtime.
+            runtime_kwargs.pop(RUNTIME_KEY, None)
             from gateway.session_api_turn import prepare_api_runtime
             model, runtime_kwargs = prepare_api_runtime(model, runtime_kwargs)
             # The classic CLI's `/model --once` / `/moa`: this admission only, nothing persisted.

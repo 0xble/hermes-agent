@@ -1,11 +1,24 @@
-'Attended-route methods split from the Gateway turn facade.'
+'''Attended-route methods split from the Gateway turn facade.'''
 
+from __future__ import annotations
+
+import asyncio
+import dataclasses
+import logging
+import time
 from contextlib import suppress
-from typing import Any, cast
+from typing import Optional
+
+from gateway.attended_model import (
+    _stamp_seconds,
+    format_attended_switch_back_notice,
+    format_attended_switch_notice,
+    is_active,
+    parse_attended_config,
+)
 from gateway.run_turn import _NO_ATTENDED_ACTIVITY_STAMP
-_NO_ATTENDED_ACTIVITY_STAMP = cast(Any, _NO_ATTENDED_ACTIVITY_STAMP)
-from gateway import run_turn as _run_turn
-globals().update(vars(_run_turn))
+
+logger = logging.getLogger("gateway.run")
 
 class GatewayAttendedMixin:
     def _load_attended_activity_stamp(self, session_key: str, *, refresh: bool = False):
