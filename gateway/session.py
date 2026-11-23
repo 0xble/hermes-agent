@@ -510,6 +510,22 @@ def sanitize_reasoning_override(override: Optional[dict[str, Any]]) -> Optional[
     return parse_reasoning_effort(override)
 
 
+class _RosterCallback(weakref.WeakMethod):
+    """Weak store callback that copies atomically, like ``weakref.ref``.
+
+    ``copy`` treats ``weakref.ref`` as atomic only by exact type, so callers that
+    deep-copy an attached entry's ``__dict__`` would otherwise fail to pickle it.
+    """
+
+    __slots__ = ()
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
+
 class _RosterEntries(dict):
     """Dict backing SessionStore._entries with structural roster invalidation."""
 
@@ -522,7 +538,7 @@ class _RosterEntries(dict):
 
     def _attach(self, value) -> None:
         if isinstance(value, SessionEntry) and self._on_change is not None:
-            object.__setattr__(value, "_roster_change", weakref.WeakMethod(self._on_change))
+            object.__setattr__(value, "_roster_change", _RosterCallback(self._on_change))
 
     def _rebind(self, on_change) -> None:
         self._on_change = on_change

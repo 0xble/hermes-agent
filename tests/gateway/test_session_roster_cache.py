@@ -133,6 +133,10 @@ def test_session_entry_attached_copy_and_dataclass_operations_drop_callback(tmp_
     result = dataclasses.asdict(entry)
     assert result["session_key"] == entry.session_key
     assert "_roster_change" not in result
+    # Snapshots deep-copy the attached entry's raw attribute dict.
+    snapshot = copy.deepcopy(entry.__dict__)
+    assert snapshot["session_key"] == entry.session_key
+    assert copy.deepcopy(entry.__dict__) == snapshot
 
 
 def test_roster_entries_attached_copy_and_pickle_drop_callback(tmp_path):
