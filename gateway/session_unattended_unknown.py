@@ -90,10 +90,10 @@ def settle_recovered_unattended(store, epoch) -> int:
     settled = 0
     for row in _unattended_unknown(store.admissions.list_unknown()):
         from cron.detached_authority import recover_detached, defer_detached
-        if recover_detached(db, epoch, row):
+        if recover_detached(store, epoch, row):
             settled += 1
             continue
-        if defer_detached(db, row):
+        if defer_detached(store, row):
             continue
         try:
             store.admissions.resolve_unknown(epoch=epoch, admission_id=row['admission_id'],

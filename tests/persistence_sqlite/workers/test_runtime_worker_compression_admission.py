@@ -4,7 +4,6 @@ import pytest
 from agent.runtime_session_store import RuntimeSessionStore
 from persistence.sqlite.authority._admission_store import admit_session_input, claim_session_input, get_session_admission
 from tests.fakes.runtime_owner import begin_runtime_epoch
-from persistence.sqlite.authority._runtime_ends import begin_runtime_epoch
 from persistence.sqlite.conversation._store.sessions import create_session
 from persistence.sqlite.workers._executions import register_worker_execution
 from persistence.sqlite.workers._receipt import mutate_worker_execution

@@ -20,9 +20,11 @@ from typing import Any, Dict, List, Optional, Tuple
 from agent.notice_style import ContextNotice
 from hermes_cli.timeouts import get_provider_request_timeout
 from agent.message_sanitization import _FULL_ARGS_LOG_BOUND, coalesce_tool_call_id, coerce_tool_name
-from session_rules.turns import drop_stale_api_content, tool_call_id_variants, tool_result_id_variants
+from session_rules.turns import (
+    drop_stale_api_content, merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message,
+    tool_call_id_variants, tool_result_id_variants,
+)
 from agent.message_metadata import TOOL_CALL_UIDS
-from session_rules.turns import merge_tool_call_uids, per_occurrence_tool_call_uids, record_absorbed_message
 from agent.cache_bounds import publish_lru
 from agent.prompt_builder import STEER_DISPLAY_KIND, steer_user_row
 from agent.tool_dispatch_helpers import _trajectory_normalize_msg, make_tool_result_message
@@ -37,7 +39,6 @@ from agent.error_classifier import FailoverReason
 from agent.shared_primary_cooldown_runtime import _adopt_shared_primary_cooldown
 from agent.retry_utils import parse_retry_after_seconds, reset_delay_from_message
 from agent.message_metadata import MERGED_TURN_PREFIX
-from session_rules.turns import drop_stale_api_content
 from agent.agent_runtime_helpers_placeholders import _INTERRUPTED_PLACEHOLDER
 from agent.primary_runtime_snapshot import _build_primary_runtime_snapshot
 from utils import base_url_host_matches, base_url_hostname, env_var_enabled, atomic_json_write

@@ -190,7 +190,7 @@ def routed_sessions_setting(key: str, env_var: str) -> Any:
         try:
             from hermes_cli.config import load_config_readonly
             return (load_config_readonly().get("sessions") or {}).get(key)
-        except Exception:
+        except Exception:  # health: allow BLE001 -- durability cleanup is best-effort after the error path
             return None
     return os.environ.get(env_var)
 
@@ -775,7 +775,7 @@ def apply_database_pragmas(conn: sqlite3.Connection, *, db_label: str = "state.d
     try:
         from hermes_cli.config import cfg_get, load_config_readonly  # local: avoids a circular import
         cfg = load_config_readonly()
-    except Exception:
+    except Exception:  # health: allow BLE001 -- durability cleanup is best-effort after the error path
         return
     for pragma_name in ("cache_size", "mmap_size", "temp_store", "wal_autocheckpoint", "journal_size_limit"):
         if (raw_value := cfg_get(cfg, "database", pragma_name, default=None)) is None:

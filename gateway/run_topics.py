@@ -1035,8 +1035,7 @@ class GatewayTopicThreadsMixin:
             await self._select_telegram_topic_icon(
                 source, adapter, topic_name, user_message=user_message, model_icon=model_icon))
 
-        # The binding can change while icon discovery is awaiting Telegram. Recheck
-        # immediately before the write so a stale title/icon cannot cross sessions.
+        session_db = await asyncio.to_thread(self._sync_session_db)
         if session_db is not None:
             try:
                 binding = await session_db.get_telegram_topic_binding(

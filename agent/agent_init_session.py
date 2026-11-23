@@ -14,11 +14,11 @@ def _publish_session_id(session_id: str) -> None:
     try:
         from gateway.session_context import set_current_session_id
         set_current_session_id(session_id)
-    except Exception:
+    except Exception:  # health: allow BLE001 -- best-effort session publication must not break initialization
         try:
             from agent.delegation_context import is_delegated_child_context
             delegated_child = is_delegated_child_context()
-        except Exception:
+        except Exception:  # health: allow BLE001 -- best-effort session publication must not break initialization
             delegated_child = False
         if not delegated_child:
             os.environ["HERMES_SESSION_ID"] = session_id

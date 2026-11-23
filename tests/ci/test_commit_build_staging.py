@@ -17,8 +17,7 @@ from tests.ci.desktop_release_roles import (
     termux_builder, universal_assembler,
 )
 from tests.ci.test_desktop_release_tag_admission import _BASH, _child_env, _workflow
-from tests.scripts.test_release_r2 import r2_server
-
+from tests.scripts.test_release_r2 import r2_server as _r2_server  # noqa: F401 -- pytest fixture registration
 
 ROOT = Path(__file__).resolve().parents[2]
 

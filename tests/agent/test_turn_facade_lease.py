@@ -315,7 +315,7 @@ def test_lock_tolerance_never_outlives_the_committed_row_expiry(tmp_path, monkey
 
     # A real takeover past expiry stops the turn: a successor claims the expired row, and the
     # next locked tick's ownership read sees it.
-    assert db.try_acquire_session_turn_lease("s1", "successor")
+    assert coordination.try_acquire_turn_lease(session_id="s1", holder="successor")
     blocker = write_lock()
     try:
         assert lease.refresh_tick() is False
@@ -331,6 +331,7 @@ def test_delayed_renewal_after_expiry_keeps_an_unclaimed_row_and_fences_a_claime
     claimed, and a row a successor claimed in the meantime fails it and stops the turn."""
     import hermes_state
     import hermes_state_compression
+    import sqlite_support
     from agent import turn_facade_lease
 
     clock = _MovingClock(1000.0)

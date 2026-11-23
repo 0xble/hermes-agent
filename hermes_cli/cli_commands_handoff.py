@@ -80,7 +80,7 @@ class CLIHandoffMixin:
                 return _cp(f"  {_t('handoff.no_home_channel', platform=platform_name)}",
                            f"  {_t('handoff.set_home_hint')}")
             return _cp(f"  {_t('handoff.' + exc.reason, platform=platform_name)}")
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- invalid handoff state is a user-facing refusal
             return _cp(f"  {_t('handoff.config_load_failed', error=exc)}")
 
     def _handoff_prepare_session(self, store=None):
