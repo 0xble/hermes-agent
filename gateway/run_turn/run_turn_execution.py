@@ -1366,7 +1366,7 @@ class GatewayTurnExecutionMixin:
                     logger.warning("Temp bubble cleanup cancelled for session %s: remaining=%d", key,
                                    len(snapshot) - deleted - len(failures))
                     raise
-                except Exception as error:
+                except Exception as error:  # health: allow BLE001 -- any delete failure is recorded per message and logged below
                     failures.extend(f"{mid}:{type(error).__name__}" for mid in owned)
             # Settled after one attempt, as before the record existed: a cancelled cleanup (shutdown)
             # re-raised above and keeps its record, so the next boot finishes it.
