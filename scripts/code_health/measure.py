@@ -14,7 +14,7 @@ from pathlib import Path
 from hermes_agent.compat.paths import original_path
 from scripts.code_health import py_rules, py_structure
 from scripts.code_health.config import RULES, RULES_BY_ID, in_scope, rule_applies
-from scripts.code_health.gitio import read_file
+from scripts.code_health.gitio import read_files
 from scripts.code_health.model import FileMeasure, Unit
 from scripts.code_health.ruff_runner import run_ruff
 from scripts.code_health.ts_measure import measure_ts
@@ -115,12 +115,8 @@ class Measurer:
         self.regex_rules = _regex_rules(repo)
 
     def measure(self, tree: str | None, paths: list[str]) -> dict[str, FileMeasure]:
-        contents = {}
-        for path in paths:
-            if in_scope(path):
-                text = read_file(self.repo, tree, path)
-                if text is not None:
-                    contents[path] = text
+        scoped = [path for path in paths if in_scope(path)]
+        contents = read_files(self.repo, tree, scoped)
         if tree is None:
             return self._measure_in(self.repo, contents)
         with tempfile.TemporaryDirectory(prefix="code-health-") as tmp:

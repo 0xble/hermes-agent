@@ -149,6 +149,67 @@ def changed_files(repo: Path, base: str, head: str | None, *diff_args: str) -> l
     return [c for c in changes if c.new not in generated]
 
 
+def _read_files_individually(repo: Path, tree: str | None, paths: list[str]) -> dict[str, str]:
+    contents = {}
+    for path in paths:
+        text = read_file(repo, tree, path)
+        if text is not None:
+            contents[path] = text
+    return contents
+
+
+def read_files(repo: Path, tree: str | None, paths: list[str]) -> dict[str, str]:
+    """Read committed paths with one Git object-stream process.
+
+    Code-health compares thousands of paths on a large sync. Spawning ``git show`` once per
+    path makes that comparison take hours, while ``cat-file --batch`` returns the same blobs
+    through one bounded subprocess. Unusual paths or a malformed batch response use the old
+    per-path reader so the batch optimization cannot change the read contract.
+    """
+    selected = [path for path in paths if path]
+    if not selected or tree is None:
+        return _read_files_individually(repo, tree, selected)
+    if any("\n" in path or "\r" in path for path in selected):
+        return _read_files_individually(repo, tree, selected)
+    request = b"".join(f"{tree}:{path}\n".encode("utf-8") for path in selected)
+    try:
+        proc = subprocess.run(
+            ["git", "cat-file", "--batch"],
+            cwd=repo,
+            input=request,
+            capture_output=True,
+            timeout=120,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return _read_files_individually(repo, tree, selected)
+    if proc.returncode != 0:
+        return _read_files_individually(repo, tree, selected)
+
+    contents: dict[str, str] = {}
+    cursor = 0
+    for path in selected:
+        header_end = proc.stdout.find(b"\n", cursor)
+        if header_end < 0:
+            return _read_files_individually(repo, tree, selected)
+        header = proc.stdout[cursor:header_end].split()
+        cursor = header_end + 1
+        if header and header[-1] == b"missing":
+            continue
+        if len(header) < 3 or header[-2] != b"blob":
+            return _read_files_individually(repo, tree, selected)
+        try:
+            size = int(header[-1])
+        except ValueError:
+            return _read_files_individually(repo, tree, selected)
+        end = cursor + size
+        if end >= len(proc.stdout) or proc.stdout[end:end + 1] != b"\n":
+            return _read_files_individually(repo, tree, selected)
+        contents[path] = proc.stdout[cursor:end].decode("utf-8-sig", errors="replace")
+        cursor = end + 1
+    return contents
+
+
 def read_file(repo: Path, tree: str | None, path: str) -> str | None:
     if tree is None:
         try:

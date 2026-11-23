@@ -50,6 +50,17 @@ def _repo(tmp_path: Path) -> tuple[Path, str]:
     return repo, _commit(repo, {"pkg/a.py": _LEGACY + "\n\n" + _SWALLOW})
 
 
+def test_read_files_batches_tree_blobs_and_skips_missing_paths(tmp_path):
+    repo, base = _repo(tmp_path)
+    head = _commit(repo, {"pkg/b.py": "value = 2\n"})
+
+    assert gitio.read_files(repo, head, ["pkg/a.py", "pkg/b.py", "pkg/missing.py"]) == {
+        "pkg/a.py": _LEGACY + "\n\n" + _SWALLOW,
+        "pkg/b.py": "value = 2\n",
+    }
+    assert gitio.read_file(repo, base, "pkg/a.py") == _LEGACY + "\n\n" + _SWALLOW
+
+
 def _verdict(repo: Path, base: str, files: dict[str, str | None], capsys) -> tuple[int, str]:
     head = _commit(repo, files)
     code = run(repo, base, head)
