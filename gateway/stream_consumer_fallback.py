@@ -312,7 +312,7 @@ class StreamFallbackMixin:
 
         self._message_id = last_message_id
         self._already_sent = True
-        if continuation == final_text:
+        if continuation == final_text or getattr(self, "_delivery_uncertain", False):
             mark_final = getattr(self, "_mark_final_delivered", None)
             if callable(mark_final):
                 mark_final(record=final_text)

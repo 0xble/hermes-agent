@@ -175,9 +175,19 @@ class GatewayProcessNotificationsMixin:
     async def _run_process_watcher(self, watcher: dict) -> None:
         """Run :meth:`_watch_process` inside the owning profile's scope, start to finish. A watcher starts
         in an empty context (live-armed from a tool thread, or recovered at startup), and the output it
-        prepares runs that profile's own ``transform_terminal_output`` hooks before any delivery."""
-        async with self._completion_event_scope(watcher):
-            await self._watch_process(watcher)
+        prepares runs that profile's own ``transform_terminal_output`` hooks before any delivery.
+
+        A process can outlive its profile route.  That is a terminal per-watcher condition, not a
+        failed poll: drop the watcher without retaining it in the live watcher set or retrying it.
+        """
+        from gateway.profile_routing import ProfileRouteRejected
+        try:
+            async with self._completion_event_scope(watcher):
+                await self._watch_process(watcher)
+        except ProfileRouteRejected:
+            from gateway.run_notifications import logger
+            logger.info("Process watcher %s dropped: profile route is no longer served",
+                        watcher.get("session_id", ""))
 
     async def _watch_process(self, watcher: dict) -> None:
         """Poll a background process and push updates until it exits. Mode

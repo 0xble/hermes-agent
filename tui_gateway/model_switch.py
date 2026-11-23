@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import time
 
 from .method_ctx import HandlerRegistry, bind_module
 

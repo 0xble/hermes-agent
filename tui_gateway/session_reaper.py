@@ -9,6 +9,7 @@ from __future__ import annotations
 import contextlib
 import secrets
 import threading
+import time
 
 from tui_gateway._env import env_float
 

@@ -532,6 +532,8 @@ class GatewayNotificationsMixin(
                         chat_id=chat_id, images=images, metadata=adapter_meta)
                     delivered_any = delivered_any or _media_send_succeeded(_res)
                     captioned = caption_landed(_res, images)
+                    if footer_captioned is not None:
+                        footer_captioned[:] = [captioned]
                 except Exception as e:
                     logger.warning("[%s] Post-stream image batch delivery failed: %s", adapter.name, e)
             for media_path, is_voice in non_image_media:

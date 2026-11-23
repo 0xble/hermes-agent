@@ -6,6 +6,7 @@ globals at install time (method_ctx.bind_module), so they reference server.py gl
 from __future__ import annotations
 
 import logging
+import time
 
 import contextlib
 

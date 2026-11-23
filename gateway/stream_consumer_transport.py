@@ -721,8 +721,10 @@ class StreamTransportMixin:
                        "treating it as shown instead of sending it again")
         self._ceiling_note_unknown()
         self._last_sent_text = text
+        self._delivery_uncertain = True
         if finalize:
             self._delivery_ambiguous = True
+            self._mark_final_delivered(record=text)
         else:
             self._preview_uncertain = True
             # The seen prefix is the RAW stream: a fence closed only for display is not in the
