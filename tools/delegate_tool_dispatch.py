@@ -122,6 +122,13 @@ def _record_finished_child(batch: _Batch, entry: Any, honor_parent_interrupt: bo
     one-child unit — loses only children still running, never finished work (#116000). Best-effort by construction:
     ``record_unit_child`` never raises into the join."""
     if not honor_parent_interrupt and batch.unit_id and isinstance(entry, dict):
+        # Stamp identity before the durable child row is written; aggregate-time stamping
+        # is too late for auto-resume/recovery readers.
+        child = next((child for index, _, child in batch.children
+                      if index == entry.get("task_index")), None)
+        sid = getattr(child, "_subagent_id", None)
+        if isinstance(sid, str) and sid:
+            entry.setdefault("subagent_id", sid)
         record_unit_child(batch.unit_id, entry)
 
 
