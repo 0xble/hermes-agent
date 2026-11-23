@@ -21,7 +21,7 @@ def restart_macos_launchd_gateways(
         if listing.returncode != 0:
             failed_or_stale_units.append("launchd (listing failed)")
             return
-    from hermes_cli.update_cmd_posix_pause import already_restarted
+    from hermes_cli.update_cmd_posix_pause import already_restarted, is_left_pending
     from hermes_cli.update_cmd_fleet_handover import restart_invoking_gateway
     current_label = get_launchd_label()
     resumed = already_restarted()["labels"]  # paused for the update, restarted on the new code
@@ -46,14 +46,15 @@ def restart_macos_launchd_gateways(
             legacy_labels.remove("ai.hermes.gateway-guardian")
     if legacy_labels:
         print(f"  ↻ legacy-labelled units of this install join the restart: {', '.join(legacy_labels)}")
-    from hermes_cli.update_fleet_scope import describe_skipped_runtime, launchd_label_foreign_home
+    from hermes_cli.update_fleet_scope import launchd_label_skip_notice
     for label in derived_labels + legacy_labels:
         if label == current_label or label in resumed or label in protected_handover_labels:
             continue
         # Labels are account-global: root B's default profile derives the same bare label root A
-        # installed. A plist pinning a foreign HERMES_HOME is another install's job (#93349).
-        if (foreign_home := launchd_label_foreign_home(label)) is not None:
-            print(describe_skipped_runtime("launchd job", label, foreign_home))
+        # installed. A plist pinning a foreign HERMES_HOME, or launching another checkout, is another
+        # install's job (#93349).
+        if (notice := launchd_label_skip_notice(label)) is not None:
+            print(notice)
             continue
         try:
             # Locate = liveness + domain in one probe; kickstart and fresh-PID checks
@@ -64,7 +65,8 @@ def restart_macos_launchd_gateways(
                     failed_or_stale_units.append(label)
                 continue  # A profile without an installed job has no restart target.
             graceful_ok = False
-            if old_pid is not None and old_pid > 0:
+            born = fleet._signalled_identity(old_pid) if old_pid else None
+            if old_pid is not None and old_pid > 0 and not is_left_pending(old_pid):
                 print(f"  → {label}: draining (up to {drain_budget:.0f}s)...")
                 from hermes_cli.update_cmd_drain_report import drain_progress_reporter
                 graceful_ok = _graceful_restart_via_sigusr1(
@@ -73,6 +75,8 @@ def restart_macos_launchd_gateways(
             if graceful_ok and _wait_for_launchd_service_pid(label, old_pid=old_pid, timeout=10.0, domain=domain):
                 # KeepAlive already respawned it on new code — a kickstart would kill it.
                 restarted_services.append(label)
+                continue
+            if not graceful_ok and old_pid and fleet._restart_left_pending(old_pid, label, self_restart_pending, born):
                 continue
             try:
                 _launchd_kickstart(label, domain)
