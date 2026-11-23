@@ -1492,7 +1492,7 @@ def get_ticker_last_error() -> Optional[str]:
 
 def _stamp_is_racy(stamp: Optional[tuple[int, int, int, int]]) -> bool:
     """Avoid caching files modified in the current racy-write window."""
-    return stamp is None or (time.time_ns() - stamp[0]) <= 2_000_000_000
+    return stamp is None or (time.time_ns() - max(stamp[0], stamp[3])) <= 2_000_000_000
 
 
 def _parse_jobs_file(jobs_file: Path) -> tuple[Any, bool]:
@@ -1914,7 +1914,9 @@ def _save_jobs_unlocked(
                 current_bytes = jobs_file.read_bytes()
             except FileNotFoundError:
                 current_bytes = None
-            if current_bytes == payload_bytes:
+            if current_bytes == payload_bytes and store_health.degraded_record(jobs_file.parent) is None:
+                _secure_file(jobs_file)
+                _preserve_file_ownership(jobs_file, _stat_before)
                 store_health.note_writable(jobs_file.parent)
                 if removed_ids:
                     _record_removed_jobs_unlocked(removed_ids)
@@ -1960,7 +1962,7 @@ def save_jobs(
     jobs: list[dict[str, Any]], *, removed_ids: Optional[Collection[str]] = None,
     replace: bool = False,
 ):
-    """Save all jobs under the lock; see ``_save_jobs_unlocked`` for ``removed_ids``/``replace``."""
+    """Save all jobs under the lock; see :func:`_save_jobs_unlocked`."""
     with _jobs_lock():
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
 

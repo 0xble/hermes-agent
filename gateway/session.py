@@ -12,7 +12,7 @@ from itertools import count
 from pathlib import Path
 from datetime import datetime, timedelta
 from dataclasses import dataclass, field, fields
-from typing import Dict, List, Optional, Any
+from typing import ClassVar, Dict, List, Optional, Any
 
 from hermes_loop_guard import LoopGuardedLock
 
@@ -521,19 +521,57 @@ class _RosterEntries(dict):
             self._attach(value)
 
     def _attach(self, value) -> None:
-        if isinstance(value, SessionEntry):
-            value._roster_change = weakref.WeakMethod(self._on_change)
+        if isinstance(value, SessionEntry) and self._on_change is not None:
+            object.__setattr__(value, "_roster_change", weakref.WeakMethod(self._on_change))
+
+    def _rebind(self, on_change) -> None:
+        self._on_change = on_change
+        for value in self.values():
+            self._attach(value)
 
     def _detach(self, value) -> None:
         if isinstance(value, SessionEntry):
-            callback = value._roster_change
+            callback = getattr(value, "_roster_change", None)
             if isinstance(callback, weakref.WeakMethod) and callback() == self._on_change:
-                value._roster_change = None
+                object.__setattr__(value, "_roster_change", None)
             elif callback == self._on_change:
-                value._roster_change = None
+                object.__setattr__(value, "_roster_change", None)
 
     def _changed(self) -> None:
-        self._on_change()
+        if self._on_change is not None:
+            self._on_change()
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state["_on_change"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
+    @classmethod
+    def _detached(cls, values=()):
+        copied = cls.__new__(cls)
+        copied._on_change = None
+        dict.__init__(copied, values)
+        return copied
+
+    def __copy__(self):
+        from copy import copy
+        return type(self)._detached((key, copy(value)) for key, value in self.items())
+
+    def __deepcopy__(self, memo):
+        from copy import deepcopy
+        copied = type(self)._detached()
+        memo[id(self)] = copied
+        dict.update(copied, {
+            deepcopy(key, memo): deepcopy(value, memo)
+            for key, value in self.items()
+        })
+        return copied
+
+    def __reduce_ex__(self, protocol):
+        return (type(self)._detached, (dict(self),))
 
     def __setitem__(self, key, value):
         old = self.get(key)
@@ -707,15 +745,18 @@ class SessionEntry:
     # Metadata copies and compression advances keep this in-memory identity.
     # A conversation switch replaces the entry with a new identity.
     _route_version: int = field(default_factory=_route_versions.__next__, compare=False, repr=False)
-    _roster_change: Any = field(default=None, init=False, compare=False, repr=False)
+    _roster_change: ClassVar[Any] = None
 
     _ROSTER_FIELDS = frozenset(("session_key", "session_id", "origin", "transport_profile", "updated_at", "suspended"))
 
     def __setattr__(self, name, value):
+        if name not in self._ROSTER_FIELDS:
+            object.__setattr__(self, name, value)
+            return
         old = getattr(self, name, None)
         object.__setattr__(self, name, value)
         changed = old is not value if name == "origin" else old != value
-        if name in self._ROSTER_FIELDS and changed:
+        if changed:
             callback = getattr(self, "_roster_change", None)
             if isinstance(callback, weakref.WeakMethod):
                 callback = callback()
@@ -725,11 +766,12 @@ class SessionEntry:
     def __getstate__(self):
         """Do not serialize the store callback; entries are independently serializable."""
         state = self.__dict__.copy()
-        state["_roster_change"] = None
+        state.pop("_roster_change", None)
         return state
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        object.__setattr__(self, "_roster_change", None)
     # Fields (de)serialized verbatim, in wire order.
     _PLAIN_FIELDS = (
         "input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens",
@@ -1151,12 +1193,14 @@ class SessionStore(
     @_entries.setter
     def _entries(self, value) -> None:
         old = getattr(self, "_SessionStore__entries", None)
-        if isinstance(old, _RosterEntries):
+        if isinstance(old, _RosterEntries) and old is not value:
             for entry in old.values():
                 old._detach(entry)
-        self.__entries = value if isinstance(value, _RosterEntries) else _RosterEntries(
-            self._mark_roster_changed_locked, value
-        )
+        if isinstance(value, _RosterEntries):
+            self.__entries = value
+            value._rebind(self._mark_roster_changed_locked)
+        else:
+            self.__entries = _RosterEntries(self._mark_roster_changed_locked, value)
         if old is not None:
             self._mark_roster_changed_locked()
 

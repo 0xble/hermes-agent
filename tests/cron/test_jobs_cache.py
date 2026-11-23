@@ -64,10 +64,13 @@ def test_save_jobs_document_skips_byte_identical_replace(tmp_path):
         jobs.save_jobs_document(document)
         path = tmp_path / "cron" / "jobs.json"
         before = path.stat()
-        with patch.object(jobs, "atomic_replace", wraps=jobs.atomic_replace) as replace:
+        with patch.object(jobs, "atomic_replace", wraps=jobs.atomic_replace) as replace, \
+                patch.object(jobs, "_secure_file", wraps=jobs._secure_file) as secure, \
+                patch.object(jobs, "_preserve_file_ownership", wraps=jobs._preserve_file_ownership) as preserve:
             jobs.save_jobs_document(document)
         after = path.stat()
         assert replace.call_count == 0
+        assert secure.call_count == 1 and preserve.call_count == 1
         assert (after.st_ino, after.st_mtime_ns, after.st_size) == (
             before.st_ino, before.st_mtime_ns, before.st_size)
 
