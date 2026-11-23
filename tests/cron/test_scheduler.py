@@ -59,7 +59,6 @@ def _run_owned_job(job, tmp_path, db=None):
         if owns_db:
             release(db)
 
-
 from cron.scheduler import (
     SILENT_MARKER,
     _build_job_prompt,
@@ -1808,7 +1807,6 @@ class TestParallelTick:
         assert resolved == (DEFAULT_CRON_MAX_PARALLEL_JOBS if expected == "default" else expected)
         assert DEFAULT_CRON_MAX_PARALLEL_JOBS >= 1
 
-
 class TestDeliverResultTimeoutCancelsFuture:
     """When the live adapter's confirmation outlasts the wait, the outcome depends on whether the
     send had STARTED on the gateway loop. Started: it is in flight (a paced multi-chunk send can
@@ -1913,7 +1911,6 @@ class TestDeliverResultPartialSplitDelivery:
         adapter.send.assert_awaited_once()
         standalone_send.assert_not_awaited()
         assert result and "delivered 2 of 5 chunks" in result, result
-
 
 class TestDeliverResultLiveAdapterUnconfirmed:
     """Regression for #47056.

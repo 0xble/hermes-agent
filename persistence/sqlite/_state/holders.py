@@ -422,6 +422,7 @@ def _windows_restart_manager_holders(db_path: Path) -> list[tuple[int, str]]:
         end(session)
 
 
+# health: allow CC, NESTING -- platform-specific fail-closed holder scan keeps one authority path
 def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     """Return foreign holders of the DB or one of its WAL sidecars.
 
