@@ -1098,7 +1098,8 @@ def _kill_process_group_posix(proc, *, snapshot_descendants: bool = True) -> Non
         # recycled leader; the process-group ownership guard protects the signal below.
         leader_alive = False
         with contextlib.suppress(OSError):
-            leader_alive = os.kill(pgid, 0) is None
+            from gateway.status import _pid_exists
+            leader_alive = _pid_exists(pgid)
         if leader_alive:
             if not snapshot_descendants:
                 return

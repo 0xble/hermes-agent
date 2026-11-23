@@ -15,8 +15,8 @@ declared models (`delegated-fallback-chain-ownership`).
 Contract tests: `tests/agent/test_pinned_model_fallback.py`, `tests/tools/test_delegation_backends.py`, `tests/gateway/test_policy_fallback_wire.py`.
 
 Contract tests: `tests/agent/test_pinned_model_fallback.py`,
-`tests/tools/test_delegation_backends.py`, and
-`tests/gateway/test_policy_fallback_wire.py`.
+    `tests/tools/test_delegation_backends.py`, and
+    `tests/gateway/test_policy_fallback_wire.py`.
 
 Proof: `tests/agent/test_pinned_model_fallback.py`,
 `tests/tools/test_delegation_backends.py`, and

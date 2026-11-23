@@ -34,12 +34,11 @@ from gateway.session_context import bound_turn_origin
 logger = logging.getLogger(__name__)
 
 
-def _redact_terminal_error_text(value: Any) -> str:
-    """Force-redact text before serializing a terminal error envelope."""
-    from agent.redact import redact_sensitive_text
-
-    return redact_sensitive_text("" if value is None else str(value), force=True)
-
+from .terminal_tool_helpers import (
+    _current_session_key,
+    _current_session_profile,
+    _redact_terminal_error_text,
+)
 
 from tools.registry import tool_error
 from tools.terminal_tool_lifecycle import (
@@ -130,22 +129,6 @@ def set_sudo_password_callback(cb):
 def set_approval_callback(cb):
     """Register the dangerous-command approval prompt callback (per-thread slot)."""
     _callback_tls.approval = cb
-
-
-def _current_session_key() -> str:
-    """Active gateway/WebUI session key, or "" outside sessions (ContextVar with
-    the ``get_session_env`` os.environ fallback for CLI/cron/tests)."""
-    from gateway.session_context import get_session_env
-
-    return get_session_env("HERMES_SESSION_KEY", "")
-
-
-def _current_session_profile() -> str:
-    """Active session's Hermes profile name, or "" (same lookup discipline as
-    :func:`_current_session_key`)."""
-    from gateway.session_context import get_session_env
-
-    return get_session_env("HERMES_SESSION_PROFILE", "")
 
 
 def _container_profile() -> str:
