@@ -456,10 +456,14 @@ def _shell_state_chain(task_id: Optional[str]) -> tuple[str, ...]:
     key = task_id
     from agent.delegation_context import is_delegated_child_context
     with _container_alias_lock:
+        if not is_delegated_child_context():
+            if key and key in _container_aliases:
+                chain.append(key)
+            return tuple(chain)
         while key and key in _container_aliases and key not in chain:
             chain.append(key)
             key = _container_aliases[key]
-        if is_delegated_child_context() and key and key != "default" and key not in chain:
+        if key and key != "default" and key not in chain:
             chain.append(key)
     return tuple(chain)
 
