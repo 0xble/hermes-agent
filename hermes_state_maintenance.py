@@ -121,6 +121,7 @@ def _not_pinned_sql(alias: str = "s") -> str:
 
 _COMPACTED_ARCHIVE_FORMAT = "hermes-compacted-history-v1"
 _COMPACTED_ARCHIVE_READ_CHUNK = 1024 * 1024
+_COMPACTED_ARCHIVE_INFLATE_LIMIT = 1024 * 1024
 
 
 def _sync_fd(fd: int) -> None:
@@ -157,21 +158,33 @@ def _read_compacted_member(
 
     def consume(payload: bytes) -> None:
         line_buffer.extend(payload)
+        start = 0
         while True:
-            try:
-                newline = line_buffer.index(10)  # b"\\n"
-            except ValueError:
-                return
-            raw_line = bytes(line_buffer[:newline])
-            del line_buffer[:newline + 1]
-            if raw_line:
-                on_line(raw_line)
+            newline = line_buffer.find(b"\n", start)
+            if newline < 0:
+                break
+            if newline > start:
+                on_line(bytes(line_buffer[start:newline]))
+            start = newline + 1
+        if start:
+            del line_buffer[:start]
 
     while chunk:
-        try:
-            consume(decompressor.decompress(chunk))
-        except zlib.error as exc:
-            raise ValueError("invalid gzip member in compacted-history archive") from exc
+        # Bound each inflate step: highly compressible rows can expand a 1 MiB
+        # read into hundreds of MiB, which would defeat streaming recovery.
+        data = chunk
+        while True:
+            try:
+                out = decompressor.decompress(data, _COMPACTED_ARCHIVE_INFLATE_LIMIT)
+            except zlib.error as exc:
+                raise ValueError("invalid gzip member in compacted-history archive") from exc
+            consume(out)
+            data = decompressor.unconsumed_tail
+            # A full output buffer may leave inflated bytes pending inside zlib
+            # even after all input is consumed; drain before declaring the
+            # member incomplete, or a complete final member could be truncated.
+            if decompressor.eof or (not data and len(out) < _COMPACTED_ARCHIVE_INFLATE_LIMIT):
+                break
         if decompressor.eof:
             if line_buffer:
                 on_line(bytes(line_buffer))
