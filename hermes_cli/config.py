@@ -1825,7 +1825,7 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
         path_key = str(config_path)
         try:
             hit = _raw_config_cache_hit_if_readable(path_key, cache_key, config_path)
-        except Exception as e:
+        except Exception as e:  # health: allow BLE001 -- cache re-probe preserves the existing read-failure boundary
             _warn_config_parse_failure(config_path, e)
             return FailedConfigRead(error=e)
         if hit is not None:
