@@ -6617,7 +6617,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         profile_dir = getattr(self, "_update_receipt_dir", None)
         if profile_dir is not None:
             try:
-                persisted = flood_state.record_deadline(profile_dir, key, wait)
+                token = getattr(getattr(self, "config", None), "token", None)
+                persisted = flood_state.record_deadline(profile_dir, flood_state.storage_key(key, token), wait)
                 until[key] = max(until[key], now + max(0.0, persisted - time.time()))
             except (OSError, ValueError, sqlite3.Error):
                 logger.warning("[%s] Could not persist Telegram flood deadline for chat %s", self.name, key, exc_info=True)
@@ -6644,7 +6645,8 @@ class TelegramAdapter(TelegramDailyQuotaMixin, TelegramProgressMixin, TelegramCo
         if profile_dir is not None:
             storage_error = False
             try:
-                persisted = flood_state.remaining_seconds(profile_dir, key)
+                token = getattr(getattr(self, "config", None), "token", None)
+                persisted = flood_state.remaining_seconds(profile_dir, flood_state.storage_key(key, token))
                 deadline = max(deadline, asyncio.get_running_loop().time() + persisted)
             except (OSError, ValueError, sqlite3.Error):
                 logger.warning("[%s] Could not read Telegram flood deadline for chat %s", self.name, key, exc_info=True)
