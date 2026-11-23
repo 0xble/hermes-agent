@@ -436,7 +436,7 @@ def _record_repair_outcome(db_path: Path, *, repaired: bool, fingerprint: Option
         attempts = int(ledger.get("failed_attempts", 0)) + 1 if recorded == fp else 1
         stamp = datetime.datetime.now().isoformat(timespec="seconds")
         ledger_path.write_text(json.dumps({"fingerprint": fp, "failed_attempts": attempts, "last_attempt": stamp}), encoding="utf-8")
-    except Exception as exc:  # pragma: no cover - best effort
+    except Exception as exc:  # health: allow BLE001 -- repair ledger recording is best-effort
         logger.warning("Could not update state.db repair ledger: %s", exc)
 
 
@@ -537,7 +537,7 @@ def _backup_db_file(db_path: Path) -> tuple[Optional[Path], Optional[str]]:
         # Retention cap (#86747): keep only the newest few forensic copies.
         _prune_malformed_backups(db_path)
         return backup_path, None
-    except Exception as exc:  # pragma: no cover - best effort
+    except Exception as exc:  # health: allow BLE001 -- repair ledger recording is best-effort
         logger.warning("Could not back up malformed DB %s: %s", db_path, exc)
         return None, f"backup copy failed: {exc}"
 
@@ -634,7 +634,7 @@ def _reapply_durability_barriers(conn: sqlite3.Connection) -> bool:
         _apply_macos_checkpoint_barrier(conn)
         _enforce_macos_synchronous_full(conn)
         return True
-    except Exception:  # schema still unparseable, or anything else — pragmas cannot be set yet
+    except Exception:  # health: allow BLE001 -- malformed schema cannot accept durability pragmas
         return False
 
 
