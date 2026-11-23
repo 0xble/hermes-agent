@@ -2374,7 +2374,7 @@ def _todo_snapshot_is_only_content(content: Any, stripped: Any) -> bool:
 
 def _replace_message_content(message: dict, content: Any) -> None:
     """Rewrite message content without allowing an old API sidecar to replay."""
-    from agent.turn_context import drop_stale_api_content
+    from session_rules.turns import drop_stale_api_content
     message["content"] = content
     drop_stale_api_content(message)
 

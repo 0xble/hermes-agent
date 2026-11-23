@@ -857,3 +857,244 @@ _FILL_JS_TEMPLATE = """(async () => {
   });
   return JSON.stringify({ filled, selectedOptions, fieldResults, remembered });
 })()"""
+
+
+_ORIGIN_GUARD_JS = """  "use strict";
+  if (window.location.origin !== __EXPECTED_ORIGIN__) {
+    return { __proto__: null, refused: "origin_changed", found: window.location.origin };
+  }"""
+
+
+def _guarded(template: str, expected_origin: str) -> str:
+    return template.replace("__ORIGIN_GUARD__", _ORIGIN_GUARD_JS.replace(
+        "__EXPECTED_ORIGIN__", json.dumps(expected_origin)))
+
+
+# How a requested value names a <select> option: by value or visible text, trimmed and
+# case-insensitive, and an expiry month "07" also names option "7". The fill script picks the first
+# option this matches; the read-back accepts the selected option only if it matches too, so the two
+# can never disagree about what "the right option" is.
+_OPTION_MATCH_JS = """  const norm = (t) => String(t || "").trim().toLowerCase();
+  const optionMatches = (o, value) => {
+    const want = norm(value);
+    return [o.value, o.textContent].some((t) => norm(t) === want || norm(t) === want.replace(/^0/, ""));
+  };"""
+
+
+
+def build_fill_verify_js(fills: list[dict[str, Any]], nonce: str = "", *, expected_origin: str,
+                         unstamp: bool = True) -> str:
+    """Build a JS expression that reads the filled controls back and removes the inspection stamps.
+
+    It carries every expected value (the password too), so it opens with the fill script's origin
+    guard: on a page that left ``expected_origin`` it returns ``{"refused": "origin_changed"}`` before
+    any value is referenced. On the bound origin the page already holds the value it was typed, so
+    comparing in the clear there exposes nothing new.
+
+    The fill script's count is a claim about the write; this is the claim about the page. Called one
+    turn of the event loop later, it catches a framework that reverted the value, a field that was
+    re-rendered (stamp gone) and a partial write. Returns counts only — no value leaves the page.
+
+    ``unstamp=False`` keeps the inspection stamps: the trusted-typing path verifies ONE field
+    between two ``Input.insertText`` calls and must still find the next field by its stamp.
+
+    A ``<select>`` holds the value when its selected option matches it the way the fill script
+    picks options. A text control holds it when it reads back exactly — except that a value made only
+    of digits and separators also holds it when a display mask reformatted it without changing what
+    it says: a card number or postal code with the same digits regrouped (``4111 1111 …``), a phone
+    number with the same digits and the same leading ``+`` (``(555) 123-4567``), an expiry with the
+    same month and year (``7/29`` for ``07/29``; ``1/203`` is another date). A dropped or added digit,
+    any letter, and every other token (passwords, usernames, CVC) stay exact.
+    """
+    payload = json.dumps(
+        [{"index": f["index"], "token": f.get("token", "current-password"), "value": f["value"]} for f in fills]
+    )
+    return (_guarded(_VERIFY_JS_TEMPLATE, expected_origin).replace("__OPTION_MATCH__", _OPTION_MATCH_JS)
+            .replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce))
+            .replace("__UNSTAMP__", "true" if unstamp else "false"))
+
+
+def build_focus_js(fills: list[dict[str, Any]], nonce: str = "", *, expected_origin: str,
+                   refocus: bool = True) -> str:
+    """Build a JS expression that focuses ONE stamped field and asserts it really holds focus.
+
+    ``Input.insertText`` types into whatever element currently has focus, so the caller MUST
+    know which element that is before typing a secret into it. This script focuses the element
+    stamped ``data-hermes-vault-slot-<nonce>="<index>"`` and only reports success when
+    ``document.activeElement`` IS that element — a page that moves focus (a re-render, a modal,
+    an autofocus elsewhere) is refused instead of receiving the secret.
+
+    Focus is read through open shadow roots (a focused input inside a component reports its HOST as
+    ``document.activeElement``), the same roots the inspection and fill scripts reach.
+    ``refocus=False`` only asserts: between the keys of one field the page must not have moved focus,
+    and pulling it back would hide that it did. The fill script's origin guard runs first: the next
+    keystroke goes wherever focus is, so focus is only vouched for on ``expected_origin``.
+
+    Takes the same ``fills`` shape as :func:`build_fill_js` but is meant for exactly one field, and
+    never a password: secrets go by :func:`build_fill_js` on their stamped control, not by keystroke.
+    Returns (by value): ``{"focused": <index>}`` or
+    ``{"refused": "focus_lost", "tag": <tag>, "found": <active tag or null>}`` /
+    ``{"refused": "not_found"}`` / ``{"refused": "origin_changed"}`` /
+    ``{"refused": "frame_on_page"}`` (a frame can take focus before the keystroke lands).
+    """
+    payload = json.dumps(
+        [{"index": f["index"], "token": f.get("token", "current-password")} for f in fills]
+    )
+    return (_guarded(_FOCUS_JS_TEMPLATE, expected_origin).replace("__FILLS__", payload).replace("__NONCE__", json.dumps(nonce))
+            .replace("__REFOCUS__", "true" if refocus else "false"))
+
+
+_FOCUS_JS_TEMPLATE = """(() => {
+__ORIGIN_GUARD__
+  const fills = __FILLS__;
+  const nonce = __NONCE__;
+  const slot = "data-hermes-vault-slot-" + nonce;
+  const f = fills[0];
+  if (!f) return { __proto__: null, refused: "not_found" };
+  const roots = [];
+  (function walk(root) {
+    roots.push(root);
+    for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
+  })(document);
+  const find = (selector) => roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
+  const el = find("[" + slot + '="' + f.index + '"]')[0];
+  if (!el) return { __proto__: null, refused: "not_found" };
+  // Selecting the field's text makes the next Input.insertText replace a prefilled value, not prefix it.
+  if (__REFOCUS__) { try { el.focus(); el.select(); } catch (e) { /* focus can throw on a detached node */ } }
+  let active = document.activeElement;
+  while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement;
+  if (active !== el) return { __proto__: null, refused: "focus_lost", tag: el.tagName, found: active ? active.tagName : null };
+  // A frame runs in its own process and can take focus between this check and the keystroke, which
+  // Input.insertText then types into the frame's document: another origin.
+  const frameTags = ["IFRAME", "FRAME", "OBJECT", "EMBED"];
+  if (find("*").some((e) => frameTags.includes(e.tagName))) return { __proto__: null, refused: "frame_on_page" };
+  return { __proto__: null, focused: f.index };
+})()"""
+
+
+def build_origin_check_js(expected_origin: str) -> str:
+    """Build a JS expression that asserts the page's origin inside the page itself.
+
+    The trusted-typing path writes through CDP, outside any page script, so it needs the same
+    in-page origin assertion the JS fill path has: if the page navigated between the origin
+    pre-check and the keystrokes, nothing is typed.
+    """
+    return ("(() => { if (window.location.origin !== " + json.dumps(expected_origin) + ") "
+            "return { __proto__: null, refused: 'origin_changed', found: window.location.origin }; "
+            "return { __proto__: null, ok: true }; })()")
+
+
+def build_unstamp_js(nonce: str) -> str:
+    """Build a JS expression that removes the stamps of the inspection ``nonce`` from the page.
+
+    Every operation removes its own stamps when it ends (a read-back, enter_code, an abort): a stamp
+    left behind would let a later read address the control the fill just targeted. Another
+    operation's stamps on the same tab are left alone: it is still using them.
+    """
+    return ("(() => { const slot = " + json.dumps(f"{INSPECTION_STAMP_ATTR}-{nonce}") + "; const roots = []; "
+            "(function walk(root) { roots.push(root); "
+            "for (const e of root.querySelectorAll('*')) if (e.shadowRoot) walk(e.shadowRoot); "
+            "})(document); const find = (s) => roots.flatMap((r) => Array.from(r.querySelectorAll(s))); "
+            "find('[' + slot + ']').forEach((n) => n.removeAttribute(slot)); "
+            "return { __proto__: null, unstamped: true }; })()")
+
+
+_CLEAR_JS_TEMPLATE = """(() => {
+__ORIGIN_GUARD__
+  const fills = __FILLS__;
+  const nonce = __NONCE__;
+  const slot = "data-hermes-vault-slot-" + nonce;
+  const roots = [];
+  (function walk(root) {
+    roots.push(root);
+    for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
+  })(document);
+  const find = (selector) => roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
+  let cleared = 0;
+  for (const f of fills) {
+    const el = find("[" + slot + '="' + f.index + '"]')[0];
+    if (!el) continue;
+    if (el.tagName === "SELECT") continue;
+    const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
+    const setter = Object.getOwnPropertyDescriptor(proto, "value");
+    if (setter && setter.set) setter.set.call(el, ""); else el.value = "";
+    el.dispatchEvent(new InputEvent("input", { bubbles: true, composed: true, data: "", inputType: "deleteContentBackward" }));
+    el.dispatchEvent(new Event("change", { bubbles: true }));
+    cleared += 1;
+  }
+  return { __proto__: null, cleared };
+})()"""
+
+
+def build_clear_js(fills: list[dict[str, Any]], nonce: str = "", *, expected_origin: str) -> str:
+    """Build a JS expression that empties stamped text controls so they can be typed again.
+
+    A trusted bulk insert can land the wrong value in a field with an input mask (a phone number,
+    a date, a card): the mask drops or reformats characters as they stream in. The fill then reads
+    a mismatch, clears the field and retypes it key by key. Clearing goes through the native value
+    setter plus an ``input`` event carrying ``data: ""`` so a controlled input ends up consistent
+    with an empty field instead of holding a value its state does not know about. Like every
+    script of a fill it acts only on ``expected_origin``.
+    """
+    payload = json.dumps([{"index": f["index"]} for f in fills])
+    return (_guarded(_CLEAR_JS_TEMPLATE, expected_origin).replace("__FILLS__", payload)
+            .replace("__NONCE__", json.dumps(nonce)))
+
+
+_VERIFY_JS_TEMPLATE = r"""(() => {
+__ORIGIN_GUARD__
+  const fills = __FILLS__;
+  const nonce = __NONCE__;
+  const slot = "data-hermes-vault-slot-" + nonce;
+  const roots = [];
+  (function walk(root) {
+    roots.push(root);
+    for (const e of root.querySelectorAll("*")) if (e.shadowRoot) walk(e.shadowRoot);
+  })(document);
+  const find = (selector) => roots.flatMap((r) => Array.from(r.querySelectorAll(selector)));
+__OPTION_MATCH__
+  const digitsAndSeparators = (v) => /^[\d\s()+\-./]*$/.test(v) && /\d/.test(v);
+  const digits = (v) => v.replace(/\D/g, "");
+  const groups = (v) => v.match(/\d+/g) || [];
+  const sameDigits = (want, shown) => digits(want) === digits(shown);
+  const international = (v) => /^\s*\(?\s*\+/.test(v);
+  // A + belongs to a number only as its leading character: one anywhere else is not formatting.
+  const plusOnlyLeads = (v) => (v.match(/\+/g) || []).length === (international(v) ? 1 : 0);
+  // Per token: when a display mask's rewrite still says the same thing.
+  const sameMeaning = {
+    "cc-number": sameDigits,
+    "postal-code": sameDigits,
+    // The + is part of the number: 15551234567 dials somewhere else than +15551234567. A mask may
+    // put the country code in parentheses, "(+48) 600 ...", so the + may follow one "(".
+    "tel": (want, shown) => plusOnlyLeads(want) && plusOnlyLeads(shown)
+      && international(want) === international(shown) && sameDigits(want, shown),
+    // Month and year stay two numbers (1/203 is not 12/03); a mask may drop the month's leading
+    // zero (7/29) or the separator (0729), never move a digit across it.
+    "cc-exp": (want, shown) => {
+      const w = groups(want), g = groups(shown);
+      if (g.length === 1) return g[0] === digits(want);
+      return g.length === w.length && w.every((part, i) => Number(part) === Number(g[i]));
+    },
+  };
+  const holds = (f, shown) => {
+    const want = String(f.value);
+    if (shown === want) return true;
+    const same = sameMeaning[f.token];
+    return Boolean(same) && digitsAndSeparators(want) && digitsAndSeparators(shown) && same(want, shown);
+  };
+  let landed = 0;
+  let reverted = 0;
+  const missing = [];
+  for (const f of fills) {
+    const el = find("[" + slot + '="' + f.index + '"]')[0];
+    if (!el) { missing.push(f.index); continue; }
+    if (el.tagName === "SELECT") {
+      const selected = el.options[el.selectedIndex];
+      if (selected && optionMatches(selected, f.value)) landed += 1; else reverted += 1;
+      continue;
+    }
+    if (holds(f, String(el.value))) landed += 1; else reverted += 1;
+  }
+  if (__UNSTAMP__) find("[" + slot + "]").forEach((n) => n.removeAttribute(slot));
+  return { __proto__: null, landed, reverted, missing };
+})()"""
