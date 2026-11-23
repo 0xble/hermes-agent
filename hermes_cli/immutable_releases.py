@@ -1353,6 +1353,9 @@ def _execution_code_sha_pins(home: Path) -> set[Path]:
         with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=2.0) as connection:
             connection.execute("PRAGMA busy_timeout=2000")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(executions)")}
+            if not columns:
+                # A ledger file without the executions table cannot prove no execution needs a release.
+                raise sqlite3.DatabaseError("missing executions table")
             if "code_sha" not in columns:
                 return set()
             if "status" in columns:

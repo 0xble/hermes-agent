@@ -314,3 +314,14 @@ def test_execution_code_sha_pins_unreadable_ledger_still_raises(tmp_path):
     db.write_text("not a valid sqlite db", encoding="utf-8")
     with pytest.raises(RuntimeError, match="unreadable cron execution ledger"):
         _execution_code_sha_pins(home)
+
+
+def test_execution_code_sha_pins_missing_table_raises(tmp_path):
+    """A valid SQLite file without the executions table fails closed."""
+    home = tmp_path / "scratch_home4"
+    cron_dir = home / "cron"
+    cron_dir.mkdir(parents=True)
+    with sqlite3.connect(cron_dir / "executions.db") as connection:
+        connection.execute("CREATE TABLE unrelated (x TEXT)")
+    with pytest.raises(RuntimeError, match="missing executions table"):
+        _execution_code_sha_pins(home)
