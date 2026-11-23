@@ -14,6 +14,8 @@ import time
 from typing import Any, Optional
 
 logger = logging.getLogger("agent.context_compressor")
+# Reclaim gate on an already-expired provider cache: there is no cache break to amortize.
+_COLD_CACHE_MIN_RECLAIM_TOKENS = 16_000
 
 
 def _cc():
