@@ -27,7 +27,7 @@ import time
 import threading
 import atexit
 from dataclasses import dataclass
-from typing import Optional, Dict, Any, List, Callable
+from typing import Optional, Any, Callable
 
 from gateway.session_context import bound_turn_origin
 
@@ -43,7 +43,7 @@ from .terminal_tool_helpers import (
 from tools.registry import tool_error
 from tools.terminal_tool_lifecycle import (
     _call_in_flight, _cleanup_inactive_envs, _create_configured_env,
-    _evict_environment_for_task, _local_shell_owner, cleanup_all_environments, ensure_task_env,
+    _evict_environment_for_task, _local_shell_owner, cleanup_all_environments, ensure_task_env as ensure_task_env,
 )
 from tools.terminal_tool_config import (
     _is_container_backend, _is_host_cwd, _is_mounted_host_cwd, _is_unusable_container_cwd,
@@ -53,10 +53,10 @@ from tools.terminal_tool_config import (
 )
 from tools.terminal_tool_backends import (
     _REQUIREMENT_CHECKERS, _VERCEL_SANDBOX_DEFAULT_CWD, _check_plugin_requirements,
-    _record_unavailable_reason, terminal_backend_unavailable_reason,
+    _record_unavailable_reason, terminal_backend_unavailable_reason as terminal_backend_unavailable_reason,
 )
 # display_hermes_home imported lazily at call site (stale-module safety during hermes update)
-from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled
+from tools.tool_backend_helpers import coerce_modal_mode, managed_nous_tools_enabled as managed_nous_tools_enabled
 
 
 def _safe_parse_import_env(name: str, default: Any, converter, type_label: str):
@@ -88,8 +88,6 @@ _FOREGROUND_SEMAPHORE_WAIT_FLOOR = 10
 # and tears down the process tree / drains output before the cell RPC can reply.
 # Flooring alone can leave almost no slack; reserve a full second even then.
 _CRON_CELL_CLEANUP_MARGIN_S = 1.0
-
-
 def _foreground_semaphore_max_wait(effective_timeout: int) -> int:
     """Bound foreground occupancy without cancelling semaphore admission."""
     return min(_FOREGROUND_SEMAPHORE_WAIT_CAP, max(_FOREGROUND_SEMAPHORE_WAIT_FLOOR, effective_timeout // 3))
@@ -111,8 +109,6 @@ DISK_USAGE_WARNING_THRESHOLD_GB = _safe_parse_import_env("TERMINAL_DISK_WARNING_
 # thread, can't stomp on each other (GHSA-qg5c-hvr5-hjgr). Gateway mode
 # resolves approvals via the per-session queue in tools.approval instead.
 _callback_tls = threading.local()
-
-
 def _get_sudo_password_callback():
     return getattr(_callback_tls, "sudo_password", None)
 
@@ -129,8 +125,6 @@ def set_sudo_password_callback(cb):
 def set_approval_callback(cb):
     """Register the dangerous-command approval prompt callback (per-thread slot)."""
     _callback_tls.approval = cb
-
-
 def _container_profile() -> str:
     """Profile whose persistent container a session-bound command uses: the bound home's profile when it is not
     the session's own (a profile-routed subagent runs in its target's home while the session, and the delivery
@@ -152,8 +146,6 @@ def _container_profile() -> str:
 from tools.approval import (
     check_all_command_guards as _check_all_guards_impl,
 )
-
-
 def _docker_volume_uses_host_path(volume_spec: str) -> bool:
     """Return True when a docker volume spec bind-mounts a host path."""
     if not isinstance(volume_spec, str):
@@ -213,8 +205,6 @@ _cleanup_running = False
 # Once-per-process guard for the docker orphan reaper.
 _docker_orphan_reaper_ran = False
 _docker_orphan_reaper_lock = threading.Lock()
-
-
 def _maybe_reap_docker_orphans(container_config: dict[str, Any]) -> None:
     """Run the docker orphan reaper once per process, if enabled.
 
@@ -285,8 +275,6 @@ _container_alias_lock = threading.Lock()
 # Without a session key they would otherwise share "default" with every other
 # session-less run, and the local shell snapshot carries exports between them.
 _run_scoped_tasks: set = set()
-
-
 def record_session_cwd(session_key: Optional[str], cwd: Optional[str]) -> None:
     """Record *cwd* as *session_key*'s working directory (after a completed
     command, or on workspace-override registration). None/empty keys collapse
@@ -348,8 +336,6 @@ def _sanitize_cwd_for_live_env(env: Any, new_cwd: str) -> Optional[str]:
         if translated:
             return translated
     return None
-
-
 def register_task_env_overrides(task_id: str, overrides: dict[str, Any]):
     """Register per-task sandbox overrides (``docker_image``/``modal_image``/
     ``daytona_image`` or a plugin backend's ``<backend>_image``, ``env_type``,
@@ -395,8 +381,6 @@ def clear_task_env_overrides(task_id: str):
     clear_session_cwd(task_id)
     with _container_alias_lock:
         _container_aliases.pop(task_id, None)
-
-
 def register_container_alias(child_task_id: str, parent_task_id: Optional[str]) -> None:
     """Make *child_task_id* resolve to *parent_task_id*'s container (called at
     delegate_task spawn). A missing parent id aliases to ``"default"``."""
@@ -418,8 +402,6 @@ def register_run_scoped_task(task_id: str) -> None:
 def clear_run_scoped_task(task_id: str) -> None:
     with _container_alias_lock:
         _run_scoped_tasks.discard(task_id)
-
-
 def _resolve_container_alias(task_id: str) -> str:
     """Follow the child→parent alias chain (cycle-safe) for *task_id*."""
     seen = set()
@@ -1120,7 +1102,7 @@ from tools.terminal_tool_guards import (
 from tools.terminal_tool_semaphore import foreground_semaphore_command, wrap_semaphore_command
 from tools.terminal_tool_background import (
     _PTY_DISABLED_REASON, _command_requires_pipe_stdin,
-    _resolve_notification_flag_conflict,
+    _resolve_notification_flag_conflict as _resolve_notification_flag_conflict,
     _with_promoted_note, _yield_kwargs, _yielded_result_json, spawn_background_process, yield_to_background_handler,
 )
 from tools.terminal_tool_result import finalize_foreground_result

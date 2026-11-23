@@ -1,11 +1,41 @@
-'Turn-context and delivery methods split from the Gateway turn facade.'
+'''Turn-context and delivery methods split from the Gateway turn facade.'''
 
-from typing import Any, Optional
-from contextlib import suppress
+from __future__ import annotations
+
+from typing import Any, Callable, Optional, TYPE_CHECKING
+from contextlib import nullcontext, suppress
+import asyncio
 import inspect
-from gateway.run_turn import TurnContext, SessionSource, display_kind_for_event, logger
-from gateway import run_turn as _run_turn
-globals().update(vars(_run_turn))
+import logging
+import queue
+import threading
+import time
+from agent.i18n import t
+from gateway import loop_completion
+from gateway.bot_peer_notices import automatic_notices_allowed
+from gateway.config import Platform
+from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
+from gateway.platforms.event import turn_origin_for_event
+from gateway.platforms.helpers import typing_metadata_for_turn
+from gateway.response_filters import display_kind_for_event, reply_expected_metadata
+from gateway.run_turn import (
+    TurnContext, SessionSource, _NO_ATTENDED_ACTIVITY_STAMP, _tool_call_logger,
+    _unexpected_silence_reply,
+)
+from gateway.run_turn_final_reconcile import edit_streamed_message, owns_reconcilable_preview
+from gateway.run_turn_pending import _drain_leftover_steer
+from gateway.run_turn_stream_delivery import stream_confirmed_final_delivery
+from gateway.session_context import bound_turn_origin, scoped_turn_actor, set_turn_origin
+from gateway.warning_notifications import diagnostic_metadata, diagnostic_turn_muted
+from gateway.zero_cut_handover_drain import handover_runs_followups
+from agent.session_activity import format_iteration_progress
+from gateway.turn_context import TurnWorker
+
+if TYPE_CHECKING:
+    from gateway.run import GatewayRunner
+    from gateway.run_turn_runner import TurnRunner
+
+logger = logging.getLogger("gateway.run")
 
 class GatewayTurnExecutionMixin:
     def _run_agent_build_turn_context(

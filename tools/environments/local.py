@@ -1092,6 +1092,12 @@ def _kill_process_group_posix(proc, *, snapshot_descendants: bool = True) -> Non
         if (pgid := getattr(proc, "_hermes_pgid", None)) is None:
             raise
     if not _leader_is_ours(pgid, expected_start):
+        # A readable but mismatched start time proves the saved PGID was recycled.
+        # Only an unreadable leader may take the legacy best-effort path below.
+        from gateway.status import get_process_start_time
+        with contextlib.suppress(Exception):
+            if get_process_start_time(pgid) is not None:
+                return
         # The leader may already be a zombie. Its PID/PGID is still the owned session
         # identity, and the surviving group members must be terminated even though the
         # leader is no longer inspectable by the start-time probe. Only reject a live
