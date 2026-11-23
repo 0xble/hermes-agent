@@ -295,12 +295,14 @@ def test_execution_code_sha_pins_non_terminal_are_pinned(tmp_path):
             ("2" * 40, "unknown"),
             ("3" * 40, "claimed"),
             ("4" * 40, None),
+            ("5" * 40, "queued"),
+            ("6" * 40, "some_future_status"),
         ]
         for sha, status in non_terminal:
             conn.execute("INSERT INTO executions (code_sha, status) VALUES (?, ?)", (sha, status))
             (releases_dir / sha).mkdir()
     pins = _execution_code_sha_pins(home)
-    assert len(pins) == 4
+    assert len(pins) == 6
     for sha, _ in non_terminal:
         assert any(sha in str(p) for p in pins)
 
@@ -313,6 +315,17 @@ def test_execution_code_sha_pins_unreadable_ledger_still_raises(tmp_path):
     db = cron_dir / "executions.db"
     db.write_text("not a valid sqlite db", encoding="utf-8")
     with pytest.raises(RuntimeError, match="unreadable cron execution ledger"):
+        _execution_code_sha_pins(home)
+
+
+def test_execution_code_sha_pins_missing_table_raises(tmp_path):
+    """A valid SQLite file without the executions table fails closed."""
+    home = tmp_path / "scratch_home4"
+    cron_dir = home / "cron"
+    cron_dir.mkdir(parents=True)
+    with sqlite3.connect(cron_dir / "executions.db") as connection:
+        connection.execute("CREATE TABLE unrelated (x TEXT)")
+    with pytest.raises(RuntimeError, match="missing executions table"):
         _execution_code_sha_pins(home)
 
 

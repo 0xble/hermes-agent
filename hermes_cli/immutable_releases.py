@@ -1443,6 +1443,12 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
     for release in releases:
         if release.resolve() in keep:
             continue
+        # Final authoritative recheck of execution-ledger and live-process pins
+        # immediately before delete. Closes the race with cron dispatch creating
+        # a new execution from a release after the initial snapshot (P1 review fix).
+        r = release.resolve()
+        if r in _live_process_pins(paths.home) or r in _execution_code_sha_pins(paths.home):
+            continue
         shutil.rmtree(release)
         removed.append(release)
     return removed
