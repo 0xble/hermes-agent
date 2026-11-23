@@ -79,9 +79,7 @@ logger = logging.getLogger(__name__)
 _pairing_tool_call_id = coalesce_tool_call_id  # canonical id used by the persisted assistant message
 
 
-def _tc_name(tool_call: Any) -> str:
-    return getattr(getattr(tool_call, "function", None), "name", "") or "tool"
-
+from .names import _tc_name
 
 def _record_persisted_path_for_stub(agent, tool_call_id: str, function_result) -> None:
     """Record the spillover file path so a later result-reference stub can't dangle (best-effort)."""

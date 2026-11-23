@@ -50,7 +50,8 @@ def request_restart(self, *, detached: bool = False, via_service: bool = False,
         # Admission closes only after the bounded wait.  A forced update pause
         # must never launch a detached helper captured by an earlier /restart.
         self._draining = True
-        restart_detached, restart_via_service = detached, via_service
+        restart_detached = bool(getattr(self, "_restart_detached", detached))
+        restart_via_service = bool(getattr(self, "_restart_via_service", via_service))
         if getattr(self, "_restart_force_event", None) is not None and self._restart_force_event.is_set():
             restart_detached = False
             restart_via_service = True
