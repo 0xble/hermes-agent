@@ -463,6 +463,21 @@ def _shell_state_chain(task_id: Optional[str]) -> tuple[str, ...]:
     return tuple(chain)
 
 
+def _shell_state_paths(task_id: Optional[str], env: Any) -> tuple[str, ...]:
+    """Return snapshot paths from each task's owning local environment, not task-id hashing."""
+    chain = _shell_state_chain(task_id)
+    if not chain:
+        return ()
+    paths: list[str] = []
+    with _env_lock:
+        for index, owner in enumerate(chain):
+            owner_env = env if index == 0 else _active_environments.get(_resolve_container_task_id(owner))
+            if owner_env is None or not hasattr(owner_env, "_task_snapshot_path"):
+                return ()
+            paths.append(owner_env._task_snapshot_path(owner))
+    return tuple(paths)
+
+
 def _is_isolation_override_key(key: str) -> bool:
     """An image (``docker_image``, a plugin backend's ``<backend>_image``) or ``env_type`` override."""
     return key == "env_type" or key.endswith("_image")
@@ -1697,7 +1712,9 @@ def terminal_tool(
         env = _acquire_env(plan, task_id)
         # _lookup_active_env stamps whichever of the two keys holds the env.
         from tools.environments.base import shell_state_scope
-        with _call_in_flight(plan.effective_task_id, task_id), shell_state_scope(_shell_state_chain(task_id)):
+        with _call_in_flight(plan.effective_task_id, task_id), shell_state_scope(
+            _shell_state_chain(task_id), _shell_state_paths(task_id, env)
+        ):
             env_type, cwd, effective_task_id = plan.env_type, plan.cwd, plan.effective_task_id
             if survive_restart and (not background or pty or env_type != "local"):
                 raise _Rejected(_error_json(
