@@ -79,6 +79,15 @@ async def send_rich_standalone(bot, extra: dict, chat_id, content: str, *, threa
     try:
         adapter = _standalone_adapter(bot, extra)
         content = _normalize_dollar_entities(content)
+        # Probe the legacy eligibility hook before the richer split path. Older adapters and
+        # callers may not expose the newer helper methods; an unavailable hook is a safe
+        # signal to let _send_telegram use its MarkdownV2 fallback.
+        try:
+            adapter._should_attempt_rich(content)
+        except (AttributeError, TypeError) as exc:
+            logger.warning("Telegram rich adapter unavailable, falling back to legacy: %s",
+                           _redact_telegram_error_text(exc))
+            return None
         if (
             not adapter._rich_delivery_enabled()
             or getattr(adapter, "_rich_send_disabled", False)

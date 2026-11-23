@@ -671,8 +671,9 @@ class StreamTransportMixin:
         prefers_fresh = self._adapter_prefers_fresh_final(text)  # probed every edit (hook contract)
         if finalize and (
             prefers_fresh or (not has_prefers_hook and self._should_send_fresh_final()
-                              and (getattr(self, "_last_sent_text", "") or "").replace(getattr(getattr(self, "cfg", None), "cursor", "") or "", "").strip()
-                              != text.replace(getattr(getattr(self, "cfg", None), "cursor", "") or "", "").strip())
+                              and (not is_turn_final or
+                                   (getattr(self, "_last_sent_text", "") or "").replace(getattr(getattr(self, "cfg", None), "cursor", "") or "", "").strip()
+                                   != text.replace(getattr(getattr(self, "cfg", None), "cursor", "") or "", "").strip()))
         ) and await self._try_fresh_final(text, is_turn_final=is_turn_final):
             return True
         if not getattr(self, "_split_delivery_journal_pending", False):

@@ -237,11 +237,7 @@ def _local_shell_owner(task_id: Optional[str]) -> Optional[str]:
     if not task_id:
         return None
     with tt._container_alias_lock:
-        # Delegated children share the parent's local environment; their shell
-        # state is isolated by BaseEnvironment's per-task snapshots. Only
-        # session-less runs that explicitly own a local environment need a
-        # distinct cache key.
-        if task_id in tt._run_scoped_tasks:
+        if task_id in tt._container_aliases or task_id in tt._run_scoped_tasks:
             return task_id
     return None
 
