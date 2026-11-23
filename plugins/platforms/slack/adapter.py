@@ -1008,8 +1008,8 @@ from plugins.platforms.slack.adapter_thread_status import SlackThreadStatusMixin
 from plugins.platforms.slack.adapter_missed_inbound import SlackMissedInboundMixin
 
 
-class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitlesMixin,
-                   SlackMissedInboundMixin, BasePlatformAdapter):
+class SlackAdapter(SlackSocketLifecycleMixin, SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitlesMixin,
+                   SlackMissedInboundMixin, SlackVaultCodeMixin, BasePlatformAdapter):
     """Slack bot adapter (Socket Mode).
     Needs SLACK_BOT_TOKEN (xoxb-, API calls) and SLACK_APP_TOKEN (xapp-, Socket Mode). DMs +
     mention-gated channels, threads, attachments, slash commands, status text."""
@@ -1378,6 +1378,20 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             logger.warning("[Slack] Socket Mode watchdog exited; restarting")
         self._socket_watchdog_task = None
         self._ensure_socket_watchdog()
+
+    async def _cancel_socket_watchdog(self, failure_msg: str) -> None:
+        """Cancel and await the watchdog task (if any); exceptions are debug-logged."""
+        watchdog_task = self._socket_watchdog_task
+        self._socket_watchdog_task = None
+        if watchdog_task is None or watchdog_task.done():
+            return
+        watchdog_task.cancel()
+        try:
+            await watchdog_task
+        except asyncio.CancelledError:
+            pass
+        except Exception:  # pragma: no cover - defensive logging
+            logger.debug(failure_msg, exc_info=True)
 
     def _ensure_socket_watchdog(self) -> None:
         if self._socket_watchdog_task is None or self._socket_watchdog_task.done():
