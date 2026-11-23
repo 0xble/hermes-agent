@@ -179,8 +179,13 @@ _LAST_EXPANDED_CONFIG_BY_PATH: dict[str, Any] = {}
 # the config writer seam, which produces a fresh inode, so stat() sees a new signature and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
 _LOAD_CONFIG_CACHE: dict[str, tuple[Any, ...]] = {}
-# path -> (mtime_ns, size, ino, ctime_ns, racy digest, raw yaml dict) for read_raw_config() (no defaults merged in).
-_RAW_CONFIG_CACHE: dict[str, tuple[Any, ...]] = {}
+# Re-export the raw YAML cache and its helpers for existing callers.
+from hermes_cli.config_cache import (
+    _RAW_CONFIG_CACHE,
+    _raw_config_cache_hit,
+    _raw_config_cache_store,
+    _worker_config_snapshot,
+)
 
 # Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
 # flows directly). Also the set reload_env() may remove from os.environ.
@@ -1786,35 +1791,6 @@ def cfg_get(cfg: Optional[dict[str, Any]], *keys: str, default: Any = None) -> A
             return default
         node = node[key]
     return node
-
-
-def _raw_config_cache_hit(path_key: str, cache_key: tuple[Any, ...]) -> Optional[dict[str, Any]]:
-    """Pure lookup: the cached raw config for ``path_key`` if its signature equals ``cache_key``,
-    else ``None``. Shared by the lock-free fast path and the locked re-check of
-    ``_read_raw_config_impl`` so the predicate cannot drift between them."""
-    cached = _RAW_CONFIG_CACHE.get(path_key)
-    if cached is not None and cached[:len(cache_key)] == cache_key:
-        return cached[len(cache_key)]
-    return None
-
-
-def _raw_config_cache_store(path_key: str, cache_key: tuple[Any, ...], data: dict[str, Any]) -> None:
-    """Publish ``data`` (caller-owned copy) as the raw config for ``path_key`` at ``cache_key``.
-    One whole-tuple replace, so the lock-free readers see either the old or the new entry."""
-    _RAW_CONFIG_CACHE[path_key] = (*cache_key, data)
-
-
-def _worker_config_snapshot() -> Optional[dict[str, Any]]:
-    """A safe worker's frozen config, or None. Install-time loads run from ``hermes_cli`` alone
-    (the installer's completion step ships no ``agent`` package), and without ``agent`` there
-    is no worker policy to consult."""
-    try:
-        from agent.safe_worker_policy import worker_config_snapshot
-    except ModuleNotFoundError as exc:
-        if exc.name != "agent" and not "agent".startswith(f"{exc.name}."):
-            raise
-        return None
-    return worker_config_snapshot()
 
 
 def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:

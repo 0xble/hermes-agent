@@ -640,6 +640,18 @@ Fork-Patch: exa-direct-extract.
 - **Retirement:** Remove when a released upstream provides equivalent bounded direct HTML extraction with conservative content acceptance and truthful fallback attribution.
 - **Rollback:** Revert the commit carrying `Fork-Patch: exa-direct-extract`, preserving the pre-existing plain-file and local-docs route.
 
+## Active patch record: gateway config reparse CPU
+
+Fork patch identity: `gateway-reparse-cpu`.
+
+- **Load when:** changing gateway config or cron job-store read/write caching, cache signatures, lock-free cache hits, or their regressions.
+- **Behavior:** Reuse parsed config YAML and unchanged cron job-store data when file signatures are stable, while invalidating on atomic replacement, preserving secret-scope expansion, caller isolation, race safety, and semantic writes.
+- **Source surfaces:** `hermes_cli/config.py`, `hermes_cli/config_cache.py`, `cron/jobs.py`, `tests/hermes_cli/test_config_cache_signature.py`, `tests/cron/test_jobs_cache.py`, and related cron/config tests.
+- **Contract tests:** `tests/hermes_cli/test_config_cache_signature.py`, `tests/cron/test_jobs_cache.py`.
+- **Upstream status:** Fork-only gateway CPU repair; no equivalent upstream fix has been established.
+- **Retirement:** Remove when upstream provides equivalent signature-aware config and cron-store caching with the same invalidation and isolation contract.
+- **Rollback:** Revert the commits carrying `Fork-Patch: gateway-reparse-cpu`.
+
 ## Update
 
 Each maintenance unit owns its patches' provenance, proof surface, and retirement
