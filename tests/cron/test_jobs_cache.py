@@ -38,6 +38,25 @@ def test_load_jobs_reuses_parse_for_unchanged_stamp(tmp_cron_dir, monkeypatch):
     assert load_jobs()[0]["id"] == "a"
 
 
+def test_save_noop_reuses_loaded_document_without_reparsing(tmp_cron_dir, monkeypatch):
+    from cron import jobs
+
+    jobs.ensure_dirs()
+    jobs.JOBS_FILE.write_text(json.dumps({"jobs": [{"id": "a"}]}))
+    original = jobs._parse_jobs_file
+    calls = 0
+
+    def counted(path):
+        nonlocal calls
+        calls += 1
+        return original(path)
+
+    monkeypatch.setattr(jobs, "_parse_jobs_file", counted)
+    loaded = load_jobs()
+    save_jobs(loaded)
+    assert calls == 1
+
+
 def test_load_jobs_reparses_after_atomic_replace(tmp_cron_dir, monkeypatch):
     from cron import jobs
 

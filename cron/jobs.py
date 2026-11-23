@@ -1620,7 +1620,12 @@ def _peek_jobs_unlocked() -> Optional[list[dict[str, Any]]]:
 
 
 def _jobs_file_stamp(jobs_file: Path) -> Optional[tuple[Any, ...]]:
-    """Content-cache stamp including ctime and a racy digest for pinned-mtime edits."""
+    """Content-cache stamp including a bounded racy digest for pinned-mtime edits.
+
+    The digest is only active during the two-second filesystem racy window. The
+    no-op save path reuses the parsed snapshot, so a settled jobs file does not
+    get reread or hashed on every scheduler tick.
+    """
     try:
         return file_cache_version(jobs_file)
     except OSError:
@@ -1628,16 +1633,26 @@ def _jobs_file_stamp(jobs_file: Path) -> Optional[tuple[Any, ...]]:
 
 
 def _peek_jobs_document_unlocked() -> tuple[Optional[list[dict[str, Any]]], bool]:
-    """Return ``(jobs, canonical)`` without repairing or saving the document."""
+    """Return ``(jobs, canonical)`` without repairing or saving the document.
+
+    Reuse the already parsed immutable snapshot when the scheduler just loaded this
+    same stamp. This keeps the no-op-save guard from parsing jobs.json a second time
+    on every tick while preserving its canonical-document check on a cold cache.
+    """
     jobs_file = _current_cron_store().jobs_file
     if not jobs_file.exists():
         return [], False
+    cache_key = str(jobs_file)
+    stamp = _jobs_file_stamp(jobs_file)
+    cached = _jobs_load_cache.get(cache_key)
+    if cached is not None and cached[0] == stamp:
+        return copy.deepcopy(cached[1]), True
     try:
         data, _ = _parse_jobs_file(jobs_file)
     except (OSError, ValueError):
         return None, False
     if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
-        return None if not isinstance(data, list) else data, False
+        return data if isinstance(data, list) else None, False
     return data["jobs"], True
 
 
