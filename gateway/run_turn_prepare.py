@@ -784,12 +784,40 @@ class GatewayTurnPrepareMixin:
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
+        async def _preempt_machine_holder(holder):
+            """A cold-path waiter can miss adapter busy dispatch; yield an internal holder before waiting."""
+            if event is None:
+                return
+            holder_event = getattr(holder, "event", None)
+            if holder_event is None or not getattr(holder_event, "internal", False):
+                return
+            state = getattr(self, "_peek_session_state")(holder.owner_key)
+            running_agent = state.turn.agent if state is not None else None
+            from gateway.run import _AGENT_PENDING_SENTINEL
+            if running_agent is not None and running_agent is not _AGENT_PENDING_SENTINEL:
+                adapter = getattr(self, "_delivery_adapter_for")(event.source)
+                if adapter is not None:
+                    await getattr(self, "_interrupt_running_agent_for_busy_event")(event, adapter, running_agent)
+                    event._gateway_lease_machine_preempted = True
+                    outcome = getattr(self, "_BusySteerOutcome")(
+                        effective_mode="interrupt", demoted_for_subagents=False,
+                        demoted_for_compression=False, steered=False, redirected=False,
+                    )
+                    await getattr(self, "_busy_interrupt_and_ack")(event, _quick_key, adapter, state, running_agent, outcome)
+            else:
+                task = getattr(self, "_session_tasks", {}).get(holder.owner_key)
+                if task is not None and not task.done():
+                    task.cancel()
+                    event._gateway_lease_machine_preempted = True
+
         try:
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
                 max_wait=lease_wait_max_seconds(),
                 on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
+                on_contended=_preempt_machine_holder if event is not None else None,
+                event=event,
                 on_timeout=(lambda: preserve_lease_wait_async(
                     self, _quick_key, session_entry.session_id, event,
                 )) if event is not None else None,

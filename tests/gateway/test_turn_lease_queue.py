@@ -21,6 +21,27 @@ HANG_GUARD_SECONDS = 30
 
 
 @pytest.mark.asyncio
+async def test_contended_internal_holder_can_be_preempted_before_waiting():
+    registry = SessionTurnLeaseRegistry()
+    machine_event = SimpleNamespace(internal=True)
+    holder = await registry.acquire("session", owner_key="topic", generation=1, event=machine_event)
+    seen = []
+
+    async def preempt(current):
+        seen.append(current.event)
+        registry.release(current)
+
+    user_event = SimpleNamespace(internal=False)
+    successor = await registry.acquire(
+        "session", owner_key="topic", generation=2, event=user_event, on_contended=preempt,
+    )
+    assert seen == [machine_event]
+    assert successor is not None
+    assert successor.event is user_event
+    registry.release(successor)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("holder_key", ["same-key", "other-key"])
 async def test_admitted_successor_waits_past_lease_deadline(monkeypatch, tmp_path, caplog, holder_key):
     runner = _bootstrap(monkeypatch, tmp_path)

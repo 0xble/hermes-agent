@@ -46,10 +46,11 @@ class TurnLeaseToken:
     """Held-lease handle from :meth:`SessionTurnLeaseRegistry.acquire`; ``released`` makes
     release idempotent."""
 
-    __slots__ = ("generation", "lease", "owner_key", "released", "session_id")
+    __slots__ = ("event", "generation", "lease", "owner_key", "released", "session_id")
 
     def __init__(self, session_id: str, owner_key: str, generation: int, lease: "_SessionLease") -> None:
         self.session_id, self.owner_key, self.generation = session_id, owner_key, generation
+        self.event = None
         self.released = False
         # The concrete lease, so release resolves by identity even after a rotation re-aliases
         # ``session_id`` (both ids map to this same lease).
@@ -103,6 +104,8 @@ class SessionTurnLeaseRegistry:
         on_timeout: Callable[[], Awaitable[None]] | None = None,
         max_wait: float = DEFAULT_MAX_LEASE_WAIT,
         on_wait: Callable[[], Awaitable[None]] | None = None,
+        event=None,
+        on_contended: Callable[["TurnLeaseToken"], Awaitable[None]] | None = None,
     ) -> Optional[TurnLeaseToken]:
         """Acquire the lease for ``session_id``; None for a falsy id.
 
@@ -115,7 +118,11 @@ class SessionTurnLeaseRegistry:
         wait = float(timeout) if timeout and timeout > 0 else DEFAULT_LEASE_WAIT
         lease = self._get_or_create(session_id)
         token = TurnLeaseToken(session_id, owner_key, int(generation), lease=lease)
+        token.event = event
         if lease.lock.locked():
+            holder = lease.holder
+            if on_contended is not None and holder is not None:
+                await on_contended(holder)
             overlap = "previous turn is handing off the lease"
             if lease.holder is not None:
                 overlap = ("same-key generation overlap" if owner_key == lease.holder.owner_key
