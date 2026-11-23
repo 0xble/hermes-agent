@@ -372,7 +372,8 @@ class SessionMaintenanceMixin:
         if older_than_days < 0 or batch_size < 1:
             raise ValueError("older_than_days must be non-negative and batch_size must be positive")
         cutoff = time.time() - older_than_days * 86400.0
-        archive = Path(archive_path or (Path(os.environ.get("HERMES_ARCHIVE_DIR", "/Volumes/Hermes Archive")).expanduser() / "compacted-history.jsonl.gz"))
+        archive = Path(archive_path or
+                       "/Volumes/Hermes Archive/compacted-history.jsonl.gz").expanduser()
         where = "active = 0 AND timestamp < ?"
         count, bytes_est = self._read_one(
             f"SELECT COUNT(*), COALESCE(SUM(length(COALESCE(content, ''))), 0) FROM messages WHERE {where}", (cutoff,))
