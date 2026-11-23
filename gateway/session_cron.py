@@ -15,6 +15,7 @@ from gateway.session_contract import SessionActor, SessionRef
 from gateway.session_persistence import authority_persistence
 from persistence.authority.bindings import cron_request_id
 from persistence.authority.vocabulary import CRON_PRINCIPAL_ID
+from hermes_state_runtime import RuntimeStoreError, get_session_admission
 from persistence.core.errors import AuthorityRefusal
 
 _execution: ContextVar[tuple | None] = ContextVar('cron_owner_execution', default=None)

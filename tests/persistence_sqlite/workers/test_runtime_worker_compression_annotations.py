@@ -6,8 +6,7 @@ from persistence.sqlite.authority._runtime_ends import begin_runtime_epoch
 from persistence.sqlite.conversation._store.sessions import create_session
 from persistence.sqlite.workers._executions import register_worker_execution
 from persistence.sqlite.workers._receipt import mutate_worker_execution
-from tests.fakes.runtime_owner import begin_runtime_epoch
-from tests.persistence_sqlite.workers._runtime_worker import worker as worker  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
+from tests.persistence_sqlite.workers._runtime_worker import worker as worker  # noqa: PLC0414 -- load-bearing fixture alias
 
 
 @pytest.mark.parametrize('rotate', [False, True])

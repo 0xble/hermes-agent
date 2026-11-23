@@ -4,6 +4,7 @@ import time
 import pytest
 
 from persistence.core.errors import AuthorityRefusal
+from hermes_state_runtime import RuntimeStoreError
 from persistence.sqlite.conversation._store.core import REACTIONS_METADATA_KEY
 from persistence.sqlite.conversation._store.messages import (
     append_message, append_messages_batch, archive_and_compact, get_messages_as_conversation, set_message_reaction,
@@ -12,6 +13,7 @@ from persistence.sqlite.conversation._store.messages import (
 from persistence.sqlite.conversation._store.sessions import create_session, get_session
 from persistence.sqlite.conversation._store.titles import get_next_title_in_lineage
 from persistence.sqlite.workers._receipt import mutate_worker_execution
+from persistence.sqlite.workers._runtime_worker import WorkerState
 from tests.persistence_sqlite.workers._runtime_worker import setup_store
 from tests.persistence_sqlite.workers._runtime_worker import worker as worker  # noqa: PLC0414 -- the self-alias is load-bearing: it suppresses F811 for the pytest fixture parameter shadowing this import
 

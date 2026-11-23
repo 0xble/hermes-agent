@@ -63,7 +63,7 @@ def describe_holder_pid(pid: int) -> str:
     if argv is None and psutil is not None:
         try:
             argv = psutil.Process(pid).cmdline() or None
-        except Exception:
+        except Exception:  # health: allow BLE001 -- holder diagnostics fail closed on unavailable process data
             argv = None
     who = " ".join(" ".join([os.path.basename(argv[0]), *argv[1:]]).split())[:80] if argv else "command line unavailable"
     return f"PID {pid} ({who})"
@@ -432,7 +432,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
     if _IS_WINDOWS:
         try:
             return _windows_restart_manager_holders(db_path)
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- holder diagnostics fail closed on scan errors
             logger.warning(
                 "Could not prove state.db has no Windows holders; deferring structural maintenance: %s",
                 exc,
@@ -533,7 +533,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                         and fd_stat.st_dev == db_dev
                     ):
                         holders.append((pid, target))
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- holder diagnostics fail closed on scan errors
             logger.warning(
                 "Could not prove state.db has no foreign holders; "
                 "deferring structural maintenance: %s",
@@ -556,7 +556,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                     and db_dev is not None and identity[0] == db_dev
                 ):
                     holders.append((pid, target))
-        except Exception as exc:
+        except Exception as exc:  # health: allow BLE001 -- holder diagnostics fail closed on scan errors
             logger.warning(
                 "Could not prove state.db has no foreign holders; "
                 "deferring structural maintenance: %s", exc,
@@ -576,7 +576,7 @@ def foreign_state_db_holders(db_path: Path) -> list[tuple[int, str]]:
                 path = getattr(opened, "path", "")
                 if path and canonical_sqlite_path(os.path.realpath(path)) in watched:
                     holders.append((pid, path))
-    except Exception as exc:
+    except Exception as exc:  # health: allow BLE001 -- holder diagnostics fail closed on scan errors
         logger.warning(
             "Could not prove state.db has no foreign holders; "
             "deferring structural maintenance: %s",
@@ -672,9 +672,9 @@ def live_writer_holds_db(
         if probe is not None:
             try:
                 probe.execute("PRAGMA locking_mode=NORMAL")
-            except Exception:
+            except Exception:  # health: allow BLE001 -- holder diagnostics fail closed on unavailable process data
                 pass
             try:
                 probe.close()
-            except Exception:
+            except Exception:  # health: allow BLE001 -- holder diagnostics fail closed on unavailable process data
                 pass

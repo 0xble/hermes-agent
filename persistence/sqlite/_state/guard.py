@@ -35,7 +35,7 @@ def _real_platform_state_root() -> Optional[Path]:
         else:
             root = home / ".hermes"
         return root.resolve()
-    except Exception:
+    except Exception:  # health: allow BLE001 -- test-process probing fails closed
         return None
 
 
@@ -78,14 +78,14 @@ def _process_looks_like_pytest(proc: Any) -> bool:
     => not pytest: guessing the other way would refuse production opens."""
     try:
         cmdline = proc.cmdline() or []
-    except Exception:
+    except Exception:  # health: allow BLE001 -- test-process probing fails closed
         return False
     names = []
     for arg in cmdline:
         try:
             # Split on both separators on every host so the answer is platform-independent.
             names.append(str(arg).strip('"').strip("'").replace("\\", "/").rsplit("/", 1)[-1].lower())
-        except Exception:
+        except Exception:  # health: allow BLE001 -- test-process probing fails closed
             names.append("")
     if any(name in _PYTEST_LAUNCHER_NAMES for name in names):
         return True
@@ -112,7 +112,7 @@ def _has_pytest_ancestor() -> bool:
     if psutil is not None:
         try:
             found = any(_process_looks_like_pytest(p) for p in psutil.Process().parents())
-        except Exception:
+        except Exception:  # health: allow BLE001 -- test-process probing fails closed
             found = False
     _PYTEST_ANCESTOR = found
     return found

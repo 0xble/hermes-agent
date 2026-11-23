@@ -166,13 +166,13 @@ def compress_now(
     with compression_level(compressor, level):
         return _compress_head(agent, before, head, tail, before_tokens, request, system_message=system_message,
                               task_id=task_id, skip_without_window=skip_without_window,
-                              snapshot_is_current=snapshot_is_current)
+                              snapshot_is_current=snapshot_is_current, trigger=trigger)
 
 
 def _compress_head(
     agent: Any, before: list[dict[str, Any]], head: list[dict[str, Any]], tail: list[dict[str, Any]],
     before_tokens: int, request: CompressRequest, *, system_message: Any, task_id: str, skip_without_window: bool,
-    snapshot_is_current: Optional[Callable[[], bool]] = None,
+    snapshot_is_current: Optional[Callable[[], bool]] = None, trigger: Optional[str] = None,
 ) -> CompressResult:
     from agent.context_compressor import _DB_PERSISTED_MARKER, _fresh_compaction_message_copy
     from agent.conversation_compression import finalize_context_engine_compression_notification
