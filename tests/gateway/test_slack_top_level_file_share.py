@@ -146,6 +146,82 @@ async def test_text_and_pdf_message_dispatches_one_turn(adapter, top_level_threa
     assert message.media_urls
     assert message.message_id == TS
     assert message.source.thread_id == (TS if top_level_threads else None)
+    download.assert_awaited_once_with(
+        "https://files.slack.com/report.pdf",
+        team_id="",
+        max_bytes=_slack_mod._SLACK_INBOUND_DOCUMENT_MAX_BYTES,
+    )
+
+
+@pytest.mark.asyncio
+async def test_metadata_over_inbound_limit_is_visible_without_download(adapter):
+    oversized = {**_message_file(), "size": _slack_mod._SLACK_INBOUND_DOCUMENT_MAX_BYTES + 1}
+    with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as download:
+        await adapter._handle_slack_message(_message(files=[oversized]))
+
+    download.assert_not_awaited()
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+    assert "[file: report.pdf (application/pdf)]" in text
+    assert "exceeds the 100 MB inbound document limit" in text
+
+
+class _StreamingResponse:
+    status_code = 200
+    headers = {"content-type": "application/octet-stream"}
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+    def raise_for_status(self):
+        return None
+
+    async def aiter_bytes(self):
+        yield b"1234"
+        yield b"56789"
+
+
+class _StreamingClient:
+    def stream(self, *_args, **_kwargs):
+        return _StreamingResponse()
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_):
+        return None
+
+
+@pytest.mark.asyncio
+async def test_unknown_size_stream_aborts_at_inbound_limit(adapter, monkeypatch):
+    monkeypatch.setattr(_slack_mod, "_SLACK_INBOUND_DOCUMENT_MAX_BYTES", 8)
+    with patch(
+        "tools.url_safety.is_safe_url", return_value=True
+    ), patch(
+        "tools.url_safety.create_ssrf_safe_async_client", return_value=_StreamingClient()
+    ), patch.object(adapter, "_is_slack_cdn_url", return_value=True):
+        with pytest.raises(_slack_mod._SlackInboundFileTooLarge):
+            await adapter._download_slack_file_bytes(
+                "https://files.slack.com/report.pdf", max_bytes=8
+            )
+
+
+@pytest.mark.asyncio
+async def test_unknown_size_over_limit_is_visible_in_same_turn(adapter):
+    with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as download:
+        download.side_effect = _slack_mod._SlackInboundFileTooLarge(
+            "Slack attachment exceeds the 100 MB inbound document limit."
+        )
+        await adapter._handle_slack_message(_message(files=[{**_message_file(), "size": 0}]))
+
+    download.assert_awaited_once()
+    adapter.handle_message.assert_awaited_once()
+    text = adapter.handle_message.await_args.args[0].text
+    assert "[file: report.pdf (application/pdf)]" in text
+    assert "exceeds the 100 MB inbound document limit" in text
 
 
 @pytest.mark.asyncio
@@ -225,6 +301,63 @@ async def test_file_shared_uses_real_ts_and_skips_bot_upload(adapter):
     await adapter._handle_slack_file_shared({**_file_shared_event(), "user_id": "U_BOT"})
     adapter.handle_message.assert_not_awaited()
     adapter._app.client.files_info.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_file_shared_without_ts_dispatches_flat_with_empty_message_id(adapter):
+    adapter._app.client.files_info = AsyncMock(
+        return_value={
+            "ok": True,
+            "file": {
+                **_message_file(),
+                "shares": {"private": {"D123": [{"thread_ts": "THREAD_ONLY"}]}},
+            },
+        }
+    )
+    with patch.object(adapter, "_download_slack_file_bytes", new_callable=AsyncMock) as download:
+        download.return_value = b"%PDF-1.4 fake content"
+        await adapter._handle_slack_file_shared({
+            "file_id": "F_PDF", "channel_id": "D123", "user_id": "U_USER"
+        })
+
+    message = adapter.handle_message.await_args.args[0]
+    assert message.message_id == ""
+    assert message.source.message_id is None
+    assert message.source.thread_id is None
+    assert message.reply_to_message_id is None
+    assert "file:F_PDF" in adapter._processed_message_ts
+
+
+@pytest.mark.asyncio
+async def test_file_shared_info_failure_waits_grace_and_rechecks_file_claim(adapter):
+    adapter._app.client.files_info = AsyncMock(return_value={"ok": False, "error": "not_found"})
+
+    async def claim_file_during_grace(delay):
+        assert delay == 0.75
+        adapter._remember_processed_file_id("F_PDF")
+
+    with patch.object(_slack_mod.asyncio, "sleep", new_callable=AsyncMock) as sleep:
+        sleep.side_effect = claim_file_during_grace
+        await adapter._handle_slack_file_shared(_file_shared_event())
+
+    sleep.assert_awaited_once_with(0.75)
+    adapter.handle_message.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unresolved_file_shared_without_ts_dispatches_flat_with_empty_message_id(adapter):
+    adapter._app.client.files_info = AsyncMock(return_value={"ok": False, "error": "not_found"})
+    await adapter._handle_slack_file_shared({
+        "file_id": "F_PDF", "channel_id": "D123", "user_id": "U_USER",
+        "file_name": "report.pdf", "mimetype": "application/pdf",
+    })
+
+    message = adapter.handle_message.await_args.args[0]
+    assert message.message_id == ""
+    assert message.source.message_id is None
+    assert message.source.thread_id is None
+    assert message.reply_to_message_id is None
+    assert "[file: report.pdf (application/pdf)]" in message.text
 
 
 @pytest.mark.asyncio

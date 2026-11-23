@@ -88,7 +88,12 @@ logger = logging.getLogger(__name__)
 from hermes_cli.version_info import hermes_user_agent
 
 _SLACK_ERROR_BODY_LIMIT_BYTES = 8 * 1024
+_SLACK_INBOUND_DOCUMENT_MAX_BYTES = 100 * 1024 * 1024
 _BOOL_WORDS = frozenset({"1", "0", "true", "false", "yes", "no", "on", "off"})
+
+
+class _SlackInboundFileTooLarge(ValueError):
+    """Raised when an inbound Slack document exceeds the bounded download limit."""
 
 # Model picker Block Kit action IDs. The picker is a two-step drill-down:
 # provider static_select → model static_select, plus Back/Cancel buttons.
@@ -3814,6 +3819,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         async def _dispatch_unresolved_file_notice(file_obj: dict[str, Any]) -> None:
             """Keep a file_shared failure visible to the agent instead of dropping it."""
             event_ts = str(event.get("event_ts") or event.get("ts") or "")
+            await asyncio.sleep(0.75)
+            if self._file_was_processed(file_id):
+                return
             await self._handle_slack_message({
                 "type": "message",
                 "subtype": "file_share",
@@ -3822,7 +3830,7 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 "channel": channel_id,
                 "channel_type": "im" if channel_id.startswith("D") else "channel",
                 "team": team_id,
-                "ts": event_ts or f"file:{file_id}",
+                "ts": event_ts,
                 "files": [{**file_obj, "file_access": "unavailable"}],
             })
 
@@ -3873,9 +3881,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
             "team": team_id,
             # Keep Slack's share timestamp as the message identity and reply anchor.
             # ``file:<id>`` is used only by the internal dedup cache.
-            "ts": ts or f"file:{file_id}",
+            "ts": ts,
             "files": [file_obj]}
-        if thread_ts and thread_ts != ts:
+        if ts and thread_ts and thread_ts != ts:
             fallback_event["thread_ts"] = thread_ts
         elif (
             ts
@@ -4645,13 +4653,21 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         if not ext and mimetype:
             mime_to_ext = {v: k for k, v in SUPPORTED_DOCUMENT_TYPES.items()}
             ext = mime_to_ext.get(mimetype, "")
-        # Slack's outbound bot upload limit does not cap inbound files. Keep larger documents
-        # available to the agent when the Slack file metadata and download are valid.
-        file_size = f.get("size", 0)
-        if file_size and file_size < 0:
+        # Slack's outbound bot upload limit is separate from this inbound document bound.
+        file_size = f.get("size")
+        try:
+            file_size = int(file_size) if file_size not in (None, "") else None
+        except (TypeError, ValueError):
+            file_size = None
+        if file_size is not None and file_size < 0:
             logger.warning("[Slack] Document has invalid size metadata: %s", file_size)
             return None
-        raw_bytes = await self._download_slack_file_bytes(url, team_id=team_id)
+        if file_size is not None and file_size > _SLACK_INBOUND_DOCUMENT_MAX_BYTES:
+            raise _SlackInboundFileTooLarge(
+                f"Slack attachment {_attachment_label(f)} exceeds the "
+                f"{_SLACK_INBOUND_DOCUMENT_MAX_BYTES // (1024 * 1024)} MB inbound document limit.")
+        raw_bytes = await self._download_slack_file_bytes(
+            url, team_id=team_id, max_bytes=_SLACK_INBOUND_DOCUMENT_MAX_BYTES)
         cached_path = await cache_document_from_bytes_async(
             raw_bytes, original_filename or f"document{ext or '.bin'}")
         doc_mime = SUPPORTED_DOCUMENT_TYPES.get(ext, mimetype or "application/octet-stream")
@@ -4692,6 +4708,7 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 if f is None:
                     notices.append(marker)
                     continue
+                marker = _slack_file_marker(f)
             mimetype = f.get("mimetype", "unknown")
             url = f.get("url_private_download") or f.get("url_private", "")
             if not url:
@@ -4715,6 +4732,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                 media_text_inlined.append(bool(injection))
                 if injection:
                     text = f"{injection}\n\n{text}" if text else injection
+            except _SlackInboundFileTooLarge as e:
+                notices.append(marker)
+                notices.append(str(e))
             except Exception as e:  # pragma: no cover - defensive logging
                 detail = self._describe_slack_download_failure(e, file_obj=f)
                 detail = detail or (
@@ -6127,7 +6147,9 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
         return self.config.token or ""
 
     async def _download_slack_file_bytes(
-        self, url: str, team_id: str = "", *, html_label: str = "file bytes") -> bytes:
+        self, url: str, team_id: str = "", *, html_label: str = "file bytes",
+        max_bytes: Optional[int] = None,
+    ) -> bytes:
         """Download a Slack file with the bot token (3 attempts on 429/5xx/timeout). URL must pass
         ``is_safe_url`` AND the Slack-CDN allowlist (token exfiltration); redirects are
         re-validated; an HTML body (sign-in page) is rejected so bogus bytes are never cached."""
@@ -6153,33 +6175,54 @@ class SlackAdapter(SlackReactionsMixin, SlackThreadStatusMixin, SlackThreadTitle
                     while True:
                         # httpx drops Authorization across origins. Enterprise Grid
                         # needs it on files-origin, but never send it off Slack's CDN.
-                        response = await client.get(
-                            download_url, headers={"Authorization": f"Bearer {bot_token}"})
-                        if response.status_code not in (301, 302, 303, 307, 308):
-                            break
-                        target = redirect_target_from_response(response)
-                        if not target:
-                            break  # raise_for_status reports the malformed redirect.
-                        if not is_safe_url(target):
-                            raise ValueError(
-                                "Blocked unsafe Slack file redirect (SSRF protection): "
-                                f"{safe_url_for_log(target)}")
-                        if not self._is_slack_cdn_url(target):
-                            raise ValueError(
-                                "Blocked non-Slack-CDN file redirect (token-exfiltration protection): "
-                                f"{safe_url_for_log(target)}")
-                        if redirect_count == 3:
-                            raise ValueError("Too many Slack file redirects (maximum 3)")
-                        download_url = target
-                        redirect_count += 1
-                    response.raise_for_status()
-                    ct = response.headers.get("content-type", "")
-                    if "text/html" in ct:
-                        raise ValueError(
-                            f"Slack returned HTML instead of {html_label} (content-type: {ct}); "
-                            "check bot token scopes and file permissions, or a cross-origin "
-                            "redirect dropped the token (Enterprise Grid files-origin)")
-                    return response.content
+                        async with client.stream(
+                            "GET", download_url,
+                            headers={"Authorization": f"Bearer {bot_token}"}) as response:
+                            if response.status_code in (301, 302, 303, 307, 308):
+                                target = redirect_target_from_response(response)
+                                if not target:
+                                    raise ValueError("Slack file redirect missing Location header")
+                                if not is_safe_url(target):
+                                    raise ValueError(
+                                        "Blocked unsafe Slack file redirect (SSRF protection): "
+                                        f"{safe_url_for_log(target)}")
+                                if not self._is_slack_cdn_url(target):
+                                    raise ValueError(
+                                        "Blocked non-Slack-CDN file redirect (token-exfiltration protection): "
+                                        f"{safe_url_for_log(target)}")
+                                if redirect_count == 3:
+                                    raise ValueError("Too many Slack file redirects (maximum 3)")
+                                download_url = target
+                                redirect_count += 1
+                                continue
+                            response.raise_for_status()
+                            ct = response.headers.get("content-type", "")
+                            if "text/html" in ct:
+                                raise ValueError(
+                                    f"Slack returned HTML instead of {html_label} (content-type: {ct}); "
+                                    "check bot token scopes and file permissions, or a cross-origin "
+                                    "redirect dropped the token (Enterprise Grid files-origin)")
+                            if max_bytes is None:
+                                return await response.aread()
+                            content_length = response.headers.get("content-length")
+                            try:
+                                content_length = int(content_length) if content_length else None
+                            except (TypeError, ValueError):
+                                content_length = None
+                            if content_length is not None and content_length > max_bytes:
+                                raise _SlackInboundFileTooLarge(
+                                    f"Slack attachment exceeds the "
+                                    f"{max_bytes // (1024 * 1024)} MB inbound document limit.")
+                            chunks: list[bytes] = []
+                            total = 0
+                            async for chunk in response.aiter_bytes():
+                                total += len(chunk)
+                                if total > max_bytes:
+                                    raise _SlackInboundFileTooLarge(
+                                        f"Slack attachment exceeds the "
+                                        f"{max_bytes // (1024 * 1024)} MB inbound document limit.")
+                                chunks.append(chunk)
+                            return b"".join(chunks)
                 except (httpx.TimeoutException, httpx.HTTPStatusError) as exc:
                     if isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code < 429:
                         raise
