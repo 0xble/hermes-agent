@@ -1512,14 +1512,16 @@ def load_jobs() -> list[dict[str, Any]]:
     pre_read_stamp = _jobs_file_stamp(jobs_file)
     if not jobs_file.exists():
         _record_load_stamp(None)
-        _jobs_load_cache.pop(str(jobs_file), None)
+        with _jobs_file_lock:
+            _jobs_load_cache.pop(str(jobs_file), None)
         return []
 
     cache_key = str(jobs_file)
-    cached = _jobs_load_cache.get(cache_key)
-    if cached is not None and cached[0] == pre_read_stamp:
-        _record_load_stamp(pre_read_stamp)
-        return copy.deepcopy(cached[1])
+    with _jobs_file_lock:
+        cached = _jobs_load_cache.get(cache_key)
+        if cached is not None and cached[0] == pre_read_stamp:
+            _record_load_stamp(pre_read_stamp)
+            return copy.deepcopy(cached[1])
 
     try:
         data, _strict_retry = _parse_jobs_file(jobs_file)
@@ -1599,7 +1601,8 @@ def load_jobs() -> list[dict[str, Any]]:
     _record_load_stamp(pre_read_stamp)
     # Do not cache a stamp that raced with a writer; the next load must parse again.
     if pre_read_stamp is not None and _jobs_file_stamp(jobs_file) == pre_read_stamp:
-        _jobs_load_cache[cache_key] = (pre_read_stamp, copy.deepcopy(list(jobs)))
+        with _jobs_file_lock:
+            _jobs_load_cache[cache_key] = (pre_read_stamp, copy.deepcopy(list(jobs)))
     return jobs
 
 
