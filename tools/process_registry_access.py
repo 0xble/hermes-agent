@@ -60,7 +60,9 @@ def resolve_actionable(session_id: str, task_id, session_key: str = "") -> tuple
     the same way, and an allowed session is acted on by its FULL id, so no prefix the check did
     not resolve can reach another conversation's process."""
     from tools.process_registry import process_registry
-    session = process_registry.get(session_id)
+    # Ownership checks must not refresh a remote handle. A conflicting or foreign
+    # request is refused before it can probe the process's original node.
+    session = process_registry._lookup_session(session_id)
     if session is None:
         return False, session_id
     caller_key = session_key or caller_session_key()
