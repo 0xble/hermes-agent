@@ -5,6 +5,8 @@ are imported lazily inside method bodies (import cycle) so ``patch("gateway.run.
 
 from __future__ import annotations
 
+# Imports are intentionally retained as compatibility exports for methods split into sibling mixins.
+# ruff: noqa: F401
 from pm import install_hint
 import logging
 from typing import TYPE_CHECKING

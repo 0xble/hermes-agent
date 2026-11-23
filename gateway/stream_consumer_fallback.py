@@ -323,6 +323,7 @@ class StreamFallbackMixin:
                 from gateway.reply_latency import record_final_reply
                 record_final_reply(getattr(self, "_reply_latency_receipt", None), chunks[-1], result)
         self._last_sent_text = chunks[-1]
+        self._final_response_sent = True
         self._fallback_prefix = ""
         self._fallback_preserve_partial_messages = False
 
