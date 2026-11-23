@@ -1355,13 +1355,19 @@ def _execution_code_sha_pins(home: Path) -> set[Path]:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(executions)")}
             if "code_sha" not in columns:
                 return set()
-            terminal = ("completed", "failed", "cancelled", "missed")
-            values = connection.execute(
-                "SELECT DISTINCT code_sha FROM executions "
-                "WHERE code_sha IS NOT NULL "
-                "AND (status IS NULL OR status NOT IN (?, ?, ?, ?))",
-                terminal,
-            ).fetchall()
+            if "status" in columns:
+                terminal = ("completed", "failed", "cancelled", "missed")
+                values = connection.execute(
+                    "SELECT DISTINCT code_sha FROM executions "
+                    "WHERE code_sha IS NOT NULL "
+                    "AND (status IS NULL OR status NOT IN (?, ?, ?, ?))",
+                    terminal,
+                ).fetchall()
+            else:
+                # A ledger without statuses cannot say which rows finished, so every row pins.
+                values = connection.execute(
+                    "SELECT DISTINCT code_sha FROM executions WHERE code_sha IS NOT NULL"
+                ).fetchall()
     except sqlite3.Error as exc:
         raise RuntimeError(f"cannot safely prune releases: unreadable cron execution ledger {database}: {exc}") from exc
     releases = (home / "releases").resolve()
