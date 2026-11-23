@@ -915,35 +915,19 @@ class GatewayBusySessionMixin:
                 running_agent._turn_reply_expected = turn.event.reply_expected
         return turn
 
-    async def _interrupt_running_agent_for_busy_event(
-        self, event: MessageEvent, adapter, running_agent, *, preserve_event_message: bool = True,
-    ) -> None:
-        """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point.
-
-        Cold-path lease preemption passes ``preserve_event_message=False`` because that event has not
-        entered the adapter FIFO yet; carrying its text in ``interrupt_message`` would process it a
-        second time when the interrupted turn drains.
-        """
+    async def _interrupt_running_agent_for_busy_event(self, event: MessageEvent, adapter, running_agent) -> None:
+        """Interrupt mode: abort in-flight tool calls; the agent loop exits at its next check point."""
         from gateway.run import _build_media_placeholder
         try:
             _interrupt_text = event.text
             _media_urls = getattr(event, "media_urls", None) or []
-            pending_audio = getattr(self, "_pending_event_audio_paths", None)
-            if preserve_event_message and callable(pending_audio) and pending_audio(event):
+            if self._pending_event_audio_paths(event):
                 _interrupt_text, _ = await self._transcribe_and_echo_pending_voice(
                     event, adapter, event.source, event.text or "", log_context="Voice-busy-interrupt",
                 )
-            elif preserve_event_message and not _interrupt_text and _media_urls:
+            elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
-            if preserve_event_message:
-                running_agent.interrupt(_interrupt_text)
-            else:
-                # Do not put the cold-path user's text into the interrupted turn's result. The
-                # same event continues below as the next lease owner and must be processed once.
-                try:
-                    running_agent.interrupt(None, tool_reason="gateway user turn preemption")
-                except TypeError:
-                    running_agent.interrupt(None)
+            running_agent.interrupt(_interrupt_text)
         except Exception:
             pass  # don't let interrupt failure block the ack
 

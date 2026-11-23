@@ -819,11 +819,16 @@ class GatewayTurnPrepareMixin:
             if callable(compression_check) and await compression_check(_quick_key):  # type: ignore[reportGeneralTypeIssues]
                 return
             adapter = getattr(self, "_delivery_adapter_for")(event.source)
-            interrupt = getattr(self, "_interrupt_running_agent_for_busy_event", None)
-            if adapter is None or not callable(interrupt):
+            if adapter is None:
                 return
-            await interrupt(event, adapter, running_agent, preserve_event_message=False)  # type: ignore[reportGeneralTypeIssues]
-            event._gateway_lease_machine_preempted = True
+            # A system-sourced soft interrupt with no message: the user's event is not in the adapter
+            # FIFO yet and runs as the next lease owner, so carrying its text would process it twice.
+            try:
+                running_agent.interrupt(None, tool_reason="gateway user turn preemption")
+            except Exception:
+                logger.debug("Cold-path machine-turn preemption failed", exc_info=True)
+                return
+            logger.info("User message preempts autonomous turn on lease wait (session=%s)", _quick_key)
             # Use the same busy-ack channel as warm-path preemption. The flag prevents the
             # later lease-wait notice from sending a second (queued) acknowledgement.
             if not getattr(event, "_gateway_busy_ack_sent", False):
