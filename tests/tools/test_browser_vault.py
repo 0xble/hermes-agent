@@ -37,6 +37,7 @@ from agent.vault_store import (
     VaultError,
     VaultStore,
     normalize_origin,
+    origin_matches_lookup,
     scrub_secret_from_text,
 )
 
@@ -150,6 +151,23 @@ class TestVaultStore:
         out = scrub_secret_from_text("boom hunter22x at me@x.io", secret)
         assert "hunter22x" not in out
         assert "me@x.io" not in out
+
+    def test_origin_lookup_allows_https_for_same_http_host_and_port(self):
+        assert origin_matches_lookup("http://example.com", "https://example.com")
+        assert origin_matches_lookup("http://example.com:8080", "https://example.com:8080")
+
+    def test_origin_lookup_does_not_cross_hosts_or_downgrade_https(self):
+        assert not origin_matches_lookup("http://example.com", "https://other.example.com")
+        assert not origin_matches_lookup("https://example.com", "http://example.com")
+        assert not origin_matches_lookup("http://example.com", "https://sub.example.com")
+        assert not origin_matches_lookup("http://example.com:8080", "https://example.com:8443")
+
+    def test_origin_lookup_handles_ipv6_and_malformed_origins(self):
+        assert normalize_origin("http://[2001:DB8::1]:8080/login") == "http://[2001:db8::1]:8080"
+        assert origin_matches_lookup("http://[2001:db8::1]:8080", "https://[2001:db8::1]:8080")
+        assert not origin_matches_lookup("http://[2001:db8::1]:8080", "https://[2001:db8::2]:8080")
+        assert not origin_matches_lookup("http://[2001:db8::1", "https://[2001:db8::1]")
+        assert not origin_matches_lookup("not an origin", "https://example.com")
 
 
 # ---------------------------------------------------------------------------
@@ -270,6 +288,51 @@ class TestBrowserVaultTools:
         assert out["items"][0]["identifier_type"] == "email"
         assert "s3cret-pw" not in json.dumps(out)
 
+    def test_list_https_lookup_finds_http_saved_login_without_widening_hosts(self, store):
+        from tools import browser_vault_tool
+
+        http_meta = _add_login(store, origin="http://example.com")
+        https_meta = _add_login(store, origin="https://secure.example.com")
+        backend = LocalLoginBackend()
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+            upgraded = json.loads(browser_vault_tool.browser_vault_list(kind="login", origin="https://example.com"))
+            wrong_host = json.loads(browser_vault_tool.browser_vault_list(kind="login", origin="https://other.example.com"))
+            exact = json.loads(browser_vault_tool.browser_vault_list(kind="login", origin="https://secure.example.com"))
+
+        assert [item["handle"] for item in upgraded["items"]] == [http_meta.id]
+        assert wrong_host["items"] == []
+        assert [item["handle"] for item in exact["items"]] == [https_meta.id]
+        assert exact["items"][0]["origin"] == "https://secure.example.com"
+
+    def test_list_https_ipv6_lookup_finds_http_saved_login_without_raising(self, store):
+        from tools import browser_vault_tool
+
+        http_meta = _add_login(store, origin="http://[2001:db8::1]:8080")
+        backend = LocalLoginBackend()
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+            out = json.loads(browser_vault_tool.browser_vault_list(
+                kind="login", origin="https://[2001:db8::1]:8080"))
+
+        assert out["success"] is True
+        assert [item["handle"] for item in out["items"]] == [http_meta.id]
+
+    def test_list_malformed_origin_metadata_still_succeeds(self):
+        from agent.vault_store import VaultItemMeta
+        from tools import browser_vault_tool
+
+        malformed = VaultItemMeta(
+            id="vault_malformed", kind="login", label="Malformed", origin="http://[2001:db8::1",
+            allowed_origins=("http://[2001:db8::1",), created_at="",
+        )
+        backend = LocalLoginBackend()
+        backend.list_items = lambda: [malformed]
+        with patch("agent.vault_backends.enabled_backends", return_value=[backend]):
+            out = json.loads(browser_vault_tool.browser_vault_list(kind="login", origin="https://example.com"))
+
+        assert out == {"success": True, "items": [], "hint": "No matching vault items for this filter. Try another kind or origin."}
+
     def test_fill_refused_on_origin_mismatch(self, store):
         from tools import browser_vault_tool
 
@@ -280,6 +343,62 @@ class TestBrowserVaultTools:
         assert out["success"] is False
         assert out["error_type"] == "origin_mismatch"
         assert "s3cret-pw" not in json.dumps(out)
+
+    def test_http_saved_payment_is_not_filled_on_https(self, store):
+        from tools import browser_vault_tool
+
+        meta = store.add_item(kind="payment", label="Card", origin="http://shop.test", secret=_CARD)
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_current_page_origin", return_value="https://shop.test"):
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
+
+        assert out["success"] is False
+        assert out["error_type"] == "origin_mismatch"
+
+    def test_fill_allows_https_upgrade_for_same_host_and_port(self, store):
+        from tools import browser_vault_tool
+
+        meta = _add_login(store, origin="http://example.com:8443")
+        controls = [
+            {"autocomplete": "current-password", "formIndex": 0, "index": 0,
+             "label": "", "name": "pw", "type": "password"},
+        ]
+
+        def fake_eval(task_id, expression):
+            return {"success": True, "result": json.dumps(controls)}
+
+        def fake_eval_secret(task_id, expression):
+            return {"success": True, "result": json.dumps({"filled": 1})}
+
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_current_page_origin",
+                          return_value="https://example.com:8443"), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_eval_secret):
+            out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
+
+        assert out["success"] is True
+        assert out["origin"] == "https://example.com:8443"
+        assert out["filled_fields"] == 1
+
+    def test_fill_refuses_other_hosts_subdomains_ports_and_downgrades(self, store):
+        from tools import browser_vault_tool
+
+        http_meta = _add_login(store, origin="http://example.com:8443")
+        https_meta = _add_login(store, origin="https://secure.example.com")
+        refused = (
+            (http_meta, "https://other.example.com:8443"),
+            (http_meta, "https://sub.example.com:8443"),
+            (http_meta, "https://example.com:9443"),
+            (https_meta, "http://secure.example.com"),
+        )
+        for meta, page_origin in refused:
+            with patch("agent.vault_store.get_vault_store", return_value=store), \
+                 patch.object(browser_vault_tool, "_current_page_origin", return_value=page_origin):
+                out = json.loads(browser_vault_tool.browser_vault_fill(meta.id))
+            assert out["success"] is False, page_origin
+            assert out["error_type"] == "origin_mismatch", page_origin
+            assert "s3cret-pw" not in json.dumps(out)
 
     @staticmethod
     def _manager_meta():
@@ -765,6 +884,34 @@ class TestTwoFactor:
         assert out["success"] and out["source"] == "local" and asked == []
         code = re.search(r'"value": "(\d{6})"', seen["expr"]).group(1)
         assert code not in raw  # the code went to the page, not to the model
+
+    def test_saved_authenticator_key_allows_https_upgrade_for_login(self, store):
+        from tools import browser_vault_tool
+
+        meta = store.add_item(
+            "login", "gh", {"identifier_type": "username", "identifier": "tek", "password": "pw",
+                         "otp_secret": "JBSWY3DPEHPK3PXP"}, origin="http://github.com",
+        )
+        controls = [{"index": 0, "type": "text", "name": "otp", "label": "Authentication code",
+                     "autocomplete": "one-time-code"}]
+        seen = {}
+
+        def fake_eval(task_id, expr):
+            return {"success": True, "result": json.dumps(controls) if "querySelectorAll" in expr else "https://github.com/sessions/two-factor"}
+
+        def fake_secret(task_id, expr):
+            seen["expr"] = expr
+            return {"success": True, "result": json.dumps({"filled": 1})}
+
+        with patch("agent.vault_store.get_vault_store", return_value=store), \
+             patch.object(browser_vault_tool, "_focus_bound_origin", lambda *a, **k: None), \
+             patch.object(browser_vault_tool, "_eval_js", side_effect=fake_eval), \
+             patch.object(browser_vault_tool, "_eval_js_secret", side_effect=fake_secret):
+            out = json.loads(browser_vault_tool.browser_vault_enter_code(meta.id, task_id="otp-upgrade"))
+
+        assert out["success"] is True
+        assert out["source"] == "local"
+        assert re.search(r'"value": "\d{6}"', seen["expr"])
 
     def test_without_a_key_the_user_is_asked_and_split_boxes_get_one_digit_each(self, store):
         from agent.vault_backends import unlock as unlock_mod

@@ -639,7 +639,9 @@ _ROUTING_FILTER_DEFAULTS = (
 _NOUS_PROVIDERS = frozenset({"nous", "nous-portal", "nousresearch"})
 
 
-def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) -> Optional[list[dict[str, Any]]]:
+def _resolve_child_fallback_chain(
+    parent_agent, routing_cfg: Any, pinned: bool, *, allow_billing_fallback: bool = False,
+) -> Optional[list[dict[str, Any]]]:
     """Fallback chain for a child, owned by the same config block as its route.
 
     Pinned children (provider, endpoint or model override) never borrow the parent chain;
@@ -650,7 +652,7 @@ def _resolve_child_fallback_chain(parent_agent, routing_cfg: Any, pinned: bool) 
     return scoped_fallback_chain(
         getattr(parent_agent, "_fallback_chain", None),
         routing_cfg.get("fallback_providers") if isinstance(routing_cfg, dict) else None,
-        pinned=pinned, owner="delegation")
+        pinned=pinned and not allow_billing_fallback, owner="delegation")
 
 
 class ResolvedReasoning(NamedTuple):
@@ -759,6 +761,9 @@ def _resolve_child_runtime(
     child_reasoning = dict(child_reasoning) if isinstance(child_reasoning, dict) else child_reasoning
     route_config = delegation_cfg if routing_cfg is None else routing_cfg
     fallback_chain_owned = isinstance(route_config, dict) and route_config.get("fallback_providers") is not None
+    allow_billing_fallback = bool(
+        (route_config or {}).get("allow_billing_fallback", delegation_cfg.get("allow_billing_fallback", False))
+    )
     # The tool passes an authored route separately from its resolved model, so a
     # provider-only route's default model is not a pin. For direct callers without
     # an authored route, a supplied model is itself the explicit selection.
@@ -778,9 +783,11 @@ def _resolve_child_runtime(
         # this chain through the spare guards and lets the child return to the primary mid-turn.
         "model_pinned": model_pinned,
         "fallback_chain_owned": fallback_chain_owned,
+        "allow_billing_fallback": allow_billing_fallback,
         "fallback_model": _resolve_child_fallback_chain(
             parent_agent, route_config,
-            pinned=bool(model_pinned or override_provider or override_base_url or model)),
+            pinned=bool(model_pinned or override_provider or override_base_url or model),
+            allow_billing_fallback=allow_billing_fallback),
         "openrouter_min_coding_score": getattr(parent_agent, "openrouter_min_coding_score", None),
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},

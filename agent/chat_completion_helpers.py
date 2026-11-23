@@ -2286,10 +2286,20 @@ def try_activate_fallback(
         try:
             from agent.route_binding import bind_route_entry
             old_route = resolved_route(agent)
+            agent._billing_fallback_attempt = reason == FailoverReason.billing
             bound = bind_route_entry(agent, fb, fb_provider, fb_model)
+            agent._billing_fallback_attempt = False
             if bound is None:
                 logger.warning("Fallback to %s failed: provider not configured", fb_provider)
-                unavailable.add(fb_key)
+                from hermes_cli.fallback_config import same_fallback_model
+                pinned = getattr(agent, "_pinned_fallback_model", None)
+                pin_rejection = (
+                    isinstance(pinned, str)
+                    and pinned
+                    and not same_fallback_model(pinned, fb_model)
+                )
+                if not pin_rejection:
+                    unavailable.add(fb_key)
                 _release_spare_lease(agent, reservation)
                 continue
             old_model, old_provider = bound
@@ -2313,6 +2323,7 @@ def try_activate_fallback(
             record_fallback(from_provider=old_provider, to_provider=fb_provider, reason=reason)
             return True
         except Exception as e:
+            agent._billing_fallback_attempt = False
             if fb_provider == "nous":
                 unavailable.add(fb_key)
             if not reservation_committed:

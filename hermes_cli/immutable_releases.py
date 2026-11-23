@@ -1339,8 +1339,10 @@ def _execution_code_sha_pins(home: Path) -> set[Path]:
     """Keep releases referenced by the durable cron execution ledger.
 
     Detached cron workers import an immutable release and persist its ``code_sha``.
-    An execution can remain ``unknown`` after its owner disappears, so that row is
-    still a live code-generation pin until execution-ledger retention removes it.
+    Only rows that may still run pin a release. ``unknown`` stays a pin because its
+    owner may have disappeared mid-run, and NULL or unrecognized statuses pin so the
+    check fails closed. Finished rows (completed, failed, cancelled, missed) do not,
+    otherwise every release that ever ran a cron job would be kept forever.
     Read the ledger without acquiring a writer handle; an unreadable ledger must
     fail closed rather than allowing release deletion under uncertainty.
     """
@@ -1351,11 +1353,24 @@ def _execution_code_sha_pins(home: Path) -> set[Path]:
         with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True, timeout=2.0) as connection:
             connection.execute("PRAGMA busy_timeout=2000")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(executions)")}
+            if not columns:
+                # A ledger file without the executions table cannot prove no execution needs a release.
+                raise sqlite3.DatabaseError("missing executions table")
             if "code_sha" not in columns:
                 return set()
-            values = connection.execute(
-                "SELECT DISTINCT code_sha FROM executions WHERE code_sha IS NOT NULL"
-            ).fetchall()
+            if "status" in columns:
+                terminal = ("completed", "failed", "cancelled", "missed")
+                values = connection.execute(
+                    "SELECT DISTINCT code_sha FROM executions "
+                    "WHERE code_sha IS NOT NULL "
+                    "AND (status IS NULL OR status NOT IN (?, ?, ?, ?))",
+                    terminal,
+                ).fetchall()
+            else:
+                # A ledger without statuses cannot say which rows finished, so every row pins.
+                values = connection.execute(
+                    "SELECT DISTINCT code_sha FROM executions WHERE code_sha IS NOT NULL"
+                ).fetchall()
     except sqlite3.Error as exc:
         raise RuntimeError(f"cannot safely prune releases: unreadable cron execution ledger {database}: {exc}") from exc
     releases = (home / "releases").resolve()
@@ -1427,6 +1442,12 @@ def retain(home: Path, *, extra_pins: Iterable[Path] = (), rollback_count: int =
     removed = []
     for release in releases:
         if release.resolve() in keep:
+            continue
+        # Final authoritative recheck of execution-ledger and live-process pins
+        # immediately before delete. Closes the race with cron dispatch creating
+        # a new execution from a release after the initial snapshot (P1 review fix).
+        r = release.resolve()
+        if r in _live_process_pins(paths.home) or r in _execution_code_sha_pins(paths.home):
             continue
         shutil.rmtree(release)
         removed.append(release)
