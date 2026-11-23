@@ -475,7 +475,11 @@ def _shell_state_paths(task_id: Optional[str], env: Any) -> tuple[str, ...]:
             owner_env = env if index == 0 else _active_environments.get(_resolve_container_task_id(owner))
             if owner_env is None or not hasattr(owner_env, "_task_snapshot_path"):
                 return ()
-            paths.append(owner_env._task_snapshot_path(owner))
+            with _container_alias_lock:
+                owner_is_delegated = owner in _container_aliases
+            paths.append(
+                owner_env._task_snapshot_path(owner) if owner_is_delegated else owner_env._snapshot_path
+            )
     return tuple(paths)
 
 
