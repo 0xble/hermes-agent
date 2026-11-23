@@ -443,7 +443,8 @@ class SessionPersistenceMixin:
                             {'session_id': entry_data['session_id']})):
                         retired += 1
                         continue
-                    self._entries[key] = SessionEntry.from_dict(entry_data)
+                    entries = getattr(self, "_entries")
+                    entries[key] = SessionEntry.from_dict(entry_data)
                     imported += 1
                 except (ValueError, KeyError, TypeError) as e:
                     logger.warning("Skipping invalid session entry %r: %s", key, e)
@@ -589,7 +590,7 @@ class SessionPersistenceMixin:
                 continue  # loaded from fallback and deliberately removed
             elif current[key] == baseline[key]:
                 self._entries[key] = durable_entry  # unchanged fallback data yields to the DB copy
-        self._heal_missing_origins(self._entries.values())
+        self._heal_missing_origins(getattr(self, "_entries").values())
         self._routing_db_loaded = True
         self._routing_fallback_baseline = None
 
@@ -681,7 +682,8 @@ class SessionPersistenceMixin:
 
     def _save_sessions_json(self, data: dict[str, Any]) -> None:
         """Write the legacy sessions.json mirror of the routing index (atomic + fsync)."""
-        atomic_json_write(self.sessions_dir / "sessions.json", {"_README": _SESSIONS_JSON_README, **data}, mode=0o600)
+        path = getattr(self, "sessions_dir") / "sessions.json"
+        atomic_json_write(path, {"_README": _SESSIONS_JSON_README, **data}, mode=0o600)
 
     def _save_entries(self) -> None:
         """Snapshot latest state under ``_lock`` and persist after releasing it."""
@@ -707,6 +709,7 @@ class SessionPersistenceMixin:
             if (entry is None or getattr(entry, "incognito", False)
                     or is_incognito(getattr(entry, "session_id", None))):
                 return
+            getattr(self, "_mark_roster_changed_locked", lambda: None)()
             serialized = dict(entry_data) if entry_data is not None else entry.to_dict()
             # The O(n) full snapshot is deferred to the fallback branch.
             entry_json, revision = json.dumps(serialized), self._next_routing_generation_locked()
