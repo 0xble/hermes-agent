@@ -14,7 +14,7 @@ from unittest import mock
 import pytest
 
 import hermes_state
-import hermes_state_wal
+import sqlite_support as hermes_state_wal
 import hermes_state_common
 import hermes_state_schema
 from agent.session_activity import ActivityProvenance, build_activity_snapshot
