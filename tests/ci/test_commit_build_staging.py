@@ -17,7 +17,7 @@ from tests.ci.desktop_release_roles import (
     termux_builder, universal_assembler,
 )
 from tests.ci.test_desktop_release_tag_admission import _BASH, _child_env, _workflow
-from tests.scripts.test_release_r2 import r2_server as _r2_server  # noqa: F401 -- pytest fixture registration
+from tests.scripts.test_release_r2 import r2_server as r2_server  # noqa: PLC0414 -- the self-alias is load-bearing: it registers the pytest fixture and suppresses F811 for parameters named after it
 
 ROOT = Path(__file__).resolve().parents[2]
 
