@@ -74,6 +74,18 @@ def test_alias_wins_over_role_and_brings_only_its_own_fallbacks(cfg):
     assert route.report() == {"backend": "model_alias", "label": "fable"}
 
 
+def test_alias_fallback_chain_filters_other_models(cfg):
+    cfg["model_aliases"]["fable"]["fallback_providers"] = [
+        {"provider": "custom:claude-proxy-b", "model": "claude-fable-5-2"},
+        {"provider": "custom:other", "model": "other-model"},
+    ]
+    (route,), err = routes.resolve_task_routes([{"goal": "g", "model": "fable"}], {}, _parent())
+    assert err is None and route.error is None
+    assert route.routing_cfg["fallback_providers"] == [
+        {"provider": "custom:claude-proxy-b", "model": "claude-fable-5-2"}
+    ]
+
+
 def test_alias_without_a_chain_never_borrows_the_delegation_chain(cfg):
     (route,), _ = routes.resolve_task_routes([{"goal": "g", "model": "astra"}],
                                              {"fallback_providers": [{"provider": "x", "model": "y"}]}, _parent())

@@ -163,6 +163,11 @@ def _alias_route(index: int, task: Mapping[str, Any]) -> Optional[dict[str, Any]
                                    f"(model_aliases in config.yaml).")
     entry = _alias_entry(full, key)
     chain = entry.get("fallback_providers") if isinstance(entry, Mapping) else None
+    if isinstance(chain, list):
+        from hermes_cli.fallback_config import same_model_fallbacks
+        from hermes_cli.model_alias_runtime import resolve_model_alias
+        resolved_model = resolve_model_alias(key, full, required=True).model
+        chain = same_model_fallbacks(chain, resolved_model)
     # The bare alias key is the route's model: `_resolve_route` expands it, as for any stored alias, into the
     # entry's live model, provider and endpoint. The default effort is read here from the same entry as the chain,
     # because the alias resolver reads it only from `model_aliases`.
