@@ -63,7 +63,7 @@ def describe_holder_pid(pid: int) -> str:
     if argv is None and psutil is not None:
         try:
             argv = psutil.Process(pid).cmdline() or None
-        except Exception:  # health: allow BLE001 -- holder diagnostics fail closed on unavailable process data
+        except Exception:  # health: allow BLE001, S110 -- holder cleanup cannot mask the original result
             argv = None
     who = " ".join(" ".join([os.path.basename(argv[0]), *argv[1:]]).split())[:80] if argv else "command line unavailable"
     return f"PID {pid} ({who})"
@@ -673,9 +673,9 @@ def live_writer_holds_db(
         if probe is not None:
             try:
                 probe.execute("PRAGMA locking_mode=NORMAL")
-            except Exception:  # health: allow BLE001 -- holder diagnostics fail closed on unavailable process data
+            except Exception:  # health: allow BLE001, S110 -- holder cleanup cannot mask the original result
                 pass
             try:
                 probe.close()
-            except Exception:  # health: allow BLE001 -- holder diagnostics fail closed on unavailable process data
+            except Exception:  # health: allow BLE001, S110 -- holder cleanup cannot mask the original result
                 pass
