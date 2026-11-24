@@ -16,6 +16,7 @@ silently skip the route recovery contract.
 ## Source surfaces
 
 - `gateway/run_inbound.py`
+- `gateway/session_route_recovery.py`
 - `tests/gateway/test_native_admission_arrival_order.py`
 - `tests/gateway/test_stop_route_mount_thread.py`
 
