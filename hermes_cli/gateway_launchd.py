@@ -754,12 +754,36 @@ def _spawn_deferred_launchd_reload(
     return True
 
 
+def _retire_disabled_standby_launchd() -> bool:
+    """Retire a legacy standby definition when zero-cut handover is disabled."""
+    from gateway.config import is_zero_cut_handover_enabled
+    from hermes_cli.config import load_config_readonly
+    from hermes_cli.gateway_service_owner import definition_belongs_to_home
+    from hermes_cli.gateway_launchd_lifetime import _state
+
+    if is_zero_cut_handover_enabled(load_config_readonly()):
+        return False
+    _active, standby = get_launchd_slot_labels()
+    path = _gw().get_launchd_plist_path().with_name(f"{standby}.plist")
+    if not path.exists() or not definition_belongs_to_home(path, _gw().get_hermes_home(), "retire"):
+        return False
+    domain = _probe_launchd_domain_for_label(standby)
+    loaded, _pid = _state(subprocess.run, domain, standby)
+    if loaded:
+        subprocess.run(["launchctl", "bootout", f"{domain}/{standby}"], check=False,
+                       timeout=90, **_gw()._CAPTURE_TEXT)
+    path.unlink(missing_ok=True)
+    _gw()._append_launchd_reload_log(f"retired disabled standby definition {standby}")
+    return True
+
+
 def refresh_launchd_plist_if_needed() -> bool | str:
     """Rewrite the installed plist when the generated one differs, then bootout/bootstrap so launchd
     re-reads it immediately."""
+    retired_standby = _retire_disabled_standby_launchd()
     plist_path = _gw().get_launchd_plist_path()
     if not plist_path.exists() or _gw().launchd_plist_is_current():
-        return False
+        return retired_standby
     # Runs on every gateway start/restart: a plist pinning another home is another install's gateway.
     from hermes_cli.gateway_service_owner import definition_belongs_to_home
     if not definition_belongs_to_home(plist_path, _gw().get_hermes_home(), "rewrite"):
