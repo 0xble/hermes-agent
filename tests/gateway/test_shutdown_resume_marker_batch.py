@@ -106,7 +106,7 @@ async def test_pre_drain_marks_six_sessions_with_one_save_and_is_durable(tmp_pat
 
 @pytest.mark.asyncio
 async def test_timeout_remark_same_turn_is_noop_but_still_returns_owed_key(tmp_path):
-    from tests.gateway.test_restart_interrupted_note import NoteAdapter, _note_runner
+    from tests.gateway.test_restart_interrupted_note.test_core import NoteAdapter, _note_runner
 
     store = SessionStore(tmp_path / "sessions", GatewayConfig())
     source = _source(1)
