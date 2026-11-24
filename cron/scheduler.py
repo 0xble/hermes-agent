@@ -4205,75 +4205,21 @@ def _launch_external_cron_worker(job: dict) -> bool:
     # around one handoff disagree.
     deadline = time.monotonic() + HANDOFF_ADOPTION_GRACE_SECONDS
     note_dispatch_stage(job, "ack_wait_enter")
-    while time.monotonic() < deadline:
-        if ack_path.exists():
-            try:
-                acknowledgement = json.loads(ack_path.read_text(encoding="utf-8-sig"))
-            except Exception:
-                logger.exception(
-                    "Cron external worker %s published an unreadable acknowledgement; "
-                    "treating handoff as ownership-uncertain",
-                    execution_id,
-                )
-                return _wait_for_external_cron_worker(
-                    process,
-                    execution_id=execution_id,
-                    job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
-                    stderr_path=stderr_path,
-                    expected_fire_owner=expected_fire_owner,
-                    terminal_exit_grace_seconds=terminal_exit_grace_seconds,
-                    worker_hard_wall_deadline=worker_hard_wall_deadline,
-                )
-            finally:
-                ack_path.unlink(missing_ok=True)
-            if (
-                not isinstance(acknowledgement, dict)
-                or acknowledgement.get("execution_id") != execution_id
-            ):
-                logger.error(
-                    "Cron external worker acknowledgement mismatch for %s; "
-                    "treating handoff as ownership-uncertain",
-                    execution_id,
-                )
-                return _wait_for_external_cron_worker(
-                    process,
-                    execution_id=execution_id,
-                    job_id=job_id,
-                    handoff_files=(payload_path, stderr_path),
-                    stderr_path=stderr_path,
-                    expected_fire_owner=expected_fire_owner,
-                    terminal_exit_grace_seconds=terminal_exit_grace_seconds,
-                    worker_hard_wall_deadline=worker_hard_wall_deadline,
-                )
-            worker_hard_wall_deadline = time.monotonic() + hard_wall_seconds
-            acknowledged_deadline_value = acknowledgement.get("hard_wall_deadline")
-            if isinstance(acknowledged_deadline_value, (int, float)):
-                acknowledged_deadline = float(acknowledged_deadline_value)
-            else:
-                acknowledged_deadline = worker_hard_wall_deadline
-            # The watchdog arms before publishing this acknowledgement. Use its
-            # same monotonic deadline so the parent never extends the worker's
-            # lifetime merely because startup/ack polling took time.
-            worker_hard_wall_deadline = acknowledged_deadline
-            note_dispatch_stage(job, "acknowledged")
-            logger.info(
-                "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
-                job_id,
-                acknowledgement.get("pid"),
+
+    def _consume_acknowledgement() -> bool:
+        """Consume a published acknowledgement (even if discovered after the worker has
+        already exited). Factors the ack-handling block so the race re-check can reuse it
+        without duplication.
+        """
+        nonlocal worker_hard_wall_deadline
+        try:
+            acknowledgement = json.loads(ack_path.read_text(encoding="utf-8-sig"))
+        except Exception:
+            logger.exception(
+                "Cron external worker %s published an unreadable acknowledgement; "
+                "treating handoff as ownership-uncertain",
                 execution_id,
-                dispatch.mode,
             )
-            _record_external_cron_worker(
-                job_id,
-                acknowledgement.get("pid") or process.pid,
-                scope_isolated=dispatch.mode == "scoped",
-            )
-            with _running_lock, contextlib.suppress(TypeError, ValueError):
-                worker_pid = int(acknowledgement.get("pid") or process.pid)
-                if _external_worker_modes.get(worker_key) in {"scoped", "detached"} and worker_pid > 0:
-                    _restart_safe_external_worker_job_ids.add(worker_key)
-                    _restart_safe_waiter_job_ids.add(worker_key)
             return _wait_for_external_cron_worker(
                 process,
                 execution_id=execution_id,
@@ -4284,8 +4230,73 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 terminal_exit_grace_seconds=terminal_exit_grace_seconds,
                 worker_hard_wall_deadline=worker_hard_wall_deadline,
             )
+        finally:
+            ack_path.unlink(missing_ok=True)
+        if (
+            not isinstance(acknowledgement, dict)
+            or acknowledgement.get("execution_id") != execution_id
+        ):
+            logger.error(
+                "Cron external worker acknowledgement mismatch for %s; "
+                "treating handoff as ownership-uncertain",
+                execution_id,
+            )
+            return _wait_for_external_cron_worker(
+                process,
+                execution_id=execution_id,
+                job_id=job_id,
+                handoff_files=(payload_path, stderr_path),
+                stderr_path=stderr_path,
+                expected_fire_owner=expected_fire_owner,
+                terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+                worker_hard_wall_deadline=worker_hard_wall_deadline,
+            )
+        worker_hard_wall_deadline = time.monotonic() + hard_wall_seconds
+        acknowledged_deadline_value = acknowledgement.get("hard_wall_deadline")
+        if isinstance(acknowledged_deadline_value, (int, float)):
+            acknowledged_deadline = float(acknowledged_deadline_value)
+        else:
+            acknowledged_deadline = worker_hard_wall_deadline
+        # The watchdog arms before publishing this acknowledgement. Use its
+        # same monotonic deadline so the parent never extends the worker's
+        # lifetime merely because startup/ack polling took time.
+        worker_hard_wall_deadline = acknowledged_deadline
+        note_dispatch_stage(job, "acknowledged")
+        logger.info(
+            "Cron job '%s' handed to restart-safe worker pid=%s execution=%s dispatch=%s",
+            job_id,
+            acknowledgement.get("pid"),
+            execution_id,
+            dispatch.mode,
+        )
+        _record_external_cron_worker(
+            job_id,
+            acknowledgement.get("pid") or process.pid,
+            scope_isolated=dispatch.mode == "scoped",
+        )
+        with _running_lock, contextlib.suppress(TypeError, ValueError):
+            worker_pid = int(acknowledgement.get("pid") or process.pid)
+            if _external_worker_modes.get(worker_key) in {"scoped", "detached"} and worker_pid > 0:
+                _restart_safe_external_worker_job_ids.add(worker_key)
+                _restart_safe_waiter_job_ids.add(worker_key)
+        return _wait_for_external_cron_worker(
+            process,
+            execution_id=execution_id,
+            job_id=job_id,
+            handoff_files=(payload_path, stderr_path),
+            stderr_path=stderr_path,
+            expected_fire_owner=expected_fire_owner,
+            terminal_exit_grace_seconds=terminal_exit_grace_seconds,
+            worker_hard_wall_deadline=worker_hard_wall_deadline,
+        )
+
+    while time.monotonic() < deadline:
+        if ack_path.exists():
+            return _consume_acknowledgement()
         returncode = process.poll()
         if returncode is not None:
+            if ack_path.exists():
+                return _consume_acknowledgement()
             with _running_lock:
                 _restart_safe_waiter_job_ids.discard(worker_key)
                 _restart_safe_external_worker_job_ids.discard(worker_key)
