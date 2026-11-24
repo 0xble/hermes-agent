@@ -1307,7 +1307,6 @@ class GatewayTurnMixin(
                 loop_completion.carry_response(agent_result, event)
 
             await self._hmwa_stop_typing_for_turn(event, source)
-
             if not self._is_session_run_current(_quick_key, run_generation):
                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
                 return None
@@ -1318,6 +1317,7 @@ class GatewayTurnMixin(
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
                 loop_identity=getattr(event, "_loop_completion_identity", None),
+                internal=getattr(event, "internal", False),
             )
             response = self._usage_window_chat_wording(agent_result, self._hmwa_prepend_reasoning(agent_result, response, source, _intentional_silence))
             from gateway.response_filters import strip_trailing_loop_complete_marker
