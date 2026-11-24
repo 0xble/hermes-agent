@@ -881,7 +881,7 @@ async def _start_gateway_runtime(config: Optional[GatewayConfig] = None, replace
             runner = GatewayRunner(resolved_config)
             runner._client_owned = client_owned
         finally:
-            unpin_launch_store(_launch_store_pin)
+            await asyncio.to_thread(unpin_launch_store, _launch_store_pin)
         await initialize_gateway_runtime(runner)
         # Multiplex: swap the launch-home file handlers for per-profile routers so each profile's records
         # land in its own logs/. Must run after the runner resolved (possibly None) config and setup_logging.
