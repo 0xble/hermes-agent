@@ -155,7 +155,7 @@ def _register_test_instance(db: Any) -> None:
     if os.environ.get(_TEST_ISOLATION_MARKER_ENV):
         try:
             _test_instance_registry.add(db)
-        except Exception:  # pragma: no cover — registry must never break init
+        except Exception:  # health: allow BLE001, S110 -- registry teardown must never break initialization
             pass
 
 
