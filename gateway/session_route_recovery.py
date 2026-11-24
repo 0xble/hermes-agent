@@ -39,15 +39,27 @@ def _messaging_platform(label):
     return None if platform in (Platform.LOCAL, Platform.API_SERVER) else platform
 
 
-def _routed_entry(authority, sid, route):
-    """The routing entry that still names *sid* under *route*, else None."""
+def _route_snapshot(authority, sid, route):
+    """The current route entry, its valid match for *sid*, and whether it names another owner.
+
+    This is a blocking read and is called only while building the off-loop mount plan. The returned
+    route entry and version let the event-loop mount revalidate the snapshot without reacquiring the
+    storage lock there.
+    """
     store = authority.runner.session_store
     with store._lock:
         entry = store._entry_locked(route)
-    if (entry is None or entry.origin is None or entry.session_key != route
-            or authority.logical_owner(entry.session_id) != sid):
-        return None
-    return entry
+    owner = authority.logical_owner(entry.session_id) if entry is not None else None
+    routed = (
+        entry if entry is not None and entry.origin is not None and entry.session_key == route
+        and owner == sid else None
+    )
+    return entry, routed, entry is not None and owner != sid
+
+
+def _routed_entry(authority, sid, route):
+    """The routing entry that still names *sid* under *route*, else None."""
+    return _route_snapshot(authority, sid, route)[1]
 
 
 def _row_source(row, platform, profile):
@@ -89,8 +101,12 @@ def _row_entry(row, platform, route, profile):
 
 
 def _mount_plan(authority, sid):
-    """``(route, entry, routed)`` for a row a route or a messaging-platform row can stand for, else
-    None. Reads only: ``restore_routed_session`` mounts it, the stored picker lists it."""
+    """A read-only snapshot for mounting a row a route or messaging-platform row can stand for.
+
+    The route snapshot is consumed on the gateway loop, where it is reconciled against the store's
+    in-memory route version before publication. The row-derived entry is kept as the safe detached
+    fallback if the lane moves while this worker is reading storage.
+    """
     row = authority.db.get_session(sid)
     route = row.get('session_key') if row is not None else None
     platform = _messaging_platform(row['source']) if route else None
@@ -101,9 +117,38 @@ def _mount_plan(authority, sid):
     profile = store._named_profile_for_key(route)
     if profile != (registry.profile_name(authority) if registry is not None else None):
         return None
-    routed = _routed_entry(authority, sid, route)
-    entry = routed or _row_entry(row, platform, route, profile)
-    return None if entry is None else (route, entry, routed)
+    route_entry, routed, moved = _route_snapshot(authority, sid, route)
+    row_entry = _row_entry(row, platform, route, profile)
+    entry = routed or row_entry
+    return None if entry is None else {
+        'sid': sid,
+        'route': route,
+        'entry': entry,
+        'row_entry': row_entry,
+        'route_entry': route_entry,
+        'route_version': getattr(route_entry, '_route_version', None),
+        'moved': moved,
+    }
+
+
+def _reconcile_mount_plan(authority, plan):
+    """Reconcile a worker snapshot with route changes already published on the loop."""
+    store = authority.runner.session_store
+    route = plan['route']
+    current = store._entries.get(route)
+    expected = plan['route_entry']
+    same_snapshot = (
+        current is expected
+        or (current is not None and expected is not None
+            and current._route_version == plan['route_version'])
+    )
+    if same_snapshot:
+        return plan['entry'], plan['moved']
+    if current is None:
+        return plan['row_entry'], False
+    if current.session_id == plan['sid'] and current.origin is not None and current.session_key == route:
+        return current, False
+    return plan['row_entry'], True
 
 
 def restore_routed_session(authority, sid, *, plan=None):
@@ -114,16 +159,21 @@ def restore_routed_session(authority, sid, *, plan=None):
     plan = _mount_plan(authority, sid) if plan is None else plan
     if plan is None:
         return None
-    route, entry, routed = plan
+    entry, detached = _reconcile_mount_plan(authority, plan)
+    if entry is None:
+        return None
+    route = plan['route']
     authority._require_admission_open()
     # Re-pin the persisted receiving bot so delivery after a restart goes through it or nowhere,
     # never the default bot by heuristic (gateway/AGENTS.md § Identity survives the process).
     source = authority.runner._restored_source(entry)
     if sid not in authority.sessions:
         live = authority.sessions[sid] = LiveSession(source, route)
-        if routed is None and _names_another_conversation(authority, sid, route):
+        if detached:
             from gateway.session_detached import detach
-            detach(authority, live, sid)  # the lane moved past it: its turns stay off the chat
+            # The lane moved past it while the worker read storage, or had already moved before the
+            # snapshot. Its turns stay off the chat, even though publication remains on this loop.
+            detach(authority, live, sid)
     return SessionRef(authority.profile_id, sid)
 
 

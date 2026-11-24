@@ -136,7 +136,6 @@ async def _admit_outbox_event(runner, event, source):
         bind_turn(home, turn_id)
 
 
-_MOUNT_PLAN_UNSET = object()
 
 
 class GatewayInboundMixin(
@@ -157,9 +156,15 @@ class GatewayInboundMixin(
     def _hm_mounted_owner_mount_plan(self, authority: Any, sid: str):
         """Read the cold route's mount plan off-loop; publishing it remains an on-loop mutation."""
         from gateway.session_route_recovery import _mount_plan
-        return _mount_plan(authority, sid)
+        try:
+            return _mount_plan(authority, sid)
+        except Exception:
+            # A transient storage failure must not abort /stop or /new before it fences and settles
+            # the route's already committed rows. The caller keeps sid and skips cold mounting.
+            logger.debug("Could not read the mount plan for %s", sid, exc_info=True)
+            return None
 
-    def _hm_mounted_owner(self, authority, sid: Optional[str], _quick_key: str, *, plan=_MOUNT_PLAN_UNSET) -> Optional[str]:
+    def _hm_mounted_owner(self, authority, sid: Optional[str], _quick_key: str, *, plan) -> Optional[str]:
         """Mount the route's durable FIFO owner for /stop and /new on the gateway loop.
 
         Right after a restart startup recovery may not have mounted it yet, but its committed rows
@@ -169,9 +174,7 @@ class GatewayInboundMixin(
         if sid and sid not in authority.sessions:
             from gateway.session_route_recovery import restore_routed_session
             try:
-                if plan is _MOUNT_PLAN_UNSET:
-                    restore_routed_session(authority, sid)
-                elif plan is not None:
+                if plan is not None:
                     restore_routed_session(authority, sid, plan=plan)
             except Exception:
                 logger.debug("Could not mount %s for %s before stopping it", sid, _quick_key, exc_info=True)
@@ -1011,7 +1014,7 @@ class GatewayInboundMixin(
             plan = None
             if sid and sid not in authority.sessions:
                 plan = await run_store_call(self._hm_mounted_owner_mount_plan, authority, sid)
-            sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
+                sid = self._hm_mounted_owner(authority, sid, _quick_key, plan=plan)
         if not sid:
             if authority is not None:
                 # The chat's first input, and a command's turn, not committed yet never commit.

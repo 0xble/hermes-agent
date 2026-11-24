@@ -181,6 +181,24 @@ async def test_a_row_its_route_moved_past_mounts_from_its_own_origin(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_a_mount_plan_rechecks_a_lane_move_before_publishing(tmp_path):
+    """A lane switch during the worker read mounts the old row detached, never on the new chat."""
+    from gateway import session_route_recovery
+    from gateway.config import Platform
+
+    _seed(tmp_path, 'old', _source(chat_name='from-row'))
+    cold = await _cold(tmp_path)
+    plan = session_route_recovery._mount_plan(cold.authority, 'old')
+    successor = cold.store.get_or_create_session(_source(), force_new=True)
+    assert successor.session_id != 'old'
+
+    session_route_recovery.restore_routed_session(cold.authority, 'old', plan=plan)
+    live = cold.authority.sessions['old']
+    assert (live.route, live.source.platform, live.source.chat_id) == (
+        'agent:main:detached:old', Platform.TELEGRAM, '4242')
+
+
+@pytest.mark.asyncio
 async def test_an_entry_that_names_another_key_does_not_stand_for_the_row(tmp_path):
     _seed(tmp_path, 'lane-key', _source(chat_name='row'), entry_source=_source(chat_name='entry'),
           entry_key='agent:main:telegram:dm:elsewhere')

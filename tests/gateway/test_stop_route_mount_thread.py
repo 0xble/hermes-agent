@@ -53,3 +53,27 @@ async def test_stop_route_mount_keeps_authority_mutation_on_gateway_loop(monkeyp
         assert _rows(authority, owner) == [('A', 'terminal', 'cancelled'), ('B', 'terminal', 'cancelled')]
     finally:
         authority.db.close()
+
+
+@pytest.mark.asyncio
+async def test_stop_route_mount_plan_failure_still_fences_and_cancels(monkeypatch):
+    """A cold storage read failure must not skip the route's already committed cancellation."""
+    from gateway import session_route_recovery
+
+    runner, adapter = _setup(monkeypatch)
+    authority = await initialize_session_authority(runner, profile_id='default', instance_id='owner')
+    runner._wire_adapter_handlers(adapter)
+    source = adapter.build_source(chat_id='42', chat_type='dm', user_id='42')
+    route, owner = await _queue_rows(runner, authority, source, 'A', 'B')
+    authority.sessions.pop(owner)
+    before = authority.route_epoch(route)
+
+    def fail_plan(*args):
+        raise RuntimeError('database temporarily unavailable')
+
+    monkeypatch.setattr(session_route_recovery, '_mount_plan', fail_plan)
+    await runner._hm_stop_owner_turn(route)
+
+    assert authority.route_epoch(route) == before + 1
+    assert _rows(authority, owner) == [('A', 'queued', None), ('B', 'queued', None)]
+    authority.db.close()
