@@ -7,9 +7,7 @@ from unittest.mock import AsyncMock
 
 from gateway.platforms.base import SendResult
 
-# Import helpers and fixtures from the parent test module (still the canonical location
-# for shared test utilities in this split).
-from ..test_restart_interrupted_note import (
+from .test_core import (
     NoteAdapter,
     _pending_store,
     _configure_real_final_delivery,
