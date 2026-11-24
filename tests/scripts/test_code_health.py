@@ -237,3 +237,104 @@ def test_crlf_blob_measures_like_lf(tmp_path, monkeypatch):
         results[name] = sorted((f.rule, f.scope, f.line, f.allowed_reason) for f in findings)
     assert results["lf"] == [("BLE001", "other", 4, "boundary"), ("S110", "other", 4, "boundary")]
     assert results["crlf"] == results["lf"]
+
+
+# --- a blobless clone hydrates a measured snapshot in one fetch ---
+
+
+def _blobless_clone(tmp_path: Path, files: dict[str, str | None]) -> tuple[Path, str]:
+    src, _ = _repo(tmp_path / "src")
+    head = _commit(src, files)
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(src), str(bare)], check=True, timeout=60)
+    _git(bare, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout", bare.as_uri(), str(clone)],
+                   check=True, timeout=60)
+    for rel in ("pyproject.toml", "scripts/ci/profile_scope_patterns.json"):
+        (clone / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src / rel, clone / rel)
+    return clone, head
+
+
+def _pack_count(clone: Path) -> int:
+    return len(list((clone / ".git" / "objects" / "pack").glob("*.pack")))
+
+
+def _missing(clone: Path, head: str, paths: list[str]) -> set[str]:
+    """Paths whose blob is absent locally, probed without triggering a lazy fetch."""
+    gone = set()
+    for path in paths:
+        out = _git(clone, "--literal-pathspecs", "rev-list", "--objects", "--no-walk", "--missing=print",
+                   f"{head}^{{tree}}", "--", path)
+        if any(line.startswith("?") for line in out.splitlines()):
+            gone.add(path)
+    return gone
+
+
+def _fail_fetch(monkeypatch, error: Exception) -> list[list[str]]:
+    real, fetches = subprocess.run, []
+
+    def run(cmd, *args, **kwargs):
+        if "fetch" in cmd and "--stdin" in cmd:
+            fetches.append(cmd)
+            raise error
+        return real(cmd, *args, **kwargs)
+
+    monkeypatch.setattr(gitio.subprocess, "run", run)
+    return fetches
+
+
+def test_measure_in_blobless_clone_fetches_snapshot_blobs_in_one_pack(tmp_path):
+    """Per-file reads lazily fetched one promisor pack per blob into the shared store."""
+    names = [f"pkg/m{i}.py" for i in range(6)]
+    clone, head = _blobless_clone(tmp_path, {name: f"X = {i}\n" for i, name in enumerate(names)})
+    before = _pack_count(clone)
+
+    measured = Measurer(clone, resolve_ruff(clone), known_env=set()).measure(head, names)
+
+    assert sorted(measured) == names
+    assert _pack_count(clone) - before == 1
+
+
+def test_prefetch_hydrates_exactly_the_requested_paths(tmp_path):
+    """Nested dirs and glob characters are literal paths; unrequested siblings stay absent."""
+    wanted = ["pkg/sub/deep/a.py", "pkg/[x]*.py", "pkg/sp ace.py"]
+    others = ["pkg/sub/deep/b.py", "pkg/xy.py", "pkg/sub/c.py"]
+    clone, head = _blobless_clone(tmp_path, {p: f"X = {i}\n" for i, p in enumerate(wanted + others)})
+    assert _missing(clone, head, wanted + others) == set(wanted + others)
+
+    gitio.prefetch_blobs(clone, head, wanted)
+
+    assert _missing(clone, head, wanted + others) == set(others)
+
+
+def test_prefetch_probe_does_not_lazily_fetch(tmp_path, monkeypatch):
+    """With the batched fetch suppressed, the missing-blob probe alone adds no pack."""
+    names = [f"pkg/m{i}.py" for i in range(3)]
+    clone, head = _blobless_clone(tmp_path, {name: f"X = {i}\n" for i, name in enumerate(names)})
+    before = _pack_count(clone)
+    fetches = _fail_fetch(monkeypatch, OSError("fetch suppressed"))
+
+    gitio.prefetch_blobs(clone, head, names)
+
+    assert len(fetches) == 1
+    assert _pack_count(clone) == before
+    assert _missing(clone, head, names) == set(names)
+
+
+@pytest.mark.parametrize("error", [subprocess.TimeoutExpired(["git", "fetch"], 120), OSError("no git")])
+def test_failed_prefetch_keeps_measurement_unchanged(tmp_path, monkeypatch, error):
+    """A failed batch only loses batching: per-file reads still fetch and measure the same."""
+    names = ["pkg/a.py", "pkg/sub/b.py"]
+    files: dict[str, str | None] = {"pkg/a.py": "import os\nX = os.environ['UNKNOWN_KEY']\n", "pkg/sub/b.py": "Y = 1\n"}
+    ok_clone, ok_head = _blobless_clone(tmp_path / "ok", files)
+    expected = Measurer(ok_clone, resolve_ruff(ok_clone), known_env=set()).measure(ok_head, names)
+    clone, head = _blobless_clone(tmp_path / "failed", files)
+    fetches = _fail_fetch(monkeypatch, error)
+
+    measured = Measurer(clone, resolve_ruff(clone), known_env=set()).measure(head, names)
+
+    assert len(fetches) == 1
+    assert measured == expected
+    assert _missing(clone, head, names) == set()
