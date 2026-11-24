@@ -6,7 +6,6 @@ through the same functions so base and head are measured identically.
 
 from __future__ import annotations
 
-import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -106,19 +105,12 @@ def prefetch_blobs(repo: Path, tree: str, paths: list[str]) -> None:
     """
     if not paths or not git(repo, "config", "--get", "remote.origin.partialclonefilter", check=False).strip():
         return
-    listing = git(repo, "--literal-pathspecs", "ls-tree", "-r", "-z", tree, "--", *paths, check=False)
-    oids = []
-    for record in listing.split("\0"):
-        meta = record.partition("\t")[0].split(" ")  # "<mode> <type> <oid>\t<path>"
-        if len(meta) == 3 and meta[1] == "blob":
-            oids.append(meta[2])
-    if not oids:
-        return
-    probe = subprocess.run(  # GIT_NO_LAZY_FETCH: the probe must not fetch each blob itself
-        ["git", "cat-file", "--batch-check"], cwd=repo, env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
-        input="\n".join(oids) + "\n", capture_output=True, text=True, timeout=60, check=False,
-    )
-    missing = [line.split()[0] for line in probe.stdout.splitlines() if line.endswith(" missing")]
+    # rev-list --missing=print names absent blobs ("?<oid>") without lazily fetching them,
+    # on every git version (GIT_NO_LAZY_FETCH only exists from 2.45; CI ships older git).
+    # Walk the tree object, not the commit: a commit walk with paths skips untouched commits.
+    listing = git(repo, "--literal-pathspecs", "rev-list", "--objects", "--no-walk", "--missing=print",
+                  f"{tree}^{{tree}}", "--", *paths, check=False)
+    missing = [line[1:] for line in listing.splitlines() if line.startswith("?")]
     if missing:
         subprocess.run(  # same single-fetch pattern as scripts/ci/prefetch_tree.py
             ["git", "-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head",
