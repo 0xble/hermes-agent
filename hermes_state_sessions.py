@@ -402,7 +402,7 @@ class SessionSessionsMixin:
         sidebar even though its transcript is intact (#99222). Stores outside the profile tree (explicit
         ``db_path`` in tests, ad-hoc copies) derive nothing and keep NULL — never guess.
         """
-        from hermes_state_worker_lifecycle import insert_session_row_in_transaction
+        from persistence.sqlite.conversation._store.worker_lifecycle import insert_session_row_in_transaction
         params = dict(session_id=session_id, source=source, model=model, model_config=model_config,
                       system_prompt=system_prompt, user_id=user_id, session_key=session_key,
                       chat_id=chat_id, chat_type=chat_type, thread_id=thread_id,
