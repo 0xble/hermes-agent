@@ -103,7 +103,16 @@ def prefetch_blobs(repo: Path, tree: str, paths: list[str]) -> None:
     promisor pack per file in the shared object store. Any failure here only loses
     the batching: the per-file reads still fetch what they need.
     """
-    if not paths or not git(repo, "config", "--get", "remote.origin.partialclonefilter", check=False).strip():
+    if not paths:
+        return
+    try:
+        _prefetch_missing(repo, tree, paths)
+    except (subprocess.TimeoutExpired, OSError):
+        pass  # only batching is lost; read_file still fetches and reports each blob itself
+
+
+def _prefetch_missing(repo: Path, tree: str, paths: list[str]) -> None:
+    if not git(repo, "config", "--get", "remote.origin.partialclonefilter", check=False).strip():
         return
     # rev-list --missing=print names absent blobs ("?<oid>") without lazily fetching them,
     # on every git version (GIT_NO_LAZY_FETCH only exists from 2.45; CI ships older git).
