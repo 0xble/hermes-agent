@@ -216,6 +216,7 @@ def _build_child_agent(
     override_provider: Optional[str] = None,
     override_base_url: Optional[str] = None,
     override_api_key: Optional[str] = None,
+    prevent_parent_api_key: bool = False,
     override_api_mode: Optional[str] = None,
     override_request_overrides: Optional[dict[str, Any]] = None,
 
@@ -284,7 +285,8 @@ def _build_child_agent(
         rt = _resolve_child_runtime(
             parent_agent, delegation_cfg if reasoning_cfg is None else reasoning_cfg, parent_api_key,
             model=model, override_provider=override_provider,
-            override_base_url=override_base_url, override_api_key=override_api_key, override_api_mode=override_api_mode,
+            override_base_url=override_base_url, override_api_key=override_api_key,
+            prevent_parent_api_key=prevent_parent_api_key, override_api_mode=override_api_mode,
             override_acp_command=override_acp_command,
             override_acp_args=override_acp_args,
             routing_cfg=routing_cfg, override_reasoning_effort=override_reasoning_effort,
@@ -508,7 +510,8 @@ def _credential_overrides(creds: dict[str, Any], routing_cfg: dict[str, Any]) ->
     """``_build_child_agent`` override kwargs for a resolved credential bundle (delegate_task and the lifecycle API)."""
     return {
         "override_provider": creds["provider"], "override_base_url": creds["base_url"],
-        "override_api_key": creds["api_key"], "override_api_mode": creds["api_mode"],
+        "override_api_key": creds["api_key"], "prevent_parent_api_key": creds.get("no_parent_api_key", False),
+        "override_api_mode": creds["api_mode"],
         "override_request_overrides": creds.get("request_overrides"),
         "override_acp_command": creds.get("command"),
         "override_acp_args": creds.get("args"),
@@ -883,11 +886,12 @@ def _build_dynamic_schema_overrides() -> dict:
 
     # The active delegation provider's per-task parameters and guidance (delegation.backend; none for the
     # built-in default). Built from config with the rest of the definition, never per turn.
-    from tools.delegate_tool_routes import schema_extension
+    from tools.delegate_tool_routes import core_task_parameters, schema_extension
     extra_params, addendum = schema_extension(delegate_tool_config._load_config())
-    if extra_params:
-        tasks = overrides_params["properties"]["tasks"]
-        tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **extra_params}}
+    # Core's explicit per-task model alias and reasoning effort come first, then the backend's (e.g. a role `option`).
+    extra_params = {**core_task_parameters(), **extra_params}
+    tasks = overrides_params["properties"]["tasks"]
+    tasks["items"] = {**tasks["items"], "properties": {**tasks["items"]["properties"], **extra_params}}
     description = _build_top_level_description(independent_completions=independent_completions)
     return {
         "description": f"{description}\n{addendum}" if addendum else description,

@@ -846,6 +846,7 @@ class GatewayTurnMixin(GatewayTurnExecutionMixin, GatewayAttendedMixin, GatewayL
                 persist_user_display_kind=prepared.persist_user_display_kind,
                 reply_expected=event.reply_expected,
                 loop_identity=getattr(event, "_loop_completion_identity", None),
+                internal=getattr(event, "internal", False),
             )
             if _intentional_silence:
                 self._hmwa_pause_typing_after_silence(event, source)

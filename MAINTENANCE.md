@@ -228,6 +228,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Attended model switching | Route genuine user activity to the configured attended model while preserving the default route when unset | Attended model configuration, activity clocks, model routing, or attended turn transitions | [Attended model switching](maintenance/attended-model-switching.md) |
 | First-reply latency metrics | Correlate genuine receipt with the first confirmed assistant text without sharing clocks across turns | Gateway receipt, stream acknowledgements, final delivery, or responsiveness log-contract changes; load attended activity and preview crash ownership before moving those boundaries | [First-reply latency metrics](maintenance/reply-latency-metrics.md) |
 | Dynamic model aliases | Persist upstream alias names and resolve them per request | Alias migration, topics, cron or plugin routes | [Dynamic aliases](maintenance/dynamic-model-aliases.md) |
+| Explicit delegation model alias | Per-task `model` alias (explicit requests only) and `reasoning_effort` on delegate_task; roles stay the default | delegate_task schema, task routing, alias or effort precedence | [Explicit delegation model alias](maintenance/delegate-model-alias.md) |
 | Explicit model fallback | Explicit model pins retry only the same model; fallback results and logs name the request, served model and reason | Session and delegation routing or fallback reporting changes | [Explicit model fallback](maintenance/explicit-model-fallback.md) |
 | Retired model presets | Historical retirement of preset expansion and Custom Subagents | Reviewing old preset trailers | [Retired presets](maintenance/model-presets.md) |
 | Session reasoning persistence | Persist session `/reasoning` picks in the routing entry so a gateway restart keeps them, like `/model` pins | Session reasoning override storage, rehydration, or conversation-boundary clears | [Session reasoning persistence](maintenance/session-reasoning-persistence.md) |
@@ -250,6 +251,7 @@ as `0xble/hermes-agent-archived`; its history is not the replacement's baseline.
 | Slack progress card recovery | Retry transient native updates without duplicate ambiguous starts or raw executable previews, within the shared outbound budget | Native task-card publication, retry disposition, fallback titles, or Slack SDK transport admission change | [Slack progress card recovery](maintenance/slack-progress-card-recovery.md) |
 | Slack status protocols | Preserve legacy phrases alongside transition-only native processing/active sessions and successor-safe Stop | Slack status/title calls, native Stop, or upstream Agent Sessions changes, also load thread status continuity | [Slack status protocols](maintenance/slack-status-legacy.md) |
 | Slack thread cascade delete | Delete tombstoned owner-home IM threads using each reply author's credential | Slack edits, tombstones, or owner-DM deletion changes | [Slack thread cascade delete](maintenance/slack-thread-cascade-delete.md) |
+| Slack top-level file shares | Preserve documents delivered through Slack's `file_shared` fallback in top-level DMs | Slack file events, inbound media caching, or DM attachment regressions | [Slack top-level file shares](maintenance/slack-top-level-file-share.md) |
 | Slack HEIC and bold inline code | Transcode recognised non-fast-path rasters to PNG, report Slack access failures only for sign-in HTML or 401/403/404, and keep emphasis around inline code | Inbound image caching, Slack attachment failure wording, or the Block Kit inline parser | [Slack HEIC and bold inline code](maintenance/slack-heic-bold-code.md) |
 | Slack DM seed off the loop | Prime the DM session store in a tracked worker thread so the Socket Mode ack never waits on it | `_seed_dm_session` or the Slack `app_home_opened` and assistant thread lifecycle handlers | [Slack DM seed off the loop](maintenance/slack-seed-off-loop.md) |
 | Slack API human users on bot-stamped posts | Allowlisted users' user-token posts are human despite the app's `bot_id`/`bot_profile`/`app_id` stamps, while Hermes's own bot user never is | `_event_declares_bot_sender`, `api_human_users`, or Slack bot-sender admission changes | [Slack API human users on bot-stamped posts](maintenance/slack-api-human-users-stamped.md) |
@@ -598,6 +600,18 @@ row:
 | Updater external supervisor sweep | Protect newly spawned supervised gateways while draining pre-existing processes for supervisor hand-back | Update restart sweeps, gateway PID snapshots, launchd or external-supervisor ownership changes; also load runtime ownership | [Updater external supervisor sweep](maintenance/updater-external-supervisor-sweep.md) |
 | Internal recovered follow-up retirement | Preserve, decline, visibly note, and quarantine shutdown follow-ups when identity is missing or uncertain; retire durable recovered inputs without replay | Shutdown follow-up spooling, restart recovery admission/retirement, or durable recovered-turn failure handling | [Internal recovered follow-up retirement](maintenance/internal-followup-retirement.md) |
 
+## Active patch record: bounded temporary-path literal scan
+
+Fork patch identity: `bounded-tmp-literals`.
+
+- **Load when:** changing the temporary-path literal scanner, its Git/ignore traversal, or its regression tests.
+- **Behavior:** Enumerate tracked source entries through Git and prune ignored directories before walking, so the scanner does not materialize every ignored artifact path in memory. Preserve the existing source scope, baseline accounting, and literal-detection rules.
+- **Source surfaces:** `scripts/check_no_tmp_literals.py` and `tests/scripts/test_check_no_tmp_literals.py`.
+- **Focused regression:** `scripts/run_tests.sh tests/scripts/test_check_no_tmp_literals.py`.
+- **Upstream status:** Fork-only bounded-memory repair for the ignored-file scan; no equivalent upstream fix has been established.
+- **Retirement:** Remove when upstream bounds the scanner's ignored-file traversal without changing its detection contract.
+- **Rollback:** Revert the commit carrying `Fork-Patch: bounded-tmp-literals`.
+
 ## Active patch record: internal recovered follow-up retirement
 
 Fork patch identity: `internal-followup-retirement`.
@@ -628,6 +642,18 @@ Fork-Patch: exa-direct-extract.
 - **Focused regression:** `tests/tools/test_web_extract_provider_shapes.py` exercises the real Exa/Parallel/Tavily/Firecrawl/Keenable/Perplexity adapters, all four keyless-ring vendors and rescue with fake transports; `tests/plugins/test_web_exa_extract_identity.py`, `tests/tools/test_web_extract_alignment.py`, `tests/tools/test_web_extract_accounting.py`, `tests/tools/test_web_extract_direct_policy.py`, `tests/tools/test_web_extract_direct.py`, and web extraction/cache/provider regressions.
 - **Retirement:** Remove when a released upstream provides equivalent bounded direct HTML extraction with conservative content acceptance and truthful fallback attribution.
 - **Rollback:** Revert the commit carrying `Fork-Patch: exa-direct-extract`, preserving the pre-existing plain-file and local-docs route.
+
+## Active patch record: gateway config reparse CPU
+
+Fork patch identity: `gateway-reparse-cpu`.
+
+- **Load when:** changing gateway config or cron job-store read/write caching, cache signatures, lock-free cache hits, or their regressions.
+- **Behavior:** Reuse parsed config YAML and unchanged cron job-store data when file signatures are stable, while invalidating on atomic replacement, preserving secret-scope expansion, caller isolation, race safety, and semantic writes.
+- **Source surfaces:** `hermes_cli/config.py`, `hermes_cli/config_cache.py`, `cron/jobs.py`, `tests/hermes_cli/test_config_cache_signature.py`, `tests/cron/test_jobs_cache.py`, and related cron/config tests.
+- **Contract tests:** `tests/hermes_cli/test_config_cache_signature.py`, `tests/cron/test_jobs_cache.py`.
+- **Upstream status:** Fork-only gateway CPU repair; no equivalent upstream fix has been established.
+- **Retirement:** Remove when upstream provides equivalent signature-aware config and cron-store caching with the same invalidation and isolation contract.
+- **Rollback:** Revert the commits carrying `Fork-Patch: gateway-reparse-cpu`.
 
 ## Update
 

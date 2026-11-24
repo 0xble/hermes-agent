@@ -60,6 +60,16 @@ def interrupt_issuer(agent) -> Optional[str]:
     return str(reason).strip().replace(" ", "_")
 
 
+def stamp_interrupt_result(agent, result: dict, interrupted: bool) -> None:
+    """Copy the interrupt cause into the finalized result, including message-less system stops."""
+    if not interrupted:
+        return
+    if agent._interrupt_message:
+        result["interrupt_message"] = agent._interrupt_message
+    if issuer := interrupt_issuer(agent):
+        result["interrupt_source"] = issuer
+
+
 def interrupt_skip_wording(agent) -> str:
     """Reason a tool call was skipped/cancelled, in words safe for tool output.
 
