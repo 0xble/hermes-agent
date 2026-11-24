@@ -97,139 +97,55 @@ def changed_files(repo: Path, base: str, head: str | None) -> list[Change]:
     return changes
 
 
-def _is_partial_clone(repo: Path) -> bool:
-    """True when this is a blob:none partial clone (prefetch before batch reads)."""
-    out = git(repo, "config", "--get", "remote.origin.partialclonefilter", check=False).strip()
-    return bool(out)
+def prefetch_blobs(repo: Path, tree: str, paths: list[str]) -> None:
+    """Hydrate a blobless clone's missing blobs for ``paths`` in one fetch.
 
-
-def _ensure_blobs(repo: Path, tree: str, paths: list[str]) -> None:
-    """For partial clones only: list blob OIDs for the paths via ls-tree, identify
-    missing ones via cat-file --batch-check, then one `git fetch --stdin` (or backfill)
-    to avoid N per-file lazy fetches that each create a promisor pack.
+    Without this, each ``git show`` below lazily fetches its own blob and leaves one
+    promisor pack per file in the shared object store. Any failure here only loses
+    the batching: the per-file reads still fetch what they need.
     """
-    if not paths or not _is_partial_clone(repo):
+    if not paths or not git(repo, "config", "--get", "remote.origin.partialclonefilter", check=False).strip():
         return
-    # Tree entries carry blob OIDs even when the blobs themselves are absent.
-    # Each record is "<mode> <type> <oid>\t<path>".
-    ls_out = git(repo, "ls-tree", "-r", "-z", tree, "--", *paths, check=False)
-    oids: list[str] = []
-    for part in ls_out.split("\0"):
-        meta, _, _path = part.partition("\t")
-        fields = meta.split(" ")
-        if len(fields) == 3 and fields[1] == "blob":
-            oids.append(fields[2])
+    listing = git(repo, "--literal-pathspecs", "ls-tree", "-r", "-z", tree, "--", *paths, check=False)
+    oids = []
+    for record in listing.split("\0"):
+        meta = record.partition("\t")[0].split(" ")  # "<mode> <type> <oid>\t<path>"
+        if len(meta) == 3 and meta[1] == "blob":
+            oids.append(meta[2])
     if not oids:
         return
-    # GIT_NO_LAZY_FETCH stops batch-check from fetching each absent blob on its own
-    # (one promisor pack per blob), which is exactly what this prefetch replaces.
-    check_proc = subprocess.run(
-        ["git", "cat-file", "--batch-check"],
-        cwd=repo,
-        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
-        input="\n".join(oids) + "\n",
-        capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=60,
-        check=False,
+    probe = subprocess.run(  # GIT_NO_LAZY_FETCH: the probe must not fetch each blob itself
+        ["git", "cat-file", "--batch-check"], cwd=repo, env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
+        input="\n".join(oids) + "\n", capture_output=True, text=True, timeout=60, check=False,
     )
-    missing_oids = [line.split()[0] for line in check_proc.stdout.splitlines() if line.endswith(" missing")]
-    if not missing_oids:
-        return
-    # one batched fetch of the missing blob OIDs (same pattern as scripts/ci/prefetch_tree.py)
-    input_oids = "\n".join(missing_oids) + "\n"
-    subprocess.run(
-        [
-            "git",
-            "-c",
-            "fetch.negotiationAlgorithm=noop",
-            "fetch",
-            "origin",
-            "--no-tags",
-            "--no-write-fetch-head",
-            "--filter=blob:none",
-            "--stdin",
-        ],
-        cwd=repo,
-        input=input_oids,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        timeout=120,
-        check=False,
-    )
-
-
-def read_files(repo: Path, tree: str | None, paths: list[str]) -> dict[str, str | None]:
-    """Batch version: one cat-file --batch (and optional one prefetch) for all paths.
-    Returns dict path -> content or None (exactly as single read_file would).
-    Handles binary via size, missing lines, utf-8-sig decode with errors=replace.
-    """
-    if tree is None:
-        result: dict[str, str | None] = {}
-        for path in paths:
-            try:
-                result[path] = (repo / path).read_text(encoding="utf-8-sig", errors="replace")
-            except (FileNotFoundError, IsADirectoryError, PermissionError, OSError):
-                result[path] = None
-        return result
-    if not paths:
-        return {}
-    _ensure_blobs(repo, tree, paths)
-    specs = [f"{tree}:{p}" for p in paths]
-    proc = subprocess.run(
-        ["git", "cat-file", "--batch"],
-        cwd=repo,
-        input=("\n".join(specs) + "\n").encode("utf-8"),
-        capture_output=True,
-        timeout=120,
-        check=False,
-    )
-    stdout = proc.stdout  # bytes for binary safety
-    result = {}
-    idx = 0
-    spec_idx = 0
-    while idx < len(stdout) and spec_idx < len(paths):
-        nl_pos = stdout.find(b"\n", idx)
-        if nl_pos == -1:
-            break
-        header = stdout[idx:nl_pos].decode("utf-8", errors="replace")
-        idx = nl_pos + 1
-        if header.endswith(" missing"):
-            result[paths[spec_idx]] = None
-            spec_idx += 1
-            continue
-        parts = header.split()
-        if len(parts) != 3:
-            result[paths[spec_idx]] = None
-            spec_idx += 1
-            continue
-        _oid, typ, size_str = parts
-        try:
-            size = int(size_str)
-        except ValueError:
-            size = 0
-        content = stdout[idx : idx + size]
-        idx += size
-        if idx < len(stdout) and stdout[idx : idx + 1] == b"\n":
-            idx += 1
-        path = paths[spec_idx]
-        if typ == "blob":
-            result[path] = content.decode("utf-8-sig", errors="replace")
-        else:
-            result[path] = None
-        spec_idx += 1
-    for p in paths:
-        if p not in result:
-            result[p] = None
-    return result
+    missing = [line.split()[0] for line in probe.stdout.splitlines() if line.endswith(" missing")]
+    if missing:
+        subprocess.run(  # same single-fetch pattern as scripts/ci/prefetch_tree.py
+            ["git", "-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head",
+             "--recurse-submodules=no", "--filter=blob:none", "--stdin", "origin"],
+            cwd=repo, input="\n".join(missing) + "\n", capture_output=True, text=True, timeout=120,
+            check=False,
+        )
 
 
 def read_file(repo: Path, tree: str | None, path: str) -> str | None:
-    """Unchanged public signature. Delegates to batched read_files for the single path."""
-    return read_files(repo, tree, [path]).get(path)
+    if tree is None:
+        try:
+            return (repo / path).read_text(encoding="utf-8-sig", errors="replace")
+        except (FileNotFoundError, IsADirectoryError):
+            return None
+    proc = subprocess.run(
+        ["git", "show", f"{tree}:{path}"],
+        cwd=repo,
+        capture_output=True,
+        stdin=subprocess.DEVNULL,
+        timeout=60,
+        check=False,
+    )
+    if proc.returncode != 0:
+        return None
+    # Same decoding as the working-tree read: a BOM must not make the two sides disagree.
+    return proc.stdout.decode("utf-8-sig", errors="replace")
 
 
 def tracked_files(repo: Path, tree: str | None) -> list[str]:

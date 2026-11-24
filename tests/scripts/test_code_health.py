@@ -239,112 +239,27 @@ def test_crlf_blob_measures_like_lf(tmp_path, monkeypatch):
     assert results["crlf"] == results["lf"]
 
 
-# --- focused tests for batched gitio reads (no per-file git show, handles BOM/binary/missing) ---
+# --- a blobless clone hydrates a measured snapshot in one fetch ---
 
 
-def test_read_files_batch_equals_old_git_show_and_handles_special_cases(tmp_path):
-    """Real temp git repo with BOM file, binary file, missing path; batched results == old per-file behavior."""
-    repo = tmp_path / "r"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    # BOM file (utf-8-sig must strip BOM on both sides)
-    bom_content = "# BOM test\nprint(1)\n"
-    (repo / "bom.py").write_text(bom_content, encoding="utf-8-sig")
-    # binary file (non-utf8 bytes -> replace chars, same as before)
-    bin_content = b"\x00\x01\x02\xff\xfe binary\x00"
-    (repo / "bin.dat").write_bytes(bin_content)
-    # normal file
-    (repo / "normal.py").write_text("print('ok')\n", encoding="utf-8")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "init")
-    tree = _git(repo, "rev-parse", "HEAD")
-
-    # old per-file way (simulated)
-    old_results = {}
-    for p in ["bom.py", "bin.dat", "normal.py", "missing.txt"]:
-        # simulate old read_file
-        if p == "missing.txt":
-            old_results[p] = None
-        else:
-            proc = subprocess.run(["git", "show", f"{tree}:{p}"], cwd=repo, capture_output=True, check=False)
-            if proc.returncode != 0:
-                old_results[p] = None
-            else:
-                old_results[p] = proc.stdout.decode("utf-8-sig", errors="replace")
-
-    # new batched
-    from scripts.code_health.gitio import read_files
-    new_results = read_files(repo, tree, ["bom.py", "bin.dat", "normal.py", "missing.txt"])
-
-    assert new_results == old_results
-    bom = new_results.get("bom.py")
-    assert bom is not None and bom.startswith("# BOM test")  # BOM stripped
-    binr = new_results.get("bin.dat")
-    assert binr is not None and ("\ufffd" in binr or "\x00" not in binr)  # replaced
-    assert new_results["missing.txt"] is None
-
-
-def test_read_files_spawns_one_subprocess_per_batch_not_per_file(tmp_path, monkeypatch):
-    """Count subprocess.run calls: batch of N files spawns O(1) git cat-file (not N)."""
-    repo = tmp_path / "r2"
-    repo.mkdir()
-    _git(repo, "init", "-q", "-b", "main")
-    _git(repo, "config", "user.email", "t@example.com")
-    _git(repo, "config", "user.name", "t")
-    for i in range(5):
-        (repo / f"f{i}.py").write_text(f"print({i})\n")
-    _git(repo, "add", "-A")
-    _git(repo, "commit", "-q", "-m", "init")
-    tree = _git(repo, "rev-parse", "HEAD")
-
-    call_count = {"n": 0}
-    orig_run = subprocess.run
-
-    def counting_run(*a, **k):
-        if a and isinstance(a[0], list) and a[0] and a[0][0] == "git":
-            if any(x in a[0] for x in ("cat-file", "show", "ls-tree")):
-                call_count["n"] += 1
-        return orig_run(*a, **k)
-
-    with monkeypatch.context() as m:
-        m.setattr(subprocess, "run", counting_run)
-        from scripts.code_health.gitio import read_files
-        res = read_files(repo, tree, [f"f{i}.py" for i in range(5)])
-    assert len(res) == 5
-    assert call_count["n"] <= 3  # ls-tree + batch-check + cat-file --batch (prefetch may add but <=3)
-    # also single read_file should be 1
-    call_count["n"] = 0
-    with monkeypatch.context() as m:
-        m.setattr(subprocess, "run", counting_run)
-        from scripts.code_health.gitio import read_file
-        read_file(repo, tree, "f0.py")
-    assert call_count["n"] <= 1
-
-
-def test_read_files_in_blobless_clone_fetches_all_blobs_in_one_pack(tmp_path):
-    """A blob:none clone must hydrate a batch in one fetch, not one promisor pack per blob."""
-    src = tmp_path / "src"
-    src.mkdir()
-    _git(src, "init", "-q", "-b", "main")
-    _git(src, "config", "user.email", "t@example.com")
-    _git(src, "config", "user.name", "t")
-    names = [f"f{i}.py" for i in range(8)]
-    for i, name in enumerate(names):
-        (src / name).write_text(f"x = {i}\n")
-    _git(src, "add", "-A")
-    _git(src, "commit", "-q", "-m", "init")
+def test_measure_in_blobless_clone_fetches_snapshot_blobs_in_one_pack(tmp_path):
+    """Per-file reads lazily fetched one promisor pack per blob into the shared store."""
+    src, _ = _repo(tmp_path / "src")
+    names = [f"pkg/m{i}.py" for i in range(6)]
+    head = _commit(src, {name: f"X = {i}\n" for i, name in enumerate(names)})
     bare = tmp_path / "bare.git"
-    subprocess.run(["git", "clone", "-q", "--bare", str(src), str(bare)], check=True)
+    subprocess.run(["git", "clone", "-q", "--bare", str(src), str(bare)], check=True, timeout=60)
     _git(bare, "config", "uploadpack.allowFilter", "true")
     clone = tmp_path / "clone"
-    subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none",
-                    bare.as_uri(), str(clone)], check=True)
+    subprocess.run(["git", "clone", "-q", "--filter=blob:none", "--no-checkout", bare.as_uri(), str(clone)],
+                   check=True, timeout=60)
+    for rel in ("pyproject.toml", "scripts/ci/profile_scope_patterns.json"):
+        (clone / rel).parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy(src / rel, clone / rel)
     packs = clone / ".git" / "objects" / "pack"
     before = len(list(packs.glob("*.pack")))
 
-    result = gitio.read_files(clone, "HEAD", [*names, "absent.py"])
+    measured = Measurer(clone, resolve_ruff(clone), known_env=set()).measure(head, names)
 
-    assert result == {**{name: f"x = {i}\n" for i, name in enumerate(names)}, "absent.py": None}
+    assert sorted(measured) == names
     assert len(list(packs.glob("*.pack"))) - before == 1
