@@ -1256,8 +1256,9 @@ class SessionDB(
                             "a large WAL checkpoint, or an older pre-update "
                             "process; the database itself is healthy)"
                         ) from exc
-                    if self._retry_ioerr_begin(
-                        err_msg, fn_started, ioerr_begin_retried, deadline, patience_s
+                    if (
+                        _DISK_IO_ERROR_MARKER in err_msg and not fn_started and not ioerr_begin_retried
+                        and self._sleep_before_write_retry(deadline, patience_s)
                     ):
                         # Retry on the SAME connection: close()+reopen would cancel this process's
                         # POSIX locks for every sibling (howtocorrupt §2.2).
@@ -1281,24 +1282,6 @@ class SessionDB(
                     if self._is_structural_corruption_error(exc):
                         self._halt_db_corrupt(exc)
                 raise
-
-    def _retry_ioerr_begin(
-        self,
-        err_msg: str,
-        fn_started: bool,
-        ioerr_begin_retried: bool,
-        deadline: float,
-        patience_s: float,
-    ) -> bool:
-        """Extracted helper to reduce CC of _execute_write_marked (phase: IOERR begin retry)."""
-        if (
-            _DISK_IO_ERROR_MARKER in err_msg
-            and not fn_started
-            and not ioerr_begin_retried
-            and self._sleep_before_write_retry(deadline, patience_s)
-        ):
-            return True
-        return False
 
     def _write_sql(
         self, sql: str, params: Any = (), *, many: bool = False, patience_s: Optional[float] = None,
