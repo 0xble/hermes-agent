@@ -96,7 +96,7 @@ def _shrink_data_url(url: str, *, max_dimension: int, resize_fn: Any) -> tuple:
             ok = len(resized) < len(url)
         return (resized, False) if ok else (None, True)
     except Exception as exc:
-        logger.warning("image-shrink recovery: re-encode failed — %s", exc)
+        logger.warning("image-shrink recovery: re-encode failed — %s", exc, exc_info=True)
         return None, triggered_by is not None
 
 
@@ -151,7 +151,7 @@ def try_shrink_image_parts_in_messages(api_messages: list, *, max_dimension: int
     try:
         from tools.vision_tools import _resize_image_for_vision
     except Exception as exc:
-        logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc)
+        logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc, exc_info=True)
         return False
     changed_count = 0
     # Track over-target parts that could not be shrunk: if any remain, a retry
