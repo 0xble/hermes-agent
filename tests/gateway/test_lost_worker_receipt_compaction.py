@@ -53,7 +53,7 @@ def test_lost_admission_worker_compacts_its_history_receipt(tmp_path):
 
 
 def test_reset_discarded_orphan_worker_compacts_its_history_receipt(tmp_path):
-    from hermes_state_runtime_workers import discard_orphan_workers_on_reset
+    from persistence.sqlite.workers._runtime_workers import discard_orphan_workers_on_reset
     with closing(SessionDB(tmp_path / 'state.db')) as db:
         db.create_session('s', 'cli')
         db.append_messages_batch('s', [{'role': 'user', 'content': 'x' * 4000}])

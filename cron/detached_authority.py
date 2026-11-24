@@ -177,7 +177,7 @@ def recover_detached(db, epoch, row):
         _epoch(conn, epoch)
         current = _admission(conn, row['admission_id'])
         if current['status'] == 'terminal':
-            from hermes_state_terminal import RESULT_PREFIX, load_result
+            from persistence.sqlite.authority._runtime import RESULT_PREFIX, load_result
             saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
                                  (RESULT_PREFIX + row['admission_id'],)).fetchone()
             if saved is None or load_result(saved[0])['result'].get('cron_result') != _redacted(result['result']):

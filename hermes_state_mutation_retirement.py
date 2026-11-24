@@ -86,7 +86,7 @@ def _compact_result(conn, admission_id):
     """A retired result keeps the exact-retry outcome (final response, flags, usage/accounting)
     but not the transcript copies a turn result carries (cumulative ``messages``, reasoning, the
     settled ``_turn_user_row``)."""
-    from hermes_state_terminal import RESULT_PREFIX, encode_result, load_result
+    from persistence.sqlite.authority._runtime import RESULT_PREFIX, encode_result, load_result
     saved = conn.execute('SELECT value FROM state_meta WHERE key=?', (RESULT_PREFIX + admission_id,)).fetchone()
     if saved is None:
         return
@@ -98,7 +98,7 @@ def _compact_result(conn, admission_id):
 
 
 def retire_terminal_receipts(conn, session_ids):
-    from hermes_state_terminal import ADMISSION_PREFIX, WORKER_PREFIX, identity_key
+    from persistence.sqlite.authority._runtime import ADMISSION_PREFIX, WORKER_PREFIX, identity_key
     for sid in session_ids:
         admissions = conn.execute('SELECT * FROM session_admissions WHERE target_session_id=?', (sid,)).fetchall()
         workers = conn.execute('SELECT * FROM worker_executions WHERE session_id=?', (sid,)).fetchall()
@@ -265,7 +265,7 @@ def retire_prunable(conn, session_ids, *, defer_messages=False):
 
 
 def delete_in_transaction(db, conn, session_id, payload):
-    from hermes_state_mutation_guards import require_idle, delete_targets
+    from persistence.sqlite.authority._runtime_guards import require_idle, delete_targets
     targets = delete_targets(conn, session_id)
     require_idle(db, conn, targets)
     retire_sessions(conn, targets, defer_messages=True)
@@ -432,7 +432,7 @@ def prune_retired_tombstones(conn, older_than=RETRY_HORIZON_S, limit=None):
     reclaimed: it holds only ``retired_at``, and without it a deleted id could be recreated,
     re-admitted or reissued as a Bot Chat generation.
     Tombstones written before ``retired_at`` existed are stamped now and age from this pass."""
-    from hermes_state_terminal import ADMISSION_PREFIX, RESULT_PREFIX, WORKER_PREFIX, identity_key
+    from persistence.sqlite.authority._runtime import ADMISSION_PREFIX, RESULT_PREFIX, WORKER_PREFIX, identity_key
     reclaimed: dict[str, int] = {}
     now = time.time()
     for prefix in (ADMISSION_PREFIX, WORKER_PREFIX):

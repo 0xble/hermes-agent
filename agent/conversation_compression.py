@@ -1691,6 +1691,35 @@ def _rebind_session_context(session_id: str) -> None:
         set_session_context(session_id)
 
 
+def context_engine_persistence(hook, persistence):
+    """``{"persistence": persistence}`` for a context engine hook that accepts that keyword, else ``{}``."""
+    return {"persistence": persistence} if accepts_keyword_argument(hook, "persistence") else {}
+
+
+def context_engine_session_db(agent, session_db):
+    """The ``session_db`` the agent's context engine binds. The built-in compressor takes the agent's store; a plugin
+    engine is outside code written against ``SessionDB``, so over a storage interface handle it takes the deprecated
+    ``hermes_state.SessionDB`` on the same profile's store, one per agent (``close_context_engine_session_db``)."""
+    from agent.context_compressor import ContextCompressor
+    from persistence_assembly import Persistence, store_location
+
+    if type(agent.context_compressor) is ContextCompressor or not isinstance(session_db, Persistence):
+        return session_db
+    plugin_db = getattr(agent, "_context_engine_session_db", None)
+    if plugin_db is None:
+        import hermes_state
+        plugin_db = agent._context_engine_session_db = hermes_state.SessionDB(
+            store_location(session_db.scope), read_only=session_db.read_only)
+    return plugin_db
+
+
+def close_context_engine_session_db(agent):
+    """Close the plugin context engine's legacy ``SessionDB`` handle, if one was opened."""
+    plugin_db, agent._context_engine_session_db = getattr(agent, "_context_engine_session_db", None), None
+    if plugin_db is not None:
+        plugin_db.close()
+
+
 def _adopt_live_compression_child(
     agent: Any, session_db: Any, parent_session_id: str
 ) -> Optional[list[dict[str, Any]]]:

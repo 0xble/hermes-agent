@@ -10,6 +10,7 @@ the conversation bodies' refusals and the store's SQLite failures into the contr
 from __future__ import annotations
 
 import hashlib
+import hmac
 import json
 from contextlib import contextmanager
 from typing import Iterator, Optional
@@ -44,6 +45,7 @@ __all__ = [
     "retry_terminal_admission",
     "settle_steer_transfers",
     "terminal_admission",
+    "terminal_worker_receipt",
     "terminal_api_admissions",
 ]
 
@@ -249,6 +251,33 @@ def terminal_admission(conn, admission_id):
     saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
                          (ADMISSION_PREFIX + admission_id,)).fetchone()
     return json.loads(saved[0]) if saved else None
+
+
+
+
+def terminal_worker_receipt(holder, *, execution_id, session_id, generation, sequence,
+                            adoption_secret, payload_digest):
+    """Read exact retired worker evidence without reviving the worker."""
+    from hermes_state_runtime import RuntimeStoreError
+    proof = _secret_digest(adoption_secret)
+    with holder._read_ctx() as conn:
+        saved = conn.execute('SELECT value FROM state_meta WHERE key=?',
+                             (WORKER_PREFIX + execution_id,)).fetchone()
+        if saved is None:
+            raise RuntimeStoreError('not_found')
+        worker = json.loads(saved[0])
+        if worker['session_id'] != session_id or not hmac.compare_digest(worker['adoption_digest'], proof):
+            raise RuntimeStoreError('permission_denied')
+        if type(generation) is not int or generation != worker['generation']:
+            raise RuntimeStoreError('stale_generation')
+        receipt = next((r for r in worker['receipts'] if r['sequence'] == sequence), None)
+        if receipt is None:
+            raise RuntimeStoreError('stale_generation')
+        if receipt['payload_digest'] != payload_digest:
+            raise RuntimeStoreError('admission_conflict')
+        if receipt['result_json'] is None:
+            raise RuntimeStoreError('stale_generation')
+        return json.loads(receipt['result_json'])
 
 
 def retry_terminal_admission(holder, *, epoch, principal_id, session_id, request_id, payload, intent='queue'):

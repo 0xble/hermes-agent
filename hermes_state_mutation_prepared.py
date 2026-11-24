@@ -2,7 +2,7 @@
 import json
 from hermes_state_local import POLICY_PREFIX
 from hermes_state_local_lineage import validate_local_lineage
-from hermes_state_mutation_guards import require_target_advanceable
+from persistence.sqlite.authority._runtime_guards import require_target_advanceable
 from hermes_state_runtime import RuntimeStoreError
 
 # A model pick made while a turn ran, committed at the next turn boundary (gateway/session_deferred_pick.py).
@@ -154,7 +154,7 @@ def policy_picks(db, session_id):
 def commit_refreshed_policy(db, *, epoch, session_id, old, new, generation):
     """The owner's config refresh of an idle session: *new* replaces exactly *old* at *generation* (a
     concurrent mutation or turn wins) and opens the next policy generation. Returns that generation."""
-    from hermes_state_mutation_guards import require_idle
+    from persistence.sqlite.authority._runtime_guards import require_idle
     from hermes_state_runtime import _epoch
 
     def write(conn):

@@ -47,7 +47,7 @@ from persistence.sqlite._state.errors import (
     StateDbReplacedError, _is_no_more_rows, classify_persistence_error, is_malformed_db_error,
     is_malformed_schema_error, is_sqlite_lock_error,
 )
-from hermes_state_guard import (
+from persistence.sqlite._state.guard import (
     _STATE_DB_GUARD_BYPASS_ENV, _in_test_context, _is_production_state_db, _real_platform_state_root,
     _register_test_instance, _set_last_init_error, get_last_init_error,
 )
@@ -217,7 +217,7 @@ def _default_db_path() -> Path:
     return DEFAULT_DB_PATH if DEFAULT_DB_PATH != _IMPORT_DEFAULT_DB_PATH else get_hermes_home() / "state.db"
 
 
-# Live-DB guard knobs live HERE (not in hermes_state_guard): the hermetic conftest monkeypatches
+# Live-DB guard knobs live HERE (not in persistence.sqlite._state.guard): the hermetic conftest monkeypatches
 # ``hermes_state._STATE_DB_GUARD_BYPASS`` (``@pytest.mark.live_system_guard_bypass`` escape hatch)
 # and ``_EXTRA_DENY_ROOTS`` (the pre-sandbox root, so custom-HERMES_HOME deployments are covered).
 _STATE_DB_GUARD_BYPASS = False

@@ -156,7 +156,7 @@ async def test_reset_copies_the_parent_surface_and_falls_back_to_policy(tmp_path
 async def test_compress_mutation_copies_parent_or_uses_the_policy_surface(tmp_path, monkeypatch):
     """The compress mutation copies the parent's surface. A NULL or ``local`` parent is not a
     surface, so the child falls back to the policy label."""
-    from hermes_state_mutation_compress import compress_in_transaction
+    from persistence.sqlite.authority._mutation_publish import compress_in_transaction
     from hermes_state_mutation_prepared import local_snapshot
 
     store, authority, owner = _owner(tmp_path / 'home', monkeypatch)

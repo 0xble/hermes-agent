@@ -19,8 +19,8 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 _PROBE = r"""
 import json, sys
 sys.path.insert(0, {repo!r})
-import hermes_state_guard
-hermes_state_guard._PYTEST_ANCESTOR = False  # launched from a shell, not from pytest
+import persistence.sqlite._state.guard
+persistence.sqlite._state.guard._PYTEST_ANCESTOR = False  # launched from a shell, not from pytest
 if {import_tests!r}:
     import tests.gateway  # what `from tests.gateway.<module> import <helper>` runs first
 from hermes_state import SessionDB

@@ -222,7 +222,7 @@ def test_large_delete_bounds_each_transaction(tmp_path, operation):
 def test_interrupted_delete_is_invisible_and_next_prune_resumes(tmp_path, monkeypatch, phase):
     from hermes_state_deletion import finish_pending_deletes
     from hermes_state_runtime import RuntimeStoreError
-    from hermes_state_timeline import get_session_timeline
+    from persistence.sqlite.conversation._store.timeline import get_session_timeline
 
     path = tmp_path / "state.db"
     db = SessionDB(path)

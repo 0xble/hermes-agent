@@ -138,7 +138,7 @@ class CompressionSnapshot:
         return self.conn.execute(sql, params).fetchall()
 
     def get_session(self, sid):
-        from hermes_state_worker_context import worker_context
+        from persistence.sqlite.workers._context import worker_context
         return worker_context(self.db, self.conn, sid, {})['session']
 
     def authorize(self, assigned, target):
@@ -256,7 +256,7 @@ def _watermarks(payload):
 
 
 def worker_archive(db, conn, sid, payload):
-    from hermes_state_worker_context import SIDECAR_KEYS
+    from persistence.sqlite.workers._context import SIDECAR_KEYS
     _fields(payload, ('messages', 'model_config_patch', 'watermark', 'lock_holder', 'tail_count'),
             optional=('carried_messages', 'covered_ids', 'unresolved_held', 'held_messages', 'held_for_cas'))
     _handoff_messages(conn, sid, payload['messages'])

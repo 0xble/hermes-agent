@@ -281,7 +281,7 @@ def test_pending_and_idle_probes_do_not_scan_finished_history(tmp_path, monkeypa
     pending/idle probe walked the session's whole finished ledger. Probes must stay O(live rows)."""
     from contextlib import nullcontext
     from hermes_state_local import end_idle_local_session
-    from hermes_state_mutation_guards import require_idle
+    from persistence.sqlite.authority._runtime_guards import require_idle
     from hermes_state_mutation_retirement import _LIVE_LEDGER_SQL
     with closing(SessionDB(tmp_path / 'state.db')) as db:
         db.create_session('s', source='api_server')

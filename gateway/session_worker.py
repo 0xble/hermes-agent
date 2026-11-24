@@ -48,7 +48,7 @@ def worker_identity_claim(authority, params, subject):
         raise RuntimeStoreError('worker_not_live') from exc
     # Reuse the durable adoption digest as the producer claim. Changing any
     # assignment, principal, profile, PID birth or secret cannot adopt it.
-    from hermes_state_worker_compression import worker_claim_origin
+    from persistence.sqlite.workers._compression import worker_claim_origin
     origin = worker_claim_origin(authority.db, params)
     return admission_fingerprint(canonical_target=origin, payload={
         key: params[key] for key in _SCOPE} | {'session_id': origin, 'principal': subject})
@@ -61,7 +61,7 @@ async def _verify(connection, params, claim):
 
 
 def verify_worker_identity_claim(authority, params, claim, *, live_only=False):
-    from hermes_state_worker_compression import worker_retry_target
+    from persistence.sqlite.workers._compression import worker_retry_target
     target = worker_retry_target(authority.db, params)
     with authority.db._read_ctx() as conn:
         row = conn.execute('SELECT * FROM worker_executions WHERE execution_id=?',

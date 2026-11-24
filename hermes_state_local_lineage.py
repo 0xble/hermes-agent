@@ -184,7 +184,7 @@ def reset_local_target(db, *, epoch, parent_session_id, entry):
         logical_id = receipt['session_id']
         if validate_local_lineage(conn, receipt) != parent_session_id:
             raise RuntimeStoreError('admission_conflict')
-        from hermes_state_mutation_guards import require_not_executing
+        from persistence.sqlite.authority._runtime_guards import require_not_executing
         require_not_executing(conn, list({logical_id, parent_session_id}))
         policy = receipt['policy']
         db._publish_child_session_row(conn, parent, parent_session_id=parent_session_id,

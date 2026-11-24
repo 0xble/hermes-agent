@@ -952,7 +952,8 @@ def _synthetic_user_row(content: str) -> bool:
 def _typed_user_text(content: str) -> str:
     """A ``/skill``, bundle or auto-load turn as the user typed it (``/skill do X``); other text unchanged.
     Its inline skill body is not the user's words — it is carried by a ``[SKILL_PRUNED: ...]`` marker instead."""
-    from session_rules.turns import describe_skill_invocation, skills_loaded_by_scaffold
+    from session_rules.turns import describe_skill_invocation
+    from agent.skill_commands import skills_loaded_by_scaffold
     return (describe_skill_invocation(content, separator=" ") or "") if skills_loaded_by_scaffold(content) else content
 
 

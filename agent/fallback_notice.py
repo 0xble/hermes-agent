@@ -6,9 +6,31 @@ import time
 from urllib.parse import urlsplit
 
 from hermes_cli.route_identity import normalize_route_base_url
+from agent.error_classifier import FailoverReason
 
-# Keep the fallback walk's logger namespace so existing filters retain these diagnostics.
 logger = logging.getLogger("agent.chat_completion_helpers")
+
+_FALLBACK_REASON_LABELS = {reason: reason.value.replace("_", " ") for reason in FailoverReason}
+_FALLBACK_DETAIL_MAX_CHARS = 200
+
+
+def fallback_reason_text(reason):
+    return _FALLBACK_REASON_LABELS.get(reason) or str(getattr(reason, "value", None) or reason or "provider failure").replace("_", " ")
+
+
+def fallback_trigger_text(agent, reason):
+    label = fallback_reason_text(reason)
+    stashed = getattr(agent, "_fallback_trigger", None)
+    agent._fallback_trigger = None
+    if not (isinstance(stashed, tuple) and len(stashed) == 2 and reason is not None and stashed[0] == reason):
+        return label
+    from agent.redact import redact_sensitive_text
+    detail = " ".join(redact_sensitive_text(str(stashed[1] or "")).split())
+    if not detail:
+        return label
+    if len(detail) > _FALLBACK_DETAIL_MAX_CHARS:
+        detail = detail[:_FALLBACK_DETAIL_MAX_CHARS - 1].rstrip() + "…"
+    return f"{label}: {detail}"
 
 
 def resolved_route(agent) -> tuple[str, str, str]:
@@ -92,3 +114,56 @@ def finish_fallback_restore(agent, was_active, held_shared_record, previous_mode
         with contextlib.suppress(Exception):
             agent._emit_diagnostic_status(ContextNotice(f"✅ Primary model restored: {agent.model} via {agent.provider}; "
                 f"fallback {previous_model} via {previous_provider} is no longer active."))
+
+
+def record_fallback_trigger(agent, reason, error_text: str) -> None:
+    """Remember a classified provider error for the next fallback notice."""
+    from agent.credential_pool_errors import redact_error_text
+    known = (getattr(agent, "api_key", None), getattr(agent, "_anthropic_api_key", None))
+    agent._fallback_trigger = (reason, redact_error_text(str(error_text or ""), known))
+
+
+def fallback_notice_hidden(agent) -> bool:
+    """A background wake turn shows no switch notice until a user-visible turn."""
+    from gateway.response_filters import is_machinery_display_kind
+    return is_machinery_display_kind(getattr(agent, "_turn_display_kind", None))
+
+
+def surface_hidden_fallback(agent) -> None:
+    """Reconcile a switch hidden by a wake turn before the next visible turn runs."""
+    held = getattr(agent, "_hidden_fallback_notice", None)
+    if not held or fallback_notice_hidden(agent):
+        return
+    agent._hidden_fallback_notice = None
+    if getattr(agent, "_provider_fallback_active", False):
+        announce_fallback_switch(agent, held)
+
+
+def announce_primary_restored(agent, previous_model: str, previous_provider: str) -> None:
+    unseen = getattr(agent, "_hidden_fallback_notice", None)
+    agent._hidden_fallback_notice = None
+    if unseen or fallback_notice_hidden(agent):
+        return
+    try:
+        agent._emit_diagnostic_status(
+            f"✅ Primary model restored: {agent.model} via {agent.provider}; "
+            f"fallback {previous_model} via {previous_provider} is no longer active.")
+    except Exception:
+        logger.debug("primary restored notice failed to emit", exc_info=True)
+
+
+FALLBACK_STATUS_KIND = "fallback"
+
+
+def announce_fallback_switch(agent, notice: str) -> None:
+    """Show a fallback switch before the fallback model answers, or hold it for a wake turn."""
+    if fallback_notice_hidden(agent):
+        logger.info("fallback switch notice not shown on a background wake turn: %s", notice)
+        agent._hidden_fallback_notice = notice
+        return
+    agent._hidden_fallback_notice = None
+    from gateway.warning_notifications import DiagnosticText
+    try:
+        agent._emit_status_kind(FALLBACK_STATUS_KIND, DiagnosticText(notice), origin="fallback_switch")
+    except Exception:
+        logger.debug("fallback switch notice failed to emit", exc_info=True)

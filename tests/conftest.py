@@ -141,7 +141,7 @@ def _hermes_home_points_at_production(value: str) -> bool:
         # ``%LOCALAPPDATA%\hermes``, and a dev shell exporting that path used to be honored as
         # "custom", pinning import-time paths (``tui_gateway.server._hermes_home``) to the live
         # install so the state.db guard tripped on every store-touching test (#112692).
-        from hermes_state_guard import _real_platform_state_root
+        from persistence.sqlite._state.guard import _real_platform_state_root
 
         resolved = Path(value).expanduser().resolve()
         real_root = _real_platform_state_root() or (Path.home() / ".hermes").resolve()
@@ -180,7 +180,7 @@ if _HERMES_EXPORTED_TMP:
             del os.environ[_key]
     del os.environ[SCRATCH_DIR_MARKER_ENV]
 
-from hermes_state_guard import _real_platform_state_root
+from persistence.sqlite._state.guard import _real_platform_state_root
 
 _real_test_root = _real_platform_state_root() or (Path.home() / ".hermes").resolve()
 _guarded_tmp_roots = [_real_test_root]
@@ -225,7 +225,7 @@ except AttributeError:
 # the child at the same moment the child lost the HERMES_HOME redirect.
 # HERMES_TEST_ISOLATION is OUR marker: exported here (before any test module
 # imports), inherited by every child by default, and honored by
-# hermes_state_guard._running_under_pytest() as a test-context signal. A child
+# persistence.sqlite._state.guard._running_under_pytest() as a test-context signal. A child
 # that carries it and still resolves the production state.db fails hard.
 # Tests that legitimately need a child to look like a non-test process AND
 # open a real DB must export HERMES_STATE_DB_GUARD_BYPASS=1 in that child's
@@ -618,7 +618,7 @@ def _close_leaked_session_dbs(tmp_path):
     OOM-killed three times in one day.
 
     Rather than editing every test file, ``SessionDB.__init__`` registers each
-    instance in ``hermes_state_guard._test_instance_registry`` (a WeakSet,
+    instance in ``persistence.sqlite._state.guard._test_instance_registry`` (a WeakSet,
     populated only when the ``HERMES_TEST_ISOLATION`` marker is set — i.e.
     only under this suite). This teardown closes whatever the test left open.
     ``close()`` is idempotent (``self._conn`` is None afterwards) and also
@@ -648,7 +648,7 @@ def _close_leaked_session_dbs(tmp_path):
     wait = getattr(sys.modules.get("agent.title_generator"), "wait_for_title_upgrades", None)
     if wait is not None:
         wait()
-    registry = getattr(sys.modules.get("hermes_state_guard"), "_test_instance_registry", ())
+    registry = getattr(sys.modules.get("persistence.sqlite._state.guard"), "_test_instance_registry", ())
     for db in list(registry):
         if getattr(db, "_shared_registry_owned", False):
             continue

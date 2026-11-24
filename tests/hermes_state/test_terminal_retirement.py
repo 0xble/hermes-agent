@@ -11,9 +11,9 @@ from gateway.session_results import retain_result, admission_result
 
 def test_used_history_retirement_is_atomic_and_exact(tmp_path, monkeypatch):
     import hermes_state_mutation_retirement as retirement
-    import hermes_state_mutations
-    monkeypatch.setattr(hermes_state_mutations, '_delete',
-        getattr(retirement, 'delete_in_transaction', hermes_state_mutations._delete))
+    import persistence.sqlite.authority._mutation
+    monkeypatch.setattr(persistence.sqlite.authority._mutation, '_delete',
+        getattr(retirement, 'delete_in_transaction', persistence.sqlite.authority._mutation._delete))
     path = tmp_path / 'state.db'
     with SessionDB(path) as db:
         db.create_session('used', source='api_server')
@@ -54,7 +54,7 @@ def test_used_history_retirement_is_atomic_and_exact(tmp_path, monkeypatch):
         # Settlement stores this turn's suffix, flagged so no reader re-derives a boundary from it.
         assert admission_result(db, row['admission_id']) == {
             'result': {**result['result'], '_messages_are_turn_suffix': True}, 'usage': result['usage']}
-        from hermes_state_terminal import terminal_worker_receipt
+        from persistence.sqlite.conversation._store.terminal import terminal_worker_receipt
         worker_args = dict(execution_id='worker', session_id='used', generation=row['generation'], sequence=1,
             adoption_secret='owned-proof', payload_digest=rt.admission_fingerprint(canonical_target='used',
                 payload={'operation': 'transcript.append', 'payload': worker_append}))
@@ -119,8 +119,8 @@ def test_native_receipt_clock_does_not_change_retired_retry_identity(tmp_path):
 
 def test_nonterminal_obligations_prevent_any_retirement(tmp_path):
     import hermes_state_mutation_retirement as retirement
-    import hermes_state_mutations
-    delete_in_transaction = getattr(retirement, 'delete_in_transaction', hermes_state_mutations._delete)
+    import persistence.sqlite.authority._mutation
+    delete_in_transaction = getattr(retirement, 'delete_in_transaction', persistence.sqlite.authority._mutation._delete)
     with SessionDB(tmp_path / 'state.db') as db:
         epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
         for status in ('queued', 'unknown', 'started', 'worker'):
@@ -179,7 +179,7 @@ def test_deletion_tombstone_keeps_only_the_closing_worker_result(tmp_path):
     """Full worker results (history reads) must not outlive the user's delete;
     only the closing receipt stays replayable, earlier digests still detect conflicts."""
     import hermes_state_mutation_retirement as retirement
-    from hermes_state_terminal import terminal_worker_receipt
+    from persistence.sqlite.conversation._store.terminal import terminal_worker_receipt
     with SessionDB(tmp_path / 'state.db') as db:
         db.create_session('gone', source='api_server')
         db.append_message('gone', 'user', 'SECRET_HISTORY_LINE')
@@ -277,7 +277,7 @@ def test_deleted_history_is_not_recoverable_from_worker_or_mutation_receipts(tmp
     receipt, so its last receipt may be a history read; a rewind/compress receipt copies the
     rewound message / summary. Neither may replay the deleted transcript after the delete."""
     import json
-    from hermes_state_terminal import terminal_worker_receipt
+    from persistence.sqlite.conversation._store.terminal import terminal_worker_receipt
     with SessionDB(tmp_path / 'state.db') as db:
         db.create_session('gone', source='cli')
         epoch = _begin_owned_runtime_epoch(db, instance_id='owner')
@@ -403,7 +403,7 @@ def test_tombstones_past_the_retry_horizon_are_reclaimed_by_the_prune_pass(tmp_p
         young, young_id = settle_and_delete('young', now - 6 * 86400)
 
         def rows_naming(sid, admission_id):
-            from hermes_state_terminal import ADMISSION_PREFIX, RESULT_PREFIX, identity_key
+            from persistence.sqlite.conversation._store.terminal import ADMISSION_PREFIX, RESULT_PREFIX, identity_key
             keys = (ADMISSION_PREFIX + admission_id, RESULT_PREFIX + admission_id,
                     identity_key('api', sid, 'r'), retirement.RETIRED_PREFIX + sid)
             return [k for k in keys if db.get_meta(k) is not None]
