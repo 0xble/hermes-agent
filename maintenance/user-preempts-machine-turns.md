@@ -38,6 +38,17 @@ Preemption happens only when all of these hold:
 
 Contract tests: `tests/gateway/test_turn_lease_queue.py`.
 
+## Interrupt attribution follow-up
+
+`abort_turn_on_interrupt()` is also a direct return path from API-error recovery;
+it does not pass through `finalize_turn()`. It must stamp `interrupt_source`
+while the pending interrupt state still exists, before `clear_interrupt()` resets
+`_tool_interrupt_reason` and `_interrupt_source`. Without that ordering, a
+message-less `gateway user turn preemption` returns `interrupted=True` but no
+source, so the gateway cannot distinguish a system preemption from a user stop.
+The regression is covered by
+`tests/agent/test_system_machine_preemption.py::test_system_soft_interrupt_real_agent_records_source_without_followup`.
+
 ## Upstream
 
 Fork-only. Upstream has no machine-turn preemption on the turn-lease wait.
