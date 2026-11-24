@@ -3,16 +3,11 @@ automatically — no extra user message required (#47699).
 
 Issue #47699 reported that a Slack ``/goal`` continuation could be enqueued by
 ``_post_turn_goal_continuation`` → ``_enqueue_fifo`` (adapter pending slot) but
-never consumed until the next real inbound message woke the session.
-
-On the current tree the continuation is enqueued while the adapter's
-``_process_message_background`` frame is still live (the runner hook runs
-inside ``self._message_handler(event)``), so the adapter's in-band pending
-drain — and, for late arrivals, the finally-block late-arrival drain — spawns
-the follow-up turn without user input.  These tests pin that contract from the
-adapter dispatch layer down, so a future refactor that moves the goal hook
-after the drain (or changes FIFO key derivation) fails loudly instead of
-silently stalling goal loops on messaging gateways.
+never consumed until the next real inbound message woke the session. The
+post-delivery judge can outlive the adapter's bounded bookkeeping join, so the
+adapter may already be idle when the continuation is enqueued. These tests pin
+that contract from the runner hook down: an idle enqueue must start the normal
+adapter drain without duplicating a real in-flight turn.
 """
 
 from __future__ import annotations
@@ -204,6 +199,62 @@ async def test_runner_goal_hook_enqueues_into_the_key_the_adapter_drains(hermes_
         f"drains: pending keys={list(adapter._pending_messages)} "
         f"expected={adapter_key}"
     )
+
+
+@pytest.mark.asyncio
+async def test_idle_post_turn_goal_continuation_starts_a_new_fifo_drain(hermes_home):
+    """A deferred judge can finish after the original adapter task releases its guard.
+
+    The continuation must kick an idle adapter itself; otherwise it sits in the pending
+    slot until an unrelated human message arrives (the incident's strand shape).
+    """
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    import uuid
+
+    from gateway.config import GatewayConfig
+    from gateway.run import GatewayRunner
+    from gateway.session import SessionEntry
+    from hermes_cli.goals import GoalManager
+
+    src = _slack_thread_source()
+    key = build_session_key(src)
+    runner = object.__new__(GatewayRunner)
+    runner.config = GatewayConfig(platforms={Platform.SLACK: PlatformConfig(enabled=True, token="x")})
+    runner._queued_events = {}
+    entry = SessionEntry(
+        session_key=key, session_id=f"idle-drain-{uuid.uuid4().hex[:8]}", created_at=datetime.now(),
+        updated_at=datetime.now(), platform=Platform.SLACK, chat_type="channel",
+    )
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = entry
+    runner.session_store._generate_session_key.return_value = key
+    adapter = _DrainProbeAdapter()
+    runner.adapters = {Platform.SLACK: adapter}
+    handled = []
+
+    async def handler(event):
+        handled.append(event.text)
+        return "reply"
+
+    adapter.set_message_handler(handler)
+    GoalManager(entry.session_id).set("ship it")
+    with patch(
+        "hermes_cli.goals.judge_goal",
+        return_value=("continue", "still needs work", False, None, False),
+    ), patch("hermes_cli.goals._evidence_only_read_only_status", return_value=False), \
+            patch("hermes_cli.goals._goal_progress_fingerprint", side_effect=lambda _e: uuid.uuid4().hex):
+        await runner._post_turn_goal_continuation(
+            session_entry=entry, source=src, final_response="partial progress",
+        )
+        for _ in range(40):
+            if handled:
+                break
+            await asyncio.sleep(0.05)
+
+    assert handled == [CONTINUATION_TEXT]
+    assert key not in adapter._pending_messages
+    assert key not in adapter._active_sessions
 
 
 @pytest.mark.asyncio

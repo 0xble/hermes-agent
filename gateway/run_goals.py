@@ -811,6 +811,22 @@ class GatewayGoalsMixin(GatewayLoopWakeMixin):
                         goal_session_id=mgr.session_id, goal_state=mgr.state,
                     ), adapter,
                 )
+                # The normal transport ingress starts a pending FIFO head. This hook can finish
+                # after that transport task's bounded bookkeeping join has released its guard,
+                # however, leaving the continuation queued with no ingress left to drain it. Start
+                # the same adapter drain when the key is idle; the guard check prevents a duplicate
+                # turn when a real or synthetic successor is already running.
+                pending_slot = getattr(adapter, "_pending_messages", None)
+                if (
+                    isinstance(pending_slot, dict)
+                    and _quick_key in pending_slot
+                    and not self._is_session_running(_quick_key)
+                    and _quick_key not in getattr(adapter, "_active_sessions", {})
+                ):
+                    pending_event = pending_slot.pop(_quick_key)
+                    started = adapter._start_session_processing(pending_event, _quick_key)
+                    if not started:
+                        pending_slot[_quick_key] = pending_event
         except Exception as exc:
             logger.debug("goal continuation: enqueue failed: %s", exc)
 
