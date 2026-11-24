@@ -4311,7 +4311,7 @@ def _launch_external_cron_worker(job: dict) -> bool:
                 # holds nothing useful: name the cause, not the exit code.
                 raise RuntimeError(
                     "restart-safe systemd scope could not be created: the user D-Bus session at "
-                    f"/run/user/{os.getuid()}/bus disappeared after the gateway started. On a "
+                    f"/run/user/{os.getuid()}/bus disappeared after the gateway started. On a "  # windows-footgun: ok — scoped dispatch exists only on Linux
                     "system-level service install, run `sudo loginctl enable-linger <gateway-user>`; "
                     "the next fire dispatches without scope isolation."
                 )
