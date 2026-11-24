@@ -62,7 +62,7 @@ import hermes_state_holders as _state_holders
 import hermes_state_lockguard as _lockguard
 from hermes_state_lockowners import log_write_lock_holders
 from hermes_loop_guard import LoopGuardedLock, check as check_loop_thread
-from hermes_state_write import WriterMutexTimeout, write_site, writer_mutex_until
+from hermes_state_write import WriterMutexTimeout, triage_write_corruption, write_site, writer_mutex_until
 from hermes_state_dbfile import (
     _chmod_pinned_inode, _connect_tracked_db, _fd_is_truly_unlinked, _is_operator_store_link,
     _prepare_connection_retirement,
@@ -1265,22 +1265,10 @@ class SessionDB(
                         ioerr_begin_retried = True
                         continue
                     raise  # non-lock error, callback already ran, or patience exhausted
-                if isinstance(exc, sqlite3.DatabaseError):
-                    # An out-of-band replace surfaces as this same corruption class; in-file repair
-                    # on a NEW generation amplifies the damage.
-                    if (
-                        "not a database" in err_msg or is_malformed_db_error(exc)
-                        or self._is_fts_write_corruption_error(exc)
-                    ):
-                        with self._lock:
-                            self._raise_if_db_replaced()
-                    # Corrupt FTS shadow tables fail every write via the sync triggers while canonical
-                    # rows are intact: detach the derived indexes atomically and retry (never rebuild here).
-                    if self._enter_fts_fail_open(exc, deadline=deadline, patience_s=patience_s):
-                        continue
-                    # What survives both checks is structural damage: quarantine.
-                    if self._is_structural_corruption_error(exc):
-                        self._halt_db_corrupt(exc)
+                if isinstance(exc, sqlite3.DatabaseError) and triage_write_corruption(
+                    self, exc, deadline=deadline, patience_s=patience_s,
+                ):
+                    continue
                 raise
 
     def _write_sql(

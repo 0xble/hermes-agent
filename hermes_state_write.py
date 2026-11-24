@@ -6,6 +6,8 @@ import sys
 import threading
 import time
 
+from hermes_state_errors import is_malformed_db_error
+
 logger = logging.getLogger("hermes_state")
 
 # One holder line per database per window: under a real stall every queued writer times out at
@@ -107,6 +109,27 @@ def _log_writer_owner(db, waiter_site) -> None:
         getattr(getattr(db, "db_path", None), "name", key), describe_site(waiter_site),
         threading.current_thread().name, holder, _OWNER_LOG_INTERVAL_S,
     )
+
+
+def triage_write_corruption(db, exc: sqlite3.DatabaseError, *, deadline, patience_s) -> bool:
+    """Classify a corruption-class write failure. True: retry (corrupt FTS indexes were detached).
+    False: propagate. Raises when the database was replaced or the damage is structural."""
+    # An out-of-band replace surfaces as this same corruption class; in-file repair
+    # on a NEW generation amplifies the damage.
+    if (
+        "not a database" in str(exc).lower() or is_malformed_db_error(exc)
+        or db._is_fts_write_corruption_error(exc)
+    ):
+        with db._lock:
+            db._raise_if_db_replaced()
+    # Corrupt FTS shadow tables fail every write via the sync triggers while canonical
+    # rows are intact: detach the derived indexes atomically and retry (never rebuild here).
+    if db._enter_fts_fail_open(exc, deadline=deadline, patience_s=patience_s):
+        return True
+    # What survives both checks is structural damage: quarantine.
+    if db._is_structural_corruption_error(exc):
+        db._halt_db_corrupt(exc)
+    return False
 
 
 def maintain_after_commit(db):
