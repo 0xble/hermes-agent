@@ -10,7 +10,8 @@ profile and notification owners. Secondary reconnects replay the owning profile'
 spool, recovered human input keeps its provenance, and startup preclaims retain
 the resolved profile. The existing continuation policy below remains authoritative.
 Contract tests: `tests/gateway/test_restart_resume_pending.py`
-  `tests/gateway/test_restart_interrupted_note.py`
+  `tests/gateway/test_restart_interrupted_note/__init__.py`
+  `tests/gateway/test_restart_interrupted_note/test_final_send_failure.py`
   `tests/gateway/test_runner_startup_failures.py`.
 Retire this integration seam when upstream carries the same profile-aware recovery
 and provenance behavior through its extracted owners.
