@@ -590,9 +590,12 @@ test.skipIf(process.platform === 'win32').each([['Ctrl-C reaches the job', 'grou
     addExtraOnly(source, env)
     const dir = mkdtempSync(join(tmpdir(), 'signalled pnpm-'))
     roots.push(dir)
+    // The shim reaps its sleep with SIGKILL, and only after forking it. Between the fork and the
+    // exec, the child still runs sh's own INT/TERM handlers. A catchable kill landing there is spent
+    // on them, and the sleep then outlives the job for its full 30 s, as with slowPnpm above.
     writeFileSync(join(dir, 'pnpm'), ['#!/bin/sh', 'if [ "$1" = install ]; then',
-      `  trap 'echo INT >> "${dir}/got"; kill $!; exit 130' INT`, `  trap 'echo TERM >> "${dir}/got"; kill $!; exit 143' TERM`,
-      `  touch '${dir}/started'; sleep 30 & wait $!; exit 1`,
+      `  trap 'echo INT >> "${dir}/got"; kill -KILL $!; exit 130' INT`, `  trap 'echo TERM >> "${dir}/got"; kill -KILL $!; exit 143' TERM`,
+      `  sleep 30 & touch '${dir}/started'; wait $!; exit 1`,
       'fi', `exec '${pnpmCommand()}' "$@"`, ''].join('\n'))
     chmodSync(join(dir, 'pnpm'), 0o755)
     json(join(dir, 'package.json'), { name: 'pnpm', version: execFileSync(pnpmCommand(), ['--version']).toString().trim() })
