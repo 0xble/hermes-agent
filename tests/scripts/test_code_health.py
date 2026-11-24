@@ -321,3 +321,30 @@ def test_read_files_spawns_one_subprocess_per_batch_not_per_file(tmp_path, monke
         from scripts.code_health.gitio import read_file
         read_file(repo, tree, "f0.py")
     assert call_count["n"] <= 1
+
+
+def test_read_files_in_blobless_clone_fetches_all_blobs_in_one_pack(tmp_path):
+    """A blob:none clone must hydrate a batch in one fetch, not one promisor pack per blob."""
+    src = tmp_path / "src"
+    src.mkdir()
+    _git(src, "init", "-q", "-b", "main")
+    _git(src, "config", "user.email", "t@example.com")
+    _git(src, "config", "user.name", "t")
+    names = [f"f{i}.py" for i in range(8)]
+    for i, name in enumerate(names):
+        (src / name).write_text(f"x = {i}\n")
+    _git(src, "add", "-A")
+    _git(src, "commit", "-q", "-m", "init")
+    bare = tmp_path / "bare.git"
+    subprocess.run(["git", "clone", "-q", "--bare", str(src), str(bare)], check=True)
+    _git(bare, "config", "uploadpack.allowFilter", "true")
+    clone = tmp_path / "clone"
+    subprocess.run(["git", "clone", "-q", "--no-checkout", "--filter=blob:none",
+                    bare.as_uri(), str(clone)], check=True)
+    packs = clone / ".git" / "objects" / "pack"
+    before = len(list(packs.glob("*.pack")))
+
+    result = gitio.read_files(clone, "HEAD", [*names, "absent.py"])
+
+    assert result == {**{name: f"x = {i}\n" for i, name in enumerate(names)}, "absent.py": None}
+    assert len(list(packs.glob("*.pack"))) - before == 1

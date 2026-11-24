@@ -6,6 +6,7 @@ through the same functions so base and head are measured identically.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -109,20 +110,23 @@ def _ensure_blobs(repo: Path, tree: str, paths: list[str]) -> None:
     """
     if not paths or not _is_partial_clone(repo):
         return
-    # ls-tree -r <tree> -- <paths> gives oids even if blobs are missing (tree entries exist)
+    # Tree entries carry blob OIDs even when the blobs themselves are absent.
+    # Each record is "<mode> <type> <oid>\t<path>".
     ls_out = git(repo, "ls-tree", "-r", "-z", tree, "--", *paths, check=False)
     oids: list[str] = []
     for part in ls_out.split("\0"):
-        if part:
-            fields = part.split(" ", 3)
-            if len(fields) >= 3 and fields[1] == "blob" and len(fields[2]) == 40:
-                oids.append(fields[2])
+        meta, _, _path = part.partition("\t")
+        fields = meta.split(" ")
+        if len(fields) == 3 and fields[1] == "blob":
+            oids.append(fields[2])
     if not oids:
         return
-    # batch-check which oids are missing
+    # GIT_NO_LAZY_FETCH stops batch-check from fetching each absent blob on its own
+    # (one promisor pack per blob), which is exactly what this prefetch replaces.
     check_proc = subprocess.run(
         ["git", "cat-file", "--batch-check"],
         cwd=repo,
+        env={**os.environ, "GIT_NO_LAZY_FETCH": "1"},
         input="\n".join(oids) + "\n",
         capture_output=True,
         text=True,
