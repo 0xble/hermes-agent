@@ -183,7 +183,13 @@ _PENDING_ADMISSION_SLOTS: set = set()
 _BACKEND_RETIRING = "backend is retiring; reconnect to continue"
 # Routing origin persisted at dispatch so a restart-recovered completion can
 # reconstruct a full SessionSource (scope_id drives relay tenant egress).
-_ROUTING_KEYS = ("scope_id", "user_id", "user_name")
+# Session keys do not retain the originating Slack reply thread (a DM session
+# can legitimately serve several threads), so detached completions persist the
+# complete source envelope captured before the child is built.
+_ROUTING_KEYS = (
+    "platform", "chat_type", "chat_id", "thread_id", "message_id",
+    "scope_id", "user_id", "user_name",
+)
 # Structured stall metadata — additive, present only on stall finalizations.
 _STALL_META_KEYS = ("stalled_after_quiet_seconds", "stall_threshold_seconds", "stall_phase", "stall_grace_seconds")
 # Private stall bookkeeping on the record -> public field in list_async_delegations().
@@ -1091,7 +1097,7 @@ def _push_completion_event(record: dict[str, Any], result: dict[str, Any], statu
         "status": status, **payload, "dispatched_at": dispatched_at, "completed_at": completed_at,
         **({"cut_reason": cut_reason} if cut_reason else {}),
         **({} if is_batch else {"exit_reason": result.get("exit_reason")}),
-        **{k: record[k] for k in _ROUTING_KEYS if record.get(k)},
+        **{k: record[k] for k in _ROUTING_KEYS if record.get(k) or (k == "thread_id" and k in record)},
         **{k: result[k] for k in _STALL_META_KEYS if k in result}}
     if record.get("superseded_by"):
         # The owner already replaced this unit with a running delegation whose own completion will report the

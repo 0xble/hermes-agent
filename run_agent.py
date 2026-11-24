@@ -280,6 +280,7 @@ class AIAgent(
         iteration_budget: IterationBudget = None, run_budget_seconds: Optional[float] = None,
         fallback_model: dict[str, Any] | None = None, model_pinned: bool = False,
         fallback_chain_owned: bool = False, credential_pool=None,
+        allow_billing_fallback: bool = False,
         checkpoints_enabled: bool = False, checkpoint_max_snapshots: int = 20,
         checkpoint_max_total_size_mb: int = 500, checkpoint_max_file_size_mb: int = 10,
         pass_session_id: bool = False, requested_provider: str | None = None,

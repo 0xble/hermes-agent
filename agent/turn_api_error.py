@@ -12,6 +12,7 @@ from dataclasses import dataclass
 import contextlib
 import json
 import logging
+import os
 import ssl
 import time
 from typing import Any, Dict, Optional
@@ -45,6 +46,16 @@ def _is_pooled_proxy_route(agent: Any) -> bool:
     except (ImportError, AttributeError, TypeError, ValueError):
         logger.debug("Unable to identify pooled proxy route", exc_info=True)
         return False
+
+
+def _notify_billing_exhausted(agent: Any, classified: Any) -> None:
+    """Notify unattended callers only after retries and fallback have been exhausted."""
+    if classified.reason != FailoverReason.billing or os.environ.get("HERMES_TEST_ISOLATION"):
+        return
+    if getattr(agent, "platform", "") not in {"subagent", "cron"}:
+        return
+    from agent.billing_notice import notify_provider_out_of_credits
+    notify_provider_out_of_credits(getattr(agent, "requested_provider", "") or getattr(agent, "provider", ""))
 
 
 @dataclass
@@ -470,6 +481,7 @@ def settle_unrecovered_error(
                 retry_count = compression_attempts = 0
                 return _verdict("break")
         # Terminal from here: collapse the continuation trail once, before the persist.
+        _notify_billing_exhausted(agent, classified)
         _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", nonretryable_client_error_result(
@@ -545,6 +557,7 @@ def settle_unrecovered_error(
             elif _ladder["action"] == "return":
                 _settle_primary_exit()
             return _verdict(_ladder["action"], _ladder.get("result"))
+        _notify_billing_exhausted(agent, classified)
         _settle_primary_exit()
         _delivered = settle_delivered_partial(agent, messages, current_turn_user_idx)
         return _verdict("return", max_retries_exhausted_result(

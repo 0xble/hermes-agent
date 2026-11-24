@@ -888,6 +888,28 @@ def test_retention_prunes_excess_without_uncertain_processes(tmp_path, monkeypat
     assert {path.name for path in removed} == {"2", "3"}
 
 
+def test_retention_rechecks_pins_before_each_delete(tmp_path, monkeypatch):
+    """A release pinned after the initial snapshot (a cron run that started from it) survives."""
+    home = tmp_path / "profile"
+    paths = [home / "releases" / str(i) for i in range(5)]
+    for i, path in enumerate(paths):
+        _fake_release(path, str(i))
+        os.utime(path, (i, i))
+    releases.promote(home, paths[-1])
+    releases.promote(home, paths[-2])
+    calls = {"n": 0}
+
+    def late_pin(_home):
+        calls["n"] += 1
+        return set() if calls["n"] == 1 else {paths[0].resolve()}
+
+    monkeypatch.setattr(releases, "_live_process_pins", lambda _: set())
+    monkeypatch.setattr(releases, "_execution_code_sha_pins", late_pin)
+    removed = releases.retain(home, rollback_count=0)
+    assert paths[0].is_dir()
+    assert {path.name for path in removed} == {"1", "2"}
+
+
 def test_retention_keeps_cron_execution_release_pins(tmp_path, monkeypatch):
     home = tmp_path / "profile"
     shas = [f"{i:040x}" for i in range(5)]

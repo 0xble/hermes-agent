@@ -179,11 +179,17 @@ _LAST_EXPANDED_CONFIG_BY_PATH: dict[str, Any] = {}
 # the config writer seam, which produces a fresh inode, so stat() sees a new signature and the next load
 # repopulates automatically — no explicit invalidation hook. See #58514.
 _LOAD_CONFIG_CACHE: dict[str, tuple[Any, ...]] = {}
-# path -> (mtime_ns, size, ino, ctime_ns, racy digest, raw yaml dict) for read_raw_config() (no defaults merged in).
-_RAW_CONFIG_CACHE: dict[str, tuple[Any, ...]] = {}
+# Re-export the raw YAML cache and its helpers for existing callers. Production code uses
+# the module helper for cache removal so rebinding a compatibility name cannot split the cache binding.
+from hermes_cli.config_cache import (
+    _RAW_CONFIG_CACHE,
+    _raw_config_cache_clear,
+    _raw_config_cache_hit,
+    _raw_config_cache_hit_if_readable,
+    _raw_config_cache_store,
+    _worker_config_snapshot,
+)
 
-# Env var names written to .env that aren't in OPTIONAL_ENV_VARS (managed by setup/provider
-# flows directly). Also the set reload_env() may remove from os.environ.
 _EXTRA_ENV_KEYS = frozenset({
     "OPENAI_API_KEY", "OPENAI_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_TOKEN",
     "DISCORD_HOME_CHANNEL", "DISCORD_HOME_CHANNEL_NAME",
@@ -1788,35 +1794,6 @@ def cfg_get(cfg: Optional[dict[str, Any]], *keys: str, default: Any = None) -> A
     return node
 
 
-def _raw_config_cache_hit(path_key: str, cache_key: tuple[Any, ...]) -> Optional[dict[str, Any]]:
-    """Pure lookup: the cached raw config for ``path_key`` if its signature equals ``cache_key``,
-    else ``None``. Shared by the lock-free fast path and the locked re-check of
-    ``_read_raw_config_impl`` so the predicate cannot drift between them."""
-    cached = _RAW_CONFIG_CACHE.get(path_key)
-    if cached is not None and cached[:len(cache_key)] == cache_key:
-        return cached[len(cache_key)]
-    return None
-
-
-def _raw_config_cache_store(path_key: str, cache_key: tuple[Any, ...], data: dict[str, Any]) -> None:
-    """Publish ``data`` (caller-owned copy) as the raw config for ``path_key`` at ``cache_key``.
-    One whole-tuple replace, so the lock-free readers see either the old or the new entry."""
-    _RAW_CONFIG_CACHE[path_key] = (*cache_key, data)
-
-
-def _worker_config_snapshot() -> Optional[dict[str, Any]]:
-    """A safe worker's frozen config, or None. Install-time loads run from ``hermes_cli`` alone
-    (the installer's completion step ships no ``agent`` package), and without ``agent`` there
-    is no worker policy to consult."""
-    try:
-        from agent.safe_worker_policy import worker_config_snapshot
-    except ModuleNotFoundError as exc:
-        if exc.name != "agent" and not "agent".startswith(f"{exc.name}."):
-            raise
-        return None
-    return worker_config_snapshot()
-
-
 def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
     snapshot = _worker_config_snapshot()
     if snapshot is not None:
@@ -1830,10 +1807,10 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
     try:
         config_path = get_config_path()
         cache_key = config_cache_version(config_path)
-        hit = _raw_config_cache_hit(str(config_path), cache_key)
+        hit = _raw_config_cache_hit_if_readable(str(config_path), cache_key, config_path)
         if hit is not None:
             return copy.deepcopy(hit) if want_deepcopy else hit
-    except Exception:
+    except Exception:  # health: allow BLE001 -- cache fast path must fall through on any stale backend seam
         pass
 
     with _CONFIG_LOCK:
@@ -1846,12 +1823,17 @@ def _read_raw_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
             return FailedConfigRead(error=e)
 
         path_key = str(config_path)
-        hit = _raw_config_cache_hit(path_key, cache_key)
+        try:
+            hit = _raw_config_cache_hit_if_readable(path_key, cache_key, config_path)
+        except Exception as e:  # health: allow BLE001 -- cache re-probe preserves the existing read-failure boundary
+            _warn_config_parse_failure(config_path, e)
+            return FailedConfigRead(error=e)
         if hit is not None:
             return copy.deepcopy(hit) if want_deepcopy else hit
 
         try:
-            data = read_config_doc(config_path) or {}
+            loaded = read_config_doc(config_path)
+            data = {} if loaded is None else loaded
         except Exception as e:
             _warn_config_parse_failure(config_path, e)
             return FailedConfigRead(error=e)
@@ -2280,7 +2262,23 @@ def _load_config_impl(*, want_deepcopy: bool) -> dict[str, Any]:
 
         if user_sig is not None:
             try:
-                user_config = read_config_doc(config_path) or {}
+                # ``user_sig`` is the same ``config_cache_version(config_path)`` used by
+                # read_raw_config(); keep both raw-read paths on one cache-entry shape. Expansion
+                # below remains per-scope so secret values never enter the raw-document cache.
+                cache_key = user_sig
+                raw_cached = _raw_config_cache_hit_if_readable(path_key, cache_key, config_path)
+                if raw_cached is not None:
+                    user_config = copy.deepcopy(raw_cached)
+                else:
+                    loaded = read_config_doc(config_path)
+                    user_config = {} if loaded is None else loaded
+                    if not isinstance(user_config, dict):
+                        raise TypeError(
+                            f"top-level YAML must be a mapping, got {type(user_config).__name__}")
+                    _raw_config_cache_store(path_key, cache_key, copy.deepcopy(user_config))
+                if not isinstance(user_config, dict):
+                    raise TypeError(
+                        f"top-level YAML must be a mapping, got {type(user_config).__name__}")
                 _CONFIG_PARSE_FAILURES.pop(path_key, None)  # the file reads now (a transient error left the record)
 
                 if "max_turns" in user_config:
@@ -2439,7 +2437,7 @@ def save_config(
         note_first_stamp(config_path.parent, _raw_for_paths, normalized)
         atomic_config_replace(config_path, normalized, extra_content_on_create=_commented_sections_for_save(normalized))
         _secure_file(config_path)
-        _RAW_CONFIG_CACHE.pop(str(config_path), None)
+        _raw_config_cache_clear(str(config_path))
         _LAST_EXPANDED_CONFIG_BY_PATH[str(config_path)] = copy.deepcopy(current_normalized)
     from hermes_cli.observability.shared_metrics_disabled import record_config_saved
     record_config_saved(_raw_for_paths, current_normalized)

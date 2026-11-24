@@ -53,7 +53,7 @@ from hermes_time import now as _hermes_now
 from hermes_time import get_timezone
 from zoneinfo import ZoneInfo
 from hermes_cli.observability.shared_metrics_gateway import record_cron_missed
-from utils import atomic_replace, atomic_write_text, fsync_directory, mkstemp_beside
+from utils import atomic_replace, atomic_write_text, file_cache_version, fsync_directory, mkstemp_beside
 
 # croniter is imported lazily (slow import, only needed for cron exprs). HAS_CRONITER stays a
 # module attribute: a monkeypatched value wins because _ensure_croniter only probes while None
@@ -115,6 +115,10 @@ TICKER_INTERVAL_SECONDS = 60
 # mark_job_run / advance_next_run calls clobber each other.
 _jobs_file_lock = threading.RLock()
 _jobs_lock_state = threading.local()
+# Parsed jobs are immutable from the store's perspective: callers receive a deep copy, while
+# the cache is invalidated naturally by the file cache stamp (mtime, size, inode, ctime, and
+# a short-lived racy content digest).
+_jobs_load_cache: dict[str, tuple[tuple[Any, ...], list[dict[str, Any]]] | None] = {}
 _fire_fence_locks: dict[str, threading.RLock] = {}
 _fire_fence_locks_guard = threading.Lock()
 _fire_fence_lock_state = threading.local()
@@ -1508,7 +1512,16 @@ def load_jobs() -> list[dict[str, Any]]:
     pre_read_stamp = _jobs_file_stamp(jobs_file)
     if not jobs_file.exists():
         _record_load_stamp(None)
+        with _jobs_file_lock:
+            _jobs_load_cache.pop(str(jobs_file), None)
         return []
+
+    cache_key = str(jobs_file)
+    with _jobs_file_lock:
+        cached = _jobs_load_cache.get(cache_key)
+        if cached is not None and cached[0] == pre_read_stamp:
+            _record_load_stamp(pre_read_stamp)
+            return copy.deepcopy(cached[1])
 
     try:
         data, _strict_retry = _parse_jobs_file(jobs_file)
@@ -1586,6 +1599,10 @@ def load_jobs() -> list[dict[str, Any]]:
         except OSError as exc:  # repaired in memory; the next load retries the persist
             store_health.note_unwritable(exc, f"jobs.json repair ({repair}) not persisted", "load")
     _record_load_stamp(pre_read_stamp)
+    # Do not cache a stamp that raced with a writer; the next load must parse again.
+    if pre_read_stamp is not None and _jobs_file_stamp(jobs_file) == pre_read_stamp:
+        with _jobs_file_lock:
+            _jobs_load_cache[cache_key] = (pre_read_stamp, copy.deepcopy(list(jobs)))
     return jobs
 
 
@@ -1605,18 +1622,44 @@ def _peek_jobs_unlocked() -> Optional[list[dict[str, Any]]]:
     return data if isinstance(data, list) else None
 
 
-def _jobs_file_stamp(jobs_file: Path) -> Optional[tuple[int, int, int]]:
-    """Shrink-merge fast-path stamp ``(mtime_ns, size, ino)``; ``None`` if unstatable. ``st_ino`` is
-    included because every writer uses mkstemp+rename, so a same-size write in one mtime quantum
-    can't false-match."""
+def _jobs_file_stamp(jobs_file: Path) -> Optional[tuple[Any, ...]]:
+    """Content-cache stamp including a bounded racy digest for pinned-mtime edits.
+
+    The digest is only active during the two-second filesystem racy window. The
+    no-op save path reuses the parsed snapshot, so a settled jobs file does not
+    get reread or hashed on every scheduler tick.
+    """
     try:
-        st = jobs_file.stat()
-        return (st.st_mtime_ns, st.st_size, st.st_ino)
+        return file_cache_version(jobs_file)
     except OSError:
         return None
 
 
-def _record_load_stamp(stamp: Optional[tuple[int, int, int]]) -> None:
+def _peek_jobs_document_unlocked() -> tuple[Optional[list[dict[str, Any]]], bool]:
+    """Return ``(jobs, canonical)`` without repairing or saving the document.
+
+    Reuse the already parsed immutable snapshot when the scheduler just loaded this
+    same stamp. This keeps the no-op-save guard from parsing jobs.json a second time
+    on every tick while preserving its canonical-document check on a cold cache.
+    """
+    jobs_file = _current_cron_store().jobs_file
+    if not jobs_file.exists():
+        return [], False
+    cache_key = str(jobs_file)
+    stamp = _jobs_file_stamp(jobs_file)
+    cached = _jobs_load_cache.get(cache_key)
+    if cached is not None and cached[0] == stamp:
+        return copy.deepcopy(cached[1]), True
+    try:
+        data, _ = _parse_jobs_file(jobs_file)
+    except (OSError, ValueError):
+        return None, False
+    if not isinstance(data, dict) or not isinstance(data.get("jobs"), list):
+        return data if isinstance(data, list) else None, False
+    return data["jobs"], True
+
+
+def _record_load_stamp(stamp: Optional[tuple[Any, ...]]) -> None:
     """Remember jobs.json's stamp for the enclosing _jobs_lock() section (no-op outside one) so the
     save path can skip the shrink-merge when disk provably hasn't changed. Capture it BEFORE
     reading: a mid-read sibling then mismatches (fail-safe); stamping after would certify an
@@ -1874,6 +1917,21 @@ def save_jobs(
 ):
     """Save all jobs under the lock; see ``_save_jobs_unlocked`` for ``removed_ids``/``replace``."""
     with _jobs_lock():
+        # Scheduler scans commonly call save_jobs after every tick.  Avoid an atomic rewrite when
+        # the semantic job list is unchanged; the writer adds a fresh updated_at wrapper timestamp.
+        if (
+            not replace
+            and not removed_ids
+            and not getattr(_jobs_lock_state, "saving_noop_check", False)
+            and store_health.degraded_record(_current_cron_store().cron_dir) is None
+        ):
+            _jobs_lock_state.saving_noop_check = True
+            try:
+                disk_jobs, canonical = _peek_jobs_document_unlocked()
+                if canonical and disk_jobs == jobs:
+                    return
+            finally:
+                _jobs_lock_state.saving_noop_check = False
         _save_jobs_unlocked(jobs, removed_ids=removed_ids, replace=replace)
 
 

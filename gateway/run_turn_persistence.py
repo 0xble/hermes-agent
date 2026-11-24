@@ -112,6 +112,7 @@ class GatewayTurnPersistenceMixin:
         persist_user_display_kind: Optional[str] = None,
         reply_expected: Optional[bool] = None,
         loop_identity: Optional[tuple] = None,
+        internal: bool = False,
     ):
         """Turn the raw agent result into the outbound text: sentinel/silence handling, response
         logging, resume-pending clear, empty-response normalization, and identity-guarded
@@ -127,6 +128,17 @@ class GatewayTurnPersistenceMixin:
         if _is_gateway_hidden_reasoning_incomplete_turn(agent_result):
             response = ""
         _intentional_silence = self._is_intentional_silence(agent_result, response)
+        _internal_preemption_silence = (
+            internal
+            and agent_result.get("interrupted")
+            and agent_result.get("interrupt_source") == "gateway_user_turn_preemption"
+        )
+        # A cold-path user admission stops an internal machine turn cooperatively. Its partial model
+        # output is transcript evidence, never a chat reply, and must not become the generic
+        # "send it again" response used for an unstarted human turn.
+        if _internal_preemption_silence:
+            response = ""
+            _intentional_silence = True
         # A queued (/queue) chain's TERMINAL turn owns the silence verdict, not the event that
         # opened the chain: an internal follow-up, or a message not addressed to the bot, may go
         # silent; any other human one must not.
@@ -139,8 +151,12 @@ class GatewayTurnPersistenceMixin:
         # the exchange in silence, and the visible fallback would be runtime text it answers (#137027).
         if not automatic_notices_allowed(_silence_source):
             _silence_reply_expected = False
-        if _intentional_silence and not self._silence_allowed_for_source(
-            _silence_source, _silence_kind, _silence_reply_expected, agent_result,
+        if (
+            _intentional_silence
+            and not _internal_preemption_silence
+            and not self._silence_allowed_for_source(
+                _silence_source, _silence_kind, _silence_reply_expected, agent_result,
+            )
         ):
             logger.warning(
                 "silence marker rejected on a user turn: platform=%s chat=%s",

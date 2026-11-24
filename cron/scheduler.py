@@ -124,8 +124,10 @@ def _job_fallback_chain(job: dict, cfg: Any) -> Optional[list]:
         # Unlike a delegated child's malformed override, an explicit cron override
         # never silently restores the global chain (including legacy fallback_model).
         return get_cron_fallback_chain(cfg) or None
+    pinned = _job_route_pinned(job)
+    allow_billing_fallback = bool(cron.get("allow_billing_fallback", False)) if isinstance(cron, dict) else False
     return scoped_fallback_chain(
-        get_fallback_chain(cfg), None, pinned=_job_route_pinned(job), owner="cron job")
+        get_fallback_chain(cfg), None, pinned=pinned and not allow_billing_fallback, owner="cron job")
 
 
 def _fallback_chain_phrase(job: Optional[dict] = None) -> str:
@@ -1907,7 +1909,13 @@ def _resolve_job_runtime(job: dict, job_id: str, jc: _CronJobConfig) -> tuple[di
         if not (is_auth or is_transient_net):
             raise RuntimeError(format_runtime_provider_error(resolve_exc)) from resolve_exc
 
-        chain = _job_fallback_chain(job, jc.cfg) or []
+        # Resolve-time fallback handles auth and transport failures. A pinned job may use an
+        # explicitly owned cron chain, but it never substitutes through the inherited global chain.
+        cron_cfg = jc.cfg.get("cron") if isinstance(jc.cfg, dict) else None
+        owns_chain = isinstance(cron_cfg, dict) and cron_cfg.get("fallback_providers") is not None
+        chain = _job_fallback_chain(job, jc.cfg) or [] if (
+            not _job_route_pinned(job) or owns_chain
+        ) else []
         logger.warning(
             "Job '%s': primary provider resolve failed (%s: %s), %s",
             job_id, "auth" if is_auth else "transient network", resolve_exc,
@@ -2483,6 +2491,7 @@ def _resolve_cron_agent_setup(job: dict, job_id: str, job_name: str, jc) -> _Cro
 def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup, *, workdir, session_id, session_db):
     runtime = setup.runtime
     pr = _cfg.get("provider_routing") or {}
+    cron_cfg = _cfg.get("cron") if isinstance(_cfg.get("cron"), dict) else {}
     return AIAgent(
         model=setup.model,
         api_key=runtime.get("api_key"),
@@ -2497,6 +2506,11 @@ def _construct_cron_agent(AIAgent, job: dict, _cfg: dict, setup: _CronAgentSetup
         reasoning_config=setup.reasoning_config,
         prefill_messages=setup.prefill_messages,
         fallback_model=setup.fallback_model,
+        model_pinned=_job_route_pinned(job),
+        fallback_chain_owned=(
+            cron_cfg.get("fallback_providers") is not None
+        ),
+        allow_billing_fallback=bool(cron_cfg.get("allow_billing_fallback", False)),
         credential_pool=setup.credential_pool,
         providers_allowed=pr.get("only"),
         providers_ignored=pr.get("ignore"),

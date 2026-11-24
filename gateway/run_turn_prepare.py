@@ -784,12 +784,82 @@ class GatewayTurnPrepareMixin:
         _lease_registry = getattr(self, "_turn_leases", None)
         if _lease_registry is None:
             return
+        async def _preempt_machine_holder(holder):
+            """A genuine user waiter may yield an internal holder before waiting on the lease.
+
+            This is deliberately narrower than adapter busy dispatch: relays, agent-origin text,
+            internal events, steer mode, active subagents, and compression all retain queue semantics.
+            """
+            if event is None:
+                return
+            is_user_turn = getattr(self, "_is_user_turn_event", None)
+            if callable(is_user_turn) and not is_user_turn(event):
+                return
+            if not callable(is_user_turn) and getattr(event, "internal", False):
+                return
+            from gateway.response_filters import is_agent_origin_text
+            if is_agent_origin_text(getattr(event, "text", None)):
+                return
+            holder_event = getattr(holder, "event", None)
+            if holder_event is None or not getattr(holder_event, "internal", False):
+                return
+            from gateway.meeting_lane import busy_input_mode
+            if await busy_input_mode(self, event, _quick_key) == "steer":
+                return
+            state = self._peek_session_state(holder.owner_key)
+            running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
+            from gateway.run import _AGENT_PENDING_SENTINEL
+            # A pending sentinel/None means the machine turn has not exposed an interruptible agent yet.
+            # Do not cancel its task: admission waits for the ordinary lease release path.
+            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+                return
+            if self._agent_has_active_subagents(running_agent):
+                return
+            compression_check = getattr(self, "_session_has_compression_in_flight", None)
+            if callable(compression_check) and await compression_check(_quick_key):  # type: ignore[reportGeneralTypeIssues]
+                return
+            adapter = self._delivery_adapter_for(event.source)
+            if adapter is None:
+                return
+            # The callback above can yield while the holder releases and a different turn starts.
+            # Never interrupt a stale token or the newly published agent.
+            if holder.lease.holder is not holder or holder.released:
+                return
+            state = self._peek_session_state(holder.owner_key)
+            running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
+            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+                return
+            if self._agent_has_active_subagents(running_agent):
+                return
+            # A system-sourced soft interrupt with no message: the user's event is not in the adapter
+            # FIFO yet and runs as the next lease owner, so carrying its text would process it twice.
+            try:
+                running_agent.interrupt(None, tool_reason="gateway user turn preemption")
+            except Exception:
+                logger.debug("Cold-path machine-turn preemption failed", exc_info=True)
+                return
+            logger.info("User message preempts autonomous turn on lease wait (session=%s)", _quick_key)
+            # Use the same busy-ack channel as warm-path preemption. The flag prevents the
+            # later lease-wait notice from sending a second (queued) acknowledgement.
+            if not getattr(event, "_gateway_busy_ack_sent", False):
+                from agent.i18n import t
+                from agent.notice_style import ContextNotice
+                notice = ContextNotice(t(
+                    "gateway.busy.ack", head=t("gateway.busy.interrupting_head"), detail="",
+                    tail=t("gateway.busy.interrupting_tail")))
+                notice._temporary = True  # type: ignore[attr-defined]
+                send_ack = getattr(self, "_send_busy_ack_reply", None)
+                if callable(send_ack):
+                    await send_ack(event, adapter, notice)  # type: ignore[reportGeneralTypeIssues]
+
         try:
             _lease_token = await _lease_registry.acquire(
                 session_entry.session_id, owner_key=_quick_key, generation=run_generation,
                 timeout=_float_env("HERMES_TURN_LEASE_TIMEOUT", DEFAULT_LEASE_WAIT),
                 max_wait=lease_wait_max_seconds(),
                 on_wait=(lambda: lease_wait_notice(self, _quick_key, event)) if event is not None else None,
+                on_contended=_preempt_machine_holder if event is not None else None,
+                event=event,
                 on_timeout=(lambda: preserve_lease_wait_async(
                     self, _quick_key, session_entry.session_id, event,
                 )) if event is not None else None,
