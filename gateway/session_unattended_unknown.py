@@ -80,6 +80,23 @@ def _unattended_unknown(records):
     return [row for row in map(admission_row, records) if row['status'] == 'unknown' and is_unattended(row)]
 
 
+def _unknown_admissions(store):
+    """Read unknown admissions through the legacy SessionDB handle used by boot recovery.
+
+    Startup recovery still receives ``SessionDB`` so it can share the fenced transaction helpers
+    and detached-cron probes.  The newer ``PersistenceStore.admissions`` repository is not
+    attached to that handle, so reaching for ``store.admissions`` crashes the gateway before
+    readiness.  Keep this read on the same connection and normalize it through the canonical
+    runtime row decoder.
+    """
+    from hermes_state_runtime import _row
+
+    with store._read_ctx() as conn:
+        return [_row(row) for row in conn.execute(
+            "SELECT * FROM session_admissions WHERE status='unknown' ORDER BY seq"
+        )]
+
+
 def settle_recovered_unattended(store, epoch) -> int:
     """Boot recovery, right after ``admissions.recover`` fenced lost turns ``unknown`` and before
     any FIFO is scheduled: settle every unattended one. Synchronous; runs off the owner loop.
@@ -88,7 +105,7 @@ def settle_recovered_unattended(store, epoch) -> int:
     from gateway.session_ingress_media import release_admission_media
     from persistence.core.errors import AuthorityRefusal
     settled = 0
-    for row in _unattended_unknown(store.admissions.list_unknown()):
+    for row in _unattended_unknown(_unknown_admissions(store)):
         from cron.detached_authority import recover_detached, defer_detached
         if recover_detached(store, epoch, row):
             settled += 1
@@ -96,8 +113,9 @@ def settle_recovered_unattended(store, epoch) -> int:
         if defer_detached(store, row):
             continue
         try:
-            store.admissions.resolve_unknown(epoch=epoch, admission_id=row['admission_id'],
-                                             generation=row['generation'], notice=AUTOMATION_INTERRUPTED_NOTICE)
+            from hermes_state_runtime import resolve_unknown_session_input
+            resolve_unknown_session_input(
+                store, epoch=epoch, admission_id=row['admission_id'], generation=row['generation'])
         except AuthorityRefusal as exc:
             logger.warning('Lost automation admission %s left unknown: %s', row['admission_id'], exc.reason)
             continue
