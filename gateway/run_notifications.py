@@ -43,23 +43,6 @@ from gateway.watch_match_coalesce import coalesce_pending_watch_matches
 logger = logging.getLogger("gateway.run")
 
 
-def _local_completion_card(evt: dict) -> dict[str, str]:
-    """Build the local async-result card for a completion or liveness notice."""
-    from tools.process_registry_notifications import (
-        PROCESS_COMPLETE_DISPLAY_KIND, async_delegation_display_text, process_completion_display_text)
-    evt_type = evt.get("type", "completion")
-    if evt_type == "completion":
-        return {"display_kind": PROCESS_COMPLETE_DISPLAY_KIND,
-                "display_text": evt.get("_display_text") or process_completion_display_text([evt])}
-    if evt_type == "async_delegation":
-        return {"display_kind": "async_delegation_complete", "display_text": async_delegation_display_text(evt)}
-    if evt_type == "heartbeat":
-        from gateway.response_filters import INTERNAL_NOTIFICATION_DISPLAY_KIND
-        from tools.process_registry_notifications import heartbeat_display_text
-        return {"display_kind": INTERNAL_NOTIFICATION_DISPLAY_KIND, "display_text": heartbeat_display_text(evt)}
-    return {}
-
-
 def _watch_notification_metadata(evt: dict, source) -> dict[str, Any]:
     """Metadata carried by synthetic watch/completion notifications."""
     metadata: dict[str, Any] = {"notification_origin": "process_registry_synthetic"}
