@@ -119,29 +119,44 @@ class SessionTurnLeaseRegistry:
         lease = self._get_or_create(session_id)
         token = TurnLeaseToken(session_id, owner_key, int(generation), lease=lease)
         token.event = event
-        if lease.lock.locked():
-            holder = lease.holder
-            if on_contended is not None and holder is not None:
-                await on_contended(holder)
-            overlap = "previous turn is handing off the lease"
-            if lease.holder is not None:
-                overlap = ("same-key generation overlap" if owner_key == lease.holder.owner_key
-                           else "two routing keys are mapped to one session_id (#64934)")
+        was_contended = lease.lock.locked()
+        contended_holder = lease.holder if was_contended else None
+        # Lock.release() wakes a waiter while leaving the lock momentarily unlocked. Count every
+        # in-progress acquire across that handoff (including the preemption callback below) so
+        # eviction cannot orphan the old lock and create a second lock for the same session.
+        lease.pending_acquires += 1
+        overlap = "previous turn is handing off the lease"
+        if contended_holder is not None:
+            overlap = ("same-key generation overlap" if owner_key == contended_holder.owner_key
+                       else "two routing keys are mapped to one session_id (#64934)")
+        if was_contended:
             logger.warning(
                 "turn lease contention on session %s: routing key %s (gen %s) waiting behind "
                 "in-flight turn held by routing key %s (gen %s, held %.0fs) — %s; "
                 "serializing this turn behind the previous turn's flush",
-                session_id, owner_key, generation, *_holder_desc(lease.holder),
+                session_id, owner_key, generation, *_holder_desc(contended_holder),
                 time.time() - lease.acquired_at if lease.acquired_at else -1.0,
                 overlap)
-        # Lock.release() wakes a waiter while leaving the lock momentarily unlocked. Count every
-        # in-progress acquire across that handoff (even apparently-uncontended ones — wait_for()
-        # may schedule them before the lock coroutine runs) so eviction cannot orphan the old
-        # lock and create a second lock for the same session.
-        lease.pending_acquires += 1
         started = time.monotonic()
         try:
-            await self._wait_for_lock(lease.lock, wait, on_timeout, max_wait, on_wait)
+            safe_contended_callback = None
+            if on_contended is not None and contended_holder is not None:
+                callback = on_contended
+                holder = contended_holder
+
+                async def _safe_contended_callback():
+                    try:
+                        await callback(holder)
+                    except Exception:
+                        logger.warning(
+                            "turn lease contention callback failed on session %s; continuing to wait",
+                            session_id, exc_info=True)
+
+                safe_contended_callback = _safe_contended_callback
+            await self._wait_for_lock(
+                lease.lock, wait, on_timeout, max_wait, on_wait,
+                on_contended=safe_contended_callback,
+            )
         except TimeoutError:
             elapsed = time.monotonic() - started
             logger.error(
@@ -160,17 +175,21 @@ class SessionTurnLeaseRegistry:
         return token
 
     @staticmethod
-    async def _wait_for_lock(lock, timeout, on_timeout, max_wait, on_wait):
+    async def _wait_for_lock(lock, timeout, on_timeout, max_wait, on_wait, on_contended=None):
         # Keep the SAME asyncio.Lock waiter after the deadline, preserving FIFO order.
         # Cancellation must drain it too: otherwise a detached acquire can steal the lease.
         waiter = asyncio.create_task(lock.acquire())
         acquired = False
-        loop = asyncio.get_running_loop()
-        started = loop.time()
-        deadlines = [(timeout, on_timeout)]
-        if on_wait is not None:
-            deadlines.append((DEFAULT_LEASE_NOTICE_DELAY, on_wait))
         try:
+            # Let lock.acquire() register its waiter before an awaited contention hook runs.
+            await asyncio.sleep(0)
+            if on_contended is not None:
+                await on_contended()
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            deadlines = [(timeout, on_timeout)]
+            if on_wait is not None:
+                deadlines.append((DEFAULT_LEASE_NOTICE_DELAY, on_wait))
             async with asyncio.timeout(max_wait):
                 for delay, callback in sorted(deadlines, key=lambda item: item[0]):
                     remaining = max(0, started + delay - loop.time())

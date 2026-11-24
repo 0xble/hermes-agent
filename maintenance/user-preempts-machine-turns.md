@@ -34,7 +34,7 @@ Preemption happens only when all of these hold:
 - the holder agent has no active subagents and no compression in flight
 - the holder has a live agent (a pending sentinel or missing agent means wait)
 
-The session task is never cancelled.
+- The session task is never cancelled. Soft preemption is cooperative: if the machine turn is inside a non-interruptible tool or step, it keeps the lease until that step yields. The user message remains FIFO behind it; the user has already seen the "Interrupting" acknowledgement rather than a second queued acknowledgement.
 
 Contract tests: `tests/gateway/test_turn_lease_queue.py`.
 

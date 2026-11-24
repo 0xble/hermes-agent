@@ -806,20 +806,30 @@ class GatewayTurnPrepareMixin:
             from gateway.meeting_lane import busy_input_mode
             if await busy_input_mode(self, event, _quick_key) == "steer":
                 return
-            state = getattr(self, "_peek_session_state")(holder.owner_key)
+            state = self._peek_session_state(holder.owner_key)
             running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
             from gateway.run import _AGENT_PENDING_SENTINEL
             # A pending sentinel/None means the machine turn has not exposed an interruptible agent yet.
             # Do not cancel its task: admission waits for the ordinary lease release path.
             if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
                 return
-            if getattr(self, "_agent_has_active_subagents")(running_agent):
+            if self._agent_has_active_subagents(running_agent):
                 return
             compression_check = getattr(self, "_session_has_compression_in_flight", None)
             if callable(compression_check) and await compression_check(_quick_key):  # type: ignore[reportGeneralTypeIssues]
                 return
-            adapter = getattr(self, "_delivery_adapter_for")(event.source)
+            adapter = self._delivery_adapter_for(event.source)
             if adapter is None:
+                return
+            # The callback above can yield while the holder releases and a different turn starts.
+            # Never interrupt a stale token or the newly published agent.
+            if holder.lease.holder is not holder or holder.released:
+                return
+            state = self._peek_session_state(holder.owner_key)
+            running_agent = getattr(getattr(state, "turn", None), "agent", None) if state is not None else None
+            if running_agent is None or running_agent is _AGENT_PENDING_SENTINEL:
+                return
+            if self._agent_has_active_subagents(running_agent):
                 return
             # A system-sourced soft interrupt with no message: the user's event is not in the adapter
             # FIFO yet and runs as the next lease owner, so carrying its text would process it twice.
