@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from run_agent import AIAgent
+from agent.turn_recovery import abort_turn_on_interrupt
 from tests.agent.test_run_agent import _make_tool_defs
 
 
@@ -54,3 +55,24 @@ def test_system_soft_interrupt_real_agent_records_source_without_followup(agent,
     assert any(message.get("role") == "user" and message.get("content") == "machine wake"
                for message in result["messages"])
     persist.assert_called()
+
+
+def test_api_error_abort_stamps_system_interrupt_source(agent):
+    """The API-error early return stamps attribution before clearing interrupt state."""
+    agent.interrupt(None, tool_reason="gateway user turn preemption")
+    messages = [{"role": "user", "content": "machine wake"}]
+
+    with patch.object(agent, "_persist_session") as persist:
+        result = abort_turn_on_interrupt(
+            agent,
+            messages,
+            [],
+            1,
+            abort_message="Interrupt detected",
+            interrupt_text="Operation interrupted",
+        )
+
+    assert result["interrupted"] is True
+    assert result["interrupt_source"] == "gateway_user_turn_preemption"
+    assert agent._interrupt_source is None
+    persist.assert_called_once()

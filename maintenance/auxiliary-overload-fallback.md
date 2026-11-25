@@ -4,7 +4,7 @@ Load this unit when changing auxiliary provider error classification or configur
 
 ## Required behavior
 
-Status-less provider overload responses, including overload messages from custom proxies, are classified through the shared API error taxonomy and treated as auxiliary capacity failures. Sync and async auxiliary calls must continue through the configured fallback chain, while timeout and connection failures retain their distinct labels and behavior.
+Status-less provider overload responses, including overload messages from custom proxies, are classified through the shared API error taxonomy and treated as capacity failures. Main turns and sync/async auxiliary calls continue through the configured fallback chain, while timeout and connection failures retain their distinct labels and behavior. A proxy HTTP 503 that explicitly names provider overload is marked provider-wide, so a declared long retry window arms the shared primary cooldown and does not block the fallback behind that sleep.
 
 An HTTP 503 whose body names `auth_unavailable` or "no auth available" is a relay-wrapped credential or quota failure, not an overload. It falls back as `auth unavailable`. A timeout-flavoured 408 keeps its timeout label. HTTP 500 bodies containing TLS handshake failures or `: EOF` are wrapped connection failures and use the existing 60-second connection quarantine, not the 600-second provider-unavailable quarantine. Other 408 or 5xx failures that survive the same-provider transient retry fall back as `provider unavailable`.
 
@@ -22,6 +22,8 @@ Ported from archived HERMES-023 (archived commit `bc39474cfdf0`) after reproduci
 ## Verification
 
 `scripts/run_tests.sh tests/agent/test_auxiliary_client.py -k 'AuxiliaryOverloadFallback' -j 6`
+
+Main-turn regression coverage also lives in `tests/agent/test_billing_proxy_error_classification.py` and `tests/agent/test_shared_primary_cooldown.py`. It proves that explicit overload wording on HTTP 503 enters fallback immediately and preserves the provider-declared cooldown across processes.
 
 ## Retirement and rollback
 

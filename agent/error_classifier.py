@@ -1411,7 +1411,13 @@ def _status_5xx(c: _Ctx) -> Verdict:
         validation = any(p in c.msg for p in _REQUEST_VALIDATION_PATTERNS) or c.code in _5XX_VALIDATION_CODES
     if validation and not _is_server_injected_param_rejection(c.msg, c.provider_slug):
         return _V_FORMAT_ERROR
-    if c.status_code == 529 or c.code == "overloaded_error":
+    # Some OpenAI-compatible proxies preserve the provider's overload wording while
+    # returning a generic 503 code. Treat that explicit capacity signal like 529 or
+    # ``overloaded_error`` so the cross-process breaker and fallback path can act
+    # before honoring a multi-minute Retry-After sleep.
+    if c.status_code == 529 or c.code == "overloaded_error" or (
+        c.status_code == 503 and any(pattern in c.msg for pattern in _OVERLOADED_PATTERNS)
+    ):
         return {**_V_OVERLOADED, "error_context": {"provider_wide": True}}
     return _V_OVERLOADED if c.status_code == 503 else _V_SERVER_ERROR
 

@@ -149,6 +149,39 @@ def changed_files(repo: Path, base: str, head: str | None, *diff_args: str) -> l
     return [c for c in changes if c.new not in generated]
 
 
+def prefetch_blobs(repo: Path, tree: str, paths: list[str]) -> None:
+    """Hydrate a blobless clone's missing blobs for ``paths`` in one fetch.
+
+    Without this, each ``git show`` below lazily fetches its own blob and leaves one
+    promisor pack per file in the shared object store. Any failure here only loses
+    the batching: the per-file reads still fetch what they need.
+    """
+    if not paths:
+        return
+    try:
+        _prefetch_missing(repo, tree, paths)
+    except (subprocess.TimeoutExpired, OSError):
+        pass  # only batching is lost; read_file still fetches and reports each blob itself
+
+
+def _prefetch_missing(repo: Path, tree: str, paths: list[str]) -> None:
+    if not git(repo, "config", "--get", "remote.origin.partialclonefilter", check=False).strip():
+        return
+    # rev-list --missing=print names absent blobs ("?<oid>") without lazily fetching them,
+    # on every git version (GIT_NO_LAZY_FETCH only exists from 2.45; CI ships older git).
+    # Walk the tree object, not the commit: a commit walk with paths skips untouched commits.
+    listing = git(repo, "--literal-pathspecs", "rev-list", "--objects", "--no-walk", "--missing=print",
+                  f"{tree}^{{tree}}", "--", *paths, check=False)
+    missing = [line[1:] for line in listing.splitlines() if line.startswith("?")]
+    if missing:
+        subprocess.run(  # same single-fetch pattern as scripts/ci/prefetch_tree.py
+            ["git", "-c", "fetch.negotiationAlgorithm=noop", "fetch", "--no-tags", "--no-write-fetch-head",
+             "--recurse-submodules=no", "--filter=blob:none", "--stdin", "origin"],
+            cwd=repo, input="\n".join(missing) + "\n", capture_output=True, text=True, timeout=120,
+            check=False,
+        )
+
+
 def read_file(repo: Path, tree: str | None, path: str) -> str | None:
     if tree is None:
         try:
